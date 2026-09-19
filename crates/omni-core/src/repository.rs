@@ -65,26 +65,82 @@ impl Repository {
             info!("Seeded initial admin account: admin@newsroom.local (password: admin123)");
         }
 
-        // Check if known journalists are seeded
-        let j_count: i64 = conn.query_row("SELECT COUNT(*) FROM journalists", [], |r| r.get(0))?;
-        if j_count == 0 {
-            let seed_journalists = vec![
-                ("PAPADAKI", "Anna Papadaki", vec!["a.papadaki@example.gr", "papadaki@example.gr"]),
-                ("NIKOLAOU", "Nikolaou", vec!["nikolaou@example.gr"]),
-                ("GEORGIOU", "Antonis Georgiou", vec!["georgiou@example.gr"]),
-                ("DIMITRIOU", "Sofia Dimitriou", vec!["dimitriou@example.gr"]),
-                ("MCR", "Master Control Room", vec!["mcr@example.gr", "ingest@example.gr"]),
-            ];
-            for (surname, full_name, emails) in seed_journalists {
-                let emails_json = serde_json::to_string(&emails).unwrap_or_else(|_| "[]".into());
-                let _ = conn.execute(
-                    "INSERT INTO journalists (surname, full_name, emails) VALUES (?, ?, ?)",
-                    params![surname, full_name, emails_json],
-                );
-            }
-            info!("Seeded default newsroom journalist roster.");
+        self.seed_journalists_from_file(&conn)?;
+
+        Ok(())
+    }
+
+    /// Seed the journalist roster from `data/journalists.seed.json`, if present
+    /// and the table is empty.
+    ///
+    /// The roster is real newsroom staff -- names and work addresses -- so it
+    /// lives in a deployment data file, not in source control. Ship
+    /// `data/journalists.seed.example.json` as the shape and let each station
+    /// provide its own. A missing file is normal: the admin panel is the
+    /// primary way to manage the roster, and `MCR` is always present as the
+    /// fallback for unresolved journalists.
+    fn seed_journalists_from_file(&self, conn: &rusqlite::Connection) -> Result<()> {
+        let existing: i64 = conn.query_row("SELECT COUNT(*) FROM journalists", [], |r| r.get(0))?;
+        if existing > 0 {
+            return Ok(());
         }
 
+        // MCR is structural, not staff: the parser assigns it whenever it
+        // cannot resolve a journalist, and delivery uses it as a folder name.
+        conn.execute(
+            "INSERT INTO journalists (surname, full_name, emails) VALUES ('MCR', 'Master Control Room', '[]')",
+            [],
+        )?;
+
+        let seed_file = match self.db_path.as_deref().and_then(|p| p.parent()) {
+            Some(dir) => dir.join("journalists.seed.json"),
+            None => return Ok(()),
+        };
+        let raw = match std::fs::read_to_string(&seed_file) {
+            Ok(raw) => raw,
+            Err(_) => {
+                info!(
+                    "No journalist roster at {:?}; add journalists in Admin -> Journalists",
+                    seed_file
+                );
+                return Ok(());
+            }
+        };
+
+        #[derive(serde::Deserialize)]
+        struct SeedJournalist {
+            surname: String,
+            #[serde(default)]
+            full_name: String,
+            #[serde(default)]
+            emails: Vec<String>,
+            #[serde(default)]
+            default_priority: i32,
+        }
+
+        let roster: Vec<SeedJournalist> = serde_json::from_str(&raw)
+            .with_context(|| format!("Failed parsing journalist roster {:?}", seed_file))?;
+
+        let mut seeded = 0usize;
+        for j in roster {
+            let surname = j.surname.trim().to_uppercase();
+            if surname.is_empty() || surname == "MCR" {
+                continue;
+            }
+            let emails_json = serde_json::to_string(&j.emails).unwrap_or_else(|_| "[]".into());
+            let full_name = if j.full_name.is_empty() {
+                surname.clone()
+            } else {
+                j.full_name
+            };
+            conn.execute(
+                "INSERT OR IGNORE INTO journalists (surname, full_name, emails, default_priority)
+                 VALUES (?, ?, ?, ?)",
+                params![surname, full_name, emails_json, j.default_priority],
+            )?;
+            seeded += 1;
+        }
+        info!("Seeded {seeded} journalists from {:?}", seed_file);
         Ok(())
     }
 
