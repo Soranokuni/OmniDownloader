@@ -1,0 +1,30 @@
+[package]
+name = "omni-web"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+omni-broadcast = { path = "../omni-broadcast" }
+omni-browser = { path = "../omni-browser" }
+omni-email = { path = "../omni-email" }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+rust-embed = "8.5"
+mime_guess = "2.0"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+anyhow = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+

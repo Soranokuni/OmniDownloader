@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniDownloader - IT Administration</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .code-font { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(18, 20, 29, 0.75); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased">
+    <!-- Header -->
+    <header class="border-b border-slate-900 bg-slate-950/80 backdrop-blur-md sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-9 h-9 rounded-lg bg-rose-500 flex items-center justify-center text-slate-950 font-black text-lg shadow-lg shadow-rose-500/20">
+                    A
+                </div>
+                <div>
+                    <h1 class="text-md font-bold tracking-tight text-white">OmniDownloader</h1>
+                    <p class="text-[10px] text-rose-400 tracking-wider uppercase font-semibold">IT Systems Administration</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-4">
+                <a href="/mcr" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 transition-colors flex items-center space-x-1.5">
+                    <i data-lucide="monitor" class="w-3.5 h-3.5"></i>
+                    <span>Open MCR Desk</span>
+                </a>
+                <button onclick="logout()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-950/40 hover:bg-rose-900 text-rose-400 hover:text-white border border-rose-500/30 transition-colors flex items-center space-x-1.5">
+                    <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
+                    <span>Sign Out</span>
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Content Grid -->
+    <main class="flex-1 max-w-7xl mx-auto px-6 py-8 w-full grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <!-- Left: System & Tool Management -->
+        <div class="space-y-6 lg:col-span-1">
+            <!-- yt-dlp Lifecycle Card -->
+            <div class="glass p-6 rounded-2xl border border-slate-900 space-y-4">
+                <div class="flex items-center space-x-2 border-b border-slate-900 pb-3">
+                    <i data-lucide="download-cloud" class="text-cyan-400 w-5 h-5"></i>
+                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-200">yt-dlp Engine Lifecycle</h2>
+                </div>
+
+                <div class="space-y-2 text-xs">
+                    <div class="flex justify-between text-slate-400">
+                        <span>Installed Version:</span>
+                        <strong id="ytdl-installed-ver" class="text-white code-font">Checking...</strong>
+                    </div>
+                    <div class="flex justify-between text-slate-400">
+                        <span>Latest GitHub Release:</span>
+                        <strong id="ytdl-remote-ver" class="text-cyan-400 code-font">Checking...</strong>
+                    </div>
+                </div>
+
+                <div class="pt-2 flex items-center justify-between border-t border-slate-900">
+                    <label class="text-xs text-slate-300 font-medium" for="nightly-toggle">Nightly Auto-Update (03:00 AM)</label>
+                    <input type="checkbox" id="nightly-toggle" checked class="w-4 h-4 rounded text-cyan-500 bg-slate-900 border-slate-800">
+                </div>
+
+                <button onclick="updateYtdl()" class="w-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold py-2 rounded-lg text-xs transition-colors flex items-center justify-center space-x-1.5 shadow-lg shadow-cyan-500/10">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5"></i>
+                    <span>Force Update yt-dlp Now</span>
+                </button>
+            </div>
+
+            <!-- Database Maintenance Card -->
+            <div class="glass p-6 rounded-2xl border border-slate-900 space-y-4">
+                <div class="flex items-center space-x-2 border-b border-slate-900 pb-3">
+                    <i data-lucide="database" class="text-purple-400 w-5 h-5"></i>
+                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-200">Database Maintenance</h2>
+                </div>
+
+                <div class="space-y-3">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-400 mb-1" for="purge-days">Purge Completed Jobs Older Than:</label>
+                        <div class="flex space-x-2">
+                            <select id="purge-days" class="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white flex-1">
+                                <option value="7">7 Days</option>
+                                <option value="14" selected>14 Days</option>
+                                <option value="30">30 Days</option>
+                            </select>
+                            <button onclick="purgeJobs()" class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold py-1.5 px-3 rounded-lg border border-slate-800">
+                                Prune
+                            </button>
+                        </div>
+                    </div>
+
+                    <button onclick="vacuumDb()" class="w-full bg-slate-900 hover:bg-slate-800 text-slate-300 font-semibold py-2 rounded-lg text-xs transition-colors border border-slate-800 flex items-center justify-center space-x-1.5">
+                        <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                        <span>Vacuum & Compact SQLite DB</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: User Management & Live Logs -->
+        <div class="space-y-6 lg:col-span-2">
+            <!-- User Management -->
+            <div class="glass p-6 rounded-2xl border border-slate-900 space-y-4">
+                <div class="flex justify-between items-center border-b border-slate-900 pb-3">
+                    <div class="flex items-center space-x-2">
+                        <i data-lucide="users" class="text-cyan-400 w-5 h-5"></i>
+                        <h2 class="text-sm font-bold uppercase tracking-wider text-slate-200">User Accounts (3-Tier RBAC)</h2>
+                    </div>
+                    <button onclick="openAddUserModal()" class="bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold py-1.5 px-3 rounded-lg flex items-center space-x-1">
+                        <i data-lucide="user-plus" class="w-3.5 h-3.5"></i>
+                        <span>Create User</span>
+                    </button>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-xs">
+                        <thead class="bg-slate-900/60 text-slate-400 uppercase tracking-wider text-[10px] border-b border-slate-800">
+                            <tr>
+                                <th class="p-2.5">Email</th>
+                                <th class="p-2.5">Name</th>
+                                <th class="p-2.5">Role</th>
+                                <th class="p-2.5">Linked Journalist</th>
+                                <th class="p-2.5 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-table-body" class="divide-y divide-slate-900">
+                            <tr><td colspan="5" class="p-4 text-center text-slate-500">Loading users...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Live Engine Audit Logs -->
+            <div class="glass p-6 rounded-2xl border border-slate-900 space-y-3">
+                <div class="flex justify-between items-center border-b border-slate-900 pb-3">
+                    <div class="flex items-center space-x-2">
+                        <i data-lucide="terminal" class="text-slate-400 w-5 h-5"></i>
+                        <h2 class="text-sm font-bold uppercase tracking-wider text-slate-200">System Telemetry & Audit Stream</h2>
+                    </div>
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+                </div>
+
+                <div id="logs-viewer" class="bg-slate-950 p-4 rounded-xl border border-slate-900 code-font text-xs h-64 overflow-y-auto space-y-1 text-slate-300">
+                    <div class="text-slate-500">[System] Connecting to live event stream...</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Create User Modal -->
+    <div id="add-user-modal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+        <div class="glass w-full max-w-md p-6 rounded-2xl space-y-4 border border-slate-800 shadow-2xl">
+            <h3 class="text-sm font-bold text-white uppercase tracking-wider">Create Newsroom User</h3>
+            <form id="create-user-form" class="space-y-3">
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1" for="new-email">Work Email</label>
+                    <input type="email" id="new-email" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1" for="new-name">Full Name</label>
+                    <input type="text" id="new-name" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1" for="new-password">Temporary Password</label>
+                    <input type="password" id="new-password" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1" for="new-role">Role</label>
+                    <select id="new-role" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500">
+                        <option value="user">User (Journalist / Submitter)</option>
+                        <option value="open_mcr">Open MCR (Master Control Operator)</option>
+                        <option value="admin">Admin (Full IT Access)</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1" for="new-j-surname">Linked Journalist Surname (Optional)</label>
+                    <input type="text" id="new-j-surname" placeholder="e.g. PAPADAKI" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500">
+                </div>
+                <div class="flex justify-end space-x-2 pt-2">
+                    <button type="button" onclick="closeAddUserModal()" class="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 rounded-lg text-xs">Cancel</button>
+                    <button type="submit" class="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold rounded-lg text-xs">Create User</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        async function init() {
+            fetchDependencies();
+            fetchUsers();
+            fetchLogs();
+            setupSSE();
+        }
+
+        async function fetchDependencies() {
+            try {
+                const res = await fetch('/api/admin/dependencies');
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('ytdl-installed-ver').innerText = data.ytdl_installed || 'Installed';
+                    document.getElementById('ytdl-remote-ver').innerText = data.ytdl_remote || 'Latest';
+                }
+            } catch (e) {}
+        }
+
+        async function updateYtdl() {
+            alert('Downloading latest yt-dlp release from GitHub...');
+            const res = await fetch('/api/admin/update-ytdl', { method: 'POST' });
+            if (res.ok) {
+                alert('yt-dlp successfully updated!');
+                fetchDependencies();
+            } else {
+                alert('Failed updating yt-dlp.');
+            }
+        }
+
+        async function purgeJobs() {
+            const days = document.getElementById('purge-days').value;
+            if (!confirm(`Purge completed jobs older than ${days} days?`)) return;
+            const res = await fetch('/api/admin/purge', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ older_than_days: parseInt(days) })
+            });
+            if (res.ok) alert('Pruned completed jobs successfully.');
+        }
+
+        async function vacuumDb() {
+            const res = await fetch('/api/admin/vacuum', { method: 'POST' });
+            if (res.ok) alert('SQLite vacuum executed successfully.');
+        }
+
+        async function fetchUsers() {
+            try {
+                const res = await fetch('/api/admin/users');
+                if (res.ok) {
+                    const data = await res.json();
+                    const tbody = document.getElementById('users-table-body');
+                    tbody.innerHTML = data.users.map(u => `
+                        <tr class="hover:bg-slate-900/40 transition-colors">
+                            <td class="p-2.5 font-semibold text-white">${u.email}</td>
+                            <td class="p-2.5 text-slate-300">${u.full_name}</td>
+                            <td class="p-2.5"><span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase ${u.role === 'admin' ? 'bg-rose-950/40 text-rose-400 border border-rose-500/20' : 'bg-slate-900 text-slate-300'}">${u.role}</span></td>
+                            <td class="p-2.5 text-slate-400">${u.journalist_surname || '--'}</td>
+                            <td class="p-2.5 text-right">
+                                <button onclick="resetPassword(${u.id})" class="px-2 py-1 text-[11px] bg-slate-900 hover:bg-slate-800 text-slate-300 rounded border border-slate-800">Reset Pass</button>
+                            </td>
+                        </tr>
+                    `).join('');
+                }
+            } catch (e) {}
+        }
+
+        async function resetPassword(id) {
+            const newPass = prompt("Enter new password for user:");
+            if (!newPass) return;
+            const res = await fetch(`/api/admin/users/${id}/password`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ password: newPass })
+            });
+            if (res.ok) alert('Password updated successfully.');
+        }
+
+        function openAddUserModal() { document.getElementById('add-user-modal').classList.remove('hidden'); }
+        function closeAddUserModal() { document.getElementById('add-user-modal').classList.add('hidden'); }
+
+        document.getElementById('create-user-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const email = document.getElementById('new-email').value.trim();
+            const full_name = document.getElementById('new-name').value.trim();
+            const password = document.getElementById('new-password').value;
+            const role = document.getElementById('new-role').value;
+            const journalist_surname = document.getElementById('new-j-surname').value.trim() || null;
+
+            const res = await fetch('/api/admin/users', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ email, full_name, password, role, journalist_surname })
+            });
+            if (res.ok) {
+                closeAddUserModal();
+                fetchUsers();
+                document.getElementById('create-user-form').reset();
+            } else {
+                const err = await res.json();
+                alert('Error: ' + err.error);
+            }
+        });
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/system/logs');
+                if (res.ok) {
+                    const data = await res.json();
+                    renderLogs(data.logs || []);
+                }
+            } catch (e) {}
+        }
+
+        function renderLogs(logs) {
+            const viewer = document.getElementById('logs-viewer');
+            viewer.innerHTML = logs.map(l => {
+                let color = "text-slate-300";
+                if (l.level === 'ERROR') color = "text-rose-400 font-bold";
+                else if (l.level === 'WARN') color = "text-amber-400";
+                else if (l.level === 'SUCCESS') color = "text-emerald-400";
+                return `<div><span class="text-slate-600">[${new Date(l.timestamp).toLocaleTimeString()}]</span> <span class="font-semibold text-slate-400">[${l.category}]</span> <span class="${color}">${l.message}</span></div>`;
+            }).join('');
+            viewer.scrollTop = viewer.scrollHeight;
+        }
+
+        function setupSSE() {
+            const eventSource = new EventSource('/api/events');
+            eventSource.onmessage = (e) => {
+                fetchLogs();
+            };
+        }
+
+        async function logout() {
+            await fetch('/api/auth/logout', { method: 'POST' });
+            window.location.href = '/login';
+        }
+
+        init();
+    </script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/omni-core",
+    "crates/omni-broadcast",
+    "crates/omni-browser",
+    "crates/omni-email",
+    "crates/omni-web",
+    "crates/omni-service",
+    "crates/omni-cli",
+]
+resolver = "2"
+
+[package]
+name = "omni-ingest"
+version = "1.0.0"
+edition = "2021"
+authors = ["OmniDownloader Team"]
+description = "Unified Broadcast-Grade Media Ingest Engine & Windows Service"
+
+[dependencies]
+omni-core = { path = "crates/omni-core" }
+omni-broadcast = { path = "crates/omni-broadcast" }
+omni-browser = { path = "crates/omni-browser" }
+omni-email = { path = "crates/omni-email" }
+omni-web = { path = "crates/omni-web" }
+omni-service = { path = "crates/omni-service" }
+omni-cli = { path = "crates/omni-cli" }
+
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+

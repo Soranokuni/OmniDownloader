@@ -1,0 +1,20 @@
+[package]
+name = "omni-browser"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+regex = "1.10"
+tracing = "0.1"
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+
