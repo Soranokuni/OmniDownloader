@@ -40,3 +40,6 @@ cookies*.txt
 Thumbs.db
 desktop.ini
 *.swp
+
+# ---- Real newsroom roster: staff names and work addresses ----
+/data/journalists.seed.json

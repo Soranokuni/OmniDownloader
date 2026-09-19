@@ -1,0 +1,14 @@
+[
+  {
+    "surname": "PAPADAKI",
+    "full_name": "Maria Papadaki",
+    "emails": ["m.papadaki@example.gr"],
+    "default_priority": 0
+  },
+  {
+    "surname": "NIKOLAOU",
+    "full_name": "Giorgos Nikolaou",
+    "emails": ["g.nikolaou@example.gr", "gnikolaou@example.gr"],
+    "default_priority": 5
+  }
+]
