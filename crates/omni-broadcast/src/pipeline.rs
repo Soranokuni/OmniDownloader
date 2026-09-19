@@ -160,7 +160,9 @@ impl BroadcastEngine {
         let _ = self.repo.update_job_progress(job_id, 99.0, "Rewrapping", "--:--");
 
         let rewrapper = Rewrapper::new(&self.bmxtranswrap_path);
-        let final_temp_mxf = match rewrapper.rewrap(job_id, &intermediate_mxf, &job_temp).await {
+        let final_temp_mxf = match rewrapper
+            .rewrap_with_clip(job_id, &intermediate_mxf, &job_temp, Some(&slug), None)
+            .await {
             Ok(path) => path,
             Err(e) => {
                 let err_msg = format!("bmxtranswrap RDD9 failed: {}", e);
@@ -181,7 +183,8 @@ impl BroadcastEngine {
         // ended early. A failed report is never delivered: a job in review is a
         // minor annoyance, a wrong file in the running order is not.
         let _ = self.repo.set_stage(job_id, owner, JobStage::Verify);
-        let report = match crate::verify::verify_mxf(&self.ffprobe_path, &final_temp_mxf, duration).await {
+        let report = match crate::verify::verify_mxf_with_clip(&self.ffprobe_path, &final_temp_mxf, duration, Some(&slug))
+            .await {
             Ok(report) => report,
             Err(e) => {
                 // Could not run the check at all. Treated as a failure: an
