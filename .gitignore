@@ -1,0 +1,42 @@
+# ---- Rust build output ----
+/target/
+**/*.rs.bk
+*.pdb
+
+# ---- External tool binaries (214 MB; fetched by scripts/fetch_tools.ps1) ----
+/bin/
+/dist/
+
+# ---- Runtime state: databases, WAL, backups ----
+/data/omni.db
+/data/omni.db-shm
+/data/omni.db-wal
+/data/backups/
+/data/adblock/
+/data/benchmarks/
+/data/secrets.bin
+
+# ---- Runtime working directories ----
+/temp/
+/logs/
+/archive/
+/watchfolder/
+
+# ---- SECRETS: live config holds mailbox credentials, never commit ----
+/config.json
+/config.*.bak.json
+*.pem
+*.key
+*.pfx
+cookies*.txt
+
+# ---- Generated reports ----
+/benchmark_results.json
+/benchmark_results.md
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

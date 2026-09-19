@@ -1,0 +1,14 @@
+[package]
+name = "omni-cli"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+omni-service = { path = "../omni-service" }
+inquire = "0.7"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1.0"
+thiserror = "1.0"

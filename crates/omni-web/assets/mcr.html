@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniDownloader - MCR Handler Portal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .code-font { font-family: 'JetBrains Mono', monospace; }
+        .glass { background: rgba(18, 20, 29, 0.75); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased">
+    <!-- Top System Telemetry Bar -->
+    <header class="border-b border-slate-900 bg-slate-950/80 backdrop-blur-md sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-9 h-9 rounded-lg bg-cyan-500 flex items-center justify-center text-slate-950 font-black text-lg shadow-lg shadow-cyan-500/20">
+                    O
+                </div>
+                <div>
+                    <h1 class="text-md font-bold tracking-tight text-white">OmniDownloader</h1>
+                    <p class="text-[10px] text-slate-400 tracking-wider uppercase font-semibold">Master Control Room (MCR) Ingest</p>
+                </div>
+            </div>
+
+            <!-- Pulsing Status Badges -->
+            <div class="flex items-center space-x-5 text-xs font-semibold">
+                <div class="flex items-center space-x-2">
+                    <span id="mail-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span id="mail-status" class="text-slate-300">Mail: Active</span>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <span id="llm-dot" class="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></span>
+                    <span id="llm-status" class="text-slate-300">LLM: Ready</span>
+                </div>
+                <div class="flex items-center space-x-2 text-slate-400">
+                    <i data-lucide="hard-drive" class="w-4 h-4 text-slate-500"></i>
+                    <span id="storage-status">Watchfolder: Checking...</span>
+                </div>
+                <a href="/admin" class="px-2.5 py-1 rounded-lg text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800 transition-colors flex items-center space-x-1">
+                    <i data-lucide="settings" class="w-3.5 h-3.5"></i>
+                    <span>IT Admin</span>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main class="flex-1 max-w-7xl mx-auto px-6 py-8 w-full space-y-6">
+        <!-- Navigation Tabs -->
+        <div class="flex items-center justify-between border-b border-slate-900 pb-2">
+            <div class="flex space-x-2">
+                <button id="tab-btn-queue" onclick="switchTab('queue')" class="px-4 py-2 text-sm font-semibold border-b-2 border-cyan-500 text-cyan-400 flex items-center space-x-2">
+                    <i data-lucide="list-video" class="w-4 h-4"></i>
+                    <span>Live Queue</span>
+                </button>
+                <button id="tab-btn-review" onclick="switchTab('review')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white flex items-center space-x-2">
+                    <i data-lucide="alert-triangle" class="w-4 h-4"></i>
+                    <span>Action Required</span>
+                    <span id="review-count-badge" class="hidden px-1.5 py-0.5 rounded-full text-[10px] bg-amber-500/20 text-amber-400 border border-amber-500/30">0</span>
+                </button>
+                <button id="tab-btn-archive" onclick="switchTab('archive')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white flex items-center space-x-2">
+                    <i data-lucide="archive" class="w-4 h-4"></i>
+                    <span>Broadcast Archive</span>
+                </button>
+                <button id="tab-btn-journalists" onclick="switchTab('journalists')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white flex items-center space-x-2">
+                    <i data-lucide="users" class="w-4 h-4"></i>
+                    <span>Journalist Mapping</span>
+                </button>
+                <button id="tab-btn-manual" onclick="switchTab('manual')" class="px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white flex items-center space-x-2">
+                    <i data-lucide="plus-circle" class="w-4 h-4"></i>
+                    <span>Quick Queue</span>
+                </button>
+            </div>
+            <button onclick="openMezzanineModal()" class="text-xs text-slate-400 hover:text-cyan-400 flex items-center space-x-1 underline">
+                <i data-lucide="file-video" class="w-3.5 h-3.5"></i>
+                <span>Mezzanine Specs (Sony XDCAM)</span>
+            </button>
+        </div>
+
+        <!-- TAB 1: LIVE QUEUE -->
+        <section id="tab-queue" class="space-y-4">
+            <div id="queue-cards" class="grid grid-cols-1 gap-4">
+                <div class="glass p-8 text-center text-slate-500 rounded-xl">Loading live queue...</div>
+            </div>
+        </section>
+
+        <!-- TAB 2: ACTION REQUIRED / REVIEW -->
+        <section id="tab-review" class="hidden space-y-4">
+            <div id="review-cards" class="grid grid-cols-1 gap-4">
+                <div class="glass p-8 text-center text-slate-500 rounded-xl">No items require operator review.</div>
+            </div>
+        </section>
+
+        <!-- TAB 3: BROADCAST ARCHIVE & SORT BY JOURNALIST -->
+        <section id="tab-archive" class="hidden space-y-4">
+            <div class="glass p-4 rounded-xl flex flex-wrap items-center justify-between gap-4">
+                <div class="flex items-center space-x-3">
+                    <label class="text-xs font-semibold text-slate-400" for="journalist-filter">Filter by Journalist:</label>
+                    <select id="journalist-filter" onchange="filterArchive()" class="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-500">
+                        <option value="">All Journalists</option>
+                    </select>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <input type="text" id="archive-search" oninput="filterArchive()" placeholder="Search by slug, keyword, URL..."
+                        class="bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-500 w-64">
+                </div>
+            </div>
+
+            <div class="glass rounded-xl overflow-hidden border border-slate-900">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-900/60 text-slate-400 font-semibold uppercase tracking-wider text-[10px] border-b border-slate-800">
+                        <tr>
+                            <th class="p-3">ID</th>
+                            <th class="p-3">Broadcast Slug / Filename</th>
+                            <th class="p-3">Journalist</th>
+                            <th class="p-3">Status</th>
+                            <th class="p-3">Duration</th>
+                            <th class="p-3">Media Format</th>
+                            <th class="p-3">Completed At</th>
+                        </tr>
+                    </thead>
+                    <tbody id="archive-table-body" class="divide-y divide-slate-900">
+                        <tr><td colspan="7" class="p-4 text-center text-slate-500">Loading broadcast archive...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- TAB 4: JOURNALIST MAPPING MANAGER -->
+        <section id="tab-journalists" class="hidden space-y-4">
+            <div class="flex justify-between items-center">
+                <h3 class="text-sm font-bold text-slate-200 uppercase tracking-wider">Newsroom Journalist Email Directory</h3>
+                <button onclick="openAddJournalistModal()" class="bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold py-1.5 px-3 rounded-lg flex items-center space-x-1">
+                    <i data-lucide="plus" class="w-3.5 h-3.5"></i>
+                    <span>Add Journalist Mapping</span>
+                </button>
+            </div>
+
+            <div class="glass rounded-xl overflow-hidden border border-slate-900">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-slate-900/60 text-slate-400 font-semibold uppercase tracking-wider text-[10px] border-b border-slate-800">
+                        <tr>
+                            <th class="p-3">Surname (Slug)</th>
+                            <th class="p-3">Full Name</th>
+                            <th class="p-3">Associated Emails & Aliases</th>
+                            <th class="p-3">Default Priority</th>
+                            <th class="p-3 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="journalists-table-body" class="divide-y divide-slate-900">
+                        <tr><td colspan="5" class="p-4 text-center text-slate-500">Loading journalists...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- TAB 5: QUICK QUEUE MANUAL INGEST -->
+        <section id="tab-manual" class="hidden space-y-4">
+            <div class="glass p-6 rounded-xl max-w-2xl mx-auto space-y-4">
+                <h3 class="text-sm font-bold text-slate-200 uppercase tracking-wider border-b border-slate-800 pb-2">Manual Broadcast Ingest</h3>
+                <form id="mcr-manual-form" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-400 mb-1" for="mcr-url">Media Stream / Page URL</label>
+                        <input class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                            type="url" id="mcr-url" required placeholder="https://...">
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-400 mb-1" for="mcr-journalist">Journalist Surname</label>
+                            <input class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                type="text" id="mcr-journalist" required placeholder="e.g. PAPADAKI or MCR">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-400 mb-1" for="mcr-keyword">Keyword</label>
+                            <input class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                type="text" id="mcr-keyword" required placeholder="e.g. KNICKS">
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-400 mb-1" for="mcr-index">Section Number / Index</label>
+                            <input class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                type="text" id="mcr-index" value="1" required>
+                        </div>
+                        <div class="flex items-center space-x-2 pt-6">
+                            <input type="checkbox" id="mcr-priority" class="w-4 h-4 rounded text-cyan-500 bg-slate-900 border-slate-800">
+                            <label class="text-xs font-semibold text-slate-300" for="mcr-priority">High Priority</label>
+                        </div>
+                    </div>
+                    <button type="submit" class="w-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold py-2.5 rounded-lg text-sm transition-all shadow-lg shadow-cyan-500/10">
+                        Dispatch to Dalet Ingest
+                    </button>
+                </form>
+            </div>
+        </section>
+    </main>
+
+    <!-- Mezzanine Format Specs Modal -->
+    <div id="mezzanine-modal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+        <div class="glass w-full max-w-lg p-6 rounded-2xl space-y-4 border border-cyan-500/30 shadow-2xl shadow-cyan-500/10">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div class="flex items-center space-x-2">
+                    <i data-lucide="shield-check" class="text-cyan-400 w-5 h-5"></i>
+                    <h3 class="text-sm font-bold text-white uppercase tracking-wider">Dalet Mezzanine Broadcast Specifications</h3>
+                </div>
+                <button onclick="closeMezzanineModal()" class="text-slate-400 hover:text-white"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
+            <div class="space-y-2 text-xs code-font text-slate-300">
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Video Codec:</span><span>MPEG-2 Video (Sony XDCAM HD422)</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Target Bitrate:</span><span>50 Mbps CBR (Constant Bit Rate)</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Resolution & Aspect:</span><span>1920x1080 (16:9 Display Aspect)</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Frame Rate & Scan:</span><span>25.000 fps (PAL 1080i50, Top Field First)</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Chroma Subsampling:</span><span>4:2:2 (YUV422P)</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Audio Standard:</span><span>EBU R48 (8 Discrete Mono Tracks)</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Audio Codec & Rate:</span><span>PCM 24-bit (pcm_s24le) @ 48,000 Hz</span></div>
+                <div class="flex justify-between border-b border-slate-900 py-1.5"><span class="text-slate-500 font-sans">Audio Channel Mapping:</span><span>Ch1: Left, Ch2: Right, Ch3-8: Silence</span></div>
+                <div class="flex justify-between py-1.5"><span class="text-slate-500 font-sans">MXF Wrapper:</span><span>SMPTE RDD9 OP1a (bmxtranswrap)</span></div>
+            </div>
+            <button onclick="closeMezzanineModal()" class="w-full bg-slate-900 hover:bg-slate-800 text-slate-300 font-bold py-2 rounded-lg text-xs transition-colors border border-slate-800">
+                Close Specifications
+            </button>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+        let allJobsCache = [];
+        let currentTab = 'queue';
+
+        function switchTab(tab) {
+            currentTab = tab;
+            const tabs = ['queue', 'review', 'archive', 'journalists', 'manual'];
+            tabs.forEach(t => {
+                const btn = document.getElementById(`tab-btn-${t}`);
+                const sec = document.getElementById(`tab-${t}`);
+                if (t === tab) {
+                    btn.className = "px-4 py-2 text-sm font-semibold border-b-2 border-cyan-500 text-cyan-400 flex items-center space-x-2";
+                    sec.classList.remove('hidden');
+                } else {
+                    btn.className = "px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-white flex items-center space-x-2";
+                    sec.classList.add('hidden');
+                }
+            });
+            if (tab === 'journalists') fetchJournalists();
+            if (tab === 'archive') renderArchive();
+        }
+
+        async function fetchSystemStatus() {
+            try {
+                const res = await fetch('/api/system/status');
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('mail-status').innerText = `Mail: ${data.mail_status}`;
+                    document.getElementById('llm-status').innerText = `LLM: ${data.llm_status}`;
+                    document.getElementById('storage-status').innerText = `Watchfolder: ${data.free_disk_gb.toFixed(1)} GB Free`;
+                }
+            } catch (e) {}
+        }
+
+        async function fetchJobs() {
+            try {
+                const res = await fetch('/api/jobs');
+                if (res.ok) {
+                    const data = await res.json();
+                    allJobsCache = data.jobs || [];
+                    renderQueue();
+                    renderReview();
+                    if (currentTab === 'archive') renderArchive();
+                }
+            } catch (e) {}
+        }
+
+        function renderQueue() {
+            const container = document.getElementById('queue-cards');
+            const activeJobs = allJobsCache.filter(j => j.status !== 'REQUIRES_REVIEW' && j.status !== 'MANUAL_DOWNLOAD');
+
+            if (activeJobs.length === 0) {
+                container.innerHTML = `
+                    <div class="glass p-8 text-center text-slate-500 rounded-xl">
+                        <i data-lucide="check-circle-2" class="w-8 h-8 mx-auto mb-2 text-slate-600"></i>
+                        <p class="text-sm">Ingest queue is clear. No active processing jobs.</p>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            container.innerHTML = activeJobs.map(j => {
+                let badgeClass = "bg-slate-800 text-slate-400 border-slate-700";
+                if (j.status === 'COMPLETED') badgeClass = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
+                else if (j.status === 'DOWNLOADING') badgeClass = "bg-blue-500/10 text-blue-400 border-blue-500/20";
+                else if (j.status === 'TRANSCODING' || j.status === 'REWRAPPING') badgeClass = "bg-purple-500/10 text-purple-400 border-purple-500/20";
+                else if (j.status === 'FAILED') badgeClass = "bg-rose-500/10 text-rose-400 border-rose-500/20";
+
+                return `
+                    <div class="glass p-5 rounded-xl border border-slate-900 space-y-3">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center space-x-3">
+                                <span class="w-8 h-8 rounded-lg bg-slate-900 flex items-center justify-center font-bold text-xs text-cyan-400 border border-slate-800">${j.id}</span>
+                                <div>
+                                    <h3 class="text-sm font-bold text-white">${j.slug}.mxf</h3>
+                                    <p class="text-[11px] text-slate-500 code-font truncate max-w-lg" title="${j.url}">${j.url}</p>
+                                </div>
+                            </div>
+                            <div class="flex items-center space-x-2">
+                                <span class="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider border ${badgeClass}">${j.status}</span>
+                                <button onclick="discardJob(${j.id})" class="p-1.5 hover:bg-slate-900 rounded text-slate-500 hover:text-rose-400" title="Discard"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                        </div>
+
+                        <div class="space-y-1">
+                            <div class="flex justify-between text-[11px] text-slate-400">
+                                <span>${j.status === 'DOWNLOADING' ? `Downloading @ ${j.speed}` : (j.status === 'TRANSCODING' ? 'Transcoding XDCAM HD422' : j.status)}</span>
+                                <span>${j.progress.toFixed(1)}%</span>
+                            </div>
+                            <div class="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-900">
+                                <div class="bg-gradient-to-r from-cyan-400 to-indigo-500 h-2 rounded-full transition-all duration-300" style="width: ${j.progress}%"></div>
+                            </div>
+                            <div class="flex justify-between text-[10px] text-slate-500 pt-1">
+                                <span>Journalist: <strong class="text-slate-300">${j.journalist}</strong></span>
+                                <span>ETA: ${j.eta}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            lucide.createIcons();
+        }
+
+        function renderReview() {
+            const container = document.getElementById('review-cards');
+            const reviewBadge = document.getElementById('review-count-badge');
+            const reviewJobs = allJobsCache.filter(j => j.status === 'REQUIRES_REVIEW' || j.status === 'MANUAL_DOWNLOAD');
+
+            if (reviewJobs.length > 0) {
+                reviewBadge.innerText = reviewJobs.length;
+                reviewBadge.classList.remove('hidden');
+                container.innerHTML = reviewJobs.map(j => `
+                    <div class="glass p-5 rounded-xl border border-amber-500/20 hover:border-amber-500/35 transition-all space-y-4">
+                        <div class="flex items-center justify-between border-b border-slate-900 pb-3">
+                            <div class="flex items-center space-x-3">
+                                <i data-lucide="alert-circle" class="text-amber-400 w-5 h-5"></i>
+                                <div>
+                                    <h3 class="text-sm font-bold text-white">${j.slug}.mxf</h3>
+                                    <p class="text-[10px] text-slate-500 code-font truncate max-w-md">${j.url}</p>
+                                </div>
+                            </div>
+                            <span class="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                                ${j.status === 'MANUAL_DOWNLOAD' ? 'FILE-LOCKER INTERCEPTED' : 'REQUIRES REVIEW'}
+                            </span>
+                        </div>
+
+                        <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-900 text-xs text-rose-400 code-font">
+                            <strong>Reason:</strong> ${j.error_message || 'Video stream could not be automatically captured (e.g. WeTransfer / complex news portal embed).'}
+                        </div>
+
+                        <div class="space-y-2">
+                            <label class="block text-[11px] text-slate-400" for="override-${j.id}">Paste Direct Video Stream (.m3u8, .mp4) or corrected URL:</label>
+                            <div class="flex space-x-2">
+                                <input class="flex-1 bg-slate-900 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-500 code-font"
+                                    type="url" id="override-${j.id}" value="${j.url}">
+                                <a href="${j.url}" target="_blank" class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-semibold py-1.5 px-3 rounded-lg border border-slate-800 flex items-center space-x-1">
+                                    <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                                    <span>Test Link</span>
+                                </a>
+                                <button onclick="overrideJob(${j.id})" class="bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold py-1.5 px-4 rounded-lg flex items-center space-x-1">
+                                    <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                                    <span>Force Transcode</span>
+                                </button>
+                                <button onclick="discardJob(${j.id})" class="bg-slate-900 hover:bg-slate-800 text-slate-400 text-xs font-semibold py-1.5 px-3 rounded-lg border border-slate-800">
+                                    Discard
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            } else {
+                reviewBadge.classList.add('hidden');
+                container.innerHTML = `
+                    <div class="glass p-8 text-center text-slate-500 rounded-xl">
+                        <i data-lucide="check-circle" class="w-8 h-8 mx-auto mb-2 text-emerald-500/50"></i>
+                        <p class="text-sm">Excellent! No jobs require operator review.</p>
+                    </div>
+                `;
+            }
+            lucide.createIcons();
+        }
+
+        function renderArchive() {
+            const tbody = document.getElementById('archive-table-body');
+            const selectedJ = document.getElementById('journalist-filter').value;
+            const search = document.getElementById('archive-search').value.toLowerCase();
+
+            // Populate journalist filter dropdown
+            const jFilter = document.getElementById('journalist-filter');
+            const uniqueJournalists = Array.from(new Set(allJobsCache.map(j => j.journalist))).sort();
+            const currentVal = jFilter.value;
+            jFilter.innerHTML = '<option value="">All Journalists</option>' + uniqueJournalists.map(j => `<option value="${j}" ${j === currentVal ? 'selected' : ''}>${j}</option>`).join('');
+
+            const filtered = allJobsCache.filter(j => {
+                if (selectedJ && j.journalist !== selectedJ) return false;
+                if (search && !j.slug.toLowerCase().includes(search) && !j.url.toLowerCase().includes(search) && !j.journalist.toLowerCase().includes(search)) return false;
+                return true;
+            });
+
+            if (filtered.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="p-4 text-center text-slate-500">No jobs match your filter criteria.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = filtered.map(j => `
+                <tr class="hover:bg-slate-900/40 transition-colors">
+                    <td class="p-3 text-slate-500">${j.id}</td>
+                    <td class="p-3 font-semibold text-white">${j.slug}.mxf</td>
+                    <td class="p-3"><span class="px-2 py-0.5 rounded bg-cyan-950/40 text-cyan-400 font-semibold text-[10px] border border-cyan-500/20">${j.journalist}</span></td>
+                    <td class="p-3 font-semibold text-[11px]">${j.status}</td>
+                    <td class="p-3 text-slate-400">${j.duration_secs > 0 ? (j.duration_secs.toFixed(1) + 's') : '--'}</td>
+                    <td class="p-3 text-slate-400 text-[10px] truncate max-w-xs">${j.media_format}</td>
+                    <td class="p-3 text-slate-500 text-[10px]">${new Date(j.updated_at).toLocaleString()}</td>
+                </tr>
+            `).join('');
+        }
+
+        async function fetchJournalists() {
+            try {
+                const res = await fetch('/api/journalists');
+                if (res.ok) {
+                    const data = await res.json();
+                    const tbody = document.getElementById('journalists-table-body');
+                    tbody.innerHTML = data.journalists.map(j => `
+                        <tr class="hover:bg-slate-900/40 transition-colors">
+                            <td class="p-3 font-bold text-white">${j.surname}</td>
+                            <td class="p-3 text-slate-300">${j.full_name}</td>
+                            <td class="p-3 text-slate-400 code-font">${j.emails.join(', ')}</td>
+                            <td class="p-3 text-slate-400">${j.default_priority}</td>
+                            <td class="p-3 text-right">
+                                <button onclick="deleteJournalist('${j.surname}')" class="p-1 hover:bg-slate-900 text-slate-500 hover:text-rose-400 rounded">
+                                    <i data-lucide="trash-2" class="w-4 h-4"></i>
+                                </button>
+                            </td>
+                        </tr>
+                    `).join('');
+                    lucide.createIcons();
+                }
+            } catch (e) {}
+        }
+
+        async function overrideJob(id) {
+            const url = document.getElementById(`override-${id}`).value.trim();
+            if (!url) return alert('Please enter a URL');
+            const res = await fetch(`/api/jobs/${id}/override`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ url })
+            });
+            if (res.ok) fetchJobs();
+        }
+
+        async function discardJob(id) {
+            if (!confirm(`Discard Job #${id}?`)) return;
+            const res = await fetch(`/api/jobs/${id}/discard`, { method: 'POST' });
+            if (res.ok) fetchJobs();
+        }
+
+        document.getElementById('mcr-manual-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const url = document.getElementById('mcr-url').value.trim();
+            const journalist = document.getElementById('mcr-journalist').value.trim();
+            const keyword = document.getElementById('mcr-keyword').value.trim();
+            const index_str = document.getElementById('mcr-index').value.trim();
+            const priority = document.getElementById('mcr-priority').checked ? 10 : 0;
+
+            const res = await fetch('/api/jobs', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ url, journalist, keyword, index_str, priority })
+            });
+            if (res.ok) {
+                alert('Job dispatched to Ingest queue!');
+                document.getElementById('mcr-manual-form').reset();
+                switchTab('queue');
+                fetchJobs();
+            }
+        });
+
+        function openMezzanineModal() { document.getElementById('mezzanine-modal').classList.remove('hidden'); }
+        function closeMezzanineModal() { document.getElementById('mezzanine-modal').classList.add('hidden'); }
+
+        // Real-time EventSource listener
+        const eventSource = new EventSource('/api/events');
+        eventSource.onmessage = () => { fetchJobs(); fetchSystemStatus(); };
+
+        fetchSystemStatus();
+        fetchJobs();
+        setInterval(fetchSystemStatus, 5000);
+    </script>
+</body>
+</html>

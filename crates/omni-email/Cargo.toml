@@ -1,0 +1,20 @@
+[package]
+name = "omni-email"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+omni-core = { path = "../omni-core" }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+mailparse = "0.15"
+encoding_rs = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+regex = "1.10"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
