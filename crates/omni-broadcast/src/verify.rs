@@ -91,6 +91,21 @@ pub async fn verify_mxf(
     mxf: &Path,
     source_duration_secs: f64,
 ) -> Result<ComplianceReport> {
+    verify_mxf_with_clip(ffprobe, mxf, source_duration_secs, None).await
+}
+
+/// Verify, and additionally confirm the MXF material package name.
+///
+/// bmxtranswrap's `--clip` sets the name Dalet shows as the asset title. A
+/// rewrap that silently dropped it leaves the operator looking at a filename in
+/// a list of otherwise-titled assets -- worth catching, and verified to be
+/// exposed by ffprobe as `format.tags.material_package_name`.
+pub async fn verify_mxf_with_clip(
+    ffprobe: &Path,
+    mxf: &Path,
+    source_duration_secs: f64,
+    expected_clip: Option<&str>,
+) -> Result<ComplianceReport> {
     let mxf_arg = mxf.to_string_lossy().into_owned();
     let out = run_capture(
         ffprobe,
@@ -116,7 +131,7 @@ pub async fn verify_mxf(
     }
 
     let size_bytes = tokio::fs::metadata(mxf).await.map(|m| m.len()).unwrap_or(0);
-    check_probe_json(&out.stdout, size_bytes, source_duration_secs)
+    check_probe_json_with_clip(&out.stdout, size_bytes, source_duration_secs, expected_clip)
 }
 
 /// Apply the checks to ffprobe JSON. Separated so the gate can be tested
@@ -125,6 +140,16 @@ pub fn check_probe_json(
     json: &str,
     size_bytes: u64,
     source_duration_secs: f64,
+) -> Result<ComplianceReport> {
+    check_probe_json_with_clip(json, size_bytes, source_duration_secs, None)
+}
+
+/// As [`check_probe_json`], additionally checking the material package name.
+pub fn check_probe_json_with_clip(
+    json: &str,
+    size_bytes: u64,
+    source_duration_secs: f64,
+    expected_clip: Option<&str>,
 ) -> Result<ComplianceReport> {
     let v: serde_json::Value =
         serde_json::from_str(json).context("ffprobe returned invalid JSON for the output MXF")?;
@@ -293,6 +318,15 @@ pub fn check_probe_json(
             format!("{:.0}% of expected", ratio * 100.0),
             (0.8..=1.2).contains(&ratio),
         ));
+    }
+
+    // Material package name, when the caller knows what it should be.
+    if let Some(expected) = expected_clip {
+        let actual = v
+            .pointer("/format/tags/material_package_name")
+            .and_then(|t| t.as_str())
+            .unwrap_or("unset");
+        checks.push(Check::eq("material_package_name", expected, actual));
     }
 
     let pass = checks.iter().all(|c| c.ok);

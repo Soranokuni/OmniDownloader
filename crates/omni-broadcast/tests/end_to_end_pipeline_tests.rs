@@ -292,3 +292,72 @@ async fn the_compliance_gate_rejects_a_real_but_wrong_file() {
         );
     }
 }
+
+/// bmxtranswrap's `--clip` must actually reach the MXF, and the gate must read
+/// it back. Verified against the real tool: ffprobe exposes it as
+/// `format.tags.material_package_name`, which is what Dalet shows as the title.
+#[tokio::test]
+async fn the_clip_name_reaches_the_mxf_and_the_gate_checks_it() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let Some(bmx) = tool("bmxtranswrap") else {
+        eprintln!("WARNING: skipping clip-name test -- bmxtranswrap not found in bin/");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.mp4");
+    assert!(make_source(&ffmpeg, &src, "25", 3, true).await);
+
+    let transcoder = Transcoder::new(&ffmpeg, &ffprobe);
+    let (intermediate, duration) = transcoder
+        .transcode_with_target(
+            7,
+            &src,
+            &dir.path().join("work"),
+            &LoudnessTarget {
+                enabled: false,
+                ..LoudnessTarget::default()
+            },
+            |_| {},
+        )
+        .await
+        .expect("transcode");
+
+    const SLUG: &str = "3_PAPADAKI_KNICKS";
+    let rewrapper = omni_broadcast::Rewrapper::new(&bmx);
+    let final_mxf = rewrapper
+        .rewrap_with_clip(7, &intermediate, &dir.path().join("work"), Some(SLUG), None)
+        .await
+        .expect("rewrap");
+
+    let report =
+        omni_broadcast::verify::verify_mxf_with_clip(&ffprobe, &final_mxf, duration, Some(SLUG))
+            .await
+            .expect("verify ran");
+    assert!(
+        report.pass,
+        "a rewrapped file failed the gate: {}",
+        report.summary()
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.name == "material_package_name" && c.actual == SLUG),
+        "the clip name did not reach the MXF: {}",
+        report.summary()
+    );
+
+    // ...and a mismatch is caught rather than silently ignored.
+    let wrong = omni_broadcast::verify::verify_mxf_with_clip(
+        &ffprobe,
+        &final_mxf,
+        duration,
+        Some("9_SOMEONE_ELSE"),
+    )
+    .await
+    .expect("verify ran");
+    assert!(!wrong.pass, "a wrong material package name was accepted");
+}

@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
 use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
 use omni_browser::sniffer::StreamSniffer;
@@ -480,12 +481,15 @@ async fn run_daemon(
                 heartbeat.abort();
 
                 if let Err(e) = outcome {
-                    error!("Broadcast pipeline failed for Job #{job_id}: {e:?}");
+                    // run_job handles its own failures; reaching here means the
+                    // bookkeeping itself failed, so release the lease rather
+                    // than leaving the job RUNNING until the reaper notices.
+                    error!("Job #{job_id}: worker bookkeeping failed: {e:?}");
                     let _ = rep.finish(
                         job_id,
                         &owner,
                         JobStatus::RequiresReview,
-                        Some("PIPELINE_FAILED"),
+                        Some(ErrorCode::PipelineFailed.as_str()),
                         Some(&e.to_string()),
                         None,
                     );
@@ -568,7 +572,7 @@ async fn run_job(
             job_id,
             owner,
             JobStatus::ManualDownload,
-            Some("MANUAL_DOWNLOAD"),
+            Some(ErrorCode::ManualDownload.as_str()),
             Some("File-locker link: download the file and use 'Upload file' on this job."),
             None,
         )?;
@@ -627,8 +631,6 @@ async fn run_job(
 
     match process_result {
         Ok(()) => {
-            // The engine records its own terminal status today; releasing the
-            // lease here keeps the row consistent either way.
             let delivered = repo
                 .get_job(job_id)?
                 .and_then(|j| j.file_path)
@@ -644,15 +646,71 @@ async fn run_job(
             Ok(())
         }
         Err(e) => {
-            repo.finish(
-                job_id,
-                owner,
-                JobStatus::RequiresReview,
-                Some("PIPELINE_FAILED"),
-                Some(&e.to_string()),
-                None,
-            )?;
+            // The classified code decides whether waiting could possibly help
+            // (plan P1.9). Retrying a deleted video burns worker slots and
+            // delays telling the journalist their link is dead; retrying a
+            // dropped connection usually just works.
+            let code = classify_pipeline_error(&e);
+            let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
+            let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
+            let message = format!("{e}");
+
+            if code.is_retryable() && attempts < max_attempts {
+                let backoff = code.backoff(attempts);
+                info!(
+                    "Job #{job_id}: {code}, retrying in {} s (attempt {attempts}/{max_attempts})",
+                    backoff.num_seconds()
+                );
+                repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
+            } else {
+                // MANUAL_DOWNLOAD is not a failure, it is a different workflow.
+                let status = match code {
+                    ErrorCode::ManualDownload => JobStatus::ManualDownload,
+                    _ => JobStatus::RequiresReview,
+                };
+                repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                repo.finish(
+                    job_id,
+                    owner,
+                    status,
+                    Some(code.as_str()),
+                    Some(&message),
+                    None,
+                )?;
+            }
             Ok(())
         }
     }
+}
+
+/// Recover the error code the pipeline attached to a failure.
+///
+/// The pipeline wraps failures with `.context(code.as_str())`, so the code is in
+/// the anyhow chain rather than parsed back out of a message. Anything
+/// unrecognised goes to a human rather than being retried on a guess.
+fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
+    let text = format!("{e:#}");
+    for code in [
+        ErrorCode::ManualDownload,
+        ErrorCode::ComplianceFailed,
+        ErrorCode::ProbeFailed,
+        ErrorCode::LoginRequired,
+        ErrorCode::GeoBlocked,
+        ErrorCode::PrivateOrRemoved,
+        ErrorCode::LiveStream,
+        ErrorCode::Http403,
+        ErrorCode::UnsupportedUrl,
+        ErrorCode::NoStreamFound,
+        ErrorCode::DownloadTimeout,
+        ErrorCode::TranscodeTimeout,
+        ErrorCode::RewrapTimeout,
+        ErrorCode::DeliveryFailed,
+        ErrorCode::LowDisk,
+        ErrorCode::Network,
+    ] {
+        if text.contains(code.as_str()) {
+            return code;
+        }
+    }
+    ErrorCode::PipelineFailed
 }
