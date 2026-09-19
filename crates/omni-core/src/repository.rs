@@ -3,14 +3,23 @@ use chrono::{Duration, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
 use crate::auth::hash_password;
 use crate::migrations;
-use crate::models::{AuditLog, Job, JobStatus, Journalist, User, UserRole};
+use crate::models::{
+    AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, NewJob, User, UserRole,
+};
 use crate::timestamps;
+
+/// Default window for treating a re-sent link as already delivered.
+///
+/// A day covers the realistic case (the same story forwarded again during one
+/// news cycle) without blocking a genuine re-ingest the next day.
+pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 
 #[derive(Clone)]
 pub struct Repository {
@@ -148,6 +157,16 @@ impl Repository {
     // Job Queue Operations
     // ==========================================
 
+    /// Convenience wrapper around [`Repository::enqueue`].
+    ///
+    /// Kept for the existing call sites (web form, email watcher) while Phase 4
+    /// moves them to `NewJob`. It routes through `enqueue`, so rows created this
+    /// way still get a `url_normalized` dedup key and the journalist's priority
+    /// floor -- a direct INSERT here would create jobs invisible to dedup.
+    ///
+    /// Returns the job id, which for a duplicate is the *existing* job's id.
+    /// Callers that need to tell the difference should use `enqueue` directly.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_job(
         &self,
         url: &str,
@@ -161,93 +180,500 @@ impl Repository {
         notes: Option<&str>,
         email_source: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            r#"
-            INSERT INTO queue (
-                url, slug, journalist, keyword, index_str, priority, status,
-                submitted_by_user_id, notes, email_source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            "#,
-        )?;
-
-        let id = stmt.insert(params![
-            url,
-            slug,
-            journalist.to_uppercase(),
-            keyword.to_uppercase(),
-            index_str,
+        let job = NewJob {
+            url: url.to_string(),
+            slug: slug.to_string(),
+            journalist: journalist.to_string(),
+            keyword: keyword.to_string(),
+            index_str: index_str.to_string(),
             priority,
-            status.as_str(),
-            submitted_by,
-            notes,
-            email_source
-        ])?;
-
-        self.log_audit("INFO", "QUEUE", &format!("Added Job #{} ({}) Status: {}", id, slug, status.as_str()))?;
-        Ok(id)
+            status,
+            submitted_by_user_id: submitted_by,
+            notes: notes.map(str::to_string),
+            email_source: email_source.map(str::to_string),
+            email_message_id: None,
+            extraction_method: None,
+        };
+        Ok(self.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id())
     }
 
-    pub fn lease_next_pending_job(&self) -> Result<Option<Job>> {
+
+    /// Queue a job, deduplicating by normalized URL (plan P1.1, defect D-10).
+    ///
+    /// Three outcomes rather than an error, because "we already have this" is a
+    /// normal thing for a newsroom to do -- two journalists forward the same
+    /// story, or an email is re-sent after a correction:
+    ///
+    /// * an active job with the same normalized URL -> `DuplicateActive`;
+    ///   queuing it again would put two identical files in the watchfolder.
+    /// * the same URL completed for the same journalist inside
+    ///   `dedup_window_hours` -> `DuplicateRecent`; the reply tells them it is
+    ///   already delivered.
+    /// * otherwise a new job.
+    ///
+    /// A *different* journalist re-queuing a completed URL is deliberately not a
+    /// duplicate: they need their own slug in their own folder.
+    ///
+    /// Priority is raised to the journalist's default if that is higher
+    /// (defect D-20 -- `journalists.default_priority` was never applied).
+    pub fn enqueue(&self, job: &NewJob, dedup_window_hours: i64) -> Result<Enqueued> {
+        let normalized = crate::urlnorm::normalize(&job.url);
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        let maybe_row: Option<(i64, String, String, String, String, String, i32, Option<String>, Option<i64>, Option<String>, Option<String>, Option<String>)> = {
-            let mut stmt = tx.prepare(
+        // Already queued or running?
+        let active: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM queue
+                 WHERE url_normalized = ? AND status IN ('PENDING','RUNNING')
+                 ORDER BY id ASC LIMIT 1",
+                params![normalized],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = active {
+            tx.commit()?;
+            self.log_audit(
+                "INFO",
+                "QUEUE",
+                &format!("Duplicate of active job #{existing_id} ignored: {}", job.url),
+            )?;
+            return Ok(Enqueued::DuplicateActive { existing_id });
+        }
+
+        // Recently delivered for this same journalist?
+        let cutoff = timestamps::format(Utc::now() - Duration::hours(dedup_window_hours));
+        let recent: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM queue
+                 WHERE url_normalized = ?
+                   AND journalist = ?
+                   AND status IN ('COMPLETED','COMPLETED_MANUAL')
+                   AND COALESCE(completed_at, updated_at) >= ?
+                 ORDER BY id DESC LIMIT 1",
+                params![normalized, job.journalist.to_uppercase(), cutoff],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing_id) = recent {
+            tx.commit()?;
+            self.log_audit(
+                "INFO",
+                "QUEUE",
+                &format!("Duplicate of recently completed job #{existing_id}: {}", job.url),
+            )?;
+            return Ok(Enqueued::DuplicateRecent { existing_id });
+        }
+
+        let journalist = job.journalist.to_uppercase();
+        let default_priority: i32 = tx
+            .query_row(
+                "SELECT default_priority FROM journalists WHERE surname = ?",
+                params![journalist],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let priority = job.priority.max(default_priority);
+
+        let now = timestamps::now_string();
+        tx.execute(
+            r#"
+            INSERT INTO queue (
+                url, url_normalized, slug, journalist, keyword, index_str, priority,
+                status, stage, submitted_by_user_id, notes, email_source,
+                email_message_id, extraction_method, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                job.url,
+                normalized,
+                job.slug,
+                journalist,
+                job.keyword.to_uppercase(),
+                job.index_str,
+                priority,
+                job.status.as_str(),
+                job.submitted_by_user_id,
+                job.notes,
+                job.email_source,
+                job.email_message_id,
+                job.extraction_method,
+                now,
+                now
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'INFO', ?)",
+            params![id, now, format!("Queued as {} (priority {priority})", job.slug)],
+        )?;
+        tx.commit()?;
+
+        self.log_audit(
+            "INFO",
+            "QUEUE",
+            &format!("Added Job #{id} ({}) status {}", job.slug, job.status.as_str()),
+        )?;
+        Ok(Enqueued::Created { id })
+    }
+
+    /// Finish a leased job in a terminal state and release the lease.
+    ///
+    /// Ownership is checked: a worker whose lease was reaped mid-stage must not
+    /// be able to mark the job completed after somebody else picked it up.
+    /// Returns `false` when the job was no longer ours.
+    pub fn finish(
+        &self,
+        job_id: i64,
+        owner: &str,
+        status: JobStatus,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+        file_path: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let delivered = matches!(status, JobStatus::Completed);
+        let changed = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = ?,
+                stage = CASE WHEN ? = 'COMPLETED' THEN 'DONE' ELSE stage END,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                error_code = ?,
+                error_message = ?,
+                file_path = COALESCE(?, file_path),
+                progress = CASE WHEN ? = 'COMPLETED' THEN 100.0 ELSE progress END,
+                completed_at = ?,
+                delivered_at = CASE WHEN ? THEN ? ELSE delivered_at END,
+                updated_at = ?
+            WHERE id = ? AND lease_owner = ?
+            "#,
+            params![
+                status.as_str(),
+                status.as_str(),
+                error_code,
+                error_message,
+                file_path,
+                status.as_str(),
+                now,
+                delivered,
+                now,
+                now,
+                job_id,
+                owner
+            ],
+        )?;
+        if changed == 1 {
+            let level = if status == JobStatus::Completed { "INFO" } else { "ERROR" };
+            self.record_event(
+                job_id,
+                level,
+                None,
+                &match error_code {
+                    Some(code) => format!("Finished as {} ({code})", status.as_str()),
+                    None => format!("Finished as {}", status.as_str()),
+                },
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Release a lease and requeue the job after a backoff (plan P1.9).
+    ///
+    /// Used for the retryable error codes: transient network trouble, a full
+    /// disk, a delivery share that was briefly unreachable. `not_before` keeps
+    /// the worker from immediately re-leasing the same job and burning all its
+    /// attempts inside a second.
+    pub fn requeue_after(
+        &self,
+        job_id: i64,
+        owner: &str,
+        backoff: Duration,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let not_before = timestamps::format(Utc::now() + backoff);
+        let changed = conn.execute(
+            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+             lease_expires_at=NULL, not_before=?, error_code=?, error_message=?,
+             progress=0.0, updated_at=?
+             WHERE id=? AND lease_owner=?",
+            params![not_before, error_code, error_message, now, job_id, owner],
+        )?;
+        if changed == 1 {
+            self.record_event(
+                job_id,
+                "WARN",
+                Some(JobStage::Queued),
+                &format!(
+                    "{error_code}: retrying in {} s -- {error_message}",
+                    backoff.num_seconds()
+                ),
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Jobs currently leased by this host, for the status endpoint and the
+    /// start-up temp sweep.
+    pub fn running_job_ids(&self) -> Result<Vec<i64>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT id FROM queue WHERE status = 'RUNNING'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+    }
+
+    /// Lease the highest-priority ready job for `owner`.
+    ///
+    /// The caller **must already hold a worker permit** before calling this
+    /// (plan P1.1, defect D-01). The old code leased first and then waited on
+    /// the semaphore, so with two workers and twenty pending jobs, eighteen sat
+    /// in DOWNLOADING with nobody working on them and the MCR panel showed
+    /// eighteen phantom downloads.
+    ///
+    /// Runs in one IMMEDIATE transaction so two workers cannot select the same
+    /// row before either updates it.
+    pub fn lease_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        let now = timestamps::now_string();
+        let id: Option<i64> = tx
+            .query_row(
                 r#"
-                SELECT id, url, slug, journalist, keyword, index_str, priority, error_message, submitted_by_user_id, email_source, notes, created_at
-                FROM queue
+                SELECT id FROM queue
                 WHERE status = 'PENDING'
+                  AND (not_before IS NULL OR not_before <= ?)
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 "#,
-            )?;
-            let mut rows = stmt.query([])?;
-            if let Some(row) = rows.next()? {
-                Some((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                    row.get(10)?, row.get(11)?
-                ))
-            } else {
-                None
+                params![now],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let id = match id {
+            Some(id) => id,
+            None => {
+                tx.commit()?;
+                return Ok(None);
             }
         };
 
-        if let Some((id, url, slug, journalist, keyword, index_str, priority, error_message, submitted_by, email_source, notes, row_created_at)) = maybe_row {
-            tx.execute(
-                "UPDATE queue SET status = 'DOWNLOADING', progress = 0.0, speed = '0 Mbps', eta = '--:--', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
-                params![id],
-            )?;
-            tx.commit()?;
-
-            return Ok(Some(Job {
-                id,
-                url,
-                slug,
-                journalist,
-                keyword,
-                index_str,
-                status: JobStatus::Downloading,
-                progress: 0.0,
-                speed: "0 Mbps".into(),
-                eta: "--:--".into(),
-                priority,
-                error_message,
-                media_format: "Sony XDCAM HD422 1080i50 (MXF RDD9)".into(),
-                file_path: None,
-                duration_secs: 0.0,
-                submitted_by_user_id: submitted_by,
-                email_source,
-                notes,
-                // A freshly leased job: these are the values just written.
-                created_at: timestamps::parse_opt(row_created_at),
-                updated_at: Some(Utc::now()),
-            }));
-        }
-
+        let expires = timestamps::format(Utc::now() + Duration::seconds(lease_secs));
+        tx.execute(
+            r#"
+            UPDATE queue
+            SET status = 'RUNNING',
+                stage = 'EXTRACT',
+                lease_owner = ?,
+                lease_expires_at = ?,
+                stage_started_at = ?,
+                attempts = attempts + 1,
+                not_before = NULL,
+                progress = 0.0,
+                speed = '0 Mbps',
+                eta = '--:--',
+                updated_at = ?
+            WHERE id = ?
+            "#,
+            params![owner, expires, now, now, id],
+        )?;
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'EXTRACT', 'INFO', ?)",
+            params![id, now, format!("Leased by {owner}")],
+        )?;
         tx.commit()?;
-        Ok(None)
+
+        self.get_job(id)
+    }
+
+    /// Extend the lease. Called every ~30 s by the worker that holds it.
+    ///
+    /// Returns `false` when the job is no longer ours -- the reaper requeued it,
+    /// or an operator cancelled it. The worker must then abandon its work
+    /// rather than deliver a file for a job somebody else now owns.
+    pub fn heartbeat(&self, job_id: i64, owner: &str, lease_secs: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let expires = timestamps::format(Utc::now() + Duration::seconds(lease_secs));
+        let changed = conn.execute(
+            "UPDATE queue SET lease_expires_at = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![expires, timestamps::now_string(), job_id, owner],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Move a leased job to the next stage and reset the stage clock.
+    pub fn set_stage(&self, job_id: i64, owner: &str, stage: JobStage) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let changed = conn.execute(
+            "UPDATE queue SET stage = ?, stage_started_at = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![stage.as_str(), now, now, job_id, owner],
+        )?;
+        if changed == 1 {
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, ?, 'INFO', ?)",
+                params![job_id, now, stage.as_str(), format!("Stage {}", stage.as_str())],
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Append to the job's timeline. Shown in the MCR job drawer.
+    pub fn record_event(
+        &self,
+        job_id: i64,
+        level: &str,
+        stage: Option<JobStage>,
+        message: &str,
+    ) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, ?, ?, ?)",
+            params![
+                job_id,
+                timestamps::now_string(),
+                stage.map(|s| s.as_str()),
+                level,
+                message
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The job's timeline, oldest first.
+    pub fn get_job_events(&self, job_id: i64, limit: usize) -> Result<Vec<JobEvent>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, job_id, at, stage, level, message FROM job_events
+             WHERE job_id = ? ORDER BY id ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![job_id, limit as i64], |row| {
+            Ok(JobEvent {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                at: timestamps::parse_opt(row.get(2).ok()),
+                stage: row.get(3)?,
+                level: row.get(4)?,
+                message: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Requeue jobs whose lease expired (plan P1.1).
+    ///
+    /// A lease expires when the worker died without releasing it -- a crash, a
+    /// power cut, a `taskkill`. Jobs with attempts left go back to PENDING;
+    /// the rest go to REQUIRES_REVIEW so a human sees them rather than the
+    /// daemon retrying the same failure forever.
+    ///
+    /// Returns `(requeued, sent_to_review)`.
+    pub fn reap_expired_leases(&self) -> Result<(usize, usize)> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = timestamps::now_string();
+
+        let expired: Vec<(i64, i32, i32)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, attempts, max_attempts FROM queue
+                 WHERE status = 'RUNNING' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+            )?;
+            let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let (mut requeued, mut review) = (0usize, 0usize);
+        for (id, attempts, max_attempts) in expired {
+            if attempts < max_attempts {
+                tx.execute(
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                     lease_expires_at=NULL, progress=0.0, updated_at=? WHERE id=?",
+                    params![now, id],
+                )?;
+                tx.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
+                    params![
+                        id,
+                        now,
+                        format!("Lease expired; requeued (attempt {attempts}/{max_attempts})")
+                    ],
+                )?;
+                requeued += 1;
+            } else {
+                tx.execute(
+                    "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+                     error_code='LEASE_EXPIRED', error_message=?, updated_at=? WHERE id=?",
+                    params![
+                        format!("Lease expired after {attempts} attempts without completing"),
+                        now,
+                        id
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'ERROR', ?)",
+                    params![id, now, "Lease expired; attempts exhausted, sent to review"],
+                )?;
+                review += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((requeued, review))
+    }
+
+    /// Requeue jobs this host was running when it died (plan P1.1, defect D-02).
+    ///
+    /// Called once at start-up, before the worker pool starts. Without it, a
+    /// crash during a transcode strands the job in RUNNING forever: no worker
+    /// owns it, no lease will expire that anyone is watching, and the operator
+    /// sees a job that has been "transcoding" since Tuesday.
+    ///
+    /// Only this host's jobs are touched, so two daemons sharing a database
+    /// never steal each other's work.
+    pub fn recover_on_startup(&self, hostname: &str) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let prefix = format!("{hostname}:%");
+
+        let ids: Vec<i64> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM queue WHERE status = 'RUNNING' AND lease_owner LIKE ?")?;
+            let rows = stmt.query_map(params![prefix], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for id in &ids {
+            conn.execute(
+                "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                 lease_expires_at=NULL, progress=0.0, speed='0 Mbps', eta='--:--', updated_at=?
+                 WHERE id=?",
+                params![now, id],
+            )?;
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
+                params![id, now, "Recovered after daemon restart; requeued"],
+            )?;
+        }
+        if !ids.is_empty() {
+            self.log_audit(
+                "WARN",
+                "QUEUE",
+                &format!("Recovered {} orphaned job(s) after restart", ids.len()),
+            )?;
+        }
+        Ok(ids.len())
     }
 
     pub fn update_job_status(&self, id: i64, status: JobStatus, error_message: Option<&str>, file_path: Option<&str>, duration: Option<f64>) -> Result<()> {
@@ -395,6 +821,21 @@ impl Repository {
 
     fn map_job_row(row: &rusqlite::Row) -> rusqlite::Result<Job> {
         let status_str: String = row.get("status")?;
+        let stage_str: String = row.get("stage").unwrap_or_else(|_| "QUEUED".to_string());
+
+        // An unrecognised status means the row is corrupt or was written by a
+        // newer build. Surfacing it as REQUIRES_REVIEW puts it in front of an
+        // operator instead of hiding it behind a plausible state (defect D-21),
+        // and the warning names the value so it is diagnosable.
+        let status = JobStatus::parse(&status_str).unwrap_or_else(|| {
+            tracing::warn!(
+                job_id = row.get::<_, i64>("id").unwrap_or(-1),
+                status = %status_str,
+                "Unrecognised job status in database; treating as REQUIRES_REVIEW"
+            );
+            JobStatus::RequiresReview
+        });
+
         Ok(Job {
             id: row.get("id")?,
             url: row.get("url")?,
@@ -402,7 +843,8 @@ impl Repository {
             journalist: row.get("journalist")?,
             keyword: row.get("keyword")?,
             index_str: row.get("index_str")?,
-            status: JobStatus::from_str_lossy(&status_str),
+            status,
+            stage: JobStage::parse(&stage_str).unwrap_or(JobStage::Queued),
             progress: row.get("progress")?,
             speed: row.get("speed")?,
             eta: row.get("eta")?,
@@ -414,6 +856,24 @@ impl Repository {
             submitted_by_user_id: row.get("submitted_by_user_id")?,
             email_source: row.get("email_source")?,
             notes: row.get("notes")?,
+
+            url_normalized: row.get("url_normalized").ok().flatten(),
+            attempts: row.get("attempts").unwrap_or(0),
+            max_attempts: row.get("max_attempts").unwrap_or(3),
+            lease_owner: row.get("lease_owner").ok().flatten(),
+            lease_expires_at: timestamps::parse_opt(row.get("lease_expires_at").ok().flatten()),
+            stage_started_at: timestamps::parse_opt(row.get("stage_started_at").ok().flatten()),
+            not_before: timestamps::parse_opt(row.get("not_before").ok().flatten()),
+            error_code: row.get("error_code").ok().flatten(),
+            source_path: row.get("source_path").ok().flatten(),
+            compliance_json: row.get("compliance_json").ok().flatten(),
+            candidates_json: row.get("candidates_json").ok().flatten(),
+            extraction_method: row.get("extraction_method").ok().flatten(),
+            stage_timings_json: row.get("stage_timings_json").ok().flatten(),
+            email_message_id: row.get("email_message_id").ok().flatten(),
+            delivered_at: timestamps::parse_opt(row.get("delivered_at").ok().flatten()),
+            completed_at: timestamps::parse_opt(row.get("completed_at").ok().flatten()),
+
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
         })
@@ -718,20 +1178,24 @@ mod tests {
         )?;
         assert!(job_id > 0);
 
-        let leased = repo.lease_next_pending_job()?.expect("Job must be leased");
+        let owner = "test-host:1:0";
+        let leased = repo.lease_job(owner, 120)?.expect("Job must be leased");
         assert_eq!(leased.id, job_id);
-        assert_eq!(leased.status, JobStatus::Downloading);
+        assert_eq!(leased.status, JobStatus::Running);
+        assert_eq!(leased.stage, JobStage::Extract);
 
-        // 4. Progress and Status Updates
+        // 4. Progress and Stage Updates
         repo.update_job_progress(job_id, 45.5, "12.4MB/s", "00:15")?;
-        repo.update_job_status(job_id, JobStatus::Transcoding, None, None, None)?;
+        repo.set_stage(job_id, owner, JobStage::Transcode)?;
 
         let current_job = repo.get_job(job_id)?.expect("Job must exist");
-        assert_eq!(current_job.status, JobStatus::Transcoding);
+        assert_eq!(current_job.status, JobStatus::Running);
+        assert_eq!(current_job.stage, JobStage::Transcode);
         assert_eq!(current_job.progress, 45.5);
 
         // 5. Completion
-        repo.update_job_status(job_id, JobStatus::Completed, None, Some("C:/Watchfolder/1_PAPADAKI_PARADE.mxf"), Some(120.5))?;
+        repo.finish(job_id, owner, JobStatus::Completed, None, None, Some("C:/Watchfolder/1_PAPADAKI_PARADE.mxf"))?;
+        repo.update_job_status(job_id, JobStatus::Completed, None, None, Some(120.5))?;
         let completed_job = repo.get_job(job_id)?.expect("Job must exist");
         assert_eq!(completed_job.status, JobStatus::Completed);
         assert_eq!(completed_job.duration_secs, 120.5);

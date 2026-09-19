@@ -5,5 +5,6 @@ pub mod paths;
 pub mod process;
 pub mod repository;
 pub mod timestamps;
+pub mod urlnorm;
 pub mod auth;
 pub mod dependencies;

@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
-use omni_core::models::{Job, JobStatus};
+use omni_core::models::{Job, JobStage, JobStatus};
 use omni_core::repository::Repository;
 
 use crate::delivery::WatchfolderDelivery;
@@ -42,13 +42,22 @@ impl BroadcastEngine {
         }
     }
 
-    pub async fn process_job(&self, job: Job) -> Result<()> {
-        self.process_job_with_context(job, None, None, None).await
+    pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
+        self.process_job_with_context(job, owner, None, None, None).await
     }
 
+    /// Run the pipeline for a job the caller holds the lease on.
+    ///
+    /// `owner` is the lease owner string. Stage transitions go through
+    /// `set_stage`, which refuses to advance a job this worker no longer owns --
+    /// so a worker whose lease was reaped mid-transcode cannot keep driving a
+    /// job another worker has already picked up. The engine never sets a
+    /// terminal status; the worker that holds the lease decides that, so the two
+    /// cannot race each other into an inconsistent row.
     pub async fn process_job_with_context(
         &self,
         job: Job,
+        owner: &str,
         referer: Option<&str>,
         user_agent: Option<&str>,
         cookies: Option<&str>,
@@ -87,7 +96,7 @@ impl BroadcastEngine {
             Err(e) => {
                 let err_msg = format!("Download failed: {}", e);
                 warn!("Job #{}: {}", job_id, err_msg);
-                let _ = self.repo.update_job_status(job_id, JobStatus::RequiresReview, Some(&err_msg), None, None);
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("WARN", "DOWNLOAD", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
                 WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
                 return Err(e);
@@ -95,7 +104,7 @@ impl BroadcastEngine {
         };
 
         // 2. Transcode stage (Sony XDCAM HD422 PAL 1080i50)
-        let _ = self.repo.update_job_status(job_id, JobStatus::Transcoding, None, None, None);
+        let _ = self.repo.set_stage(job_id, owner, JobStage::Transcode);
         let _ = self.repo.update_job_progress(job_id, 0.0, "Transcoding", "--:--");
 
         let transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
@@ -116,7 +125,7 @@ impl BroadcastEngine {
             Err(e) => {
                 let err_msg = format!("FFmpeg Transcode failed: {}", e);
                 error!("Job #{}: {}", job_id, err_msg);
-                let _ = self.repo.update_job_status(job_id, JobStatus::RequiresReview, Some(&err_msg), None, None);
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "TRANSCODE", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
                 WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
                 return Err(e);
@@ -124,7 +133,7 @@ impl BroadcastEngine {
         };
 
         // 3. Rewrap stage (SMPTE RDD9 OP1a MXF)
-        let _ = self.repo.update_job_status(job_id, JobStatus::Rewrapping, None, None, None);
+        let _ = self.repo.set_stage(job_id, owner, JobStage::Rewrap);
         let _ = self.repo.update_job_progress(job_id, 99.0, "Rewrapping", "--:--");
 
         let rewrapper = Rewrapper::new(&self.bmxtranswrap_path);
@@ -133,7 +142,7 @@ impl BroadcastEngine {
             Err(e) => {
                 let err_msg = format!("bmxtranswrap RDD9 failed: {}", e);
                 error!("Job #{}: {}", job_id, err_msg);
-                let _ = self.repo.update_job_status(job_id, JobStatus::RequiresReview, Some(&err_msg), None, None);
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "REWRAP", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
                 WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
                 return Err(e);
@@ -146,7 +155,7 @@ impl BroadcastEngine {
             Err(e) => {
                 let err_msg = format!("Watchfolder delivery failed: {}", e);
                 error!("Job #{}: {}", job_id, err_msg);
-                let _ = self.repo.update_job_status(job_id, JobStatus::RequiresReview, Some(&err_msg), None, None);
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
                 WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
                 return Err(e);
