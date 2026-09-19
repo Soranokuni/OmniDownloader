@@ -1,4 +1,5 @@
 pub mod delivery;
+pub mod errors;
 pub mod downloader;
 pub mod pipeline;
 pub mod probe;

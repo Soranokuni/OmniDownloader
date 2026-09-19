@@ -6,7 +6,8 @@ use omni_core::models::{Job, JobStage, JobStatus};
 use omni_core::repository::Repository;
 
 use crate::delivery::WatchfolderDelivery;
-use crate::downloader::Downloader;
+use crate::downloader::{DownloadError, DownloadOpts, Downloader};
+use crate::errors::ErrorCode;
 use crate::rewrapper::Rewrapper;
 use crate::transcoder::Transcoder;
 
@@ -81,14 +82,16 @@ impl BroadcastEngine {
         let downloader = Downloader::new(&self.ytdl_path);
         let repo_clone = self.repo.clone();
         let raw_download_res = downloader
-            .download_with_context(
+            .download(
                 job_id,
                 &url,
-                &slug,
                 &job_temp,
-                referer,
-                user_agent,
-                cookies,
+                DownloadOpts {
+                    referer,
+                    user_agent,
+                    cookie_header: cookies,
+                    ..Default::default()
+                },
                 move |prog| {
                     let _ = repo_clone.update_job_progress(
                         job_id,
@@ -103,12 +106,23 @@ impl BroadcastEngine {
         let downloaded_file = match raw_download_res {
             Ok(path) => path,
             Err(e) => {
-                let err_msg = format!("Download failed: {}", e);
-                warn!("Job #{}: {}", job_id, err_msg);
-                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
-                let _ = self.repo.log_audit("WARN", "DOWNLOAD", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
+                // The downloader already classified the failure, so the pipeline
+                // does not have to re-read stderr to decide whether a retry could
+                // possibly help (plan P1.9).
+                let code = e
+                    .downcast_ref::<DownloadError>()
+                    .map(|d| d.code)
+                    .unwrap_or(ErrorCode::PipelineFailed);
+                let err_msg = format!("{code}: {e}");
+                warn!("Job #{job_id}: {err_msg}");
+                let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Download), &err_msg);
+                let _ = self.repo.log_audit(
+                    "WARN",
+                    "DOWNLOAD",
+                    &format!("Job #{job_id} ({slug}): {err_msg}"),
+                );
                 WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
-                return Err(e);
+                return Err(e.context(code.as_str()));
             }
         };
 

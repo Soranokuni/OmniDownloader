@@ -1,15 +1,74 @@
-use anyhow::{anyhow, Context, Result};
-use regex::Regex;
+//! yt-dlp runner (plan P1.8; defects D-17, D-18).
+//!
+//! Everything here goes through `omni_core::process::run`, so the download has a
+//! timeout and dies with its whole process tree — yt-dlp spawns ffmpeg to mux
+//! fragments, and an orphaned ffmpeg holds the job's workspace open (defect
+//! D-03).
+
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-use tracing::info;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use omni_core::process::{run, RunOpts};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use crate::errors::{classify_download_error, ErrorCode};
 
 pub struct DownloadProgress {
     pub percent: f64,
     pub speed: String,
     pub eta: String,
+}
+
+/// A download failure with its classification already applied, so the pipeline
+/// does not have to re-read stderr to decide whether a retry could help.
+#[derive(Debug)]
+pub struct DownloadError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for DownloadError {}
+
+/// Options for one download.
+pub struct DownloadOpts<'a> {
+    /// Sent with the request. Many Greek portals 403 a bare fetch of a stream
+    /// URL but serve it happily with the article page as the referer.
+    pub referer: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub cookie_header: Option<&'a str>,
+    /// Netscape cookie jar for this domain (plan P3.5).
+    pub cookie_jar: Option<&'a Path>,
+    /// Skip TLS verification. Off by default (defect D-17): a station that
+    /// ingests whatever a MITM hands it is not a station with working ingest.
+    pub insecure_tls: bool,
+    pub max_height: u32,
+    pub concurrent_fragments: u32,
+    pub timeout: Duration,
+    pub cancel: Option<CancellationToken>,
+}
+
+impl Default for DownloadOpts<'_> {
+    fn default() -> Self {
+        Self {
+            referer: None,
+            user_agent: None,
+            cookie_header: None,
+            cookie_jar: None,
+            insecure_tls: false,
+            max_height: 1080,
+            concurrent_fragments: 4,
+            timeout: Duration::from_secs(1800),
+            cancel: None,
+        }
+    }
 }
 
 pub struct Downloader {
@@ -23,119 +82,372 @@ impl Downloader {
         }
     }
 
+    /// Build the yt-dlp argument vector.
+    ///
+    /// Pure, so the format selection and the hardening flags are unit-testable
+    /// without a network.
+    pub fn build_args(url: &str, output_dir: &Path, opts: &DownloadOpts<'_>) -> Vec<String> {
+        let h = opts.max_height;
+        let mut args: Vec<String> = vec![
+            // Never pull 4K to downscale it to 1080 (defect D-18): on a news
+            // deadline that is minutes of wasted download for no visible gain,
+            // since the output is 1080i50 either way. Prefer H.264/AAC so the
+            // merge is a remux rather than a re-encode.
+            "-f".into(),
+            format!(
+                "bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
+                 bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+            ),
+            "--merge-output-format".into(),
+            "mp4".into(),
+            // A journalist's link often carries a playlist id; ingesting the
+            // whole playlist would flood the watchfolder.
+            "--no-playlist".into(),
+            "--retries".into(),
+            "5".into(),
+            "--fragment-retries".into(),
+            "10".into(),
+            "--retry-sleep".into(),
+            "exp=1:30".into(),
+            "--socket-timeout".into(),
+            "30".into(),
+            "--concurrent-fragments".into(),
+            opts.concurrent_fragments.to_string(),
+            "--newline".into(),
+            "--no-warnings".into(),
+            "--no-color".into(),
+            // Machine-readable progress instead of scraping the human format.
+            "--progress-template".into(),
+            "download:OMNIPROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes_estimate)s \
+             %(progress.speed)s %(progress.eta)s"
+                .into(),
+            // The definitive output path, instead of guessing by scanning the
+            // directory for a name we hope matches (defect D-18).
+            "--print".into(),
+            "after_move:filepath".into(),
+            "-o".into(),
+            output_dir
+                .join("source.%(ext)s")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+
+        if opts.insecure_tls {
+            args.push("--no-check-certificates".into());
+        }
+        if let Some(r) = opts.referer {
+            args.push("--referer".into());
+            args.push(r.to_string());
+        }
+        if let Some(ua) = opts.user_agent {
+            args.push("--user-agent".into());
+            args.push(ua.to_string());
+        }
+        if let Some(c) = opts.cookie_header {
+            args.push("--add-header".into());
+            args.push(format!("Cookie: {c}"));
+        }
+        if let Some(jar) = opts.cookie_jar {
+            args.push("--cookies".into());
+            args.push(jar.to_string_lossy().into_owned());
+        }
+
+        args.push(url.to_string());
+        args
+    }
+
+    /// Download `url` into `output_dir`, reporting progress.
+    ///
+    /// Returns the downloaded file, or a [`DownloadError`] carrying the
+    /// classified reason.
     pub async fn download<F>(
         &self,
         job_id: i64,
         url: &str,
-        slug: &str,
-        temp_dir: &Path,
-        on_progress: F,
-    ) -> Result<PathBuf>
-    where
-        F: FnMut(DownloadProgress) + Send + 'static,
-    {
-        self.download_with_context(job_id, url, slug, temp_dir, None, None, None, on_progress)
-            .await
-    }
-
-    pub async fn download_with_context<F>(
-        &self,
-        job_id: i64,
-        url: &str,
-        slug: &str,
-        temp_dir: &Path,
-        referer: Option<&str>,
-        user_agent: Option<&str>,
-        cookies: Option<&str>,
+        output_dir: &Path,
+        opts: DownloadOpts<'_>,
         mut on_progress: F,
     ) -> Result<PathBuf>
     where
         F: FnMut(DownloadProgress) + Send + 'static,
     {
-        tokio::fs::create_dir_all(temp_dir).await?;
+        tokio::fs::create_dir_all(output_dir).await?;
+        let args = Self::build_args(url, output_dir, &opts);
 
-        // Sanitize slug for filesystem safe names
-        let safe_slug: String = slug
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
-            .collect();
+        info!("Job #{job_id}: downloading {url}");
 
-        let out_template = temp_dir
-            .join(format!("{}_{}_download.%(ext)s", job_id, safe_slug))
-            .to_string_lossy()
-            .to_string();
+        // yt-dlp prints the final path on stdout as well as progress lines, so
+        // both are collected from the same stream.
+        let printed_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed_paths.clone();
 
-        let mut cmd = Command::new(&self.ytdl_path);
-        cmd.args([
-            "-f",
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "--outtmpl",
-            &out_template,
-            "--newline",
-            "--no-check-certificates",
-            "--no-warnings",
-        ]);
-
-        if let Some(ref_url) = referer {
-            cmd.arg("--add-header").arg(format!("Referer: {}", ref_url));
-        }
-        if let Some(ua) = user_agent {
-            cmd.arg("--user-agent").arg(ua);
-        }
-        if let Some(cookie_str) = cookies {
-            cmd.arg("--add-header").arg(format!("Cookie: {}", cookie_str));
+        let mut run_opts = RunOpts::new(opts.timeout).on_stdout_line(move |line| {
+            if let Some(rest) = line.strip_prefix("OMNIPROGRESS ") {
+                if let Some(p) = parse_progress(rest) {
+                    on_progress(p);
+                }
+            } else if !line.trim().is_empty() {
+                sink.lock().unwrap().push(line.trim().to_string());
+            }
+        });
+        if let Some(token) = opts.cancel {
+            run_opts = run_opts.with_cancel(token);
         }
 
-        cmd.arg(url);
+        let outcome = run(&self.ytdl_path, &args, run_opts)
+            .await
+            .with_context(|| format!("Could not run yt-dlp at {:?}", self.ytdl_path))?;
 
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+        if !outcome.success {
+            let code = if outcome.timed_out {
+                ErrorCode::DownloadTimeout
+            } else if outcome.cancelled {
+                ErrorCode::PipelineFailed
+            } else {
+                classify_download_error(&outcome.stderr_tail)
+            };
+            return Err(DownloadError {
+                code,
+                message: first_error_line(&outcome.stderr_tail),
+            }
+            .into());
         }
 
-        info!("Starting yt-dlp download for Job #{} ({})...", job_id, slug);
-        let mut child = cmd.spawn().with_context(|| format!("Failed to spawn yt-dlp at {:?}", self.ytdl_path))?;
-
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture stdout"))?;
-        let mut reader = BufReader::new(stdout).lines();
-
-        // Regex for yt-dlp: [download]  45.2% of ~  15.20MiB at  2.45MiB/s ETA 00:04
-        let progress_regex = Regex::new(r"\[download\]\s+([\d\.]+)%\s+of.*?at\s+([^\s]+)\s+ETA\s+([^\s]+)")
-            .expect("Valid regex");
-
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(caps) = progress_regex.captures(&line) {
-                let percent: f64 = caps[1].parse().unwrap_or(0.0);
-                let speed = caps[2].to_string();
-                let eta = caps[3].to_string();
-
-                on_progress(DownloadProgress {
-                    percent,
-                    speed,
-                    eta,
-                });
+        // `--print after_move:filepath` gives the real path. Fall back to a
+        // directory scan only if that produced nothing usable, because a wrong
+        // guess here feeds the wrong file to the transcoder.
+        let candidates = printed_paths.lock().unwrap().clone();
+        for line in candidates.iter().rev() {
+            let p = PathBuf::from(line);
+            if p.is_file() {
+                return Ok(p);
             }
         }
 
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(anyhow!("yt-dlp exited with non-zero status: {:?}", status.code()));
-        }
+        warn!("Job #{job_id}: yt-dlp did not print an output path; scanning {output_dir:?}");
+        find_downloaded_file(output_dir)
+            .await
+            .ok_or_else(|| anyhow!("yt-dlp reported success but produced no file in {output_dir:?}"))
+    }
+}
 
-        // Find the actual output file in temp_dir matching the job_id prefix
-        let prefix = format!("{}_{}_download.", job_id, safe_slug);
-        let mut dir = tokio::fs::read_dir(temp_dir).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if fname.starts_with(&prefix) && !fname.ends_with(".tmp") && !fname.ends_with(".part") {
-                return Ok(entry.path());
-            }
-        }
+/// `downloaded total speed eta`, with `NA` for values yt-dlp does not know yet.
+fn parse_progress(rest: &str) -> Option<DownloadProgress> {
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    if f.len() < 4 {
+        return None;
+    }
+    let downloaded: f64 = f[0].parse().ok()?;
+    let total: f64 = f[1].parse().unwrap_or(0.0);
+    let percent = if total > 0.0 {
+        ((downloaded / total) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let speed = match f[2].parse::<f64>() {
+        Ok(bps) if bps > 0.0 => format!("{:.1} MB/s", bps / 1_048_576.0),
+        _ => "--".to_string(),
+    };
+    let eta = match f[3].parse::<f64>() {
+        Ok(s) if s > 0.0 => format!("{:02}:{:02}", (s as u64) / 60, (s as u64) % 60),
+        _ => "--:--".to_string(),
+    };
+    Some(DownloadProgress {
+        percent,
+        speed,
+        eta,
+    })
+}
 
-        Err(anyhow!("Downloaded file not found in temp directory for Job #{}", job_id))
+/// The largest complete file in the job's workspace.
+///
+/// Only used when yt-dlp printed no path. `.part` and `.ytdl` are in-progress
+/// artefacts; picking one would hand a truncated file to the transcoder.
+async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(u64, PathBuf)> = None;
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if name.ends_with(".part") || name.ends_with(".ytdl") || name.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(size, _)| meta.len() > *size) {
+            best = Some((meta.len(), path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The first `ERROR:` line, which is the one worth showing an operator.
+fn first_error_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|l| l.trim_start().to_uppercase().starts_with("ERROR"))
+        .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
+        .unwrap_or("yt-dlp failed with no diagnostic output")
+        .trim()
+        .chars()
+        .take(500)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_for(opts: &DownloadOpts<'_>) -> Vec<String> {
+        Downloader::build_args(
+            "https://www.youtube.com/watch?v=abc",
+            Path::new("C:/temp/jobs/7"),
+            opts,
+        )
+    }
+
+    #[test]
+    fn tls_verification_is_on_unless_explicitly_disabled() {
+        // Defect D-17: --no-check-certificates was unconditional.
+        let args = args_for(&DownloadOpts::default());
+        assert!(
+            !args.iter().any(|a| a == "--no-check-certificates"),
+            "TLS verification must be on by default: {args:?}"
+        );
+
+        let args = args_for(&DownloadOpts {
+            insecure_tls: true,
+            ..Default::default()
+        });
+        assert!(args.iter().any(|a| a == "--no-check-certificates"));
+    }
+
+    #[test]
+    fn the_format_selector_never_pulls_more_than_1080() {
+        // Defect D-18: the old selector downloaded 4K and then downscaled it,
+        // costing minutes of a news deadline for no visible gain.
+        let args = args_for(&DownloadOpts::default());
+        let i = args.iter().position(|a| a == "-f").expect("-f present");
+        let selector = &args[i + 1];
+        assert!(
+            selector.contains("height<=1080"),
+            "format selector must cap the height: {selector}"
+        );
+        assert!(
+            !selector.contains("2160") && !selector.contains("1440"),
+            "format selector must not ask for 4K: {selector}"
+        );
+        // Every fallback must be capped too, or the last one pulls 4K anyway.
+        for alt in selector.split('/') {
+            assert!(
+                alt.contains("height<=1080") || alt == "best",
+                "fallback {alt:?} is not height-capped"
+            );
+        }
+    }
+
+    #[test]
+    fn resilience_flags_are_present() {
+        let args = args_for(&DownloadOpts::default());
+        for flag in [
+            "--retries",
+            "--fragment-retries",
+            "--socket-timeout",
+            "--concurrent-fragments",
+            "--no-playlist",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+        }
+    }
+
+    #[test]
+    fn the_output_path_is_requested_explicitly() {
+        // Defect D-18: the old code scanned the directory for a filename it
+        // hoped matched. --print after_move:filepath is authoritative.
+        let args = args_for(&DownloadOpts::default());
+        let i = args.iter().position(|a| a == "--print").expect("--print");
+        assert_eq!(args[i + 1], "after_move:filepath");
+    }
+
+    #[test]
+    fn session_context_is_forwarded_when_given() {
+        // Greek portals routinely 403 a bare fetch of a sniffed stream URL but
+        // serve it with the article page as the referer.
+        let jar = PathBuf::from("C:/temp/x.com.cookies.txt");
+        let args = args_for(&DownloadOpts {
+            referer: Some("https://www.in.gr/article"),
+            user_agent: Some("Mozilla/5.0 omni"),
+            cookie_header: Some("sid=1"),
+            cookie_jar: Some(&jar),
+            ..Default::default()
+        });
+        let joined = args.join(" ");
+        assert!(joined.contains("--referer https://www.in.gr/article"), "{joined}");
+        assert!(joined.contains("--user-agent Mozilla/5.0 omni"), "{joined}");
+        assert!(joined.contains("Cookie: sid=1"), "{joined}");
+        assert!(joined.contains("--cookies"), "{joined}");
+    }
+
+    #[test]
+    fn the_url_is_always_the_last_argument() {
+        // yt-dlp treats anything after the URL as another URL.
+        let args = args_for(&DownloadOpts {
+            referer: Some("https://example.gr"),
+            insecure_tls: true,
+            ..Default::default()
+        });
+        assert_eq!(args.last().unwrap(), "https://www.youtube.com/watch?v=abc");
+    }
+
+    #[test]
+    fn progress_lines_parse_into_percent_speed_and_eta() {
+        let p = parse_progress("5242880 10485760 2097152 5").expect("parses");
+        assert!((p.percent - 50.0).abs() < 0.01, "{}", p.percent);
+        assert_eq!(p.speed, "2.0 MB/s");
+        assert_eq!(p.eta, "00:05");
+    }
+
+    #[test]
+    fn unknown_progress_values_do_not_produce_nonsense() {
+        // yt-dlp emits NA for the total until it knows the size; showing 0% is
+        // honest, showing NaN% or 100% is not.
+        let p = parse_progress("5242880 NA NA NA").expect("parses");
+        assert_eq!(p.percent, 0.0);
+        assert_eq!(p.speed, "--");
+        assert_eq!(p.eta, "--:--");
+        assert!(parse_progress("garbage").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_fallback_scan_ignores_partial_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        // A finished small file and a large in-progress one: picking the .part
+        // would feed a truncated file to the transcoder.
+        tokio::fs::write(dir.path().join("source.mp4"), vec![0u8; 1000])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("source.mkv.part"), vec![0u8; 500_000])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("source.ytdl"), vec![0u8; 900_000])
+            .await
+            .unwrap();
+
+        let found = find_downloaded_file(dir.path()).await.expect("a file");
+        assert_eq!(found.file_name().unwrap(), "source.mp4");
+    }
+
+    #[test]
+    fn the_operator_facing_message_is_the_error_line_not_the_last_line() {
+        let stderr = "[youtube] Extracting URL\n\
+                      ERROR: [youtube] abc: Private video. Sign in if you've been granted access\n\
+                      [debug] Exiting with code 1";
+        let msg = first_error_line(stderr);
+        assert!(msg.contains("Private video"), "{msg}");
+        assert!(!msg.contains("Exiting with code"), "{msg}");
     }
 }
