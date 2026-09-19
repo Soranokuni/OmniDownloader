@@ -345,7 +345,23 @@ async fn run_daemon(
         Err(e) => error!("Orphan recovery failed: {e:?}"),
     }
 
-    // 5. Lease reaper: requeue jobs whose owner died without releasing them.
+    // 5. Sweep scratch directories left behind by jobs that are no longer
+    // running. On a newsroom machine these are gigabytes of source media.
+    match repo.running_job_ids() {
+        Ok(running) => {
+            let removed = omni_broadcast::delivery::WatchfolderDelivery::sweep_orphan_job_dirs(
+                &temp_path.join("jobs"),
+                &running,
+            )
+            .await;
+            if removed > 0 {
+                info!("Swept {removed} orphaned job workspace(s) from temp/jobs.");
+            }
+        }
+        Err(e) => warn!("Could not list running jobs for the temp sweep: {e:?}"),
+    }
+
+    // 6. Lease reaper: requeue jobs whose owner died without releasing them.
     {
         let repo_reaper = repo.clone();
         let mut reaper_rx = shutdown_tx.subscribe();
@@ -368,7 +384,7 @@ async fn run_daemon(
         });
     }
 
-    // 6. Worker pool.
+    // 7. Worker pool.
     //
     // Capacity is acquired *before* leasing (plan P1.1, defect D-01). The old
     // loop leased first and then waited on the semaphore, so with two workers

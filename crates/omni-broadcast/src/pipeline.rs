@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -66,6 +66,15 @@ impl BroadcastEngine {
         let slug = job.slug.clone();
         let url = job.url.clone();
 
+        // Every stage works inside this job's own directory. Cleanup is a
+        // remove_dir_all of exactly this path -- never a filename-prefix match
+        // in a shared directory, which is how job 1 used to delete the working
+        // files of jobs 10-19 and 100-199 mid-transcode (defect D-04).
+        let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
+        tokio::fs::create_dir_all(&job_temp).await.with_context(|| {
+            format!("Failed creating the workspace for job #{job_id} at {job_temp:?}")
+        })?;
+
         info!("BroadcastEngine: Processing Job #{} ({})", job_id, slug);
 
         // 1. Download stage
@@ -76,7 +85,7 @@ impl BroadcastEngine {
                 job_id,
                 &url,
                 &slug,
-                &self.temp_dir,
+                &job_temp,
                 referer,
                 user_agent,
                 cookies,
@@ -98,7 +107,7 @@ impl BroadcastEngine {
                 warn!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("WARN", "DOWNLOAD", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
-                WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
                 return Err(e);
             }
         };
@@ -110,7 +119,7 @@ impl BroadcastEngine {
         let transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
         let repo_clone = self.repo.clone();
         let transcode_res = transcoder
-            .transcode(job_id, &downloaded_file, &self.temp_dir, move |prog| {
+            .transcode(job_id, &downloaded_file, &job_temp, move |prog| {
                 let _ = repo_clone.update_job_progress(
                     job_id,
                     prog.percent,
@@ -127,7 +136,7 @@ impl BroadcastEngine {
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "TRANSCODE", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
-                WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
                 return Err(e);
             }
         };
@@ -137,36 +146,51 @@ impl BroadcastEngine {
         let _ = self.repo.update_job_progress(job_id, 99.0, "Rewrapping", "--:--");
 
         let rewrapper = Rewrapper::new(&self.bmxtranswrap_path);
-        let final_temp_mxf = match rewrapper.rewrap(job_id, &intermediate_mxf, &self.temp_dir).await {
+        let final_temp_mxf = match rewrapper.rewrap(job_id, &intermediate_mxf, &job_temp).await {
             Ok(path) => path,
             Err(e) => {
                 let err_msg = format!("bmxtranswrap RDD9 failed: {}", e);
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "REWRAP", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
-                WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
                 return Err(e);
             }
         };
 
         // 4. Atomic Delivery to Dalet Watchfolder
-        let final_destination = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
+        let _ = self.repo.set_stage(job_id, owner, JobStage::Deliver);
+        let delivered = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
             Ok(dest) => dest,
             Err(e) => {
                 let err_msg = format!("Watchfolder delivery failed: {}", e);
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
-                WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
                 return Err(e);
             }
         };
 
         // Clean up remaining temp files for this job
-        WatchfolderDelivery::cleanup_job_temp_files(&self.temp_dir, job_id).await;
+        WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+
+        if delivered.suffixed {
+            // Two assets now share a slug in Dalet. Not a failure -- the file is
+            // on air -- but an operator has to know which one is which.
+            let _ = self.repo.record_event(
+                job_id,
+                "WARN",
+                Some(JobStage::Deliver),
+                &format!(
+                    "Slug collision: delivered as {} because {slug}.mxf already existed",
+                    delivered.filename
+                ),
+            );
+        }
 
         // 5. Mark Completed
-        let dest_str = final_destination.to_string_lossy().to_string();
+        let dest_str = delivered.path.to_string_lossy().to_string();
         let _ = self.repo.update_job_progress(job_id, 100.0, "Completed", "00:00");
         let _ = self.repo.update_job_status(job_id, JobStatus::Completed, None, Some(&dest_str), Some(duration));
         let _ = self.repo.log_audit(
