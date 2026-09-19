@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use inquire::{Confirm, CustomType, Password, Text};
-use omni_core::auth::hash_password;
 use omni_core::config::AppConfig;
 use omni_core::models::UserRole;
 use omni_core::repository::Repository;
@@ -160,9 +159,17 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
         let admin_password = Password::new("Admin Password:")
             .with_display_mode(inquire::PasswordDisplayMode::Masked)
             .prompt()?;
-        let pass_hash = hash_password(&admin_password)?;
-        repo.create_user(&admin_email, &pass_hash, UserRole::Admin, "System Administrator", None)?;
-
+        // create_user hashes internally (repository.rs). Hashing here as well
+        // stored a hash *of the hash*, so the account the wizard created could
+        // never log in -- and the operator only found out at the login screen,
+        // after the wizard had reported success (defect W-05).
+        repo.create_user(
+            &admin_email,
+            &admin_password,
+            UserRole::Admin,
+            "System Administrator",
+            None,
+        )?;
 
 
         println!("✓ Administrator user '{}' created.", admin_email);

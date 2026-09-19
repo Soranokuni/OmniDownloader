@@ -65,8 +65,12 @@ pub struct Job {
     pub submitted_by_user_id: Option<i64>,
     pub email_source: Option<String>,
     pub notes: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    /// Stored timestamp, `None` when the row predates real timestamps or the
+    /// value is unreadable. Never substituted with "now" (defect D-11): the MCR
+    /// archive exists to answer *when* something went to Dalet, and a fabricated
+    /// value is worse than an honest blank.
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,7 +110,7 @@ pub struct User {
     pub full_name: String,
     pub journalist_surname: Option<String>,
     pub is_active: bool,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +120,7 @@ pub struct Journalist {
     pub full_name: String,
     pub emails: Vec<String>,
     pub default_priority: i32,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +129,7 @@ pub struct AuditLog {
     pub level: String,
     pub category: String,
     pub message: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
