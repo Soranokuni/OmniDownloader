@@ -120,13 +120,36 @@ impl UnifiedAdBlocker {
         blocker
     }
 
-    /// Returns or initializes the global blocker instance.
+    /// Initialize the process-wide blocker with an **absolute** cache directory
+    /// (plan P0.1, defect W-10).
+    ///
+    /// Must be called once during start-up, before any sniff. The previous
+    /// `global()` defaulted to the CWD-relative `data/adblock`, which under the
+    /// Windows service resolved to `C:\Windows\System32\data\adblock` — an
+    /// unwritable path, so the lists silently never loaded and promotional
+    /// streams could reach the watchfolder.
+    ///
+    /// Calling it a second time keeps the first directory and returns that
+    /// instance; the caller is expected to initialize exactly once.
+    pub fn init(cache_dir: PathBuf) -> Arc<Self> {
+        GLOBAL_BLOCKER
+            .get_or_init(|| Arc::new(Self::new(cache_dir)))
+            .clone()
+    }
+
+    /// Returns the global blocker.
+    ///
+    /// # Panics
+    /// If [`UnifiedAdBlocker::init`] has not been called. This is a programming
+    /// error in start-up ordering, and failing loudly at boot is far safer than
+    /// silently sniffing with an empty blocklist.
     pub fn global() -> Arc<Self> {
         GLOBAL_BLOCKER
-            .get_or_init(|| {
-                let cache_dir = PathBuf::from("data/adblock");
-                Arc::new(Self::new(cache_dir))
-            })
+            .get()
+            .expect(
+                "UnifiedAdBlocker::init(paths.data.join(\"adblock\")) must be called \
+                 during start-up before any sniff or adblock command",
+            )
             .clone()
     }
 

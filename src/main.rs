@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Semaphore};
@@ -10,6 +10,7 @@ use omni_broadcast::pipeline::BroadcastEngine;
 use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
 use omni_browser::sniffer::StreamSniffer;
 use omni_core::config::AppConfig;
+use omni_core::paths::AppPaths;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::JobStatus;
 use omni_core::repository::Repository;
@@ -28,6 +29,14 @@ struct Cli {
 
     #[arg(short, long, default_value = "config.json", global = true)]
     config: String,
+
+    /// Install directory to resolve relative paths against.
+    ///
+    /// Defaults to the directory holding omni-ingest.exe (or `$OMNI_ROOT`).
+    /// Never the process working directory: under the Windows SCM that is
+    /// `C:\Windows\System32` (plan P0.1, defect W-10).
+    #[arg(long, global = true)]
+    root: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -90,20 +99,33 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Anchor every relative path to the install directory exactly once, before
+    // anything can accidentally resolve one against the CWD (plan P0.1).
+    let paths = match &cli.root {
+        Some(root) => AppPaths::with_root(root, &cli.config),
+        None => AppPaths::discover(&cli.config),
+    };
+    paths
+        .ensure_dirs()
+        .with_context(|| format!("Failed creating the directory tree under {:?}", paths.root))?;
+    info!("Install root: {:?}", paths.root);
+
+    // The adblock cache must be absolute before any sniff can run.
+    omni_browser::UnifiedAdBlocker::init(paths.data.join("adblock"));
+
     match cli.command {
         None | Some(Commands::Run) => {
-            let config_path = PathBuf::from(&cli.config);
-            run_daemon(&config_path, None).await?;
+            run_daemon(&paths, None).await?;
         }
         Some(Commands::RunService) => {
-            let config_path = PathBuf::from(&cli.config);
+            let paths = paths.clone();
             omni_service::run_service(move |shutdown_rx| {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .expect("Failed to build Tokio runtime for Windows Service");
                 rt.block_on(async {
-                    if let Err(e) = run_daemon(&config_path, Some(shutdown_rx)).await {
+                    if let Err(e) = run_daemon(&paths, Some(shutdown_rx)).await {
                         error!("Daemon error inside Windows Service: {:?}", e);
                     }
                 });
@@ -177,7 +199,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_daemon(
-    config_path: &Path,
+    paths: &AppPaths,
     service_shutdown_rx: Option<tokio::sync::mpsc::Receiver<()>>,
 ) -> Result<()> {
 
@@ -186,13 +208,16 @@ async fn run_daemon(
     info!("   Sony XDCAM HD422 PAL 1080i50 + Dalet OP1a Integration    ");
     info!("============================================================");
 
-    let config = AppConfig::load_from_file(config_path)
+    let config_path = paths.config.clone();
+    let config = AppConfig::load_from_file(&config_path)
         .with_context(|| format!("Failed loading configuration from {:?}", config_path))?;
 
-    let db_path = config.resolve_path(&config.database_path);
-    let temp_path = config.resolve_path(&config.temp_path);
-    let watchfolder_path = config.resolve_path(&config.watchfolder_path);
-    let bin_dir = config.resolve_path(&config.bin_dir);
+    // Every one of these is absolute: relative entries resolve against the
+    // install root, absolute and UNC entries (the Dalet share) pass through.
+    let db_path = paths.resolve(&config.database_path);
+    let temp_path = paths.resolve(&config.temp_path);
+    let watchfolder_path = paths.resolve(&config.watchfolder_path);
+    let bin_dir = paths.resolve(&config.bin_dir);
 
     tokio::fs::create_dir_all(&temp_path).await?;
     tokio::fs::create_dir_all(&watchfolder_path).await?;
