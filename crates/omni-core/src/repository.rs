@@ -419,6 +419,20 @@ impl Repository {
         Ok(changed == 1)
     }
 
+    /// Store the pre-delivery compliance report (plan P1.6).
+    ///
+    /// Kept whether the job passed or failed: on a failure it is what the MCR
+    /// drawer shows the operator, and on a success it is the record of what was
+    /// verified about a file that is now on air.
+    pub fn set_compliance_report(&self, job_id: i64, report_json: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE queue SET compliance_json = ?, updated_at = ? WHERE id = ?",
+            params![report_json, timestamps::now_string(), job_id],
+        )?;
+        Ok(())
+    }
+
     /// Jobs currently leased by this host, for the status endpoint and the
     /// start-up temp sweep.
     pub fn running_job_ids(&self) -> Result<Vec<i64>> {

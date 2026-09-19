@@ -2,6 +2,7 @@ pub mod delivery;
 pub mod downloader;
 pub mod pipeline;
 pub mod probe;
+pub mod verify;
 pub mod rewrapper;
 pub mod transcoder;
 

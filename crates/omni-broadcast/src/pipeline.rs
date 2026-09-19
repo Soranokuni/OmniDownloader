@@ -158,7 +158,55 @@ impl BroadcastEngine {
             }
         };
 
-        // 4. Atomic Delivery to Dalet Watchfolder
+        // 4. Compliance gate (plan P1.6, defect D-06).
+        //
+        // The last thing between the transcoder and air. ffmpeg exits zero for
+        // plenty of files Dalet will reject or mis-play -- a chain that quietly
+        // fell back to 4:2:0, an audio map that produced one stereo stream
+        // instead of eight mono ones, a transcode truncated by a source that
+        // ended early. A failed report is never delivered: a job in review is a
+        // minor annoyance, a wrong file in the running order is not.
+        let _ = self.repo.set_stage(job_id, owner, JobStage::Verify);
+        let report = match crate::verify::verify_mxf(&self.ffprobe_path, &final_temp_mxf, duration).await {
+            Ok(report) => report,
+            Err(e) => {
+                // Could not run the check at all. Treated as a failure: an
+                // unverifiable file must not reach the watchfolder.
+                let err_msg = format!("Compliance check could not run: {e}");
+                error!("Job #{job_id}: {err_msg}");
+                let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Verify), &err_msg);
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+                return Err(e.context("COMPLIANCE_FAILED"));
+            }
+        };
+
+        if let Ok(json) = serde_json::to_string(&report) {
+            let _ = self.repo.set_compliance_report(job_id, &json);
+        }
+
+        if !report.pass {
+            let summary = report.summary();
+            error!("Job #{job_id}: {summary}");
+            let _ = self
+                .repo
+                .record_event(job_id, "ERROR", Some(JobStage::Verify), &summary);
+            let _ = self.repo.log_audit(
+                "ERROR",
+                "COMPLIANCE",
+                &format!("Job #{job_id} ({slug}) failed the compliance gate: {summary}"),
+            );
+            WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+            return Err(anyhow::anyhow!("COMPLIANCE_FAILED: {summary}"));
+        }
+
+        let _ = self.repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Verify),
+            &report.summary(),
+        );
+
+        // 5. Atomic Delivery to Dalet Watchfolder
         let _ = self.repo.set_stage(job_id, owner, JobStage::Deliver);
         let delivered = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
             Ok(dest) => dest,
@@ -189,7 +237,7 @@ impl BroadcastEngine {
             );
         }
 
-        // 5. Mark Completed
+        // 6. Mark Completed
         let dest_str = delivered.path.to_string_lossy().to_string();
         let _ = self.repo.update_job_progress(job_id, 100.0, "Completed", "00:00");
         let _ = self.repo.update_job_status(job_id, JobStatus::Completed, None, Some(&dest_str), Some(duration));
