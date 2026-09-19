@@ -18,6 +18,150 @@ pub struct Transcoder {
     ffprobe_path: PathBuf,
 }
 
+
+/// Everything the argument builder needs to know about the source.
+///
+/// Kept deliberately small and owned so [`build_args`] is a pure function that
+/// unit tests can drive without ffmpeg, ffprobe or a media file (plan P0.4).
+/// Phase 1.5 extends this into the full `SourceProbe` decision matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscodeInput {
+    /// Audio channels in the selected source stream. `None` means "the source
+    /// has no audio stream" -- which is different from "we could not probe it".
+    ///
+    /// The distinction matters: a failed probe must never be rendered as
+    /// silence (defect D-07). `Transcoder::transcode` refuses to build a plan
+    /// from an unknown probe rather than passing `None` here.
+    pub audio_channels: Option<u32>,
+}
+
+/// The ffmpeg argument vector plus a label for the branch that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscodePlan {
+    pub args: Vec<String>,
+    /// Which audio branch was taken; surfaced in job events and asserted in tests.
+    pub branch: &'static str,
+}
+
+/// Video filter chain for Sony XDCAM HD422 1080i50.
+///
+/// NOTE (defect D-08, fixed in plan P1.5): `tinterlace=interleave_top` halves
+/// the frame rate, so it is only correct when fed 50 progressive frames per
+/// second. Fed a 25p source it produces 12.5 fps that `-r 25` then duplicates.
+/// This constant preserves today's behaviour verbatim; P1.5 replaces it with a
+/// source-dependent chain. It is named and tested here so that change is a
+/// visible, reviewable diff rather than an edit buried in a spawn call.
+pub const VIDEO_FILTER_CHAIN: &str = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,tinterlace=mode=interleave_top:flags=vlpf,format=yuv422p";
+
+/// Silence source for the six EBU R48 pad channels.
+pub const SILENCE_SOURCE: &str = "anullsrc=r=48000:cl=mono";
+
+/// Build the exact ffmpeg argument vector for a transcode.
+///
+/// Pure: no I/O, no clock, no filesystem. Every broadcast-critical flag in
+/// AGENTS.md section 2 is asserted against the output of this function in
+/// `broadcast_compliance_tests`.
+pub fn build_args(input: &TranscodeInput, source: &Path, output: &Path) -> TranscodePlan {
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-threads".into(),
+        "0".into(),
+        "-i".into(),
+        source.to_string_lossy().into_owned(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        SILENCE_SOURCE.into(),
+    ];
+
+    // EBU R48: Ch1 programme left, Ch2 programme right, Ch3-8 silence pads.
+    let (branch, filter_complex, programme_maps): (&'static str, Option<&str>, usize) =
+        match input.audio_channels {
+            // No audio stream at all: eight silent channels. The job carries a
+            // "silent" badge to MCR so nobody discovers it on air.
+            None | Some(0) => ("no_audio", None, 0),
+            Some(1) => ("mono", Some("[0:a:0]asplit=2[l][r]"), 2),
+            _ => (
+                "stereo_or_multichannel",
+                Some("[0:a:0]pan=mono|c0=c0[l];[0:a:0]pan=mono|c0=c1[r]"),
+                2,
+            ),
+        };
+
+    if let Some(fc) = filter_complex {
+        args.push("-filter_complex".into());
+        args.push(fc.into());
+    }
+
+    args.push("-map".into());
+    args.push("0:v".into());
+
+    if programme_maps == 2 {
+        for label in ["[l]", "[r]"] {
+            args.push("-map".into());
+            args.push(label.into());
+        }
+    }
+    // Pad out to exactly eight discrete mono streams. Dalet rejects anything else.
+    for _ in 0..(8 - programme_maps) {
+        args.push("-map".into());
+        args.push("1:a".into());
+    }
+
+    for a in [
+        "-vf",
+        VIDEO_FILTER_CHAIN,
+        "-sws_flags",
+        "bilinear",
+        "-c:v",
+        "mpeg2video",
+        "-b:v",
+        "50M",
+        "-minrate",
+        "50M",
+        "-maxrate",
+        "50M",
+        "-bufsize",
+        "17825792",
+        "-profile:v",
+        "0",
+        "-level:v",
+        "2",
+        "-pix_fmt",
+        "yuv422p",
+        "-g",
+        "12",
+        "-bf",
+        "2",
+        "-flags",
+        "+ildct+ilme",
+        "-trellis",
+        "0",
+        "-top",
+        "1",
+        "-r",
+        "25",
+        "-aspect",
+        "16:9",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-c:a",
+        "pcm_s24le",
+        "-ar",
+        "48000",
+        "-shortest",
+    ] {
+        args.push(a.into());
+    }
+    args.push(output.to_string_lossy().into_owned());
+
+    TranscodePlan { args, branch }
+}
+
 impl Transcoder {
     pub fn new<P: AsRef<Path>, Q: AsRef<Path>>(ffmpeg_path: P, ffprobe_path: Q) -> Self {
         Self {
@@ -85,78 +229,23 @@ impl Transcoder {
             let _ = tokio::fs::remove_file(&intermediate_mxf).await;
         }
 
+        // One pure function builds the argument vector, so the broadcast
+        // compliance tests assert the exact flags this process will run
+        // (plan P0.4) rather than restating constants to themselves.
+        let plan = build_args(
+            &TranscodeInput {
+                audio_channels: Some(channels as u32),
+            },
+            input_path,
+            &intermediate_mxf,
+        );
+        info!(
+            "Job #{}: XDCAM HD422 transcode, audio branch '{}'",
+            job_id, plan.branch
+        );
+
         let mut cmd = Command::new(&self.ffmpeg_path);
-        cmd.args([
-            "-y",
-            "-threads", "0",
-            "-i", input_path.to_string_lossy().as_ref(),
-            "-f", "lavfi",
-            "-i", "anullsrc=r=48000:cl=mono",
-        ]);
-
-        // EBU R48 Broadcast Audio Mapping:
-        // Ch 1 (Left), Ch 2 (Right), Ch 3-8 (Silent mono)
-        let mut filter_complex = String::new();
-        let mut audio_maps: Vec<&str> = Vec::new();
-
-        if channels == 0 {
-            // Pure silence for all 8 channels
-            for _ in 0..8 {
-                audio_maps.extend_from_slice(&["-map", "1:a"]);
-            }
-        } else if channels == 1 {
-            // Mono: copy to L & R
-            filter_complex = "[0:a:0]asplit=2[l][r]".into();
-            audio_maps.extend_from_slice(&["-map", "[l]", "-map", "[r]"]);
-            for _ in 0..6 {
-                audio_maps.extend_from_slice(&["-map", "1:a"]);
-            }
-        } else {
-            // Stereo or multi-channel: pan first two into L and R
-            filter_complex = "[0:a:0]pan=mono|c0=c0[l];[0:a:0]pan=mono|c0=c1[r]".into();
-            audio_maps.extend_from_slice(&["-map", "[l]", "-map", "[r]"]);
-            for _ in 0..6 {
-                audio_maps.extend_from_slice(&["-map", "1:a"]);
-            }
-        }
-
-        if !filter_complex.is_empty() {
-            cmd.args(["-filter_complex", &filter_complex]);
-        }
-
-        // Map video stream
-        cmd.args(["-map", "0:v"]);
-
-        // Append mapped audio channels
-        for map in audio_maps {
-            cmd.arg(map);
-        }
-
-        // Sony XDCAM Long GOP HD422 PAL 1080i50 Video Parameters
-        cmd.args([
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,tinterlace=mode=interleave_top:flags=vlpf,format=yuv422p",
-            "-sws_flags", "bilinear",
-            "-c:v", "mpeg2video",
-            "-b:v", "50M",
-            "-minrate", "50M",
-            "-maxrate", "50M",
-            "-bufsize", "17825792",
-            "-profile:v", "0",
-            "-level:v", "2",
-            "-pix_fmt", "yuv422p",
-            "-g", "12",
-            "-bf", "2",
-            "-flags", "+ildct+ilme",
-            "-trellis", "0",
-            "-top", "1",
-            "-r", "25",
-            "-aspect", "16:9",
-            // Audio output format
-            "-c:a", "pcm_s24le",
-            "-ar", "48000",
-            "-shortest",
-            intermediate_mxf.to_string_lossy().as_ref(),
-        ]);
+        cmd.args(&plan.args);
 
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
