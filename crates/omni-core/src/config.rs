@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::paths::AppPaths;
+
 pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a broadcast automation parsing engine for a Greek newsroom. Analyze the email and extract video asset links into a strict JSON array.
 
 === FEW-SHOT EXAMPLES ===
@@ -318,12 +320,27 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Resolve a config path against the **install directory** (plan P0.1, W-10).
+    ///
+    /// Under the Windows service the process working directory is
+    /// `C:\Windows\System32`, so the previous CWD-relative behaviour silently
+    /// created a second, empty `data/omni.db` there while the operator stared at
+    /// an empty queue. Callers that hold an [`AppPaths`] should prefer
+    /// [`AppPaths::resolve`]; this method exists for the code paths that only
+    /// have a config, and delegates to the same logic.
+    pub fn resolve_path_in(&self, paths: &AppPaths, relative_or_absolute: &str) -> PathBuf {
+        paths.resolve(relative_or_absolute)
+    }
+
+    /// Resolve against the discovered install root.
+    ///
+    /// Kept for call sites that have no `AppPaths` to hand. It discovers the
+    /// root from the executable location, never from the CWD.
     pub fn resolve_path(&self, relative_or_absolute: &str) -> PathBuf {
-        let path = Path::new(relative_or_absolute);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        let p = Path::new(relative_or_absolute);
+        if p.is_absolute() {
+            return p.to_path_buf();
         }
+        AppPaths::discover("config.json").resolve(relative_or_absolute)
     }
 }

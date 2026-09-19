@@ -539,8 +539,19 @@ impl StreamSniffer {
 mod tests {
     use super::*;
 
+    /// The blocker is process-wide and no longer self-initializes from a
+    /// CWD-relative path (plan P0.1). Point it at a scratch directory; with no
+    /// cached lists present it falls back to the built-in seed domains, which
+    /// is what these scoring tests exercise.
+    fn init_blocker() {
+        crate::adblock::UnifiedAdBlocker::init(
+            std::env::temp_dir().join("omni-adblock-unit-tests"),
+        );
+    }
+
     #[test]
     fn test_is_ad_or_tracking() {
+        init_blocker();
         assert!(StreamSniffer::is_ad_or_tracking(
             "https://cdn.exitbee.com/user-template-uploads/HOTB_Survive_16x9-1-_1789034729.mp4"
         ));
@@ -582,6 +593,7 @@ mod tests {
 
     #[test]
     fn test_score_stream_url() {
+        init_blocker();
         assert_eq!(
             StreamSniffer::score_stream_url("https://stream.star.gr/star/live/master.m3u8"),
             100
