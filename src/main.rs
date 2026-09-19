@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use omni_broadcast::pipeline::BroadcastEngine;
@@ -12,7 +13,7 @@ use omni_browser::sniffer::StreamSniffer;
 use omni_core::config::AppConfig;
 use omni_core::paths::AppPaths;
 use omni_core::dependencies::DependencyManager;
-use omni_core::models::JobStatus;
+use omni_core::models::{JobStage, JobStatus};
 use omni_core::repository::Repository;
 use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
@@ -332,104 +333,150 @@ async fn run_daemon(
         });
     }
 
-    // 4. Start Worker Pool Queue Leaser
+    // 4. Recover jobs this host was running when it last stopped.
+    //
+    // Must happen before any worker starts leasing (plan P1.1, defect D-02).
+    // Without it a crash during a transcode strands the job in RUNNING forever:
+    // no worker owns it and no lease anybody is watching will expire.
+    let hostname = hostname_for_lease();
+    match repo.recover_on_startup(&hostname) {
+        Ok(0) => info!("No orphaned jobs to recover."),
+        Ok(n) => warn!("Recovered {n} orphaned job(s) from a previous run; requeued."),
+        Err(e) => error!("Orphan recovery failed: {e:?}"),
+    }
+
+    // 5. Lease reaper: requeue jobs whose owner died without releasing them.
+    {
+        let repo_reaper = repo.clone();
+        let mut reaper_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(LEASE_REAP_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = reaper_rx.recv() => break,
+                    _ = interval.tick() => {
+                        match repo_reaper.reap_expired_leases() {
+                            Ok((0, 0)) => {}
+                            Ok((requeued, review)) => warn!(
+                                "Lease reaper: {requeued} job(s) requeued, {review} sent to review"
+                            ),
+                            Err(e) => error!("Lease reaper failed: {e:?}"),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // 6. Worker pool.
+    //
+    // Capacity is acquired *before* leasing (plan P1.1, defect D-01). The old
+    // loop leased first and then waited on the semaphore, so with two workers
+    // and twenty pending jobs, eighteen sat in DOWNLOADING with nobody working
+    // on them -- and the MCR panel showed eighteen phantom downloads while the
+    // operator waited for files that were not being made.
     let max_concurrency = config.max_concurrent_downloads.clamp(1, 10);
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
     let mut worker_rx = shutdown_tx.subscribe();
     let repo_worker = repo.clone();
     let engine_worker = broadcast_engine.clone();
+    let worker_hostname = hostname.clone();
 
     tokio::spawn(async move {
-        info!("Queue Worker pool active (concurrency: {})", max_concurrency);
+        info!("Queue worker pool active (concurrency: {max_concurrency})");
+        let mut worker_seq: u64 = 0;
+
         loop {
-            tokio::select! {
+            // Capacity first. This await is where an idle daemon sits.
+            let permit = tokio::select! {
                 _ = worker_rx.recv() => {
                     info!("Worker pool shutting down.");
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(1500)) => {
-                    match repo_worker.lease_next_pending_job() {
-                        Ok(Some(job)) => {
-                            let sem = semaphore.clone();
-                            let eng = engine_worker.clone();
-                            let rep = repo_worker.clone();
+                p = semaphore.clone().acquire_owned() => match p {
+                    Ok(p) => p,
+                    Err(_) => break,
+                },
+            };
 
-                            tokio::spawn(async move {
-                                let permit = match sem.acquire_owned().await {
-                                    Ok(p) => p,
-                                    Err(_) => return,
-                                };
+            worker_seq += 1;
+            let owner = format!("{worker_hostname}:{}:{worker_seq}", std::process::id());
 
-                                let job_id = job.id;
-                                let orig_url = job.url.clone();
-
-                                // Check for file locker URLs requiring autonomous Computer-Use agent
-                                let locker_resolver = ComputerUseAgentPlaceholder::new(None, None);
-                                if locker_resolver.can_handle(&orig_url) {
-                                    warn!("Job #{} matches file locker domain. Routing to MCR resolution desk.", job_id);
-                                    let _ = rep.update_job_status(
-                                        job_id,
-                                        JobStatus::RequiresReview,
-                                        Some("File-locker detected (WeTransfer/AirBridge). Manual download or Computer-Use resolution required."),
-                                        None,
-                                        None,
-                                    );
-                                    let _ = rep.log_audit(
-                                        "WARN",
-                                        "COMPUTER_USE",
-                                        &format!("Job #{} file locker: {}", job_id, orig_url),
-                                    );
-                                    drop(permit);
-                                    return;
-                                }
-
-                                // Process job with broadcast pipeline.
-                                // If direct download fails and URL appears to be an interactive web portal,
-                                // fallback to StreamSniffer to extract .m3u8 stream.
-                                let mut process_result = eng.process_job(job.clone()).await;
-
-                                if process_result.is_err() {
-                                    let is_web_url = orig_url.starts_with("http://")
-                                        || orig_url.starts_with("https://");
-
-                                    if is_web_url {
-                                        info!("Direct download failed for web URL ({}). Attempting Headless Browser StreamSniffer fallback...", orig_url);
-                                        let _ = rep.update_job_progress(job_id, 0.0, "Sniffing stream...", "--:--");
-
-                                        match StreamSniffer::extract_media_bundle(&orig_url, 25).await {
-                                            Ok(bundle) => {
-                                                info!("StreamSniffer recovered primary stream URL: {}", bundle.primary_stream);
-                                                let mut retry_job = job.clone();
-                                                retry_job.url = bundle.primary_stream;
-                                                let _ = rep.update_job_status(job_id, JobStatus::Downloading, None, None, None);
-                                                process_result = eng.process_job_with_context(
-                                                    retry_job,
-                                                    Some(&bundle.referer),
-                                                    Some(&bundle.user_agent),
-                                                    bundle.cookies.as_deref(),
-                                                ).await;
-                                            }
-                                            Err(sniff_err) => {
-                                                warn!("StreamSniffer fallback also failed: {}", sniff_err);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Err(e) = process_result {
-                                    error!("Broadcast pipeline failed for Job #{}: {:?}", job_id, e);
-                                }
-
-                                drop(permit);
-                            });
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("Error leasing next pending job: {:?}", e);
-                        }
+            let job = match repo_worker.lease_job(&owner, LEASE_SECS) {
+                Ok(Some(job)) => job,
+                Ok(None) => {
+                    // Nothing ready. Release the permit and idle with jitter so
+                    // several workers do not wake in lockstep and hammer SQLite.
+                    drop(permit);
+                    let jitter = Duration::from_millis(1000 + (worker_seq % 5) * 100);
+                    tokio::select! {
+                        _ = worker_rx.recv() => break,
+                        _ = tokio::time::sleep(jitter) => continue,
                     }
                 }
-            }
+                Err(e) => {
+                    error!("Failed leasing a job: {e:?}");
+                    drop(permit);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let eng = engine_worker.clone();
+            let rep = repo_worker.clone();
+
+            tokio::spawn(async move {
+                let job_id = job.id;
+
+                // Keep the lease alive while we work. If it stops succeeding we
+                // have lost the job -- the reaper requeued it, or an operator
+                // cancelled it -- and must stop rather than deliver a file for a
+                // job somebody else now owns.
+                let cancel = CancellationToken::new();
+                let heartbeat = {
+                    let rep = rep.clone();
+                    let owner = owner.clone();
+                    let cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+                        tick.tick().await; // fires immediately; skip it
+                        loop {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tick.tick() => {
+                                    match rep.heartbeat(job_id, &owner, LEASE_SECS) {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            warn!("Job #{job_id}: lease lost, abandoning work");
+                                            cancel.cancel();
+                                            break;
+                                        }
+                                        Err(e) => warn!("Job #{job_id}: heartbeat failed: {e:?}"),
+                                    }
+                                }
+                            }
+                        }
+                    })
+                };
+
+                let outcome = run_job(&rep, &eng, &owner, job).await;
+                cancel.cancel();
+                heartbeat.abort();
+
+                if let Err(e) = outcome {
+                    error!("Broadcast pipeline failed for Job #{job_id}: {e:?}");
+                    let _ = rep.finish(
+                        job_id,
+                        &owner,
+                        JobStatus::RequiresReview,
+                        Some("PIPELINE_FAILED"),
+                        Some(&e.to_string()),
+                        None,
+                    );
+                }
+
+                drop(permit);
+            });
         }
     });
 
@@ -455,4 +502,141 @@ async fn run_daemon(
     info!("OmniDownloader shutdown complete. Goodbye!");
 
     Ok(())
+}
+
+/// Lease renewal interval and lease length.
+///
+/// The lease outlives several missed heartbeats so a momentarily busy machine
+/// does not lose a job mid-transcode, but is short enough that a crashed worker
+/// is noticed within a couple of minutes rather than at the next restart.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const LEASE_SECS: i64 = 180;
+const LEASE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Host component of a lease owner string.
+///
+/// Recovery only requeues jobs whose owner starts with this host, so two
+/// daemons sharing a database never steal each other's work.
+fn hostname_for_lease() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+/// Run one leased job through the pipeline.
+///
+/// Extracted from the worker loop so the lease, the heartbeat and the permit are
+/// all managed in one place and cannot be forgotten on an early return.
+async fn run_job(
+    repo: &Repository,
+    engine: &Arc<BroadcastEngine>,
+    owner: &str,
+    job: omni_core::models::Job,
+) -> Result<()> {
+    let job_id = job.id;
+    let orig_url = job.url.clone();
+
+    // File lockers (WeTransfer and friends) are never handed to yt-dlp: the
+    // link is a landing page, not a media URL. Plan P8 may resolve them
+    // automatically; until then an operator fetches the file.
+    let locker_resolver = ComputerUseAgentPlaceholder::new(None, None);
+    if locker_resolver.can_handle(&orig_url) {
+        warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
+        repo.record_event(
+            job_id,
+            "WARN",
+            Some(JobStage::Extract),
+            "File-locker link (WeTransfer/AirBridge/…); needs a manual download",
+        )?;
+        repo.finish(
+            job_id,
+            owner,
+            JobStatus::ManualDownload,
+            Some("MANUAL_DOWNLOAD"),
+            Some("File-locker link: download the file and use 'Upload file' on this job."),
+            None,
+        )?;
+        return Ok(());
+    }
+
+    repo.set_stage(job_id, owner, JobStage::Download)?;
+    let mut process_result = engine.process_job(job.clone(), owner).await;
+
+    // yt-dlp could not resolve the page. For a news portal that is expected:
+    // the video is behind an embedded player, so sniff the actual stream and
+    // retry with the session context (referer/UA/cookies) it needs to avoid 403.
+    if process_result.is_err() && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
+        info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
+        repo.set_stage(job_id, owner, JobStage::Extract)?;
+        repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Extract),
+            "Direct download failed; sniffing the page for a stream",
+        )?;
+
+        match StreamSniffer::extract_media_bundle(&orig_url, 25).await {
+            Ok(bundle) => {
+                info!("Job #{job_id}: sniffer found {}", bundle.primary_stream);
+                repo.record_event(
+                    job_id,
+                    "INFO",
+                    Some(JobStage::Extract),
+                    &format!("Sniffed stream: {}", bundle.primary_stream),
+                )?;
+                let mut retry_job = job.clone();
+                retry_job.url = bundle.primary_stream;
+                repo.set_stage(job_id, owner, JobStage::Download)?;
+                process_result = engine
+                    .process_job_with_context(
+                        retry_job,
+                        owner,
+                        Some(&bundle.referer),
+                        Some(&bundle.user_agent),
+                        bundle.cookies.as_deref(),
+                    )
+                    .await;
+            }
+            Err(sniff_err) => {
+                warn!("Job #{job_id}: sniffer found nothing: {sniff_err}");
+                repo.record_event(
+                    job_id,
+                    "ERROR",
+                    Some(JobStage::Extract),
+                    &format!("Sniffer found no stream: {sniff_err}"),
+                )?;
+            }
+        }
+    }
+
+    match process_result {
+        Ok(()) => {
+            // The engine records its own terminal status today; releasing the
+            // lease here keeps the row consistent either way.
+            let delivered = repo
+                .get_job(job_id)?
+                .and_then(|j| j.file_path)
+                .filter(|p| !p.is_empty());
+            repo.finish(
+                job_id,
+                owner,
+                JobStatus::Completed,
+                None,
+                None,
+                delivered.as_deref(),
+            )?;
+            Ok(())
+        }
+        Err(e) => {
+            repo.finish(
+                job_id,
+                owner,
+                JobStatus::RequiresReview,
+                Some("PIPELINE_FAILED"),
+                Some(&e.to_string()),
+                None,
+            )?;
+            Ok(())
+        }
+    }
 }

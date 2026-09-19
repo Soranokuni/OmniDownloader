@@ -91,6 +91,105 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        2,
+        // Plan P1.1: explicit job state machine with leases, per-stage timing,
+        // error codes and idempotent enqueue.
+        //
+        // The UNIQUE constraint on queue.url has to go (defect D-10): the same
+        // link legitimately recurs -- a different journalist, a re-send after a
+        // discard, an MCR override onto an already-known URL. SQLite cannot drop
+        // a constraint, so the table is rebuilt. Dedup moves to url_normalized
+        // plus a time window, which is a policy the code can reason about rather
+        // than a hard error from the database.
+        r#"
+        CREATE TABLE queue_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            url_normalized TEXT,
+            slug TEXT NOT NULL,
+            journalist TEXT NOT NULL DEFAULT 'MCR',
+            keyword TEXT NOT NULL DEFAULT 'ASSET',
+            index_str TEXT NOT NULL DEFAULT '1',
+            status TEXT NOT NULL,
+            stage TEXT NOT NULL DEFAULT 'QUEUED',
+            progress REAL DEFAULT 0.0,
+            speed TEXT DEFAULT '0 Mbps',
+            eta TEXT DEFAULT '--:--',
+            priority INTEGER DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            stage_started_at TEXT,
+            not_before TEXT,
+            error_message TEXT DEFAULT NULL,
+            error_code TEXT DEFAULT NULL,
+            media_format TEXT DEFAULT 'Sony XDCAM HD422 1080i50 (MXF RDD9)',
+            file_path TEXT DEFAULT NULL,
+            source_path TEXT DEFAULT NULL,
+            compliance_json TEXT DEFAULT NULL,
+            candidates_json TEXT DEFAULT NULL,
+            extraction_method TEXT DEFAULT NULL,
+            stage_timings_json TEXT DEFAULT NULL,
+            duration_secs REAL DEFAULT 0.0,
+            submitted_by_user_id INTEGER DEFAULT NULL,
+            email_source TEXT DEFAULT NULL,
+            email_message_id TEXT DEFAULT NULL,
+            notes TEXT DEFAULT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            delivered_at TEXT DEFAULT NULL,
+            completed_at TEXT DEFAULT NULL,
+            FOREIGN KEY(submitted_by_user_id) REFERENCES users(id)
+        );
+
+        INSERT INTO queue_new (
+            id, url, slug, journalist, keyword, index_str, status, progress, speed, eta,
+            priority, error_message, media_format, file_path, duration_secs,
+            submitted_by_user_id, email_source, notes, created_at, updated_at
+        )
+        SELECT
+            id, url, slug, journalist, keyword, index_str, status, progress, speed, eta,
+            priority, error_message, media_format, file_path, duration_secs,
+            submitted_by_user_id, email_source, notes, created_at, updated_at
+        FROM queue;
+
+        DROP TABLE queue;
+        ALTER TABLE queue_new RENAME TO queue;
+
+        -- Rows left mid-flight by the old code have no owner and no lease, so
+        -- nothing will ever finish them. They are orphans by definition: record
+        -- the stage they died in, then requeue.
+        UPDATE queue SET stage = 'EXTRACT'   WHERE status = 'EXTRACTING';
+        UPDATE queue SET stage = 'DOWNLOAD'  WHERE status = 'DOWNLOADING';
+        UPDATE queue SET stage = 'TRANSCODE' WHERE status = 'TRANSCODING';
+        UPDATE queue SET stage = 'REWRAP'    WHERE status = 'REWRAPPING';
+        UPDATE queue SET status = 'PENDING', stage = 'QUEUED'
+            WHERE status IN ('EXTRACTING','DOWNLOADING','TRANSCODING','REWRAPPING');
+        UPDATE queue SET stage = 'DONE' WHERE status IN ('COMPLETED','COMPLETED_MANUAL');
+
+        CREATE INDEX idx_queue_status_prio ON queue(status, priority DESC, created_at ASC);
+        CREATE INDEX idx_queue_url_norm    ON queue(url_normalized);
+        CREATE INDEX idx_queue_lease       ON queue(status, lease_expires_at);
+
+        -- Per-job timeline shown in the MCR job drawer.
+        CREATE TABLE job_events (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id  INTEGER NOT NULL,
+            at      TEXT NOT NULL,
+            stage   TEXT,
+            level   TEXT,
+            message TEXT,
+            FOREIGN KEY(job_id) REFERENCES queue(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_job_events_job ON job_events(job_id, id);
+
+        -- Journalist aliases for Greek name resolution (plan P4.3), as a JSON
+        -- array. Declared here so the roster survives a Phase 4 restart.
+        ALTER TABLE journalists ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]';
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -271,14 +370,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("omni.db");
 
-        // Create a v1 database, then pretend this build has a newer target by
-        // resetting the recorded version so `apply` has work to do.
-        {
-            let mut conn = Connection::open(&db).unwrap();
-            apply(&mut conn, Some(&db)).unwrap();
-            conn.execute("DELETE FROM schema_version", []).unwrap();
-        }
-
+        // Opening creates the file, so `apply` has an existing database to back
+        // up before it runs anything.
         let mut conn = Connection::open(&db).unwrap();
         apply(&mut conn, Some(&db)).unwrap();
 
@@ -291,5 +384,87 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with("omni.db.v0."));
+
+        // A second start-up has nothing to migrate, so it must not spam the
+        // backup directory on every service restart.
+        let mut conn = Connection::open(&db).unwrap();
+        apply(&mut conn, Some(&db)).unwrap();
+        let after = std::fs::read_dir(tmp.path().join("backups")).unwrap().count();
+        assert_eq!(after, 1, "a no-op start-up wrote another backup");
+    }
+
+    /// Upgrading a real v1 database: the rows survive, the UNIQUE(url)
+    /// constraint is gone, and jobs the old code left mid-flight are requeued.
+    #[test]
+    fn v1_database_upgrades_without_losing_jobs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Build a v1 database exactly as the old code would have left it.
+        conn.execute_batch(MIGRATIONS[0].1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO queue (url, slug, status) VALUES
+                ('https://www.youtube.com/watch?v=a', '1_PAPADAKI_ONE', 'COMPLETED'),
+                ('https://www.youtube.com/watch?v=b', '2_PAPADAKI_TWO', 'DOWNLOADING'),
+                ('https://www.youtube.com/watch?v=c', '3_PAPADAKI_TRE', 'TRANSCODING'),
+                ('https://www.youtube.com/watch?v=d', '4_PAPADAKI_FOR', 'REQUIRES_REVIEW');",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (1, '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        apply(&mut conn, None).unwrap();
+
+        // Nothing lost.
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 4, "jobs were lost rebuilding the queue table");
+
+        // Jobs the old code abandoned mid-flight are requeued, not stranded
+        // forever in DOWNLOADING/TRANSCODING with no owner (defect D-02).
+        let requeued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM queue WHERE status='PENDING' AND stage='QUEUED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(requeued, 2, "orphaned in-flight jobs were not requeued");
+
+        // Terminal states are untouched.
+        let completed: i64 = conn
+            .query_row("SELECT COUNT(*) FROM queue WHERE status='COMPLETED'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(completed, 1);
+        let review: i64 = conn
+            .query_row("SELECT COUNT(*) FROM queue WHERE status='REQUIRES_REVIEW'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(review, 1);
+
+        // UNIQUE(url) is gone (defect D-10): the same link must be queueable
+        // again for a different journalist or after a discard.
+        conn.execute(
+            "INSERT INTO queue (url, slug, status) VALUES ('https://www.youtube.com/watch?v=a', '9_NIKOLAOU_AGAIN', 'PENDING')",
+            [],
+        )
+        .expect("re-queuing a previously seen URL must be allowed");
+
+        // New columns are present and defaulted.
+        let (attempts, max_attempts, stage): (i64, i64, String) = conn
+            .query_row(
+                "SELECT attempts, max_attempts, stage FROM queue WHERE slug='9_NIKOLAOU_AGAIN'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((attempts, max_attempts, stage.as_str()), (0, 3, "QUEUED"));
     }
 }
