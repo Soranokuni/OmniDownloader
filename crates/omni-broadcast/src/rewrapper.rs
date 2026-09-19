@@ -3,6 +3,24 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::info;
 
+
+/// Build the bmxtranswrap argument vector.
+///
+/// Pure, so the broadcast compliance tests assert the flags this process will
+/// actually run (plan P0.4). SMPTE RDD9 OP1a at 25 fps is what Dalet Galaxy
+/// ingests; anything else is rejected or mis-plays.
+pub fn build_args(source_mxf: &Path, output_mxf: &Path) -> Vec<String> {
+    vec![
+        "-t".into(),
+        "rdd9".into(),
+        "--tc-rate".into(),
+        "25".into(),
+        "-o".into(),
+        output_mxf.to_string_lossy().into_owned(),
+        source_mxf.to_string_lossy().into_owned(),
+    ]
+}
+
 pub struct Rewrapper {
     bmxtranswrap_path: PathBuf,
 }
@@ -24,15 +42,7 @@ impl Rewrapper {
         }
 
         let mut cmd = Command::new(&self.bmxtranswrap_path);
-        cmd.args([
-            "-t",
-            "rdd9",
-            "--tc-rate",
-            "25",
-            "-o",
-            final_temp_mxf.to_string_lossy().as_ref(),
-            intermediate_mxf.to_string_lossy().as_ref(),
-        ]);
+        cmd.args(build_args(intermediate_mxf, &final_temp_mxf));
 
         #[cfg(windows)]
         {
