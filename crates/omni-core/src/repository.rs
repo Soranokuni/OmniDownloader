@@ -8,11 +8,15 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::auth::hash_password;
+use crate::migrations;
 use crate::models::{AuditLog, Job, JobStatus, Journalist, User, UserRole};
+use crate::timestamps;
 
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
+    /// Used for the pre-migration backup; `None` for in-memory test databases.
+    db_path: Option<Arc<Path>>,
 }
 
 impl Repository {
@@ -31,81 +35,18 @@ impl Repository {
 
         let repo = Self {
             pool: Arc::new(pool),
+            db_path: Some(Arc::from(path.to_path_buf())),
         };
         repo.run_migrations()?;
         Ok(repo)
     }
 
     fn run_migrations(&self) -> Result<()> {
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
 
-        conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA busy_timeout = 30000;
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('admin', 'open_mcr', 'user')),
-                full_name TEXT NOT NULL,
-                journalist_surname TEXT DEFAULT NULL,
-                is_active INTEGER DEFAULT 1,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                expires_at DATETIME NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT NOT NULL UNIQUE,
-                slug TEXT NOT NULL,
-                journalist TEXT NOT NULL DEFAULT 'MCR',
-                keyword TEXT NOT NULL DEFAULT 'ASSET',
-                index_str TEXT NOT NULL DEFAULT '1',
-                status TEXT NOT NULL,
-                progress REAL DEFAULT 0.0,
-                speed TEXT DEFAULT '0 Mbps',
-                eta TEXT DEFAULT '--:--',
-                priority INTEGER DEFAULT 0,
-                error_message TEXT DEFAULT NULL,
-                media_format TEXT DEFAULT 'Sony XDCAM HD422 1080i50 (MXF RDD9)',
-                file_path TEXT DEFAULT NULL,
-                duration_secs REAL DEFAULT 0.0,
-                submitted_by_user_id INTEGER DEFAULT NULL,
-                email_source TEXT DEFAULT NULL,
-                notes TEXT DEFAULT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(submitted_by_user_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS journalists (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                surname TEXT NOT NULL UNIQUE,
-                full_name TEXT NOT NULL,
-                emails TEXT NOT NULL,
-                default_priority INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                level TEXT NOT NULL,
-                category TEXT NOT NULL,
-                message TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            "#,
-        )?;
+        conn.execute_batch(migrations::CONNECTION_PRAGMAS)?;
+        migrations::apply(&mut conn, self.db_path.as_deref())
+            .context("Schema migration failed; refusing to start against a half-migrated database")?;
 
         // Check if any admin exists. If not, seed default admin account
         let admin_count: i64 = conn.query_row(
@@ -170,7 +111,7 @@ impl Repository {
             INSERT INTO queue (
                 url, slug, journalist, keyword, index_str, priority, status,
                 submitted_by_user_id, notes, email_source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             "#,
         )?;
 
@@ -195,10 +136,10 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        let maybe_row: Option<(i64, String, String, String, String, String, i32, Option<String>, Option<i64>, Option<String>, Option<String>)> = {
+        let maybe_row: Option<(i64, String, String, String, String, String, i32, Option<String>, Option<i64>, Option<String>, Option<String>, Option<String>)> = {
             let mut stmt = tx.prepare(
                 r#"
-                SELECT id, url, slug, journalist, keyword, index_str, priority, error_message, submitted_by_user_id, email_source, notes
+                SELECT id, url, slug, journalist, keyword, index_str, priority, error_message, submitted_by_user_id, email_source, notes, created_at
                 FROM queue
                 WHERE status = 'PENDING'
                 ORDER BY priority DESC, created_at ASC
@@ -210,16 +151,16 @@ impl Repository {
                 Some((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
                     row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                    row.get(10)?
+                    row.get(10)?, row.get(11)?
                 ))
             } else {
                 None
             }
         };
 
-        if let Some((id, url, slug, journalist, keyword, index_str, priority, error_message, submitted_by, email_source, notes)) = maybe_row {
+        if let Some((id, url, slug, journalist, keyword, index_str, priority, error_message, submitted_by, email_source, notes, row_created_at)) = maybe_row {
             tx.execute(
-                "UPDATE queue SET status = 'DOWNLOADING', progress = 0.0, speed = '0 Mbps', eta = '--:--', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE queue SET status = 'DOWNLOADING', progress = 0.0, speed = '0 Mbps', eta = '--:--', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
                 params![id],
             )?;
             tx.commit()?;
@@ -243,8 +184,9 @@ impl Repository {
                 submitted_by_user_id: submitted_by,
                 email_source,
                 notes,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
+                // A freshly leased job: these are the values just written.
+                created_at: timestamps::parse_opt(row_created_at),
+                updated_at: Some(Utc::now()),
             }));
         }
 
@@ -261,7 +203,7 @@ impl Repository {
                 error_message = COALESCE(?, error_message),
                 file_path = COALESCE(?, file_path),
                 duration_secs = COALESCE(?, duration_secs),
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
             WHERE id = ?
             "#,
             params![status.as_str(), error_message, file_path, duration, id],
@@ -272,7 +214,7 @@ impl Repository {
     pub fn update_job_progress(&self, id: i64, progress: f64, speed: &str, eta: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
-            "UPDATE queue SET progress = ?, speed = ?, eta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE queue SET progress = ?, speed = ?, eta = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
             params![progress, speed, eta, id],
         )?;
         Ok(())
@@ -340,7 +282,7 @@ impl Repository {
                 r#"
                 UPDATE queue
                 SET url = ?, status = 'PENDING', progress = 0.0, speed = '0 Mbps', eta = '--:--',
-                    error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                    error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                 WHERE id = ?
                 "#,
                 params![url, id],
@@ -350,7 +292,7 @@ impl Repository {
                 r#"
                 UPDATE queue
                 SET status = 'PENDING', progress = 0.0, speed = '0 Mbps', eta = '--:--',
-                    error_message = NULL, updated_at = CURRENT_TIMESTAMP
+                    error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                 WHERE id = ?
                 "#,
                 params![id],
@@ -416,8 +358,8 @@ impl Repository {
             submitted_by_user_id: row.get("submitted_by_user_id")?,
             email_source: row.get("email_source")?,
             notes: row.get("notes")?,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: timestamps::parse_opt(row.get("created_at").ok()),
+            updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
         })
     }
 
@@ -464,7 +406,7 @@ impl Repository {
                 full_name: row.get("full_name")?,
                 journalist_surname: row.get("journalist_surname")?,
                 is_active: row.get::<_, i32>("is_active")? == 1,
-                created_at: Utc::now(),
+                created_at: timestamps::parse_opt(row.get("created_at").ok()),
             }))
         } else {
             Ok(None)
@@ -485,7 +427,7 @@ impl Repository {
                 full_name: row.get("full_name")?,
                 journalist_surname: row.get("journalist_surname")?,
                 is_active: row.get::<_, i32>("is_active")? == 1,
-                created_at: Utc::now(),
+                created_at: timestamps::parse_opt(row.get("created_at").ok()),
             }))
         } else {
             Ok(None)
@@ -505,7 +447,7 @@ impl Repository {
                 full_name: row.get("full_name")?,
                 journalist_surname: row.get("journalist_surname")?,
                 is_active: row.get::<_, i32>("is_active")? == 1,
-                created_at: Utc::now(),
+                created_at: timestamps::parse_opt(row.get("created_at").ok()),
             })
         })?;
         let mut list = Vec::new();
@@ -519,7 +461,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let hash = hash_password(new_pass)?;
         conn.execute(
-            "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE users SET password_hash = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
             params![hash, user_id],
         )?;
         self.log_audit("INFO", "AUTH", &format!("Password updated for User #{}", user_id))?;
@@ -534,11 +476,23 @@ impl Repository {
     }
 
     pub fn create_session(&self, user_id: i64, token: &str, expires_in_days: i64) -> Result<()> {
+        self.create_session_for(user_id, token, Duration::days(expires_in_days))
+    }
+
+    /// Create a session with an arbitrary lifetime.
+    ///
+    /// `expires_at` is stored in the same RFC3339 format the expiry query
+    /// compares against. The previous code wrote `to_rfc3339()`
+    /// (`2026-09-19T16:00:00+00:00`) and compared it with `CURRENT_TIMESTAMP`
+    /// (`2026-09-19 17:00:00`); SQLite compares those as text and `'T'` (0x54)
+    /// sorts above `' '` (0x20), so any session expiring *earlier the same day*
+    /// still authenticated.
+    pub fn create_session_for(&self, user_id: i64, token: &str, lifetime: Duration) -> Result<()> {
         let conn = self.pool.get()?;
-        let expires_at = Utc::now() + Duration::days(expires_in_days);
+        let expires_at = Utc::now() + lifetime;
         conn.execute(
             "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
-            params![token, user_id, expires_at.to_rfc3339()],
+            params![token, user_id, timestamps::format(expires_at)],
         )?;
         Ok(())
     }
@@ -550,7 +504,7 @@ impl Repository {
             SELECT u.*
             FROM users u
             JOIN sessions s ON u.id = s.user_id
-            WHERE s.token = ? AND s.expires_at > CURRENT_TIMESTAMP AND u.is_active = 1
+            WHERE s.token = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND u.is_active = 1
             "#,
         )?;
         let mut rows = stmt.query(params![token])?;
@@ -564,7 +518,7 @@ impl Repository {
                 full_name: row.get("full_name")?,
                 journalist_surname: row.get("journalist_surname")?,
                 is_active: row.get::<_, i32>("is_active")? == 1,
-                created_at: Utc::now(),
+                created_at: timestamps::parse_opt(row.get("created_at").ok()),
             }))
         } else {
             Ok(None)
@@ -593,7 +547,7 @@ impl Repository {
                 full_name: row.get("full_name")?,
                 emails,
                 default_priority: row.get("default_priority")?,
-                created_at: Utc::now(),
+                created_at: timestamps::parse_opt(row.get("created_at").ok()),
             })
         })?;
         let mut list = Vec::new();
@@ -646,7 +600,7 @@ impl Repository {
     pub fn log_audit(&self, level: &str, category: &str, message: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
-            "INSERT INTO audit_logs (level, category, message, timestamp) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO audit_logs (level, category, message, timestamp) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             params![level, category, message],
         )?;
         Ok(())
@@ -661,7 +615,7 @@ impl Repository {
                 level: row.get("level")?,
                 category: row.get("category")?,
                 message: row.get("message")?,
-                timestamp: Utc::now(),
+                timestamp: timestamps::parse_opt(row.get("timestamp").ok()),
             })
         })?;
         let mut list = Vec::new();
