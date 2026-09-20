@@ -104,17 +104,147 @@ Respond with ONLY valid JSON:
   ]
 }"#;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AuthMode {
-    #[serde(rename = "open_mcr")]
-    OpenMcr,
-    #[serde(rename = "strict")]
-    Strict,
+/// Security policy (plan P2.1, P2.2).
+///
+/// This replaces the old `auth_mode` enum. `auth_mode: "open_mcr"` was a global
+/// switch: it made `/mcr` and every read API reachable by *anyone* who could
+/// route to the port, which on a newsroom LAN is everyone. The replacement is
+/// an explicit allowlist of client networks, so the same convenience — MCR
+/// workstations never see a login screen — costs exactly the networks the
+/// operator names and nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Client networks that may use the MCR panel without logging in, in CIDR
+    /// form. An **empty list means login for everyone** — that is the safe
+    /// reading, and it is what a station that never configures this gets once
+    /// it removes the loopback default.
+    #[serde(default = "default_mcr_open_networks")]
+    pub mcr_open_networks: Vec<String>,
+
+    /// Read the client IP from `X-Forwarded-For` instead of the socket peer.
+    ///
+    /// Off by default, and even when on it is only honoured when the *direct*
+    /// peer is in [`Self::trusted_proxies`]. A forwarded header from an
+    /// untrusted peer is client-controlled text, so trusting it unconditionally
+    /// would let anyone claim to be on the allowlist.
+    #[serde(default)]
+    pub trust_proxy_header: bool,
+
+    /// Peers whose `X-Forwarded-For` is believed, in CIDR form.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// Absolute session lifetime for `user` accounts.
+    #[serde(default = "default_session_hours_user")]
+    pub session_hours_user: i64,
+
+    /// Absolute session lifetime for `admin` accounts — deliberately the
+    /// shortest, because an admin session can repoint the watchfolder.
+    #[serde(default = "default_session_hours_admin")]
+    pub session_hours_admin: i64,
+
+    /// Absolute session lifetime for MCR accounts. Long, because the MCR desk
+    /// is a shared always-on workstation in a controlled room and a login
+    /// prompt mid-bulletin is its own kind of outage.
+    #[serde(default = "default_session_days_mcr")]
+    pub session_days_mcr: i64,
+
+    /// Idle timeout: a session unused for this long is ended, whatever its
+    /// absolute lifetime. This is what protects an unattended browser on a
+    /// shared MCR workstation, which the absolute window alone does not.
+    #[serde(default = "default_session_idle_hours")]
+    pub session_idle_hours: i64,
+
+    /// Failed logins allowed per client IP per five minutes before a 429.
+    #[serde(default = "default_login_rate_limit")]
+    pub login_rate_limit_per_5min: u32,
+
+    /// Failed logins allowed per account per hour, independent of source IP.
+    /// This is the one that matters against a distributed guess.
+    #[serde(default = "default_login_rate_limit_account")]
+    pub login_rate_limit_per_account_hour: u32,
 }
 
-impl Default for AuthMode {
+fn default_mcr_open_networks() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+}
+fn default_session_hours_user() -> i64 {
+    12
+}
+fn default_session_hours_admin() -> i64 {
+    8
+}
+fn default_session_days_mcr() -> i64 {
+    30
+}
+fn default_session_idle_hours() -> i64 {
+    12
+}
+fn default_login_rate_limit() -> u32 {
+    5
+}
+fn default_login_rate_limit_account() -> u32 {
+    10
+}
+
+impl Default for SecurityConfig {
     fn default() -> Self {
-        AuthMode::OpenMcr
+        Self {
+            mcr_open_networks: default_mcr_open_networks(),
+            trust_proxy_header: false,
+            trusted_proxies: Vec::new(),
+            session_hours_user: default_session_hours_user(),
+            session_hours_admin: default_session_hours_admin(),
+            session_days_mcr: default_session_days_mcr(),
+            session_idle_hours: default_session_idle_hours(),
+            login_rate_limit_per_5min: default_login_rate_limit(),
+            login_rate_limit_per_account_hour: default_login_rate_limit_account(),
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Parse [`Self::mcr_open_networks`], dropping and logging bad entries.
+    pub fn open_networks(&self) -> crate::net::CidrSet {
+        crate::net::CidrSet::parse_lossy(&self.mcr_open_networks)
+    }
+
+    /// Parse [`Self::trusted_proxies`], dropping and logging bad entries.
+    pub fn trusted_proxy_networks(&self) -> crate::net::CidrSet {
+        crate::net::CidrSet::parse_lossy(&self.trusted_proxies)
+    }
+}
+
+/// TLS material for the web listener (plan P2.7). Both paths must be set for
+/// HTTPS to be served; either one alone is a misconfiguration and is refused at
+/// start-up rather than silently falling back to plaintext.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+}
+
+impl TlsConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.cert_path.is_some() && self.key_path.is_some()
+    }
+
+    /// `Ok(None)` when TLS is off, `Err` when it is half-configured.
+    pub fn resolve(&self, paths: &AppPaths) -> Result<Option<(PathBuf, PathBuf)>> {
+        match (&self.cert_path, &self.key_path) {
+            (Some(c), Some(k)) => Ok(Some((paths.resolve(c), paths.resolve(k)))),
+            (None, None) => Ok(None),
+            (Some(_), None) => anyhow::bail!(
+                "web.tls.cert_path is set but web.tls.key_path is not; refusing to start \
+                 rather than silently serving the panels over plaintext HTTP"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "web.tls.key_path is set but web.tls.cert_path is not; refusing to start \
+                 rather than silently serving the panels over plaintext HTTP"
+            ),
+        }
     }
 }
 
@@ -139,7 +269,10 @@ pub struct AppConfig {
     pub web_host: String,
 
     #[serde(default)]
-    pub auth_mode: AuthMode,
+    pub security: SecurityConfig,
+
+    #[serde(default)]
+    pub tls: TlsConfig,
 
     #[serde(default = "default_concurrent")]
     pub max_concurrent_downloads: usize,
@@ -264,7 +397,8 @@ impl Default for AppConfig {
             bin_dir: default_bin_dir(),
             web_port: default_web_port(),
             web_host: default_web_host(),
-            auth_mode: AuthMode::default(),
+            security: SecurityConfig::default(),
+            tls: TlsConfig::default(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
             email_provider: default_email_provider(),
@@ -291,6 +425,36 @@ impl Default for AppConfig {
     }
 }
 
+/// Tell the operator, loudly, that `auth_mode` no longer does anything.
+///
+/// Serde ignores unknown fields, so an existing deployment that ran
+/// `auth_mode: "open_mcr"` would upgrade into the new loopback-only default and
+/// the MCR desk would meet a login screen with no explanation. The tightening
+/// is deliberate — the old switch was open to the whole LAN — but it must not
+/// be silent.
+fn warn_on_removed_auth_mode(raw: &str, path: &Path) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(mode) = value.get("auth_mode").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if mode == "open_mcr" {
+        tracing::warn!(
+            config = ?path,
+            "`auth_mode: open_mcr` has been removed: it opened the MCR panel to every host \
+             that could reach the port. Access without login is now granted per client \
+             network. Set security.mcr_open_networks to the newsroom subnet (e.g. \
+             [\"10.20.0.0/16\"]); until then only loopback skips the login screen."
+        );
+    } else {
+        tracing::warn!(
+            config = ?path,
+            "`auth_mode` has been removed and is ignored; see security.mcr_open_networks."
+        );
+    }
+}
+
 impl AppConfig {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref();
@@ -299,6 +463,7 @@ impl AppConfig {
                 .with_context(|| format!("Failed reading config file at {:?}", p))?;
             let config: AppConfig = serde_json::from_str(&content)
                 .with_context(|| format!("Failed parsing JSON from {:?}", p))?;
+            warn_on_removed_auth_mode(&content, p);
             Ok(config)
         } else {
             let config = AppConfig::default();
