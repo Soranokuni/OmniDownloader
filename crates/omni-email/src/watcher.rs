@@ -5,6 +5,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use omni_core::config::AppConfig;
+use omni_core::health::{Check, HealthState};
 use omni_core::models::JobStatus;
 use omni_core::repository::Repository;
 
@@ -17,12 +18,60 @@ pub struct EmailWatcher {
     config: AppConfig,
     repo: Repository,
     llm: Arc<LlmClient>,
+    /// Where the poll result is reported (plan P6.2). `None` in tests and in
+    /// any caller that does not care.
+    health: Option<HealthState>,
+}
+
+/// Reduce an error chain to one line an operator can act on.
+///
+/// The full chain goes to the log and to `last_error`; this is what the MCR
+/// panel shows, so it must be short, must name the *first* cause rather than
+/// the outermost wrapper, and must never carry a credential — which is why it
+/// takes the anyhow root and not the formatted `{:#}` chain.
+fn short_reason(e: &anyhow::Error) -> String {
+    let root = e.chain().last().map(|c| c.to_string()).unwrap_or_default();
+    let text = if root.is_empty() { e.to_string() } else { root };
+    let lower = text.to_ascii_lowercase();
+
+    // The two that matter are worth naming plainly, because the remedy differs
+    // and an operator should not have to read an IMAP error to tell them apart.
+    if lower.contains("authenticationfailed")
+        || lower.contains("login failed")
+        || lower.contains("invalid credentials")
+    {
+        return "mailbox rejected the credentials".to_string();
+    }
+    if lower.contains("timed out") || lower.contains("connect") || lower.contains("dns") {
+        return "cannot reach the mail server".to_string();
+    }
+    text.chars().take(120).collect()
 }
 
 impl EmailWatcher {
     pub fn new(config: AppConfig, repo: Repository) -> Self {
         let llm = Arc::new(LlmClient::new(&config.ollama_endpoint, &config.ollama_model));
-        Self { config, repo, llm }
+        Self {
+            config,
+            repo,
+            llm,
+            health: None,
+        }
+    }
+
+    /// Report poll outcomes into the shared health state.
+    pub fn with_health(mut self, health: HealthState) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    fn report_health(&self, check: Check) {
+        if let Some(h) = &self.health {
+            // `set_if_changed` keeps `last_ok` meaning "when this last worked".
+            // A 20-second poll rewriting an identical success would make the
+            // timestamp advance during an outage.
+            h.set_if_changed(omni_core::health::checks::MAIL, check);
+        }
     }
 
     pub fn test_connection(server: &str, port: u16, email: &str, pass: &str) -> Result<()> {
@@ -55,6 +104,7 @@ impl EmailWatcher {
                 _ = tokio::time::sleep(poll_interval) => {
                     if self.config.email_address.is_empty() || self.config.email_password.is_empty() {
                         warn!("EmailWatcher: Credentials not configured. Sleeping...");
+                        self.report_health(Check::disabled("Mailbox"));
                         continue;
                     }
 
@@ -64,11 +114,25 @@ impl EmailWatcher {
                         Ok(Err(e)) => {
                             error!("EmailWatcher error: {:#}", e);
                             let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("IMAP poll error: {}", e));
+                            // The panel used to say "Mail: Active" through
+                            // exactly this (defect W-09). A short reason, not
+                            // the whole chain: this string is shown to an
+                            // operator, and it must not carry a credential.
+                            self.report_health(
+                                Check::degraded(short_reason(&e)).with_error(format!("{e:#}")),
+                            );
                         }
                         Err(join_err) => {
                             error!("EmailWatcher task error: {}", join_err);
+                            self.report_health(Check::degraded("mail poll task failed"));
                         }
-                        _ => {}
+                        Ok(Ok(())) => {
+                            self.report_health(Check::ok(format!(
+                                "polling {} every {}s",
+                                self.config.imap_server,
+                                poll_interval.as_secs()
+                            )));
+                        }
                     }
                 }
             }

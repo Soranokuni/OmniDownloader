@@ -12,3 +12,11 @@ thiserror = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_System_EventLog",
+    "Win32_System_Registry",
+]

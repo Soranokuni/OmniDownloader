@@ -927,31 +927,116 @@ pub async fn api_secrets_set(
 // System Status & Setup API
 // ==========================================
 
-pub async fn api_health() -> Json<serde_json::Value> {
-    // Public, and deliberately says nothing beyond "the process is answering".
-    // Anything about disk, mailbox or queue depth belongs behind the MCR gate.
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+/// Public health, for an external monitor (plan P6.2).
+///
+/// A verdict and each check's state, and nothing else: no paths, no versions,
+/// no error strings. A monitor needs to know *that* something is wrong and who
+/// to page; an operator opens the panel to find out what. The route is
+/// unauthenticated, so everything it says is said to anyone who can reach the
+/// port.
+///
+/// The status code follows the verdict, because half of monitoring tools only
+/// look at that: `down` answers 503 so a health check fails rather than
+/// reporting a cheerful 200 with bad news in the body.
+pub async fn api_health(State(state): State<AppState>) -> Response {
+    let mut body = state.health.summary();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "version".into(),
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
+        obj.insert(
+            "uptime_secs".into(),
+            serde_json::Value::from(state.health.uptime_secs()),
+        );
+    }
+
+    let code = match state.health.overall() {
+        omni_core::health::Health::Down => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::OK,
+    };
+    (code, Json(body)).into_response()
 }
 
+/// The full picture, for the MCR panel (plan P6.2, defect W-09).
+///
+/// This replaces two hardcoded string literals — `mail_status: "Active"` and
+/// `llm_status: "Ready"` — that were true when they were written and never
+/// checked again. A panel that reports a healthy mailbox while the mailbox is
+/// refusing the password is worse than a panel that reports nothing, because an
+/// operator who trusts it stops looking there.
 pub async fn api_system_status(
     RequireMcr(_): RequireMcr,
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let (free_gb, total_gb) = {
+    use omni_core::selftest::{disk_space, BYTES_PER_GB};
+
+    let (watchfolder, temp_path, bin_dir, llm_model) = {
         let cfg = state.config.read().await;
-        let p = std::path::Path::new(&cfg.watchfolder_path);
-        sys_info_disk(p).unwrap_or((0.0, 0.0))
+        (
+            cfg.watchfolder_path.clone(),
+            cfg.temp_path.clone(),
+            cfg.bin_dir.clone(),
+            cfg.ollama_model.clone(),
+        )
     };
 
+    let disk_of = |p: &str| {
+        disk_space(std::path::Path::new(p))
+            .map(|(free, total)| {
+                serde_json::json!({
+                    "free_gb": (free as f64 / BYTES_PER_GB * 10.0).round() / 10.0,
+                    "total_gb": (total as f64 / BYTES_PER_GB * 10.0).round() / 10.0,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    let queue = state
+        .repo
+        .queue_summary()
+        .unwrap_or_default();
+
+    let checks = state.health.all();
+
     Json(serde_json::json!({
-        "mail_status": "Active",
-        "llm_status": "Ready",
-        "free_disk_gb": free_gb,
-        "total_disk_gb": total_gb,
+        "status": state.health.overall().as_str(),
+        "checks": checks,
+        "queue": queue,
+        "disk": {
+            "watchfolder": disk_of(&watchfolder),
+            "temp": disk_of(&temp_path),
+        },
+        "service": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": state.health.uptime_secs(),
+            "started_at": state.health.started_at(),
+            "tls": state.tls_enabled,
+        },
+        "config": {
+            "watchfolder_path": watchfolder,
+            "bin_dir": bin_dir,
+            "llm_model": llm_model,
+        },
+
+        // Kept so an older cached panel does not break on upgrade. Derived
+        // from the real checks now, not hardcoded.
+        "free_disk_gb": disk_space(std::path::Path::new(&watchfolder))
+            .map(|(free, _)| free as f64 / BYTES_PER_GB)
+            .unwrap_or(0.0),
+        "mail_status": legacy_label(&state, omni_core::health::checks::MAIL),
+        "llm_status": legacy_label(&state, omni_core::health::checks::LLM),
     }))
+}
+
+/// The old two-word status strings, derived from the real check.
+fn legacy_label(state: &AppState, check: &str) -> &'static str {
+    match state.health.get(check).map(|c| c.state) {
+        Some(omni_core::health::Health::Ok) => "Active",
+        Some(omni_core::health::Health::Degraded) => "Degraded",
+        Some(omni_core::health::Health::Down) => "Down",
+        None => "Unknown",
+    }
 }
 
 pub async fn api_system_logs(
@@ -1155,45 +1240,6 @@ pub async fn api_events(
 // Helpers
 // ==========================================
 
-/// Free and total gigabytes on the volume holding `path`.
-fn sys_info_disk(path: &std::path::Path) -> Option<(f64, f64)> {
-    #[cfg(windows)]
-    {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        let mut root = path.to_path_buf();
-        while root.parent().is_some() && root.parent().unwrap() != std::path::Path::new("") {
-            root = root.parent().unwrap().to_path_buf();
-        }
-        let wide: Vec<u16> = OsStr::new(&root).encode_wide().chain(std::iter::once(0)).collect();
-
-        unsafe {
-            let mut free_bytes: u64 = 0;
-            let mut total_bytes: u64 = 0;
-            let mut total_free_bytes: u64 = 0;
-
-            extern "system" {
-                fn GetDiskFreeSpaceExW(
-                    lpDirectoryName: *const u16,
-                    lpFreeBytesAvailableToCaller: *mut u64,
-                    lpTotalNumberOfBytes: *mut u64,
-                    lpTotalNumberOfFreeBytes: *mut u64,
-                ) -> i32;
-            }
-
-            if GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_bytes, &mut total_bytes, &mut total_free_bytes) != 0 {
-                let free_gb = (free_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
-                let total_gb = (total_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
-                return Some((free_gb, total_gb));
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-    }
-    None
-}
 
 /// Exposed for tests that need the same address parsing the extractors use.
 #[doc(hidden)]

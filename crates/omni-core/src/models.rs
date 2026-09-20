@@ -259,6 +259,24 @@ pub struct Journalist {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Queue depth, for the status panel (plan P6.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueueSummary {
+    pub pending: i64,
+    /// Anything currently being worked on, whatever stage it is in.
+    pub running: i64,
+    pub review: i64,
+    pub manual: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub total: i64,
+    /// How long the oldest waiting job has been waiting. `None` when nothing is
+    /// pending. This, not the pending count, is what says "the pipeline has
+    /// stalled": twenty pending jobs are normal right after a rundown arrives
+    /// and alarming an hour later.
+    pub oldest_pending_age_secs: Option<i64>,
+}
+
 /// One row of `login_attempts` (plan P2.2).
 ///
 /// Records the *attempt*, never the credential: the password is not a field

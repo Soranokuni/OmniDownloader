@@ -17,6 +17,8 @@ use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStage, JobStatus};
 use omni_core::repository::Repository;
 use omni_core::secrets::SecretStore;
+use omni_core::health::HealthState;
+use omni_core::logging::{LogGuard, Redactions};
 use omni_core::update_gate::UpdateGate;
 use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
@@ -108,22 +110,42 @@ enum ServiceAction {
     Status,
 }
 
+/// Set up logging for whichever subcommand is running.
+///
+/// The daemon writes rotated files; `run` additionally writes the console,
+/// because a human is watching it. `run-service` does not, because the SCM
+/// discards stdout — which is exactly how the previous build managed to throw
+/// away every diagnostic it produced in the newsroom.
+///
+/// The short-lived subcommands get console-only logging: they should not open,
+/// rotate or prune the file the running service owns.
+fn init_logging(cli: &Cli, paths: &AppPaths) -> Result<Option<LogGuard>> {
+    let daemon_mode = matches!(
+        cli.command,
+        None | Some(Commands::Run) | Some(Commands::RunService)
+    );
+    if !daemon_mode {
+        omni_core::logging::init_console_only("info,chromiumoxide=off");
+        return Ok(None);
+    }
+
+    // Read the log settings straight from the file: this runs before the
+    // daemon's own config load, and a config that fails to parse should still
+    // produce a log saying so.
+    let config = AppConfig::load_from_file(&paths.config).unwrap_or_default();
+    let console = !matches!(cli.command, Some(Commands::RunService));
+
+    // Seed the redaction set from the secret store before the first line is
+    // written, so nothing can be logged in the window before it is populated.
+    let store = SecretStore::new(paths.resolve("data/secrets.bin"));
+    let redactions = Redactions::new(store.all_values());
+
+    let guard = omni_core::logging::init(&paths.logs, &config.log, console, redactions)?;
+    Ok(Some(guard))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            tracing_subscriber::EnvFilter::new(
-                "info,omni_web=info,omni_email=info,omni_broadcast=info,omni_browser=info",
-            )
-        })
-        .add_directive("chromiumoxide=off".parse().unwrap())
-        .add_directive("chromiumoxide::conn=off".parse().unwrap())
-        .add_directive("chromiumoxide::handler=off".parse().unwrap());
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
-
     let cli = Cli::parse();
 
     // Anchor every relative path to the install directory exactly once, before
@@ -135,6 +157,12 @@ async fn main() -> Result<()> {
     paths
         .ensure_dirs()
         .with_context(|| format!("Failed creating the directory tree under {:?}", paths.root))?;
+
+    // Logging is set up *after* paths, because the log directory is one of
+    // them, and only the long-running commands write files: a `secrets list`
+    // must not rotate or prune the log the running service is writing to
+    // (plan P6.1, defect W-11).
+    let _log_guard = init_logging(&cli, &paths)?;
     info!("Install root: {:?}", paths.root);
 
     // The adblock cache must be absolute before any sniff can run.
@@ -354,9 +382,37 @@ async fn run_daemon(
     // running download (plan P2.9, defect D-16).
     let update_gate = UpdateGate::new();
 
+    // Live subsystem health, shared with the web panels (plan P6.2, W-09).
+    let health = HealthState::new();
+
+    // Everything the self-test finds used to surface as a *job* failure,
+    // attributed to whatever link happened to be at the front of the queue —
+    // a missing bmxtranswrap.exe reported as a problem with someone's YouTube
+    // URL, once per job. It never blocks start-up: refusing to come up is the
+    // one outcome an operator cannot diagnose from the MCR desk.
+    match omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await {
+        omni_core::health::Health::Ok => info!("Start-up self-test passed"),
+        verdict => {
+            for (name, check) in health.all() {
+                if check.state != omni_core::health::Health::Ok {
+                    warn!(
+                        "Self-test [{name}]: {} — {}",
+                        check.state.as_str(),
+                        check.detail.as_deref().unwrap_or("no detail")
+                    );
+                }
+            }
+            warn!(
+                "Start-up self-test reports {}; the daemon is running and the panel shows detail",
+                verdict.as_str()
+            );
+        }
+    }
+
     // 1. Start Embedded Web Server
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
-        .with_secret_store(secret_store.clone());
+        .with_secret_store(secret_store.clone())
+        .with_health(health.clone());
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();
@@ -369,13 +425,52 @@ async fn run_daemon(
 
     // 2. Start Email Monitoring Watchdog
     if !config.email_address.is_empty() {
-        let email_watcher = Arc::new(EmailWatcher::new(config.clone(), repo.clone()));
+        let email_watcher = Arc::new(
+            EmailWatcher::new(config.clone(), repo.clone()).with_health(health.clone()),
+        );
         let email_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             email_watcher.start_polling_loop(email_rx).await;
         });
     } else {
         info!("Email monitoring disabled (no email address configured in config.json).");
+        health.set(
+            omni_core::health::checks::MAIL,
+            omni_core::health::Check::disabled("Mailbox"),
+        );
+    }
+
+    // 2b. LLM reachability.
+    //
+    // Polled rather than probed on demand, so the panel can say when it last
+    // worked. Degraded, never down: the parser is deterministic-first and the
+    // newsroom keeps running with the model offline — which is the whole point
+    // of that constraint, and the status must not imply otherwise.
+    {
+        let llm_health = health.clone();
+        let endpoint = config.ollama_endpoint.clone();
+        let model = config.ollama_model.clone();
+        let mut llm_rx = shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            let client = omni_email::llm::LlmClient::new(&endpoint, &model);
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = llm_rx.recv() => break,
+                    _ = tick.tick() => {
+                        let check = if client.ping().await {
+                            omni_core::health::Check::ok(format!("{model} at {endpoint}"))
+                        } else {
+                            omni_core::health::Check::degraded(format!(
+                                "{endpoint} unreachable; parsing continues without it"
+                            ))
+                        };
+                        llm_health.set_if_changed(omni_core::health::checks::LLM, check);
+                    }
+                }
+            }
+        });
     }
 
     // 3. Start Nightly yt-dlp & Adblock Auto-updater
@@ -760,6 +855,14 @@ async fn run_job(
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
             let message = format!("{e}");
+
+            // The full context chain, which carries each stage's stderr tail,
+            // into the job's own timeline (plan P6.1). `error_message` is the
+            // one line the MCR card shows; this is what an engineer needs an
+            // hour later, and putting it on the job means it survives log
+            // rotation and does not require finding the right file.
+            let diagnostic: String = format!("{e:#}").chars().take(8192).collect();
+            let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
 
             if code.is_retryable() && attempts < max_attempts {
                 let backoff = code.backoff(attempts);

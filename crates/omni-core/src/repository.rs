@@ -11,7 +11,8 @@ use tracing::{info, warn};
 use crate::auth::hash_password;
 use crate::migrations;
 use crate::models::{
-    AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob, User,
+    AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob,
+    QueueSummary, User,
     UserRole,
 };
 use crate::timestamps;
@@ -743,6 +744,53 @@ impl Repository {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    /// Queue depth by status, plus the age of the oldest waiting job.
+    ///
+    /// One query rather than `get_all_jobs().len()`: the status panel refreshes
+    /// every few seconds and the archive grows without bound, so counting rows
+    /// by loading them would make the panel slower the longer the station runs
+    /// (defect W-12's smaller sibling).
+    pub fn queue_summary(&self) -> Result<QueueSummary> {
+        let conn = self.pool.get()?;
+
+        let mut summary = QueueSummary::default();
+        let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM queue GROUP BY status")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (status, count) = row?;
+            match status.as_str() {
+                "PENDING" => summary.pending += count,
+                "REQUIRES_REVIEW" => summary.review += count,
+                "MANUAL_DOWNLOAD" => summary.manual += count,
+                "COMPLETED" | "COMPLETED_MANUAL" => summary.completed += count,
+                "FAILED" => summary.failed += count,
+                // Everything else is a stage of "currently being worked on".
+                _ => summary.running += count,
+            }
+            summary.total += count;
+        }
+
+        // How long the front of the queue has been waiting. This is the number
+        // that tells an operator the pipeline has stalled, which a plain
+        // pending count does not: twenty pending jobs are normal after a big
+        // rundown and alarming an hour later.
+        let oldest: Option<String> = conn
+            .query_row(
+                "SELECT MIN(created_at) FROM queue WHERE status = 'PENDING'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        summary.oldest_pending_age_secs = oldest
+            .and_then(|s| timestamps::parse_opt(Some(s)))
+            .map(|t| (Utc::now() - t).num_seconds().max(0));
+
+        Ok(summary)
     }
 
     pub fn get_jobs_by_status(&self, status: JobStatus) -> Result<Vec<Job>> {
