@@ -95,9 +95,22 @@ mod windows_impl {
         Ok(())
     }
 
-    pub fn install(exe_path: &Path) -> Result<()> {
+    pub fn install(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
             .context("Failed opening Service Manager with CREATE_SERVICE access")?;
+
+        // `None` means LocalSystem, which is fine for a single machine writing
+        // to a local watchfolder — and wrong the moment the watchfolder is a
+        // UNC share, because LocalSystem authenticates to SMB as the *computer
+        // account*, which a file server will usually refuse (defect W-13). The
+        // caller warns about that; here we just honour what it decided.
+        let (account_name, account_password) = match account {
+            Some(a) => (
+                Some(OsString::from(&a.name)),
+                a.password.as_ref().map(OsString::from),
+            ),
+            None => (None, None),
+        };
 
         let service_info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
@@ -108,8 +121,8 @@ mod windows_impl {
             executable_path: exe_path.to_path_buf(),
             launch_arguments: vec![OsString::from("run-service")],
             dependencies: vec![],
-            account_name: None,
-            account_password: None,
+            account_name,
+            account_password,
         };
 
         let service = manager
@@ -117,7 +130,16 @@ mod windows_impl {
             .context("Failed creating Windows Service")?;
 
         let _ = service.set_description(SERVICE_DESCRIPTION);
-        info!("Successfully installed Windows Service: {}", SERVICE_NAME);
+        match account {
+            Some(a) => info!(
+                "Successfully installed Windows Service {} running as {}",
+                SERVICE_NAME, a.name
+            ),
+            None => info!(
+                "Successfully installed Windows Service {} running as LocalSystem",
+                SERVICE_NAME
+            ),
+        }
         Ok(())
     }
 
@@ -222,11 +244,46 @@ where
     return non_windows_impl::run_service(runner);
 }
 
-pub fn install_service(exe_path: &Path) -> Result<()> {
+/// The account a service runs as (plan P2.8, defect W-13).
+///
+/// `password: None` covers the accounts Windows does not take a password for:
+/// the virtual service account `NT SERVICE\OmniIngestService`, and the built-in
+/// `NT AUTHORITY\NetworkService` / `LocalService`.
+#[derive(Debug, Clone)]
+pub struct ServiceAccount {
+    pub name: String,
+    pub password: Option<String>,
+}
+
+impl ServiceAccount {
+    /// A domain or local account, with its password.
+    pub fn with_password(name: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            password: Some(password.into()),
+        }
+    }
+
+    /// True for the built-in accounts that take no password.
+    pub fn is_passwordless_builtin(name: &str) -> bool {
+        let n = name.trim().to_ascii_uppercase();
+        n.starts_with("NT SERVICE\\")
+            || n == "NT AUTHORITY\\NETWORKSERVICE"
+            || n == "NT AUTHORITY\\LOCALSERVICE"
+            || n == "NT AUTHORITY\\LOCALSYSTEM"
+            || n == "LOCALSYSTEM"
+    }
+}
+
+/// Install the service. `account` of `None` means LocalSystem.
+pub fn install_service(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
     #[cfg(windows)]
-    return windows_impl::install(exe_path);
+    return windows_impl::install(exe_path, account);
     #[cfg(not(windows))]
-    return non_windows_impl::install(exe_path);
+    {
+        let _ = account;
+        return non_windows_impl::install(exe_path);
+    }
 }
 
 pub fn uninstall_service() -> Result<()> {
@@ -257,3 +314,51 @@ pub fn query_service_status() -> Result<String> {
     return non_windows_impl::status();
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_accounts_that_take_no_password_are_recognised() {
+        // Prompting for a password for one of these and then passing an empty
+        // string makes CreateService fail with a misleading "logon failure".
+        for name in [
+            r"NT SERVICE\OmniIngestService",
+            r"nt service\omniingestservice",
+            r"NT AUTHORITY\NetworkService",
+            r"NT AUTHORITY\LocalService",
+            "LocalSystem",
+        ] {
+            assert!(
+                ServiceAccount::is_passwordless_builtin(name),
+                "{name} should not be prompted for a password"
+            );
+        }
+
+        for name in [r"CRETETV\svc_omni", r".\omniservice", "svc_omni@cretetv.gr"] {
+            assert!(
+                !ServiceAccount::is_passwordless_builtin(name),
+                "{name} is a real account and does need a password"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unc_watchfolder_is_what_makes_localsystem_wrong() {
+        // LocalSystem authenticates to SMB as the computer account, which a
+        // file server usually refuses -- so delivery fails at the last step,
+        // after a correct MXF has already been produced (defect W-13).
+        assert!(needs_network_identity(r"\\dalet\ingest"));
+        assert!(needs_network_identity(r"//dalet/ingest"));
+        assert!(!needs_network_identity(r"D:\watchfolder"));
+        assert!(!needs_network_identity("watchfolder"));
+    }
+}
+
+/// True when the watchfolder is on another machine, so the service needs an
+/// identity the file server will accept.
+pub fn needs_network_identity(watchfolder: &str) -> bool {
+    let w = watchfolder.trim();
+    w.starts_with(r"\\") || w.starts_with("//")
+}
