@@ -6,12 +6,13 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::hash_password;
 use crate::migrations;
 use crate::models::{
-    AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, NewJob, User, UserRole,
+    AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob, User,
+    UserRole,
 };
 use crate::timestamps;
 
@@ -57,21 +58,27 @@ impl Repository {
         migrations::apply(&mut conn, self.db_path.as_deref())
             .context("Schema migration failed; refusing to start against a half-migrated database")?;
 
-        // Check if any admin exists. If not, seed default admin account
+        // No default admin is seeded (plan P2.4, defect W-04).
+        //
+        // The old code created `admin@newsroom.local / admin123` on every
+        // database that had no admin — including production. Published
+        // credentials on a box that can repoint the playout watchfolder is not
+        // a convenience, it is a back door, and nothing ever removed it.
+        //
+        // First run is instead: `omni-ingest setup`, or `/setup` served to a
+        // loopback client while no admin exists. Once an admin exists, that
+        // window closes.
         let admin_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin'",
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1",
             [],
             |r| r.get(0),
         )?;
-
         if admin_count == 0 {
-            let default_admin_pass = hash_password("admin123")?;
-            conn.execute(
-                "INSERT INTO users (email, password_hash, role, full_name, is_active)
-                 VALUES ('admin@newsroom.local', ?, 'admin', 'System Administrator', 1)",
-                params![default_admin_pass],
-            )?;
-            info!("Seeded initial admin account: admin@newsroom.local (password: admin123)");
+            warn!(
+                "No administrator account exists. Run `omni-ingest setup`, or open /setup in a \
+                 browser ON THIS MACHINE, to create one. Until then the panels cannot be \
+                 administered."
+            );
         }
 
         self.seed_journalists_from_file(&conn)?;
@@ -964,6 +971,22 @@ impl Repository {
         }
     }
 
+    /// Whether any active administrator exists.
+    ///
+    /// The `/setup` first-run window is open exactly while this is false, so it
+    /// is asked on every request to that route rather than cached: an admin
+    /// created through the CLI while the daemon runs must close the window
+    /// immediately, without a restart.
+    pub fn has_active_admin(&self) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn list_users(&self) -> Result<Vec<User>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT * FROM users ORDER BY id ASC")?;
@@ -994,7 +1017,17 @@ impl Repository {
             "UPDATE users SET password_hash = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
             params![hash, user_id],
         )?;
-        self.log_audit("INFO", "AUTH", &format!("Password updated for User #{}", user_id))?;
+        // A password change that leaves the old sessions alive has revoked
+        // nothing: whoever the change was meant to lock out is still logged in.
+        let ended = self.delete_sessions_for_user(user_id)?;
+        self.log_audit(
+            "INFO",
+            "AUTH",
+            &format!(
+                "Password updated for User #{} ({} session(s) ended)",
+                user_id, ended
+            ),
+        )?;
         Ok(())
     }
 
@@ -1009,6 +1042,166 @@ impl Repository {
         self.create_session_for(user_id, token, Duration::days(expires_in_days))
     }
 
+    /// Create a session recording where it came from (plan P2.2).
+    ///
+    /// The IP and user agent exist so that "end other sessions" and the audit
+    /// trail can answer *which* session, from *where* — not for access control.
+    /// Nothing authenticates on them.
+    pub fn create_session_with_meta(
+        &self,
+        user_id: i64,
+        token: &str,
+        lifetime: Duration,
+        ip: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.pool.get()?;
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at, created_at, last_seen_at, ip, user_agent)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![
+                token,
+                user_id,
+                timestamps::format(now + lifetime),
+                timestamps::format(now),
+                timestamps::format(now),
+                ip,
+                user_agent.map(|ua| ua.chars().take(256).collect::<String>()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Refresh `last_seen_at` and report whether the session is idle-expired.
+    ///
+    /// Returns `false` when the session has not been used within `idle`, in
+    /// which case it is deleted. The absolute expiry is still enforced by
+    /// [`Self::get_user_by_session_token`]; this is the second, shorter clock.
+    pub fn touch_session(&self, token: &str, idle: Duration) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let last_seen: Option<String> = conn
+            .query_row(
+                "SELECT last_seen_at FROM sessions WHERE token = ?",
+                params![token],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let Some(last_seen) = last_seen else {
+            return Ok(false);
+        };
+
+        // A row backfilled by migration 3 (or written before it) has an empty
+        // string here. Treat that as "seen now" rather than as expired: the
+        // upgrade must not log the newsroom out.
+        if !last_seen.is_empty() {
+            if let Some(seen) = timestamps::parse_opt(Some(last_seen)) {
+                if Utc::now() - seen > idle {
+                    conn.execute("DELETE FROM sessions WHERE token = ?", params![token])?;
+                    return Ok(false);
+                }
+            }
+        }
+
+        conn.execute(
+            "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+            params![timestamps::format(Utc::now()), token],
+        )?;
+        Ok(true)
+    }
+
+    /// End every session for a user. Used by "sign out everywhere" and after a
+    /// password change — a changed password that leaves old sessions alive has
+    /// not actually revoked anything.
+    pub fn delete_sessions_for_user(&self, user_id: i64) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let n = conn.execute("DELETE FROM sessions WHERE user_id = ?", params![user_id])?;
+        Ok(n)
+    }
+
+    /// Drop sessions that are past their absolute expiry. Called at start-up
+    /// and by the nightly maintenance tick.
+    pub fn purge_expired_sessions(&self) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// Record a login attempt, successful or not (plan P2.2).
+    pub fn record_login_attempt(
+        &self,
+        email: Option<&str>,
+        ip: Option<&str>,
+        successful: bool,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO login_attempts (at, email, ip, successful, reason) VALUES (?, ?, ?, ?, ?)",
+            params![
+                timestamps::format(Utc::now()),
+                email.map(|e| e.to_lowercase()),
+                ip,
+                if successful { 1 } else { 0 },
+                reason
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent login attempts, newest first — the data behind the admin
+    /// panel's "recent sign-ins" list.
+    pub fn recent_login_attempts(&self, limit: i64) -> Result<Vec<LoginAttempt>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, at, email, ip, successful, reason FROM login_attempts
+             ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(LoginAttempt {
+                id: row.get("id")?,
+                at: timestamps::parse_opt(row.get("at").ok()),
+                email: row.get("email")?,
+                ip: row.get("ip")?,
+                successful: row.get::<_, i64>("successful")? == 1,
+                reason: row.get("reason")?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for a in rows {
+            list.push(a?);
+        }
+        Ok(list)
+    }
+
+    /// Move a session's `last_seen_at` back in time.
+    ///
+    /// Test-only, but it lives here because it is the only honest way to
+    /// exercise the idle timeout: the alternative is a test that sleeps for
+    /// hours or one that asserts against the clock arithmetic rather than
+    /// against the query.
+    #[doc(hidden)]
+    pub fn backdate_session_last_seen(&self, token: &str, by: Duration) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+            params![timestamps::format(Utc::now() - by), token],
+        )?;
+        Ok(())
+    }
+
+    /// Delete login attempts older than `days`.
+    pub fn purge_login_attempts(&self, days: i64) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(Utc::now() - Duration::days(days));
+        let n = conn.execute("DELETE FROM login_attempts WHERE at < ?", params![cutoff])?;
+        Ok(n)
+    }
+
     /// Create a session with an arbitrary lifetime.
     ///
     /// `expires_at` is stored in the same RFC3339 format the expiry query
@@ -1018,13 +1211,7 @@ impl Repository {
     /// sorts above `' '` (0x20), so any session expiring *earlier the same day*
     /// still authenticated.
     pub fn create_session_for(&self, user_id: i64, token: &str, lifetime: Duration) -> Result<()> {
-        let conn = self.pool.get()?;
-        let expires_at = Utc::now() + lifetime;
-        conn.execute(
-            "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
-            params![token, user_id, timestamps::format(expires_at)],
-        )?;
-        Ok(())
+        self.create_session_with_meta(user_id, token, lifetime, None, None)
     }
 
     pub fn get_user_by_session_token(&self, token: &str) -> Result<Option<User>> {

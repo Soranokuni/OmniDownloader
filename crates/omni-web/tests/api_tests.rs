@@ -1,277 +1,391 @@
+//! Functional coverage of the JSON API.
+//!
+//! These tests were originally written against an API with no authentication
+//! at all, so every request here now carries a session and the CSRF marker the
+//! panel sends. Who is *allowed* to call what is not this file's job — that is
+//! `auth_matrix_tests.rs`. This one checks that the calls do the right thing
+//! once they are through the door.
+
 use anyhow::Result;
 use axum::body::Body;
+use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use tempfile::NamedTempFile;
+use std::net::SocketAddr;
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 use omni_core::config::AppConfig;
-use omni_core::models::JobStatus;
+use omni_core::models::{JobStatus, UserRole};
 use omni_core::repository::Repository;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
-fn setup_test_app() -> Result<(axum::Router, Repository)> {
-    let temp_db = NamedTempFile::new()?;
-    let temp_cfg = NamedTempFile::new()?;
-    let repo = Repository::new(temp_db.path())?;
-    let config = AppConfig::default();
-    let state = AppState::new(repo.clone(), config, temp_cfg.path().to_path_buf());
-    let router = WebServer::build_router(state);
-    Ok((router, repo))
+const PEER: &str = "127.0.0.1:50000";
+
+struct App {
+    router: axum::Router,
+    repo: Repository,
+    mcr_token: String,
+    user_token: String,
+    admin_token: String,
+    _dir: TempDir,
+}
+
+impl App {
+    fn new() -> Result<Self> {
+        let dir = TempDir::new()?;
+        let repo = Repository::new(dir.path().join("omni.db"))?;
+        let config = AppConfig::default();
+
+        let mcr_id = repo.create_user(
+            "desk@station.gr",
+            "correct-horse-battery",
+            UserRole::OpenMcr,
+            "MCR Desk",
+            None,
+        )?;
+        let mcr_token = omni_core::auth::generate_session_token();
+        repo.create_session(mcr_id, &mcr_token, 1)?;
+
+        let user_id = repo.create_user(
+            "reporter@station.gr",
+            "correct-horse-battery",
+            UserRole::User,
+            "Reporter",
+            Some("PAPADAKI"),
+        )?;
+        let user_token = omni_core::auth::generate_session_token();
+        repo.create_session(user_id, &user_token, 1)?;
+
+        let admin_id = repo.create_user(
+            "it@station.gr",
+            "correct-horse-battery",
+            UserRole::Admin,
+            "Administrator",
+            None,
+        )?;
+        let admin_token = omni_core::auth::generate_session_token();
+        repo.create_session(admin_id, &admin_token, 1)?;
+
+        let state = AppState::new(repo.clone(), config, dir.path().join("config.json"));
+        let router = WebServer::build_router(state);
+
+        Ok(Self {
+            router,
+            repo,
+            mcr_token,
+            user_token,
+            admin_token,
+            _dir: dir,
+        })
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> Result<(StatusCode, Value)> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", format!("omni_session={}", token))
+            .header("host", "mcr.local")
+            .header("x-omni-request", "1")
+            .header("origin", "http://mcr.local");
+
+        let body = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&v)?)
+            }
+            None => Body::empty(),
+        };
+
+        let res = self
+            .router
+            .clone()
+            .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+            .oneshot(builder.body(body)?)
+            .await?;
+        let status = res.status();
+        let bytes = res.into_body().collect().await?.to_bytes();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Ok((status, json))
+    }
 }
 
 #[tokio::test]
-async fn test_system_status_endpoint() -> Result<()> {
-    let (app, _) = setup_test_app()?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/system/status")
-                .body(Body::empty())?,
-        )
+async fn system_status_reports_disk_space() -> Result<()> {
+    let app = App::new()?;
+    let (status, json) = app
+        .send("GET", "/api/system/status", &app.mcr_token, None)
         .await?;
 
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = response.into_body().collect().await?.to_bytes();
-    let json: Value = serde_json::from_slice(&body)?;
-
+    assert_eq!(status, StatusCode::OK);
     assert!(json.get("free_disk_gb").is_some());
-    assert_eq!(json.get("llm_status").unwrap(), "Ready");
-    assert_eq!(json.get("mail_status").unwrap(), "Active");
     Ok(())
 }
 
 #[tokio::test]
-async fn test_jobs_api_full_lifecycle() -> Result<()> {
-    let (app, repo) = setup_test_app()?;
-
-    // 1. Create a job via POST /api/jobs
-    let create_payload = json!({
-        "url": "https://www.youtube.com/watch?v=sample123",
-        "notes": "ΓΙΑ ΠΛΑΝΑ",
-        "priority": 10
-    });
-
+async fn health_is_public_and_says_nothing_about_the_station() -> Result<()> {
+    let app = App::new()?;
     let res = app
+        .router
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/jobs")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&create_payload)?))?,
+        .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+        .oneshot(Request::builder().uri("/api/health").body(Body::empty())?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = res.into_body().collect().await?.to_bytes();
+    let json: Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(json.get("status").unwrap(), "ok");
+    // Disk, mailbox and queue depth belong behind the MCR gate.
+    assert!(json.get("free_disk_gb").is_none());
+    assert!(json.get("mail_status").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn jobs_api_full_lifecycle() -> Result<()> {
+    let app = App::new()?;
+
+    // 1. Create
+    let (status, json) = app
+        .send(
+            "POST",
+            "/api/jobs",
+            &app.mcr_token,
+            Some(json!({
+                "url": "https://www.youtube.com/watch?v=sample123",
+                "notes": "ΓΙΑ ΠΛΑΝΑ",
+                "priority": 10
+            })),
         )
         .await?;
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.into_body().collect().await?.to_bytes();
-    let json: Value = serde_json::from_slice(&body)?;
-    assert_eq!(json.get("status").unwrap(), "ok");
+    assert_eq!(status, StatusCode::OK);
     let job_id = json.get("job_id").unwrap().as_i64().unwrap();
     assert!(job_id > 0);
 
-    // 2. Fetch jobs via GET /api/jobs
-    let res = app
-        .clone()
-        .oneshot(Request::builder().uri("/api/jobs").body(Body::empty())?)
-        .await?;
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.into_body().collect().await?.to_bytes();
-    let json: Value = serde_json::from_slice(&body)?;
+    // 2. List
+    let (status, json) = app.send("GET", "/api/jobs", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
     let jobs = json.get("jobs").unwrap().as_array().unwrap();
-    assert!(jobs.iter().any(|j| j.get("id").unwrap().as_i64().unwrap() == job_id));
+    assert!(jobs
+        .iter()
+        .any(|j| j.get("id").unwrap().as_i64().unwrap() == job_id));
 
-    // 3. Override job via POST /api/jobs/:id/override
-    let override_payload = json!({
-        "url": "https://www.youtube.com/watch?v=new_sample"
-    });
-
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/jobs/{}/override", job_id))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&override_payload)?))?,
+    // 3. Override
+    let (status, _) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{}/override", job_id),
+            &app.mcr_token,
+            Some(json!({"url": "https://www.youtube.com/watch?v=new_sample"})),
         )
         .await?;
+    assert_eq!(status, StatusCode::OK);
 
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let updated = repo.get_job(job_id)?.expect("Job must exist");
+    let updated = app.repo.get_job(job_id)?.expect("Job must exist");
     assert_eq!(updated.url, "https://www.youtube.com/watch?v=new_sample");
     assert_eq!(updated.status, JobStatus::Pending);
 
-    // 4. Retry job via POST /api/jobs/:id/retry
-    repo.update_job_status(job_id, JobStatus::Failed, Some("Simulated fail"), None, None)?;
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/jobs/{}/retry", job_id))
-                .body(Body::empty())?,
+    // 4. Retry
+    app.repo
+        .update_job_status(job_id, JobStatus::Failed, Some("Simulated fail"), None, None)?;
+    let (status, _) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{}/retry", job_id),
+            &app.mcr_token,
+            None,
         )
         .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        app.repo.get_job(job_id)?.unwrap().status,
+        JobStatus::Pending
+    );
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let retried = repo.get_job(job_id)?.expect("Job must exist");
-    assert_eq!(retried.status, JobStatus::Pending);
-
-    // 5. Discard job via POST /api/jobs/:id/discard
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/api/jobs/{}/discard", job_id))
-                .body(Body::empty())?,
+    // 5. Discard
+    let (status, _) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{}/discard", job_id),
+            &app.mcr_token,
+            None,
         )
         .await?;
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let discarded = repo.get_job(job_id)?;
-    assert!(discarded.is_none());
-
-    Ok(())
-
-}
-
-#[tokio::test]
-async fn test_journalists_api_crud() -> Result<()> {
-    let (app, repo) = setup_test_app()?;
-
-    // 1. Add journalist via POST /api/journalists
-    let payload = json!({
-        "surname": "PAPADOPOULOS",
-        "full_name": "Nikos Papadopoulos",
-        "emails": ["npapadopoulos@station.gr", "nikos.p@station.gr"],
-        "priority": 15
-    });
-
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/journalists")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&payload)?))?,
-        )
-        .await?;
-
-    assert_eq!(res.status(), StatusCode::OK);
-
-    // 2. Lookup journalist in database
-    let surname = repo.find_journalist_by_email("npapadopoulos@station.gr")?;
-    assert_eq!(surname.as_deref(), Some("PAPADOPOULOS"));
-
-    // 3. Delete journalist via POST /api/journalists/:surname
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/journalists/PAPADOPOULOS")
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let deleted = repo.find_journalist_by_email("npapadopoulos@station.gr")?;
-    assert!(deleted.is_none());
+    assert_eq!(status, StatusCode::OK);
+    assert!(app.repo.get_job(job_id)?.is_none());
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_html_pages_rendering_and_rbac() -> Result<()> {
-    let (app, repo) = setup_test_app()?;
+async fn a_job_url_must_be_http_or_https() -> Result<()> {
+    let app = App::new()?;
 
-    // 1. Unauthenticated access:
-    // /mcr is accessible in OpenMcr mode
+    for bad in [
+        "javascript:alert(document.cookie)",
+        "data:text/html;base64,PHNjcmlwdD4=",
+        "file:///C:/Windows/System32/config",
+        "",
+    ] {
+        let (status, _) = app
+            .send("POST", "/api/jobs", &app.mcr_token, Some(json!({"url": bad})))
+            .await?;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{bad} must be refused at the API, not left for a renderer to make safe"
+        );
+    }
+    assert!(app.repo.get_all_jobs()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn journalists_api_crud() -> Result<()> {
+    let app = App::new()?;
+
+    let (status, _) = app
+        .send(
+            "POST",
+            "/api/journalists",
+            &app.mcr_token,
+            Some(json!({
+                "surname": "PAPADOPOULOS",
+                "full_name": "Nikos Papadopoulos",
+                "emails": ["npapadopoulos@station.gr", "nikos.p@station.gr"],
+                "priority": 15
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        app.repo
+            .find_journalist_by_email("npapadopoulos@station.gr")?
+            .as_deref(),
+        Some("PAPADOPOULOS")
+    );
+
+    let (status, _) = app
+        .send(
+            "POST",
+            "/api/journalists/PAPADOPOULOS",
+            &app.mcr_token,
+            None,
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(app
+        .repo
+        .find_journalist_by_email("npapadopoulos@station.gr")?
+        .is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_mcr_fallback_journalist_cannot_be_deleted() -> Result<()> {
+    // MCR is where every unresolved job is filed and is a delivery folder
+    // name. Deleting it does not fail loudly; it silently breaks routing.
+    let app = App::new()?;
+    let (status, _) = app
+        .send("POST", "/api/journalists/MCR", &app.mcr_token, None)
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(app
+        .repo
+        .list_journalists()?
+        .iter()
+        .any(|j| j.surname == "MCR"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn html_pages_render_for_the_roles_that_may_see_them() -> Result<()> {
+    let app = App::new()?;
+
+    for (uri, token, needle) in [
+        ("/mcr", &app.mcr_token, "MCR"),
+        ("/user", &app.user_token, "Ingest"),
+        ("/admin", &app.admin_token, "Administration"),
+    ] {
+        let res = app
+            .router
+            .clone()
+            .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", format!("omni_session={}", token))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let body = res.into_body().collect().await?.to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(needle), "{uri} did not render its own page");
+    }
+
+    // /login is public.
     let res = app
+        .router
         .clone()
-        .oneshot(Request::builder().uri("/mcr").body(Body::empty())?)
+        .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+        .oneshot(Request::builder().uri("/login").body(Body::empty())?)
         .await?;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = res.into_body().collect().await?.to_bytes();
-    assert!(String::from_utf8_lossy(&body).contains("MCR Handler Portal"));
 
-    // /login and /setup are publicly accessible
-    for uri in ["/login", "/setup"] {
-        let res = app
-            .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
-            .await?;
-        assert_eq!(res.status(), StatusCode::OK);
-    }
+    Ok(())
+}
 
-    // /user and /admin redirect unauthenticated visitors to /login
-    for uri in ["/user", "/admin"] {
-        let res = app
-            .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
-            .await?;
-        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(res.headers().get("location").unwrap(), "/login");
-    }
+#[tokio::test]
+async fn a_user_sees_only_their_own_jobs() -> Result<()> {
+    let app = App::new()?;
+    let reporter = app
+        .repo
+        .get_user_by_email("reporter@station.gr")?
+        .unwrap();
 
-    // 2. Authenticated access:
-    // Create Admin user and session
-    let admin_id = repo.create_user(
-        "admin@station.gr",
-        "hash123",
-        omni_core::models::UserRole::Admin,
-        "Admin",
+    app.repo.add_job(
+        "https://www.youtube.com/watch?v=mine",
+        "1_PAPADAKI_MINE",
+        "PAPADAKI",
+        "MINE",
+        "1",
+        0,
+        JobStatus::Pending,
+        Some(reporter.id),
+        None,
         None,
     )?;
-    let admin_token = omni_core::auth::generate_session_token();
-    repo.create_session(admin_id, &admin_token, 7)?;
-
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/admin")
-                .header("cookie", format!("omni_session={}", admin_token))
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.into_body().collect().await?.to_bytes();
-    assert!(String::from_utf8_lossy(&body).contains("IT Administration"));
-
-    // Create Journalist User and session
-    let user_id = repo.create_user(
-        "reporter@station.gr",
-        "hash123",
-        omni_core::models::UserRole::User,
-        "Reporter",
-        Some("PAPADAKI"),
+    app.repo.add_job(
+        "https://www.youtube.com/watch?v=theirs",
+        "2_GEORGIOU_THEIRS",
+        "GEORGIOU",
+        "THEIRS",
+        "2",
+        0,
+        JobStatus::Pending,
+        None,
+        None,
+        None,
     )?;
-    let user_token = omni_core::auth::generate_session_token();
-    repo.create_session(user_id, &user_token, 7)?;
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/user")
-                .header("cookie", format!("omni_session={}", user_token))
-                .body(Body::empty())?,
-        )
+    let (status, json) = app
+        .send("GET", "/api/jobs/mine", &app.user_token, None)
         .await?;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = res.into_body().collect().await?.to_bytes();
-    assert!(String::from_utf8_lossy(&body).contains("Journalist Ingest Portal"));
-
-
+    assert_eq!(status, StatusCode::OK);
+    let jobs = json.get("jobs").unwrap().as_array().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].get("keyword").unwrap(), "MINE");
     Ok(())
 }

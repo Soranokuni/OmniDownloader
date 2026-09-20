@@ -1,5 +1,6 @@
 pub mod config;
 pub mod models;
+pub mod net;
 pub mod migrations;
 pub mod paths;
 pub mod process;

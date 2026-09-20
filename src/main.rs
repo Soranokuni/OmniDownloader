@@ -228,6 +228,22 @@ async fn run_daemon(
     info!("Initializing SQLite database at: {:?}", db_path);
     let repo = Repository::new(&db_path)?;
 
+    // Sessions that expired while the daemon was down are dead rows; clearing
+    // them at start-up keeps the table from growing without bound on a machine
+    // that is restarted far more often than it is logged into.
+    match repo.purge_expired_sessions() {
+        Ok(0) => {}
+        Ok(n) => info!("Cleared {n} expired session(s)"),
+        Err(e) => warn!("Could not clear expired sessions: {e:?}"),
+    }
+    if !repo.has_active_admin().unwrap_or(true) {
+        warn!(
+            "No administrator account exists. Open http://127.0.0.1:{}/setup from this machine, \
+             or run `omni-ingest setup`, to create one.",
+            config.web_port
+        );
+    }
+
     // Dependency manager and tool paths
     let dep_mgr = DependencyManager::new(&bin_dir);
     let ffmpeg_path = config

@@ -190,6 +190,44 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE journalists ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]';
         "#,
     ),
+    (
+        3,
+        // Session hardening (plan P2.2). Sessions carried only a token, a user
+        // and an expiry, so an admin could neither see nor end the sessions on
+        // their account, and there was no idle timeout -- an unattended MCR
+        // browser stayed authenticated for the full absolute lifetime.
+        //
+        // Existing rows are backfilled with 'now' rather than dropped: a
+        // migration that logs the whole newsroom out mid-bulletin is a worse
+        // failure than one stale `last_seen_at`.
+        r#"
+        ALTER TABLE sessions ADD COLUMN created_at   TEXT NOT NULL DEFAULT '';
+        ALTER TABLE sessions ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT '';
+        ALTER TABLE sessions ADD COLUMN ip           TEXT;
+        ALTER TABLE sessions ADD COLUMN user_agent   TEXT;
+
+        UPDATE sessions
+           SET created_at   = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+               last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE created_at = '';
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+        -- Login attempts are audited so a lockout can be explained after the
+        -- fact ("who was hitting it, from where"). Kept out of audit_log
+        -- because that table is what the panel shows operators, and a brute
+        -- force would bury every operational message in it.
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            at         TEXT NOT NULL,
+            email      TEXT,
+            ip         TEXT,
+            successful INTEGER NOT NULL DEFAULT 0,
+            reason     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_at ON login_attempts(at);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

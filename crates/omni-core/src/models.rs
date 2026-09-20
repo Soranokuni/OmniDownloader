@@ -259,6 +259,20 @@ pub struct Journalist {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// One row of `login_attempts` (plan P2.2).
+///
+/// Records the *attempt*, never the credential: the password is not a field
+/// here and must never become one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginAttempt {
+    pub id: i64,
+    pub at: Option<DateTime<Utc>>,
+    pub email: Option<String>,
+    pub ip: Option<String>,
+    pub successful: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLog {
     pub id: i64,
