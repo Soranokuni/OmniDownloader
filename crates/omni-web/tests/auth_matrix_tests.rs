@@ -398,6 +398,17 @@ const MATRIX: &[Row] = &[
     ),
     (
         "GET",
+        "/api/secrets",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "GET",
         "/api/system/logs",
         &[
             (Anonymous, Denied),

@@ -381,3 +381,95 @@ fn session_token(cookie: String) -> String {
         .unwrap()
         .to_string()
 }
+
+/// Plan P2.6: the panel can say whether a secret is set, and replace it, but
+/// there is no route that returns one.
+#[tokio::test]
+async fn the_secrets_api_never_returns_a_value() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let admin = repo.create_user("it@station.gr", PASSWORD, UserRole::Admin, "Admin", None)?;
+    let token = omni_core::auth::generate_session_token();
+    repo.create_session(admin, &token, 1)?;
+
+    let store = omni_core::secrets::SecretStore::new(dir.path().join("secrets.bin"));
+    let state = AppState::new(repo, AppConfig::default(), dir.path().join("config.json"))
+        .with_secret_store(store.clone());
+    let router = WebServer::build_router(state);
+
+    let send = |method: &'static str, body: Option<serde_json::Value>, token: String| {
+        let router = router.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri("/api/secrets")
+                .header("x-omni-request", "1")
+                .header("cookie", format!("omni_session={token}"));
+            let body = match body {
+                Some(v) => {
+                    builder = builder.header("content-type", "application/json");
+                    Body::from(v.to_string())
+                }
+                None => Body::empty(),
+            };
+            let res = router
+                .layer(MockConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()))
+                .oneshot(builder.body(body).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = res.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    // Set it through the API.
+    let (status, _) = send(
+        "POST",
+        Some(json!({"key": "mail.password", "value": "the-actual-mailbox-secret"})),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        store.get("mail.password")?.as_deref(),
+        Some("the-actual-mailbox-secret")
+    );
+
+    // Read it back: only `is_set`.
+    let (status, body) = send("GET", None, token.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"mail.password\":true"), "{body}");
+    assert!(
+        !body.contains("the-actual-mailbox-secret"),
+        "the API handed back the secret itself: {body}"
+    );
+
+    // An unknown key is refused rather than silently written somewhere that
+    // nothing will ever read.
+    let (status, _) = send(
+        "POST",
+        Some(json!({"key": "made.up", "value": "x"})),
+        token.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The audit row names the key and not the value.
+    let logs = state_logs(&dir)?;
+    assert!(logs.iter().any(|m| m.contains("mail.password")), "{logs:?}");
+    assert!(
+        !logs.iter().any(|m| m.contains("the-actual-mailbox-secret")),
+        "the secret leaked into the audit log: {logs:?}"
+    );
+    Ok(())
+}
+
+fn state_logs(dir: &TempDir) -> Result<Vec<String>> {
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    Ok(repo
+        .get_recent_audit_logs(50)?
+        .into_iter()
+        .map(|l| l.message)
+        .collect())
+}

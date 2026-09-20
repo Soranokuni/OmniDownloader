@@ -836,6 +836,69 @@ pub async fn api_admin_update_ytdl(
 }
 
 // ==========================================
+// Secrets API (plan P2.6)
+// ==========================================
+
+/// Which secrets are configured — **never their values**.
+///
+/// There is deliberately no read route. An admin session that has been taken
+/// over can overwrite the mailbox password (which is loud: mail ingest stops)
+/// but cannot walk away with it.
+pub async fn api_secrets_status(
+    RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
+) -> JsonResult {
+    Ok(Json(serde_json::json!({ "secrets": state.secrets.status() })))
+}
+
+#[derive(Deserialize)]
+pub struct SetSecretPayload {
+    key: String,
+    value: String,
+}
+
+pub async fn api_secrets_set(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<SetSecretPayload>,
+) -> JsonResult {
+    if !omni_core::secrets::keys::ALL.contains(&payload.key.as_str()) {
+        // Only the known keys, so a typo cannot quietly write a secret that
+        // nothing will ever read.
+        return Err(ApiError::bad_request(format!(
+            "Unknown secret `{}`.",
+            payload.key
+        )));
+    }
+
+    state
+        .secrets
+        .set(&payload.key, payload.value.trim())
+        .map_err(internal_error("Could not store the secret."))?;
+
+    // The key is logged; the value is not, and never will be.
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!(
+            "Secret `{}` {} by {}",
+            payload.key,
+            if payload.value.trim().is_empty() { "cleared" } else { "updated" },
+            admin.email
+        ),
+    );
+
+    // Mail uses its secret from the running config, so reflect the change
+    // without a restart.
+    if payload.key == omni_core::secrets::keys::MAIL_PASSWORD {
+        let mut cfg = state.config.write().await;
+        cfg.email_password = payload.value.trim().to_string();
+    }
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
 // System Status & Setup API
 // ==========================================
 
@@ -1014,6 +1077,16 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
         cfg.imap_server = payload.imap_server;
         cfg.email_address = payload.email_address;
         if !payload.email_password.is_empty() {
+            // Into the encrypted store, never into config.json (plan P2.6).
+            // The runtime copy is what the mail watcher reads.
+            if let Err(e) = state
+                .secrets
+                .set(omni_core::secrets::keys::MAIL_PASSWORD, &payload.email_password)
+            {
+                tracing::error!(error = ?e, "Storing the mailbox password failed");
+                return ApiError::internal("Could not store the mailbox password.")
+                    .into_response();
+            }
             cfg.email_password = payload.email_password;
         }
         cfg.ollama_endpoint = payload.ollama_endpoint;

@@ -3,6 +3,7 @@ use inquire::{Confirm, CustomType, Password, Text};
 use omni_core::config::AppConfig;
 use omni_core::models::UserRole;
 use omni_core::repository::Repository;
+use omni_core::secrets::{keys as secret_keys, SecretStore};
 use omni_service::{install_service, query_service_status, start_service, stop_service, uninstall_service};
 use std::env;
 use std::path::Path;
@@ -46,6 +47,59 @@ pub fn handle_service_command(cmd: ServiceSubcommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `omni-ingest secrets …` (plan P2.6).
+pub enum SecretSubcommand {
+    /// Set a secret, prompting for the value so it never appears in a command
+    /// line, a shell history, or the process list.
+    Set { key: String },
+    /// Remove a secret.
+    Clear { key: String },
+    /// List which secrets are set. Values are never printed.
+    List,
+}
+
+pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Result<()> {
+    match cmd {
+        SecretSubcommand::List => {
+            println!("\nSecret store: {}", store.path().display());
+            for (key, is_set) in store.status() {
+                println!("  {:<24} {}", key, if is_set { "set" } else { "not set" });
+            }
+            println!("\nValues are never displayed. To replace one: omni-ingest secrets set <key>");
+        }
+        SecretSubcommand::Set { key } => {
+            ensure_known_key(&key)?;
+            let value = Password::new(&format!("Value for {key}:"))
+                .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                .with_help_message("Stored encrypted in data/secrets.bin; not echoed")
+                .prompt()?;
+            if value.is_empty() {
+                println!("! Empty value; nothing was changed. Use `secrets clear` to remove one.");
+                return Ok(());
+            }
+            store.set(&key, &value)?;
+            println!("✓ {key} stored.");
+        }
+        SecretSubcommand::Clear { key } => {
+            ensure_known_key(&key)?;
+            store.remove(&key)?;
+            println!("✓ {key} cleared.");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_known_key(key: &str) -> Result<()> {
+    if secret_keys::ALL.contains(&key) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Unknown secret `{}`. Known keys: {}",
+        key,
+        secret_keys::ALL.join(", ")
+    )
 }
 
 pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
@@ -106,7 +160,15 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
             .prompt()?;
 
         if !pw.is_empty() {
+            // Into the encrypted store, not config.json (plan P2.6, W-06).
+            // `config.email_password` is the runtime copy the mail watcher
+            // reads; `save_to_file` cannot serialise it.
+            let store = SecretStore::new(config.resolve_path("data/secrets.bin"));
+            store
+                .set(secret_keys::MAIL_PASSWORD, &pw)
+                .context("Failed storing the mailbox password")?;
             config.email_password = pw;
+            println!("  Mailbox password stored encrypted in data/secrets.bin.");
         }
 
         config.email_poll_interval_secs = CustomType::<u64>::new("Email Polling Interval (seconds):")

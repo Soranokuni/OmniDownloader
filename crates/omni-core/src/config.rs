@@ -293,7 +293,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub email_address: String,
 
-    #[serde(default)]
+    /// Mailbox password — **runtime only** (plan P2.6, defect W-06).
+    ///
+    /// `skip_serializing` is the whole point: the field still *deserializes*,
+    /// so a config.json written before Phase 2 is read once and its value
+    /// harvested into the encrypted store by [`AppConfig::adopt_secrets`], but
+    /// `save_to_file` can never write it back. Without that asymmetry the
+    /// first save after upgrading would put the password straight back into
+    /// plaintext, and nothing would look wrong.
+    #[serde(default, skip_serializing)]
     pub email_password: String,
 
     #[serde(default = "default_poll_interval")]
@@ -472,6 +480,10 @@ impl AppConfig {
         }
     }
 
+    /// Write config.json.
+    ///
+    /// Secrets are `skip_serializing`, so they cannot reach this file even if
+    /// a caller forgets. `secrets_never_reach_config_json` asserts it.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let p = path.as_ref();
         if let Some(parent) = p.parent() {
@@ -483,6 +495,38 @@ impl AppConfig {
         std::fs::write(p, json_str)
             .with_context(|| format!("Failed writing config file {:?}", p))?;
         Ok(())
+    }
+
+    /// Move any plaintext secret out of config.json and load the real ones
+    /// from the encrypted store (plan P2.6).
+    ///
+    /// Returns `true` when config.json needs rewriting because a secret was
+    /// harvested from it. The caller must then save, or the plaintext stays on
+    /// disk until something else happens to save.
+    ///
+    /// Idempotent: on every later start there is nothing to harvest and this
+    /// just repopulates the runtime field.
+    pub fn adopt_secrets(&mut self, store: &crate::secrets::SecretStore) -> Result<bool> {
+        use crate::secrets::keys;
+
+        let mut rewrote = false;
+
+        if !self.email_password.is_empty() {
+            store
+                .set(keys::MAIL_PASSWORD, &self.email_password)
+                .context("Failed moving the mailbox password into the encrypted store")?;
+            tracing::warn!(
+                "Moved the mailbox password out of config.json and into the encrypted secret \
+                 store. The old value is still in any backup of config.json taken before now; \
+                 rotate it if that matters."
+            );
+            rewrote = true;
+        }
+
+        // Always read back from the store, so the store is the single source
+        // of truth and a secret removed there takes effect on restart.
+        self.email_password = store.get_lossy(keys::MAIL_PASSWORD).unwrap_or_default();
+        Ok(rewrote)
     }
 
     /// Resolve a config path against the **install directory** (plan P0.1, W-10).
@@ -507,5 +551,103 @@ impl AppConfig {
             return p.to_path_buf();
         }
         AppPaths::discover("config.json").resolve(relative_or_absolute)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::{keys, SecretStore};
+    use tempfile::TempDir;
+
+    #[test]
+    fn secrets_never_reach_config_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+
+        let mut config = AppConfig::default();
+        config.email_password = "plaintext-mailbox-password".to_string();
+        config.save_to_file(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("plaintext-mailbox-password"),
+            "the mailbox password was written to config.json: {written}"
+        );
+        assert!(
+            !written.contains("email_password"),
+            "the key itself should not be emitted either: {written}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_plaintext_password_is_harvested_into_the_store_once() {
+        // What an upgrade actually looks like: a config.json written by the
+        // pre-Phase-2 build, with the password sitting in it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{ "email_address": "ingest@station.gr", "email_password": "legacy-secret-value" }"#,
+        )
+        .unwrap();
+
+        let store = SecretStore::new(dir.path().join("secrets.bin"));
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        assert_eq!(config.email_password, "legacy-secret-value");
+
+        let rewrite_needed = config.adopt_secrets(&store).unwrap();
+        assert!(rewrite_needed, "the caller must be told to rewrite config.json");
+        assert_eq!(
+            store.get(keys::MAIL_PASSWORD).unwrap().as_deref(),
+            Some("legacy-secret-value")
+        );
+        // The runtime field still works, so the mail watcher keeps running.
+        assert_eq!(config.email_password, "legacy-secret-value");
+
+        // After the caller saves, the plaintext is gone from disk.
+        config.save_to_file(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("legacy-secret-value"), "{written}");
+
+        // Second start: nothing to harvest, and the value still resolves.
+        let mut config2 = AppConfig::load_from_file(&path).unwrap();
+        assert!(!config2.adopt_secrets(&store).unwrap());
+        assert_eq!(config2.email_password, "legacy-secret-value");
+    }
+
+    #[test]
+    fn removing_a_secret_from_the_store_takes_effect_on_the_next_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        AppConfig::default().save_to_file(&path).unwrap();
+
+        let store = SecretStore::new(dir.path().join("secrets.bin"));
+        store.set(keys::MAIL_PASSWORD, "current-value").unwrap();
+
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        config.adopt_secrets(&store).unwrap();
+        assert_eq!(config.email_password, "current-value");
+
+        store.remove(keys::MAIL_PASSWORD).unwrap();
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        config.adopt_secrets(&store).unwrap();
+        assert_eq!(config.email_password, "");
+    }
+
+    #[test]
+    fn the_removed_auth_mode_does_not_grant_open_access_after_an_upgrade() {
+        // A deployment running `auth_mode: open_mcr` must not silently keep
+        // station-wide access; it falls back to the loopback default, and the
+        // loader warns.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{ "auth_mode": "open_mcr" }"#).unwrap();
+
+        let config = AppConfig::load_from_file(&path).unwrap();
+        assert_eq!(
+            config.security.mcr_open_networks,
+            vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+        );
     }
 }

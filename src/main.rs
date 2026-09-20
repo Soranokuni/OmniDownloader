@@ -16,6 +16,7 @@ use omni_core::paths::AppPaths;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStage, JobStatus};
 use omni_core::repository::Repository;
+use omni_core::secrets::SecretStore;
 use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
@@ -64,6 +65,22 @@ enum Commands {
         #[command(subcommand)]
         action: AdblockAction,
     },
+    /// Manage credentials in the encrypted secret store
+    Secrets {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Show which secrets are set (values are never printed)
+    List,
+    /// Set a secret; the value is prompted for, never taken from the command
+    /// line, so it cannot leak through shell history or the process list
+    Set { key: String },
+    /// Remove a secret
+    Clear { key: String },
 }
 
 #[derive(Subcommand)]
@@ -171,6 +188,15 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Secrets { action }) => {
+            let store = SecretStore::new(paths.resolve("data/secrets.bin"));
+            let sub = match action {
+                SecretAction::List => omni_cli::SecretSubcommand::List,
+                SecretAction::Set { key } => omni_cli::SecretSubcommand::Set { key },
+                SecretAction::Clear { key } => omni_cli::SecretSubcommand::Clear { key },
+            };
+            omni_cli::handle_secrets_command(&store, sub)?;
+        }
         Some(Commands::Adblock { action }) => match action {
             AdblockAction::Update => {
                 println!("Synchronizing HaGeZi & Greek AdBlock filter lists...");
@@ -211,8 +237,24 @@ async fn run_daemon(
     info!("============================================================");
 
     let config_path = paths.config.clone();
-    let config = AppConfig::load_from_file(&config_path)
+    let mut config = AppConfig::load_from_file(&config_path)
         .with_context(|| format!("Failed loading configuration from {:?}", config_path))?;
+
+    // Secrets live in an encrypted store, not in config.json (plan P2.6).
+    // If this deployment still has a plaintext mailbox password in the config,
+    // it is moved now and the config rewritten without it — otherwise the
+    // password stays readable to anyone who can read the install directory.
+    let secret_store = SecretStore::new(paths.resolve("data/secrets.bin"));
+    if config
+        .adopt_secrets(&secret_store)
+        .context("Failed initialising the secret store")?
+    {
+        config
+            .save_to_file(&config_path)
+            .context("Failed rewriting config.json without the plaintext secret")?;
+        info!("Rewrote {:?} without the plaintext mailbox password", config_path);
+    }
+    let config = config;
 
     // Every one of these is absolute: relative entries resolve against the
     // install root, absolute and UNC entries (the Dalet share) pass through.
@@ -290,7 +332,8 @@ async fn run_daemon(
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
     // 1. Start Embedded Web Server
-    let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf());
+    let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
+        .with_secret_store(secret_store.clone());
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();

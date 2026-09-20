@@ -5,6 +5,7 @@ pub mod migrations;
 pub mod paths;
 pub mod process;
 pub mod repository;
+pub mod secrets;
 pub mod timestamps;
 pub mod urlnorm;
 pub mod auth;
