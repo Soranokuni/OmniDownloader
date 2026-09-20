@@ -1,22 +1,51 @@
 {
+  "_comment": "Copy to config.json and edit. Secrets never belong in this file: the mailbox password and any API secret live in the encrypted store (data/secrets.bin), set with `omni-ingest secrets set mail.password` or from the admin panel.",
+
   "database_path": "data/omni.db",
   "watchfolder_path": "watchfolder",
   "temp_path": "temp",
   "bin_dir": "bin",
+
   "web_port": 8080,
   "web_host": "0.0.0.0",
-  "auth_mode": "open_mcr",
+
+  "security": {
+    "_comment": "Client networks that may use the MCR panel without signing in. An empty list means everyone signs in. Set this to the newsroom subnet, e.g. [\"10.20.0.0/16\"]. Replaces the removed `auth_mode`, which opened the panel to every host that could reach the port.",
+    "mcr_open_networks": ["127.0.0.1/32", "::1/128"],
+
+    "trust_proxy_header": false,
+    "trusted_proxies": [],
+
+    "session_hours_admin": 8,
+    "session_hours_user": 12,
+    "session_days_mcr": 30,
+    "session_idle_hours": 12,
+
+    "login_rate_limit_per_5min": 5,
+    "login_rate_limit_per_account_hour": 10
+  },
+
+  "tls": {
+    "_comment": "Both paths, or neither. PEM. When set, the panels are served over HTTPS and the session cookie gains Secure.",
+    "cert_path": null,
+    "key_path": null
+  },
+
   "max_concurrent_downloads": 2,
   "max_concurrent_transcodes": 2,
+
   "email_provider": "Outlook",
   "imap_server": "outlook.office365.com",
   "imap_port": 993,
   "email_address": "",
   "email_poll_interval_secs": 30,
+
   "ollama_endpoint": "http://localhost:11434/v1",
   "ollama_model": "gemma3:4b",
+
   "ytdl_channel": "stable",
   "ytdl_auto_update_nightly": true,
+
   "ffmpeg_path": null,
   "ffprobe_path": null,
   "bmxtranswrap_path": null,

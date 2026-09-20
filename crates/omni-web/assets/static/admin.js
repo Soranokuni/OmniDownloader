@@ -144,6 +144,76 @@ document.getElementById('create-user-form').addEventListener('submit', async (ev
 });
 
 /* ------------------------------------------------------------------ *
+ * Credentials
+ * ------------------------------------------------------------------ */
+
+const SECRET_LABEL = {
+  'mail.password': 'Mailbox password',
+  'graph.client_secret': 'Microsoft Graph client secret',
+  'teams.webhook_url': 'Teams webhook URL',
+};
+
+async function loadSecrets() {
+  let status = {};
+  try {
+    const data = await api('/api/secrets');
+    status = data.secrets || {};
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+
+  // The API reports only whether each secret is set. There is no route that
+  // returns a value, so nothing here can display one.
+  render('secrets-list', Object.entries(status).map(([key, isSet]) => {
+    const input = el('input', {
+      type: 'password',
+      autocomplete: 'off',
+      placeholder: isSet ? '•••••••• (set)' : 'not set',
+    });
+    return el('div', { class: 'stack' },
+      el('div', { class: 'row', style: 'justify-content:space-between' },
+        el('label', { style: 'margin:0' }, SECRET_LABEL[key] || key),
+        el('span', { class: isSet ? 'badge ok' : 'badge' }, isSet ? 'set' : 'not set'),
+      ),
+      el('div', { class: 'row' },
+        el('div', { class: 'grow' }, input),
+        el('button', {
+          class: 'btn',
+          type: 'button',
+          onClick: () => saveSecret(key, input),
+        }, 'Save'),
+        isSet && el('button', {
+          class: 'btn btn-danger',
+          type: 'button',
+          onClick: () => clearSecret(key),
+        }, 'Clear'),
+      ),
+    );
+  }));
+}
+
+async function saveSecret(key, input) {
+  const value = input.value;
+  if (!value) { toast('Enter a value first.', 'bad'); return; }
+  try {
+    await api('/api/secrets', { method: 'POST', body: { key, value } });
+    input.value = '';
+    toast(`${SECRET_LABEL[key] || key} updated.`, 'ok');
+    loadSecrets();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function clearSecret(key) {
+  if (!confirm(`Clear ${SECRET_LABEL[key] || key}? It cannot be recovered.`)) return;
+  try {
+    await api('/api/secrets', { method: 'POST', body: { key, value: '' } });
+    toast('Cleared.', 'ok');
+    loadSecrets();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+/* ------------------------------------------------------------------ *
  * Maintenance
  * ------------------------------------------------------------------ */
 
@@ -246,6 +316,7 @@ document.getElementById('test-mail-btn').addEventListener('click', async () => {
 document.getElementById('logout-btn').addEventListener('click', logout);
 
 loadDependencies();
+loadSecrets();
 loadUsers();
 loadLogs();
 setInterval(loadLogs, 15000);
