@@ -68,6 +68,8 @@ impl WebServer {
             .route("/api/admin/dependencies", get(api_admin_dependencies))
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))
             .route("/api/admin/rollback-ytdl", post(api_admin_rollback_ytdl))
+            .route("/api/admin/maintenance", get(api_admin_maintenance))
+            .route("/api/admin/maintenance/:name/run", post(api_admin_run_task))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))

@@ -228,6 +228,28 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_login_attempts_at ON login_attempts(at);
         "#,
     ),
+    (
+        4,
+        // Maintenance scheduling (plan P6.6).
+        //
+        // The previous scheduler was `if now.format("%H") == "03"` inside an
+        // hourly tick. Three problems it could not express: a task that should
+        // run at 03:30 rather than on the hour; a task that was missed because
+        // the machine was off at 03:00 and should run at next start; and any
+        // record at all of whether last night's run worked. Persisting
+        // `next_run` answers all three.
+        r#"
+        CREATE TABLE IF NOT EXISTS scheduled_tasks (
+            name         TEXT PRIMARY KEY,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            next_run     TEXT,
+            last_run     TEXT,
+            last_outcome TEXT,
+            last_error   TEXT,
+            last_ms      INTEGER
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

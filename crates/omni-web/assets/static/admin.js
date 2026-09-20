@@ -248,6 +248,69 @@ document.getElementById('vacuum-btn').addEventListener('click', async () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Scheduled maintenance
+ * ------------------------------------------------------------------ */
+
+const OUTCOME_CLASS = { ok: 'ok', skipped: '', failed: 'bad' };
+
+async function loadMaintenance() {
+  let tasks = [];
+  try {
+    const data = await api('/api/admin/maintenance');
+    tasks = data.tasks || [];
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+
+  if (tasks.length === 0) {
+    render('maintenance-body', el('tr', {},
+      el('td', { colspan: '5', class: 'empty' }, 'No maintenance tasks registered.')));
+    return;
+  }
+
+  render('maintenance-body', tasks.map((task) => el('tr', {},
+    el('td', {},
+      el('div', { class: 'strong' }, task.name),
+      el('div', { class: 'note' }, task.description || ''),
+    ),
+    el('td', { class: 'num' }, fmtTime(task.next_run)),
+    el('td', { class: 'num' }, fmtTime(task.last_run)),
+    el('td', {},
+      task.last_outcome
+        ? el('span', {
+            class: `badge ${OUTCOME_CLASS[task.last_outcome] ?? ''}`,
+            // The failure reason belongs on hover: the column stays readable
+            // and the detail is one gesture away.
+            title: task.last_error || '',
+          }, task.last_outcome)
+        : el('span', { class: 'note' }, 'never run'),
+    ),
+    el('td', { class: 'right' },
+      el('button', {
+        class: 'btn',
+        type: 'button',
+        onClick: () => runTask(task.name),
+      }, 'Run now'),
+    ),
+  )));
+}
+
+async function runTask(name) {
+  try {
+    const result = await api(`/api/admin/maintenance/${encodeURIComponent(name)}/run`, {
+      method: 'POST',
+    });
+    toast(result.message || 'Scheduled.', 'ok');
+    // The scheduler picks it up on its own tick, so re-read shortly after
+    // rather than pretending it has already run.
+    setTimeout(loadMaintenance, 2000);
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+document.getElementById('maintenance-refresh').addEventListener('click', loadMaintenance);
+
+/* ------------------------------------------------------------------ *
  * Audit log
  * ------------------------------------------------------------------ */
 
@@ -327,6 +390,7 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 
 loadDependencies();
 loadSecrets();
+loadMaintenance();
 loadUsers();
 loadLogs();
 setInterval(loadLogs, 15000);

@@ -403,6 +403,21 @@ const MATRIX: &[Row] = &[
     ),
     (
         "GET",
+        "/api/admin/maintenance",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/admin/maintenance/vacuum/run",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
+    ),
+    (
+        "GET",
         "/api/secrets",
         &[
             (Anonymous, Denied),
