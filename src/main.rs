@@ -93,7 +93,14 @@ enum AdblockAction {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    Install,
+    Install {
+        /// Account the service runs as, e.g. `DOMAIN\svc_omni`. The password is
+        /// prompted for. Omit for LocalSystem, which cannot authenticate to an
+        /// SMB share (defect W-13) — the installer warns when the watchfolder
+        /// is one.
+        #[arg(long)]
+        account: Option<String>,
+    },
     Uninstall,
     Start,
     Stop,
@@ -155,7 +162,18 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Service { action }) => {
             let sub = match action {
-                ServiceAction::Install => omni_cli::ServiceSubcommand::Install,
+                ServiceAction::Install { account } => {
+                    // The watchfolder is read from the config so the installer
+                    // can tell whether LocalSystem will actually be able to
+                    // deliver to it.
+                    let watchfolder = AppConfig::load_from_file(&paths.config)
+                        .ok()
+                        .map(|c| c.watchfolder_path);
+                    omni_cli::ServiceSubcommand::Install {
+                        account,
+                        watchfolder,
+                    }
+                }
                 ServiceAction::Uninstall => omni_cli::ServiceSubcommand::Uninstall,
                 ServiceAction::Start => omni_cli::ServiceSubcommand::Start,
                 ServiceAction::Stop => omni_cli::ServiceSubcommand::Stop,
