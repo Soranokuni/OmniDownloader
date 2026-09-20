@@ -397,6 +397,11 @@ const MATRIX: &[Row] = &[
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
     ),
     (
+        "POST",
+        "/api/admin/rollback-ytdl",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
+    ),
+    (
         "GET",
         "/api/secrets",
         &[

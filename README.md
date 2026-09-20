@@ -1,50 +1,193 @@
 # OmniDownloader
 
 Broadcast-grade media ingest daemon for a television newsroom. Emails and web
-links go in; Sony XDCAM HD422 1080i50 MXF files land atomically in the Dalet
-Galaxy playout watchfolder.
+links go in; Sony XDCAM HD422 1080i50 MXF files land atomically in the
+broadcast ingest watchfolder that playout monitors.
 
 Pure Rust, one `omni-ingest.exe`, runs as a Windows service.
 
-> **Status:** actively being hardened against [`plan.md`](plan.md). Phase 0
-> (safety net) is complete. See [`handoffs.md`](handoffs.md) for what has
-> landed, what was verified and how, and which known defects are still open.
+**Author:** Alex Fountas · Master Control engineer
 
-## What it does
+---
 
-A journalist emails a numbered list of stories with links. The daemon:
+## The problem this solves
 
-1. **Reads the mailbox** and parses the Greek email — sections, numbering,
-   `ΓΙΑ ΠΛΑΝΑ:` markers, journalist resolution, keyword generation.
-2. **Extracts the video** with yt-dlp, or — for news portals that embed a
-   player — with a headless-browser CDP stream sniffer that blocks ads and
-   trackers, dismisses consent dialogs, and scores candidate streams.
-3. **Transcodes to the on-air format** and re-wraps to SMPTE RDD9 OP1a.
-4. **Delivers atomically** into the watchfolder as `{index}_{JOURNALIST}_{KEYWORD}.mxf`.
+A journalist emails a numbered rundown: ten stories, each with a link to a
+social post, a news portal article, or a video embedded three iframes deep in a
+page that only works with cookies accepted. Someone in Master Control then
+spends an hour a day downloading those by hand, renaming them to the playout
+convention, running them through a transcode preset, and dropping them in a
+watchfolder — while the bulletin gets closer.
 
-Anything it cannot resolve becomes a review item in the MCR panel rather than a
-silent failure or a wrong file on air.
+The manual version fails in expensive ways. A file with the wrong frame rate
+plays back with judder on air. A file with two audio channels instead of eight
+comes up silent on the channels the gallery expects. A file dropped into the
+watchfolder while it is still being written gets ingested half-complete. None of
+those are noticed at the desk; they are noticed on air.
 
-## The on-air format is not negotiable
+So the goal was never "download videos". It was: **produce a file that is
+correct by construction, or produce nothing and say why.**
 
-Playout rejects or mis-plays a file if a single parameter is wrong. These are
-enforced by contract tests over the actual ffmpeg argument vector
-(`crates/omni-broadcast/tests/broadcast_compliance_tests.rs`):
+---
+
+## The approach
+
+### 1. Treat the output format as a contract, not a setting
+
+The on-air specification is fixed and every part of it matters. Playout rejects
+or mis-plays a file if a single parameter is wrong, and the failure mode is
+usually silent.
 
 | | |
 |---|---|
 | Container | SMPTE RDD9 OP1a MXF (`bmxtranswrap -t rdd9 --tc-rate 25`) |
 | Video | MPEG-2 4:2:2 Profile @ Main Level, 1920×1080 |
-| Bitrate | 50 Mbps **constant** (`-b:v`/`-minrate`/`-maxrate` all 50M) |
+| Bitrate | 50 Mbps **constant** — `-b:v`, `-minrate` and `-maxrate` all 50M |
 | Frame rate | exactly 25 fps — never 29.97 / 30 / 50p / 60 |
 | Scan | interlaced, top field first (`+ildct+ilme`, `-top 1`) |
 | Chroma / colour | `yuv422p`, Rec.709 |
 | GOP | 12, with 2 B-frames |
-| Audio | **exactly 8** discrete mono PCM 24-bit 48 kHz streams (EBU R48): Ch1/Ch2 programme L/R, Ch3–8 silence |
-| Delivery | write `.{slug}.mxf.tmp`, fsync, verify size, atomic rename. Never overwrite an existing file in the watchfolder |
+| Audio | **exactly 8** discrete mono PCM 24-bit 48 kHz tracks (EBU R48): ch 1–2 programme L/R, ch 3–8 silence |
+| Loudness | EBU R128, −23 LUFS / −1 dBTP |
 
-See [`AGENTS.md`](AGENTS.md) section 2 for the full specification and the
-reasoning behind each constraint.
+Rather than trusting the encoder command to stay right, the format is enforced
+twice:
+
+- **Contract tests over the argument builders.** The ffmpeg and bmxtranswrap
+  command lines are produced by pure functions, and the tests assert the exact
+  arguments. Changing `-g 12` to `-g 15` fails a test by name.
+- **A compliance gate before delivery.** The finished MXF is probed and checked
+  against the specification — dimensions, pixel format, field order, stream
+  count, bitrate mode — and a file that does not match never reaches the
+  watchfolder. It goes to review instead.
+
+The second one exists because the first can only prove that the command we
+*intended* was issued. Only probing the actual file proves what came out.
+
+### 2. Test the thing that actually breaks, not the thing that is easy to assert
+
+The most instructive defect in this codebase was a filter chain that halved the
+frame rate for progressive sources. The output file still reported 25 fps and
+still reported top-field-first, because a later `-r 25` duplicated the halved
+frames back up. Every obvious check passed. The symptom on air was judder on
+every camera pan.
+
+A frame-count assertion cannot catch that. What catches it is counting *unique*
+frames:
+
+| | frames | unique frames (`mpdecimate`) |
+|---|---|---|
+| old chain | 250 | **125** |
+| fixed chain | 250 | **250** |
+
+The lesson generalised into a habit: for each fix, ask what observation would
+distinguish the fixed system from the broken one, and assert *that* — then
+verify the test by breaking the code on purpose and watching it fail. Several
+tests in this repository carry a recorded negative control for exactly that
+reason. One concurrency test, inverted, reproduces the original defect and
+reports it in words: *"8 jobs were RUNNING at once with only 2 worker permits"*.
+
+### 3. Make partial failure the normal case
+
+Web video extraction fails constantly and for boring reasons: a video is
+geo-blocked, a portal changed its embed, a link is a file-locker page, a site
+wants consent before it will load a player. The system is built so that none of
+those produce a wrong file or a silent stall:
+
+- Every job has a **lease with a heartbeat**, so a worker that dies has its job
+  requeued rather than leaving it stuck in `DOWNLOADING` forever.
+- Every external tool runs under a **timeout with a process-tree kill**, so a
+  hung ffmpeg cannot hold a worker slot indefinitely.
+- Failures are **classified into error codes** with a retry policy per code: a
+  transient HTTP error is retried with backoff, a deleted video is not retried
+  at all, and a failure worth opening a browser for is routed to the sniffer.
+- Anything unresolved becomes a **review item in the MCR panel** with the reason
+  attached, where an operator can paste a corrected URL and force the job
+  through — rather than a wrong file on air or a job that quietly disappeared.
+
+The pipeline never writes a terminal status itself; the worker holding the lease
+does, so two workers cannot race a job into an inconsistent state.
+
+### 4. Never damage what is already on air
+
+Delivery is the last step and the one with the least margin for cleverness:
+
+- write to `.{name}.mxf.tmp`, fsync, verify the size, then **atomically rename**;
+- **never overwrite** an existing file in the watchfolder — a name collision
+  gets a `_N` suffix, because the file already there may be in a rundown;
+- the copy path is the *only* path. An earlier version had a same-volume rename
+  shortcut, which meant the copy logic — the one that has to be correct on the
+  SMB share — only ran when the watchfolder happened to be remote. That is
+  backwards: the risky path should be the one that is always exercised.
+
+### 5. Deterministic first, model second
+
+Email parsing is the one place a language model is genuinely useful — rundowns
+are written by people, in prose, with inconsistent numbering. But a newsroom
+cannot stop working because a model endpoint is down, and a model that
+hallucinates a URL is worse than one that finds nothing.
+
+So the parser is deterministic, and the model is an *assist* with strict
+validation on its output. The constraint is testable: **the parser must produce
+the same job set with the model unreachable.** Language handling is a
+configurable concern, not a hardcoded one — the deployed prompt, keyword
+transliteration and journalist-name resolution all live in configuration so the
+station's own language of preference can be set without touching the code.
+
+### 6. Assume the operator's network is hostile to convenience
+
+The panels are served by the daemon itself and load **nothing from the
+internet** — no CDN stylesheet, no icon script, no web font. Two reasons, and
+the second is the real one:
+
+- Master Control workstations are often on a restricted or entirely offline
+  VLAN, where CDN assets mean the panel renders as unstyled text at exactly the
+  moment an operator needs it.
+- A CDN `<script>` tag is an unsigned third party with full DOM access, running
+  on a machine that can write to the playout share.
+
+This is enforced by a test that reads the shipped assets and fails the build on
+any external reference. The same test bans building HTML from strings, because
+job URLs and error messages originate in email and were previously injected into
+the page with `innerHTML` — a path from "someone mailed the newsroom" to "script
+ran in an operator's browser".
+
+### 7. Security sized to the actual threat model
+
+The threat is not a targeted attacker; it is the newsroom LAN, where everyone
+can route to everything and a misconfiguration is one keystroke away. So:
+
+- **Every route declares its policy** through a typed extractor, and a test
+  walks the route table and fails on any route the access matrix does not
+  mention. The defects this replaced were not subtle bugs — they were routes
+  nobody had decided a policy for, including one that could repoint the playout
+  watchfolder without a session.
+- **Convenience is scoped, not global.** The MCR desk skips the login screen,
+  but only from the client networks an administrator names in CIDR form — not
+  from anywhere that can reach the port.
+- **No default credentials.** There is no seeded administrator; first run
+  creates one, from the machine itself, and that window closes the moment an
+  account exists.
+- **Secrets are encrypted at rest** with Windows DPAPI at machine scope, and no
+  API ever reads one back — the panel reports only whether a secret is set. An
+  admin session that is taken over can overwrite the mailbox password, which is
+  loud, but cannot walk away with it.
+
+### 8. Make upgrades and failures recoverable
+
+- **Schema migrations** are ordered and append-only, with a backup taken before
+  any pending migration runs. A schema change never means "delete the database",
+  which would lose the record of what went to air.
+- **Tool updates are staged and verified.** A new yt-dlp is checksum-verified
+  against the release manifest, staged, and swapped only once no download is in
+  flight — with the previous build kept for one-click rollback, because a
+  release that breaks an extractor is an ordinary event.
+- **Every path is anchored to the install directory**, never the working
+  directory. Under the Windows service the working directory is `System32`,
+  which previously meant a second, empty database was created there while the
+  operator stared at an empty queue.
+
+---
 
 ## Architecture
 
@@ -52,24 +195,27 @@ Seven-crate Cargo workspace, one binary:
 
 | Crate | Responsibility |
 |---|---|
-| `omni-core` | config, paths, SQLite repository, migrations, auth, process runner |
+| `omni-core` | config, paths, SQLite repository, migrations, auth, secrets, process runner |
 | `omni-broadcast` | download → transcode → rewrap → verify → deliver pipeline |
 | `omni-browser` | CDP stream sniffer, unified adblocker, browser pool |
-| `omni-email` | mail source, Greek MIME decoding, parser, LLM assist |
+| `omni-email` | mail source, MIME decoding, deterministic parser, LLM assist |
 | `omni-web` | Axum server, session auth, MCR / admin / user panels, SSE |
 | `omni-service` | Windows Service Control Manager integration |
-| `omni-cli` | setup wizard, service commands |
+| `omni-cli` | setup wizard, service and secret commands |
 
-Design principles the code is being moved toward: acquire worker capacity
-before leasing a job; every running job holds a lease with a heartbeat and
-every stage has a timeout and a process-tree kill; verify before deliver;
-deterministic parsing first with the LLM as optional assist; per-domain routing
-learned from history rather than hand-tuned; every path anchored to the install
-directory, never the working directory.
+Conventions the codebase holds to:
+
+- one queue-insertion function, so no job can be created invisible to
+  deduplication;
+- one process runner, so no external tool runs without a timeout;
+- one API helper in the front-end, so the CSRF header cannot be forgotten per
+  call site;
+- timestamps are `Option` and render blank when absent, never as "now".
 
 ## Building
 
-Requires a stable Rust toolchain (2021 edition) on Windows.
+Requires a stable Rust toolchain (2021 edition) on Windows. No build step
+beyond cargo — no Node, no npm, no Python, and no C toolchain requirement.
 
 ```powershell
 cargo build --release
@@ -94,45 +240,38 @@ copy config.example.json config.json
 # console mode
 .\target\release\omni-ingest.exe run
 
-# sniff a single URL
-.\target\release\omni-ingest.exe browser-test "https://example.gr/video/..."
+# first run: open http://127.0.0.1:8080/setup from this machine,
+# or use the wizard
+.\target\release\omni-ingest.exe setup
+
+# credentials never go in config.json
+.\target\release\omni-ingest.exe secrets set mail.password
+.\target\release\omni-ingest.exe secrets list
+
+# sniff a single URL through the headless browser
+.\target\release\omni-ingest.exe browser-test "https://example.com/video/..."
 
 # Windows service (admin terminal)
-.\target\release\omni-ingest.exe service install|start|stop|status|uninstall
+.\target\release\omni-ingest.exe service install --account "DOMAIN\svc_omni"
+.\target\release\omni-ingest.exe service start|stop|status|uninstall
 ```
 
 Panels: `/mcr` (operators), `/admin`, `/user`, `/login` on port 8080 by default.
+
+If the watchfolder is a network share, install the service under a domain
+account. LocalSystem authenticates to SMB as the computer account, which most
+file servers refuse — and the failure appears only at delivery, after a correct
+file has already been produced.
 
 ## Configuration and data that stay out of git
 
 | Path | Why |
 |---|---|
-| `config.json` | holds mailbox credentials — `config.example.json` ships the shape |
-| `data/journalists.seed.json` | real staff names and work addresses — see `data/journalists.seed.example.json` |
+| `config.json` | deployment-specific; `config.example.json` ships the shape |
+| `data/secrets.bin` | encrypted credential store, tied to the machine |
+| `data/journalists.seed.json` | real staff names and work addresses |
 | `data/omni.db*` | the live queue and archive |
 | `bin/`, `temp/`, `logs/`, `archive/`, `watchfolder/` | runtime state and vendored binaries |
-
-## Documentation
-
-- [`plan.md`](plan.md) — the hardening roadmap being implemented, phase by phase,
-  with a defect register and acceptance criteria per phase.
-- [`AGENTS.md`](AGENTS.md) — invariants. Read before changing anything.
-- [`CLAUDE.md`](CLAUDE.md) — orientation: commands, code map, conventions.
-- [`handoffs.md`](handoffs.md) — milestone log: what landed and how it was verified.
-
-## Known defects still open
-
-Tracked in `plan.md` section 1. The ones that matter most right now:
-
-- **D-08** — the `tinterlace` filter chain halves the frame rate for
-  progressive sources; only a 50p input produces correct 25i today. Isolated in
-  `transcoder::VIDEO_FILTER_CHAIN`, fixed in plan P1.5.
-- **D-07** — an ffprobe failure is read as "no audio", so a probe error can
-  deliver a silent clip instead of going to review.
-- **D-01 / D-02** — jobs are leased before a worker permit is acquired, and
-  there is no crash recovery for jobs left running.
-- **W-01 / W-02 / W-03** — several state-changing routes are unauthenticated and
-  the panels render user-supplied strings via `innerHTML`.
 
 ## Licence
 

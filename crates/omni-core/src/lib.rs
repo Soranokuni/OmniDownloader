@@ -7,6 +7,7 @@ pub mod process;
 pub mod repository;
 pub mod secrets;
 pub mod timestamps;
+pub mod update_gate;
 pub mod urlnorm;
 pub mod auth;
 pub mod dependencies;

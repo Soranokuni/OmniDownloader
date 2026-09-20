@@ -64,6 +64,15 @@ document.getElementById('ytdl-update').addEventListener('click', async (event) =
   }
 });
 
+document.getElementById('ytdl-rollback').addEventListener('click', async () => {
+  if (!confirm('Put the previous yt-dlp build back?')) return;
+  try {
+    await api('/api/admin/rollback-ytdl', { method: 'POST' });
+    toast('Rolled back to the previous yt-dlp build.', 'ok');
+    loadDependencies();
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
 /* ------------------------------------------------------------------ *
  * Users
  * ------------------------------------------------------------------ */

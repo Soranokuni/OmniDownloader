@@ -225,7 +225,7 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
     println!();
     println!("============================================================");
     println!("   OMNIDOWNLOADER BROADCAST INGEST ENGINE - SETUP WIZARD    ");
-    println!("   Sony XDCAM HD422 PAL 1080i50 + Dalet OP1a Integration    ");
+    println!("   Sony XDCAM HD422 PAL 1080i50 + RDD9 OP1a broadcast ingest   ");
     println!("============================================================");
     println!();
 
@@ -244,7 +244,7 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
         .prompt()?;
 
     // 2. Watchfolder
-    config.watchfolder_path = Text::new("Dalet / Play-out Watchfolder Destination:")
+    config.watchfolder_path = Text::new("Broadcast ingest watchfolder (play-out destination):")
         .with_default(&config.watchfolder_path)
         .with_help_message("Directory where atomic broadcast MXF assets will be dropped")
         .prompt()?;
