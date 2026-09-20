@@ -1,189 +1,107 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OmniDownloader - System Setup Wizard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-        .glass { background: rgba(18, 20, 29, 0.75); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OmniDownloader — First run</title>
+<link rel="stylesheet" href="/static/app.css?v=2">
+<link rel="icon" href="data:,">
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-6">
-    <div class="glass w-full max-w-2xl p-8 rounded-2xl shadow-2xl border border-slate-900 space-y-6">
-        <div class="text-center space-y-2 border-b border-slate-900 pb-4">
-            <div class="inline-flex w-12 h-12 rounded-xl bg-cyan-500 items-center justify-center text-slate-950 font-black text-2xl shadow-lg shadow-cyan-500/20 mb-2">
-                O
-            </div>
-            <h1 class="text-xl font-bold tracking-tight text-white">OmniDownloader Initial Setup Wizard</h1>
-            <p class="text-xs text-slate-400">Configure your broadcast ingest pipeline, Outlook watchdog, and Dalet watchfolder</p>
-        </div>
+<body>
 
-        <form id="setup-form" class="space-y-6">
-            <!-- Section 1: Email Configuration -->
-            <div class="space-y-3">
-                <h3 class="text-xs font-bold text-cyan-400 uppercase tracking-wider flex items-center space-x-1.5">
-                    <i data-lucide="mail" class="w-4 h-4"></i>
-                    <span>1. Outlook / IMAP Watchdog</span>
-                </h3>
-                <div class="grid grid-cols-2 gap-3">
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1" for="email_provider">Provider</label>
-                        <select id="email_provider" onchange="onProviderChange()" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                            <option value="Outlook" selected>Microsoft Outlook / Office 365</option>
-                            <option value="Zoho">Zoho Mail</option>
-                            <option value="Gmail">Gmail</option>
-                            <option value="Custom">Custom IMAP</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1" for="imap_server">IMAP Host</label>
-                        <input type="text" id="imap_server" value="outlook.office365.com" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                    </div>
-                </div>
-                <div class="grid grid-cols-2 gap-3">
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1" for="email_address">Email Address</label>
-                        <input type="email" id="email_address" placeholder="ingest@example.gr" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                    </div>
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1" for="email_password">Password / App Token</label>
-                        <input type="password" id="email_password" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                    </div>
-                </div>
-                <button type="button" onclick="testEmail()" class="text-xs text-cyan-400 hover:text-cyan-300 font-semibold flex items-center space-x-1">
-                    <i data-lucide="plug" class="w-3.5 h-3.5"></i>
-                    <span>Test Mail Connection</span>
-                </button>
-                <div id="email-test-result" class="hidden text-xs p-2 rounded-lg font-medium"></div>
-            </div>
-
-            <!-- Section 2: LLM Configuration -->
-            <div class="space-y-3 pt-4 border-t border-slate-900">
-                <h3 class="text-xs font-bold text-cyan-400 uppercase tracking-wider flex items-center space-x-1.5">
-                    <i data-lucide="cpu" class="w-4 h-4"></i>
-                    <span>2. Greek Broadcast LLM Parser (Ollama / OpenAI)</span>
-                </h3>
-                <div class="grid grid-cols-2 gap-3">
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1" for="ollama_endpoint">Endpoint URL</label>
-                        <input type="url" id="ollama_endpoint" value="http://localhost:11434/v1" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                    </div>
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1" for="ollama_model">Model Name</label>
-                        <input type="text" id="ollama_model" value="google/gemma-4-e4b" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                    </div>
-                </div>
-                <button type="button" onclick="testLlm()" class="text-xs text-cyan-400 hover:text-cyan-300 font-semibold flex items-center space-x-1">
-                    <i data-lucide="activity" class="w-3.5 h-3.5"></i>
-                    <span>Test LLM Connection</span>
-                </button>
-                <div id="llm-test-result" class="hidden text-xs p-2 rounded-lg font-medium"></div>
-            </div>
-
-            <!-- Section 3: Watchfolder Storage -->
-            <div class="space-y-3 pt-4 border-t border-slate-900">
-                <h3 class="text-xs font-bold text-cyan-400 uppercase tracking-wider flex items-center space-x-1.5">
-                    <i data-lucide="folder" class="w-4 h-4"></i>
-                    <span>3. Dalet Ingest Watchfolder Directory</span>
-                </h3>
-                <div>
-                    <label class="block text-xs text-slate-400 mb-1" for="watchfolder_path">Watchfolder Path (Local or Network Share)</label>
-                    <input type="text" id="watchfolder_path" value="C:/Users/Shado/Videos/test" required class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white">
-                </div>
-            </div>
-
-            <button type="submit" class="w-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold py-3 rounded-xl text-sm transition-all shadow-lg shadow-cyan-500/20 flex items-center justify-center space-x-2">
-                <i data-lucide="check" class="w-4 h-4"></i>
-                <span>Save Configuration & Launch Engine</span>
-            </button>
-        </form>
+<div class="auth-wrap">
+  <div class="auth-card wide">
+    <div class="auth-head">
+      <div class="brand-mark">O</div>
+      <h1>First-run configuration</h1>
+      <p>This page is served only to a browser on the ingest machine, and only
+         until an administrator account exists.</p>
     </div>
 
-    <script>
-        lucide.createIcons();
+    <form id="setup-form" class="stack">
 
-        function onProviderChange() {
-            const p = document.getElementById('email_provider').value;
-            const s = document.getElementById('imap_server');
-            if (p === 'Outlook') s.value = 'outlook.office365.com';
-            else if (p === 'Zoho') s.value = 'imap.zoho.eu';
-            else if (p === 'Gmail') s.value = 'imap.gmail.com';
-        }
+      <section class="card stack" id="admin-section">
+        <h2 class="card-title">Administrator account</h2>
+        <div class="grid-2">
+          <div>
+            <label for="admin-email">Email</label>
+            <input type="email" id="admin-email" required autocomplete="off">
+          </div>
+          <div>
+            <label for="admin-name">Full name</label>
+            <input type="text" id="admin-name" value="System Administrator">
+          </div>
+        </div>
+        <div>
+          <label for="admin-password">Password (at least 12 characters)</label>
+          <input type="password" id="admin-password" required minlength="12" autocomplete="new-password">
+        </div>
+        <p class="note">
+          There is no default account. Whatever you set here is the only way in,
+          so record it somewhere the MCR team can reach.
+        </p>
+      </section>
 
-        async function testEmail() {
-            const server = document.getElementById('imap_server').value;
-            const email = document.getElementById('email_address').value;
-            const pass = document.getElementById('email_password').value;
-            const resDiv = document.getElementById('email-test-result');
-            resDiv.innerText = 'Testing IMAP connection...';
-            resDiv.className = 'text-xs p-2 rounded-lg bg-slate-900 text-slate-300';
-            resDiv.classList.remove('hidden');
+      <section class="card stack">
+        <h2 class="card-title">Delivery</h2>
+        <div>
+          <label for="watchfolder">Broadcast ingest watchfolder</label>
+          <input type="text" id="watchfolder" required placeholder="\\server\share\ingest">
+          <p class="note" style="margin-top:6px">
+            Finished MXF files are written here. Under a Windows service the
+            account must have Modify rights on this path.
+          </p>
+        </div>
+      </section>
 
-            const res = await fetch('/api/system/test-email', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ server, port: 993, email, pass })
-            });
-            if (res.ok) {
-                resDiv.innerText = 'Connected successfully to IMAP server!';
-                resDiv.className = 'text-xs p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
-            } else {
-                const data = await res.json();
-                resDiv.innerText = 'Connection failed: ' + data.error;
-                resDiv.className = 'text-xs p-2 rounded-lg bg-rose-500/10 text-rose-400 border border-rose-500/20';
-            }
-        }
+      <section class="card stack">
+        <h2 class="card-title">Mailbox</h2>
+        <div class="grid-2">
+          <div>
+            <label for="email-provider">Provider</label>
+            <select id="email-provider">
+              <option value="Outlook">Outlook / Office 365</option>
+              <option value="IMAP">Generic IMAP</option>
+            </select>
+          </div>
+          <div>
+            <label for="imap-server">IMAP server</label>
+            <input type="text" id="imap-server" value="outlook.office365.com">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="email-address">Ingest mailbox</label>
+            <input type="email" id="email-address" placeholder="ingest@station.gr" autocomplete="off">
+          </div>
+          <div>
+            <label for="email-password">Mailbox password</label>
+            <input type="password" id="email-password" autocomplete="off">
+          </div>
+        </div>
+        <p class="note">Leave the mailbox blank to run without email ingest.</p>
+      </section>
 
-        async function testLlm() {
-            const endpoint = document.getElementById('ollama_endpoint').value;
-            const model = document.getElementById('ollama_model').value;
-            const resDiv = document.getElementById('llm-test-result');
-            resDiv.innerText = 'Testing LLM endpoint...';
-            resDiv.className = 'text-xs p-2 rounded-lg bg-slate-900 text-slate-300';
-            resDiv.classList.remove('hidden');
+      <section class="card stack">
+        <h2 class="card-title">Parser assistance (optional)</h2>
+        <div class="grid-2">
+          <div>
+            <label for="llm-endpoint">LLM endpoint</label>
+            <input type="text" id="llm-endpoint" value="http://localhost:11434/v1">
+          </div>
+          <div>
+            <label for="llm-model">Model</label>
+            <input type="text" id="llm-model" value="gemma3:4b">
+          </div>
+        </div>
+      </section>
 
-            const res = await fetch('/api/system/test-llm', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ endpoint, model })
-            });
-            if (res.ok) {
-                resDiv.innerText = 'LLM endpoint reachable!';
-                resDiv.className = 'text-xs p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
-            } else {
-                resDiv.innerText = 'Failed to connect to LLM endpoint.';
-                resDiv.className = 'text-xs p-2 rounded-lg bg-rose-500/10 text-rose-400 border border-rose-500/20';
-            }
-        }
+      <button class="btn btn-primary btn-block" type="submit" id="submit-btn">Finish setup</button>
+      <p id="error" class="note bad" role="alert"></p>
+    </form>
+  </div>
+</div>
 
-        document.getElementById('setup-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const config = {
-                email_provider: document.getElementById('email_provider').value,
-                imap_server: document.getElementById('imap_server').value,
-                email_address: document.getElementById('email_address').value,
-                email_password: document.getElementById('email_password').value,
-                ollama_endpoint: document.getElementById('ollama_endpoint').value,
-                ollama_model: document.getElementById('ollama_model').value,
-                watchfolder_path: document.getElementById('watchfolder_path').value,
-            };
-
-            const res = await fetch('/api/setup', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(config)
-            });
-            if (res.ok) {
-                alert('Setup completed successfully! Redirecting to MCR portal...');
-                window.location.href = '/mcr';
-            } else {
-                alert('Failed saving setup configuration.');
-            }
-        });
-    </script>
+<script type="module" src="/static/setup.js?v=2"></script>
 </body>
 </html>
