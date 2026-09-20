@@ -195,3 +195,164 @@ than the thing in front of it.
   `finish` and `requeue_after` all verify ownership.
 - Failures are wrapped with `.context(code.as_str())` so the worker can recover
   the `ErrorCode` from the anyhow chain rather than re-parsing a message.
+
+---
+
+# Forward handoff — entry points for Phases 2–9
+
+Written 2026-09-20, after Phase 1. Everything above this line records what
+happened; everything below is for whoever picks the work up next.
+
+## Recommended order, and why it differs from the plan
+
+`plan.md` section 16 schedules P3 (extraction) before P4 and P7. **Do Phase 2
+next regardless of what else is scheduled**, because of where the system
+currently stands:
+
+The pipeline is now considerably more trustworthy than the thing in front of it.
+`POST /api/setup` is unauthenticated, so anyone on the newsroom LAN can repoint
+`watchfolder_path`. The hardening in Phases 0–1 guarantees a correct MXF is
+produced and delivered atomically to *whatever directory an attacker last
+named*. Phase 1 made that failure mode more reliable, not less.
+
+Suggested sequence: **P2 → P6.1/P6.2 (logging + real health) → P4 → P3 → P7 →
+P5 → P8 → P9.** Logging and honest health checks make every later phase
+debuggable in situ; P4 is what the newsroom touches daily and its deterministic
+parser is testable offline; P3 is the most open-ended and benefits from having
+the benchmark harness P6.4 provides.
+
+## Carried-forward backlog
+
+Items the plan assigns to Phase 1 that are **not** done. None block Phase 2.
+
+| Item | State | Where to start |
+|---|---|---|
+| P1.4 disk guard | `ErrorCode::LowDisk` exists with a 10-min backoff; nothing raises it | before DOWNLOAD in `pipeline.rs`; needs a free-space call — `GetDiskFreeSpaceExW` via the `windows` crate already in `omni-core` |
+| P1.7 source archive | not started | `Delivered` already reports the final filename; archive after the DELIVER stage |
+| P1.7 per-journalist layout | delivery is still flat | `WatchfolderDelivery::deliver` takes the destination dir — pass `watchfolder/{JOURNALIST}` and the collision logic works unchanged |
+| P1.10 stage timings / SSE | stages are set and timed; `stage_timings_json` is never written | column exists in migration 2 |
+| D-21 remainder | `JobStatus::parse` returns `Option`; `media_format` is still free text | `models.rs` |
+
+## Phase 2 — security (do this next)
+
+Verified state as of this commit:
+
+- **W-01 / W-02.** `crates/omni-web/src/server.rs` builds one flat router with
+  no auth layer. `/api/setup`, `/api/jobs/:id/{override,retry,discard}`,
+  `/api/journalists*`, `/api/admin/*`, `/api/system/logs` and
+  `/api/system/test-email` are all reachable unauthenticated. The last is a
+  credential oracle for the mailbox.
+- **W-03.** 12 `innerHTML` sites across `crates/omni-web/assets/*.html`. The
+  injected values (`url`, `slug`, `notes`, `error_message`) originate in emails,
+  so this is stored XSS reachable by anyone who can mail the ingest address.
+- **W-04.** Still seeded at `repository.rs:68-74` —
+  `admin@newsroom.local` / `admin123`. Removing it must land together with
+  P2.4's first-run path, or a fresh install has no way in.
+- **W-06.** `AppConfig::email_password` is still a plaintext `String`
+  (`config.rs:164`), written to `config.json` by `save_to_file`.
+- **W-08.** 15 external asset references across the panels.
+- **`AuthMode`** (`config.rs:108-119`) is to be *deleted*, not extended — P2.1
+  replaces it with `security.mcr_open_networks`.
+
+Build on rather than redo:
+
+- `Repository::create_session_for(user_id, token, chrono::Duration)` already
+  takes an arbitrary lifetime, so P2.2's per-role session lengths need no new
+  plumbing.
+- Session expiry now stores and compares one timestamp format. **Do not
+  reintroduce `CURRENT_TIMESTAMP` in a session query** — see Milestone 1 for why
+  that let expired sessions authenticate for most of a day.
+- Argon2id hashing is centralised in `Repository::create_user`; it is the only
+  place that hashes, and it takes plaintext.
+
+**The next migration number is 3.** `MIGRATIONS` in `migrations.rs` is
+append-only — never edit or renumber an applied entry. P2.2 needs
+`sessions.created_at / last_seen_at / ip / user_agent`.
+
+## Phase 3 — extraction
+
+- `UnifiedAdBlocker::init(dir)` is now **mandatory** before any sniff, and
+  `global()` panics otherwise. The browser-pool work must not move
+  initialisation later than `main`'s current call site.
+- `ErrorCode::should_try_sniffer()` already encodes which failures are worth
+  opening a browser for (`UNSUPPORTED_URL`, `HTTP_403`, `NO_STREAM_FOUND`) and
+  which are not — a deleted or geo-blocked video should never cost a browser
+  launch. P3.1's router should use it rather than re-deriving the rule.
+- `crates/omni-browser/src/agent.rs` (`ComputerUseAgentPlaceholder`) is called
+  from `src/main.rs:562` for locker detection. P8 deletes the module, so
+  whoever does that must replace this call site with the `LockerResolver`
+  trait — it is the only remaining user.
+- `omni_core::urlnorm::registrable_domain()` is what `domain_stats` and the
+  cookie jars should key on; it already folds `youtu.be` → `youtube.com` and
+  `twitter.com` → `x.com`.
+
+## Phase 4 — email
+
+- `watcher.rs:157` and `:212` still call `add_job`. Move them to
+  `Repository::enqueue(&NewJob, dedup_window_hours)`, which returns
+  `Enqueued::{Created, DuplicateActive, DuplicateRecent}` — P4.5 and the P5
+  reply templates need that distinction, and `add_job` flattens it to an id.
+- `NewJob` already carries `email_message_id` and `extraction_method`, and
+  migration 2 added `journalists.aliases` (JSON array) for P4.3's Greek name
+  resolution. `processed_mail` does **not** exist yet.
+- E-03 is still live: the deployed `config.json` overrides
+  `DEFAULT_SYSTEM_PROMPT` (`config.rs:7`) with a one-liner. P4.4 moves the
+  prompt to `assets/prompts/` and leaves only `llm.prompt_id` in config.
+- Deterministic-first is a decided constraint, not a preference: the parser must
+  produce the same job set with the LLM unreachable.
+
+## Phase 6 — observability and benchmarks
+
+**Read this before writing the P6.3 interlacing check.** `idet` reports
+**Progressive** for a 25p source's output, and that is *correct*: 25p → 25i
+produces PsF, where both fields come from one source frame, so there is no
+inter-field motion to detect. The container correctly says `field_order=tt`.
+An "idet must report TFF" assertion would false-alarm on the single most common
+web source rate. Measured: a 50p source does produce genuine interlacing
+(TFF 151, BFF 0, Progressive 0).
+
+The check that actually catches the D-08 class of defect is **unique frame count
+under `mpdecimate`** — not frame count, and not `idet`. See
+`crates/omni-broadcast/tests/end_to_end_pipeline_tests.rs`, which already does
+this and can be lifted into the PowerShell suite.
+
+`scripts/in_house_test.ps1` still generates 50p only (T-03) — the one rate that
+hid D-08. It needs 25p/30p/25i-tff/mono/5.1/no-audio sources. The Rust
+end-to-end test already covers 25p/30p/50p, so the two should not duplicate
+effort.
+
+## Conventions this codebase now assumes
+
+Breaking any of these will pass review by accident and fail in the newsroom:
+
+1. **`Repository::enqueue` is the only correct way to create a job.** A direct
+   INSERT produces a row invisible to deduplication.
+2. **Every external tool goes through `omni_core::process::run`.** No bare
+   `Command::spawn` remains in the pipeline; anything else has no timeout and
+   leaks its process tree.
+3. **The pipeline never sets a terminal status** — the worker holding the lease
+   does. `set_stage`, `heartbeat`, `finish` and `requeue_after` all verify
+   ownership, so a worker whose lease was reaped mid-stage cannot write to a job
+   another worker now owns.
+4. **Failures are wrapped with `.context(code.as_str())`** so the worker recovers
+   the `ErrorCode` from the anyhow chain instead of re-parsing a message.
+5. **Never a filename-prefix match for cleanup.** Job 1's prefix also matches
+   jobs 10–19 and 100–199. Per-job directories only.
+6. **Never delete or overwrite a file in the watchfolder.** Collisions get a
+   `_N` suffix.
+7. **Timestamps are `Option`.** Render `None` as blank, never as "now".
+8. **`MIGRATIONS` is append-only.**
+
+## Open questions for the product owner
+
+None blocking today, but each is needed before the phase that depends on it:
+
+1. **P1.7 per-journalist subfolders** require MCR to reconfigure Dalet to watch
+   subdirectories. If Dalet cannot, `delivery.layout=flat` stays — worth
+   confirming before building the layout.
+2. **P2.1's `mcr_open_networks`** needs the actual newsroom subnet in CIDR form.
+3. **P3.5's cookie jar** assumes the station has an X account whose cookies can
+   be exported.
+4. **Loudness target** is −23 LUFS / −1 dBTP. If playout already normalises,
+   `audio.loudnorm_enabled` should ship `false` — double normalisation is worse
+   than none.
