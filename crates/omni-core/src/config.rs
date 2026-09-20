@@ -282,6 +282,9 @@ pub struct AppConfig {
     #[serde(default)]
     pub tls: TlsConfig,
 
+    #[serde(default)]
+    pub log: crate::logging::LogConfig,
+
     #[serde(default = "default_concurrent")]
     pub max_concurrent_downloads: usize,
 
@@ -415,6 +418,7 @@ impl Default for AppConfig {
             web_host: default_web_host(),
             security: SecurityConfig::default(),
             tls: TlsConfig::default(),
+            log: crate::logging::LogConfig::default(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
             email_provider: default_email_provider(),

@@ -3,6 +3,8 @@ use std::ffi::OsString;
 use std::path::Path;
 use tracing::{error, info};
 
+
+pub mod eventlog;
 pub const SERVICE_NAME: &str = "OmniIngestService";
 pub const SERVICE_DISPLAY_NAME: &str = "OmniDownloader Broadcast Ingest Engine";
 pub const SERVICE_DESCRIPTION: &str = "Automated mailbox monitoring, newsroom rundown parsing, browser video extraction, and Sony XDCAM HD422 PAL 1080i50 delivery to the broadcast ingest watchfolder.";
@@ -30,6 +32,13 @@ mod windows_impl {
     fn my_service_main(_arguments: Vec<OsString>) {
         if let Err(e) = run_service_impl() {
             error!("Error in service main: {:?}", e);
+            // A service that dies here writes nothing anyone will find: the
+            // file log may not even be open yet. Event Viewer is where the
+            // administrator is already looking.
+            crate::eventlog::report(
+                crate::eventlog::EventLevel::Error,
+                &format!("{SERVICE_DISPLAY_NAME} failed to run: {e:#}"),
+            );
         }
     }
 
@@ -64,9 +73,22 @@ mod windows_impl {
             lock.take()
         };
 
+        // The three moments an IT administrator looking at Event Viewer
+        // actually needs (plan P6.1). Detail stays in logs/; this is the
+        // breadcrumb that says where to look.
+        crate::eventlog::report(
+            crate::eventlog::EventLevel::Info,
+            &format!("{SERVICE_DISPLAY_NAME} started."),
+        );
+
         if let Some(run_fn) = runner {
             run_fn(shutdown_rx);
         }
+
+        crate::eventlog::report(
+            crate::eventlog::EventLevel::Info,
+            &format!("{SERVICE_DISPLAY_NAME} stopped."),
+        );
 
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -130,6 +152,15 @@ mod windows_impl {
             .context("Failed creating Windows Service")?;
 
         let _ = service.set_description(SERVICE_DESCRIPTION);
+
+        // Register the Event Log source while we still have the administrator
+        // rights that creating a service required. A failure here is not fatal
+        // — the service will run and log to files either way — but it does mean
+        // Event Viewer renders our messages wrapped in a complaint, so say so.
+        if let Err(e) = crate::eventlog::register_source() {
+            info!("Event Log source not registered ({e:#}); file logging is unaffected");
+        }
+
         match account {
             Some(a) => info!(
                 "Successfully installed Windows Service {} running as {}",
@@ -153,6 +184,8 @@ mod windows_impl {
 
         let _ = service.stop();
         service.delete().context("Failed deleting service")?;
+        // Leave the machine as we found it.
+        let _ = crate::eventlog::unregister_source();
         info!("Successfully uninstalled Windows Service: {}", SERVICE_NAME);
         Ok(())
     }

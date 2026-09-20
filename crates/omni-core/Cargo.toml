@@ -22,6 +22,8 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 regex = "1.10"
 tokio-util = "0.7"
 sha2 = "0.10"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

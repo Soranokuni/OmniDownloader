@@ -22,6 +22,12 @@ pub struct AppState {
     /// admin session cannot exfiltrate the mailbox password — only overwrite
     /// it, which is loud.
     pub secrets: Arc<omni_core::secrets::SecretStore>,
+    /// Live subsystem health (plan P6.2).
+    ///
+    /// Written by the subsystems as they run and read by the status endpoints,
+    /// so the panel reflects what actually happened rather than what a probe
+    /// fired at page-load time would say.
+    pub health: omni_core::health::HealthState,
     /// Whether the listener actually serves HTTPS.
     ///
     /// Drives the `Secure` cookie attribute. It is a property of the running
@@ -55,8 +61,16 @@ impl AppState {
             event_tx: tx,
             login_limiter: Arc::new(limiter),
             secrets: Arc::new(default_store),
+            health: omni_core::health::HealthState::new(),
             tls_enabled,
         }
+    }
+
+    /// Share the daemon's health state, so the endpoints report what the
+    /// subsystems observed rather than a second, private copy.
+    pub fn with_health(mut self, health: omni_core::health::HealthState) -> Self {
+        self.health = health;
+        self
     }
 
     /// Point the state at the daemon's real secret store.

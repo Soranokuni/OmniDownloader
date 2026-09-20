@@ -41,22 +41,72 @@ for (const button of document.querySelectorAll('.tab[data-tab]')) {
  * Status bar
  * ------------------------------------------------------------------ */
 
+/** Health state -> dot colour. */
+const DOT = { ok: 'ok', degraded: 'warn', down: 'bad' };
+
 async function loadStatus() {
+  let data;
   try {
-    const data = await api('/api/system/status');
-    setStatus('mail', `Mail: ${data.mail_status}`, data.mail_status === 'Active' ? 'ok' : 'warn');
-    setStatus('llm', `LLM: ${data.llm_status}`, data.llm_status === 'Ready' ? 'ok' : 'warn');
-    const free = Number(data.free_disk_gb) || 0;
-    document.getElementById('storage-status').textContent =
-      `Watchfolder: ${free.toFixed(1)} GB free`;
+    data = await api('/api/system/status');
   } catch {
-    setStatus('mail', 'Mail: unknown', 'bad');
-    setStatus('llm', 'LLM: unknown', 'bad');
+    setStatus('mail', 'Mail: unknown', 'bad', '');
+    setStatus('llm', 'LLM: unknown', 'bad', '');
+    return;
+  }
+
+  const checks = data.checks || {};
+
+  // The detail goes in the tooltip, so the bar stays readable but the reason
+  // is one hover away. These used to be the string literals "Active" and
+  // "Ready", which said the mailbox was fine while it was refusing the
+  // password (defect W-09).
+  const mail = checks.mail || { state: 'ok' };
+  setStatus('mail', `Mail: ${label(mail)}`, DOT[mail.state] || '', mail.detail || '');
+
+  const llm = checks.llm || { state: 'ok' };
+  setStatus('llm', `LLM: ${label(llm)}`, DOT[llm.state] || '', llm.detail || '');
+
+  const free = data.disk?.watchfolder?.free_gb;
+  const storage = document.getElementById('storage-status');
+  storage.textContent =
+    free === undefined || free === null
+      ? 'Watchfolder: unknown'
+      : `Watchfolder: ${free.toFixed(1)} GB free`;
+  // Whatever the watchfolder check says is the authoritative word on whether
+  // delivery will work at all.
+  const wf = checks.watchfolder;
+  storage.title = wf?.detail || '';
+
+  // Anything not already on the bar — tools, disk, queue — surfaces here
+  // rather than staying invisible until a job fails on it.
+  const problems = Object.entries(checks)
+    .filter(([name, c]) => c.state !== 'ok' && name !== 'mail' && name !== 'llm')
+    .map(([name, c]) => `${name}: ${c.detail || c.state}`);
+  const banner = document.getElementById('health-banner');
+  if (problems.length === 0) {
+    banner.hidden = true;
+  } else {
+    banner.hidden = false;
+    render(banner, el('div', { class: 'card attention' },
+      el('strong', {}, data.status === 'down' ? 'Ingest is blocked: ' : 'Attention: '),
+      problems.join(' · '),
+    ));
   }
 }
 
-function setStatus(prefix, text, dotClass) {
-  document.getElementById(`${prefix}-status`).textContent = text;
+function label(check) {
+  switch (check.state) {
+    case 'ok': return 'OK';
+    case 'degraded': return 'degraded';
+    case 'down': return 'down';
+    default: return 'unknown';
+  }
+}
+
+function setStatus(prefix, text, dotClass, title) {
+  const node = document.getElementById(`${prefix}-status`);
+  node.textContent = text;
+  node.title = title || '';
   document.getElementById(`${prefix}-dot`).className = `dot ${dotClass}`;
 }
 
