@@ -1242,6 +1242,145 @@ impl Repository {
         Ok(())
     }
 
+    // ==========================================
+    // Scheduled maintenance (plan P6.6)
+    // ==========================================
+
+    /// Make sure every task this build knows about has a row.
+    ///
+    /// A task added in a later version gets its first `next_run` here. It is
+    /// scheduled *forward*, not immediately: an upgrade that ran every
+    /// maintenance task at once — including a VACUUM — the moment the daemon
+    /// came back would be a surprising thing for an upgrade to do.
+    pub fn ensure_scheduled_tasks(&self, tasks: &[crate::scheduler::TaskSpec]) -> Result<()> {
+        let conn = self.pool.get()?;
+        let now = Utc::now();
+        for task in tasks {
+            conn.execute(
+                "INSERT OR IGNORE INTO scheduled_tasks (name, enabled, next_run)
+                 VALUES (?, 1, ?)",
+                params![task.name, timestamps::format(task.cadence.next_after(now))],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Tasks whose time has come.
+    ///
+    /// A task whose `next_run` passed while the machine was off is returned at
+    /// the next tick rather than waiting for tomorrow — the old hourly
+    /// `hour == "03"` check simply lost that day's run.
+    pub fn due_tasks(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT name FROM scheduled_tasks
+             WHERE enabled = 1 AND next_run IS NOT NULL AND next_run <= ?
+             ORDER BY next_run ASC",
+        )?;
+        let rows = stmt.query_map(params![timestamps::format(Utc::now())], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Claim a task for this process.
+    ///
+    /// Pushes `next_run` forward *before* the work starts, so a task that
+    /// takes longer than the tick interval is not started again on the next
+    /// tick — and so a task that panics does not spin. `false` means someone
+    /// else got there first.
+    pub fn claim_task(
+        &self,
+        name: &str,
+        next_run: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE scheduled_tasks SET next_run = ?
+             WHERE name = ? AND enabled = 1 AND next_run IS NOT NULL AND next_run <= ?",
+            params![
+                timestamps::format(next_run),
+                name,
+                timestamps::format(Utc::now())
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Record how a run went.
+    pub fn record_task_run(
+        &self,
+        name: &str,
+        outcome: crate::scheduler::TaskOutcome,
+        error: Option<&str>,
+        elapsed_ms: i64,
+    ) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE scheduled_tasks
+                SET last_run = ?, last_outcome = ?, last_error = ?, last_ms = ?
+              WHERE name = ?",
+            params![
+                timestamps::format(Utc::now()),
+                outcome.as_str(),
+                error.map(|e| e.chars().take(500).collect::<String>()),
+                elapsed_ms,
+                name
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Schedule a task to run at the next tick — the admin panel's "Run now".
+    pub fn run_task_now(&self, name: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE scheduled_tasks SET next_run = ?, enabled = 1 WHERE name = ?",
+            params![timestamps::format(Utc::now() - Duration::seconds(1)), name],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Every task, for the maintenance panel.
+    pub fn list_scheduled_tasks(
+        &self,
+        specs: &[crate::scheduler::TaskSpec],
+    ) -> Result<Vec<crate::scheduler::TaskStatus>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT name, enabled, next_run, last_run, last_outcome, last_error, last_ms
+               FROM scheduled_tasks",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::scheduler::TaskStatus {
+                name: row.get(0)?,
+                description: String::new(),
+                enabled: row.get::<_, i64>(1)? == 1,
+                next_run: timestamps::parse_opt(row.get(2).ok()),
+                last_run: timestamps::parse_opt(row.get(3).ok()),
+                last_outcome: row.get(4)?,
+                last_error: row.get(5)?,
+                last_ms: row.get(6)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let mut status = r?;
+            // The description lives in code, not in the database, so editing
+            // the wording does not need a migration.
+            if let Some(spec) = specs.iter().find(|s| s.name == status.name) {
+                status.description = spec.description.to_string();
+            }
+            out.push(status);
+        }
+        // Stable order for the panel.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
     /// Delete login attempts older than `days`.
     pub fn purge_login_attempts(&self, days: i64) -> Result<usize> {
         let conn = self.pool.get()?;

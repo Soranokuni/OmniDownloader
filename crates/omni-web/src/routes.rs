@@ -860,6 +860,53 @@ pub async fn api_admin_rollback_ytdl(
     ))
 }
 
+/// The maintenance schedule and how each task last went (plan P6.6).
+pub async fn api_admin_maintenance(
+    RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let specs = omni_core::scheduler::default_tasks();
+    let tasks = state
+        .repo
+        .list_scheduled_tasks(&specs)
+        .map_err(internal_error("Could not read the maintenance schedule."))?;
+    Ok(Json(serde_json::json!({ "tasks": tasks })))
+}
+
+/// Bring a task's next run forward to now — the panel's "Run now".
+///
+/// It does not run the task inline: the scheduler owns execution, so a task
+/// cannot end up running twice concurrently because someone clicked while it
+/// was already due. The next tick picks it up, within a minute.
+pub async fn api_admin_run_task(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(name): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let specs = omni_core::scheduler::default_tasks();
+    if !specs.iter().any(|s| s.name == name) {
+        return Err(ApiError::bad_request(format!("Unknown task `{name}`.")));
+    }
+
+    let scheduled = state
+        .repo
+        .run_task_now(&name)
+        .map_err(internal_error("Could not schedule the task."))?;
+    if !scheduled {
+        return Err(ApiError::not_found());
+    }
+
+    let _ = state.repo.log_audit(
+        "INFO",
+        "ADMIN",
+        &format!("{} requested maintenance task `{name}`", admin.email),
+    );
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "message": "Scheduled; it will start within a minute."
+    })))
+}
+
 // ==========================================
 // Secrets API (plan P2.6)
 // ==========================================

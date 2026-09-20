@@ -113,6 +113,23 @@
     </section>
 
     <section class="card">
+      <div class="section-head" style="margin-bottom:12px">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Scheduled maintenance</h2>
+        <button class="btn" type="button" id="maintenance-refresh">Refresh</button>
+      </div>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr><th>Task</th><th>Next run</th><th>Last run</th><th>Result</th><th class="right">Actions</th></tr>
+          </thead>
+          <tbody id="maintenance-body">
+            <tr><td colspan="5" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
       <h2 class="card-title">Connection tests</h2>
       <div class="grid-2">
         <div>

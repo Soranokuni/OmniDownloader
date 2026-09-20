@@ -473,45 +473,38 @@ async fn run_daemon(
         });
     }
 
-    // 3. Start Nightly yt-dlp & Adblock Auto-updater
-    if config.ytdl_auto_update_nightly || config.adblock_auto_update_nightly {
-        let mut updater_rx = shutdown_tx.subscribe();
-        let dep_mgr_clone = DependencyManager::new(&bin_dir);
-        let channel = config.ytdl_channel.clone();
-        let ytdl_enabled = config.ytdl_auto_update_nightly;
-        let adblock_enabled = config.adblock_auto_update_nightly;
-        let gate = update_gate.clone();
-        let repo_updater = repo.clone();
+
+    // 3. Maintenance scheduler (plan P6.6).
+    //
+    // Replaces `if now.format("%H") == "03"` inside an hourly tick, which could
+    // not express a time off the hour, could not notice a run missed while the
+    // machine was off, and recorded nothing about whether last night worked.
+    {
+        let specs = omni_core::scheduler::default_tasks();
+        repo.ensure_scheduled_tasks(&specs)
+            .context("Failed registering the maintenance tasks")?;
+
+        let repo_sched = repo.clone();
+        let mut sched_rx = shutdown_tx.subscribe();
+        let ctx = MaintenanceContext {
+            bin_dir: bin_dir.clone(),
+            temp_path: temp_path.clone(),
+            ytdl_channel: config.ytdl_channel.clone(),
+            ytdl_enabled: config.ytdl_auto_update_nightly,
+            adblock_enabled: config.adblock_auto_update_nightly,
+            gate: update_gate.clone(),
+            retention_days: config.retention_days.max(1),
+        };
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            // A minute is fine: these tasks are nightly, and the cost of a tick
+            // is one indexed query against four rows.
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
-                    _ = updater_rx.recv() => break,
-                    _ = interval.tick() => {
-                        let now = chrono::Local::now();
-                        if now.format("%H").to_string() == "03" {
-                            if ytdl_enabled {
-                                // ±20 minutes, so a fleet of installs does not
-                                // hit the GitHub release endpoint in lockstep
-                                // and read a rate-limit as a network fault.
-                                let jitter = omni_core::update_gate::nightly_jitter(
-                                    Duration::from_secs(20 * 60),
-                                );
-                                info!("Nightly yt-dlp check in {}s (jitter)", jitter.as_secs());
-                                tokio::time::sleep(jitter).await;
-                                nightly_ytdl_update(&dep_mgr_clone, &channel, &gate, &repo_updater)
-                                    .await;
-                            }
-                            if adblock_enabled {
-                                info!("Running scheduled nightly HaGeZi + Greek AdBlock update check...");
-                                let blocker = omni_browser::UnifiedAdBlocker::global();
-                                match blocker.update_blocklists().await {
-                                    Ok(stats) => info!("Nightly AdBlock updated ({} active domains)", stats.total_domains),
-                                    Err(e) => warn!("Nightly AdBlock update check failed: {}", e),
-                                }
-                            }
-                        }
+                    _ = sched_rx.recv() => break,
+                    _ = tick.tick() => {
+                        run_due_tasks(&repo_sched, &specs, &ctx).await;
                     }
                 }
             }
@@ -935,7 +928,9 @@ async fn nightly_ytdl_update(
     channel: &str,
     gate: &UpdateGate,
     repo: &Repository,
-) {
+) -> omni_core::scheduler::TaskOutcome {
+    use omni_core::scheduler::TaskOutcome;
+
     info!("Running scheduled nightly yt-dlp update check...");
 
     let staged = match dep_mgr.stage_ytdl(channel).await {
@@ -945,7 +940,7 @@ async fn nightly_ytdl_update(
             // would have installed silently.
             warn!("Nightly yt-dlp update not installed: {e:#}");
             let _ = repo.log_audit("WARN", "SYSTEM", &format!("yt-dlp update skipped: {e}"));
-            return;
+            return TaskOutcome::Failed;
         }
     };
 
@@ -958,7 +953,10 @@ async fn nightly_ytdl_update(
              verified build stays staged and will be applied on the next attempt.",
             gate.active()
         );
-        return;
+        // Skipped, not failed: nothing is wrong, the pipeline was simply busy,
+        // and an operator reading the maintenance panel should not be sent
+        // looking for a fault that does not exist.
+        return TaskOutcome::Skipped;
     }
 
     let outcome = dep_mgr.apply_staged_ytdl();
@@ -978,10 +976,195 @@ async fn nightly_ytdl_update(
                     &staged.sha256[..16]
                 ),
             );
+            TaskOutcome::Ok
         }
         Err(e) => {
             warn!("Nightly yt-dlp update failed to install: {e:#}");
             let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+            TaskOutcome::Failed
         }
     }
+}
+
+/// Everything the maintenance tasks need, gathered once at start-up.
+struct MaintenanceContext {
+    bin_dir: PathBuf,
+    temp_path: PathBuf,
+    ytdl_channel: String,
+    ytdl_enabled: bool,
+    adblock_enabled: bool,
+    gate: UpdateGate,
+    retention_days: i64,
+}
+
+/// Run whatever is due, recording the outcome of each (plan P6.6).
+async fn run_due_tasks(
+    repo: &Repository,
+    specs: &[omni_core::scheduler::TaskSpec],
+    ctx: &MaintenanceContext,
+) {
+    use omni_core::scheduler::TaskOutcome;
+
+    let due = match repo.due_tasks() {
+        Ok(d) => d,
+        Err(e) => {
+            error!("Could not read the maintenance schedule: {e:?}");
+            return;
+        }
+    };
+
+    for name in due {
+        let Some(spec) = specs.iter().find(|s| s.name == name) else {
+            // A row for a task this build no longer has. Left alone rather
+            // than deleted: a downgrade should not lose its history.
+            continue;
+        };
+
+        // Claim before working. `next_run` moves forward first, so a task that
+        // outlasts the tick interval is not started again on the next tick.
+        let next = spec.cadence.next_after(chrono::Utc::now());
+        match repo.claim_task(&name, next) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                error!("Could not claim maintenance task {name}: {e:?}");
+                continue;
+            }
+        }
+
+        // Jitter applies to the tasks that hit a shared external service, so a
+        // fleet of installs does not arrive at the same endpoint together.
+        let delay = omni_core::scheduler::jitter(spec.jitter);
+        if !delay.is_zero() {
+            info!("Maintenance [{name}] starting in {}s (jitter)", delay.as_secs());
+            tokio::time::sleep(delay).await;
+        }
+
+        info!("Maintenance [{name}] running: {}", spec.description);
+        let started = std::time::Instant::now();
+        let result = run_one_task(&name, repo, ctx).await;
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+
+        match &result {
+            Ok(TaskOutcome::Ok) => info!("Maintenance [{name}] ok in {elapsed_ms} ms"),
+            Ok(TaskOutcome::Skipped) => info!("Maintenance [{name}] skipped"),
+            Ok(TaskOutcome::Failed) | Err(_) => {}
+        }
+
+        let (outcome, error) = match result {
+            Ok(o) => (o, None),
+            Err(e) => {
+                warn!("Maintenance [{name}] failed: {e:#}");
+                (TaskOutcome::Failed, Some(format!("{e:#}")))
+            }
+        };
+        let _ = repo.record_task_run(&name, outcome, error.as_deref(), elapsed_ms);
+    }
+}
+
+async fn run_one_task(
+    name: &str,
+    repo: &Repository,
+    ctx: &MaintenanceContext,
+) -> Result<omni_core::scheduler::TaskOutcome> {
+    use omni_core::scheduler::TaskOutcome;
+
+    match name {
+        "ytdl_update" => {
+            if !ctx.ytdl_enabled {
+                return Ok(TaskOutcome::Skipped);
+            }
+            let dep_mgr = DependencyManager::new(&ctx.bin_dir);
+            Ok(nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await)
+        }
+
+        "adblock_update" => {
+            if !ctx.adblock_enabled {
+                return Ok(TaskOutcome::Skipped);
+            }
+            let blocker = omni_browser::UnifiedAdBlocker::global();
+            let stats = blocker
+                .update_blocklists()
+                .await
+                .context("Blocklist update failed")?;
+            info!("Blocklists updated ({} active domains)", stats.total_domains);
+            Ok(TaskOutcome::Ok)
+        }
+
+        "retention" => {
+            // Login records first: the table grows with every failed attempt
+            // and nothing else prunes it.
+            match repo.purge_login_attempts(90) {
+                Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: login records not purged: {e:#}"),
+            }
+
+            // Orphaned per-job workspaces. The start-up sweep only runs at
+            // start-up, and a machine that stays up for a month accumulates
+            // the temp directories of every job that died mid-stage.
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path, ctx.retention_days).await;
+            if removed > 0 {
+                info!("Retention: removed {removed} orphaned job workspace(s)");
+            }
+            Ok(TaskOutcome::Ok)
+        }
+
+        "vacuum" => {
+            // Blocking, and it holds a write lock, which is why it is monthly
+            // and at 04:30 rather than opportunistic.
+            repo.vacuum_database().context("VACUUM failed")?;
+            Ok(TaskOutcome::Ok)
+        }
+
+        other => {
+            warn!("Maintenance: no handler for task {other}");
+            Ok(TaskOutcome::Skipped)
+        }
+    }
+}
+
+/// Remove `temp/jobs/{id}` directories whose job is gone or long finished.
+///
+/// Deliberately keyed on the directory name being a job id, never on a
+/// filename prefix: job 1's prefix also matches jobs 10-19 and 100-199, which
+/// is defect D-04 and is exactly why per-job directories exist.
+async fn sweep_orphan_job_dirs(repo: &Repository, temp_path: &PathBuf, keep_days: i64) -> usize {
+    let jobs_dir = temp_path.join("jobs");
+    let Ok(entries) = std::fs::read_dir(&jobs_dir) else {
+        return 0;
+    };
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(keep_days.max(1));
+    let mut removed = 0;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<i64>().ok())
+        else {
+            continue;
+        };
+
+        let stale = match repo.get_job(id) {
+            // No such job: nothing will ever come back for these files.
+            Ok(None) => true,
+            // Finished long enough ago that a retry is not coming.
+            Ok(Some(job)) => {
+                job.status.is_terminal()
+                    && job.updated_at.map(|t| t < cutoff).unwrap_or(false)
+            }
+            Err(_) => false,
+        };
+
+        if stale && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }

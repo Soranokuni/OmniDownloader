@@ -177,6 +177,9 @@ fn default_session_hours_admin() -> i64 {
 fn default_session_days_mcr() -> i64 {
     30
 }
+fn default_retention_days() -> i64 {
+    7
+}
 fn default_session_idle_hours() -> i64 {
     12
 }
@@ -284,6 +287,15 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub log: crate::logging::LogConfig,
+
+    /// How long a finished job's working files are kept before the nightly
+    /// retention task removes them (plan P6.6).
+    ///
+    /// Only the *workspace* — the download and the intermediate transcode —
+    /// not the delivered MXF, which belongs to playout, and not the job row,
+    /// which is the record of what went to air.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: i64,
 
     #[serde(default = "default_concurrent")]
     pub max_concurrent_downloads: usize,
@@ -419,6 +431,7 @@ impl Default for AppConfig {
             security: SecurityConfig::default(),
             tls: TlsConfig::default(),
             log: crate::logging::LogConfig::default(),
+            retention_days: default_retention_days(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
             email_provider: default_email_provider(),

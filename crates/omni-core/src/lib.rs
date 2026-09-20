@@ -7,6 +7,7 @@ pub mod migrations;
 pub mod paths;
 pub mod process;
 pub mod repository;
+pub mod scheduler;
 pub mod secrets;
 pub mod selftest;
 pub mod timestamps;

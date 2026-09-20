@@ -59,36 +59,47 @@ pub async fn probe_tools(bin_dir: &Path) -> Vec<ToolReport> {
             continue;
         }
 
-        // Short timeout: a version flag that does not return in five seconds
-        // means something is badly wrong, and start-up must not hang on it.
-        let opts = RunOpts::new(Duration::from_secs(5));
-        let outcome = process::run(&path, &[flag.to_string()], opts).await;
-
-        let (present, version) = match outcome {
-            Ok(out) => {
-                // bmxtranswrap's `--help` exits non-zero by design, so the
-                // check is "did it produce its own output", not "did it
-                // succeed". A tool that cannot start produces neither.
-                let text = if out.stdout.trim().is_empty() {
-                    out.stderr_tail.clone()
-                } else {
-                    out.stdout.clone()
-                };
-                let first = text.lines().next().unwrap_or("").trim().to_string();
-                (!first.is_empty(), Some(first).filter(|s| !s.is_empty()))
-            }
-            Err(_) => (false, None),
-        };
-
+        let version = probe_one(&path, &[flag]).await;
         reports.push(ToolReport {
             name: name.to_string(),
-            present,
+            present: version.is_some(),
             version,
             path: Some(path),
         });
     }
 
     reports
+}
+
+/// Run one binary with a version flag; `Some(first line)` when it answered.
+///
+/// The check is "did it produce its own output", not "did it exit zero":
+/// `bmxtranswrap --help` exits non-zero by design. A binary that cannot start
+/// produces neither.
+pub async fn probe_one(path: &Path, args: &[&str]) -> Option<String> {
+    // `RunOpts::new` discards stdout by default — it is built for the pipeline,
+    // where a tool's stdout is either noise or streamed line by line. Version
+    // banners go to stdout, so without this every probe reads as empty and
+    // every tool is reported missing.
+    let mut opts = RunOpts::new(Duration::from_secs(5));
+    opts.stdout = crate::process::StdoutMode::Capture;
+
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let out = process::run(path, &args, opts).await.ok()?;
+
+    // ffmpeg writes its banner to stdout; some builds and some tools write to
+    // stderr. Take whichever spoke.
+    let text = if out.stdout.trim().is_empty() {
+        out.stderr_tail
+    } else {
+        out.stdout
+    };
+    let first = text.lines().next().unwrap_or("").trim().to_string();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 /// Can we actually write to the watchfolder?
@@ -295,6 +306,27 @@ mod tests {
         assert_eq!(reports.len(), REQUIRED_TOOLS.len());
         assert!(reports.iter().all(|r| !r.present));
         assert!(reports.iter().all(|r| r.version.is_none()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_binary_that_answers_is_detected_with_its_first_line() {
+        // The check the missing-tool tests cannot make: that a *working*
+        // binary is recognised. Without it, `probe_one` returning None for
+        // everything looks exactly like a machine with no tools installed --
+        // which is precisely the bug this test was written for, where
+        // `RunOpts::new` discarded stdout and every probe read as empty.
+        let version = probe_one(
+            std::path::Path::new(r"C:\Windows\System32\cmd.exe"),
+            &["/c", "echo", "omni-probe-ok"],
+        )
+        .await;
+
+        assert_eq!(
+            version.as_deref(),
+            Some("omni-probe-ok"),
+            "a binary that produced output on stdout was not detected"
+        );
     }
 
     #[tokio::test]
