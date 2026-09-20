@@ -43,3 +43,22 @@ desktop.ini
 
 # ---- Real newsroom roster: staff names and work addresses ----
 /data/journalists.seed.json
+
+# ---- Internal working notes and agent instructions ----
+#
+# These are how the work gets done, not part of what ships. They name internal
+# defect ids, the station's own conventions and the order the hardening is being
+# carried out in; none of that is useful to someone reading the repository, and
+# some of it would go stale the moment it was published. README.md is the one
+# Markdown file that is deliberately tracked.
+/AGENTS.md
+/CLAUDE.md
+/SKILL.md
+/plan.md
+/handoffs.md
+/benchmark_results.md
+/.claude/
+/.cursor/
+/.github/copilot-instructions.md
+/.windsurfrules
+/.aider*

@@ -835,6 +835,31 @@ pub async fn api_admin_update_ytdl(
     ))
 }
 
+/// Put the previous yt-dlp build back (plan P2.9).
+///
+/// A yt-dlp release that breaks an extractor is an ordinary event, and before
+/// this the newsroom's only recourse was finding the old executable by hand
+/// while the queue filled up.
+pub async fn api_admin_rollback_ytdl(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let bin_dir = { state.config.read().await.bin_dir.clone() };
+    let dep_mgr = DependencyManager::new(&bin_dir);
+    let path = dep_mgr.rollback_ytdl().map_err(|e| {
+        tracing::error!(error = ?e, "yt-dlp rollback failed");
+        ApiError::bad_request(e.to_string())
+    })?;
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("{} rolled yt-dlp back to the previous build", admin.email),
+    );
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "path": path.to_string_lossy() }),
+    ))
+}
+
 // ==========================================
 // Secrets API (plan P2.6)
 // ==========================================

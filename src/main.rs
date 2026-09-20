@@ -17,13 +17,14 @@ use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStage, JobStatus};
 use omni_core::repository::Repository;
 use omni_core::secrets::SecretStore;
+use omni_core::update_gate::UpdateGate;
 use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
-#[command(author = "OmniDownloader Team")]
+#[command(author = "Alex Fountas <afountas@cretetv.gr>")]
 #[command(version = "1.0.0")]
 #[command(about = "Unified Broadcast-Grade Media Ingest Engine & Windows Service")]
 struct Cli {
@@ -251,7 +252,7 @@ async fn run_daemon(
 
     info!("============================================================");
     info!("   OMNIDOWNLOADER BROADCAST INGEST ENGINE v1.0.0            ");
-    info!("   Sony XDCAM HD422 PAL 1080i50 + Dalet OP1a Integration    ");
+    info!("   Sony XDCAM HD422 PAL 1080i50 + RDD9 OP1a broadcast ingest   ");
     info!("============================================================");
 
     let config_path = paths.config.clone();
@@ -275,7 +276,7 @@ async fn run_daemon(
     let config = config;
 
     // Every one of these is absolute: relative entries resolve against the
-    // install root, absolute and UNC entries (the Dalet share) pass through.
+    // install root, absolute and UNC entries (a playout share) pass through.
     let db_path = paths.resolve(&config.database_path);
     let temp_path = paths.resolve(&config.temp_path);
     let watchfolder_path = paths.resolve(&config.watchfolder_path);
@@ -349,6 +350,10 @@ async fn run_daemon(
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
+    // Keeps the nightly tool update from swapping yt-dlp.exe out from under a
+    // running download (plan P2.9, defect D-16).
+    let update_gate = UpdateGate::new();
+
     // 1. Start Embedded Web Server
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_secret_store(secret_store.clone());
@@ -380,6 +385,8 @@ async fn run_daemon(
         let channel = config.ytdl_channel.clone();
         let ytdl_enabled = config.ytdl_auto_update_nightly;
         let adblock_enabled = config.adblock_auto_update_nightly;
+        let gate = update_gate.clone();
+        let repo_updater = repo.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
@@ -390,11 +397,16 @@ async fn run_daemon(
                         let now = chrono::Local::now();
                         if now.format("%H").to_string() == "03" {
                             if ytdl_enabled {
-                                info!("Running scheduled nightly yt-dlp auto-update check...");
-                                match dep_mgr_clone.download_ytdl(&channel).await {
-                                    Ok(dest) => info!("Nightly yt-dlp updated successfully to {:?}", dest),
-                                    Err(e) => warn!("Nightly yt-dlp update check failed: {}", e),
-                                }
+                                // ±20 minutes, so a fleet of installs does not
+                                // hit the GitHub release endpoint in lockstep
+                                // and read a rate-limit as a network fault.
+                                let jitter = omni_core::update_gate::nightly_jitter(
+                                    Duration::from_secs(20 * 60),
+                                );
+                                info!("Nightly yt-dlp check in {}s (jitter)", jitter.as_secs());
+                                tokio::time::sleep(jitter).await;
+                                nightly_ytdl_update(&dep_mgr_clone, &channel, &gate, &repo_updater)
+                                    .await;
                             }
                             if adblock_enabled {
                                 info!("Running scheduled nightly HaGeZi + Greek AdBlock update check...");
@@ -475,6 +487,7 @@ async fn run_daemon(
     let repo_worker = repo.clone();
     let engine_worker = broadcast_engine.clone();
     let worker_hostname = hostname.clone();
+    let worker_gate = update_gate.clone();
 
     tokio::spawn(async move {
         info!("Queue worker pool active (concurrency: {max_concurrency})");
@@ -494,6 +507,19 @@ async fn run_daemon(
             };
 
             worker_seq += 1;
+
+            // A tool swap is pending: hold off rather than lease a job whose
+            // downloader is about to be replaced underneath it. The pass is
+            // taken *before* leasing, so there is no window where a job is
+            // owned but uncounted.
+            let Some(gate_pass) = worker_gate.try_enter() else {
+                drop(permit);
+                tokio::select! {
+                    _ = worker_rx.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                }
+            };
+
             let owner = format!("{worker_hostname}:{}:{worker_seq}", std::process::id());
 
             let job = match repo_worker.lease_job(&owner, LEASE_SECS) {
@@ -520,6 +546,9 @@ async fn run_daemon(
             let rep = repo_worker.clone();
 
             tokio::spawn(async move {
+                // Held for the whole job, including every error path: dropping
+                // it is what tells a waiting updater the downloader is idle.
+                let _gate_pass = gate_pass;
                 let job_id = job.id;
 
                 // Keep the lease alive while we work. If it stops succeeding we
@@ -790,4 +819,66 @@ fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
         }
     }
     ErrorCode::PipelineFailed
+}
+
+/// One nightly yt-dlp update: verify, wait for the pool, swap (plan P2.9).
+///
+/// Every step can decline without consequence. A checksum mismatch, a pool that
+/// will not drain, a failed rename — each leaves the working binary in place
+/// and tries again the following night. Late is fine; a half-installed
+/// downloader in the middle of a news cycle is not.
+async fn nightly_ytdl_update(
+    dep_mgr: &DependencyManager,
+    channel: &str,
+    gate: &UpdateGate,
+    repo: &Repository,
+) {
+    info!("Running scheduled nightly yt-dlp update check...");
+
+    let staged = match dep_mgr.stage_ytdl(channel).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Includes a checksum mismatch, which is the case the old code
+            // would have installed silently.
+            warn!("Nightly yt-dlp update not installed: {e:#}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &format!("yt-dlp update skipped: {e}"));
+            return;
+        }
+    };
+
+    // Up to ten minutes for in-flight downloads. Longer than any sane clip and
+    // shorter than the gap to the next bulletin.
+    if !gate.pause_and_drain(Duration::from_secs(600)).await {
+        gate.resume();
+        warn!(
+            "yt-dlp update postponed: {} download(s) still running after 10 minutes. The \
+             verified build stays staged and will be applied on the next attempt.",
+            gate.active()
+        );
+        return;
+    }
+
+    let outcome = dep_mgr.apply_staged_ytdl();
+    // Resume before reporting, so a logging failure cannot leave the queue
+    // paused.
+    gate.resume();
+
+    match outcome {
+        Ok(path) => {
+            info!("Nightly yt-dlp updated to {:?}", path);
+            let _ = repo.log_audit(
+                "INFO",
+                "SYSTEM",
+                &format!(
+                    "yt-dlp updated ({} channel, sha256 {}); previous build kept for rollback",
+                    channel,
+                    &staged.sha256[..16]
+                ),
+            );
+        }
+        Err(e) => {
+            warn!("Nightly yt-dlp update failed to install: {e:#}");
+            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+        }
+    }
 }

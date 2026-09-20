@@ -5,7 +5,7 @@ use tracing::{error, info};
 
 pub const SERVICE_NAME: &str = "OmniIngestService";
 pub const SERVICE_DISPLAY_NAME: &str = "OmniDownloader Broadcast Ingest Engine";
-pub const SERVICE_DESCRIPTION: &str = "Automated Outlook email monitoring, Greek newsroom LLM parsing, browser video extraction, and Sony XDCAM HD422 PAL 1080i50 Dalet watchfolder ingestion.";
+pub const SERVICE_DESCRIPTION: &str = "Automated mailbox monitoring, newsroom rundown parsing, browser video extraction, and Sony XDCAM HD422 PAL 1080i50 delivery to the broadcast ingest watchfolder.";
 
 #[cfg(windows)]
 mod windows_impl {
