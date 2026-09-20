@@ -83,13 +83,40 @@ impl WebServer {
         state: AppState,
         host: &str,
         port: u16,
-        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<()> {
-        let app = Self::build_router(state);
         let addr: SocketAddr = format!("{}:{}", host, port)
             .parse()
             .with_context(|| format!("Invalid socket address {}:{}", host, port))?;
 
+        // Resolved before the router is built, because the answer decides
+        // whether the session cookie is marked `Secure`.
+        let tls_cert = {
+            let cfg = state.config.read().await;
+            let paths = omni_core::paths::AppPaths::discover("config.json");
+            cfg.tls.resolve(&paths)?
+        };
+
+        match tls_cert {
+            Some(cert) => {
+                // An empty passphrase is legitimate for a `.pfx` exported
+                // without one, so "not set" is not an error here.
+                let password = state
+                    .secrets
+                    .get_lossy(omni_core::secrets::keys::TLS_PASSWORD)
+                    .unwrap_or_default();
+                Self::run_tls(state.with_tls(true), addr, cert, password, shutdown_rx).await
+            }
+            None => Self::run_plain(state.with_tls(false), addr, shutdown_rx).await,
+        }
+    }
+
+    async fn run_plain(
+        state: AppState,
+        addr: SocketAddr,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<()> {
+        let app = Self::build_router(state);
         info!("OmniDownloader Web Server listening on http://{}", addr);
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -110,5 +137,104 @@ impl WebServer {
         .context("Error running Axum server")?;
 
         Ok(())
+    }
+
+    /// Serve HTTPS (plan P2.7).
+    ///
+    /// Optional and off by default: the deployment is a single machine on a
+    /// newsroom LAN, where the realistic choice is an IT-issued certificate or
+    /// a reverse proxy, not a self-signed one that trains operators to click
+    /// through warnings. When it is on, the session cookie gains `Secure`.
+    ///
+    /// The TLS implementation is **SChannel**, through `native-tls` — the same
+    /// stack the HTTP client already uses. The alternative, rustls, needs a C
+    /// toolchain at build time for whichever crypto provider it uses (`ring`
+    /// wants clang on aarch64-windows; `aws-lc` wants cmake). This project
+    /// builds with `cargo build --release` and nothing else, and a TLS option
+    /// that breaks the build on the machine that has to produce the binary is
+    /// not an option. SChannel is already on every Windows box, and a `.pfx`
+    /// is what Windows IT issues anyway.
+    async fn run_tls(
+        state: AppState,
+        addr: SocketAddr,
+        cert_path: std::path::PathBuf,
+        password: String,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) -> Result<()> {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder as ConnBuilder;
+        use tower::Service;
+
+        let pkcs12 = tokio::fs::read(&cert_path)
+            .await
+            .with_context(|| format!("Failed reading the TLS certificate {cert_path:?}"))?;
+
+        let identity = native_tls::Identity::from_pkcs12(&pkcs12, &password).with_context(|| {
+            format!(
+                "Failed opening {cert_path:?} as a PKCS#12 certificate. It must be a .pfx/.p12 \
+                 containing the certificate and its private key; the passphrase comes from the \
+                 secret store (`omni-ingest secrets set web.tls_password`)."
+            )
+        })?;
+
+        let acceptor = tokio_native_tls::TlsAcceptor::from(
+            native_tls::TlsAcceptor::new(identity).context("Failed building the TLS acceptor")?,
+        );
+
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!("OmniDownloader Web Server listening on https://{}", addr);
+
+        let app = Self::build_router(state);
+
+        loop {
+            let (stream, peer) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // One refused connection is not a reason to stop
+                        // serving the newsroom.
+                        tracing::warn!(error = %e, "Failed accepting a TLS connection");
+                        continue;
+                    }
+                },
+                _ = shutdown_rx.recv() => {
+                    info!("OmniDownloader Web Server gracefully shutting down.");
+                    return Ok(());
+                }
+            };
+
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+
+            tokio::spawn(async move {
+                let stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // A browser that rejected the certificate, a port
+                        // scanner, a health check speaking plain HTTP. Common
+                        // and uninteresting: debug, not warn.
+                        tracing::debug!(error = %e, %peer, "TLS handshake failed");
+                        return;
+                    }
+                };
+
+                // The same `ConnectInfo` the plaintext path gets from
+                // `into_make_service_with_connect_info`. Without it the MCR
+                // allowlist would never match over HTTPS — and would fail
+                // closed and silently, which is the worst way to fail.
+                let service = hyper::service::service_fn(move |mut req: axum::http::Request<hyper::body::Incoming>| {
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    app.clone().call(req)
+                });
+
+                if let Err(e) = ConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                    .await
+                {
+                    tracing::debug!(error = %e, %peer, "HTTPS connection ended");
+                }
+            });
+        }
     }
 }

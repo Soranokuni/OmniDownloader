@@ -26,9 +26,8 @@
   },
 
   "tls": {
-    "_comment": "Both paths, or neither. PEM. When set, the panels are served over HTTPS and the session cookie gains Secure.",
-    "cert_path": null,
-    "key_path": null
+    "_comment": "Path to a PKCS#12 (.pfx) certificate holding the certificate and its private key -- the form Windows IT issues. Set the passphrase with `omni-ingest secrets set web.tls_password`. When set, the panels are served over HTTPS and the session cookie gains Secure. Default is plain HTTP on the LAN.",
+    "cert_path": null
   },
 
   "max_concurrent_downloads": 2,
