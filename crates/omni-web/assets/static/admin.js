@@ -160,6 +160,7 @@ const SECRET_LABEL = {
   'mail.password': 'Mailbox password',
   'graph.client_secret': 'Microsoft Graph client secret',
   'teams.webhook_url': 'Teams webhook URL',
+  'web.tls_password': 'TLS certificate passphrase',
 };
 
 async function loadSecrets() {
