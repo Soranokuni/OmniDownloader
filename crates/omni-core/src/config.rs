@@ -215,36 +215,44 @@ impl SecurityConfig {
     }
 }
 
-/// TLS material for the web listener (plan P2.7). Both paths must be set for
-/// HTTPS to be served; either one alone is a misconfiguration and is refused at
-/// start-up rather than silently falling back to plaintext.
+/// TLS material for the web listener (plan P2.7).
+///
+/// The certificate is a **PKCS#12** bundle (`.pfx`/`.p12`) holding the
+/// certificate and its private key together, because the TLS implementation is
+/// Windows SChannel — see the note on `WebServer::run_tls` for why rustls is
+/// not used. A `.pfx` is also the form Windows IT issues, so this asks the
+/// operator for the file they already have rather than for a PEM pair they
+/// would have to convert.
+///
+/// The passphrase is **not** here: it lives in the secret store under
+/// `web.tls_password`, like every other credential (plan P2.6).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default)]
     pub cert_path: Option<String>,
-    #[serde(default)]
-    pub key_path: Option<String>,
 }
 
 impl TlsConfig {
     pub fn is_enabled(&self) -> bool {
-        self.cert_path.is_some() && self.key_path.is_some()
+        self.cert_path.is_some()
     }
 
-    /// `Ok(None)` when TLS is off, `Err` when it is half-configured.
-    pub fn resolve(&self, paths: &AppPaths) -> Result<Option<(PathBuf, PathBuf)>> {
-        match (&self.cert_path, &self.key_path) {
-            (Some(c), Some(k)) => Ok(Some((paths.resolve(c), paths.resolve(k)))),
-            (None, None) => Ok(None),
-            (Some(_), None) => anyhow::bail!(
-                "web.tls.cert_path is set but web.tls.key_path is not; refusing to start \
-                 rather than silently serving the panels over plaintext HTTP"
-            ),
-            (None, Some(_)) => anyhow::bail!(
-                "web.tls.key_path is set but web.tls.cert_path is not; refusing to start \
-                 rather than silently serving the panels over plaintext HTTP"
-            ),
+    /// `Ok(None)` when TLS is off.
+    pub fn resolve(&self, paths: &AppPaths) -> Result<Option<PathBuf>> {
+        let Some(cert) = &self.cert_path else {
+            return Ok(None);
+        };
+        let resolved = paths.resolve(cert);
+        if !resolved.exists() {
+            // Refuse to start rather than silently falling back to plaintext:
+            // an operator who configured TLS and got HTTP would have no way to
+            // tell, and the `Secure` cookie flag would be wrong either way.
+            anyhow::bail!(
+                "web.tls.cert_path points at {resolved:?}, which does not exist. Refusing to \
+                 start rather than silently serving the panels over plaintext HTTP."
+            );
         }
+        Ok(Some(resolved))
     }
 }
 

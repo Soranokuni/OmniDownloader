@@ -37,9 +37,16 @@ pub mod keys {
     /// Teams incoming-webhook URL (plan P5.3) — a URL that is itself a
     /// credential, since anyone holding it can post to the MCR channel.
     pub const TEAMS_WEBHOOK_URL: &str = "teams.webhook_url";
+    /// Passphrase for the PKCS#12 TLS certificate (plan P2.7).
+    pub const TLS_PASSWORD: &str = "web.tls_password";
 
     /// Every key the panel and CLI accept, for validation and listing.
-    pub const ALL: &[&str] = &[MAIL_PASSWORD, GRAPH_CLIENT_SECRET, TEAMS_WEBHOOK_URL];
+    pub const ALL: &[&str] = &[
+        MAIL_PASSWORD,
+        GRAPH_CLIENT_SECRET,
+        TEAMS_WEBHOOK_URL,
+        TLS_PASSWORD,
+    ];
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

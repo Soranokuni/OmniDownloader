@@ -22,6 +22,10 @@ tracing = "0.1"
 anyhow = "1.0"
 thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+tokio-native-tls = "0.3.1"
+native-tls = "0.2.18"
+hyper = "1"
+hyper-util = { version = "0.1.20", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

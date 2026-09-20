@@ -71,10 +71,17 @@ pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Res
         }
         SecretSubcommand::Set { key } => {
             ensure_known_key(&key)?;
-            let value = Password::new(&format!("Value for {key}:"))
-                .with_display_mode(inquire::PasswordDisplayMode::Masked)
-                .with_help_message("Stored encrypted in data/secrets.bin; not echoed")
-                .prompt()?;
+            // Piped stdin (`... | omni-ingest secrets set mail.password`) for a
+            // scripted install; an interactive masked prompt otherwise. Either
+            // way the value never appears as a command-line argument, where it
+            // would be visible in the process list and the shell history.
+            let value = match read_piped_secret()? {
+                Some(piped) => piped,
+                None => Password::new(&format!("Value for {key}:"))
+                    .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                    .with_help_message("Stored encrypted in data/secrets.bin; not echoed")
+                    .prompt()?,
+            };
             if value.is_empty() {
                 println!("! Empty value; nothing was changed. Use `secrets clear` to remove one.");
                 return Ok(());
@@ -89,6 +96,23 @@ pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Res
         }
     }
     Ok(())
+}
+
+/// Read a secret from a pipe, or `None` when stdin is a terminal.
+///
+/// A trailing newline is stripped, because `echo x | ...` adds one and a
+/// password with an invisible newline on the end is a support call that takes
+/// an afternoon.
+fn read_piped_secret() -> Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    stdin.read_to_string(&mut buf)?;
+    Ok(Some(buf.trim_end_matches(['\r', '\n']).to_string()))
 }
 
 fn ensure_known_key(key: &str) -> Result<()> {
