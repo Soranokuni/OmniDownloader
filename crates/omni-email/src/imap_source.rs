@@ -104,7 +104,9 @@ impl MailSource for ImapMailSource {
     async fn fetch_unprocessed(&self, limit: usize) -> Result<Vec<InboundMail>> {
         self.with_session(move |session| {
             let mut uids: Vec<u32> = session
-                .uid_search("UNSEEN")
+                // UNFLAGGED: a message given up on is flagged and left unread
+                // for a human; it must not be picked up again every poll.
+                .uid_search("UNSEEN UNFLAGGED")
                 .map_err(|e| anyhow!("IMAP search UNSEEN failed: {e}"))?
                 .into_iter()
                 .collect();

@@ -24,71 +24,7 @@ use crate::mail::InboundMail;
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Parser tuning, from config `parser.*` (plan section 13).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParserConfig {
-    /// News portals whose article pages carry the video (Tier 2).
-    #[serde(default = "default_tier2_domains")]
-    pub tier2_domains: Vec<String>,
-    /// Queue low-confidence links anyway and let the sniffer try; only
-    /// failures reach MCR review.
-    #[serde(default = "default_true")]
-    pub auto_attempt_unknown_domains: bool,
-    /// Subject words that raise the job priority.
-    #[serde(default = "default_urgent_keywords")]
-    pub urgent_keywords: Vec<String>,
-    /// Video attachments above this are not queued (warning instead).
-    #[serde(default = "default_max_attachment_mb")]
-    pub max_attachment_mb: u64,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-pub fn default_tier2_domains() -> Vec<String> {
-    [
-        "neakriti.gr",
-        "lifo.gr",
-        "protothema.gr",
-        "newsit.gr",
-        "iefimerida.gr",
-        "athletiko.gr",
-        "carandmotor.gr",
-        "gazzetta.gr",
-        "star.gr",
-        "ertnews.gr",
-        "ert.gr",
-        "in.gr",
-        "news247.gr",
-        "cnn.gr",
-        "bbc.com",
-        "bbc.co.uk",
-        "cnn.com",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-pub fn default_urgent_keywords() -> Vec<String> {
-    vec!["ΕΚΤΑΚΤΟ".into(), "BREAKING".into(), "URGENT".into()]
-}
-
-fn default_max_attachment_mb() -> u64 {
-    2048
-}
-
-impl Default for ParserConfig {
-    fn default() -> Self {
-        Self {
-            tier2_domains: default_tier2_domains(),
-            auto_attempt_unknown_domains: true,
-            urgent_keywords: default_urgent_keywords(),
-            max_attachment_mb: default_max_attachment_mb(),
-        }
-    }
-}
+pub use omni_core::config::ParserConfig;
 
 // ---------------------------------------------------------------------------
 // Output
