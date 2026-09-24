@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
-use mailparse::{parse_mail, ParsedMail};
-use std::sync::Arc;
+use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -10,17 +10,42 @@ use omni_core::models::JobStatus;
 use omni_core::repository::Repository;
 
 use crate::decontaminate::decontaminate_email_body;
+use crate::imap_source::ImapMailSource;
 use crate::interceptor::{intercept_volatile_urls, make_manual_slug};
 use crate::llm::LlmClient;
+use crate::mail::InboundMail;
+use crate::source::{MailOutcome, MailSource};
+
+/// Messages fetched per poll. The rest wait for the next poll, oldest first.
+const FETCH_LIMIT: usize = 20;
+
+/// Consecutive processing failures before a message is given up on and left
+/// unread for a human (plan P4.2: "Omni/Failed"). A transient failure (the
+/// database briefly locked, the disk full) gets this many polls to clear.
+pub const MAX_PROCESS_ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
 pub struct EmailWatcher {
     config: AppConfig,
     repo: Repository,
     llm: Arc<LlmClient>,
+    source: Arc<dyn MailSource>,
     /// Where the poll result is reported (plan P6.2). `None` in tests and in
     /// any caller that does not care.
     health: Option<HealthState>,
+    /// Failed processing attempts per message id, since start-up.
+    attempts: Arc<Mutex<HashMap<String, u32>>>,
+}
+
+/// What one poll did, for health and tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PollReport {
+    pub fetched: usize,
+    pub processed: usize,
+    /// Failed this time, will be retried next poll.
+    pub retrying: usize,
+    /// Gave up: marked failed on the server.
+    pub failed: usize,
 }
 
 /// Reduce an error chain to one line an operator can act on.
@@ -50,12 +75,25 @@ fn short_reason(e: &anyhow::Error) -> String {
 
 impl EmailWatcher {
     pub fn new(config: AppConfig, repo: Repository) -> Self {
+        let source = Arc::new(ImapMailSource::new(
+            &config.imap_server,
+            config.imap_port,
+            &config.email_address,
+            &config.email_password,
+        ));
+        Self::with_source(config, repo, source)
+    }
+
+    /// A watcher over any mail source (Graph, IMAP, or a test double).
+    pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
         let llm = Arc::new(LlmClient::new(&config.ollama_endpoint, &config.ollama_model));
         Self {
             config,
             repo,
             llm,
+            source,
             health: None,
+            attempts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -75,23 +113,11 @@ impl EmailWatcher {
     }
 
     pub fn test_connection(server: &str, port: u16, email: &str, pass: &str) -> Result<()> {
-        let client = imap::ClientBuilder::new(server, port)
-            .connect()
-            .with_context(|| format!("Failed to connect to IMAP {}:{}", server, port))?;
-
-        let mut session = client
-            .login(email, pass)
-            .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
-
-        let _ = session.logout();
-        Ok(())
+        ImapMailSource::new(server, port, email, pass).test_connection_blocking()
     }
 
     pub async fn start_polling_loop(self: Arc<Self>, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
-        info!(
-            "EmailWatcher: Starting IMAP watchdog on {} ({}:{})",
-            self.config.email_provider, self.config.imap_server, self.config.imap_port
-        );
+        info!("EmailWatcher: watching {}", self.source.describe());
 
         let poll_interval = Duration::from_secs(self.config.email_poll_interval_secs.max(10));
 
@@ -102,18 +128,16 @@ impl EmailWatcher {
                     break;
                 }
                 _ = tokio::time::sleep(poll_interval) => {
-                    if self.config.email_address.is_empty() || self.config.email_password.is_empty() {
+                    if !self.source.is_configured() {
                         warn!("EmailWatcher: Credentials not configured. Sleeping...");
                         self.report_health(Check::disabled("Mailbox"));
                         continue;
                     }
 
-                    let watcher = self.clone();
-                    let res = tokio::task::spawn_blocking(move || watcher.poll_inbox_sync()).await;
-                    match res {
-                        Ok(Err(e)) => {
+                    match self.poll_once().await {
+                        Err(e) => {
                             error!("EmailWatcher error: {:#}", e);
-                            let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("IMAP poll error: {}", e));
+                            let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("Mail poll error: {}", short_reason(&e)));
                             // The panel used to say "Mail: Active" through
                             // exactly this (defect W-09). A short reason, not
                             // the whole chain: this string is shown to an
@@ -122,14 +146,10 @@ impl EmailWatcher {
                                 Check::degraded(short_reason(&e)).with_error(format!("{e:#}")),
                             );
                         }
-                        Err(join_err) => {
-                            error!("EmailWatcher task error: {}", join_err);
-                            self.report_health(Check::degraded("mail poll task failed"));
-                        }
-                        Ok(Ok(())) => {
+                        Ok(_) => {
                             self.report_health(Check::ok(format!(
                                 "polling {} every {}s",
-                                self.config.imap_server,
+                                self.source.describe(),
                                 poll_interval.as_secs()
                             )));
                         }
@@ -139,77 +159,70 @@ impl EmailWatcher {
         }
     }
 
-    fn poll_inbox_sync(&self) -> Result<()> {
-        let server = &self.config.imap_server;
-        let port = self.config.imap_port;
-
-        let client = imap::ClientBuilder::new(server.as_str(), port)
-            .connect()
-            .with_context(|| format!("Failed IMAP connect with {}:{}", server, port))?;
-
-        let mut session = client
-            .login(&self.config.email_address, &self.config.email_password)
-            .map_err(|(e, _)| anyhow!("IMAP login failed for {}: {}", self.config.email_address, e))?;
-
-        session
-            .select("INBOX")
-            .map_err(|e| anyhow!("Select INBOX failed: {}", e))?;
-
-        let unseen_ids = session
-            .search("UNSEEN")
-            .map_err(|e| anyhow!("IMAP Search UNSEEN failed: {}", e))?;
-
-        if !unseen_ids.is_empty() {
-            info!("EmailWatcher: Found {} unread email(s). Processing...", unseen_ids.len());
-
-            for id in unseen_ids {
-                let id_str = id.to_string();
-                let messages = match session.fetch(&id_str, "RFC822") {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("Fetch error for ID {}: {}", id, e);
-                        continue;
-                    }
-                };
-
-                for msg in messages.iter() {
-                    if let Some(body_bytes) = msg.body() {
-                        let rt = tokio::runtime::Handle::current();
-                        if let Err(e) = rt.block_on(self.process_raw_email(body_bytes)) {
-                            error!("Failed processing email #{}: {:#}", id, e);
-                        }
-                    }
-                }
-
-                // Mark as seen on mail server
-                let _ = session.store(&id_str, "+FLAGS (\\Seen)");
-            }
+    /// One poll: fetch, process, and mark each message **only after** what it
+    /// produced is persisted (defect E-02 marked everything `\Seen`, success
+    /// or not, so a failed parse silently lost the links).
+    pub async fn poll_once(&self) -> Result<PollReport> {
+        let mails = self.source.fetch_unprocessed(FETCH_LIMIT).await?;
+        let mut report = PollReport {
+            fetched: mails.len(),
+            ..Default::default()
+        };
+        if !mails.is_empty() {
+            info!("EmailWatcher: {} unread message(s)", mails.len());
         }
 
-        let _ = session.logout();
-        Ok(())
+        for mail in &mails {
+            match self.process_mail(mail).await {
+                Ok(()) => {
+                    self.attempts.lock().unwrap().remove(&mail.id);
+                    if let Err(e) = self.source.mark_processed(&mail.id, MailOutcome::Processed).await {
+                        // The jobs exist; the next poll sees the message again
+                        // and dedup keeps it from queueing twice.
+                        warn!("EmailWatcher: could not mark message {} processed: {e:#}", mail.id);
+                    }
+                    report.processed += 1;
+                }
+                Err(e) => {
+                    let n = {
+                        let mut attempts = self.attempts.lock().unwrap();
+                        let n = attempts.entry(mail.id.clone()).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    error!(
+                        "EmailWatcher: processing '{}' failed (attempt {n}/{MAX_PROCESS_ATTEMPTS}): {e:#}",
+                        mail.subject
+                    );
+                    if n >= MAX_PROCESS_ATTEMPTS {
+                        let _ = self.repo.log_audit(
+                            "ERROR",
+                            "EMAIL",
+                            &format!("Gave up on email '{}' from {}: {}", mail.subject, mail.from_address, short_reason(&e)),
+                        );
+                        match self.source.mark_processed(&mail.id, MailOutcome::Failed).await {
+                            Ok(()) => {
+                                self.attempts.lock().unwrap().remove(&mail.id);
+                                report.failed += 1;
+                            }
+                            Err(e) => warn!("EmailWatcher: could not mark message {} failed: {e:#}", mail.id),
+                        }
+                    } else {
+                        report.retrying += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
-    async fn process_raw_email(&self, raw_bytes: &[u8]) -> Result<()> {
-        let parsed = parse_mail(raw_bytes).context("Failed parsing RFC822 MIME message")?;
-
-        let subject = parsed
-            .headers
-            .iter()
-            .find(|h| h.get_key().eq_ignore_ascii_case("subject"))
-            .map(|h| h.get_value())
-            .unwrap_or_default();
-
-        let from = parsed
-            .headers
-            .iter()
-            .find(|h| h.get_key().eq_ignore_ascii_case("from"))
-            .map(|h| h.get_value())
-            .unwrap_or_default();
+    async fn process_mail(&self, mail: &InboundMail) -> Result<()> {
+        let subject = &mail.subject;
+        let from = &mail.from_address;
 
         info!("EmailWatcher: Processing email From: '{}', Subject: '{}'", from, subject);
 
-        let body_text = extract_body_text(&parsed);
+        let body_text = mail.readable_body();
         let decontaminated = decontaminate_email_body(&body_text);
 
         // 1. Intercept volatile file-locker URLs (WeTransfer, TransferNow, AMNA)
@@ -228,7 +241,7 @@ impl EmailWatcher {
                     JobStatus::ManualDownload,
                     None,
                     Some("Volatile file-locker intercepted from email"),
-                    Some(&from),
+                    Some(from),
                 );
             }
         }
@@ -247,7 +260,7 @@ impl EmailWatcher {
 
         // 3. Resolve journalist surname against database mappings
         let mut journalist = llm_res.journalist_surname.trim().to_uppercase();
-        if let Ok(Some(mapped_surname)) = self.repo.find_journalist_by_email(&from) {
+        if let Ok(Some(mapped_surname)) = self.repo.find_journalist_by_email(from) {
             info!("Authoritative journalist mapping found: '{}' -> {}", from, mapped_surname);
             journalist = mapped_surname;
         }
@@ -283,7 +296,7 @@ impl EmailWatcher {
                 status,
                 None,
                 Some(&format!("Email subject: {}", subject)),
-                Some(&from),
+                Some(from),
             ) {
                 Ok(id) => {
                     info!("Successfully enqueued Job #{} ({}) Status: {:?}", id, slug, status);
@@ -295,45 +308,5 @@ impl EmailWatcher {
         }
 
         Ok(())
-    }
-}
-
-fn extract_body_text(mail: &ParsedMail) -> String {
-    if mail.subparts.is_empty() {
-        let content_type = mail.ctype.mimetype.to_lowercase();
-        if content_type.contains("text/plain") || content_type.contains("text/html") {
-            let body_bytes = mail.get_body_raw().unwrap_or_default();
-            decode_text_with_charset(&body_bytes, &mail.ctype.charset)
-        } else {
-            String::new()
-        }
-    } else {
-        // Multipart: look for text/plain first, then text/html
-        for part in &mail.subparts {
-            if part.ctype.mimetype.to_lowercase() == "text/plain" {
-                let body_bytes = part.get_body_raw().unwrap_or_default();
-                return decode_text_with_charset(&body_bytes, &part.ctype.charset);
-            }
-        }
-        for part in &mail.subparts {
-            if part.ctype.mimetype.to_lowercase() == "text/html" {
-                let body_bytes = part.get_body_raw().unwrap_or_default();
-                return decode_text_with_charset(&body_bytes, &part.ctype.charset);
-            }
-        }
-        String::new()
-    }
-}
-
-fn decode_text_with_charset(bytes: &[u8], charset: &str) -> String {
-    let lower = charset.to_lowercase();
-    if lower.contains("iso-8859-7") || lower.contains("greek") {
-        let (cow, _, _) = encoding_rs::ISO_8859_7.decode(bytes);
-        cow.to_string()
-    } else if lower.contains("windows-1253") || lower.contains("cp1253") {
-        let (cow, _, _) = encoding_rs::WINDOWS_1253.decode(bytes);
-        cow.to_string()
-    } else {
-        String::from_utf8_lossy(bytes).to_string()
     }
 }
