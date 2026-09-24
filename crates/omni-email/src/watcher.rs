@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,14 +7,12 @@ use tracing::{error, info, warn};
 
 use omni_core::config::AppConfig;
 use omni_core::health::{Check, HealthState};
-use omni_core::models::JobStatus;
-use omni_core::repository::Repository;
+use omni_core::models::{Enqueued, JobStatus, NewJob, ProcessedMail};
+use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
-use crate::decontaminate::decontaminate_email_body;
 use crate::imap_source::ImapMailSource;
-use crate::interceptor::{intercept_volatile_urls, make_manual_slug};
-use crate::llm::LlmClient;
 use crate::mail::InboundMail;
+use crate::parser::{self, ParsedEmail, Tier};
 use crate::source::{MailOutcome, MailSource};
 
 /// Messages fetched per poll. The rest wait for the next poll, oldest first.
@@ -28,7 +27,6 @@ pub const MAX_PROCESS_ATTEMPTS: u32 = 3;
 pub struct EmailWatcher {
     config: AppConfig,
     repo: Repository,
-    llm: Arc<LlmClient>,
     source: Arc<dyn MailSource>,
     /// Where the poll result is reported (plan P6.2). `None` in tests and in
     /// any caller that does not care.
@@ -86,11 +84,9 @@ impl EmailWatcher {
 
     /// A watcher over any mail source (Graph, IMAP, or a test double).
     pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
-        let llm = Arc::new(LlmClient::new(&config.ollama_endpoint, &config.ollama_model));
         Self {
             config,
             repo,
-            llm,
             source,
             health: None,
             attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -174,7 +170,11 @@ impl EmailWatcher {
 
         for mail in &mails {
             match self.process_mail(mail).await {
-                Ok(()) => {
+                Ok(Handled::GaveUpEarlier) => {
+                    // Recorded as failed on an earlier run and still showing
+                    // as unprocessed: leave it for the human it was left for.
+                }
+                Ok(Handled::Done) => {
                     self.attempts.lock().unwrap().remove(&mail.id);
                     if let Err(e) = self.source.mark_processed(&mail.id, MailOutcome::Processed).await {
                         // The jobs exist; the next poll sees the message again
@@ -200,6 +200,15 @@ impl EmailWatcher {
                             "EMAIL",
                             &format!("Gave up on email '{}' from {}: {}", mail.subject, mail.from_address, short_reason(&e)),
                         );
+                        let _ = self.repo.record_processed_mail(&ProcessedMail {
+                            internet_message_id: mail_key(mail),
+                            source_id: Some(mail.id.clone()),
+                            processed_at: None,
+                            outcome: MailOutcome::Failed.as_str().into(),
+                            from_address: Some(mail.from_address.clone()),
+                            subject: Some(mail.subject.clone()),
+                            jobs_json: "[]".into(),
+                        });
                         match self.source.mark_processed(&mail.id, MailOutcome::Failed).await {
                             Ok(()) => {
                                 self.attempts.lock().unwrap().remove(&mail.id);
@@ -216,97 +225,146 @@ impl EmailWatcher {
         Ok(report)
     }
 
-    async fn process_mail(&self, mail: &InboundMail) -> Result<()> {
-        let subject = &mail.subject;
-        let from = &mail.from_address;
+    /// Parse one message and queue its jobs (plan P4.5).
+    ///
+    /// Returns only after every job is persisted; any error leaves the
+    /// message for the next poll. A retry after a partial failure is safe: the
+    /// jobs already created come back from `enqueue` as `DuplicateActive`.
+    async fn process_mail(&self, mail: &InboundMail) -> Result<Handled> {
+        let key = mail_key(mail);
 
-        info!("EmailWatcher: Processing email From: '{}', Subject: '{}'", from, subject);
-
-        let body_text = mail.readable_body();
-        let decontaminated = decontaminate_email_body(&body_text);
-
-        // 1. Intercept volatile file-locker URLs (WeTransfer, TransferNow, AMNA)
-        let volatile_urls = intercept_volatile_urls(&decontaminated);
-        if !volatile_urls.is_empty() {
-            info!("EmailWatcher: Intercepted {} volatile file-locker URL(s).", volatile_urls.len());
-            for v_url in volatile_urls {
-                let slug = make_manual_slug(&v_url);
-                let _ = self.repo.add_job(
-                    &v_url,
-                    &slug,
-                    "MCR",
-                    "MANUAL_DOWNLOAD",
-                    "1",
-                    1, // High priority
-                    JobStatus::ManualDownload,
-                    None,
-                    Some("Volatile file-locker intercepted from email"),
-                    Some(from),
-                );
+        // E-07: the server can show a message as unread again (a lost flag,
+        // a failed move, a journalist dragging it back). Seen before → done.
+        if let Some(prev) = self.repo.get_processed_mail(&key)? {
+            if prev.outcome == MailOutcome::Failed.as_str() {
+                return Ok(Handled::GaveUpEarlier);
             }
+            info!("EmailWatcher: {key} was already processed ({}); not queueing again", prev.outcome);
+            return Ok(Handled::Done);
         }
 
-        // 2. Format prompt for LLM
-        let user_prompt = format!("Sender: {}\nSubject: {}\n\nBody:\n{}", from, subject, decontaminated);
+        info!("EmailWatcher: processing email from '{}', subject '{}'", mail.from_address, mail.subject);
 
-        let llm_res = match self.llm.parse_email(&self.config.system_prompt, &user_prompt).await {
-            Ok(res) => res,
-            Err(e) => {
-                warn!("LLM extraction failed: {}", e);
-                let _ = self.repo.log_audit("WARN", "LLM", &format!("LLM parsing error for email '{}': {}", subject, e));
-                return Err(e);
-            }
-        };
+        let roster = self.repo.list_journalists()?;
+        let parsed = parser::parse(mail, &roster, &self.config.parser);
+        let default_priority = roster
+            .iter()
+            .find(|j| j.surname == parsed.journalist.surname)
+            .map(|j| j.default_priority)
+            .unwrap_or(0);
+        let records = self.enqueue_parsed(mail, &parsed, default_priority)?;
 
-        // 3. Resolve journalist surname against database mappings
-        let mut journalist = llm_res.journalist_surname.trim().to_uppercase();
-        if let Ok(Some(mapped_surname)) = self.repo.find_journalist_by_email(from) {
-            info!("Authoritative journalist mapping found: '{}' -> {}", from, mapped_surname);
-            journalist = mapped_surname;
+        info!(
+            "EmailWatcher: {} → {} ({:?}), {} job(s), {} new",
+            key,
+            parsed.journalist.surname,
+            parsed.journalist.how,
+            records.len(),
+            records.iter().filter(|r| r.result.is_new()).count()
+        );
+        if !parsed.warnings.is_empty() {
+            let codes: Vec<&str> = parsed.warnings.iter().map(|w| w.code.as_str()).collect();
+            let _ = self.repo.log_audit(
+                "WARN",
+                "EMAIL",
+                &format!("Email '{}' from {}: {}", mail.subject, mail.from_address, codes.join(", ")),
+            );
         }
 
-        info!("LLM extracted {} jobs for journalist '{}'", llm_res.jobs.len(), journalist);
+        self.repo.record_processed_mail(&ProcessedMail {
+            internet_message_id: key,
+            source_id: Some(mail.id.clone()),
+            processed_at: None,
+            outcome: serde_json::to_value(parsed.outcome)?.as_str().unwrap_or("JOBS").to_string(),
+            from_address: Some(mail.from_address.clone()),
+            subject: Some(mail.subject.clone()),
+            jobs_json: serde_json::to_string(&records)?,
+        })?;
+        Ok(Handled::Done)
+    }
 
-        // 4. Ingest parsed jobs into SQLite queue
-        for job in llm_res.jobs {
-            let index_str = job.index_str.trim().to_uppercase();
-            let keyword = job.keyword.trim().to_uppercase();
-            let confidence = job.confidence;
+    fn enqueue_parsed(&self, mail: &InboundMail, parsed: &ParsedEmail, default_priority: i32) -> Result<Vec<QueuedFromMail>> {
+        let journalist = &parsed.journalist.surname;
+        let mut notes = format!("Email: {}", mail.subject);
+        if !parsed.warnings.is_empty() {
+            let codes: Vec<&str> = parsed.warnings.iter().map(|w| w.code.as_str()).collect();
+            notes.push_str(&format!(" [{}]", codes.join(", ")));
+        }
+        // Urgent mail goes ahead of the journalist's usual place in the queue.
+        let priority = default_priority + if parsed.urgent { URGENT_PRIORITY_BOOST } else { 0 };
 
-            // Formulate broadcast standardized slug: {index_str}_{journalist}_{keyword}
-            let slug = format!("{}_{}_{}", index_str, journalist, keyword);
-
-            let status = if keyword == "MANUAL_DOWNLOAD" {
-                JobStatus::ManualDownload
-            } else if confidence >= 0.7 {
-                JobStatus::Pending
-            } else {
-                JobStatus::RequiresReview
+        let mut out = Vec::new();
+        for job in parsed.jobs() {
+            let slug = format!("{}_{}_{}", job.index_str, journalist, job.keyword);
+            // Attachments are queued for a human until the pipeline can take
+            // a file from the mailbox itself (plan P4.6).
+            let (status, method) = match job.tier {
+                Tier::Attachment => (JobStatus::ManualDownload, Some("attachment")),
+                Tier::Locker => (job.status, Some("locker")),
+                _ => (job.status, None),
             };
-
-            let priority = if status == JobStatus::ManualDownload { 1 } else { 0 };
-
-            match self.repo.add_job(
-                &job.url,
-                &slug,
-                &journalist,
-                &keyword,
-                &index_str,
+            let new = NewJob {
+                url: job.url.clone(),
+                slug: slug.clone(),
+                journalist: journalist.clone(),
+                keyword: job.keyword.clone(),
+                index_str: job.index_str.clone(),
                 priority,
                 status,
-                None,
-                Some(&format!("Email subject: {}", subject)),
-                Some(from),
-            ) {
-                Ok(id) => {
-                    info!("Successfully enqueued Job #{} ({}) Status: {:?}", id, slug, status);
+                submitted_by_user_id: None,
+                notes: Some(notes.clone()),
+                email_source: Some(mail.from_address.clone()),
+                email_message_id: Some(mail_key(mail)),
+                extraction_method: method.map(String::from),
+            };
+            let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
+            match &result {
+                Enqueued::Created { id } => info!("EmailWatcher: queued job #{id} {slug} ({})", status.as_str()),
+                Enqueued::DuplicateActive { existing_id } => {
+                    info!("EmailWatcher: {} already queued as job #{existing_id}", job.url)
                 }
-                Err(e) => {
-                    info!("Notice: Job for URL '{}' skipped (already queued): {}", job.url, e);
+                Enqueued::DuplicateRecent { existing_id } => {
+                    info!("EmailWatcher: {} delivered recently as job #{existing_id}", job.url)
                 }
             }
+            out.push(QueuedFromMail {
+                index_str: job.index_str.clone(),
+                slug,
+                url: job.url.clone(),
+                status: status.as_str().to_string(),
+                result,
+            });
         }
+        Ok(out)
+    }
+}
 
-        Ok(())
+/// Priority added to jobs from a mail whose subject is urgent (plan P4.5).
+pub const URGENT_PRIORITY_BOOST: i32 = 10;
+
+enum Handled {
+    Done,
+    GaveUpEarlier,
+}
+
+/// One entry of `processed_mail.jobs_json`: what the summary reply (plan
+/// P5.2) tells the journalist about each link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedFromMail {
+    pub index_str: String,
+    pub slug: String,
+    pub url: String,
+    pub status: String,
+    pub result: Enqueued,
+}
+
+/// Idempotency key: the Message-ID, or the provider id for the rare message
+/// that has none (a hand-crafted or broken sender).
+pub fn mail_key(mail: &InboundMail) -> String {
+    let mid = mail.internet_message_id.trim();
+    if mid.is_empty() {
+        format!("source:{}", mail.id)
+    } else {
+        mid.to_string()
     }
 }

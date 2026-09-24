@@ -1638,6 +1638,7 @@ dependencies = [
  "omni-core",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

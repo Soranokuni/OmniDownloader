@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use omni_core::config::AppConfig;
+use omni_core::models::JobStatus;
 use omni_core::repository::Repository;
 use omni_email::mail::InboundMail;
 use omni_email::source::{MailHealth, MailOutcome, MailSource};
-use omni_email::watcher::{EmailWatcher, MAX_PROCESS_ATTEMPTS};
+use omni_email::watcher::{EmailWatcher, MAX_PROCESS_ATTEMPTS, URGENT_PRIORITY_BOOST};
 
 #[derive(Default)]
 struct FakeSource {
@@ -30,6 +31,12 @@ impl FakeSource {
     }
     fn marks(&self) -> Vec<(String, MailOutcome)> {
         self.marks.lock().unwrap().clone()
+    }
+    /// The server shows a message again under a new provider id (a mail
+    /// dragged back to the inbox, a Graph move that failed after queueing).
+    fn redeliver(&self, mut mail: InboundMail, new_id: &str) {
+        mail.id = new_id.into();
+        self.inbox.lock().unwrap().push(mail);
     }
 }
 
@@ -69,12 +76,12 @@ impl MailSource for FakeSource {
     }
 }
 
-fn mail(id: &str, body: &str) -> InboundMail {
+fn mail(id: &str, subject: &str, body: &str) -> InboundMail {
     InboundMail {
         id: id.into(),
         internet_message_id: format!("<{id}@example.gr>"),
         from_address: "a.papadaki@example.gr".into(),
-        subject: "ΘΕΜΑΤΑ".into(),
+        subject: subject.into(),
         body_text: body.into(),
         ..Default::default()
     }
@@ -83,23 +90,26 @@ fn mail(id: &str, body: &str) -> InboundMail {
 fn repo() -> (tempfile::TempDir, Repository) {
     let dir = tempfile::tempdir().unwrap();
     let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+    repo.save_journalist("PAPADAKI", "Anna Papadaki", &["a.papadaki@example.gr".into()], 5)
+        .unwrap();
     (dir, repo)
 }
 
-/// A config whose LLM endpoint refuses connections at once, so processing
-/// fails the way it did whenever Ollama was down.
-fn config_with_dead_llm() -> AppConfig {
-    AppConfig {
-        ollama_endpoint: "http://127.0.0.1:9/v1".into(),
-        ..Default::default()
-    }
+/// Break the queue's event table so every `enqueue` fails inside its
+/// transaction — the shape of a real mid-processing database failure.
+fn break_queue(dir: &tempfile::TempDir) {
+    let conn = rusqlite::Connection::open(dir.path().join("omni.db")).unwrap();
+    conn.execute_batch("DROP TABLE job_events;").unwrap();
 }
+
+const BODY: &str = "1. ΠΑΡΕΛΑΣΗ ΣΤΟ ΗΡΑΚΛΕΙΟ\nhttps://www.youtube.com/watch?v=w0001\n\n2. ΚΑΥΣΩΝΑΣ\nhttps://we.tl/t-w0002";
 
 #[tokio::test]
 async fn a_message_that_fails_processing_is_not_marked_until_retries_run_out() {
-    let (_dir, repo) = repo();
-    let source = FakeSource::with(vec![mail("m1", "1. ΘΕΜΑ\nhttps://youtu.be/abc")]);
-    let watcher = EmailWatcher::with_source(config_with_dead_llm(), repo, source.clone());
+    let (dir, repo) = repo();
+    break_queue(&dir);
+    let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", BODY)]);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
 
     for attempt in 1..MAX_PROCESS_ATTEMPTS {
         let r = watcher.poll_once().await.unwrap();
@@ -110,7 +120,85 @@ async fn a_message_that_fails_processing_is_not_marked_until_retries_run_out() {
     let r = watcher.poll_once().await.unwrap();
     assert_eq!(r.failed, 1);
     assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Failed)]);
+    assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "FAILED");
 
-    // Given up on: the next poll does not see it again.
-    assert_eq!(watcher.poll_once().await.unwrap().fetched, 0);
+    // Given up on and shown again (someone marked it unread): left alone for
+    // the human, not retried in a loop and not marked processed.
+    source.redeliver(mail("m1", "ΘΕΜΑΤΑ", BODY), "m1-again");
+    let r = watcher.poll_once().await.unwrap();
+    assert_eq!((r.fetched, r.processed, r.failed, r.retrying), (1, 0, 0, 0));
+    assert_eq!(source.marks().len(), 1);
+}
+
+#[tokio::test]
+async fn a_parsed_message_queues_its_jobs_then_is_marked() {
+    let (_dir, repo) = repo();
+    let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", BODY)]);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+
+    let r = watcher.poll_once().await.unwrap();
+    assert_eq!(r.processed, 1);
+    assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Processed)]);
+
+    let mut jobs = repo.get_all_jobs().unwrap();
+    jobs.sort_by_key(|j| j.id);
+    let slugs: Vec<&str> = jobs.iter().map(|j| j.slug.as_str()).collect();
+    assert_eq!(slugs, vec!["1_PAPADAKI_PARELASIIRAKLEIO", "2_PAPADAKI_KAFSONAS"]);
+    assert_eq!(jobs[0].status, JobStatus::Pending);
+    assert_eq!(jobs[1].status, JobStatus::ManualDownload);
+    assert_eq!(jobs[1].extraction_method.as_deref(), Some("locker"));
+    assert_eq!(jobs[0].email_message_id.as_deref(), Some("<m1@example.gr>"));
+    assert_eq!(jobs[0].email_source.as_deref(), Some("a.papadaki@example.gr"));
+    assert_eq!(jobs[0].priority, 5, "journalist default priority");
+
+    let row = repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap();
+    assert_eq!(row.outcome, "JOBS");
+    let recorded: serde_json::Value = serde_json::from_str(&row.jobs_json).unwrap();
+    assert_eq!(recorded.as_array().unwrap().len(), 2);
+    assert_eq!(recorded[0]["result"]["outcome"], "created");
+}
+
+/// E-07: the same message seen again must not queue again — even when URL
+/// dedup would let it through because the first job is no longer active.
+#[tokio::test]
+async fn a_redelivered_message_is_not_queued_twice() {
+    let (_dir, repo) = repo();
+    let first = mail("m1", "ΘΕΜΑΤΑ", BODY);
+    let source = FakeSource::with(vec![first.clone()]);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 2);
+
+    // MCR cancels the video job, then the mail shows up unread again.
+    let video = repo.get_all_jobs().unwrap().into_iter().find(|j| j.status == JobStatus::Pending).unwrap();
+    repo.update_job_status(video.id, JobStatus::Cancelled, None, None, None).unwrap();
+    source.redeliver(first, "m1-again");
+
+    let r = watcher.poll_once().await.unwrap();
+    assert_eq!(r.processed, 1);
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 2, "re-delivery queued the mail again");
+    // Marked on the server too, so it stops showing as unread.
+    assert!(source.marks().contains(&("m1-again".to_string(), MailOutcome::Processed)));
+}
+
+#[tokio::test]
+async fn an_urgent_subject_raises_priority_above_the_journalist_default() {
+    let (_dir, repo) = repo();
+    let source = FakeSource::with(vec![mail("m1", "ΕΚΤΑΚΤΟ: σεισμός", "https://youtu.be/w0003")]);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].priority, 5 + URGENT_PRIORITY_BOOST);
+}
+
+#[tokio::test]
+async fn a_message_with_no_links_is_still_marked_processed() {
+    let (_dir, repo) = repo();
+    let source = FakeSource::with(vec![mail("m1", "Καλημέρα", "Θα στείλω τα λινκ αργότερα.")]);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+    assert!(repo.get_all_jobs().unwrap().is_empty());
+    assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Processed)]);
+    assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "NO_LINKS");
 }

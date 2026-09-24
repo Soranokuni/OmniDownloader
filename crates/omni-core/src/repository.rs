@@ -12,7 +12,7 @@ use crate::auth::hash_password;
 use crate::migrations;
 use crate::models::{
     AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob,
-    QueueSummary, User,
+    ProcessedMail, QueueSummary, User,
     UserRole,
 };
 use crate::timestamps;
@@ -1520,6 +1520,59 @@ impl Repository {
             }
         }
         Ok(None)
+    }
+
+    // ==========================================
+    // Processed mail (plan P4.2, defect E-07)
+    // ==========================================
+
+    pub fn get_processed_mail(&self, internet_message_id: &str) -> Result<Option<ProcessedMail>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM processed_mail WHERE internet_message_id = ?",
+                params![internet_message_id],
+                |row| {
+                    Ok(ProcessedMail {
+                        internet_message_id: row.get("internet_message_id")?,
+                        source_id: row.get("source_id")?,
+                        processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
+                        outcome: row.get("outcome")?,
+                        from_address: row.get("from_address")?,
+                        subject: row.get("subject")?,
+                        jobs_json: row.get("jobs_json")?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record (or update) what a message produced. Called only after its
+    /// jobs are in the queue, so a row here means "nothing left to do".
+    pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            r#"
+            INSERT INTO processed_mail
+                (internet_message_id, source_id, processed_at, outcome, from_address, subject, jobs_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(internet_message_id) DO UPDATE SET
+                source_id    = excluded.source_id,
+                processed_at = excluded.processed_at,
+                outcome      = excluded.outcome,
+                jobs_json    = excluded.jobs_json
+            "#,
+            params![
+                m.internet_message_id,
+                m.source_id,
+                timestamps::now_string(),
+                m.outcome,
+                m.from_address,
+                m.subject,
+                m.jobs_json
+            ],
+        )?;
+        Ok(())
     }
 
     // ==========================================
