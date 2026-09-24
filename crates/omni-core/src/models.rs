@@ -256,6 +256,11 @@ pub struct Journalist {
     pub full_name: String,
     pub emails: Vec<String>,
     pub default_priority: i32,
+    /// Other spellings the email parser accepts for this journalist (plan
+    /// P4.3): Greek surname, genitive, first name — `["ΠΑΠΑΔΑΚΗ", "ΑΝΝΑΣ"]`.
+    /// Compared accent- and case-insensitively, in ELOT 743 Latin.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
 }
 

@@ -11,6 +11,7 @@ pub mod scheduler;
 pub mod secrets;
 pub mod selftest;
 pub mod timestamps;
+pub mod translit;
 pub mod update_gate;
 pub mod urlnorm;
 pub mod auth;

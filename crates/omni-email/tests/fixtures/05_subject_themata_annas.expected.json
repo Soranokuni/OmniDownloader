@@ -1,0 +1,44 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "TRYGOSARCHANES",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.tiktok.com/@winery/video/7400000000000000001"
+        }
+      ],
+      "keyword": "TRYGOSARCHANES",
+      "title": "ΤΡΥΓΟΣ ΣΤΙΣ ΑΡΧΑΝΕΣ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "APERGIALIMANI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://x.com/port_news/status/1830000000000000002"
+        }
+      ],
+      "keyword": "APERGIALIMANI",
+      "title": "ΑΠΕΡΓΙΑ ΛΙΜΑΝΙ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}
