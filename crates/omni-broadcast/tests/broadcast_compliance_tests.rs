@@ -467,8 +467,15 @@ fn two_pass_loudness_uses_the_measured_values() {
     );
 }
 
+/// No usable measurement → no normalisation, said plainly in the note.
+///
+/// The old fallback was single-pass dynamic loudnorm. Its 3 s lookahead holds
+/// audio back past the end of the video, and `-shortest` (required by the pad
+/// channels) then cut the programme short — or, for a clip under 3 s, left no
+/// audio at all and ffmpeg failed writing the MXF. Dynamic mode must never
+/// appear in the graph.
 #[test]
-fn a_failed_measurement_falls_back_to_single_pass_rather_than_no_normalisation() {
+fn an_unusable_measurement_skips_normalisation_instead_of_going_dynamic() {
     let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
     let plan = build_plan(
         &p,
@@ -479,11 +486,41 @@ fn a_failed_measurement_falls_back_to_single_pass_rather_than_no_normalisation()
     );
     let chain = filter_graph(&plan.args);
     assert!(
-        chain.contains("loudnorm=I=-23"),
-        "loudness must still be applied when the measurement pass failed: {chain}"
+        !chain.contains("loudnorm"),
+        "without a measurement there must be no loudnorm (dynamic mode truncates): {chain}"
     );
-    assert!(!chain.contains("measured_I"), "{chain}");
-    assert!(plan.note.contains("single-pass"), "{}", plan.note);
+    assert!(plan.note.contains("R128 skipped"), "{}", plan.note);
+    // The programme audio is still there, still eight mono tracks.
+    assert!(chain.contains("[al]") && chain.contains("[ar]"), "{chain}");
+}
+
+/// A short clip measures LRA 0.00. Passed through as-is, loudnorm reads it as
+/// "not supplied" and silently switches the linear pass to dynamic mode,
+/// which truncated the programme (and produced no file under 3 s).
+#[test]
+fn a_zero_loudness_range_is_never_passed_to_the_linear_pass() {
+    let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
+    let short_clip = LoudnessMeasurement {
+        input_i: -21.05,
+        input_lra: 0.0,
+        input_tp: -16.60,
+        input_thresh: -31.05,
+        target_offset: 0.05,
+    };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&short_clip), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(chain.contains("measured_LRA=0.01"), "{chain}");
+    assert!(!chain.contains("measured_LRA=0.00"), "{chain}");
+    assert!(chain.contains("measured_I=-21.05") && chain.contains("linear=true"), "{chain}");
+}
+
+#[test]
+fn a_measurement_at_the_silence_floor_is_unusable() {
+    // Near-silence gates nothing: loudnorm reports input_thresh -70 and would
+    // silently switch a linear pass to dynamic mode.
+    let stderr = r#"{ "input_i" : "-68.20", "input_tp" : "-60.00", "input_lra" : "0.00",
+                      "input_thresh" : "-70.00", "target_offset" : "0.00" }"#;
+    assert!(parse_loudness_measurement(stderr).is_none());
 }
 
 #[test]
@@ -523,7 +560,7 @@ frame= 1234 fps=250 q=-1.0 size=N/A time=00:00:49.36 bitrate=N/A speed=9.99x
 #[test]
 fn digital_silence_does_not_produce_an_infinite_measurement() {
     // loudnorm reports "-inf" for a silent track. Feeding that into pass two
-    // yields an ffmpeg error mid-transcode; falling back to single-pass does not.
+    // yields an ffmpeg error mid-transcode; skipping normalisation does not.
     let stderr = r#"{ "input_i" : "-inf", "input_tp" : "-inf", "input_lra" : "0.00",
                       "input_thresh" : "-inf", "target_offset" : "0.00" }"#;
     assert!(

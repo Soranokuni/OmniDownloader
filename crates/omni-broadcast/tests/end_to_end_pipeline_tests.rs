@@ -211,6 +211,59 @@ async fn a_25p_source_keeps_its_full_motion_cadence() {
     );
 }
 
+/// Short clips with the production loudness policy (R128 on).
+///
+/// Every other case here runs with loudness off, which is how a 2 s social
+/// clip failing in the real pipeline went unnoticed: below loudnorm's 3 s
+/// measurement window the chain fell back to single-pass dynamic loudnorm,
+/// and ffmpeg failed writing the MXF trailer, delivering nothing.
+#[tokio::test]
+async fn short_clips_transcode_with_the_default_loudness_policy() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let transcoder = Transcoder::new(&ffmpeg, &ffprobe);
+
+    for secs in [1u32, 2, 4] {
+        let src = dir.path().join(format!("short_{secs}s.mp4"));
+        assert!(make_source(&ffmpeg, &src, "25", secs, true).await, "could not build the {secs}s source");
+
+        let (mxf, duration) = transcoder
+            .transcode(1, &src, &dir.path().join(format!("work_{secs}")), |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("{secs}s clip with default loudness failed to transcode: {e:#}"));
+
+        let report = verify_mxf(&ffprobe, &mxf, duration)
+            .await
+            .unwrap_or_else(|e| panic!("{secs}s: could not verify: {e:?}"));
+        assert!(report.pass, "{secs}s clip produced a non-compliant file: {}", report.summary());
+
+        // And it was actually normalised: a pass that silently skipped R128
+        // would also produce a compliant file. Programme = tracks 1+2.
+        let out = omni_core::process::run(
+            &ffmpeg,
+            [
+                "-nostdin", "-hide_banner", "-i", &mxf.to_string_lossy(), "-filter_complex",
+                "[0:a:0][0:a:1]amerge=inputs=2,loudnorm=I=-23:TP=-1:LRA=7:print_format=json", "-f", "null", "-",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+            omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("loudness check run");
+        let m = omni_broadcast::transcoder::parse_loudness_measurement(&out.stderr_tail)
+            .unwrap_or_else(|| panic!("{secs}s: output loudness unmeasurable"));
+        assert!(
+            (m.input_i - -23.0).abs() <= 1.0,
+            "{secs}s clip delivered at {:.2} LUFS, not -23 (was normalisation skipped?)",
+            m.input_i
+        );
+    }
+}
+
 /// A source the tools cannot read must fail the job, not silently become a
 /// silent clip (defect D-07).
 #[tokio::test]
