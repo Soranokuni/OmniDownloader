@@ -259,6 +259,62 @@ impl TlsConfig {
     }
 }
 
+/// Microsoft Graph mailbox (plan P4.2, defect E-01).
+///
+/// Used instead of IMAP whenever it is configured: Exchange Online no longer
+/// accepts the basic-auth IMAP login the daemon started with. The app
+/// registration needs `Mail.ReadWrite` and `Mail.Send` (application), limited
+/// to the ingest mailbox by an Exchange application access policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphConfig {
+    #[serde(default)]
+    pub tenant_id: String,
+    #[serde(default)]
+    pub client_id: String,
+    /// The ingest mailbox, e.g. `ingest@example.gr`.
+    #[serde(default)]
+    pub mailbox: String,
+    #[serde(default = "default_processed_folder")]
+    pub processed_folder: String,
+    #[serde(default = "default_failed_folder")]
+    pub failed_folder: String,
+    /// Client secret — **runtime only**, loaded from the secret store
+    /// (`graph.client_secret`). Never read from or written to config.json.
+    #[serde(skip)]
+    pub client_secret: String,
+}
+
+fn default_processed_folder() -> String {
+    "Omni/Processed".into()
+}
+
+fn default_failed_folder() -> String {
+    "Omni/Failed".into()
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            tenant_id: String::new(),
+            client_id: String::new(),
+            mailbox: String::new(),
+            processed_folder: default_processed_folder(),
+            failed_folder: default_failed_folder(),
+            client_secret: String::new(),
+        }
+    }
+}
+
+impl GraphConfig {
+    /// Everything needed to log in is present, secret included.
+    pub fn is_configured(&self) -> bool {
+        !self.tenant_id.trim().is_empty()
+            && !self.client_id.trim().is_empty()
+            && !self.mailbox.trim().is_empty()
+            && !self.client_secret.is_empty()
+    }
+}
+
 /// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
@@ -352,6 +408,9 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub parser: ParserConfig,
+
+    #[serde(default)]
+    pub graph: GraphConfig,
 
     /// How long a finished job's working files are kept before the nightly
     /// retention task removes them (plan P6.6).
@@ -497,6 +556,7 @@ impl Default for AppConfig {
             tls: TlsConfig::default(),
             log: crate::logging::LogConfig::default(),
             parser: ParserConfig::default(),
+            graph: GraphConfig::default(),
             retention_days: default_retention_days(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
@@ -617,6 +677,7 @@ impl AppConfig {
         // Always read back from the store, so the store is the single source
         // of truth and a secret removed there takes effect on restart.
         self.email_password = store.get_lossy(keys::MAIL_PASSWORD).unwrap_or_default();
+        self.graph.client_secret = store.get_lossy(keys::GRAPH_CLIENT_SECRET).unwrap_or_default();
         Ok(rewrote)
     }
 
@@ -724,6 +785,37 @@ mod tests {
         let mut config = AppConfig::load_from_file(&path).unwrap();
         config.adopt_secrets(&store).unwrap();
         assert_eq!(config.email_password, "");
+    }
+
+    #[test]
+    fn the_graph_client_secret_lives_only_in_the_store() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Even a hand-edited config.json cannot supply it...
+        std::fs::write(
+            &path,
+            r#"{ "graph": { "tenant_id": "t", "client_id": "c", "mailbox": "ingest@example.gr",
+                            "client_secret": "typed-into-config" } }"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        assert_eq!(config.graph.client_secret, "");
+        assert!(!config.graph.is_configured());
+        assert_eq!(config.graph.processed_folder, "Omni/Processed");
+
+        // ...the store does, and a save never writes it back.
+        let store = SecretStore::new(dir.path().join("secrets.bin"));
+        store.set(keys::GRAPH_CLIENT_SECRET, "from-the-store").unwrap();
+        config.adopt_secrets(&store).unwrap();
+        assert_eq!(config.graph.client_secret, "from-the-store");
+        assert!(config.graph.is_configured());
+
+        config.save_to_file(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("from-the-store"));
+        assert!(!written.contains("client_secret"));
+        assert!(written.contains("ingest@example.gr"));
     }
 
     #[test]

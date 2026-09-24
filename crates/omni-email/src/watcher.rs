@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use omni_core::config::AppConfig;
@@ -10,6 +10,7 @@ use omni_core::health::{Check, HealthState};
 use omni_core::models::{Enqueued, JobStatus, NewJob, ProcessedMail};
 use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
+use crate::graph::{GraphMailSource, RetryAfter};
 use crate::imap_source::ImapMailSource;
 use crate::mail::InboundMail;
 use crate::parser::{self, ParsedEmail, Tier};
@@ -72,13 +73,19 @@ fn short_reason(e: &anyhow::Error) -> String {
 }
 
 impl EmailWatcher {
+    /// Graph when it is configured (the only option on Office 365, defect
+    /// E-01); IMAP otherwise, for on-prem servers.
     pub fn new(config: AppConfig, repo: Repository) -> Self {
-        let source = Arc::new(ImapMailSource::new(
-            &config.imap_server,
-            config.imap_port,
-            &config.email_address,
-            &config.email_password,
-        ));
+        let source: Arc<dyn MailSource> = if config.graph.is_configured() {
+            Arc::new(GraphMailSource::new(config.graph.clone()))
+        } else {
+            Arc::new(ImapMailSource::new(
+                &config.imap_server,
+                config.imap_port,
+                &config.email_address,
+                &config.email_password,
+            ))
+        };
         Self::with_source(config, repo, source)
     }
 
@@ -116,14 +123,16 @@ impl EmailWatcher {
         info!("EmailWatcher: watching {}", self.source.describe());
 
         let poll_interval = Duration::from_secs(self.config.email_poll_interval_secs.max(10));
+        let mut backoff = Backoff::default();
 
         loop {
+            let wait = backoff.next_wait(poll_interval);
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("EmailWatcher: Received shutdown signal. Exiting watchdog loop.");
                     break;
                 }
-                _ = tokio::time::sleep(poll_interval) => {
+                _ = tokio::time::sleep(wait) => {
                     if !self.source.is_configured() {
                         warn!("EmailWatcher: Credentials not configured. Sleeping...");
                         self.report_health(Check::disabled("Mailbox"));
@@ -138,11 +147,12 @@ impl EmailWatcher {
                             // exactly this (defect W-09). A short reason, not
                             // the whole chain: this string is shown to an
                             // operator, and it must not carry a credential.
-                            self.report_health(
-                                Check::degraded(short_reason(&e)).with_error(format!("{e:#}")),
-                            );
+                            if let Some(check) = backoff.failed(&e, Instant::now()) {
+                                self.report_health(check.with_error(format!("{e:#}")));
+                            }
                         }
                         Ok(_) => {
+                            backoff.succeeded();
                             self.report_health(Check::ok(format!(
                                 "polling {} every {}s",
                                 self.source.describe(),
@@ -366,5 +376,81 @@ pub fn mail_key(mail: &InboundMail) -> String {
         format!("source:{}", mail.id)
     } else {
         mid.to_string()
+    }
+}
+/// Consecutive failures before the mail check turns Degraded (plan P4.2).
+/// One failed poll is a blip — a Graph 503, a DNS hiccup — and a panel that
+/// flaps on every blip teaches operators to ignore it.
+pub const DEGRADED_AFTER_FAILURES: u32 = 3;
+/// An outage this long is Down, not Degraded.
+pub const DOWN_AFTER: Duration = Duration::from_secs(600);
+/// Ceiling for the exponential backoff between failing polls.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(600);
+
+/// Poll pacing and health escalation across consecutive failures.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    failures: u32,
+    since: Option<Instant>,
+    retry_after: Option<Duration>,
+}
+
+impl Backoff {
+    /// How long to wait before the next poll.
+    pub fn next_wait(&self, poll: Duration) -> Duration {
+        if self.failures == 0 {
+            return poll;
+        }
+        let exp = poll.saturating_mul(1u32 << self.failures.min(10)).min(MAX_BACKOFF);
+        exp.max(self.retry_after.unwrap_or_default())
+    }
+
+    /// Record a failure; returns the health to report, if it should change.
+    pub fn failed(&mut self, e: &anyhow::Error, now: Instant) -> Option<Check> {
+        self.failures += 1;
+        let since = *self.since.get_or_insert(now);
+        self.retry_after = e.chain().find_map(|c| c.downcast_ref::<RetryAfter>()).map(|r| r.0);
+        if now.duration_since(since) >= DOWN_AFTER {
+            Some(Check::down(short_reason(e)))
+        } else if self.failures >= DEGRADED_AFTER_FAILURES {
+            Some(Check::degraded(short_reason(e)))
+        } else {
+            None
+        }
+    }
+
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_core::health::Health;
+
+    #[test]
+    fn backoff_escalates_and_honours_retry_after() {
+        let poll = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        let err = anyhow::anyhow!("cannot reach Graph");
+
+        assert_eq!(b.next_wait(poll), poll);
+        assert!(b.failed(&err, t0).is_none(), "one blip must not flip the panel");
+        assert_eq!(b.next_wait(poll), Duration::from_secs(60));
+        assert!(b.failed(&err, t0).is_none());
+        assert_eq!(b.failed(&err, t0).unwrap().state, Health::Degraded);
+        assert!(b.next_wait(poll) <= MAX_BACKOFF);
+
+        assert_eq!(b.failed(&err, t0 + DOWN_AFTER).unwrap().state, Health::Down);
+
+        // A throttle longer than the backoff wins.
+        let throttled = anyhow::Error::new(RetryAfter(Duration::from_secs(900))).context("fetch");
+        b.failed(&throttled, t0 + DOWN_AFTER);
+        assert_eq!(b.next_wait(poll), Duration::from_secs(900));
+
+        b.succeeded();
+        assert_eq!(b.next_wait(poll), poll);
     }
 }

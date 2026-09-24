@@ -979,6 +979,10 @@ pub async fn api_secrets_set(
         let mut cfg = state.config.write().await;
         cfg.email_password = payload.value.trim().to_string();
     }
+    if payload.key == omni_core::secrets::keys::GRAPH_CLIENT_SECRET {
+        let mut cfg = state.config.write().await;
+        cfg.graph.client_secret = payload.value.trim().to_string();
+    }
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
