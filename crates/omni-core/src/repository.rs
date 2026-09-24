@@ -1522,6 +1522,30 @@ impl Repository {
         Ok(None)
     }
 
+    /// Hand a job the source file it will be built from and release it to the
+    /// workers (plan P4.6: a video attached to an email).
+    ///
+    /// Only a job still parked as MANUAL_DOWNLOAD moves: the watcher parks
+    /// attachment jobs there while the file downloads, so no worker can lease
+    /// one before its source exists. If MCR has already acted on the job,
+    /// this changes nothing and returns `false`.
+    pub fn attach_source(&self, id: i64, source_path: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?
+             WHERE id = ? AND status = 'MANUAL_DOWNLOAD'",
+            params![source_path, now, id],
+        )?;
+        if n == 1 {
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'INFO', ?)",
+                params![id, now, "Attachment saved from the email; queued"],
+            )?;
+        }
+        Ok(n == 1)
+    }
+
     // ==========================================
     // Processed mail (plan P4.2, defect E-07)
     // ==========================================

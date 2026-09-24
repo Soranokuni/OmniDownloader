@@ -78,6 +78,28 @@ impl BroadcastEngine {
 
         info!("BroadcastEngine: Processing Job #{} ({})", job_id, slug);
 
+        // 1a. A video attached to an email (plan P4.6) is already on disk:
+        // the mail watcher saved it and recorded `source_path`. It lives
+        // outside the job workspace, so a failed attempt's cleanup below does
+        // not take the only copy with it and a retry still has its source.
+        if url.starts_with("attachment://") {
+            let source = job.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file());
+            let Some(source) = source else {
+                let err_msg = "The attachment is not on disk; download it from the email by hand";
+                warn!("Job #{job_id}: {err_msg}");
+                let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Download), err_msg);
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+                return Err(anyhow::anyhow!(err_msg).context(ErrorCode::ManualDownload.as_str()));
+            };
+            let _ = self.repo.record_event(
+                job_id,
+                "INFO",
+                Some(JobStage::Download),
+                "Source is the file attached to the email; nothing to download",
+            );
+            return self.finish_from_source(job, owner, source, job_temp).await;
+        }
+
         // 1. Download stage
         let downloader = Downloader::new(&self.ytdl_path);
         let repo_clone = self.repo.clone();
@@ -125,6 +147,14 @@ impl BroadcastEngine {
                 return Err(e.context(code.as_str()));
             }
         };
+
+        self.finish_from_source(job, owner, downloaded_file, job_temp).await
+    }
+
+    /// Stages 2–6, from a source file on disk to the watchfolder.
+    async fn finish_from_source(&self, job: Job, owner: &str, downloaded_file: PathBuf, job_temp: PathBuf) -> Result<()> {
+        let job_id = job.id;
+        let slug = job.slug.clone();
 
         // 2. Transcode stage (Sony XDCAM HD422 PAL 1080i50)
         let _ = self.repo.set_stage(job_id, owner, JobStage::Transcode);
