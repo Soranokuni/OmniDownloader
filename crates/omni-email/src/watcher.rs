@@ -11,6 +11,7 @@ use omni_core::health::{Check, HealthState};
 use omni_core::models::{Enqueued, JobStatus, NewJob, ProcessedMail};
 use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
+use crate::assist::Assist;
 use crate::graph::{GraphMailSource, RetryAfter};
 use crate::imap_source::ImapMailSource;
 use crate::mail::InboundMail;
@@ -35,6 +36,8 @@ pub struct EmailWatcher {
     health: Option<HealthState>,
     /// Failed processing attempts per message id, since start-up.
     attempts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Second opinion on journalist and keywords (plan P4.4).
+    assist: Arc<Assist>,
     /// Where video attachments are saved: `{dir}/{job_id}/source.{ext}`.
     /// Not under `temp/jobs`, which start-up sweeps for every job that is
     /// not running — a queued attachment job would lose its only source.
@@ -97,8 +100,10 @@ impl EmailWatcher {
     /// A watcher over any mail source (Graph, IMAP, or a test double).
     pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
         let attachments_dir = config.resolve_path(&config.temp_path).join("attachments");
+        let assist = Arc::new(Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone()));
         Self {
             attachments_dir,
+            assist,
             config,
             repo,
             source,
@@ -269,7 +274,11 @@ impl EmailWatcher {
         info!("EmailWatcher: processing email from '{}', subject '{}'", mail.from_address, mail.subject);
 
         let roster = self.repo.list_journalists()?;
-        let parsed = parser::parse(mail, &roster, &self.config.parser);
+        let mut parsed = parser::parse(mail, &roster, &self.config.parser);
+        let body = mail.readable_body();
+        if self.assist.wanted(&parsed, &body) {
+            self.assist.refine(mail, &body, &mut parsed, &roster, &self.config.parser).await;
+        }
         let default_priority = roster
             .iter()
             .find(|j| j.surname == parsed.journalist.surname)

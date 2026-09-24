@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::AppPaths;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a broadcast automation parsing engine for a Greek newsroom. Analyze the email and extract video asset links into a strict JSON array.
+/// The full-extraction prompt the LLM used before the deterministic parser
+/// (plan P4.3). Kept for `llm.mode = primary`, which is not implemented yet;
+/// nothing reads it today.
+pub const DEFAULT_SYSTEM_PROMPT: &str =r#"You are a broadcast automation parsing engine for a Greek newsroom. Analyze the email and extract video asset links into a strict JSON array.
 
 === FEW-SHOT EXAMPLES ===
 
@@ -315,6 +318,54 @@ impl GraphConfig {
     }
 }
 
+/// What the LLM may do with an email (plan P4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmMode {
+    /// Never called. The deterministic parser alone decides.
+    Off,
+    /// Called only where the parser is unsure, and only to suggest a
+    /// journalist or a keyword, which are validated before use.
+    #[default]
+    Assist,
+    /// Full extraction by the model. Not implemented: treated as `assist`,
+    /// with a warning at start-up.
+    Primary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default)]
+    pub mode: LlmMode,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    /// Ask for a keyword for every section, not only where the parser fell
+    /// back to `ASSET`.
+    #[serde(default)]
+    pub keyword_polish: bool,
+}
+
+fn default_llm_timeout() -> u64 {
+    30
+}
+
+fn default_llm_max_tokens() -> u32 {
+    400
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            mode: LlmMode::default(),
+            timeout_secs: default_llm_timeout(),
+            max_tokens: default_llm_max_tokens(),
+            keyword_polish: false,
+        }
+    }
+}
+
 /// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
@@ -461,8 +512,14 @@ pub struct AppConfig {
     #[serde(default = "default_ollama_model")]
     pub ollama_model: String,
 
-    #[serde(default = "default_system_prompt")]
-    pub system_prompt: String,
+    /// LLM assist policy (plan P4.4). Endpoint and model stay above.
+    ///
+    /// There is deliberately no `system_prompt` any more (defect E-03): the
+    /// deployed config.json overrode the tuned prompt with a one-liner and
+    /// nobody could tell. An old file that still has the key loads fine; it
+    /// is ignored, and the next save drops it.
+    #[serde(default)]
+    pub llm: LlmConfig,
 
     // Update settings
     #[serde(default = "default_channel")]
@@ -533,9 +590,7 @@ fn default_ollama_endpoint() -> String {
 fn default_ollama_model() -> String {
     "google/gemma-4-e4b".to_string()
 }
-fn default_system_prompt() -> String {
-    DEFAULT_SYSTEM_PROMPT.to_string()
-}
+
 fn default_channel() -> String {
     "stable".to_string()
 }
@@ -568,7 +623,7 @@ impl Default for AppConfig {
             email_poll_interval_secs: default_poll_interval(),
             ollama_endpoint: default_ollama_endpoint(),
             ollama_model: default_ollama_model(),
-            system_prompt: default_system_prompt(),
+            llm: LlmConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,

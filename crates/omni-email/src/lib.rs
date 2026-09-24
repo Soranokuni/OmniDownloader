@@ -1,3 +1,4 @@
+pub mod assist;
 pub mod decontaminate;
 pub mod graph;
 pub mod imap_source;
