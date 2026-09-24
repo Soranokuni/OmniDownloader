@@ -263,6 +263,42 @@ account. LocalSystem authenticates to SMB as the computer account, which most
 file servers refuse — and the failure appears only at delivery, after a correct
 file has already been produced.
 
+## Office 365 mailbox (Microsoft Graph)
+
+Exchange Online no longer accepts basic-auth IMAP, so an Office 365 ingest
+mailbox is read through Microsoft Graph with an app registration. IMAP remains
+for on-premises servers.
+
+1. **Entra ID → App registrations → New registration.** Single tenant, no
+   redirect URI. Note the *Application (client) ID* and *Directory (tenant) ID*.
+2. **API permissions → Add → Microsoft Graph → Application permissions:**
+   `Mail.ReadWrite` and `Mail.Send`. Grant admin consent.
+3. **Certificates & secrets → New client secret.** Copy the value once.
+4. **Limit the app to the ingest mailbox.** Without this, application
+   permissions reach every mailbox in the tenant. In Exchange Online
+   PowerShell, with a mail-enabled security group that contains only the
+   ingest mailbox:
+
+   ```powershell
+   New-ApplicationAccessPolicy -AppId <client-id> `
+       -PolicyScopeGroupId omni-ingest-scope@example.gr `
+       -AccessRight RestrictAccess -Description "OmniDownloader: ingest mailbox only"
+   Test-ApplicationAccessPolicy -Identity ingest@example.gr -AppId <client-id>
+   ```
+
+5. **Configure the daemon.** In `config.json`, fill `graph.tenant_id`,
+   `graph.client_id` and `graph.mailbox`; store the secret in the encrypted
+   store, then restart:
+
+   ```powershell
+   .\target\release\omni-ingest.exe secrets set graph.client_secret
+   ```
+
+Processed mail is marked read and moved to `Omni/Processed`. Mail that could
+not be processed is moved to `Omni/Failed` and left **unread**, so a person
+sees it. Both folders are created on first use. A message is never processed
+twice: the daemon remembers every Message-ID it has handled.
+
 ## Configuration and data that stay out of git
 
 | Path | Why |

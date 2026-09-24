@@ -424,7 +424,8 @@ async fn run_daemon(
     });
 
     // 2. Start Email Monitoring Watchdog
-    if !config.email_address.is_empty() {
+    // Graph (Office 365) when configured, else IMAP; see EmailWatcher::new.
+    if config.graph.is_configured() || !config.email_address.is_empty() {
         let email_watcher = Arc::new(
             EmailWatcher::new(config.clone(), repo.clone()).with_health(health.clone()),
         );
@@ -433,7 +434,7 @@ async fn run_daemon(
             email_watcher.start_polling_loop(email_rx).await;
         });
     } else {
-        info!("Email monitoring disabled (no email address configured in config.json).");
+        info!("Email monitoring disabled (neither a Graph mailbox nor an IMAP address is configured).");
         health.set(
             omni_core::health::checks::MAIL,
             omni_core::health::Check::disabled("Mailbox"),

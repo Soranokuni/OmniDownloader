@@ -39,6 +39,15 @@
   "email_address": "",
   "email_poll_interval_secs": 30,
 
+  "graph": {
+    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, Graph is used and the IMAP fields above are ignored. See README, 'Office 365 mailbox'.",
+    "tenant_id": "",
+    "client_id": "",
+    "mailbox": "ingest@example.gr",
+    "processed_folder": "Omni/Processed",
+    "failed_folder": "Omni/Failed"
+  },
+
   "ollama_endpoint": "http://localhost:11434/v1",
   "ollama_model": "gemma3:4b",
 

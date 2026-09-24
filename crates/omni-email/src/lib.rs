@@ -1,4 +1,5 @@
 pub mod decontaminate;
+pub mod graph;
 pub mod imap_source;
 pub mod interceptor;
 pub mod llm;
