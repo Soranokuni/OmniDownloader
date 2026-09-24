@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -34,6 +35,10 @@ pub struct EmailWatcher {
     health: Option<HealthState>,
     /// Failed processing attempts per message id, since start-up.
     attempts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Where video attachments are saved: `{dir}/{job_id}/source.{ext}`.
+    /// Not under `temp/jobs`, which start-up sweeps for every job that is
+    /// not running — a queued attachment job would lose its only source.
+    attachments_dir: PathBuf,
 }
 
 /// What one poll did, for health and tests.
@@ -91,13 +96,21 @@ impl EmailWatcher {
 
     /// A watcher over any mail source (Graph, IMAP, or a test double).
     pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
+        let attachments_dir = config.resolve_path(&config.temp_path).join("attachments");
         Self {
+            attachments_dir,
             config,
             repo,
             source,
             health: None,
             attempts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Save attachments here instead of `{temp}/attachments`.
+    pub fn with_attachments_dir(mut self, dir: PathBuf) -> Self {
+        self.attachments_dir = dir;
+        self
     }
 
     /// Report poll outcomes into the shared health state.
@@ -262,7 +275,8 @@ impl EmailWatcher {
             .find(|j| j.surname == parsed.journalist.surname)
             .map(|j| j.default_priority)
             .unwrap_or(0);
-        let records = self.enqueue_parsed(mail, &parsed, default_priority)?;
+        let mut records = self.enqueue_parsed(mail, &parsed, default_priority)?;
+        self.fetch_attachments(mail, &mut records).await;
 
         info!(
             "EmailWatcher: {} → {} ({:?}), {} job(s), {} new",
@@ -293,6 +307,49 @@ impl EmailWatcher {
         Ok(Handled::Done)
     }
 
+    /// Download each newly queued attachment and release its job (plan P4.6).
+    ///
+    /// Never fails the message: the jobs already exist, and retrying the mail
+    /// would only find them again. A failed download leaves its job as
+    /// MANUAL_DOWNLOAD with an event saying why, which is where a human looks.
+    async fn fetch_attachments(&self, mail: &InboundMail, records: &mut [QueuedFromMail]) {
+        for rec in records.iter_mut() {
+            let (Some(att_id), Enqueued::Created { id }) = (rec.attachment_id.clone(), rec.result.clone()) else {
+                continue;
+            };
+            let name = mail
+                .attachments
+                .iter()
+                .find(|a| a.id == att_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let dest = self
+                .attachments_dir
+                .join(id.to_string())
+                .join(format!("source.{}", attachment_extension(&name)));
+            let outcome = match self.source.download_attachment(&mail.id, &att_id, &dest).await {
+                Ok(path) => self.repo.attach_source(id, &path.to_string_lossy()),
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(true) => {
+                    info!("EmailWatcher: attachment '{name}' saved for job #{id}");
+                    rec.status = JobStatus::Pending.as_str().into();
+                }
+                Ok(false) => info!("EmailWatcher: job #{id} was changed by MCR before its attachment arrived"),
+                Err(e) => {
+                    warn!("EmailWatcher: attachment '{name}' for job #{id} not saved: {e:#}");
+                    let _ = self.repo.record_event(
+                        id,
+                        "WARN",
+                        None,
+                        &format!("Could not save the attachment '{name}' from the email ({}); download it from the mail by hand", short_reason(&e)),
+                    );
+                }
+            }
+        }
+    }
+
     fn enqueue_parsed(&self, mail: &InboundMail, parsed: &ParsedEmail, default_priority: i32) -> Result<Vec<QueuedFromMail>> {
         let journalist = &parsed.journalist.surname;
         let mut notes = format!("Email: {}", mail.subject);
@@ -306,8 +363,9 @@ impl EmailWatcher {
         let mut out = Vec::new();
         for job in parsed.jobs() {
             let slug = format!("{}_{}_{}", job.index_str, journalist, job.keyword);
-            // Attachments are queued for a human until the pipeline can take
-            // a file from the mailbox itself (plan P4.6).
+            // Attachment jobs are parked as MANUAL_DOWNLOAD until their file
+            // is on disk (`fetch_attachments`), so no worker can lease one
+            // first. If the download fails they stay there, for MCR.
             let (status, method) = match job.tier {
                 Tier::Attachment => (JobStatus::ManualDownload, Some("attachment")),
                 Tier::Locker => (job.status, Some("locker")),
@@ -343,6 +401,7 @@ impl EmailWatcher {
                 url: job.url.clone(),
                 status: status.as_str().to_string(),
                 result,
+                attachment_id: job.attachment_id.clone(),
             });
         }
         Ok(out)
@@ -366,6 +425,17 @@ pub struct QueuedFromMail {
     pub url: String,
     pub status: String,
     pub result: Enqueued,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+}
+
+/// File extension for a saved attachment: the original one when it is a
+/// plain short extension, else `bin` (ffprobe identifies content, not names).
+fn attachment_extension(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| "bin".into())
 }
 
 /// Idempotency key: the Message-ID, or the provider id for the rare message

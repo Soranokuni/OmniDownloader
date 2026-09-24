@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use omni_core::config::AppConfig;
 use omni_core::models::JobStatus;
 use omni_core::repository::Repository;
-use omni_email::mail::InboundMail;
+use omni_email::mail::{AttachmentMeta, InboundMail};
 use omni_email::source::{MailHealth, MailOutcome, MailSource};
 use omni_email::watcher::{EmailWatcher, MAX_PROCESS_ATTEMPTS, URGENT_PRIORITY_BOOST};
 
@@ -20,6 +20,7 @@ use omni_email::watcher::{EmailWatcher, MAX_PROCESS_ATTEMPTS, URGENT_PRIORITY_BO
 struct FakeSource {
     inbox: Mutex<Vec<InboundMail>>,
     marks: Mutex<Vec<(String, MailOutcome)>>,
+    fail_downloads: std::sync::atomic::AtomicBool,
 }
 
 impl FakeSource {
@@ -27,6 +28,7 @@ impl FakeSource {
         Arc::new(Self {
             inbox: Mutex::new(mails),
             marks: Mutex::default(),
+            fail_downloads: Default::default(),
         })
     }
     fn marks(&self) -> Vec<(String, MailOutcome)> {
@@ -65,8 +67,13 @@ impl MailSource for FakeSource {
         self.marks.lock().unwrap().push((mail_id.to_string(), outcome));
         Ok(())
     }
-    async fn download_attachment(&self, _: &str, _: &str, _: &Path) -> Result<PathBuf> {
-        bail!("not in this test")
+    async fn download_attachment(&self, _: &str, att: &str, dest: &Path) -> Result<PathBuf> {
+        if self.fail_downloads.load(std::sync::atomic::Ordering::SeqCst) {
+            bail!("connection reset while downloading {att}");
+        }
+        std::fs::create_dir_all(dest.parent().unwrap())?;
+        std::fs::write(dest, format!("video {att}"))?;
+        Ok(dest.to_path_buf())
     }
     async fn reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
         Ok(())
@@ -201,4 +208,57 @@ async fn a_message_with_no_links_is_still_marked_processed() {
     assert!(repo.get_all_jobs().unwrap().is_empty());
     assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Processed)]);
     assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "NO_LINKS");
+}
+fn mail_with_video(id: &str) -> InboundMail {
+    let mut m = mail(id, "Βίντεο από το λιμάνι", "");
+    m.attachments = vec![AttachmentMeta {
+        id: "att/1+x=".into(), // Graph ids carry '/', '+' and '='
+        name: "limani_kataplous.MP4".into(),
+        content_type: "video/mp4".into(),
+        size: 11,
+    }];
+    m
+}
+
+#[tokio::test]
+async fn an_attached_video_is_saved_and_its_job_released_to_the_workers() {
+    let (dir, repo) = repo();
+    let source = FakeSource::with(vec![mail_with_video("m1")]);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone())
+        .with_attachments_dir(dir.path().join("attachments"));
+    watcher.poll_once().await.unwrap();
+
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[0];
+    assert_eq!(job.status, JobStatus::Pending, "a saved attachment must be leasable");
+    assert_eq!(job.extraction_method.as_deref(), Some("attachment"));
+    assert_eq!(job.url, "attachment://m1@example.gr/att/1+x=");
+    assert_eq!(job.slug, "1_PAPADAKI_LIMANIKATAPLOUS");
+    let saved = PathBuf::from(job.source_path.clone().expect("source_path recorded"));
+    assert_eq!(saved, dir.path().join("attachments").join(job.id.to_string()).join("source.mp4"));
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "video att/1+x=");
+    assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Processed)]);
+
+    let row = repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap();
+    assert!(row.jobs_json.contains("\"status\":\"PENDING\""), "{}", row.jobs_json);
+}
+
+#[tokio::test]
+async fn a_failed_attachment_download_leaves_the_job_for_mcr_and_the_mail_processed() {
+    let (dir, repo) = repo();
+    let source = FakeSource::with(vec![mail_with_video("m1")]);
+    source.fail_downloads.store(true, std::sync::atomic::Ordering::SeqCst);
+    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone())
+        .with_attachments_dir(dir.path().join("attachments"));
+    watcher.poll_once().await.unwrap();
+
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, JobStatus::ManualDownload);
+    assert!(jobs[0].source_path.is_none());
+    let events = repo.get_job_events(jobs[0].id, 10).unwrap();
+    assert!(events.iter().any(|e| e.message.contains("Could not save the attachment")), "{events:?}");
+    // The job exists, so retrying the mail would only duplicate it.
+    assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Processed)]);
 }

@@ -77,6 +77,9 @@ pub struct ParsedJob {
     pub status: JobStatus,
     /// Selected by a `ΓΙΑ ΠΛΑΝΑ:` style marker.
     pub marker: bool,
+    /// Provider attachment id, for `Tier::Attachment` jobs (plan P4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -948,6 +951,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                     keyword,
                     confidence,
                     marker,
+                    attachment_id: None,
                 }
             })
             .collect();
@@ -1024,6 +1028,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 confidence,
                 status: status_for(Tier::Attachment, confidence, cfg),
                 marker: false,
+                attachment_id: Some(a.id.clone()),
             });
         }
     }

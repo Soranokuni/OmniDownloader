@@ -427,7 +427,9 @@ async fn run_daemon(
     // Graph (Office 365) when configured, else IMAP; see EmailWatcher::new.
     if config.graph.is_configured() || !config.email_address.is_empty() {
         let email_watcher = Arc::new(
-            EmailWatcher::new(config.clone(), repo.clone()).with_health(health.clone()),
+            EmailWatcher::new(config.clone(), repo.clone())
+                .with_attachments_dir(temp_path.join("attachments"))
+                .with_health(health.clone()),
         );
         let email_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -1104,9 +1106,16 @@ async fn run_one_task(
             // Orphaned per-job workspaces. The start-up sweep only runs at
             // start-up, and a machine that stays up for a month accumulates
             // the temp directories of every job that died mid-stage.
-            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path, ctx.retention_days).await;
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join("jobs"), ctx.retention_days).await;
             if removed > 0 {
                 info!("Retention: removed {removed} orphaned job workspace(s)");
+            }
+            // Email attachments (plan P4.6) live outside temp/jobs so the
+            // start-up sweep cannot take a queued job's only source; this is
+            // where they go once their job is long finished.
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join("attachments"), ctx.retention_days).await;
+            if removed > 0 {
+                info!("Retention: removed {removed} saved email attachment(s)");
             }
             Ok(TaskOutcome::Ok)
         }
@@ -1125,14 +1134,14 @@ async fn run_one_task(
     }
 }
 
-/// Remove `temp/jobs/{id}` directories whose job is gone or long finished.
+/// Remove `{dir}/{id}` directories (`temp/jobs`, `temp/attachments`) whose
+/// job is gone or long finished.
 ///
 /// Deliberately keyed on the directory name being a job id, never on a
 /// filename prefix: job 1's prefix also matches jobs 10-19 and 100-199, which
 /// is defect D-04 and is exactly why per-job directories exist.
-async fn sweep_orphan_job_dirs(repo: &Repository, temp_path: &PathBuf, keep_days: i64) -> usize {
-    let jobs_dir = temp_path.join("jobs");
-    let Ok(entries) = std::fs::read_dir(&jobs_dir) else {
+async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, keep_days: i64) -> usize {
+    let Ok(entries) = std::fs::read_dir(jobs_dir) else {
         return 0;
     };
 
