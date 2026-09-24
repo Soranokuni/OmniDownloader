@@ -514,6 +514,58 @@ fn a_zero_loudness_range_is_never_passed_to_the_linear_pass() {
     assert!(chain.contains("measured_I=-21.05") && chain.contains("linear=true"), "{chain}");
 }
 
+/// Station policy: when reaching -23 LUFS would lift true peak over -1 dBTP,
+/// the ceiling wins. A plain linear gain, no limiter -- and no loudnorm, which
+/// would switch itself to dynamic mode here and truncate the programme.
+#[test]
+fn clipped_audio_is_gained_to_the_peak_ceiling_and_lands_under_target() {
+    let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
+    // Quiet programme, peaks near full scale: +7 dB to target would put
+    // peaks at +4 dBTP.
+    let clipped = LoudnessMeasurement {
+        input_i: -30.0,
+        input_lra: 4.0,
+        input_tp: -3.0,
+        input_thresh: -40.0,
+        target_offset: 0.0,
+    };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&clipped), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(chain.contains("volume=2.00dB"), "{chain}");
+    assert!(!chain.contains("loudnorm"), "loudnorm would go dynamic and truncate: {chain}");
+    assert!(plan.note.contains("peak-limited"), "{}", plan.note);
+    assert!(plan.note.contains("-28.0 LUFS"), "{}", plan.note);
+
+    // A hot clip needing *less* level is never limited: cutting gain lowers
+    // the peaks too.
+    let hot = LoudnessMeasurement { input_i: -12.0, input_tp: 0.5, ..clipped };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&hot), Path::new("src.mp4"), Path::new("out.mxf"));
+    assert!(filter_graph(&plan.args).contains("linear=true"), "{}", filter_graph(&plan.args));
+}
+
+#[test]
+fn the_peak_decision_errs_on_the_safe_side_of_the_ceiling() {
+    use omni_broadcast::transcoder::peak_limited_gain;
+    let t = LoudnessTarget::default();
+    let m = |i: f64, tp: f64| LoudnessMeasurement {
+        input_i: i,
+        input_lra: 3.0,
+        input_tp: tp,
+        input_thresh: i - 10.0,
+        target_offset: 0.0,
+    };
+    // Comfortably under: two-pass loudnorm as before.
+    assert_eq!(peak_limited_gain(&m(-20.0, -10.0), &t), None);
+    // 0.05 dB under the ceiling: too close to trust loudnorm's own rounding,
+    // but the target still fits, so the gain is the full correction.
+    let (g, landed) = peak_limited_gain(&m(-20.0, 1.95), &t).unwrap();
+    assert!((g - -3.0).abs() < 1e-9 && (landed - -23.0).abs() < 1e-9, "{g} {landed}");
+    // Over: peaks go exactly to the ceiling and loudness lands under target.
+    let (g, landed) = peak_limited_gain(&m(-22.75, 0.18), &t).unwrap();
+    assert!((g - -1.18).abs() < 1e-9, "{g}");
+    assert!(landed < -23.0, "{landed}");
+}
+
 #[test]
 fn a_measurement_at_the_silence_floor_is_unusable() {
     // Near-silence gates nothing: loudnorm reports input_thresh -70 and would
