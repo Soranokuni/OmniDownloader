@@ -39,6 +39,34 @@ pub struct LoudnessMeasurement {
 /// Smallest `measured_LRA` handed to loudnorm (see `build_plan`).
 pub const MIN_MEASURED_LRA: f64 = 0.01;
 
+/// Headroom kept below the true-peak ceiling when deciding whether loudnorm's
+/// linear mode will hold. loudnorm makes the same test on the values we pass,
+/// rounded to two decimals; erring on its side of the line would let it
+/// switch to dynamic mode, which truncates the output.
+pub const PEAK_DECISION_MARGIN_DB: f64 = 0.1;
+
+/// When a linear gain to the loudness target would lift true peak above the
+/// ceiling, the gain that puts the peaks exactly at the ceiling instead, and
+/// the loudness the programme then lands at.
+///
+/// Station policy (product owner, 2026-09-24): **the -1 dBTP ceiling wins**.
+/// Such a clip is delivered under -23 LUFS by a plain linear gain; no
+/// limiter, no dynamic processing. `None` when the normal two-pass linear
+/// correction fits under the ceiling.
+///
+/// A linear gain moves true peak and integrated loudness by the same amount,
+/// so both results are exact, not estimates.
+pub fn peak_limited_gain(m: &LoudnessMeasurement, target: &LoudnessTarget) -> Option<(f64, f64)> {
+    let gain_to_target = target.lufs - m.input_i;
+    let peak_after = m.input_tp + gain_to_target;
+    if peak_after <= target.true_peak - PEAK_DECISION_MARGIN_DB {
+        return None;
+    }
+    // Within the decision margin the target itself still fits: take it.
+    let gain = (target.true_peak - m.input_tp).min(gain_to_target);
+    Some((gain, m.input_i + gain))
+}
+
 /// Loudness policy (config `audio.*`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoudnessTarget {
@@ -288,8 +316,22 @@ pub fn build_plan(
         let (down, down_branch) = downmix(audio.channels, audio.channel_layout.as_deref());
         audio_branch = down_branch;
 
-        let loudness = if !target.enabled {
-            String::new()
+        let (loudness, loudness_note) = if !target.enabled {
+            (String::new(), "; loudness off".to_string())
+        } else if let Some((gain, landed)) = measurement.and_then(|m| peak_limited_gain(m, target)) {
+            // Reaching the target would push true peak past the ceiling.
+            // Station policy: the peak ceiling wins and the programme lands
+            // under target -- a plain linear gain, no limiter, and never
+            // loudnorm, which would switch itself to dynamic mode here and
+            // truncate the output (see `LoudnessMeasurement`).
+            (
+                format!(",volume={gain:.2}dB"),
+                format!(
+                    "; R128 peak-limited: {gain:+.2} dB puts true peak at {:.1} dBTP, \
+                     programme at about {landed:.1} LUFS (under {:.1})",
+                    target.true_peak, target.lufs
+                ),
+            )
         } else if let Some(m) = measurement {
             // Two-pass: correct by the measured values, linearly.
             //
@@ -301,23 +343,31 @@ pub fn build_plan(
             // a 1-2 s clip, left no audio and no file. In linear mode the gain
             // depends only on I and the offset, so the floor changes nothing
             // audible.
-            format!(
-                ",loudnorm=I={}:LRA={}:TP={}:measured_I={:.2}:measured_LRA={:.2}:\
-                 measured_TP={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true",
-                target.lufs,
-                target.lra,
-                target.true_peak,
-                m.input_i,
-                m.input_lra.max(MIN_MEASURED_LRA),
-                m.input_tp,
-                m.input_thresh,
-                m.target_offset
+            (
+                format!(
+                    ",loudnorm=I={}:LRA={}:TP={}:measured_I={:.2}:measured_LRA={:.2}:\
+                     measured_TP={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true",
+                    target.lufs,
+                    target.lra,
+                    target.true_peak,
+                    m.input_i,
+                    m.input_lra.max(MIN_MEASURED_LRA),
+                    m.input_tp,
+                    m.input_thresh,
+                    m.target_offset
+                ),
+                "; R128 two-pass".to_string(),
             )
         } else {
             // No usable measurement: leave the level alone. Dynamic loudnorm
             // was the old fallback and it cut the programme short (or, under
             // 3 s, produced no audio and no file at all).
-            String::new()
+            (
+                String::new(),
+                "; R128 skipped: loudness measurement unusable (silence or too short to gate), \
+                 level left as received"
+                    .to_string(),
+            )
         };
 
         // Downmix, resample, normalise, then split into two discrete mono
@@ -336,11 +386,7 @@ pub fn build_plan(
             probe.video.scan,
             audio.channels,
             audio.index,
-            match (target.enabled, measurement.is_some()) {
-                (false, _) => "; loudness off",
-                (true, true) => "; R128 two-pass",
-                (true, false) => "; R128 skipped: loudness measurement unusable (silence or too short to gate), level left as received",
-            }
+            loudness_note
         );
     } else {
         note = format!(

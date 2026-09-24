@@ -264,6 +264,59 @@ async fn short_clips_transcode_with_the_default_loudness_policy() {
     }
 }
 
+/// Clipped audio: reaching -23 LUFS would break -1 dBTP. loudnorm's linear
+/// mode refuses that and silently runs dynamic mode, which cut this 6 s clip
+/// to 3.12 s. Policy: the peak ceiling wins, the clip lands under -23.
+#[tokio::test]
+async fn clipped_audio_is_delivered_whole_with_peaks_at_the_ceiling() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("clipped.mp4");
+    // A quiet tone with a near-full-scale click every second.
+    let made = omni_core::process::run(
+        &ffmpeg,
+        [
+            "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=6", "-f", "lavfi",
+            "-i", "aevalsrc='0.01*sin(2*PI*440*t)+if(lt(mod(t\\,1)\\,0.002)\\,0.9\\,0)':s=48000:d=6",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", "-shortest",
+            &src.to_string_lossy(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .unwrap();
+    assert!(made.success, "could not build the clipped source: {}", made.stderr_tail);
+
+    let (mxf, duration) = Transcoder::new(&ffmpeg, &ffprobe)
+        .transcode(1, &src, &dir.path().join("work"), |_| {})
+        .await
+        .expect("clipped clip should transcode");
+    let report = verify_mxf(&ffprobe, &mxf, duration).await.expect("verify");
+    assert!(report.pass, "clipped clip: {}", report.summary());
+
+    let out = omni_core::process::run(
+        &ffmpeg,
+        [
+            "-nostdin", "-hide_banner", "-i", &mxf.to_string_lossy(), "-filter_complex",
+            "[0:a:0][0:a:1]amerge=inputs=2,loudnorm=I=-23:TP=-1:LRA=7:print_format=json", "-f", "null", "-",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .unwrap();
+    let m = omni_broadcast::transcoder::parse_loudness_measurement(&out.stderr_tail).expect("measurable");
+    assert!(m.input_tp <= -0.9, "true peak {:.2} dBTP is over the -1 dBTP ceiling", m.input_tp);
+    assert!(m.input_i < -23.0, "loudness {:.2} LUFS: expected under -23 when peak-limited", m.input_i);
+}
+
 /// A source the tools cannot read must fail the job, not silently become a
 /// silent clip (defect D-07).
 #[tokio::test]
