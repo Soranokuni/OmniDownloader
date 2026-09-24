@@ -1,0 +1,57 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "DIMITRIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1A",
+          "keyword": "SYNENTEFXITYPOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture1501"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "SYNENTEFXITYPOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1502"
+        }
+      ],
+      "keyword": "SYNENTEFXITYPOU",
+      "title": "ΣΥΝΕΝΤΕΥΞΗ ΤΥΠΟΥ ΔΗΜΑΡΧΟΥ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "VROCHICHANIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/reel/fixture1503"
+        }
+      ],
+      "keyword": "VROCHICHANIA",
+      "title": "Η ΒΡΟΧΗ ΣΤΑ ΧΑΝΙΑ (ΒΙΝΤΕΟ ΑΝΑΓΝΩΣΤΗ)"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "PREAMBLE_URLS"
+    }
+  ]
+}

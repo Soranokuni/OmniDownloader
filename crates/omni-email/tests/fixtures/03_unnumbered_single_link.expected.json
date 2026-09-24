@@ -1,0 +1,28 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "SYNENTEFXIDIMARCHOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture0301"
+        }
+      ],
+      "keyword": "SYNENTEFXIDIMARCHOU",
+      "title": "Συνέντευξη δημάρχου Χανίων"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

@@ -1,0 +1,55 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "NIKOLAOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "AVRIOSYNENTEFXI",
+      "title": "Για αύριο η συνέντευξη, χωρίς λίνκ ακόμα"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "PLIMMYRARETHYMNO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture0801&t=12s"
+        }
+      ],
+      "keyword": "PLIMMYRARETHYMNO",
+      "title": "ΠΛΗΜΜΥΡΑ ΣΤΟ ΡΕΘΥΜΝΟ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3",
+          "keyword": "EPISKEPSIYPOURGOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.dailymotion.com/video/fixture0802"
+        }
+      ],
+      "keyword": "EPISKEPSIYPOURGOU",
+      "title": "ΕΠΙΣΚΕΨΗ ΥΠΟΥΡΓΟΥ"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "SECTION_WITHOUT_LINKS",
+      "detail": "1"
+    }
+  ]
+}

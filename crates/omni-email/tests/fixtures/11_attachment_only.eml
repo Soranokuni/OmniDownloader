@@ -1,0 +1,35 @@
+From: Kostas Dimitriou <k.dimitriou@example.gr>
+To: ingest@example.gr
+Subject: =?UTF-8?B?zpLOr869z4TOtc6/IM6xz4DPjCDPhM6/IM67zrnOvM6szr3OuQ==?=
+Date: Wed, 23 Sep 2026 10:15:00 +0300
+Message-ID: <fixture-11@example.gr>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="B11"
+
+--B11
+Content-Type: multipart/alternative; boundary="ALT11"
+
+--ALT11
+Content-Type: text/plain; charset=utf-8
+
+
+
+--ALT11
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>&nbsp;</p></body></html>
+--ALT11--
+
+--B11
+Content-Type: video/mp4; name="limani_kataplous.mp4"
+Content-Disposition: attachment; filename="limani_kataplous.mp4"
+Content-Transfer-Encoding: base64
+
+AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE=
+--B11
+Content-Type: video/quicktime; name="IMG_0421.MOV"
+Content-Disposition: attachment; filename="IMG_0421.MOV"
+Content-Transfer-Encoding: base64
+
+AAAAFGZ0eXBxdCAgAAAAAHF0ICA=
+--B11--

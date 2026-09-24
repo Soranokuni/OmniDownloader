@@ -1,0 +1,109 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "NIKOLAOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1A",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1301"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1302"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1C",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1303"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1D",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1304"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1E",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1305"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1F",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1306"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1G",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1307"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1H",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1308"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1I",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1309"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1J",
+          "keyword": "KALYTERAEVDOMADAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1310"
+        }
+      ],
+      "keyword": "KALYTERAEVDOMADAS",
+      "title": "Τα 10 καλύτερα βίντεο της εβδομάδας"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

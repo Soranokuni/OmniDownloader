@@ -612,6 +612,8 @@ pub struct CreateJournalistPayload {
     full_name: String,
     emails: Vec<String>,
     priority: Option<i32>,
+    /// Parser aliases (plan P4.3). Absent leaves the stored ones untouched.
+    aliases: Option<Vec<String>>,
 }
 
 pub async fn api_save_journalist(
@@ -626,6 +628,11 @@ pub async fn api_save_journalist(
     if payload.emails.len() > 20 {
         return Err(ApiError::bad_request("At most 20 addresses per journalist."));
     }
+    if let Some(aliases) = &payload.aliases {
+        if aliases.len() > 30 || aliases.iter().any(|a| a.chars().count() > 40) {
+            return Err(ApiError::bad_request("At most 30 aliases of 40 characters each."));
+        }
+    }
     state
         .repo
         .save_journalist(
@@ -635,6 +642,12 @@ pub async fn api_save_journalist(
             payload.priority.unwrap_or(0).clamp(-100, 100),
         )
         .map_err(internal_error("Could not save the journalist."))?;
+    if let Some(aliases) = &payload.aliases {
+        state
+            .repo
+            .set_journalist_aliases(&surname, aliases)
+            .map_err(internal_error("Could not save the journalist's aliases."))?;
+    }
     audit_action(&state, &principal, &format!("Journalist {surname} saved"));
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }

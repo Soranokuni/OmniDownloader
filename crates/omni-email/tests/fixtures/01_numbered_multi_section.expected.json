@@ -1,0 +1,71 @@
+{
+  "ignored_urls": [
+    "https://www.lifo.gr/now/politics/synenteyxi-perifereiarchi"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "PARELASIIRAKLEIO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture0101"
+        }
+      ],
+      "keyword": "PARELASIIRAKLEIO",
+      "title": "ΠΑΡΕΛΑΣΗ ΣΤΟ ΗΡΑΚΛΕΙΟ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "SYNENTEFXIPERIFEREIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture0102"
+        }
+      ],
+      "keyword": "SYNENTEFXIPERIFEREIA",
+      "title": "Συνέντευξη περιφερειάρχη"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3A",
+          "keyword": "KAFSONAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/share/r/fixture0103/"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "3B",
+          "keyword": "KAFSONAS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.instagram.com/reel/fixture0104/"
+        }
+      ],
+      "keyword": "KAFSONAS",
+      "title": "ΚΑΥΣΩΝΑΣ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

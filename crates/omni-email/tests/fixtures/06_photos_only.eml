@@ -1,0 +1,22 @@
+From: Kostas Dimitriou <k.dimitriou@example.gr>
+To: ingest@example.gr
+Subject: =?UTF-8?B?zqbPic+Ezr/Os8+BzrHPhs6vzrXPgiDOsc+Az4wgz4TOt869IM61zrrOtM6uzrvPic+Dzrc=?=
+Date: Tue, 22 Sep 2026 14:00:00 +0300
+Message-ID: <fixture-06@example.gr>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="B06"
+
+--B06
+Content-Type: text/plain; charset=utf-8
+
+Φωτογραφίες από την εκδήλωση:
+https://www.example.org/uploads/2026/09/ekdilosi-01.jpg
+https://www.example.org/uploads/2026/09/ekdilosi-02.JPEG
+
+--B06
+Content-Type: image/jpeg; name="ekdilosi-03.jpg"
+Content-Disposition: attachment; filename="ekdilosi-03.jpg"
+Content-Transfer-Encoding: base64
+
+/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AKp//2Q==
+--B06--

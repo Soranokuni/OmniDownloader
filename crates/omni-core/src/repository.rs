@@ -133,6 +133,8 @@ impl Repository {
             emails: Vec<String>,
             #[serde(default)]
             default_priority: i32,
+            #[serde(default)]
+            aliases: Vec<String>,
         }
 
         let roster: Vec<SeedJournalist> = serde_json::from_str(&raw)
@@ -150,10 +152,11 @@ impl Repository {
             } else {
                 j.full_name
             };
+            let aliases_json = serde_json::to_string(&j.aliases).unwrap_or_else(|_| "[]".into());
             conn.execute(
-                "INSERT OR IGNORE INTO journalists (surname, full_name, emails, default_priority)
-                 VALUES (?, ?, ?, ?)",
-                params![surname, full_name, emails_json, j.default_priority],
+                "INSERT OR IGNORE INTO journalists (surname, full_name, emails, default_priority, aliases)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![surname, full_name, emails_json, j.default_priority, aliases_json],
             )?;
             seeded += 1;
         }
@@ -1445,12 +1448,15 @@ impl Repository {
         let rows = stmt.query_map([], |row| {
             let emails_raw: String = row.get("emails")?;
             let emails: Vec<String> = serde_json::from_str(&emails_raw).unwrap_or_default();
+            let aliases_raw: String = row.get("aliases")?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_raw).unwrap_or_default();
             Ok(Journalist {
                 id: row.get("id")?,
                 surname: row.get("surname")?,
                 full_name: row.get("full_name")?,
                 emails,
                 default_priority: row.get("default_priority")?,
+                aliases,
                 created_at: timestamps::parse_opt(row.get("created_at").ok()),
             })
         })?;
@@ -1475,6 +1481,25 @@ impl Repository {
             "#,
             params![surname.to_uppercase(), full_name, emails_json, priority],
         )?;
+        Ok(())
+    }
+
+    /// Replace a journalist's parser aliases (plan P4.3). Blank entries are
+    /// dropped; a missing journalist is an error, not a silent no-op.
+    pub fn set_journalist_aliases(&self, surname: &str, aliases: &[String]) -> Result<()> {
+        let clean: Vec<String> = aliases
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE journalists SET aliases = ? WHERE surname = ?",
+            params![serde_json::to_string(&clean)?, surname.to_uppercase()],
+        )?;
+        if n == 0 {
+            anyhow::bail!("no journalist named {surname}");
+        }
         Ok(())
     }
 
@@ -1534,6 +1559,31 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn journalist_aliases_round_trip_and_survive_a_resave() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        repo.save_journalist("PAPADAKI", "Anna Papadaki", &[], 0)?;
+        repo.set_journalist_aliases("papadaki", &["ΠΑΠΑΔΑΚΗ".into(), "  ".into(), " ΑΝΝΑΣ ".into()])?;
+
+        let find = |repo: &Repository| -> Result<Vec<String>> {
+            Ok(repo
+                .list_journalists()?
+                .into_iter()
+                .find(|j| j.surname == "PAPADAKI")
+                .unwrap()
+                .aliases)
+        };
+        assert_eq!(find(&repo)?, vec!["ΠΑΠΑΔΑΚΗ".to_string(), "ΑΝΝΑΣ".to_string()]);
+
+        // Editing name or addresses in the panel must not wipe the aliases.
+        repo.save_journalist("PAPADAKI", "A. Papadaki", &["a@example.gr".into()], 5)?;
+        assert_eq!(find(&repo)?.len(), 2);
+
+        assert!(repo.set_journalist_aliases("NOBODY", &["X".into()]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_repository_lifecycle() -> Result<()> {
