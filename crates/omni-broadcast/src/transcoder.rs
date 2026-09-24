@@ -22,8 +22,11 @@ pub struct Transcoder {
 /// Measured loudness of the programme audio, from the first `loudnorm` pass.
 ///
 /// EBU R128 normalisation is two-pass: pass one measures, pass two corrects
-/// with `linear=true`. Single-pass dynamic mode can pump on speech, which is
-/// audible on a news package.
+/// with `linear=true`. Dynamic mode is never used: it pumps on speech, and its
+/// 3 s lookahead holds audio back until after the video has ended, so with the
+/// `-shortest` the pad channels require the output is cut short — or, for a
+/// clip under 3 s, has no audio at all and ffmpeg fails writing the MXF
+/// trailer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoudnessMeasurement {
     pub input_i: f64,
@@ -32,6 +35,9 @@ pub struct LoudnessMeasurement {
     pub input_thresh: f64,
     pub target_offset: f64,
 }
+
+/// Smallest `measured_LRA` handed to loudnorm (see `build_plan`).
+pub const MIN_MEASURED_LRA: f64 = 0.01;
 
 /// Loudness policy (config `audio.*`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,18 +224,22 @@ pub fn parse_loudness_measurement(stderr: &str) -> Option<LoudnessMeasurement> {
 
     let num = |k: &str| -> Option<f64> {
         let raw = v.get(k)?.as_str()?;
-        // loudnorm reports "-inf" for digital silence; treat that as unusable
-        // and fall back to single-pass rather than feeding -inf to pass two.
+        // loudnorm reports "-inf" for digital silence and for audio too short
+        // to gate (under ~0.4 s); treat that as unusable rather than feeding
+        // -inf to pass two.
         raw.parse::<f64>().ok().filter(|f| f.is_finite())
     };
 
-    Some(LoudnessMeasurement {
+    let m = LoudnessMeasurement {
         input_i: num("input_i")?,
         input_lra: num("input_lra")?,
         input_tp: num("input_tp")?,
         input_thresh: num("input_thresh")?,
         target_offset: num("target_offset").unwrap_or(0.0),
-    })
+    };
+    // A gating threshold at the -70 LUFS floor means nothing was above it:
+    // silence. loudnorm refuses linear mode for it and would go dynamic.
+    (m.input_thresh > -70.0).then_some(m)
 }
 
 /// Build the full ffmpeg argument vector for a transcode (plan P1.5).
@@ -240,8 +250,10 @@ pub fn parse_loudness_measurement(stderr: &str) -> Option<LoudnessMeasurement> {
 /// `broadcast_compliance_tests`.
 ///
 /// `measurement` is the result of the loudness measurement pass; `None` means
-/// either loudness is disabled or the measurement failed, in which case pass two
-/// falls back to single-pass dynamic mode rather than skipping normalisation.
+/// either loudness is disabled or the measurement was unusable (silence, a
+/// clip too short to gate, a failed pass). Then normalisation is **skipped**
+/// and the plan note says so: dynamic `loudnorm` is not a safe fallback in
+/// this graph (see [`LoudnessMeasurement`]).
 pub fn build_plan(
     probe: &crate::probe::SourceProbe,
     target: &LoudnessTarget,
@@ -280,6 +292,15 @@ pub fn build_plan(
             String::new()
         } else if let Some(m) = measurement {
             // Two-pass: correct by the measured values, linearly.
+            //
+            // measured_LRA is floored at 0.01 LU. loudnorm takes a value equal
+            // to its option default (0) as "not supplied", refuses linear mode
+            // and silently runs dynamic mode instead -- and every clip under
+            // about 3 s measures LRA 0.00, because loudness range needs several
+            // gating blocks. Dynamic mode then truncated the programme or, for
+            // a 1-2 s clip, left no audio and no file. In linear mode the gain
+            // depends only on I and the offset, so the floor changes nothing
+            // audible.
             format!(
                 ",loudnorm=I={}:LRA={}:TP={}:measured_I={:.2}:measured_LRA={:.2}:\
                  measured_TP={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true",
@@ -287,18 +308,16 @@ pub fn build_plan(
                 target.lra,
                 target.true_peak,
                 m.input_i,
-                m.input_lra,
+                m.input_lra.max(MIN_MEASURED_LRA),
                 m.input_tp,
                 m.input_thresh,
                 m.target_offset
             )
         } else {
-            // Single-pass dynamic mode. Not as clean, but better than shipping
-            // a package 10 LU off the house target.
-            format!(
-                ",loudnorm=I={}:LRA={}:TP={}",
-                target.lufs, target.lra, target.true_peak
-            )
+            // No usable measurement: leave the level alone. Dynamic loudnorm
+            // was the old fallback and it cut the programme short (or, under
+            // 3 s, produced no audio and no file at all).
+            String::new()
         };
 
         // Downmix, resample, normalise, then split into two discrete mono
@@ -320,7 +339,7 @@ pub fn build_plan(
             match (target.enabled, measurement.is_some()) {
                 (false, _) => "; loudness off",
                 (true, true) => "; R128 two-pass",
-                (true, false) => "; R128 single-pass fallback",
+                (true, false) => "; R128 skipped: loudness measurement unusable (silence or too short to gate), level left as received",
             }
         );
     } else {
@@ -437,20 +456,19 @@ impl Transcoder {
     /// Measure programme loudness (pass one of EBU R128 normalisation).
     ///
     /// Returns `None` -- not an error -- when loudness is disabled, the source
-    /// has no audio, or the measurement is unusable (a very short clip, or
-    /// digital silence, for which loudnorm reports `-inf`). The caller then
-    /// falls back to single-pass dynamic mode, which is worse than two-pass but
-    /// far better than shipping a package well off the house target.
+    /// has no audio, or the measurement is unusable (digital silence, or audio
+    /// too short to gate, for which loudnorm reports `-inf`). The plan then
+    /// skips normalisation and records why.
+    ///
+    /// Short clips are measured like any other: a 1 s clip gates fine, and
+    /// skipping the measurement below 3 s is what used to send them down the
+    /// dynamic path that produced no file.
     pub async fn measure_loudness(
         &self,
         probe: &SourceProbe,
         target: &LoudnessTarget,
         source: &Path,
     ) -> Option<LoudnessMeasurement> {
-        // loudnorm needs a few seconds of programme to measure anything useful.
-        if probe.duration_secs < 3.0 {
-            return None;
-        }
         let args = build_loudness_measure_args(probe, target, source)?;
 
         // Generous but bounded: the measurement pass decodes audio only, so it
@@ -465,12 +483,12 @@ impl Transcoder {
         .ok()?;
 
         if !out.success {
-            warn!("Loudness measurement pass failed; falling back to single-pass loudnorm");
+            warn!("Loudness measurement pass failed; normalisation skipped for this clip");
             return None;
         }
         let measured = parse_loudness_measurement(&out.stderr_tail);
         if measured.is_none() {
-            warn!("Could not parse loudnorm measurement; falling back to single-pass");
+            warn!("Loudness measurement unusable (silence or too short); normalisation skipped for this clip");
         }
         measured
     }

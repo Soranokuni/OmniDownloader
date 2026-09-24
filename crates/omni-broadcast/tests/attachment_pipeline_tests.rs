@@ -65,10 +65,11 @@ async fn an_attached_video_is_built_from_its_saved_file() {
 
     let source = r.root.join("attachments").join("saved").join("source.mp4");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-    // 6 s: longer than the loudness measurement's 3 s window.
+    // 2 s, as short social clips are: this is also the original reproduction
+    // of the short-clip loudness failure, through the whole engine.
     let args: Vec<String> = [
-        "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=6", "-f", "lavfi",
-        "-i", "sine=frequency=1000:sample_rate=48000:duration=6", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=2", "-f", "lavfi",
+        "-i", "sine=frequency=1000:sample_rate=48000:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest",
     ]
     .iter()
