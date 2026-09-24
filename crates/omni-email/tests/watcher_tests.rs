@@ -94,6 +94,14 @@ fn mail(id: &str, subject: &str, body: &str) -> InboundMail {
     }
 }
 
+/// LLM off: these tests are about the watcher, and must not reach a real
+/// Ollama that happens to be running on the machine.
+fn test_config() -> AppConfig {
+    let mut c = AppConfig::default();
+    c.llm.mode = omni_core::config::LlmMode::Off;
+    c
+}
+
 fn repo() -> (tempfile::TempDir, Repository) {
     let dir = tempfile::tempdir().unwrap();
     let repo = Repository::new(dir.path().join("omni.db")).unwrap();
@@ -116,7 +124,7 @@ async fn a_message_that_fails_processing_is_not_marked_until_retries_run_out() {
     let (dir, repo) = repo();
     break_queue(&dir);
     let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", BODY)]);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
 
     for attempt in 1..MAX_PROCESS_ATTEMPTS {
         let r = watcher.poll_once().await.unwrap();
@@ -141,7 +149,7 @@ async fn a_message_that_fails_processing_is_not_marked_until_retries_run_out() {
 async fn a_parsed_message_queues_its_jobs_then_is_marked() {
     let (_dir, repo) = repo();
     let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", BODY)]);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
 
     let r = watcher.poll_once().await.unwrap();
     assert_eq!(r.processed, 1);
@@ -172,7 +180,7 @@ async fn a_redelivered_message_is_not_queued_twice() {
     let (_dir, repo) = repo();
     let first = mail("m1", "ΘΕΜΑΤΑ", BODY);
     let source = FakeSource::with(vec![first.clone()]);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
     watcher.poll_once().await.unwrap();
     assert_eq!(repo.get_all_jobs().unwrap().len(), 2);
 
@@ -192,7 +200,7 @@ async fn a_redelivered_message_is_not_queued_twice() {
 async fn an_urgent_subject_raises_priority_above_the_journalist_default() {
     let (_dir, repo) = repo();
     let source = FakeSource::with(vec![mail("m1", "ΕΚΤΑΚΤΟ: σεισμός", "https://youtu.be/w0003")]);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
     watcher.poll_once().await.unwrap();
     let jobs = repo.get_all_jobs().unwrap();
     assert_eq!(jobs.len(), 1);
@@ -203,7 +211,7 @@ async fn an_urgent_subject_raises_priority_above_the_journalist_default() {
 async fn a_message_with_no_links_is_still_marked_processed() {
     let (_dir, repo) = repo();
     let source = FakeSource::with(vec![mail("m1", "Καλημέρα", "Θα στείλω τα λινκ αργότερα.")]);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
     watcher.poll_once().await.unwrap();
     assert!(repo.get_all_jobs().unwrap().is_empty());
     assert_eq!(source.marks(), vec![("m1".to_string(), MailOutcome::Processed)]);
@@ -224,7 +232,7 @@ fn mail_with_video(id: &str) -> InboundMail {
 async fn an_attached_video_is_saved_and_its_job_released_to_the_workers() {
     let (dir, repo) = repo();
     let source = FakeSource::with(vec![mail_with_video("m1")]);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone())
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone())
         .with_attachments_dir(dir.path().join("attachments"));
     watcher.poll_once().await.unwrap();
 
@@ -249,7 +257,7 @@ async fn a_failed_attachment_download_leaves_the_job_for_mcr_and_the_mail_proces
     let (dir, repo) = repo();
     let source = FakeSource::with(vec![mail_with_video("m1")]);
     source.fail_downloads.store(true, std::sync::atomic::Ordering::SeqCst);
-    let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone())
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone())
         .with_attachments_dir(dir.path().join("attachments"));
     watcher.poll_once().await.unwrap();
 

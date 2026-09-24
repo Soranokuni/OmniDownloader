@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::info;
 
@@ -41,10 +42,31 @@ pub struct LlmClient {
     client: Client,
     endpoint: String,
     model: String,
+    /// The server rejected `response_format: json_schema` once; use plain
+    /// JSON mode from then on.
+    no_json_schema: AtomicBool,
+}
+
+/// Strip a Markdown code fence some models wrap JSON in.
+pub fn strip_json_fence(content: &str) -> &str {
+    let s = content.trim();
+    if let Some(rest) = s.strip_prefix("```json") {
+        rest.trim_end_matches("```").trim()
+    } else if let Some(rest) = s.strip_prefix("```") {
+        rest.trim_end_matches("```").trim()
+    } else {
+        s
+    }
 }
 
 impl LlmClient {
     pub fn new(endpoint: &str, model: &str) -> Self {
+        Self::with_timeout(endpoint, model, Duration::from_secs(240))
+    }
+
+    /// A client whose every request gives up after `timeout` (plan P4.4:
+    /// `llm.timeout_secs`, 30 s — the poll loop waits on it).
+    pub fn with_timeout(endpoint: &str, model: &str, timeout: Duration) -> Self {
         let clean_endpoint = endpoint.trim_end_matches('/');
         let final_endpoint = if clean_endpoint.ends_with("/chat/completions") {
             clean_endpoint.to_string()
@@ -55,7 +77,8 @@ impl LlmClient {
         };
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(240))
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_default();
 
@@ -63,6 +86,64 @@ impl LlmClient {
             client,
             endpoint: final_endpoint,
             model: model.to_string(),
+            no_json_schema: AtomicBool::new(false),
+        }
+    }
+
+    /// One chat completion that must answer with a JSON object.
+    ///
+    /// Asks for `response_format: json_schema` (Ollama >= 0.5, llama.cpp,
+    /// vLLM); a server that rejects it with a 4xx is asked again, and from
+    /// then on, with plain `json_object` mode — the schema is in the prompt
+    /// either way. Temperature 0: the same email should get the same answer.
+    pub async fn chat_json(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<serde_json::Value> {
+        loop {
+            let use_schema = !self.no_json_schema.load(Ordering::Relaxed);
+            let response_format = if use_schema {
+                serde_json::json!({ "type": "json_schema", "json_schema": { "name": "assist", "schema": schema } })
+            } else {
+                serde_json::json!({ "type": "json_object" })
+            };
+            let payload = serde_json::json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ],
+                "temperature": 0,
+                "max_tokens": max_tokens,
+                "stream": false,
+                "response_format": response_format,
+            });
+            let resp = self
+                .client
+                .post(&self.endpoint)
+                .json(&payload)
+                .send()
+                .await
+                .with_context(|| format!("LLM unreachable at {}", self.endpoint))?;
+            let status = resp.status();
+            if status.is_client_error() && use_schema {
+                self.no_json_schema.store(true, Ordering::Relaxed);
+                continue;
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("LLM HTTP error {}: {}", status, text.chars().take(200).collect::<String>()));
+            }
+            let data: serde_json::Value = resp.json().await.context("LLM answer is not JSON")?;
+            let content = data
+                .pointer("/choices/0/message/content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("LLM answer has no message content"))?;
+            return serde_json::from_str(strip_json_fence(content))
+                .with_context(|| format!("LLM content is not a JSON object: {}", content.chars().take(200).collect::<String>()));
         }
     }
 

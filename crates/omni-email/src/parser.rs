@@ -58,6 +58,8 @@ pub enum Resolution {
     Sender,
     /// Nobody matched; the jobs go to `MCR`.
     Unresolved,
+    /// Proposed by the LLM (plan P4.4) and confirmed against the roster.
+    LlmAssist,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +154,10 @@ pub mod warnings {
     pub const DUPLICATE_SECTION_NUMBER: &str = "DUPLICATE_SECTION_NUMBER";
     pub const MARKER_WITHOUT_URL: &str = "MARKER_WITHOUT_URL";
     pub const ATTACHMENT_TOO_LARGE: &str = "ATTACHMENT_TOO_LARGE";
+    /// The LLM was asked and something it said was used (plan P4.4).
+    pub const LLM_ASSIST_APPLIED: &str = "LLM_ASSIST_APPLIED";
+    /// The LLM was asked and nothing it said was used.
+    pub const LLM_ASSIST_SKIPPED: &str = "LLM_ASSIST_SKIPPED";
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,4 +1203,95 @@ mod tests {
         let p = parse(&mail("x", "a.papadaki@example.gr", "https://example.org/story"), &roster(), &ParserConfig::default());
         assert_eq!(p.jobs().next().unwrap().status, JobStatus::Pending);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hooks for the LLM assist (plan P4.4). Everything the model proposes passes
+// through one of these; none of them can add a URL or an index.
+// ---------------------------------------------------------------------------
+
+/// The roster surname a proposed name refers to, under the same rules the
+/// parser uses (aliases, genitive prefixes, ambiguity).
+///
+/// Every word must name the same journalist: `PAPADAKI` and `Anna Papadaki`
+/// pass, `ANNA; DROP TABLE` does not — a roster name buried in other text is
+/// not an answer. `None` for nobody, several people, or `MCR`.
+pub fn resolve_name(roster: &[Journalist], name: &str) -> Option<String> {
+    let ix = Roster::new(roster);
+    let words: Vec<&str> = tokens(name).collect();
+    if words.is_empty() || words.len() > 3 {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    for w in words {
+        let Lookup::One(s) = ix.lookup(w) else {
+            return None;
+        };
+        match &found {
+            Some(prev) if *prev != s => return None,
+            _ => found = Some(s),
+        }
+    }
+    found.filter(|s| s != "MCR")
+}
+
+static RE_KEYWORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Z0-9]{2,20}$").unwrap());
+
+/// A keyword as the LLM proposed it, if it is one: transliterated, and then
+/// exactly `^[A-Z0-9]{2,20}$` — no spaces, no punctuation, nothing trimmed
+/// into shape.
+pub fn valid_keyword(raw: &str) -> Option<String> {
+    let k = translit(raw.trim());
+    (RE_KEYWORD.is_match(&k) && !STOPWORDS.contains(&k.as_str())).then_some(k)
+}
+
+/// Adopt a journalist for a mail the parser left unresolved: the −0.2
+/// confidence penalty is taken back and every job's status recomputed.
+pub fn adopt_journalist(parsed: &mut ParsedEmail, surname: String, cfg: &ParserConfig) {
+    if parsed.journalist.how != Resolution::Unresolved {
+        return;
+    }
+    parsed.journalist = ResolvedJournalist {
+        surname,
+        how: Resolution::LlmAssist,
+    };
+    parsed
+        .warnings
+        .retain(|w| w.code != warnings::JOURNALIST_UNRESOLVED && w.code != warnings::JOURNALIST_AMBIGUOUS);
+    for s in &mut parsed.sections {
+        for j in &mut s.jobs {
+            j.confidence = round2(j.confidence + 0.2);
+            j.status = status_for(j.tier, j.confidence, cfg);
+        }
+    }
+}
+
+/// Sections whose title produced no keyword, so their jobs fell back to a
+/// URL slug or `ASSET`: where a keyword from the LLM helps.
+pub fn sections_needing_keyword(parsed: &ParsedEmail) -> Vec<(String, String)> {
+    parsed
+        .sections
+        .iter()
+        .filter(|s| s.keyword.is_none() && !s.jobs.is_empty())
+        .filter_map(|s| s.title.clone().map(|t| (s.index_str.clone(), t)))
+        .collect()
+}
+
+/// Give a section a keyword. With `all_jobs` false only jobs that fell back
+/// to `ASSET` change; attachment jobs keep their file-name keyword.
+pub fn set_section_keyword(parsed: &mut ParsedEmail, index: &str, keyword: &str, all_jobs: bool) -> bool {
+    let Some(s) = parsed.sections.iter_mut().find(|s| s.index_str == index) else {
+        return false;
+    };
+    let mut changed = false;
+    for j in &mut s.jobs {
+        if j.tier != Tier::Attachment && (all_jobs || j.keyword == "ASSET") {
+            j.keyword = keyword.to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        s.keyword = Some(keyword.to_string());
+    }
+    changed
 }
