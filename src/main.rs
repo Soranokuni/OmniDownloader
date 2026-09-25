@@ -823,7 +823,13 @@ async fn run_job(
     // yt-dlp could not resolve the page. For a news portal that is expected:
     // the video is behind an embedded player, so sniff the actual stream and
     // retry with the session context (referer/UA/cookies) it needs to avoid 403.
-    if process_result.is_err() && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
+    // A platform post is sniffed only where that can help (`should_sniff`):
+    // its page also plays other posts' videos.
+    let sniff = match &process_result {
+        Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
+        Ok(()) => false,
+    };
+    if sniff && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
         info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
         repo.set_stage(job_id, owner, JobStage::Extract)?;
         repo.record_event(
