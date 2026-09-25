@@ -366,6 +366,7 @@ async fn run_daemon(
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
     info!("  yt-dlp:       {:?}", ytdl_path);
 
+    let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdl_path.clone(),
@@ -390,7 +391,35 @@ async fn run_daemon(
     // a missing bmxtranswrap.exe reported as a problem with someone's YouTube
     // URL, once per job. It never blocks start-up: refusing to come up is the
     // one outcome an operator cannot diagnose from the MCR desk.
-    match omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await {
+    omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
+
+    // Tools that start are not tools that make the file: an FFmpeg 9 build
+    // answered `-version` and then rejected an output option, so every job
+    // failed at transcode under a green "tools" check. One real 2 s job —
+    // transcode, RDD9 rewrap, compliance gate — proves the chain.
+    let encoder_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match omni_broadcast::selftest::encoder_self_test(&st_ffmpeg, &st_ffprobe, &st_bmx, &temp_path).await {
+        Ok(report) => {
+            encoder_ok.store(true, std::sync::atomic::Ordering::SeqCst);
+            health.set(
+                omni_core::health::checks::ENCODER,
+                omni_core::health::Check::ok(format!(
+                    "test clip transcoded, rewrapped and verified in {:.1} s",
+                    report.elapsed.as_secs_f64()
+                )),
+            );
+        }
+        Err(e) => {
+            error!("Encoder self-test failed: {e:#}. Jobs are held in the queue until this is fixed and the daemon restarted.");
+            let _ = repo.log_audit("ERROR", "SELFTEST", &format!("Encoder self-test failed: {e}"));
+            health.set(
+                omni_core::health::checks::ENCODER,
+                omni_core::health::Check::down(format!("{e} — jobs are held; fix the tool and restart")),
+            );
+        }
+    }
+
+    match health.overall() {
         omni_core::health::Health::Ok => info!("Start-up self-test passed"),
         verdict => {
             for (name, check) in health.all() {
@@ -579,6 +608,7 @@ async fn run_daemon(
     let engine_worker = broadcast_engine.clone();
     let worker_hostname = hostname.clone();
     let worker_gate = update_gate.clone();
+    let worker_encoder_ok = encoder_ok.clone();
 
     tokio::spawn(async move {
         info!("Queue worker pool active (concurrency: {max_concurrency})");
@@ -598,6 +628,17 @@ async fn run_daemon(
             };
 
             worker_seq += 1;
+
+            // The start-up test could not make a compliant file with these
+            // tools. Leasing now would only turn every waiting job into a
+            // transcode failure for MCR to retry one by one; they wait instead.
+            if !worker_encoder_ok.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(permit);
+                tokio::select! {
+                    _ = worker_rx.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                }
+            }
 
             // A tool swap is pending: hold off rather than lease a job whose
             // downloader is about to be replaced underneath it. The pass is
