@@ -45,6 +45,37 @@ pub const MIN_MEASURED_LRA: f64 = 0.01;
 /// switch to dynamic mode, which truncates the output.
 pub const PEAK_DECISION_MARGIN_DB: f64 = 0.1;
 
+/// `Some(reason)` when the transcode is shorter than its source by more than
+/// 0.5 % (at least 1 s — sources often carry audio a few frames longer than
+/// the video, and `-shortest` trims to the shorter one).
+///
+/// Deliberately tighter than the compliance gate's 2 %: 2 % of a 163 s clip
+/// is 3.3 s, and the 2.8 s cut that dynamic loudnorm made fitted inside it.
+pub fn truncation(source_secs: f64, output_secs: f64) -> Option<String> {
+    if source_secs <= 1.0 {
+        return None;
+    }
+    let tolerance = (source_secs * 0.005).max(1.0);
+    (output_secs < source_secs - tolerance).then(|| {
+        format!(
+            "transcode is {output_secs:.2} s but the source is {source_secs:.2} s: the output was \
+             cut short (check the audio chain in the plan note)"
+        )
+    })
+}
+
+/// loudnorm's upper bound for its `LRA` option.
+pub const MAX_LRA_OPTION: f64 = 50.0;
+
+/// The `LRA=` value for the linear pass: the target, or the clip's measured
+/// range plus a margin when that is wider (see `build_plan`). loudnorm
+/// compares against the values as printed to two decimals, so the margin
+/// keeps rounding from landing on the refusing side.
+pub fn linear_lra_ceiling(m: &LoudnessMeasurement, target: &LoudnessTarget) -> f64 {
+    let needed = ((m.input_lra + 0.1) * 10.0).ceil() / 10.0;
+    target.lra.max(needed).min(MAX_LRA_OPTION)
+}
+
 /// When a linear gain to the loudness target would lift true peak above the
 /// ceiling, the gain that puts the peaks exactly at the ceiling instead, and
 /// the loudness the programme then lands at.
@@ -332,6 +363,18 @@ pub fn build_plan(
                     target.true_peak, target.lufs
                 ),
             )
+        } else if let Some(m) = measurement.filter(|m| linear_lra_ceiling(m, target) < m.input_lra + 0.05) {
+            // Loudness range beyond anything loudnorm's LRA option accepts:
+            // it would go dynamic whatever we pass. Same correction as linear
+            // mode, as a plain gain (still never above the peak ceiling).
+            let gain = (target.lufs - m.input_i).min(target.true_peak - m.input_tp);
+            (
+                format!(",volume={gain:.2}dB"),
+                format!(
+                    "; R128 as a plain {gain:+.2} dB gain (loudness range {:.1} LU is beyond loudnorm's limit)",
+                    m.input_lra
+                ),
+            )
         } else if let Some(m) = measurement {
             // Two-pass: correct by the measured values, linearly.
             //
@@ -343,12 +386,20 @@ pub fn build_plan(
             // a 1-2 s clip, left no audio and no file. In linear mode the gain
             // depends only on I and the offset, so the floor changes nothing
             // audible.
+            //
+            // The LRA ceiling is raised to the clip's own range when that is
+            // wider than the target: loudnorm refuses linear mode whenever
+            // measured_LRA > LRA and, again, silently goes dynamic -- a 163 s X
+            // clip at LRA 7.10 came out 2.8 s short and bmxtranswrap then
+            // rejected the truncated file. LRA only steers dynamic
+            // compression; the linear gain is the same either way.
+            let lra = linear_lra_ceiling(m, target);
             (
                 format!(
                     ",loudnorm=I={}:LRA={}:TP={}:measured_I={:.2}:measured_LRA={:.2}:\
                      measured_TP={:.2}:measured_thresh={:.2}:offset={:.2}:linear=true",
                     target.lufs,
-                    target.lra,
+                    lra,
                     target.true_peak,
                     m.input_i,
                     m.input_lra.max(MIN_MEASURED_LRA),
@@ -356,7 +407,14 @@ pub fn build_plan(
                     m.input_thresh,
                     m.target_offset
                 ),
-                "; R128 two-pass".to_string(),
+                if lra > target.lra {
+                    format!(
+                        "; R128 two-pass (LRA {:.1} LU kept; wider than the {:.0} LU target, not compressed)",
+                        m.input_lra, target.lra
+                    )
+                } else {
+                    "; R128 two-pass".to_string()
+                },
             )
         } else {
             // No usable measurement: leave the level alone. Dynamic loudnorm
@@ -623,6 +681,17 @@ impl Transcoder {
             return Err(anyhow!(
                 "ffmpeg reported success but produced no output at {intermediate_mxf:?}"
             ));
+        }
+
+        // ffmpeg exits 0 for a cut-short programme (loudnorm going dynamic
+        // did exactly that). Catch it here, by name, rather than as a
+        // baffling bmxtranswrap error or a compliance failure two stages on.
+        let produced = crate::probe::probe(&self.ffprobe_path, &intermediate_mxf)
+            .await
+            .map(|p| p.duration_secs)
+            .unwrap_or(0.0);
+        if let Some(msg) = truncation(duration, produced) {
+            return Err(anyhow!("{msg}").context("TRANSCODE_FAILED"));
         }
 
         Ok((intermediate_mxf, duration))
