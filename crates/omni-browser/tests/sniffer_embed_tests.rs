@@ -73,3 +73,29 @@ async fn every_x_embed_in_an_article_is_found_once() {
         media.all_streams
     );
 }
+
+/// Two workers sniffing at once, as in the 2026-09-25 trial where the second
+/// failed "Failed launching Chromium via CDP": both launches shared one
+/// profile, and Chrome runs one process per profile.
+#[tokio::test]
+async fn two_sniffs_at_once_both_run() {
+    if !browser_installed() {
+        eprintln!("WARNING: skipping concurrent sniffer test -- no Chrome/Edge installed");
+        return;
+    }
+    let adblock = tempfile::tempdir().unwrap();
+    UnifiedAdBlocker::init(adblock.path().to_path_buf());
+
+    let app = Router::new().route("/article", get(|| async { Html(ARTICLE) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let url = format!("http://{addr}/article");
+    let (a, b) = tokio::join!(
+        StreamSniffer::extract_media_bundle(&url, 20),
+        StreamSniffer::extract_media_bundle(&url, 20),
+    );
+    assert!(a.is_ok(), "first sniff: {:#}", a.unwrap_err());
+    assert!(b.is_ok(), "second sniff: {:#}", b.unwrap_err());
+}
