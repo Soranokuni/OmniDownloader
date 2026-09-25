@@ -71,6 +71,45 @@ impl Default for DownloadOpts<'_> {
     }
 }
 
+/// Hosts yt-dlp has a native extractor for, which want to be fetched as
+/// themselves, never with another site's page context.
+const VIDEO_PLATFORMS: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "x.com",
+    "twitter.com",
+    "facebook.com",
+    "fb.watch",
+    "instagram.com",
+    "tiktok.com",
+    "vimeo.com",
+    "dailymotion.com",
+    "dai.ly",
+];
+
+/// Whether `url` is a page on a video platform (as opposed to a raw stream
+/// or a news portal's article).
+pub fn is_video_platform(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    VIDEO_PLATFORMS
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
 pub struct Downloader {
     ytdl_path: PathBuf,
 }
@@ -135,17 +174,24 @@ impl Downloader {
         if opts.insecure_tls {
             args.push("--no-check-certificates".into());
         }
-        if let Some(r) = opts.referer {
-            args.push("--referer".into());
-            args.push(r.to_string());
-        }
-        if let Some(ua) = opts.user_agent {
-            args.push("--user-agent".into());
-            args.push(ua.to_string());
-        }
-        if let Some(c) = opts.cookie_header {
-            args.push("--add-header".into());
-            args.push(format!("Cookie: {c}"));
+        // The article page's session (referer, browser UA, its cookies) is for
+        // raw streams on the portal's own CDN. A video platform the sniffer
+        // found embedded in the article is fetched by yt-dlp's own extractor,
+        // and the platform rejects a foreign referer: X's video CDN answers
+        // 403 to an x.com post fetched "from" a news article.
+        if !is_video_platform(url) {
+            if let Some(r) = opts.referer {
+                args.push("--referer".into());
+                args.push(r.to_string());
+            }
+            if let Some(ua) = opts.user_agent {
+                args.push("--user-agent".into());
+                args.push(ua.to_string());
+            }
+            if let Some(c) = opts.cookie_header {
+                args.push("--add-header".into());
+                args.push(format!("Cookie: {c}"));
+            }
         }
         if let Some(jar) = opts.cookie_jar {
             args.push("--cookies".into());
@@ -378,18 +424,62 @@ mod tests {
         // Greek portals routinely 403 a bare fetch of a sniffed stream URL but
         // serve it with the article page as the referer.
         let jar = PathBuf::from("C:/temp/x.com.cookies.txt");
-        let args = args_for(&DownloadOpts {
-            referer: Some("https://www.in.gr/article"),
-            user_agent: Some("Mozilla/5.0 omni"),
-            cookie_header: Some("sid=1"),
-            cookie_jar: Some(&jar),
-            ..Default::default()
-        });
+        let args = Downloader::build_args(
+            "https://cdn.in.gr/media/2026/09/clip/master.m3u8",
+            Path::new("C:/temp/jobs/7"),
+            &DownloadOpts {
+                referer: Some("https://www.in.gr/article"),
+                user_agent: Some("Mozilla/5.0 omni"),
+                cookie_header: Some("sid=1"),
+                cookie_jar: Some(&jar),
+                ..Default::default()
+            },
+        );
         let joined = args.join(" ");
         assert!(joined.contains("--referer https://www.in.gr/article"), "{joined}");
         assert!(joined.contains("--user-agent Mozilla/5.0 omni"), "{joined}");
         assert!(joined.contains("Cookie: sid=1"), "{joined}");
         assert!(joined.contains("--cookies"), "{joined}");
+    }
+
+    /// Regression: a newsbomb.gr article embedding an X post. The sniffer
+    /// returned the post URL with the article's context, and X's video CDN
+    /// answered 403 to the article referer; a plain fetch works.
+    #[test]
+    fn a_platform_link_found_in_an_article_is_fetched_without_the_article_context() {
+        let jar = PathBuf::from("C:/temp/x.com.cookies.txt");
+        let opts = DownloadOpts {
+            referer: Some("https://www.newsbomb.gr/kosmos/story/1764192/article"),
+            user_agent: Some("Mozilla/5.0 omni"),
+            cookie_header: Some("_ga=GA1.2.1"),
+            cookie_jar: Some(&jar),
+            ..Default::default()
+        };
+        for url in [
+            "https://x.com/i/status/2100509173943288138",
+            "https://twitter.com/user/status/1",
+            "https://www.youtube.com/watch?v=abc",
+            "https://m.facebook.com/watch/?v=1",
+            "https://www.instagram.com/reel/abc/",
+        ] {
+            let joined = Downloader::build_args(url, Path::new("C:/temp/jobs/7"), &opts).join(" ");
+            assert!(!joined.contains("--referer"), "{url}: {joined}");
+            assert!(!joined.contains("--user-agent"), "{url}: {joined}");
+            assert!(!joined.contains("Cookie:"), "{url}: {joined}");
+            // The station's own login for the platform (P3.5) still applies.
+            assert!(joined.contains("--cookies"), "{url}: {joined}");
+        }
+    }
+
+    #[test]
+    fn platform_hosts_are_matched_exactly_not_by_substring() {
+        assert!(is_video_platform("https://x.com/i/status/1"));
+        assert!(is_video_platform("https://mobile.twitter.com/a/status/1"));
+        assert!(is_video_platform("HTTPS://WWW.YOUTUBE.COM/watch?v=1"));
+        assert!(!is_video_platform("https://www.newsbomb.gr/x.com/story"));
+        assert!(!is_video_platform("https://notyoutube.com/watch?v=1"));
+        assert!(!is_video_platform("https://box.com/v"));
+        assert!(!is_video_platform("https://cdn.in.gr/master.m3u8?ref=youtube.com"));
     }
 
     #[test]

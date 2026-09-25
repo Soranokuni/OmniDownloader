@@ -1,0 +1,28 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "body_override",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "ANASKAFESKNOSO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://vimeo.com/fixture0401"
+        }
+      ],
+      "keyword": "ANASKAFESKNOSO",
+      "title": "ΑΝΑΣΚΑΦΕΣ ΣΤΗΝ ΚΝΩΣΟ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

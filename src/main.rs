@@ -366,6 +366,7 @@ async fn run_daemon(
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
     info!("  yt-dlp:       {:?}", ytdl_path);
 
+    let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdl_path.clone(),
@@ -390,7 +391,35 @@ async fn run_daemon(
     // a missing bmxtranswrap.exe reported as a problem with someone's YouTube
     // URL, once per job. It never blocks start-up: refusing to come up is the
     // one outcome an operator cannot diagnose from the MCR desk.
-    match omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await {
+    omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
+
+    // Tools that start are not tools that make the file: an FFmpeg 9 build
+    // answered `-version` and then rejected an output option, so every job
+    // failed at transcode under a green "tools" check. One real 2 s job —
+    // transcode, RDD9 rewrap, compliance gate — proves the chain.
+    let encoder_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match omni_broadcast::selftest::encoder_self_test(&st_ffmpeg, &st_ffprobe, &st_bmx, &temp_path).await {
+        Ok(report) => {
+            encoder_ok.store(true, std::sync::atomic::Ordering::SeqCst);
+            health.set(
+                omni_core::health::checks::ENCODER,
+                omni_core::health::Check::ok(format!(
+                    "test clip transcoded, rewrapped and verified in {:.1} s",
+                    report.elapsed.as_secs_f64()
+                )),
+            );
+        }
+        Err(e) => {
+            error!("Encoder self-test failed: {e:#}. Jobs are held in the queue until this is fixed and the daemon restarted.");
+            let _ = repo.log_audit("ERROR", "SELFTEST", &format!("Encoder self-test failed: {e}"));
+            health.set(
+                omni_core::health::checks::ENCODER,
+                omni_core::health::Check::down(format!("{e} — jobs are held; fix the tool and restart")),
+            );
+        }
+    }
+
+    match health.overall() {
         omni_core::health::Health::Ok => info!("Start-up self-test passed"),
         verdict => {
             for (name, check) in health.all() {
@@ -424,16 +453,19 @@ async fn run_daemon(
     });
 
     // 2. Start Email Monitoring Watchdog
-    if !config.email_address.is_empty() {
+    // Graph (Office 365) when configured, else IMAP; see EmailWatcher::new.
+    if config.graph.is_configured() || !config.email_address.is_empty() {
         let email_watcher = Arc::new(
-            EmailWatcher::new(config.clone(), repo.clone()).with_health(health.clone()),
+            EmailWatcher::new(config.clone(), repo.clone())
+                .with_attachments_dir(temp_path.join("attachments"))
+                .with_health(health.clone()),
         );
         let email_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             email_watcher.start_polling_loop(email_rx).await;
         });
     } else {
-        info!("Email monitoring disabled (no email address configured in config.json).");
+        info!("Email monitoring disabled (neither a Graph mailbox nor an IMAP address is configured).");
         health.set(
             omni_core::health::checks::MAIL,
             omni_core::health::Check::disabled("Mailbox"),
@@ -576,6 +608,7 @@ async fn run_daemon(
     let engine_worker = broadcast_engine.clone();
     let worker_hostname = hostname.clone();
     let worker_gate = update_gate.clone();
+    let worker_encoder_ok = encoder_ok.clone();
 
     tokio::spawn(async move {
         info!("Queue worker pool active (concurrency: {max_concurrency})");
@@ -595,6 +628,17 @@ async fn run_daemon(
             };
 
             worker_seq += 1;
+
+            // The start-up test could not make a compliant file with these
+            // tools. Leasing now would only turn every waiting job into a
+            // transcode failure for MCR to retry one by one; they wait instead.
+            if !worker_encoder_ok.load(std::sync::atomic::Ordering::SeqCst) {
+                drop(permit);
+                tokio::select! {
+                    _ = worker_rx.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                }
+            }
 
             // A tool swap is pending: hold off rather than lease a job whose
             // downloader is about to be replaced underneath it. The pass is
@@ -779,7 +823,13 @@ async fn run_job(
     // yt-dlp could not resolve the page. For a news portal that is expected:
     // the video is behind an embedded player, so sniff the actual stream and
     // retry with the session context (referer/UA/cookies) it needs to avoid 403.
-    if process_result.is_err() && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
+    // A platform post is sniffed only where that can help (`should_sniff`):
+    // its page also plays other posts' videos.
+    let sniff = match &process_result {
+        Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
+        Ok(()) => false,
+    };
+    if sniff && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
         info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
         repo.set_stage(job_id, owner, JobStage::Extract)?;
         repo.record_event(
@@ -799,6 +849,7 @@ async fn run_job(
                     &format!("Sniffed stream: {}", bundle.primary_stream),
                 )?;
                 let mut retry_job = job.clone();
+                omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &bundle.primary_stream, &bundle.all_streams);
                 retry_job.url = bundle.primary_stream;
                 repo.set_stage(job_id, owner, JobStage::Download)?;
                 process_result = engine
@@ -1103,9 +1154,16 @@ async fn run_one_task(
             // Orphaned per-job workspaces. The start-up sweep only runs at
             // start-up, and a machine that stays up for a month accumulates
             // the temp directories of every job that died mid-stage.
-            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path, ctx.retention_days).await;
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join("jobs"), ctx.retention_days).await;
             if removed > 0 {
                 info!("Retention: removed {removed} orphaned job workspace(s)");
+            }
+            // Email attachments (plan P4.6) live outside temp/jobs so the
+            // start-up sweep cannot take a queued job's only source; this is
+            // where they go once their job is long finished.
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join("attachments"), ctx.retention_days).await;
+            if removed > 0 {
+                info!("Retention: removed {removed} saved email attachment(s)");
             }
             Ok(TaskOutcome::Ok)
         }
@@ -1124,14 +1182,14 @@ async fn run_one_task(
     }
 }
 
-/// Remove `temp/jobs/{id}` directories whose job is gone or long finished.
+/// Remove `{dir}/{id}` directories (`temp/jobs`, `temp/attachments`) whose
+/// job is gone or long finished.
 ///
 /// Deliberately keyed on the directory name being a job id, never on a
 /// filename prefix: job 1's prefix also matches jobs 10-19 and 100-199, which
 /// is defect D-04 and is exactly why per-job directories exist.
-async fn sweep_orphan_job_dirs(repo: &Repository, temp_path: &PathBuf, keep_days: i64) -> usize {
-    let jobs_dir = temp_path.join("jobs");
-    let Ok(entries) = std::fs::read_dir(&jobs_dir) else {
+async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, keep_days: i64) -> usize {
+    let Ok(entries) = std::fs::read_dir(jobs_dir) else {
         return 0;
     };
 

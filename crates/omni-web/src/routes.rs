@@ -548,6 +548,78 @@ pub async fn api_override_job(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+#[derive(Deserialize)]
+pub struct QueueOfferPayload {
+    url: String,
+}
+
+/// Queue one of the videos the sniffer found in a job's article and offered
+/// to MCR (policy C, `omni_broadcast::article`).
+///
+/// Only a URL that is on the job's offer list is accepted, and only once: the
+/// offer records the job it became. Arbitrary URLs go through the normal
+/// "new job" form, not here.
+pub async fn api_queue_offer(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<QueueOfferPayload>,
+) -> JsonResult {
+    use omni_broadcast::article::Offered;
+
+    let job = state
+        .repo
+        .get_job(job_id)
+        .map_err(internal_error("Could not read the job."))?
+        .ok_or_else(ApiError::not_found)?;
+    let mut offers: Vec<Offered> = job
+        .candidates_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    let Some(offer) = offers.iter_mut().find(|o| o.url == payload.url.trim()) else {
+        return Err(ApiError::bad_request("That video is not among this job's offers."));
+    };
+    if let Some(existing) = offer.queued_job_id {
+        return Err(ApiError::bad_request(format!("Already queued as job #{existing}.")));
+    }
+
+    let mut new = omni_core::models::NewJob::new(
+        offer.url.clone(),
+        format!("{}_{}_{}", offer.index_str, job.journalist, job.keyword),
+        job.journalist.clone(),
+    );
+    new.keyword = job.keyword.clone();
+    new.index_str = offer.index_str.clone();
+    new.priority = job.priority;
+    new.email_source = job.email_source.clone();
+    new.email_message_id = job.email_message_id.clone();
+    new.submitted_by_user_id = principal.user().map(|u| u.id).or(job.submitted_by_user_id);
+    new.extraction_method = Some("sniffer".into());
+    new.notes = Some(format!("Offered from the article of job #{job_id}: {}", job.url));
+    let result = state
+        .repo
+        .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+        .map_err(internal_error("Could not queue that video."))?;
+    offer.queued_job_id = Some(result.job_id());
+    let index = offer.index_str.clone();
+
+    let json = serde_json::to_string(&offers).map_err(|_| ApiError::internal("Could not save the offer."))?;
+    state
+        .repo
+        .set_candidates(job_id, Some(&json))
+        .map_err(internal_error("Could not save the offer."))?;
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Offered video queued by MCR as {index} (job #{}): {}", result.job_id(), payload.url.trim()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: offered video queued as job #{}", result.job_id()));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "job_id": result.job_id(), "index_str": index })))
+}
+
 pub async fn api_retry_job(
     RequireMcr(principal): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
@@ -612,6 +684,8 @@ pub struct CreateJournalistPayload {
     full_name: String,
     emails: Vec<String>,
     priority: Option<i32>,
+    /// Parser aliases (plan P4.3). Absent leaves the stored ones untouched.
+    aliases: Option<Vec<String>>,
 }
 
 pub async fn api_save_journalist(
@@ -626,6 +700,11 @@ pub async fn api_save_journalist(
     if payload.emails.len() > 20 {
         return Err(ApiError::bad_request("At most 20 addresses per journalist."));
     }
+    if let Some(aliases) = &payload.aliases {
+        if aliases.len() > 30 || aliases.iter().any(|a| a.chars().count() > 40) {
+            return Err(ApiError::bad_request("At most 30 aliases of 40 characters each."));
+        }
+    }
     state
         .repo
         .save_journalist(
@@ -635,6 +714,12 @@ pub async fn api_save_journalist(
             payload.priority.unwrap_or(0).clamp(-100, 100),
         )
         .map_err(internal_error("Could not save the journalist."))?;
+    if let Some(aliases) = &payload.aliases {
+        state
+            .repo
+            .set_journalist_aliases(&surname, aliases)
+            .map_err(internal_error("Could not save the journalist's aliases."))?;
+    }
     audit_action(&state, &principal, &format!("Journalist {surname} saved"));
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -965,6 +1050,10 @@ pub async fn api_secrets_set(
     if payload.key == omni_core::secrets::keys::MAIL_PASSWORD {
         let mut cfg = state.config.write().await;
         cfg.email_password = payload.value.trim().to_string();
+    }
+    if payload.key == omni_core::secrets::keys::GRAPH_CLIENT_SECRET {
+        let mut cfg = state.config.write().await;
+        cfg.graph.client_secret = payload.value.trim().to_string();
     }
 
     Ok(Json(serde_json::json!({ "status": "ok" })))

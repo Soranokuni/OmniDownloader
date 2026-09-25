@@ -1,0 +1,39 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "DIMITRIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "attachment_id": "2",
+          "confidence": 1.0,
+          "index_str": "1A",
+          "keyword": "LIMANIKATAPLOUS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "attachment",
+          "url": "attachment://fixture-11@example.gr/2"
+        },
+        {
+          "attachment_id": "3",
+          "confidence": 1.0,
+          "index_str": "1B",
+          "keyword": "LIMANI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "attachment",
+          "url": "attachment://fixture-11@example.gr/3"
+        }
+      ],
+      "keyword": "LIMANI",
+      "title": "Βίντεο από το λιμάνι"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

@@ -172,6 +172,23 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             }
         }
     }
+
+    // An X post is its status id; the handle in front of it is decoration X
+    // ignores (`/i/status/N`, `/IOL/status/N` and `/iol/status/N` are one
+    // post), and the share link's `?s=20&t=…` is tracking. The same post
+    // under two handles was delivered twice (trial run 2026-09-25). What
+    // follows the id stays: `/video/2` picks one video of a post with several.
+    if host == "x.com" {
+        let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if let Some(i) = segs.iter().position(|s| *s == "status") {
+            let id = segs.get(i + 1).copied().unwrap_or("");
+            if (1..=2).contains(&i) && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                let rest = segs[i + 2..].join("/");
+                *path = if rest.is_empty() { format!("/i/status/{id}") } else { format!("/i/status/{id}/{rest}") };
+                params.clear();
+            }
+        }
+    }
 }
 
 fn parse_query(query: &str) -> BTreeMap<String, String> {
@@ -236,9 +253,18 @@ mod tests {
             ("https://youtu.be/aO8YWYaNoew?si=XYZ123", "https://www.youtube.com/watch?v=aO8YWYaNoew"),
 
             // --- X / Twitter ---
-            ("https://twitter.com/user/status/123", "https://x.com/user/status/123"),
-            ("https://x.com/user/status/123?ref_src=twsrc%5Etfw", "https://x.com/user/status/123"),
-            ("https://mobile.twitter.com/user/status/123", "https://x.com/user/status/123"),
+            ("https://twitter.com/user/status/123", "https://x.com/i/status/123"),
+            ("https://x.com/user/status/123?ref_src=twsrc%5Etfw", "https://x.com/i/status/123"),
+            ("https://mobile.twitter.com/user/status/123", "https://x.com/i/status/123"),
+            // One post, whichever handle (or none) is in front of the id.
+            ("https://x.com/i/status/123", "https://x.com/i/status/123"),
+            ("https://x.com/NewsDeskOne/status/123/", "https://x.com/i/status/123"),
+            ("https://x.com/i/web/status/123", "https://x.com/i/status/123"),
+            ("https://x.com/NewsDeskOne/status/123?s=20&t=AbCdEf", "https://x.com/i/status/123"),
+            // The second video of a post with several is its own asset.
+            ("https://x.com/NewsDeskOne/status/123/video/2", "https://x.com/i/status/123/video/2"),
+            // Not a post: left alone.
+            ("https://x.com/NewsDeskOne", "https://x.com/NewsDeskOne"),
 
             // --- Facebook / TikTok ---
             ("https://m.facebook.com/watch?v=99", "https://www.facebook.com/watch?v=99"),
@@ -285,6 +311,13 @@ mod tests {
         let c = normalize("https://www.lifo.gr/now/story-one");
         let d = normalize("https://www.lifo.gr/now/story-two");
         assert_ne!(c, d);
+
+        // Two posts by one account, and two videos of one post.
+        assert_ne!(normalize("https://x.com/NewsDeskOne/status/1"), normalize("https://x.com/NewsDeskOne/status/2"));
+        assert_ne!(
+            normalize("https://x.com/NewsDeskOne/status/1/video/1"),
+            normalize("https://x.com/NewsDeskOne/status/1/video/2")
+        );
 
         // Same path on different hosts stays distinct.
         assert_ne!(

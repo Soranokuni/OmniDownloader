@@ -211,6 +211,161 @@ async fn a_25p_source_keeps_its_full_motion_cadence() {
     );
 }
 
+/// Short clips with the production loudness policy (R128 on).
+///
+/// Every other case here runs with loudness off, which is how a 2 s social
+/// clip failing in the real pipeline went unnoticed: below loudnorm's 3 s
+/// measurement window the chain fell back to single-pass dynamic loudnorm,
+/// and ffmpeg failed writing the MXF trailer, delivering nothing.
+#[tokio::test]
+async fn short_clips_transcode_with_the_default_loudness_policy() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let transcoder = Transcoder::new(&ffmpeg, &ffprobe);
+
+    for secs in [1u32, 2, 4] {
+        let src = dir.path().join(format!("short_{secs}s.mp4"));
+        assert!(make_source(&ffmpeg, &src, "25", secs, true).await, "could not build the {secs}s source");
+
+        let (mxf, duration) = transcoder
+            .transcode(1, &src, &dir.path().join(format!("work_{secs}")), |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("{secs}s clip with default loudness failed to transcode: {e:#}"));
+
+        let report = verify_mxf(&ffprobe, &mxf, duration)
+            .await
+            .unwrap_or_else(|e| panic!("{secs}s: could not verify: {e:?}"));
+        assert!(report.pass, "{secs}s clip produced a non-compliant file: {}", report.summary());
+
+        // And it was actually normalised: a pass that silently skipped R128
+        // would also produce a compliant file. Programme = tracks 1+2.
+        let out = omni_core::process::run(
+            &ffmpeg,
+            [
+                "-nostdin", "-hide_banner", "-i", &mxf.to_string_lossy(), "-filter_complex",
+                "[0:a:0][0:a:1]amerge=inputs=2,loudnorm=I=-23:TP=-1:LRA=7:print_format=json", "-f", "null", "-",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+            omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("loudness check run");
+        let m = omni_broadcast::transcoder::parse_loudness_measurement(&out.stderr_tail)
+            .unwrap_or_else(|| panic!("{secs}s: output loudness unmeasurable"));
+        assert!(
+            (m.input_i - -23.0).abs() <= 1.0,
+            "{secs}s clip delivered at {:.2} LUFS, not -23 (was normalisation skipped?)",
+            m.input_i
+        );
+    }
+}
+
+/// Clipped audio: reaching -23 LUFS would break -1 dBTP. loudnorm's linear
+/// mode refuses that and silently runs dynamic mode, which cut this 6 s clip
+/// to 3.12 s. Policy: the peak ceiling wins, the clip lands under -23.
+#[tokio::test]
+async fn clipped_audio_is_delivered_whole_with_peaks_at_the_ceiling() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("clipped.mp4");
+    // A quiet tone with a near-full-scale click every second.
+    let made = omni_core::process::run(
+        &ffmpeg,
+        [
+            "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=6", "-f", "lavfi",
+            "-i", "aevalsrc='0.01*sin(2*PI*440*t)+if(lt(mod(t\\,1)\\,0.002)\\,0.9\\,0)':s=48000:d=6",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", "-shortest",
+            &src.to_string_lossy(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .unwrap();
+    assert!(made.success, "could not build the clipped source: {}", made.stderr_tail);
+
+    let (mxf, duration) = Transcoder::new(&ffmpeg, &ffprobe)
+        .transcode(1, &src, &dir.path().join("work"), |_| {})
+        .await
+        .expect("clipped clip should transcode");
+    let report = verify_mxf(&ffprobe, &mxf, duration).await.expect("verify");
+    assert!(report.pass, "clipped clip: {}", report.summary());
+
+    let out = omni_core::process::run(
+        &ffmpeg,
+        [
+            "-nostdin", "-hide_banner", "-i", &mxf.to_string_lossy(), "-filter_complex",
+            "[0:a:0][0:a:1]amerge=inputs=2,loudnorm=I=-23:TP=-1:LRA=7:print_format=json", "-f", "null", "-",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .unwrap();
+    let m = omni_broadcast::transcoder::parse_loudness_measurement(&out.stderr_tail).expect("measurable");
+    assert!(m.input_tp <= -0.9, "true peak {:.2} dBTP is over the -1 dBTP ceiling", m.input_tp);
+    assert!(m.input_i < -23.0, "loudness {:.2} LUFS: expected under -23 when peak-limited", m.input_i);
+}
+
+/// Wide loudness range (loud, then quiet): loudnorm refuses linear mode when
+/// the measured LRA exceeds the 7 LU target, goes dynamic, and the programme
+/// came out ~3 s short whenever the source's audio outlasts its video (the
+/// lookahead is lost to -shortest), which bmxtranswrap then rejected ("Read fewer
+/// samples than expected"). It must come out whole and survive the RDD9 rewrap.
+#[tokio::test]
+async fn a_wide_loudness_range_is_delivered_whole_through_the_rdd9_rewrap() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let Some(bmx) = tool("bmxtranswrap") else {
+        eprintln!("WARNING: skipping wide-LRA test -- bmxtranswrap not in bin/");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("wide.mp4");
+    let made = omni_core::process::run(
+        &ffmpeg,
+        [
+            "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=12", "-f", "lavfi",
+            "-i", "aevalsrc='if(lt(t\\,6)\\,0.3\\,0.02)*sin(2*PI*440*t)':s=48000:d=12.4",
+            // Audio 0.4 s longer than the video, as web video often has: that is
+            // what lets dynamic loudnorm lose its 3 s lookahead to -shortest.
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+            &src.to_string_lossy(),
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .unwrap();
+    assert!(made.success, "could not build the wide-range source: {}", made.stderr_tail);
+
+    let (mxf, duration) = Transcoder::new(&ffmpeg, &ffprobe)
+        .transcode(1, &src, &dir.path().join("work"), |_| {})
+        .await
+        .unwrap_or_else(|e| panic!("wide-LRA clip failed to transcode: {e:#}"));
+    let out = omni_broadcast::rewrapper::Rewrapper::new(&bmx)
+        .rewrap_with_clip(1, &mxf, &dir.path().join("work"), Some("1_MCR_WIDE"), None)
+        .await
+        .unwrap_or_else(|e| panic!("RDD9 rewrap failed: {e:#}"));
+    let report = omni_broadcast::verify::verify_mxf_with_clip(&ffprobe, &out, duration, Some("1_MCR_WIDE"))
+        .await
+        .expect("verify");
+    assert!(report.pass, "wide-LRA clip: {}", report.summary());
+}
+
 /// A source the tools cannot read must fail the job, not silently become a
 /// silent clip (defect D-07).
 #[tokio::test]

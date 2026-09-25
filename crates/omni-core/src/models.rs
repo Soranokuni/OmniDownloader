@@ -256,6 +256,11 @@ pub struct Journalist {
     pub full_name: String,
     pub emails: Vec<String>,
     pub default_priority: i32,
+    /// Other spellings the email parser accepts for this journalist (plan
+    /// P4.3): Greek surname, genitive, first name — `["ΠΑΠΑΔΑΚΗ", "ΑΝΝΑΣ"]`.
+    /// Compared accent- and case-insensitively, in ELOT 743 Latin.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
 }
 
@@ -386,6 +391,22 @@ impl Enqueued {
     pub fn is_new(&self) -> bool {
         matches!(self, Self::Created { .. })
     }
+}
+
+/// One row of `processed_mail` (plan P4.2, defect E-07).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessedMail {
+    /// RFC 5322 Message-ID, or `source:{provider id}` when a message has none.
+    pub internet_message_id: String,
+    /// Provider id at the time (Graph message id, IMAP UID).
+    pub source_id: Option<String>,
+    pub processed_at: Option<DateTime<Utc>>,
+    /// Parser outcome (`JOBS`, `PHOTOS_ONLY`, `NO_LINKS`) or `FAILED`.
+    pub outcome: String,
+    pub from_address: Option<String>,
+    pub subject: Option<String>,
+    /// What the message produced, as the email crate records it.
+    pub jobs_json: String,
 }
 
 /// A job to be queued (plan P1.1).

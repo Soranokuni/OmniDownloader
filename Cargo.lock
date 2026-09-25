@@ -1569,6 +1569,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chromiumoxide",
  "chrono",
  "futures",
@@ -1577,6 +1578,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -1629,6 +1631,8 @@ name = "omni-email"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "chrono",
  "encoding_rs",
  "imap",
@@ -1637,8 +1641,10 @@ dependencies = [
  "omni-core",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

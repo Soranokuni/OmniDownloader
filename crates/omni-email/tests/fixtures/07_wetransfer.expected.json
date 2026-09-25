@@ -1,0 +1,53 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 1.0,
+          "index_str": "1A",
+          "keyword": "SYNAVLIAKASTELLI",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://we.tl/t-Fixture0701"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "SYNAVLIAKASTELLI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture0702"
+        }
+      ],
+      "keyword": "SYNAVLIAKASTELLI",
+      "title": "ΣΥΝΑΥΛΙΑ ΣΤΟ ΚΑΣΤΕΛΛΙ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 1.0,
+          "index_str": "2",
+          "keyword": "EKTHESIZOGRAFIKIS",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://1drv.ms/v/s!Fixture0703"
+        }
+      ],
+      "keyword": "EKTHESIZOGRAFIKIS",
+      "title": "ΕΚΘΕΣΗ ΖΩΓΡΑΦΙΚΗΣ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

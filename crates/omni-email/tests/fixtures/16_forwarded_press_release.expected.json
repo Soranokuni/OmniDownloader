@@ -1,0 +1,30 @@
+{
+  "ignored_urls": [
+    "https://www.example.org/press/2026/stathmos.jpg"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "DELTIOTYPOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://vimeo.com/fixture1601"
+        }
+      ],
+      "keyword": "DELTIOTYPOU",
+      "title": "Δελτίο τύπου Δήμου"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

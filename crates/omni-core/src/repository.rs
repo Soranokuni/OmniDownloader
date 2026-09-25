@@ -12,7 +12,7 @@ use crate::auth::hash_password;
 use crate::migrations;
 use crate::models::{
     AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob,
-    QueueSummary, User,
+    ProcessedMail, QueueSummary, User,
     UserRole,
 };
 use crate::timestamps;
@@ -133,6 +133,8 @@ impl Repository {
             emails: Vec<String>,
             #[serde(default)]
             default_priority: i32,
+            #[serde(default)]
+            aliases: Vec<String>,
         }
 
         let roster: Vec<SeedJournalist> = serde_json::from_str(&raw)
@@ -150,10 +152,11 @@ impl Repository {
             } else {
                 j.full_name
             };
+            let aliases_json = serde_json::to_string(&j.aliases).unwrap_or_else(|_| "[]".into());
             conn.execute(
-                "INSERT OR IGNORE INTO journalists (surname, full_name, emails, default_priority)
-                 VALUES (?, ?, ?, ?)",
-                params![surname, full_name, emails_json, j.default_priority],
+                "INSERT OR IGNORE INTO journalists (surname, full_name, emails, default_priority, aliases)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![surname, full_name, emails_json, j.default_priority, aliases_json],
             )?;
             seeded += 1;
         }
@@ -547,6 +550,36 @@ impl Repository {
             )?;
         }
         Ok(changed == 1)
+    }
+
+    /// Give a running job a new index and slug — `1` becomes `1A` when the
+    /// sniffer finds sibling videos in its article. Only the worker holding
+    /// the lease may do it, like every other change to a running job.
+    pub fn rename_leased_job(&self, job_id: i64, owner: &str, index_str: &str, slug: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let changed = conn.execute(
+            "UPDATE queue SET index_str = ?, slug = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![index_str, slug, now, job_id, owner],
+        )?;
+        if changed == 1 {
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'EXTRACT', 'INFO', ?)",
+                params![job_id, now, format!("Renamed to {slug}: the article has more videos")],
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Store the videos offered to MCR for this job (`candidates_json`).
+    pub fn set_candidates(&self, job_id: i64, candidates_json: Option<&str>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE queue SET candidates_json = ?, updated_at = ? WHERE id = ?",
+            params![candidates_json, timestamps::now_string(), job_id],
+        )?;
+        Ok(())
     }
 
     /// Append to the job's timeline. Shown in the MCR job drawer.
@@ -1445,12 +1478,15 @@ impl Repository {
         let rows = stmt.query_map([], |row| {
             let emails_raw: String = row.get("emails")?;
             let emails: Vec<String> = serde_json::from_str(&emails_raw).unwrap_or_default();
+            let aliases_raw: String = row.get("aliases")?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_raw).unwrap_or_default();
             Ok(Journalist {
                 id: row.get("id")?,
                 surname: row.get("surname")?,
                 full_name: row.get("full_name")?,
                 emails,
                 default_priority: row.get("default_priority")?,
+                aliases,
                 created_at: timestamps::parse_opt(row.get("created_at").ok()),
             })
         })?;
@@ -1478,6 +1514,25 @@ impl Repository {
         Ok(())
     }
 
+    /// Replace a journalist's parser aliases (plan P4.3). Blank entries are
+    /// dropped; a missing journalist is an error, not a silent no-op.
+    pub fn set_journalist_aliases(&self, surname: &str, aliases: &[String]) -> Result<()> {
+        let clean: Vec<String> = aliases
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect();
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE journalists SET aliases = ? WHERE surname = ?",
+            params![serde_json::to_string(&clean)?, surname.to_uppercase()],
+        )?;
+        if n == 0 {
+            anyhow::bail!("no journalist named {surname}");
+        }
+        Ok(())
+    }
+
     pub fn delete_journalist(&self, surname: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM journalists WHERE surname = ?", params![surname.to_uppercase()])?;
@@ -1495,6 +1550,83 @@ impl Repository {
             }
         }
         Ok(None)
+    }
+
+    /// Hand a job the source file it will be built from and release it to the
+    /// workers (plan P4.6: a video attached to an email).
+    ///
+    /// Only a job still parked as MANUAL_DOWNLOAD moves: the watcher parks
+    /// attachment jobs there while the file downloads, so no worker can lease
+    /// one before its source exists. If MCR has already acted on the job,
+    /// this changes nothing and returns `false`.
+    pub fn attach_source(&self, id: i64, source_path: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?
+             WHERE id = ? AND status = 'MANUAL_DOWNLOAD'",
+            params![source_path, now, id],
+        )?;
+        if n == 1 {
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'INFO', ?)",
+                params![id, now, "Attachment saved from the email; queued"],
+            )?;
+        }
+        Ok(n == 1)
+    }
+
+    // ==========================================
+    // Processed mail (plan P4.2, defect E-07)
+    // ==========================================
+
+    pub fn get_processed_mail(&self, internet_message_id: &str) -> Result<Option<ProcessedMail>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(
+                "SELECT * FROM processed_mail WHERE internet_message_id = ?",
+                params![internet_message_id],
+                |row| {
+                    Ok(ProcessedMail {
+                        internet_message_id: row.get("internet_message_id")?,
+                        source_id: row.get("source_id")?,
+                        processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
+                        outcome: row.get("outcome")?,
+                        from_address: row.get("from_address")?,
+                        subject: row.get("subject")?,
+                        jobs_json: row.get("jobs_json")?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Record (or update) what a message produced. Called only after its
+    /// jobs are in the queue, so a row here means "nothing left to do".
+    pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            r#"
+            INSERT INTO processed_mail
+                (internet_message_id, source_id, processed_at, outcome, from_address, subject, jobs_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(internet_message_id) DO UPDATE SET
+                source_id    = excluded.source_id,
+                processed_at = excluded.processed_at,
+                outcome      = excluded.outcome,
+                jobs_json    = excluded.jobs_json
+            "#,
+            params![
+                m.internet_message_id,
+                m.source_id,
+                timestamps::now_string(),
+                m.outcome,
+                m.from_address,
+                m.subject,
+                m.jobs_json
+            ],
+        )?;
+        Ok(())
     }
 
     // ==========================================
@@ -1534,6 +1666,31 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn journalist_aliases_round_trip_and_survive_a_resave() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        repo.save_journalist("PAPADAKI", "Anna Papadaki", &[], 0)?;
+        repo.set_journalist_aliases("papadaki", &["ΠΑΠΑΔΑΚΗ".into(), "  ".into(), " ΑΝΝΑΣ ".into()])?;
+
+        let find = |repo: &Repository| -> Result<Vec<String>> {
+            Ok(repo
+                .list_journalists()?
+                .into_iter()
+                .find(|j| j.surname == "PAPADAKI")
+                .unwrap()
+                .aliases)
+        };
+        assert_eq!(find(&repo)?, vec!["ΠΑΠΑΔΑΚΗ".to_string(), "ΑΝΝΑΣ".to_string()]);
+
+        // Editing name or addresses in the panel must not wipe the aliases.
+        repo.save_journalist("PAPADAKI", "A. Papadaki", &["a@example.gr".into()], 5)?;
+        assert_eq!(find(&repo)?.len(), 2);
+
+        assert!(repo.set_journalist_aliases("NOBODY", &["X".into()]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_repository_lifecycle() -> Result<()> {
