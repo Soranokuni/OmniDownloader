@@ -442,11 +442,18 @@ pub fn build_plan(
         "-trellis",
         "0",
         // Higher DC precision: better detail at the same bitrate, and XDCAM
-        // decoders handle it. Verified by the compliance gate.
-        "-dc",
-        "10",
-        "-top",
-        "1",
+        // decoders handle it. Verified by the compliance gate. The value is the
+        // coded field (0 = 8 bit ... 2 = 10 bit): `-intra_dc_precision 2` writes
+        // a bitstream byte-identical to the old `-dc 10`, which FFmpeg 9
+        // deprecates.
+        "-intra_dc_precision",
+        "2",
+        // Top field first. FFmpeg 9 removed the old `-top 1` encoder option
+        // (it now rejects the whole command); `-field_order tt` is the
+        // generic replacement, accepted by 8.x as well. Same file on air:
+        // TFF interlaced, checked by the compliance gate and e2e tests.
+        "-field_order",
+        "tt",
         "-r",
         "25",
         "-aspect",

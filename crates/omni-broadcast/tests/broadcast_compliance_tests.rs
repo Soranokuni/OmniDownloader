@@ -126,7 +126,11 @@ fn video_matches_sony_xdcam_hd422_pal_1080i50() {
     // Interlaced, top field first. -top 1 without +ildct+ilme yields a
     // progressive file that merely claims to be TFF.
     assert_flag(&args, "-flags", "+ildct+ilme");
-    assert_flag(&args, "-top", "1");
+    assert_flag(&args, "-field_order", "tt");
+    // FFmpeg 9 rejects the whole command if the removed `-top` is present.
+    assert!(!args.iter().any(|a| a == "-top"), "-top is gone in FFmpeg 9: {args:?}");
+    assert_flag(&args, "-intra_dc_precision", "2");
+    assert!(!args.iter().any(|a| a == "-dc"), "-dc is deprecated; use -intra_dc_precision: {args:?}");
     assert_flag(&args, "-r", "25");
     assert_flag(&args, "-aspect", "16:9");
     // Rec.709, legal range.
