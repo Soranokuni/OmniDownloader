@@ -123,6 +123,19 @@ pub fn house_slug(current_slug: &str, current_index: &str, journalist: &str, key
         .then(|| format!("{index}_{journalist}_{keyword}"))
 }
 
+/// The timeline line for one sibling. A retry of the article job plans the
+/// same siblings again; dedup stops the second job, and the line must not
+/// claim one was queued.
+fn sibling_event(url: &str, index: &str, r: &omni_core::models::Enqueued) -> String {
+    use omni_core::models::Enqueued;
+    match r {
+        Enqueued::Created { id } => format!("Another video in this article queued as {index} (job #{id}): {url}"),
+        Enqueued::DuplicateActive { existing_id } | Enqueued::DuplicateRecent { existing_id } => {
+            format!("Another video in this article is already job #{existing_id}: {url}")
+        }
+    }
+}
+
 /// The article behind a job held more than one video (policy C above): queue the other platform posts as sibling jobs,
 /// offer the rest to MCR, and rename this job `1` → `1A` when it has siblings.
 ///
@@ -169,13 +182,9 @@ pub fn queue_article_siblings(
         sibling.notes = Some(format!("Also in the article of job #{job_id}: {}", job.url));
         match repo.enqueue(&sibling, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS) {
             Ok(r) => {
-                tracing::info!("Job #{job_id}: article video {url} queued as {index} ({r:?})");
-                let _ = repo.record_event(
-                    job_id,
-                    "INFO",
-                    Some(omni_core::models::JobStage::Extract),
-                    &format!("Another video in this article queued as {index} (job #{}): {url}", r.job_id()),
-                );
+                let line = sibling_event(url, index, &r);
+                tracing::info!("Job #{job_id}: {line}");
+                let _ = repo.record_event(job_id, "INFO", Some(omni_core::models::JobStage::Extract), &line);
             }
             Err(e) => tracing::warn!("Job #{job_id}: could not queue article video {url}: {e:#}"),
         }
@@ -277,6 +286,15 @@ mod tests {
         assert_eq!(p.primary_index, "1B");
         assert!(p.siblings.is_empty(), "{:?}", p.siblings);
         assert!(p.offered.is_empty(), "{:?}", p.offered);
+    }
+
+    #[test]
+    fn a_sibling_already_queued_is_not_reported_as_queued_again() {
+        use omni_core::models::Enqueued;
+        let fresh = sibling_event(X2, "1B", &Enqueued::Created { id: 7 });
+        assert_eq!(fresh, format!("Another video in this article queued as 1B (job #7): {X2}"));
+        let again = sibling_event(X2, "1A2", &Enqueued::DuplicateActive { existing_id: 7 });
+        assert!(!again.contains("queued as") && again.contains("job #7"), "{again}");
     }
 
     #[test]
