@@ -23,12 +23,40 @@
 /watchfolder/
 
 # ---- SECRETS: live config holds mailbox credentials, never commit ----
-/config.json
-/config.*.bak.json
+# Any config*.json at the root (config.json, config.local.json, backups);
+# only the example is published.
+/config*.json
+!/config.example.json
+*.bak.json
+.env
+.env.*
 *.pem
 *.key
 *.pfx
-cookies*.txt
+*.p12
+# DPAPI secret store and any database copy, wherever it lands (a trial run
+# puts both next to its own config).
+secrets.bin
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+# Browser cookie exports: cookies.txt, and the extension naming
+# x.com_cookies.txt / www.youtube.com_cookies.txt (plan P3.5 jars).
+*cookies*.txt
+*.cookies
+*.log
+
+# ---- Real mail and newsroom media: never in a public repo ----
+# Golden fixtures are invented and are the only mail that is tracked.
+*.eml
+*.msg
+!/crates/omni-email/tests/fixtures/*.eml
+*.mxf
+*.mp4
+*.mov
+*.mkv
 
 # ---- Generated reports ----
 /benchmark_results.json
@@ -42,7 +70,7 @@ desktop.ini
 *.swp
 
 # ---- Real newsroom roster: staff names and work addresses ----
-/data/journalists.seed.json
+journalists.seed.json
 
 # ---- Internal working notes and agent instructions ----
 #
