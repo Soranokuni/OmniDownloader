@@ -68,7 +68,15 @@ fn suffixer(index: &str) -> (bool, impl Fn(usize) -> String + '_) {
     (numeric, f)
 }
 
-pub fn plan_article_videos(primary: &str, all: &[String], index: &str) -> ArticlePlan {
+/// `page` is the link the sniffer opened. Only an article has "other videos":
+/// on a platform's own post page the other posts the sniffer sees are replies,
+/// the thread above it and "more from this account" — none of them what the
+/// journalist sent. Queueing them delivered one X video four times, under four
+/// names, for an article that held three different ones.
+pub fn plan_article_videos(page: &str, primary: &str, all: &[String], index: &str) -> ArticlePlan {
+    if is_video_platform(page) {
+        return ArticlePlan { primary_index: index.to_string(), siblings: Vec::new(), offered: Vec::new() };
+    }
     let mut seen = vec![primary.to_string()];
     let mut others = Vec::new();
     for u in all {
@@ -126,7 +134,7 @@ pub fn queue_article_siblings(
     primary: &str,
     all_streams: &[String],
 ) {
-    let plan = plan_article_videos(primary, all_streams, &job.index_str);
+    let plan = plan_article_videos(&job.url, primary, all_streams, &job.index_str);
     if plan.siblings.is_empty() && plan.offered.is_empty() {
         return;
     }
@@ -200,11 +208,12 @@ mod tests {
     const X1: &str = "https://x.com/i/status/1";
     const X2: &str = "https://x.com/i/status/2";
     const X3: &str = "https://x.com/i/status/3";
+    const ARTICLE: &str = "https://www.portal.gr/article/1";
 
     #[test]
     fn three_platform_videos_become_1a_1b_1c() {
         // The newsbomb.gr case: three X posts in one article.
-        let p = plan_article_videos(X1, &s(&[X1, X2, X3]), "1");
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1, X2, X3]), "1");
         assert_eq!(p.primary_index, "1A");
         assert_eq!(p.siblings, vec![(X2.to_string(), "1B".to_string()), (X3.to_string(), "1C".to_string())]);
         assert!(p.offered.is_empty());
@@ -213,7 +222,7 @@ mod tests {
     #[test]
     fn raw_streams_are_offered_not_queued() {
         let raw = "https://cdn.portal.gr/video/master.m3u8";
-        let p = plan_article_videos(X1, &s(&[X1, raw, X2]), "2");
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1, raw, X2]), "2");
         assert_eq!(p.primary_index, "2A");
         assert_eq!(p.siblings, vec![(X2.to_string(), "2B".to_string())]);
         assert_eq!(p.offered, vec![Offered { url: raw.into(), index_str: "2C".into(), queued_job_id: None }]);
@@ -221,11 +230,11 @@ mod tests {
 
     #[test]
     fn a_single_video_changes_nothing() {
-        let p = plan_article_videos(X1, &s(&[X1]), "1");
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1]), "1");
         assert_eq!(p.primary_index, "1");
         assert!(p.siblings.is_empty() && p.offered.is_empty());
         // Only raw extras: offered, and the primary keeps its plain index.
-        let p = plan_article_videos(X1, &s(&[X1, "https://cdn.portal.gr/a.mp4"]), "1");
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1, "https://cdn.portal.gr/a.mp4"]), "1");
         assert_eq!(p.primary_index, "1");
         assert_eq!(p.offered[0].index_str, "1B");
     }
@@ -233,7 +242,7 @@ mod tests {
     #[test]
     fn a_listicle_is_capped_and_the_rest_offered() {
         let many: Vec<String> = (1..=9).map(|i| format!("https://x.com/i/status/{i}")).collect();
-        let p = plan_article_videos(&many[0], &many, "1");
+        let p = plan_article_videos(ARTICLE, &many[0], &many, "1");
         assert_eq!(p.siblings.len(), MAX_AUTO_SIBLINGS);
         assert_eq!(p.offered.len(), 9 - 1 - MAX_AUTO_SIBLINGS);
         assert_eq!(p.siblings.last().unwrap().1, "1F");
@@ -242,15 +251,32 @@ mod tests {
 
     #[test]
     fn an_index_that_already_has_a_letter_gets_numbers() {
-        let p = plan_article_videos(X1, &s(&[X1, X2]), "3B");
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1, X2]), "3B");
         assert_eq!(p.primary_index, "3B");
         assert_eq!(p.siblings[0].1, "3B2");
     }
 
     #[test]
     fn duplicates_and_the_primary_itself_are_not_repeated() {
-        let p = plan_article_videos(X1, &s(&[X1, X2, X2, X1]), "1");
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1, X2, X2, X1]), "1");
         assert_eq!(p.siblings.len(), 1);
+    }
+
+    #[test]
+    fn a_post_page_is_not_an_article() {
+        // Sniffing an X post whose yt-dlp fetch failed: the page also shows
+        // the post itself under its author's handle and two replies. None of
+        // them is another video of the submission (trial run 2026-09-25).
+        let page = "https://x.com/i/status/1900000000000000010";
+        let seen = s(&[
+            "https://x.com/NewsDeskOne/status/1900000000000000010",
+            "https://x.com/SomeReader/status/1900000000000000011",
+            "https://x.com/OtherReader/status/1900000000000000012",
+        ]);
+        let p = plan_article_videos(page, "https://video.twimg.com/amplify_video/1/pl/master.m3u8", &seen, "1B");
+        assert_eq!(p.primary_index, "1B");
+        assert!(p.siblings.is_empty(), "{:?}", p.siblings);
+        assert!(p.offered.is_empty(), "{:?}", p.offered);
     }
 
     #[test]
