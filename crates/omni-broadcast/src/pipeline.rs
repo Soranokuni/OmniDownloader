@@ -176,7 +176,7 @@ impl BroadcastEngine {
         let (intermediate_mxf, duration) = match transcode_res {
             Ok(res) => res,
             Err(e) => {
-                let err_msg = format!("FFmpeg Transcode failed: {}", e);
+                let err_msg = format!("FFmpeg Transcode failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "TRANSCODE", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
@@ -195,7 +195,7 @@ impl BroadcastEngine {
             .await {
             Ok(path) => path,
             Err(e) => {
-                let err_msg = format!("bmxtranswrap RDD9 failed: {}", e);
+                let err_msg = format!("bmxtranswrap RDD9 failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "REWRAP", &format!("Job #{} ({}): {}", job_id, slug, err_msg));
@@ -258,7 +258,7 @@ impl BroadcastEngine {
         let delivered = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
             Ok(dest) => dest,
             Err(e) => {
-                let err_msg = format!("Watchfolder delivery failed: {}", e);
+                let err_msg = format!("Watchfolder delivery failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
                 let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{} ({}): {}", job_id, slug, err_msg));

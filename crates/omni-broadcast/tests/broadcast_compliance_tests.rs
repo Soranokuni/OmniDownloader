@@ -570,6 +570,51 @@ fn the_peak_decision_errs_on_the_safe_side_of_the_ceiling() {
     assert!(landed < -23.0, "{landed}");
 }
 
+/// A clip whose loudness range is wider than the 7 LU target: loudnorm
+/// refuses linear mode when measured_LRA > LRA and silently goes dynamic,
+/// which cut a real 163 s X clip (LRA 7.10) short by 2.8 s.
+#[test]
+fn a_wide_loudness_range_keeps_the_linear_pass_linear() {
+    use omni_broadcast::transcoder::linear_lra_ceiling;
+    let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
+    let wide = LoudnessMeasurement {
+        input_i: -24.97,
+        input_lra: 7.10,
+        input_tp: -4.09,
+        input_thresh: -36.06,
+        target_offset: 0.20,
+    };
+    assert_eq!(linear_lra_ceiling(&wide, &LoudnessTarget::default()), 7.2);
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&wide), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(chain.contains("LRA=7.2:") && chain.contains("measured_LRA=7.10"), "{chain}");
+    assert!(chain.contains("linear=true") && chain.contains("I=-23"), "{chain}");
+    assert!(plan.note.contains("not compressed"), "{}", plan.note);
+
+    // A normal range keeps the house target untouched.
+    let normal = LoudnessMeasurement { input_lra: 4.0, ..wide };
+    assert_eq!(linear_lra_ceiling(&normal, &LoudnessTarget::default()), 7.0);
+
+    // Beyond loudnorm's LRA limit: a plain gain, never loudnorm.
+    let extreme = LoudnessMeasurement { input_lra: 60.0, ..wide };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&extreme), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(!chain.contains("loudnorm") && chain.contains("volume=1.97dB"), "{chain}");
+}
+
+#[test]
+fn a_cut_short_transcode_is_named_as_such() {
+    use omni_broadcast::transcoder::truncation;
+    assert!(truncation(163.54, 160.68).unwrap().contains("cut short"));
+    assert!(truncation(163.54, 163.48).is_none(), "frame rounding is not truncation");
+    assert!(truncation(10.0, 9.2).is_none(), "within 1 s");
+    assert!(truncation(10.0, 8.5).is_some());
+    // Long programmes scale: 0.5 % of an hour is 18 s.
+    assert!(truncation(3600.0, 3590.0).is_none());
+    assert!(truncation(3600.0, 3570.0).is_some());
+    assert!(truncation(0.3, 0.0).is_none(), "too short to judge");
+}
+
 #[test]
 fn a_measurement_at_the_silence_floor_is_unusable() {
     // Near-silence gates nothing: loudnorm reports input_thresh -70 and would
