@@ -149,6 +149,18 @@ impl ErrorCode {
     pub fn should_try_sniffer(&self) -> bool {
         matches!(self, Self::UnsupportedUrl | Self::Http403 | Self::NoStreamFound)
     }
+
+    /// Whether to open `url` in the browser after yt-dlp failed on it with
+    /// this code (plan P3.1, rule 5).
+    ///
+    /// A news article: yes — yt-dlp failing there is the normal route to the
+    /// embedded player. A platform post: only where the sniffer can help.
+    /// yt-dlp's extractor knows which video belongs to the post; the page does
+    /// not. An X reply without a video of its own plays the thread parent's,
+    /// and sniffing it delivered someone else's video under the reply's name.
+    pub fn should_sniff(&self, url: &str) -> bool {
+        !crate::downloader::is_video_platform(url) || self.should_try_sniffer()
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -208,6 +220,14 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     }
     if s.contains("unsupported url") || s.contains("no suitable extractor") {
         return ErrorCode::UnsupportedUrl;
+    }
+    // The platform's API answered with an empty or non-JSON body: X does this
+    // for a minute or two under load (trial run 2026-09-25, five posts in a
+    // row, all fine a few minutes later). Waiting helps; if the extractor is
+    // really broken, the retries run out and the nightly yt-dlp update is the
+    // fix.
+    if s.contains("failed to parse json") {
+        return ErrorCode::Network;
     }
     // Network last: its phrases are generic and appear inside other messages.
     if s.contains("timed out")
@@ -274,6 +294,17 @@ mod tests {
             (
                 "ERROR: unable to download: ConnectionResetError(104, 'Connection reset by peer')",
                 ErrorCode::Network,
+            ),
+            (
+                // Verbatim from the 2026-09-25 trial; the same posts fetched
+                // fine minutes later.
+                "ERROR: [twitter] 1900000000000000001: Failed to parse JSON (caused by JSONDecodeError(\"Expecting value in '': line 1 column 1 (char 0)\")); please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U",
+                ErrorCode::Network,
+            ),
+            (
+                // A reply that has no video: final, not a sniffer case.
+                "ERROR: [twitter] 1900000000000000011: No video could be found in this tweet",
+                ErrorCode::PipelineFailed,
             ),
             (
                 "ERROR: [generic] Requested format is not available",
@@ -352,6 +383,21 @@ mod tests {
         assert!(!ErrorCode::PrivateOrRemoved.should_try_sniffer());
         assert!(!ErrorCode::GeoBlocked.should_try_sniffer());
         assert!(!ErrorCode::LiveStream.should_try_sniffer());
+    }
+
+    #[test]
+    fn a_platform_post_is_sniffed_only_where_the_sniffer_can_help() {
+        let reply = "https://x.com/SomeReader/status/1900000000000000011";
+        let article = "https://www.portal.gr/article/1";
+        // yt-dlp said the reply has no video. Its page plays the thread
+        // parent's video, and that must not be delivered under this job.
+        assert!(!ErrorCode::PipelineFailed.should_sniff(reply));
+        // Transient: retried, not sniffed.
+        assert!(!ErrorCode::Network.should_sniff(reply));
+        assert!(ErrorCode::Http403.should_sniff(reply));
+        // An article is sniffed whatever yt-dlp said.
+        assert!(ErrorCode::PipelineFailed.should_sniff(article));
+        assert!(ErrorCode::UnsupportedUrl.should_sniff(article));
     }
 
     #[test]
