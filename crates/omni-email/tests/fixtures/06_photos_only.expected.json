@@ -1,0 +1,21 @@
+{
+  "ignored_urls": [
+    "https://www.example.org/uploads/2026/09/ekdilosi-01.jpg",
+    "https://www.example.org/uploads/2026/09/ekdilosi-02.JPEG"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "DIMITRIOU"
+  },
+  "outcome": "PHOTOS_ONLY",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "FOTOGRAFIESEKDILOSI",
+      "title": "Φωτογραφίες από την εκδήλωση"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

@@ -126,7 +126,11 @@ fn video_matches_sony_xdcam_hd422_pal_1080i50() {
     // Interlaced, top field first. -top 1 without +ildct+ilme yields a
     // progressive file that merely claims to be TFF.
     assert_flag(&args, "-flags", "+ildct+ilme");
-    assert_flag(&args, "-top", "1");
+    assert_flag(&args, "-field_order", "tt");
+    // FFmpeg 9 rejects the whole command if the removed `-top` is present.
+    assert!(!args.iter().any(|a| a == "-top"), "-top is gone in FFmpeg 9: {args:?}");
+    assert_flag(&args, "-intra_dc_precision", "2");
+    assert!(!args.iter().any(|a| a == "-dc"), "-dc is deprecated; use -intra_dc_precision: {args:?}");
     assert_flag(&args, "-r", "25");
     assert_flag(&args, "-aspect", "16:9");
     // Rec.709, legal range.
@@ -467,8 +471,15 @@ fn two_pass_loudness_uses_the_measured_values() {
     );
 }
 
+/// No usable measurement → no normalisation, said plainly in the note.
+///
+/// The old fallback was single-pass dynamic loudnorm. Its 3 s lookahead holds
+/// audio back past the end of the video, and `-shortest` (required by the pad
+/// channels) then cut the programme short — or, for a clip under 3 s, left no
+/// audio at all and ffmpeg failed writing the MXF. Dynamic mode must never
+/// appear in the graph.
 #[test]
-fn a_failed_measurement_falls_back_to_single_pass_rather_than_no_normalisation() {
+fn an_unusable_measurement_skips_normalisation_instead_of_going_dynamic() {
     let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
     let plan = build_plan(
         &p,
@@ -479,11 +490,138 @@ fn a_failed_measurement_falls_back_to_single_pass_rather_than_no_normalisation()
     );
     let chain = filter_graph(&plan.args);
     assert!(
-        chain.contains("loudnorm=I=-23"),
-        "loudness must still be applied when the measurement pass failed: {chain}"
+        !chain.contains("loudnorm"),
+        "without a measurement there must be no loudnorm (dynamic mode truncates): {chain}"
     );
-    assert!(!chain.contains("measured_I"), "{chain}");
-    assert!(plan.note.contains("single-pass"), "{}", plan.note);
+    assert!(plan.note.contains("R128 skipped"), "{}", plan.note);
+    // The programme audio is still there, still eight mono tracks.
+    assert!(chain.contains("[al]") && chain.contains("[ar]"), "{chain}");
+}
+
+/// A short clip measures LRA 0.00. Passed through as-is, loudnorm reads it as
+/// "not supplied" and silently switches the linear pass to dynamic mode,
+/// which truncated the programme (and produced no file under 3 s).
+#[test]
+fn a_zero_loudness_range_is_never_passed_to_the_linear_pass() {
+    let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
+    let short_clip = LoudnessMeasurement {
+        input_i: -21.05,
+        input_lra: 0.0,
+        input_tp: -16.60,
+        input_thresh: -31.05,
+        target_offset: 0.05,
+    };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&short_clip), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(chain.contains("measured_LRA=0.01"), "{chain}");
+    assert!(!chain.contains("measured_LRA=0.00"), "{chain}");
+    assert!(chain.contains("measured_I=-21.05") && chain.contains("linear=true"), "{chain}");
+}
+
+/// Station policy: when reaching -23 LUFS would lift true peak over -1 dBTP,
+/// the ceiling wins. A plain linear gain, no limiter -- and no loudnorm, which
+/// would switch itself to dynamic mode here and truncate the programme.
+#[test]
+fn clipped_audio_is_gained_to_the_peak_ceiling_and_lands_under_target() {
+    let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
+    // Quiet programme, peaks near full scale: +7 dB to target would put
+    // peaks at +4 dBTP.
+    let clipped = LoudnessMeasurement {
+        input_i: -30.0,
+        input_lra: 4.0,
+        input_tp: -3.0,
+        input_thresh: -40.0,
+        target_offset: 0.0,
+    };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&clipped), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(chain.contains("volume=2.00dB"), "{chain}");
+    assert!(!chain.contains("loudnorm"), "loudnorm would go dynamic and truncate: {chain}");
+    assert!(plan.note.contains("peak-limited"), "{}", plan.note);
+    assert!(plan.note.contains("-28.0 LUFS"), "{}", plan.note);
+
+    // A hot clip needing *less* level is never limited: cutting gain lowers
+    // the peaks too.
+    let hot = LoudnessMeasurement { input_i: -12.0, input_tp: 0.5, ..clipped };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&hot), Path::new("src.mp4"), Path::new("out.mxf"));
+    assert!(filter_graph(&plan.args).contains("linear=true"), "{}", filter_graph(&plan.args));
+}
+
+#[test]
+fn the_peak_decision_errs_on_the_safe_side_of_the_ceiling() {
+    use omni_broadcast::transcoder::peak_limited_gain;
+    let t = LoudnessTarget::default();
+    let m = |i: f64, tp: f64| LoudnessMeasurement {
+        input_i: i,
+        input_lra: 3.0,
+        input_tp: tp,
+        input_thresh: i - 10.0,
+        target_offset: 0.0,
+    };
+    // Comfortably under: two-pass loudnorm as before.
+    assert_eq!(peak_limited_gain(&m(-20.0, -10.0), &t), None);
+    // 0.05 dB under the ceiling: too close to trust loudnorm's own rounding,
+    // but the target still fits, so the gain is the full correction.
+    let (g, landed) = peak_limited_gain(&m(-20.0, 1.95), &t).unwrap();
+    assert!((g - -3.0).abs() < 1e-9 && (landed - -23.0).abs() < 1e-9, "{g} {landed}");
+    // Over: peaks go exactly to the ceiling and loudness lands under target.
+    let (g, landed) = peak_limited_gain(&m(-22.75, 0.18), &t).unwrap();
+    assert!((g - -1.18).abs() < 1e-9, "{g}");
+    assert!(landed < -23.0, "{landed}");
+}
+
+/// A clip whose loudness range is wider than the 7 LU target: loudnorm
+/// refuses linear mode when measured_LRA > LRA and silently goes dynamic,
+/// which cut a real 163 s X clip (LRA 7.10) short by 2.8 s.
+#[test]
+fn a_wide_loudness_range_keeps_the_linear_pass_linear() {
+    use omni_broadcast::transcoder::linear_lra_ceiling;
+    let p = probe_of(video(1920, 1080, 25.0, ScanType::Progressive), Some(audio(2)));
+    let wide = LoudnessMeasurement {
+        input_i: -24.97,
+        input_lra: 7.10,
+        input_tp: -4.09,
+        input_thresh: -36.06,
+        target_offset: 0.20,
+    };
+    assert_eq!(linear_lra_ceiling(&wide, &LoudnessTarget::default()), 7.2);
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&wide), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(chain.contains("LRA=7.2:") && chain.contains("measured_LRA=7.10"), "{chain}");
+    assert!(chain.contains("linear=true") && chain.contains("I=-23"), "{chain}");
+    assert!(plan.note.contains("not compressed"), "{}", plan.note);
+
+    // A normal range keeps the house target untouched.
+    let normal = LoudnessMeasurement { input_lra: 4.0, ..wide };
+    assert_eq!(linear_lra_ceiling(&normal, &LoudnessTarget::default()), 7.0);
+
+    // Beyond loudnorm's LRA limit: a plain gain, never loudnorm.
+    let extreme = LoudnessMeasurement { input_lra: 60.0, ..wide };
+    let plan = build_plan(&p, &LoudnessTarget::default(), Some(&extreme), Path::new("src.mp4"), Path::new("out.mxf"));
+    let chain = filter_graph(&plan.args);
+    assert!(!chain.contains("loudnorm") && chain.contains("volume=1.97dB"), "{chain}");
+}
+
+#[test]
+fn a_cut_short_transcode_is_named_as_such() {
+    use omni_broadcast::transcoder::truncation;
+    assert!(truncation(163.54, 160.68).unwrap().contains("cut short"));
+    assert!(truncation(163.54, 163.48).is_none(), "frame rounding is not truncation");
+    assert!(truncation(10.0, 9.2).is_none(), "within 1 s");
+    assert!(truncation(10.0, 8.5).is_some());
+    // Long programmes scale: 0.5 % of an hour is 18 s.
+    assert!(truncation(3600.0, 3590.0).is_none());
+    assert!(truncation(3600.0, 3570.0).is_some());
+    assert!(truncation(0.3, 0.0).is_none(), "too short to judge");
+}
+
+#[test]
+fn a_measurement_at_the_silence_floor_is_unusable() {
+    // Near-silence gates nothing: loudnorm reports input_thresh -70 and would
+    // silently switch a linear pass to dynamic mode.
+    let stderr = r#"{ "input_i" : "-68.20", "input_tp" : "-60.00", "input_lra" : "0.00",
+                      "input_thresh" : "-70.00", "target_offset" : "0.00" }"#;
+    assert!(parse_loudness_measurement(stderr).is_none());
 }
 
 #[test]
@@ -523,7 +661,7 @@ frame= 1234 fps=250 q=-1.0 size=N/A time=00:00:49.36 bitrate=N/A speed=9.99x
 #[test]
 fn digital_silence_does_not_produce_an_infinite_measurement() {
     // loudnorm reports "-inf" for a silent track. Feeding that into pass two
-    // yields an ffmpeg error mid-transcode; falling back to single-pass does not.
+    // yields an ffmpeg error mid-transcode; skipping normalisation does not.
     let stderr = r#"{ "input_i" : "-inf", "input_tp" : "-inf", "input_lra" : "0.00",
                       "input_thresh" : "-inf", "target_offset" : "0.00" }"#;
     assert!(

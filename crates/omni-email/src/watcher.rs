@@ -1,26 +1,58 @@
-use anyhow::{anyhow, Context, Result};
-use mailparse::{parse_mail, ParsedMail};
-use std::sync::Arc;
-use std::time::Duration;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use omni_core::config::AppConfig;
 use omni_core::health::{Check, HealthState};
-use omni_core::models::JobStatus;
-use omni_core::repository::Repository;
+use omni_core::models::{Enqueued, JobStatus, NewJob, ProcessedMail};
+use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
-use crate::decontaminate::decontaminate_email_body;
-use crate::interceptor::{intercept_volatile_urls, make_manual_slug};
-use crate::llm::LlmClient;
+use crate::assist::Assist;
+use crate::graph::{GraphMailSource, RetryAfter};
+use crate::imap_source::ImapMailSource;
+use crate::mail::InboundMail;
+use crate::parser::{self, ParsedEmail, Tier};
+use crate::source::{MailOutcome, MailSource};
+
+/// Messages fetched per poll. The rest wait for the next poll, oldest first.
+const FETCH_LIMIT: usize = 20;
+
+/// Consecutive processing failures before a message is given up on and left
+/// unread for a human (plan P4.2: "Omni/Failed"). A transient failure (the
+/// database briefly locked, the disk full) gets this many polls to clear.
+pub const MAX_PROCESS_ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
 pub struct EmailWatcher {
     config: AppConfig,
     repo: Repository,
-    llm: Arc<LlmClient>,
+    source: Arc<dyn MailSource>,
     /// Where the poll result is reported (plan P6.2). `None` in tests and in
     /// any caller that does not care.
     health: Option<HealthState>,
+    /// Failed processing attempts per message id, since start-up.
+    attempts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Second opinion on journalist and keywords (plan P4.4).
+    assist: Arc<Assist>,
+    /// Where video attachments are saved: `{dir}/{job_id}/source.{ext}`.
+    /// Not under `temp/jobs`, which start-up sweeps for every job that is
+    /// not running — a queued attachment job would lose its only source.
+    attachments_dir: PathBuf,
+}
+
+/// What one poll did, for health and tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PollReport {
+    pub fetched: usize,
+    pub processed: usize,
+    /// Failed this time, will be retried next poll.
+    pub retrying: usize,
+    /// Gave up: marked failed on the server.
+    pub failed: usize,
 }
 
 /// Reduce an error chain to one line an operator can act on.
@@ -49,14 +81,41 @@ fn short_reason(e: &anyhow::Error) -> String {
 }
 
 impl EmailWatcher {
+    /// Graph when it is configured (the only option on Office 365, defect
+    /// E-01); IMAP otherwise, for on-prem servers.
     pub fn new(config: AppConfig, repo: Repository) -> Self {
-        let llm = Arc::new(LlmClient::new(&config.ollama_endpoint, &config.ollama_model));
+        let source: Arc<dyn MailSource> = if config.graph.is_configured() {
+            Arc::new(GraphMailSource::new(config.graph.clone()))
+        } else {
+            Arc::new(ImapMailSource::new(
+                &config.imap_server,
+                config.imap_port,
+                &config.email_address,
+                &config.email_password,
+            ))
+        };
+        Self::with_source(config, repo, source)
+    }
+
+    /// A watcher over any mail source (Graph, IMAP, or a test double).
+    pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
+        let attachments_dir = config.resolve_path(&config.temp_path).join("attachments");
+        let assist = Arc::new(Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone()));
         Self {
+            attachments_dir,
+            assist,
             config,
             repo,
-            llm,
+            source,
             health: None,
+            attempts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Save attachments here instead of `{temp}/attachments`.
+    pub fn with_attachments_dir(mut self, dir: PathBuf) -> Self {
+        self.attachments_dir = dir;
+        self
     }
 
     /// Report poll outcomes into the shared health state.
@@ -75,61 +134,46 @@ impl EmailWatcher {
     }
 
     pub fn test_connection(server: &str, port: u16, email: &str, pass: &str) -> Result<()> {
-        let client = imap::ClientBuilder::new(server, port)
-            .connect()
-            .with_context(|| format!("Failed to connect to IMAP {}:{}", server, port))?;
-
-        let mut session = client
-            .login(email, pass)
-            .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
-
-        let _ = session.logout();
-        Ok(())
+        ImapMailSource::new(server, port, email, pass).test_connection_blocking()
     }
 
     pub async fn start_polling_loop(self: Arc<Self>, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
-        info!(
-            "EmailWatcher: Starting IMAP watchdog on {} ({}:{})",
-            self.config.email_provider, self.config.imap_server, self.config.imap_port
-        );
+        info!("EmailWatcher: watching {}", self.source.describe());
 
         let poll_interval = Duration::from_secs(self.config.email_poll_interval_secs.max(10));
+        let mut backoff = Backoff::default();
 
         loop {
+            let wait = backoff.next_wait(poll_interval);
             tokio::select! {
                 _ = shutdown_rx.recv() => {
                     info!("EmailWatcher: Received shutdown signal. Exiting watchdog loop.");
                     break;
                 }
-                _ = tokio::time::sleep(poll_interval) => {
-                    if self.config.email_address.is_empty() || self.config.email_password.is_empty() {
+                _ = tokio::time::sleep(wait) => {
+                    if !self.source.is_configured() {
                         warn!("EmailWatcher: Credentials not configured. Sleeping...");
                         self.report_health(Check::disabled("Mailbox"));
                         continue;
                     }
 
-                    let watcher = self.clone();
-                    let res = tokio::task::spawn_blocking(move || watcher.poll_inbox_sync()).await;
-                    match res {
-                        Ok(Err(e)) => {
+                    match self.poll_once().await {
+                        Err(e) => {
                             error!("EmailWatcher error: {:#}", e);
-                            let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("IMAP poll error: {}", e));
+                            let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("Mail poll error: {}", short_reason(&e)));
                             // The panel used to say "Mail: Active" through
                             // exactly this (defect W-09). A short reason, not
                             // the whole chain: this string is shown to an
                             // operator, and it must not carry a credential.
-                            self.report_health(
-                                Check::degraded(short_reason(&e)).with_error(format!("{e:#}")),
-                            );
+                            if let Some(check) = backoff.failed(&e, Instant::now()) {
+                                self.report_health(check.with_error(format!("{e:#}")));
+                            }
                         }
-                        Err(join_err) => {
-                            error!("EmailWatcher task error: {}", join_err);
-                            self.report_health(Check::degraded("mail poll task failed"));
-                        }
-                        Ok(Ok(())) => {
+                        Ok(_) => {
+                            backoff.succeeded();
                             self.report_health(Check::ok(format!(
                                 "polling {} every {}s",
-                                self.config.imap_server,
+                                self.source.describe(),
                                 poll_interval.as_secs()
                             )));
                         }
@@ -139,201 +183,353 @@ impl EmailWatcher {
         }
     }
 
-    fn poll_inbox_sync(&self) -> Result<()> {
-        let server = &self.config.imap_server;
-        let port = self.config.imap_port;
-
-        let client = imap::ClientBuilder::new(server.as_str(), port)
-            .connect()
-            .with_context(|| format!("Failed IMAP connect with {}:{}", server, port))?;
-
-        let mut session = client
-            .login(&self.config.email_address, &self.config.email_password)
-            .map_err(|(e, _)| anyhow!("IMAP login failed for {}: {}", self.config.email_address, e))?;
-
-        session
-            .select("INBOX")
-            .map_err(|e| anyhow!("Select INBOX failed: {}", e))?;
-
-        let unseen_ids = session
-            .search("UNSEEN")
-            .map_err(|e| anyhow!("IMAP Search UNSEEN failed: {}", e))?;
-
-        if !unseen_ids.is_empty() {
-            info!("EmailWatcher: Found {} unread email(s). Processing...", unseen_ids.len());
-
-            for id in unseen_ids {
-                let id_str = id.to_string();
-                let messages = match session.fetch(&id_str, "RFC822") {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("Fetch error for ID {}: {}", id, e);
-                        continue;
-                    }
-                };
-
-                for msg in messages.iter() {
-                    if let Some(body_bytes) = msg.body() {
-                        let rt = tokio::runtime::Handle::current();
-                        if let Err(e) = rt.block_on(self.process_raw_email(body_bytes)) {
-                            error!("Failed processing email #{}: {:#}", id, e);
-                        }
-                    }
-                }
-
-                // Mark as seen on mail server
-                let _ = session.store(&id_str, "+FLAGS (\\Seen)");
-            }
-        }
-
-        let _ = session.logout();
-        Ok(())
-    }
-
-    async fn process_raw_email(&self, raw_bytes: &[u8]) -> Result<()> {
-        let parsed = parse_mail(raw_bytes).context("Failed parsing RFC822 MIME message")?;
-
-        let subject = parsed
-            .headers
-            .iter()
-            .find(|h| h.get_key().eq_ignore_ascii_case("subject"))
-            .map(|h| h.get_value())
-            .unwrap_or_default();
-
-        let from = parsed
-            .headers
-            .iter()
-            .find(|h| h.get_key().eq_ignore_ascii_case("from"))
-            .map(|h| h.get_value())
-            .unwrap_or_default();
-
-        info!("EmailWatcher: Processing email From: '{}', Subject: '{}'", from, subject);
-
-        let body_text = extract_body_text(&parsed);
-        let decontaminated = decontaminate_email_body(&body_text);
-
-        // 1. Intercept volatile file-locker URLs (WeTransfer, TransferNow, AMNA)
-        let volatile_urls = intercept_volatile_urls(&decontaminated);
-        if !volatile_urls.is_empty() {
-            info!("EmailWatcher: Intercepted {} volatile file-locker URL(s).", volatile_urls.len());
-            for v_url in volatile_urls {
-                let slug = make_manual_slug(&v_url);
-                let _ = self.repo.add_job(
-                    &v_url,
-                    &slug,
-                    "MCR",
-                    "MANUAL_DOWNLOAD",
-                    "1",
-                    1, // High priority
-                    JobStatus::ManualDownload,
-                    None,
-                    Some("Volatile file-locker intercepted from email"),
-                    Some(&from),
-                );
-            }
-        }
-
-        // 2. Format prompt for LLM
-        let user_prompt = format!("Sender: {}\nSubject: {}\n\nBody:\n{}", from, subject, decontaminated);
-
-        let llm_res = match self.llm.parse_email(&self.config.system_prompt, &user_prompt).await {
-            Ok(res) => res,
-            Err(e) => {
-                warn!("LLM extraction failed: {}", e);
-                let _ = self.repo.log_audit("WARN", "LLM", &format!("LLM parsing error for email '{}': {}", subject, e));
-                return Err(e);
-            }
+    /// One poll: fetch, process, and mark each message **only after** what it
+    /// produced is persisted (defect E-02 marked everything `\Seen`, success
+    /// or not, so a failed parse silently lost the links).
+    pub async fn poll_once(&self) -> Result<PollReport> {
+        let mails = self.source.fetch_unprocessed(FETCH_LIMIT).await?;
+        let mut report = PollReport {
+            fetched: mails.len(),
+            ..Default::default()
         };
-
-        // 3. Resolve journalist surname against database mappings
-        let mut journalist = llm_res.journalist_surname.trim().to_uppercase();
-        if let Ok(Some(mapped_surname)) = self.repo.find_journalist_by_email(&from) {
-            info!("Authoritative journalist mapping found: '{}' -> {}", from, mapped_surname);
-            journalist = mapped_surname;
+        if !mails.is_empty() {
+            info!("EmailWatcher: {} unread message(s)", mails.len());
         }
 
-        info!("LLM extracted {} jobs for journalist '{}'", llm_res.jobs.len(), journalist);
-
-        // 4. Ingest parsed jobs into SQLite queue
-        for job in llm_res.jobs {
-            let index_str = job.index_str.trim().to_uppercase();
-            let keyword = job.keyword.trim().to_uppercase();
-            let confidence = job.confidence;
-
-            // Formulate broadcast standardized slug: {index_str}_{journalist}_{keyword}
-            let slug = format!("{}_{}_{}", index_str, journalist, keyword);
-
-            let status = if keyword == "MANUAL_DOWNLOAD" {
-                JobStatus::ManualDownload
-            } else if confidence >= 0.7 {
-                JobStatus::Pending
-            } else {
-                JobStatus::RequiresReview
-            };
-
-            let priority = if status == JobStatus::ManualDownload { 1 } else { 0 };
-
-            match self.repo.add_job(
-                &job.url,
-                &slug,
-                &journalist,
-                &keyword,
-                &index_str,
-                priority,
-                status,
-                None,
-                Some(&format!("Email subject: {}", subject)),
-                Some(&from),
-            ) {
-                Ok(id) => {
-                    info!("Successfully enqueued Job #{} ({}) Status: {:?}", id, slug, status);
+        for mail in &mails {
+            match self.process_mail(mail).await {
+                Ok(Handled::GaveUpEarlier) => {
+                    // Recorded as failed on an earlier run and still showing
+                    // as unprocessed: leave it for the human it was left for.
+                }
+                Ok(Handled::Done) => {
+                    self.attempts.lock().unwrap().remove(&mail.id);
+                    if let Err(e) = self.source.mark_processed(&mail.id, MailOutcome::Processed).await {
+                        // The jobs exist; the next poll sees the message again
+                        // and dedup keeps it from queueing twice.
+                        warn!("EmailWatcher: could not mark message {} processed: {e:#}", mail.id);
+                    }
+                    report.processed += 1;
                 }
                 Err(e) => {
-                    info!("Notice: Job for URL '{}' skipped (already queued): {}", job.url, e);
+                    let n = {
+                        let mut attempts = self.attempts.lock().unwrap();
+                        let n = attempts.entry(mail.id.clone()).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    error!(
+                        "EmailWatcher: processing '{}' failed (attempt {n}/{MAX_PROCESS_ATTEMPTS}): {e:#}",
+                        mail.subject
+                    );
+                    if n >= MAX_PROCESS_ATTEMPTS {
+                        let _ = self.repo.log_audit(
+                            "ERROR",
+                            "EMAIL",
+                            &format!("Gave up on email '{}' from {}: {}", mail.subject, mail.from_address, short_reason(&e)),
+                        );
+                        let _ = self.repo.record_processed_mail(&ProcessedMail {
+                            internet_message_id: mail_key(mail),
+                            source_id: Some(mail.id.clone()),
+                            processed_at: None,
+                            outcome: MailOutcome::Failed.as_str().into(),
+                            from_address: Some(mail.from_address.clone()),
+                            subject: Some(mail.subject.clone()),
+                            jobs_json: "[]".into(),
+                        });
+                        match self.source.mark_processed(&mail.id, MailOutcome::Failed).await {
+                            Ok(()) => {
+                                self.attempts.lock().unwrap().remove(&mail.id);
+                                report.failed += 1;
+                            }
+                            Err(e) => warn!("EmailWatcher: could not mark message {} failed: {e:#}", mail.id),
+                        }
+                    } else {
+                        report.retrying += 1;
+                    }
                 }
             }
         }
+        Ok(report)
+    }
 
-        Ok(())
+    /// Parse one message and queue its jobs (plan P4.5).
+    ///
+    /// Returns only after every job is persisted; any error leaves the
+    /// message for the next poll. A retry after a partial failure is safe: the
+    /// jobs already created come back from `enqueue` as `DuplicateActive`.
+    async fn process_mail(&self, mail: &InboundMail) -> Result<Handled> {
+        let key = mail_key(mail);
+
+        // E-07: the server can show a message as unread again (a lost flag,
+        // a failed move, a journalist dragging it back). Seen before → done.
+        if let Some(prev) = self.repo.get_processed_mail(&key)? {
+            if prev.outcome == MailOutcome::Failed.as_str() {
+                return Ok(Handled::GaveUpEarlier);
+            }
+            info!("EmailWatcher: {key} was already processed ({}); not queueing again", prev.outcome);
+            return Ok(Handled::Done);
+        }
+
+        info!("EmailWatcher: processing email from '{}', subject '{}'", mail.from_address, mail.subject);
+
+        let roster = self.repo.list_journalists()?;
+        let mut parsed = parser::parse(mail, &roster, &self.config.parser);
+        let body = mail.readable_body();
+        if self.assist.wanted(&parsed, &body) {
+            self.assist.refine(mail, &body, &mut parsed, &roster, &self.config.parser).await;
+        }
+        let default_priority = roster
+            .iter()
+            .find(|j| j.surname == parsed.journalist.surname)
+            .map(|j| j.default_priority)
+            .unwrap_or(0);
+        let mut records = self.enqueue_parsed(mail, &parsed, default_priority)?;
+        self.fetch_attachments(mail, &mut records).await;
+
+        info!(
+            "EmailWatcher: {} → {} ({:?}), {} job(s), {} new",
+            key,
+            parsed.journalist.surname,
+            parsed.journalist.how,
+            records.len(),
+            records.iter().filter(|r| r.result.is_new()).count()
+        );
+        if !parsed.warnings.is_empty() {
+            let codes: Vec<&str> = parsed.warnings.iter().map(|w| w.code.as_str()).collect();
+            let _ = self.repo.log_audit(
+                "WARN",
+                "EMAIL",
+                &format!("Email '{}' from {}: {}", mail.subject, mail.from_address, codes.join(", ")),
+            );
+        }
+
+        self.repo.record_processed_mail(&ProcessedMail {
+            internet_message_id: key,
+            source_id: Some(mail.id.clone()),
+            processed_at: None,
+            outcome: serde_json::to_value(parsed.outcome)?.as_str().unwrap_or("JOBS").to_string(),
+            from_address: Some(mail.from_address.clone()),
+            subject: Some(mail.subject.clone()),
+            jobs_json: serde_json::to_string(&records)?,
+        })?;
+        Ok(Handled::Done)
+    }
+
+    /// Download each newly queued attachment and release its job (plan P4.6).
+    ///
+    /// Never fails the message: the jobs already exist, and retrying the mail
+    /// would only find them again. A failed download leaves its job as
+    /// MANUAL_DOWNLOAD with an event saying why, which is where a human looks.
+    async fn fetch_attachments(&self, mail: &InboundMail, records: &mut [QueuedFromMail]) {
+        for rec in records.iter_mut() {
+            let (Some(att_id), Enqueued::Created { id }) = (rec.attachment_id.clone(), rec.result.clone()) else {
+                continue;
+            };
+            let name = mail
+                .attachments
+                .iter()
+                .find(|a| a.id == att_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            let dest = self
+                .attachments_dir
+                .join(id.to_string())
+                .join(format!("source.{}", attachment_extension(&name)));
+            let outcome = match self.source.download_attachment(&mail.id, &att_id, &dest).await {
+                Ok(path) => self.repo.attach_source(id, &path.to_string_lossy()),
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(true) => {
+                    info!("EmailWatcher: attachment '{name}' saved for job #{id}");
+                    rec.status = JobStatus::Pending.as_str().into();
+                }
+                Ok(false) => info!("EmailWatcher: job #{id} was changed by MCR before its attachment arrived"),
+                Err(e) => {
+                    warn!("EmailWatcher: attachment '{name}' for job #{id} not saved: {e:#}");
+                    let _ = self.repo.record_event(
+                        id,
+                        "WARN",
+                        None,
+                        &format!("Could not save the attachment '{name}' from the email ({}); download it from the mail by hand", short_reason(&e)),
+                    );
+                }
+            }
+        }
+    }
+
+    fn enqueue_parsed(&self, mail: &InboundMail, parsed: &ParsedEmail, default_priority: i32) -> Result<Vec<QueuedFromMail>> {
+        let journalist = &parsed.journalist.surname;
+        let mut notes = format!("Email: {}", mail.subject);
+        if !parsed.warnings.is_empty() {
+            let codes: Vec<&str> = parsed.warnings.iter().map(|w| w.code.as_str()).collect();
+            notes.push_str(&format!(" [{}]", codes.join(", ")));
+        }
+        // Urgent mail goes ahead of the journalist's usual place in the queue.
+        let priority = default_priority + if parsed.urgent { URGENT_PRIORITY_BOOST } else { 0 };
+
+        let mut out = Vec::new();
+        for job in parsed.jobs() {
+            let slug = format!("{}_{}_{}", job.index_str, journalist, job.keyword);
+            // Attachment jobs are parked as MANUAL_DOWNLOAD until their file
+            // is on disk (`fetch_attachments`), so no worker can lease one
+            // first. If the download fails they stay there, for MCR.
+            let (status, method) = match job.tier {
+                Tier::Attachment => (JobStatus::ManualDownload, Some("attachment")),
+                Tier::Locker => (job.status, Some("locker")),
+                _ => (job.status, None),
+            };
+            let new = NewJob {
+                url: job.url.clone(),
+                slug: slug.clone(),
+                journalist: journalist.clone(),
+                keyword: job.keyword.clone(),
+                index_str: job.index_str.clone(),
+                priority,
+                status,
+                submitted_by_user_id: None,
+                notes: Some(notes.clone()),
+                email_source: Some(mail.from_address.clone()),
+                email_message_id: Some(mail_key(mail)),
+                extraction_method: method.map(String::from),
+            };
+            let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
+            match &result {
+                Enqueued::Created { id } => info!("EmailWatcher: queued job #{id} {slug} ({})", status.as_str()),
+                Enqueued::DuplicateActive { existing_id } => {
+                    info!("EmailWatcher: {} already queued as job #{existing_id}", job.url)
+                }
+                Enqueued::DuplicateRecent { existing_id } => {
+                    info!("EmailWatcher: {} delivered recently as job #{existing_id}", job.url)
+                }
+            }
+            out.push(QueuedFromMail {
+                index_str: job.index_str.clone(),
+                slug,
+                url: job.url.clone(),
+                status: status.as_str().to_string(),
+                result,
+                attachment_id: job.attachment_id.clone(),
+            });
+        }
+        Ok(out)
     }
 }
 
-fn extract_body_text(mail: &ParsedMail) -> String {
-    if mail.subparts.is_empty() {
-        let content_type = mail.ctype.mimetype.to_lowercase();
-        if content_type.contains("text/plain") || content_type.contains("text/html") {
-            let body_bytes = mail.get_body_raw().unwrap_or_default();
-            decode_text_with_charset(&body_bytes, &mail.ctype.charset)
+/// Priority added to jobs from a mail whose subject is urgent (plan P4.5).
+pub const URGENT_PRIORITY_BOOST: i32 = 10;
+
+enum Handled {
+    Done,
+    GaveUpEarlier,
+}
+
+/// One entry of `processed_mail.jobs_json`: what the summary reply (plan
+/// P5.2) tells the journalist about each link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedFromMail {
+    pub index_str: String,
+    pub slug: String,
+    pub url: String,
+    pub status: String,
+    pub result: Enqueued,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+}
+
+/// File extension for a saved attachment: the original one when it is a
+/// plain short extension, else `bin` (ffprobe identifies content, not names).
+fn attachment_extension(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| "bin".into())
+}
+
+/// Idempotency key: the Message-ID, or the provider id for the rare message
+/// that has none (a hand-crafted or broken sender).
+pub fn mail_key(mail: &InboundMail) -> String {
+    let mid = mail.internet_message_id.trim();
+    if mid.is_empty() {
+        format!("source:{}", mail.id)
+    } else {
+        mid.to_string()
+    }
+}
+/// Consecutive failures before the mail check turns Degraded (plan P4.2).
+/// One failed poll is a blip — a Graph 503, a DNS hiccup — and a panel that
+/// flaps on every blip teaches operators to ignore it.
+pub const DEGRADED_AFTER_FAILURES: u32 = 3;
+/// An outage this long is Down, not Degraded.
+pub const DOWN_AFTER: Duration = Duration::from_secs(600);
+/// Ceiling for the exponential backoff between failing polls.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(600);
+
+/// Poll pacing and health escalation across consecutive failures.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    failures: u32,
+    since: Option<Instant>,
+    retry_after: Option<Duration>,
+}
+
+impl Backoff {
+    /// How long to wait before the next poll.
+    pub fn next_wait(&self, poll: Duration) -> Duration {
+        if self.failures == 0 {
+            return poll;
+        }
+        let exp = poll.saturating_mul(1u32 << self.failures.min(10)).min(MAX_BACKOFF);
+        exp.max(self.retry_after.unwrap_or_default())
+    }
+
+    /// Record a failure; returns the health to report, if it should change.
+    pub fn failed(&mut self, e: &anyhow::Error, now: Instant) -> Option<Check> {
+        self.failures += 1;
+        let since = *self.since.get_or_insert(now);
+        self.retry_after = e.chain().find_map(|c| c.downcast_ref::<RetryAfter>()).map(|r| r.0);
+        if now.duration_since(since) >= DOWN_AFTER {
+            Some(Check::down(short_reason(e)))
+        } else if self.failures >= DEGRADED_AFTER_FAILURES {
+            Some(Check::degraded(short_reason(e)))
         } else {
-            String::new()
+            None
         }
-    } else {
-        // Multipart: look for text/plain first, then text/html
-        for part in &mail.subparts {
-            if part.ctype.mimetype.to_lowercase() == "text/plain" {
-                let body_bytes = part.get_body_raw().unwrap_or_default();
-                return decode_text_with_charset(&body_bytes, &part.ctype.charset);
-            }
-        }
-        for part in &mail.subparts {
-            if part.ctype.mimetype.to_lowercase() == "text/html" {
-                let body_bytes = part.get_body_raw().unwrap_or_default();
-                return decode_text_with_charset(&body_bytes, &part.ctype.charset);
-            }
-        }
-        String::new()
+    }
+
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
     }
 }
 
-fn decode_text_with_charset(bytes: &[u8], charset: &str) -> String {
-    let lower = charset.to_lowercase();
-    if lower.contains("iso-8859-7") || lower.contains("greek") {
-        let (cow, _, _) = encoding_rs::ISO_8859_7.decode(bytes);
-        cow.to_string()
-    } else if lower.contains("windows-1253") || lower.contains("cp1253") {
-        let (cow, _, _) = encoding_rs::WINDOWS_1253.decode(bytes);
-        cow.to_string()
-    } else {
-        String::from_utf8_lossy(bytes).to_string()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_core::health::Health;
+
+    #[test]
+    fn backoff_escalates_and_honours_retry_after() {
+        let poll = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let mut b = Backoff::default();
+        let err = anyhow::anyhow!("cannot reach Graph");
+
+        assert_eq!(b.next_wait(poll), poll);
+        assert!(b.failed(&err, t0).is_none(), "one blip must not flip the panel");
+        assert_eq!(b.next_wait(poll), Duration::from_secs(60));
+        assert!(b.failed(&err, t0).is_none());
+        assert_eq!(b.failed(&err, t0).unwrap().state, Health::Degraded);
+        assert!(b.next_wait(poll) <= MAX_BACKOFF);
+
+        assert_eq!(b.failed(&err, t0 + DOWN_AFTER).unwrap().state, Health::Down);
+
+        // A throttle longer than the backoff wins.
+        let throttled = anyhow::Error::new(RetryAfter(Duration::from_secs(900))).context("fetch");
+        b.failed(&throttled, t0 + DOWN_AFTER);
+        assert_eq!(b.next_wait(poll), Duration::from_secs(900));
+
+        b.succeeded();
+        assert_eq!(b.next_wait(poll), poll);
     }
 }

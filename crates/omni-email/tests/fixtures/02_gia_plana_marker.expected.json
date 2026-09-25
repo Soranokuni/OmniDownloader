@@ -1,0 +1,72 @@
+{
+  "ignored_urls": [
+    "https://www.gazzetta.gr/football/superleague/ofi-agonas-kyriakis",
+    "https://www.youtube.com/watch?v=fixture0201",
+    "https://youtu.be/fixture0203"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "NIKOLAOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 1.0,
+          "index_str": "1",
+          "keyword": "AGONASOFI",
+          "marker": true,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture0202"
+        }
+      ],
+      "keyword": "AGONASOFI",
+      "title": "ΑΓΩΝΑΣ ΟΦΗ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.85,
+          "index_str": "2A",
+          "keyword": "NEONOSOKOMEIO",
+          "marker": true,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/article/kriti/1234567/neo-nosokomeio-egkainia"
+        },
+        {
+          "confidence": 0.85,
+          "index_str": "2B",
+          "keyword": "NEONOSOKOMEIO",
+          "marker": true,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/article/kriti/1234568/nosokomeio-deyteri-mera"
+        }
+      ],
+      "keyword": "NEONOSOKOMEIO",
+      "title": "ΝΕΟ ΝΟΣΟΚΟΜΕΙΟ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [],
+      "keyword": "SYNEDRIASIDIMOTIKOU",
+      "title": "ΣΥΝΕΔΡΙΑΣΗ ΔΗΜΟΤΙΚΟΥ ΣΥΜΒΟΥΛΙΟΥ"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "MARKER_WITHOUT_URL",
+      "detail": "3"
+    },
+    {
+      "code": "SECTION_WITHOUT_LINKS",
+      "detail": "3"
+    }
+  ]
+}

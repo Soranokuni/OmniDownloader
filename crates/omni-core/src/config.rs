@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::paths::AppPaths;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a broadcast automation parsing engine for a Greek newsroom. Analyze the email and extract video asset links into a strict JSON array.
+/// The full-extraction prompt the LLM used before the deterministic parser
+/// (plan P4.3). Kept for `llm.mode = primary`, which is not implemented yet;
+/// nothing reads it today.
+pub const DEFAULT_SYSTEM_PROMPT: &str =r#"You are a broadcast automation parsing engine for a Greek newsroom. Analyze the email and extract video asset links into a strict JSON array.
 
 === FEW-SHOT EXAMPLES ===
 
@@ -259,6 +262,172 @@ impl TlsConfig {
     }
 }
 
+/// Microsoft Graph mailbox (plan P4.2, defect E-01).
+///
+/// Used instead of IMAP whenever it is configured: Exchange Online no longer
+/// accepts the basic-auth IMAP login the daemon started with. The app
+/// registration needs `Mail.ReadWrite` and `Mail.Send` (application), limited
+/// to the ingest mailbox by an Exchange application access policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphConfig {
+    #[serde(default)]
+    pub tenant_id: String,
+    #[serde(default)]
+    pub client_id: String,
+    /// The ingest mailbox, e.g. `ingest@example.gr`.
+    #[serde(default)]
+    pub mailbox: String,
+    #[serde(default = "default_processed_folder")]
+    pub processed_folder: String,
+    #[serde(default = "default_failed_folder")]
+    pub failed_folder: String,
+    /// Client secret — **runtime only**, loaded from the secret store
+    /// (`graph.client_secret`). Never read from or written to config.json.
+    #[serde(skip)]
+    pub client_secret: String,
+}
+
+fn default_processed_folder() -> String {
+    "Omni/Processed".into()
+}
+
+fn default_failed_folder() -> String {
+    "Omni/Failed".into()
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            tenant_id: String::new(),
+            client_id: String::new(),
+            mailbox: String::new(),
+            processed_folder: default_processed_folder(),
+            failed_folder: default_failed_folder(),
+            client_secret: String::new(),
+        }
+    }
+}
+
+impl GraphConfig {
+    /// Everything needed to log in is present, secret included.
+    pub fn is_configured(&self) -> bool {
+        !self.tenant_id.trim().is_empty()
+            && !self.client_id.trim().is_empty()
+            && !self.mailbox.trim().is_empty()
+            && !self.client_secret.is_empty()
+    }
+}
+
+/// What the LLM may do with an email (plan P4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmMode {
+    /// Never called. The deterministic parser alone decides.
+    Off,
+    /// Called only where the parser is unsure, and only to suggest a
+    /// journalist or a keyword, which are validated before use.
+    #[default]
+    Assist,
+    /// Full extraction by the model. Not implemented: treated as `assist`,
+    /// with a warning at start-up.
+    Primary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default)]
+    pub mode: LlmMode,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    /// Ask for a keyword for every section, not only where the parser fell
+    /// back to `ASSET`.
+    #[serde(default)]
+    pub keyword_polish: bool,
+}
+
+fn default_llm_timeout() -> u64 {
+    30
+}
+
+fn default_llm_max_tokens() -> u32 {
+    400
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            mode: LlmMode::default(),
+            timeout_secs: default_llm_timeout(),
+            max_tokens: default_llm_max_tokens(),
+            keyword_polish: false,
+        }
+    }
+}
+
+/// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParserConfig {
+    /// News portals whose article pages carry the video (Tier 2).
+    #[serde(default = "default_tier2_domains")]
+    pub tier2_domains: Vec<String>,
+    /// Queue low-confidence links anyway and let the sniffer try; only
+    /// failures reach MCR review.
+    #[serde(default = "default_true")]
+    pub auto_attempt_unknown_domains: bool,
+    /// Subject words that raise the job priority.
+    #[serde(default = "default_urgent_keywords")]
+    pub urgent_keywords: Vec<String>,
+    /// Video attachments above this are not queued (warning instead).
+    #[serde(default = "default_max_attachment_mb")]
+    pub max_attachment_mb: u64,
+}
+
+pub fn default_tier2_domains() -> Vec<String> {
+    [
+        "neakriti.gr",
+        "lifo.gr",
+        "protothema.gr",
+        "newsit.gr",
+        "iefimerida.gr",
+        "athletiko.gr",
+        "carandmotor.gr",
+        "gazzetta.gr",
+        "star.gr",
+        "ertnews.gr",
+        "ert.gr",
+        "in.gr",
+        "news247.gr",
+        "cnn.gr",
+        "bbc.com",
+        "bbc.co.uk",
+        "cnn.com",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+pub fn default_urgent_keywords() -> Vec<String> {
+    vec!["ΕΚΤΑΚΤΟ".into(), "BREAKING".into(), "URGENT".into()]
+}
+
+fn default_max_attachment_mb() -> u64 {
+    2048
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self {
+            tier2_domains: default_tier2_domains(),
+            auto_attempt_unknown_domains: true,
+            urgent_keywords: default_urgent_keywords(),
+            max_attachment_mb: default_max_attachment_mb(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_db_path")]
@@ -287,6 +456,12 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub log: crate::logging::LogConfig,
+
+    #[serde(default)]
+    pub parser: ParserConfig,
+
+    #[serde(default)]
+    pub graph: GraphConfig,
 
     /// How long a finished job's working files are kept before the nightly
     /// retention task removes them (plan P6.6).
@@ -337,8 +512,14 @@ pub struct AppConfig {
     #[serde(default = "default_ollama_model")]
     pub ollama_model: String,
 
-    #[serde(default = "default_system_prompt")]
-    pub system_prompt: String,
+    /// LLM assist policy (plan P4.4). Endpoint and model stay above.
+    ///
+    /// There is deliberately no `system_prompt` any more (defect E-03): the
+    /// deployed config.json overrode the tuned prompt with a one-liner and
+    /// nobody could tell. An old file that still has the key loads fine; it
+    /// is ignored, and the next save drops it.
+    #[serde(default)]
+    pub llm: LlmConfig,
 
     // Update settings
     #[serde(default = "default_channel")]
@@ -409,9 +590,7 @@ fn default_ollama_endpoint() -> String {
 fn default_ollama_model() -> String {
     "google/gemma-4-e4b".to_string()
 }
-fn default_system_prompt() -> String {
-    DEFAULT_SYSTEM_PROMPT.to_string()
-}
+
 fn default_channel() -> String {
     "stable".to_string()
 }
@@ -431,6 +610,8 @@ impl Default for AppConfig {
             security: SecurityConfig::default(),
             tls: TlsConfig::default(),
             log: crate::logging::LogConfig::default(),
+            parser: ParserConfig::default(),
+            graph: GraphConfig::default(),
             retention_days: default_retention_days(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
@@ -442,7 +623,7 @@ impl Default for AppConfig {
             email_poll_interval_secs: default_poll_interval(),
             ollama_endpoint: default_ollama_endpoint(),
             ollama_model: default_ollama_model(),
-            system_prompt: default_system_prompt(),
+            llm: LlmConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -551,6 +732,7 @@ impl AppConfig {
         // Always read back from the store, so the store is the single source
         // of truth and a secret removed there takes effect on restart.
         self.email_password = store.get_lossy(keys::MAIL_PASSWORD).unwrap_or_default();
+        self.graph.client_secret = store.get_lossy(keys::GRAPH_CLIENT_SECRET).unwrap_or_default();
         Ok(rewrote)
     }
 
@@ -658,6 +840,37 @@ mod tests {
         let mut config = AppConfig::load_from_file(&path).unwrap();
         config.adopt_secrets(&store).unwrap();
         assert_eq!(config.email_password, "");
+    }
+
+    #[test]
+    fn the_graph_client_secret_lives_only_in_the_store() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+
+        // Even a hand-edited config.json cannot supply it...
+        std::fs::write(
+            &path,
+            r#"{ "graph": { "tenant_id": "t", "client_id": "c", "mailbox": "ingest@example.gr",
+                            "client_secret": "typed-into-config" } }"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        assert_eq!(config.graph.client_secret, "");
+        assert!(!config.graph.is_configured());
+        assert_eq!(config.graph.processed_folder, "Omni/Processed");
+
+        // ...the store does, and a save never writes it back.
+        let store = SecretStore::new(dir.path().join("secrets.bin"));
+        store.set(keys::GRAPH_CLIENT_SECRET, "from-the-store").unwrap();
+        config.adopt_secrets(&store).unwrap();
+        assert_eq!(config.graph.client_secret, "from-the-store");
+        assert!(config.graph.is_configured());
+
+        config.save_to_file(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("from-the-store"));
+        assert!(!written.contains("client_secret"));
+        assert!(written.contains("ingest@example.gr"));
     }
 
     #[test]

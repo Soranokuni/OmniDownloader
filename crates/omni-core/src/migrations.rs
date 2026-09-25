@@ -250,6 +250,29 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        5,
+        // Per-message idempotency for email ingest (plan P4.2, defect E-07).
+        //
+        // A server can present a message as unread again: an IMAP flag lost
+        // on reconnect, a Graph move that failed after the jobs were queued,
+        // a journalist dragging it back to the inbox. Keyed on the RFC 5322
+        // Message-ID, which survives all three, so the second sighting is
+        // recognised instead of re-parsed. `jobs_json` lists what the message
+        // produced, for the summary reply (plan P5.2).
+        r#"
+        CREATE TABLE IF NOT EXISTS processed_mail (
+            internet_message_id TEXT PRIMARY KEY,
+            source_id    TEXT,
+            processed_at TEXT NOT NULL,
+            outcome      TEXT NOT NULL,
+            from_address TEXT,
+            subject      TEXT,
+            jobs_json    TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_processed_mail_at ON processed_mail(processed_at);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -377,7 +400,7 @@ mod tests {
         let v = apply(&mut conn, None).unwrap();
         assert_eq!(v, target_version());
         // The baseline tables must exist.
-        for table in ["users", "sessions", "queue", "journalists", "audit_logs"] {
+        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",

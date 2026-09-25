@@ -389,3 +389,46 @@ async fn a_user_sees_only_their_own_jobs() -> Result<()> {
     assert_eq!(jobs[0].get("keyword").unwrap(), "MINE");
     Ok(())
 }
+
+/// Policy C: MCR queues a video the sniffer offered from a job's article —
+/// only one that is on the offer list, and only once.
+#[tokio::test]
+async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Result<()> {
+    let app = App::new()?;
+    let mut parent = omni_core::models::NewJob::new("https://www.portal.example/story/1", "1A_MCR_SEISMOS", "MCR");
+    parent.keyword = "SEISMOS".into();
+    parent.index_str = "1A".into();
+    let id = app.repo.enqueue(&parent, 24)?.job_id();
+    let raw = "https://cdn.portal.example/video/master.m3u8";
+    app.repo.set_candidates(
+        id,
+        Some(&json!([{ "url": raw, "index_str": "1D", "queued_job_id": null }]).to_string()),
+    )?;
+    let uri = format!("/api/jobs/{id}/offers/queue");
+
+    // Not on the list: refused, nothing queued.
+    let (status, _) = app
+        .send("POST", &uri, &app.mcr_token, Some(json!({ "url": "https://evil.example/x.mp4" })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(app.repo.get_all_jobs()?.len(), 1);
+
+    // On the list: queued with the offered index, journalist and keyword.
+    let (status, body) = app.send("POST", &uri, &app.mcr_token, Some(json!({ "url": raw }))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let new_id = body["job_id"].as_i64().unwrap();
+    let queued = app.repo.get_job(new_id)?.unwrap();
+    assert_eq!((queued.url.as_str(), queued.slug.as_str()), (raw, "1D_MCR_SEISMOS"));
+    assert_eq!(queued.status, JobStatus::Pending);
+
+    // Twice: refused, and the offer remembers the job it became.
+    let (status, body) = app.send("POST", &uri, &app.mcr_token, Some(json!({ "url": raw }))).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let offers: Value = serde_json::from_str(app.repo.get_job(id)?.unwrap().candidates_json.as_deref().unwrap())?;
+    assert_eq!(offers[0]["queued_job_id"], json!(new_id));
+
+    // A reporter cannot use it.
+    let (status, _) = app.send("POST", &uri, &app.user_token, Some(json!({ "url": raw }))).await?;
+    assert!(status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED, "{status}");
+    Ok(())
+}

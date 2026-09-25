@@ -1,0 +1,28 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "4",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "4",
+          "keyword": "SYNENTEFXIPRYTANI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1001"
+        }
+      ],
+      "keyword": "SYNENTEFXIPRYTANI",
+      "title": "ΣΥΝΕΝΤΕΥΞΗ ΠΡΥΤΑΝΗ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

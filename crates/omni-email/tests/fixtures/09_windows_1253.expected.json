@@ -1,0 +1,44 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "DIMITRIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "APOKATASTASIENETIKOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture0901"
+        }
+      ],
+      "keyword": "APOKATASTASIENETIKOU",
+      "title": "ΑΠΟΚΑΤΑΣΤΑΣΗ ΕΝΕΤΙΚΟΥ ΛΙΜΑΝΙΟΥ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "2",
+          "keyword": "EKDILOSIEPETEIO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.ertnews.gr/perifereiaka/kriti/ekdilosi-epeteios-irakleio/"
+        }
+      ],
+      "keyword": "EKDILOSIEPETEIO",
+      "title": "ΕΚΔΗΛΩΣΗ ΓΙΑ ΤΗΝ ΕΠΕΤΕΙΟ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

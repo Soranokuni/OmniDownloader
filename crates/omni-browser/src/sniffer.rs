@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{EventRequestWillBeSent, SetBlockedUrLsParams};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -90,7 +91,13 @@ impl StreamSniffer {
     pub async fn extract_media_bundle(target_url: &str, timeout_secs: u64) -> Result<DiscoveredMedia> {
         info!("StreamSniffer: Starting browser extraction for {}", target_url);
 
-        let (browser, _handle) = HeadlessBrowserManager::launch().await?;
+        let mut session = HeadlessBrowserManager::launch().await?;
+        let result = Self::sniff(&session.browser, target_url, timeout_secs).await;
+        session.shutdown().await;
+        result
+    }
+
+    async fn sniff(browser: &Browser, target_url: &str, timeout_secs: u64) -> Result<DiscoveredMedia> {
         let page = browser
             .new_page(target_url)
             .await
@@ -208,14 +215,23 @@ impl StreamSniffer {
                 const tweetNodes = Array.from(document.querySelectorAll(
                     'blockquote.twitter-tweet a, .twitter-tweet a, iframe[src*="twitter.com"], iframe[src*="x.com"], div[data-tweet-id], a[href*="/status/"]'
                 ));
+                // Every post, not just the first: an article routinely embeds
+                // several (a newsbomb.gr story had three X videos and only the
+                // first was ever seen). Keyed on the status id so the same
+                // post found as a blockquote link and as a rendered iframe
+                // counts once.
+                const tweetIds = new Set();
+                const addTweet = (id, url) => {
+                    if (!tweetIds.has(id)) { tweetIds.add(id); found.push({ type: 'twitter', url }); }
+                };
                 for (const el of tweetNodes) {
                     const href = el.href || getSrc(el) || el.getAttribute('href') || '';
-                    const m = href.match(/(https?:\/\/(?:twitter|x)\.com\/(?:#!\/)?[a-zA-Z0-9_]+\/status\/\d+)/i);
-                    if (m) { found.push({ type: 'twitter', url: m[1] }); break; }
+                    const m = href.match(/(https?:\/\/(?:twitter|x)\.com\/(?:#!\/)?[a-zA-Z0-9_]+\/status\/(\d+))/i);
+                    if (m) { addTweet(m[2], m[1].replace(/\/\/twitter\.com\//i, '//x.com/')); continue; }
                     const idMatch = href.match(/id=(\d{15,})/);
-                    if (idMatch) { found.push({ type: 'twitter', url: 'https://x.com/i/status/' + idMatch[1] }); break; }
+                    if (idMatch) { addTweet(idMatch[1], 'https://x.com/i/status/' + idMatch[1]); continue; }
                     const dataId = el.getAttribute('data-tweet-id');
-                    if (dataId) { found.push({ type: 'twitter', url: 'https://x.com/i/status/' + dataId }); break; }
+                    if (dataId) { addTweet(dataId, 'https://x.com/i/status/' + dataId); }
                 }
 
                 // 2. Glomex player embeds (web components, divs, iframes)

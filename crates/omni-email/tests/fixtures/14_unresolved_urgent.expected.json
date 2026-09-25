@@ -1,0 +1,32 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.6,
+          "index_str": "1",
+          "keyword": "SEISMOSNOTIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/article/kriti/1300000/seismos-notia-kriti-4-8-rixter"
+        }
+      ],
+      "keyword": "SEISMOSNOTIA",
+      "title": "ΕΚΤΑΚΤΟ: Σεισμός στη Νότια Κρήτη"
+    }
+  ],
+  "urgent": true,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

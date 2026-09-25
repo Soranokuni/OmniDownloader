@@ -1,3 +1,4 @@
+pub mod article;
 pub mod delivery;
 pub mod errors;
 pub mod downloader;
@@ -5,6 +6,7 @@ pub mod pipeline;
 pub mod probe;
 pub mod verify;
 pub mod rewrapper;
+pub mod selftest;
 pub mod transcoder;
 
 pub use delivery::WatchfolderDelivery;
