@@ -8,7 +8,7 @@
  */
 
 import {
-  api, el, render, live, toast, fmtTime, fmtDuration, statusClass, logout,
+  api, el, render, live, toast, fmtTime, fmtDuration, statusClass, logout, safeHref,
 } from '/static/app.js?v=2';
 
 let jobs = [];
@@ -122,12 +122,63 @@ async function loadJobs() {
     if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
     return;
   }
+  renderOffers();
   renderQueue();
   renderReview();
   if (currentTab === 'archive') renderArchive();
 }
 
 const NEEDS_REVIEW = new Set(['REQUIRES_REVIEW', 'MANUAL_DOWNLOAD']);
+
+/* Videos the sniffer found in a submitted article and left for MCR to
+ * decide (raw page streams, and platform posts beyond the automatic limit).
+ * Platform posts within the limit were already queued as 1B, 1C, … */
+function offersOf(job) {
+  if (!job.candidates_json) return [];
+  try {
+    const list = JSON.parse(job.candidates_json);
+    return Array.isArray(list) ? list.filter((o) => o && o.url && !o.queued_job_id) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function renderOffers() {
+  const withOffers = jobs.filter((j) => offersOf(j).length > 0);
+  if (withOffers.length === 0) {
+    render('article-offers');
+    return;
+  }
+  render('article-offers', el('div', { class: 'card stack' },
+    el('h3', { class: 'job-name' }, 'Other videos found in submitted articles'),
+    ...withOffers.flatMap((job) => offersOf(job).map((offer) => {
+      const href = safeHref(offer.url);
+      return el('div', { class: 'job-head', style: 'border-top:1px solid var(--line);padding-top:10px' },
+        el('div', {},
+          el('p', { class: 'job-meta' },
+            `Job #${job.id} (${job.slug}) — would be ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
+          el('p', { class: 'job-url', title: offer.url }, offer.url),
+        ),
+        el('div', { class: 'row tight' },
+          href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Open') : null,
+          el('button', {
+            class: 'btn btn-warn',
+            type: 'button',
+            onClick: () => queueOffer(job.id, offer),
+          }, `Queue as ${offer.index_str}`),
+        ),
+      );
+    })),
+  ));
+}
+
+async function queueOffer(id, offer) {
+  try {
+    const r = await api(`/api/jobs/${id}/offers/queue`, { method: 'POST', body: { url: offer.url } });
+    toast(`Queued as ${r.index_str} (job #${r.job_id}).`, 'ok');
+    loadJobs();
+  } catch (e) { toast(e.message, 'bad'); }
+}
 
 function renderQueue() {
   const active = jobs.filter((j) => !NEEDS_REVIEW.has(j.status));

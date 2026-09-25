@@ -843,6 +843,7 @@ async fn run_job(
                     &format!("Sniffed stream: {}", bundle.primary_stream),
                 )?;
                 let mut retry_job = job.clone();
+                omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &bundle.primary_stream, &bundle.all_streams);
                 retry_job.url = bundle.primary_stream;
                 repo.set_stage(job_id, owner, JobStage::Download)?;
                 process_result = engine
