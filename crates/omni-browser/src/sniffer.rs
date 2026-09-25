@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{EventRequestWillBeSent, SetBlockedUrLsParams};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -90,7 +91,13 @@ impl StreamSniffer {
     pub async fn extract_media_bundle(target_url: &str, timeout_secs: u64) -> Result<DiscoveredMedia> {
         info!("StreamSniffer: Starting browser extraction for {}", target_url);
 
-        let (browser, _handle) = HeadlessBrowserManager::launch().await?;
+        let mut session = HeadlessBrowserManager::launch().await?;
+        let result = Self::sniff(&session.browser, target_url, timeout_secs).await;
+        session.shutdown().await;
+        result
+    }
+
+    async fn sniff(browser: &Browser, target_url: &str, timeout_secs: u64) -> Result<DiscoveredMedia> {
         let page = browser
             .new_page(target_url)
             .await
