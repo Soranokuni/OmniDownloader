@@ -552,6 +552,36 @@ impl Repository {
         Ok(changed == 1)
     }
 
+    /// Give a running job a new index and slug — `1` becomes `1A` when the
+    /// sniffer finds sibling videos in its article. Only the worker holding
+    /// the lease may do it, like every other change to a running job.
+    pub fn rename_leased_job(&self, job_id: i64, owner: &str, index_str: &str, slug: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let changed = conn.execute(
+            "UPDATE queue SET index_str = ?, slug = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![index_str, slug, now, job_id, owner],
+        )?;
+        if changed == 1 {
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'EXTRACT', 'INFO', ?)",
+                params![job_id, now, format!("Renamed to {slug}: the article has more videos")],
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Store the videos offered to MCR for this job (`candidates_json`).
+    pub fn set_candidates(&self, job_id: i64, candidates_json: Option<&str>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE queue SET candidates_json = ?, updated_at = ? WHERE id = ?",
+            params![candidates_json, timestamps::now_string(), job_id],
+        )?;
+        Ok(())
+    }
+
     /// Append to the job's timeline. Shown in the MCR job drawer.
     pub fn record_event(
         &self,

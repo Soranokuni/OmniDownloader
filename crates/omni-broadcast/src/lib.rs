@@ -1,3 +1,4 @@
+pub mod article;
 pub mod delivery;
 pub mod errors;
 pub mod downloader;
