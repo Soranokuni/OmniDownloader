@@ -396,11 +396,165 @@ document.getElementById('test-mail-btn').addEventListener('click', async () => {
   document.getElementById('test-mail-secret').value = '';
 });
 
+/* ------------------------------------------------------------------ *
+ * Newsroom taxonomy (plan P4.20)
+ * ------------------------------------------------------------------ */
+
+const taxonomyResult = document.getElementById('taxonomy-result');
+let knownGroups = [];
+
+function showTaxonomy(message, ok) {
+  taxonomyResult.textContent = message;
+  taxonomyResult.className = ok ? 'note ok' : 'note bad';
+}
+
+const splitList = (text) => text.split(',').map((s) => s.trim()).filter(Boolean);
+
+async function loadTaxonomy() {
+  let groups;
+  let people;
+  try {
+    groups = (await api('/api/groups')).groups || [];
+    people = (await api('/api/journalists')).journalists || [];
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  knownGroups = groups;
+
+  render('groups-body', groups.length === 0
+    ? el('tr', {}, el('td', { colspan: '6', class: 'empty' }, 'No groups yet. Add one below or import taxonomy.json.'))
+    : groups.map((g) => el('tr', {},
+      el('td', { class: 'mono strong' }, g.code),
+      el('td', {}, g.name),
+      el('td', {}, el('span', { class: 'badge info' }, g.kind)),
+      el('td', {}, (g.keywords || []).join(', ')),
+      el('td', {}, g.description || ''),
+      el('td', { class: 'right' },
+        el('div', { class: 'row tight', style: 'justify-content:flex-end' },
+          el('button', { class: 'btn', type: 'button', onClick: () => editGroup(g) }, 'Edit'),
+          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => deleteGroup(g.code) }, 'Delete'),
+        )),
+    )));
+
+  const staff = people.filter((p) => p.surname !== 'MCR');
+  render('members-body', staff.length === 0
+    ? el('tr', {}, el('td', { colspan: '5', class: 'empty' }, 'No journalists yet.'))
+    : staff.map((p) => {
+      const input = el('input', {
+        type: 'text',
+        value: (p.groups || []).join(', '),
+        placeholder: groups.map((g) => g.code).slice(0, 3).join(', '),
+        'aria-label': `Groups of ${p.surname}`,
+      });
+      return el('tr', {},
+        el('td', { class: 'mono strong' }, p.surname),
+        el('td', {}, p.full_name),
+        el('td', { class: 'mono' }, (p.emails || []).join(', ')),
+        el('td', {}, input),
+        el('td', { class: 'right' },
+          el('button', { class: 'btn', type: 'button', onClick: () => saveMembership(p.surname, input) }, 'Save')),
+      );
+    }));
+}
+
+function editGroup(g) {
+  document.getElementById('g-code').value = g.code;
+  document.getElementById('g-name').value = g.name;
+  document.getElementById('g-kind').value = g.kind;
+  document.getElementById('g-keywords').value = (g.keywords || []).join(', ');
+  document.getElementById('g-description').value = g.description || '';
+  document.getElementById('g-name').focus();
+}
+
+document.getElementById('group-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    await api('/api/groups', {
+      method: 'POST',
+      body: {
+        code: document.getElementById('g-code').value.trim(),
+        name: document.getElementById('g-name').value.trim(),
+        kind: document.getElementById('g-kind').value,
+        keywords: splitList(document.getElementById('g-keywords').value),
+        description: document.getElementById('g-description').value.trim(),
+      },
+    });
+    toast('Group saved.', 'ok');
+    event.target.reset();
+    loadTaxonomy();
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
+async function deleteGroup(code) {
+  if (!confirm(`Delete group ${code}? People lose this membership; jobs keep their label.`)) return;
+  try {
+    await api(`/api/groups/${encodeURIComponent(code)}`, { method: 'POST' });
+    toast('Group deleted.', 'ok');
+    loadTaxonomy();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function saveMembership(surname, input) {
+  try {
+    await api(`/api/journalists/${encodeURIComponent(surname)}/groups`, {
+      method: 'POST',
+      body: { groups: splitList(input.value).map((c) => c.toUpperCase()) },
+    });
+    toast(`Groups of ${surname} saved.`, 'ok');
+    loadTaxonomy();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+document.getElementById('taxonomy-export').addEventListener('click', async () => {
+  try {
+    const data = await api('/api/admin/taxonomy');
+    const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
+    // Our own JSON as a local blob: a plain anchor, since el() only allows
+    // http(s) links.
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'taxonomy.json';
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    showTaxonomy('Exported. The file lists staff and their addresses: keep it out of shared folders and git.', true);
+  } catch (e) { showTaxonomy(e.message, false); }
+});
+
+const fileInput = document.getElementById('taxonomy-file');
+document.getElementById('taxonomy-import-btn').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files && fileInput.files[0];
+  fileInput.value = '';
+  if (!file) return;
+  let taxonomy;
+  try {
+    taxonomy = JSON.parse(await file.text());
+  } catch {
+    showTaxonomy(`${file.name} is not valid JSON.`, false);
+    return;
+  }
+  const replace = document.getElementById('taxonomy-replace').checked;
+  if (replace && !confirm('Replace: groups and people not in the file will be removed. Continue?')) return;
+  try {
+    const { report } = await api('/api/admin/taxonomy', { method: 'POST', body: { taxonomy, replace } });
+    showTaxonomy(
+      `Imported ${file.name}: ${report.groups_saved} groups and ${report.people_saved} people saved` +
+      (replace ? `, ${report.groups_removed} groups and ${report.people_removed} people removed.` : '.'),
+      true,
+    );
+    loadTaxonomy();
+  } catch (e) { showTaxonomy(e.message, false); }
+});
+
 document.getElementById('logout-btn').addEventListener('click', logout);
 
 loadDependencies();
 loadSecrets();
 loadMaintenance();
 loadUsers();
+loadTaxonomy();
 loadLogs();
 setInterval(loadLogs, 15000);
