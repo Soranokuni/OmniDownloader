@@ -412,6 +412,19 @@ const INVISIBLE: [char; 6] = ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\
 
 static RE_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>"'«»\[\]{}|\\^`]+"#).unwrap());
+/// A link typed without `https://` or `www.` (plan P4.11), only for hosts
+/// that are nearly always a link to video or a transfer, and only with a
+/// path: `youtube.com/watch?v=…`, `fb.watch/…`, `we.tl/t-…`. A bare portal
+/// name in a sentence ("στο sigma.gr") is not one.
+static RE_BARE_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"(?i)\b(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be|youtube-nocookie\.com|instagram\.com|facebook\.com"#,
+        r#"|fb\.watch|tiktok\.com|x\.com|twitter\.com|vimeo\.com|dailymotion\.com|dai\.ly"#,
+        r#"|wetransfer\.com|we\.tl|transfernow\.net|myairbridge\.com|filemail\.com|1drv\.ms"#,
+        r#"|onedrive\.live\.com|drive\.google\.com|dropbox\.com)/[^\s<>"'«»\[\]{}|\\^`]+"#
+    ))
+    .unwrap()
+});
 static RE_NUMBERED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(\d{1,3})(\s*)([.)\-:])?(\s*)(.*)$").unwrap());
 static RE_MARKER: LazyLock<Regex> = LazyLock::new(|| {
@@ -435,10 +448,46 @@ struct Line {
     url_only: bool,
 }
 
+/// Every link in `text`, in order: with a scheme or `www.`, then bare ones
+/// on known hosts. Returns each match's byte range and cleaned URL.
+fn find_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut found: Vec<(std::ops::Range<usize>, String)> = RE_URL
+        .find_iter(text)
+        .filter_map(|m| clean_url(m.as_str()).map(|u| (m.range(), u)))
+        .collect();
+    // Blank what was found (same byte length), so a bare match cannot start
+    // inside a full URL.
+    let mut masked = text.to_string();
+    for (r, _) in &found {
+        masked.replace_range(r.clone(), &" ".repeat(r.len()));
+    }
+    for m in RE_BARE_URL.find_iter(&masked) {
+        // `press@x.com/…`, `./youtube.com/…`: part of something else.
+        let before = masked[..m.start()].chars().next_back();
+        if before.is_some_and(|c| matches!(c, '@' | '.' | '/' | '-' | '_' | ':' | '=')) {
+            continue;
+        }
+        if let Some(u) = clean_url(&format!("https://{}", m.as_str())) {
+            found.push((m.range(), u));
+        }
+    }
+    found.sort_by_key(|(r, _)| r.start);
+    found
+}
+
+/// `text` with every link found by [`find_urls`] removed.
+fn strip_urls(text: &str) -> String {
+    let mut out = text.to_string();
+    for (r, _) in find_urls(text).into_iter().rev() {
+        out.replace_range(r, "");
+    }
+    out
+}
+
 impl Line {
     fn new(text: &str) -> Self {
-        let urls: Vec<String> = RE_URL.find_iter(text).filter_map(|m| clean_url(m.as_str())).collect();
-        let rest = RE_URL.replace_all(text, "");
+        let urls: Vec<String> = find_urls(text).into_iter().map(|(_, u)| u).collect();
+        let rest = strip_urls(text);
         let url_only = !urls.is_empty() && !rest.chars().any(|c| c.is_alphanumeric());
         Self {
             text: text.to_string(),
@@ -454,7 +503,7 @@ impl Line {
 
     /// The line with links and any marker removed, if it reads as a title.
     fn title_text(&self) -> Option<String> {
-        let no_urls = RE_URL.replace_all(&self.text, "");
+        let no_urls = strip_urls(&self.text);
         let no_marker = RE_MARKER_PREFIX.replace(&no_urls, "");
         let t = no_marker
             .trim()

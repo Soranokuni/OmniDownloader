@@ -1,0 +1,71 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "AGONASPAGKRITIO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtube.com/watch?v=fixture1801"
+        }
+      ],
+      "keyword": "AGONASPAGKRITIO",
+      "title": "ΑΓΩΝΑΣ ΣΤΟ ΠΑΓΚΡΗΤΙΟ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "SYNAVLIALIMANI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://fb.watch/fixture1802"
+        }
+      ],
+      "keyword": "SYNAVLIALIMANI",
+      "title": "ΣΥΝΑΥΛΙΑ ΣΤΟ ΛΙΜΑΝΙ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 1.0,
+          "index_str": "3",
+          "keyword": "SYNENTEFXIPRYTANI",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://we.tl/t-fixture1803"
+        }
+      ],
+      "keyword": "SYNENTEFXIPRYTANI",
+      "title": "ΣΥΝΕΝΤΕΥΞΗ ΠΡΥΤΑΝΗ"
+    },
+    {
+      "index_str": "4",
+      "jobs": [],
+      "keyword": "KAIROS",
+      "title": "ΚΑΙΡΟΣ"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "SECTION_WITHOUT_LINKS",
+      "detail": "4"
+    }
+  ]
+}
