@@ -248,6 +248,11 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe secrets set graph.client_secret
 .\target\release\omni-ingest.exe secrets list
 
+# what the parser would do with the last 10 mails (read-only: nothing is
+# queued, nothing in the mailbox changes); or with saved .eml files
+.\target\release\omni-ingest.exe mail-preview --last 10
+.\target\release\omni-ingest.exe mail-preview --eml .\sample.eml
+
 # sniff a single URL through the headless browser
 .\target\release\omni-ingest.exe browser-test "https://example.com/video/..."
 
