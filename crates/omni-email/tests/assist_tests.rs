@@ -91,8 +91,8 @@ async fn run(a: &Assist, m: &InboundMail) -> ParsedEmail {
     let cfg = ParserConfig::default();
     let mut p = parser::parse(m, &r, &cfg);
     let body = m.readable_body();
-    if a.wanted(&p, &body) {
-        a.refine(m, &body, &mut p, &r, &cfg).await;
+    if a.wanted(&p, &body, &[]) {
+        a.refine(m, &body, &mut p, &r, &[], &cfg).await;
     }
     p
 }
@@ -216,4 +216,81 @@ async fn with_the_llm_down_every_fixture_keeps_the_parsers_jobs() {
         checked += 1;
     }
     assert!(checked >= 15);
+}
+
+// ---------------------------------------------------------------------------
+// Group tie-break (plan P4.19)
+// ---------------------------------------------------------------------------
+
+fn show(code: &str, name: &str, description: &str) -> omni_core::taxonomy::Group {
+    omni_core::taxonomy::Group {
+        code: code.into(),
+        name: name.into(),
+        kind: "show".into(),
+        keywords: vec![],
+        description: description.into(),
+    }
+}
+
+fn shows() -> Vec<omni_core::taxonomy::Group> {
+    vec![
+        show("NEWS", "Κεντρικό Δελτίο", "Ειδήσεις της ημέρας"),
+        show("MORNING", "Πρωινή εκπομπή", "Συνεντεύξεις και θέματα πόλης"),
+    ]
+}
+
+/// Nothing names a group and the sender is unknown: the rules give none.
+const UNGROUPED: &str = "Η συνέντευξη του δημάρχου:\nhttps://www.youtube.com/watch?v=as0100";
+
+#[tokio::test]
+async fn a_listed_group_is_adopted_when_the_rules_chose_none() {
+    let (mock, addr) = start(r#"{"journalist_surname_latin": null, "keywords": {}, "group_code": "morning"}"#).await;
+    let a = assist(&format!("http://{addr}/v1"));
+    let m = mail("someone@example.org", "Συνέντευξη", UNGROUPED);
+    let without = omni_email::assist::interpret(&m, &roster(), &shows(), &ParserConfig::default(), None).await;
+    let p = omni_email::assist::interpret(&m, &roster(), &shows(), &ParserConfig::default(), Some(&a)).await;
+
+    let g = p.group.clone().expect("group adopted");
+    assert_eq!((g.code.as_str(), g.how), ("MORNING", omni_email::groups::GroupResolution::LlmAssist));
+    assert_eq!(jobs(&p), jobs(&without), "a group must not change any job");
+    // The model was shown the groups with their descriptions.
+    let prompt = mock.lock().unwrap().requests[0]["messages"][1]["content"].as_str().unwrap().to_string();
+    assert!(prompt.contains("- MORNING: Πρωινή εκπομπή, show; Συνεντεύξεις και θέματα πόλης"), "{prompt}");
+}
+
+#[tokio::test]
+async fn a_group_that_is_not_in_the_list_is_discarded() {
+    let (_m, addr) = start(r#"{"journalist_surname_latin": null, "keywords": {}, "group_code": "WEATHER"}"#).await;
+    let a = assist(&format!("http://{addr}/v1"));
+    let m = mail("someone@example.org", "Συνέντευξη", UNGROUPED);
+    let p = omni_email::assist::interpret(&m, &roster(), &shows(), &ParserConfig::default(), Some(&a)).await;
+    assert!(p.group.is_none());
+    assert!(p.has_warning(warnings::LLM_ASSIST_SKIPPED));
+}
+
+#[tokio::test]
+async fn a_rule_outranks_the_models_group() {
+    // The model names the journalist *and* a group. NIKOLAOU's default group
+    // is NEWS: once he is known, that rule decides, not the model's guess.
+    let mut r = roster();
+    r.iter_mut().find(|j| j.surname == "NIKOLAOU").unwrap().groups = vec!["NEWS".into()];
+    let (_m, addr) =
+        start(r#"{"journalist_surname_latin": "NIKOLAOU", "keywords": {}, "group_code": "MORNING"}"#).await;
+    let a = assist(&format!("http://{addr}/v1"));
+    let m = mail("someone@example.org", "Βίντεο σύσκεψης", UNROUTED);
+    let p = omni_email::assist::interpret(&m, &r, &shows(), &ParserConfig::default(), Some(&a)).await;
+    assert_eq!(p.journalist.surname, "NIKOLAOU");
+    let g = p.group.expect("group");
+    assert_eq!((g.code.as_str(), g.how), ("NEWS", omni_email::groups::GroupResolution::Member));
+}
+
+#[tokio::test]
+async fn with_a_group_decided_by_rules_the_model_is_not_asked_about_groups() {
+    let (mock, addr) = start(r#"{"journalist_surname_latin": null, "keywords": {}, "group_code": null}"#).await;
+    let a = assist(&format!("http://{addr}/v1"));
+    let m = mail("a.papadaki@example.gr", "Για την πρωινή εκπομπή", "https://youtu.be/as0101");
+    let p = omni_email::assist::interpret(&m, &roster(), &shows(), &ParserConfig::default(), Some(&a)).await;
+    assert_eq!(p.group.unwrap().how, omni_email::groups::GroupResolution::Subject);
+    // Journalist known, keyword made from the subject, group decided: no call.
+    assert!(mock.lock().unwrap().requests.is_empty());
 }

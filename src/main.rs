@@ -228,14 +228,7 @@ async fn mail_preview(
         omni_email::assist::Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
     });
     for mail in &mails {
-        let mut parsed = omni_email::parser::parse(mail, &roster, &config.parser);
-        if let Some(a) = &assist {
-            let body = mail.readable_body();
-            if a.wanted(&parsed, &body) {
-                a.refine(mail, &body, &mut parsed, &roster, &config.parser).await;
-            }
-        }
-        omni_email::groups::resolve_group(mail, &mut parsed, &roster, &groups);
+        let parsed = omni_email::assist::interpret(mail, &roster, &groups, &config.parser, assist.as_ref()).await;
         let seen = repo
             .get_processed_mail(&omni_email::watcher::mail_key(mail))?
             .map(|p| p.outcome);
