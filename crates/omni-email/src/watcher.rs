@@ -15,7 +15,7 @@ use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 use crate::assist::Assist;
 use crate::graph::{GraphMailSource, RetryAfter};
 use crate::mail::InboundMail;
-use crate::parser::{self, ParsedEmail, Tier};
+use crate::parser::{ParsedEmail, Tier};
 use crate::source::{MailGone, MailHeader, MailOutcome, MailSource};
 
 /// New messages processed per poll. The rest wait for the next poll, oldest
@@ -363,15 +363,9 @@ impl EmailWatcher {
         info!("EmailWatcher: processing email from '{}', subject '{}'", mail.from_address, mail.subject);
 
         let roster = self.repo.list_journalists()?;
-        let mut parsed = parser::parse(mail, &roster, &self.config.parser);
-        let body = mail.readable_body();
-        if self.assist.wanted(&parsed, &body) {
-            self.assist.refine(mail, &body, &mut parsed, &roster, &self.config.parser).await;
-        }
-        // After the assist, which may have named the journalist whose
-        // default group decides (plan P4.18).
         let groups = self.repo.list_groups()?;
-        crate::groups::resolve_group(mail, &mut parsed, &roster, &groups);
+        let parsed =
+            crate::assist::interpret(mail, &roster, &groups, &self.config.parser, Some(self.assist.as_ref())).await;
         let default_priority = roster
             .iter()
             .find(|j| j.surname == parsed.journalist.surname)
