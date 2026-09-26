@@ -1603,6 +1603,34 @@ impl Repository {
 
     /// Record (or update) what a message produced. Called only after its
     /// jobs are in the queue, so a row here means "nothing left to do".
+    /// Where the last poll of `mailbox` got to (plan P4.8). `None` before the
+    /// first poll that saw a message.
+    pub fn get_mail_checkpoint(&self, mailbox: &str) -> Result<Option<chrono::DateTime<Utc>>> {
+        let conn = self.pool.get()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT modified_since FROM mail_checkpoints WHERE mailbox = ?",
+                params![mailbox],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(timestamps::parse_opt(raw))
+    }
+
+    pub fn set_mail_checkpoint(&self, mailbox: &str, modified_since: chrono::DateTime<Utc>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            r#"
+            INSERT INTO mail_checkpoints (mailbox, modified_since, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(mailbox) DO UPDATE SET
+                modified_since = excluded.modified_since,
+                updated_at     = excluded.updated_at
+            "#,
+            params![mailbox, timestamps::format(modified_since), timestamps::now_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(

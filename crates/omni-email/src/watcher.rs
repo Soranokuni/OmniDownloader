@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,10 +16,31 @@ use crate::assist::Assist;
 use crate::graph::{GraphMailSource, RetryAfter};
 use crate::mail::InboundMail;
 use crate::parser::{self, ParsedEmail, Tier};
-use crate::source::{MailOutcome, MailSource};
+use crate::source::{MailGone, MailHeader, MailOutcome, MailSource};
 
-/// Messages fetched per poll. The rest wait for the next poll, oldest first.
+/// New messages processed per poll. The rest wait for the next poll, oldest
+/// change first; the checkpoint does not pass them.
 const FETCH_LIMIT: usize = 20;
+
+/// Headers listed per poll at most. Only reached when a person bulk-edits
+/// thousands of mails at once (select all, mark read); they are all already
+/// known or too old, so they cost a listing, not a fetch.
+pub const LIST_LIMIT: usize = 5000;
+
+/// Each poll lists from this far before the checkpoint, so a message whose
+/// change time the server stamps slightly late is not stepped over. Mail seen
+/// twice is harmless: `processed_mail` recognises it.
+pub const CHECKPOINT_OVERLAP: chrono::Duration = chrono::Duration::minutes(15);
+
+/// First poll of a mailbox (no checkpoint yet): look back this far. Mail the
+/// old IMAP build already handled is in `processed_mail` and is not queued
+/// again.
+pub const FIRST_RUN_LOOKBACK: chrono::Duration = chrono::Duration::hours(24);
+
+/// A mail received this long before the checkpoint is not ingested even when
+/// it shows up as changed (someone flagged or moved a month-old mail). Long
+/// enough for a Monday rescue of a Friday mail from Junk.
+pub const MAX_MAIL_AGE: chrono::Duration = chrono::Duration::hours(72);
 
 /// Consecutive processing failures before a message is given up on and left
 /// unread for a human (plan P4.2: "Omni/Failed"). A transient failure (the
@@ -46,6 +68,13 @@ pub struct EmailWatcher {
 /// What one poll did, for health and tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PollReport {
+    /// Headers the listing returned (changed since the checkpoint).
+    pub listed: usize,
+    /// Already in `processed_mail`: not fetched again.
+    pub already_seen: usize,
+    /// Received before the age floor: not ingested.
+    pub too_old: usize,
+    /// Fetched in full, to be processed.
     pub fetched: usize,
     pub processed: usize,
     /// Failed this time, will be retried next poll.
@@ -165,74 +194,152 @@ impl EmailWatcher {
         }
     }
 
-    /// One poll: fetch, process, and mark each message **only after** what it
-    /// produced is persisted (defect E-02 marked everything `\Seen`, success
-    /// or not, so a failed parse silently lost the links).
+    /// One poll (plan P4.8): list what changed since the checkpoint, fetch
+    /// and process only what `processed_mail` has not seen, then move the
+    /// checkpoint up to the last message that is settled.
+    ///
+    /// A message is recorded **only after** what it produced is persisted
+    /// (defect E-02 marked everything `\Seen`, success or not, so a failed
+    /// parse silently lost the links). The mailbox may be read-only: nothing
+    /// here depends on a message being marked.
     pub async fn poll_once(&self) -> Result<PollReport> {
-        let mails = self.source.fetch_unprocessed(FETCH_LIMIT).await?;
+        let now = Utc::now();
+        let key = self.source.checkpoint_key();
+        let checkpoint = self.repo.get_mail_checkpoint(&key)?;
+        let (since, received_floor) = match checkpoint {
+            Some(c) => (c - CHECKPOINT_OVERLAP, c - MAX_MAIL_AGE),
+            None => (now - FIRST_RUN_LOOKBACK, now - FIRST_RUN_LOOKBACK),
+        };
+        let headers = self.source.list_changed(since, LIST_LIMIT).await?;
         let mut report = PollReport {
-            fetched: mails.len(),
+            listed: headers.len(),
             ..Default::default()
         };
-        if !mails.is_empty() {
-            info!("EmailWatcher: {} unread message(s)", mails.len());
+        if headers.len() >= LIST_LIMIT {
+            warn!("EmailWatcher: listing hit {LIST_LIMIT} messages changed since {since}; the rest wait for later polls");
         }
 
-        for mail in &mails {
-            match self.process_mail(mail).await {
-                Ok(Handled::GaveUpEarlier) => {
-                    // Recorded as failed on an earlier run and still showing
-                    // as unprocessed: leave it for the human it was left for.
-                }
-                Ok(Handled::Done) => {
-                    self.attempts.lock().unwrap().remove(&mail.id);
-                    if let Err(e) = self.source.mark_processed(&mail.id, MailOutcome::Processed).await {
-                        // The jobs exist; the next poll sees the message again
-                        // and dedup keeps it from queueing twice.
-                        warn!("EmailWatcher: could not mark message {} processed: {e:#}", mail.id);
-                    }
-                    report.processed += 1;
-                }
-                Err(e) => {
-                    let n = {
-                        let mut attempts = self.attempts.lock().unwrap();
-                        let n = attempts.entry(mail.id.clone()).or_insert(0);
-                        *n += 1;
-                        *n
-                    };
-                    error!(
-                        "EmailWatcher: processing '{}' failed (attempt {n}/{MAX_PROCESS_ATTEMPTS}): {e:#}",
-                        mail.subject
-                    );
-                    if n >= MAX_PROCESS_ATTEMPTS {
-                        let _ = self.repo.log_audit(
-                            "ERROR",
-                            "EMAIL",
-                            &format!("Gave up on email '{}' from {}: {}", mail.subject, mail.from_address, short_reason(&e)),
-                        );
-                        let _ = self.repo.record_processed_mail(&ProcessedMail {
-                            internet_message_id: mail_key(mail),
-                            source_id: Some(mail.id.clone()),
-                            processed_at: None,
-                            outcome: MailOutcome::Failed.as_str().into(),
-                            from_address: Some(mail.from_address.clone()),
-                            subject: Some(mail.subject.clone()),
-                            jobs_json: "[]".into(),
-                        });
-                        match self.source.mark_processed(&mail.id, MailOutcome::Failed).await {
-                            Ok(()) => {
-                                self.attempts.lock().unwrap().remove(&mail.id);
-                                report.failed += 1;
-                            }
-                            Err(e) => warn!("EmailWatcher: could not mark message {} failed: {e:#}", mail.id),
-                        }
-                    } else {
-                        report.retrying += 1;
-                    }
-                }
+        // The checkpoint may pass a message only once it is settled: done,
+        // given up on, gone, or too old. One still being retried holds it,
+        // though later messages are still processed (and recorded, so the
+        // next poll skips them cheaply).
+        let mut advance_to = checkpoint;
+        let mut held = false;
+        for h in &headers {
+            let settled = self.handle(h, received_floor, &mut report).await?;
+            if !settled {
+                held = true;
+            } else if !held && advance_to.map_or(true, |c| h.modified_at > c) {
+                advance_to = Some(h.modified_at);
             }
         }
+        if advance_to != checkpoint {
+            if let Some(t) = advance_to {
+                self.repo.set_mail_checkpoint(&key, t)?;
+            }
+        }
+        if report.fetched > 0 {
+            info!(
+                "EmailWatcher: {} new message(s); {} processed, {} retrying, {} failed",
+                report.fetched, report.processed, report.retrying, report.failed
+            );
+        }
         Ok(report)
+    }
+
+    /// Deal with one listed message. `Ok(true)` when it is settled and the
+    /// checkpoint may pass it.
+    async fn handle(&self, h: &MailHeader, received_floor: DateTime<Utc>, report: &mut PollReport) -> Result<bool> {
+        let key = key_for(&h.internet_message_id, &h.id);
+        // E-07, and the heart of read-only ingest: seen before, nothing to
+        // do, whatever the mailbox says about read state.
+        if self.repo.get_processed_mail(&key)?.is_some() {
+            report.already_seen += 1;
+            return Ok(true);
+        }
+        if h.received_at.is_some_and(|r| r < received_floor) {
+            info!(
+                "EmailWatcher: not ingesting '{}' from {}: received {}, before {received_floor}",
+                h.subject,
+                h.from_address,
+                h.received_at.map(|r| r.to_rfc3339()).unwrap_or_default()
+            );
+            report.too_old += 1;
+            return Ok(true);
+        }
+        if report.fetched >= FETCH_LIMIT {
+            return Ok(false);
+        }
+
+        report.fetched += 1;
+        let result = match self.source.fetch_mail(&h.id).await {
+            Ok(mail) => self.process_mail(&mail).await.map(|handled| (mail, handled)),
+            Err(e) if e.chain().any(|c| c.is::<MailGone>()) => {
+                info!("EmailWatcher: '{}' left the inbox before it was read; skipped", h.subject);
+                self.attempts.lock().unwrap().remove(&h.id);
+                return Ok(true);
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok((_, Handled::GaveUpEarlier)) => Ok(true),
+            Ok((mail, Handled::Done)) => {
+                self.attempts.lock().unwrap().remove(&h.id);
+                if let Err(e) = self.source.mark_processed(&mail.id, MailOutcome::Processed).await {
+                    // The jobs and the processed_mail row exist; marking is
+                    // only a courtesy to people reading the mailbox.
+                    warn!("EmailWatcher: could not mark message {} processed: {e:#}", mail.id);
+                }
+                report.processed += 1;
+                Ok(true)
+            }
+            Err(e) => Ok(self.note_failure(h, &key, &e, report).await),
+        }
+    }
+
+    /// Count a failed attempt; after [`MAX_PROCESS_ATTEMPTS`] record the
+    /// message as FAILED so it stops holding the checkpoint. Returns whether
+    /// it is now settled.
+    async fn note_failure(&self, h: &MailHeader, key: &str, e: &anyhow::Error, report: &mut PollReport) -> bool {
+        let n = {
+            let mut attempts = self.attempts.lock().unwrap();
+            let n = attempts.entry(h.id.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        error!(
+            "EmailWatcher: processing '{}' failed (attempt {n}/{MAX_PROCESS_ATTEMPTS}): {e:#}",
+            h.subject
+        );
+        if n < MAX_PROCESS_ATTEMPTS {
+            report.retrying += 1;
+            return false;
+        }
+        let _ = self.repo.log_audit(
+            "ERROR",
+            "EMAIL",
+            &format!("Gave up on email '{}' from {}: {}", h.subject, h.from_address, short_reason(e)),
+        );
+        if let Err(db) = self.repo.record_processed_mail(&ProcessedMail {
+            internet_message_id: key.to_string(),
+            source_id: Some(h.id.clone()),
+            processed_at: None,
+            outcome: MailOutcome::Failed.as_str().into(),
+            from_address: Some(h.from_address.clone()),
+            subject: Some(h.subject.clone()),
+            jobs_json: "[]".into(),
+        }) {
+            // Not recorded: it must keep holding the checkpoint, or it is lost.
+            warn!("EmailWatcher: could not record '{}' as failed: {db:#}", h.subject);
+            report.retrying += 1;
+            return false;
+        }
+        self.attempts.lock().unwrap().remove(&h.id);
+        if let Err(e) = self.source.mark_processed(&h.id, MailOutcome::Failed).await {
+            warn!("EmailWatcher: could not mark message {} failed: {e:#}", h.id);
+        }
+        report.failed += 1;
+        true
     }
 
     /// Parse one message and queue its jobs (plan P4.5).
@@ -432,9 +539,13 @@ fn attachment_extension(name: &str) -> String {
 /// Idempotency key: the Message-ID, or the provider id for the rare message
 /// that has none (a hand-crafted or broken sender).
 pub fn mail_key(mail: &InboundMail) -> String {
-    let mid = mail.internet_message_id.trim();
+    key_for(&mail.internet_message_id, &mail.id)
+}
+
+fn key_for(internet_message_id: &str, provider_id: &str) -> String {
+    let mid = internet_message_id.trim();
     if mid.is_empty() {
-        format!("source:{}", mail.id)
+        format!("source:{provider_id}")
     } else {
         mid.to_string()
     }

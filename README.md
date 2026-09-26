@@ -272,7 +272,9 @@ source; IMAP support has been removed.
 1. **Entra ID → App registrations → New registration.** Single tenant, no
    redirect URI. Note the *Application (client) ID* and *Directory (tenant) ID*.
 2. **API permissions → Add → Microsoft Graph → Application permissions:**
-   `Mail.ReadWrite` and `Mail.Send`. Grant admin consent.
+   `Mail.Read`. Grant admin consent. That is all the daemon needs: it never
+   writes to the mailbox unless you also grant `Mail.ReadWrite` and set
+   `graph.write_access` (see below).
 3. **Certificates & secrets → New client secret.** Copy the value once.
 4. **Limit the app to the ingest mailbox.** Without this, application
    permissions reach every mailbox in the tenant. In Exchange Online
@@ -294,10 +296,23 @@ source; IMAP support has been removed.
    .\target\release\omni-ingest.exe secrets set graph.client_secret
    ```
 
-Processed mail is marked read and moved to `Omni/Processed`. Mail that could
-not be processed is moved to `Omni/Failed` and left **unread**, so a person
-sees it. Both folders are created on first use. A message is never processed
-twice: the daemon remembers every Message-ID it has handled.
+**How mail is picked up.** Each poll lists the Inbox messages changed since the
+last poll (with a 15-minute overlap) and processes those whose Message-ID the
+database has not seen. Read state does not matter: someone opening the ingest
+mailbox in Outlook hides nothing, and a message is never processed twice. A
+mail moved into the Inbox later (rescued from Junk) is picked up, provided it
+was received no more than 72 hours before the last poll. On the very first
+poll the daemon looks back 24 hours.
+
+With `Mail.Read` alone the mailbox is left exactly as it is. A mail that could
+not be processed after three attempts is recorded as failed and appears in the
+admin log (`Gave up on email ...`), not in the mailbox.
+
+**Optional: mark and file mail in the mailbox.** Grant `Mail.ReadWrite`
+instead and set `"write_access": true` under `graph`: processed mail is then
+marked read and moved to `Omni/Processed`, and mail that could not be
+processed is moved to `Omni/Failed` and left **unread**. Both folders are
+created on first use.
 
 ## Configuration and data that stay out of git
 

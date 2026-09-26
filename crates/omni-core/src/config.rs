@@ -266,8 +266,9 @@ impl TlsConfig {
 ///
 /// Used instead of IMAP whenever it is configured: Exchange Online no longer
 /// accepts the basic-auth IMAP login the daemon started with. The app
-/// registration needs `Mail.ReadWrite` and `Mail.Send` (application), limited
-/// to the ingest mailbox by an Exchange application access policy.
+/// registration needs `Mail.Read` (application), limited to the ingest
+/// mailbox by an Exchange application access policy. `Mail.ReadWrite` is
+/// optional and only used when `write_access` is set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphConfig {
     #[serde(default)]
@@ -281,6 +282,12 @@ pub struct GraphConfig {
     pub processed_folder: String,
     #[serde(default = "default_failed_folder")]
     pub failed_folder: String,
+    /// The app also holds `Mail.ReadWrite`: mark processed mail read and move
+    /// it to `processed_folder` / `failed_folder`. Off by default; with
+    /// `Mail.Read` alone the mailbox is never written and the database alone
+    /// records what was handled (plan P4.8).
+    #[serde(default)]
+    pub write_access: bool,
     /// Client secret — **runtime only**, loaded from the secret store
     /// (`graph.client_secret`). Never read from or written to config.json.
     #[serde(skip)]
@@ -303,6 +310,7 @@ impl Default for GraphConfig {
             mailbox: String::new(),
             processed_folder: default_processed_folder(),
             failed_folder: default_failed_folder(),
+            write_access: false,
             client_secret: String::new(),
         }
     }

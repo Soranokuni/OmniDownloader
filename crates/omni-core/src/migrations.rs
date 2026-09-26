@@ -273,6 +273,23 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_processed_mail_at ON processed_mail(processed_at);
         "#,
     ),
+    (
+        6,
+        // Where the last mail poll got to, per mailbox (plan P4.8).
+        //
+        // The station's Graph app has `Mail.Read` only, so nothing can be
+        // marked read or moved: "unread" says nothing about what the daemon
+        // has handled. The poll lists what changed since this point (minus an
+        // overlap) and `processed_mail` decides what is new. Losing the row
+        // costs Graph calls, never a duplicate job.
+        r#"
+        CREATE TABLE IF NOT EXISTS mail_checkpoints (
+            mailbox        TEXT PRIMARY KEY,
+            modified_since TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -400,7 +417,7 @@ mod tests {
         let v = apply(&mut conn, None).unwrap();
         assert_eq!(v, target_version());
         // The baseline tables must exist.
-        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail"] {
+        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail", "mail_checkpoints"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",

@@ -36,10 +36,11 @@
   "email_poll_interval_secs": 30,
 
   "graph": {
-    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, the mailbox is polled; otherwise email ingest is off. See README, 'Office 365 mailbox'.",
+    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, the mailbox is polled; otherwise email ingest is off. The app needs Mail.Read only; write_access (with Mail.ReadWrite) also marks and files mail under the two folders. See README, 'Office 365 mailbox'.",
     "tenant_id": "",
     "client_id": "",
     "mailbox": "ingest@example.gr",
+    "write_access": false,
     "processed_folder": "Omni/Processed",
     "failed_folder": "Omni/Failed"
   },
