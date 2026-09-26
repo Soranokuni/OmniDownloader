@@ -326,6 +326,22 @@ impl GraphConfig {
     }
 }
 
+/// Environment variables that override the Graph settings (plan P4.9).
+///
+/// For console and development runs, so a developer's own app registration
+/// never has to be typed into a config.json that sits in a working copy. The
+/// service should keep using config.json and the encrypted store: a service's
+/// environment lives in plaintext in the registry.
+pub mod env_vars {
+    pub const GRAPH_TENANT_ID: &str = "OMNI_GRAPH_TENANT_ID";
+    pub const GRAPH_CLIENT_ID: &str = "OMNI_GRAPH_CLIENT_ID";
+    pub const GRAPH_MAILBOX: &str = "OMNI_GRAPH_MAILBOX";
+    pub const GRAPH_CLIENT_SECRET: &str = "OMNI_GRAPH_CLIENT_SECRET";
+
+    /// Variables whose values must be redacted from every log line.
+    pub const SECRETS: &[&str] = &[GRAPH_CLIENT_SECRET];
+}
+
 /// What the LLM may do with an email (plan P4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -717,6 +733,29 @@ impl AppConfig {
         Ok(rewrote)
     }
 
+    /// Apply the `OMNI_GRAPH_*` overrides ([`env_vars`]). An unset or blank
+    /// variable leaves the setting alone. Returns the names applied, never
+    /// the values, for the start-up log.
+    ///
+    /// Call after [`AppConfig::adopt_secrets`]: the environment wins over the
+    /// store for the life of the process and is never written anywhere.
+    pub fn apply_env_overrides(&mut self, get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+        let mut applied = Vec::new();
+        let targets: [(&'static str, &mut String); 4] = [
+            (env_vars::GRAPH_TENANT_ID, &mut self.graph.tenant_id),
+            (env_vars::GRAPH_CLIENT_ID, &mut self.graph.client_id),
+            (env_vars::GRAPH_MAILBOX, &mut self.graph.mailbox),
+            (env_vars::GRAPH_CLIENT_SECRET, &mut self.graph.client_secret),
+        ];
+        for (name, field) in targets {
+            if let Some(value) = get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+                *field = value;
+                applied.push(name);
+            }
+        }
+        applied
+    }
+
     /// Resolve a config path against the **install directory** (plan P0.1, W-10).
     ///
     /// Under the Windows service the process working directory is
@@ -811,6 +850,35 @@ mod tests {
         let mut config = AppConfig::load_from_file(&path).unwrap();
         config.adopt_secrets(&store).unwrap();
         assert_eq!(config.graph.client_secret, "");
+    }
+
+    #[test]
+    fn environment_overrides_win_over_the_store_and_never_reach_config_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let store = SecretStore::new(dir.path().join("secrets.bin"));
+        store.set(keys::GRAPH_CLIENT_SECRET, "stored-secret").unwrap();
+
+        let mut config = AppConfig::default();
+        config.graph.tenant_id = "tenant-from-file".into();
+        config.adopt_secrets(&store).unwrap();
+        let env = |name: &str| match name {
+            "OMNI_GRAPH_CLIENT_ID" => Some("client-from-env".to_string()),
+            "OMNI_GRAPH_CLIENT_SECRET" => Some("  secret-from-env \n".to_string()),
+            "OMNI_GRAPH_MAILBOX" => Some("   ".to_string()),
+            _ => None,
+        };
+        let applied = config.apply_env_overrides(env);
+
+        assert_eq!(applied, vec![env_vars::GRAPH_CLIENT_ID, env_vars::GRAPH_CLIENT_SECRET]);
+        assert_eq!(config.graph.tenant_id, "tenant-from-file", "unset variable changed the setting");
+        assert_eq!(config.graph.client_id, "client-from-env");
+        assert_eq!(config.graph.client_secret, "secret-from-env");
+        assert_eq!(config.graph.mailbox, "", "a blank variable must not count");
+
+        config.save_to_file(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("secret-from-env"));
+        assert_eq!(store.get(keys::GRAPH_CLIENT_SECRET).unwrap().as_deref(), Some("stored-secret"));
     }
 
     #[test]

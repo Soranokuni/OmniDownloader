@@ -296,6 +296,15 @@ source; IMAP support has been removed.
    .\target\release\omni-ingest.exe secrets set graph.client_secret
    ```
 
+   Or use `/setup` in the browser, which stores the secret the same way, then
+   **Test mailbox** on `/admin`.
+
+   For a console or development run you can instead set `OMNI_GRAPH_TENANT_ID`,
+   `OMNI_GRAPH_CLIENT_ID`, `OMNI_GRAPH_MAILBOX` and `OMNI_GRAPH_CLIENT_SECRET`
+   (see `.env.example`); a set variable wins over config.json and the store
+   and is never written to either. Do not use them for the service: a
+   service's environment is stored in plaintext in the registry.
+
 **How mail is picked up.** Each poll lists the Inbox messages changed since the
 last poll (with a 15-minute overlap) and processes those whose Message-ID the
 database has not seen. Read state does not matter: someone opening the ingest
