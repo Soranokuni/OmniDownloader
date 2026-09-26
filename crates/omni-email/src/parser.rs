@@ -475,6 +475,40 @@ fn find_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     found
 }
 
+/// Plain-text clients hard-wrap long lines (72–78 columns), and some break a
+/// long link at a `&` or `/` whatever the width. Join a line that ends in a
+/// link with the next line when that line is one token of URL characters
+/// and either the link ends on a separator or the line is wrap-width long
+/// (plan P4.12). A next line that is a new link, a number, or has any
+/// non-URL character (Greek, a space) is never joined.
+fn rejoin_wrapped_urls(body: &str) -> String {
+    const WRAP_WIDTH: usize = 70;
+    let is_url_char = |c: char| c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let next = line.trim();
+        if let Some(prev) = out.last_mut() {
+            let prev_trim = prev.trim_end();
+            let ends_in_url = find_urls(prev_trim).last().is_some_and(|(r, _)| r.end == prev_trim.len());
+            let continues = !next.is_empty()
+                && next.chars().all(is_url_char)
+                && !next.to_ascii_lowercase().starts_with("http")
+                && !next.to_ascii_lowercase().starts_with("www.")
+                && !next.starts_with(|c: char| c.is_ascii_digit() && next.len() <= 4);
+            let at_separator = prev_trim.ends_with(['&', '=', '?', '/', '-', '_', '%', '.'])
+                || next.starts_with(['&', '=', '?', '/', '#', '%']);
+            let wrap_long = prev.chars().count() >= WRAP_WIDTH;
+            if ends_in_url && continues && (at_separator || wrap_long) {
+                let joined = format!("{prev_trim}{next}");
+                *prev = joined;
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
 /// `text` with every link found by [`find_urls`] removed.
 fn strip_urls(text: &str) -> String {
     let mut out = text.to_string();
@@ -891,6 +925,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     // link is copied out of a chat app or a web page, and split the URL.
     let body = mail.readable_body().replace(INVISIBLE, "");
     let body = strip_quotes_and_signature(&body, is_forward(&mail.subject));
+    let body = rejoin_wrapped_urls(&body);
     let body = decontaminate_email_body(&body);
 
     // 2. Journalist.
