@@ -271,7 +271,7 @@ async fn the_listing_follows_paging_links_on_the_graph_host_only() {
 }
 
 #[tokio::test]
-async fn fetch_maps_one_message_with_its_attachments_and_asks_for_text_bodies() {
+async fn fetch_maps_one_message_with_its_attachments_and_takes_the_body_as_sent() {
     let (mock, addr) = start().await;
     let src = source(addr, "s3cret");
 
@@ -287,9 +287,10 @@ async fn fetch_maps_one_message_with_its_attachments_and_asks_for_text_bodies() 
     assert_eq!(m2.attachments.len(), 1);
     assert_eq!(m2.attachments[0].name, "limani.mp4");
 
+    // The body as sent (HTML): our converter, not Graph's, reads it (P4.10).
     let m = mock.lock().unwrap();
     let get = graph_calls(&m).into_iter().find(|c| c.path.ends_with("/messages/AAMk-1")).unwrap();
-    assert_eq!(get.prefer, "outlook.body-content-type=\"text\"");
+    assert!(!get.prefer.contains("body-content-type"), "{}", get.prefer);
 }
 
 #[tokio::test]
