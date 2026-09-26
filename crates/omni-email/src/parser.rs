@@ -575,8 +575,45 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The real target of a redirect wrapper (plan P4.13), or `None` when `url`
+/// is not one. Outlook Safe Links, Facebook / Instagram / Messenger outbound
+/// links, Google's `/url`, and Proofpoint URL Defense v2 and v3.
+fn unwrap_redirect(parsed: &Url, raw: &str) -> Option<String> {
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let param = |names: &[&str]| {
+        parsed
+            .query_pairs()
+            .find(|(k, _)| names.contains(&k.as_ref()))
+            .map(|(_, v)| v.into_owned())
+            .filter(|v| v.starts_with("http://") || v.starts_with("https://") || v.starts_with("www."))
+    };
+    if host.ends_with("safelinks.protection.outlook.com") {
+        return param(&["url"]);
+    }
+    if ["l.facebook.com", "lm.facebook.com", "l.instagram.com", "l.messenger.com"].contains(&host.as_str())
+        && parsed.path() == "/l.php"
+    {
+        return param(&["u"]);
+    }
+    let google = host == "google.com" || host.starts_with("www.google.") || host.starts_with("google.");
+    if google && parsed.path() == "/url" {
+        return param(&["q", "url"]);
+    }
+    if host == "urldefense.com" {
+        // v3: https://urldefense.com/v3/__https://real.example/path__;!!token
+        let rest = raw.split_once("/v3/__")?.1;
+        return rest.split_once("__;").map(|(target, _)| target.to_string());
+    }
+    if host == "urldefense.proofpoint.com" && parsed.path().starts_with("/v2/url") {
+        // v2 encodes the target: "-" for "%", "_" for "/".
+        let u = parsed.query_pairs().find(|(k, _)| k == "u")?.1.replace('-', "%").replace('_', "/");
+        return Some(percent_decode(&u)).filter(|t| t.starts_with("http"));
+    }
+    None
+}
+
 /// Trim punctuation a sentence glued to the link, add the scheme to a bare
-/// `www.` link, and unwrap Outlook Safe Links so the real target is queued.
+/// `www.` link, and unwrap redirect wrappers so the real target is queued.
 fn clean_url(raw: &str) -> Option<String> {
     let mut u = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', '>', '»', '"', '\'']).to_string();
     // A closing parenthesis belongs to the URL only if it opened one.
@@ -588,9 +625,9 @@ fn clean_url(raw: &str) -> Option<String> {
         u = format!("https://{u}");
     }
     let parsed = Url::parse(&u).ok()?;
-    let host = parsed.host_str()?.to_ascii_lowercase();
-    if host.ends_with("safelinks.protection.outlook.com") {
-        let target = parsed.query_pairs().find(|(k, _)| k == "url").map(|(_, v)| v.into_owned())?;
+    parsed.host_str()?;
+    if let Some(target) = unwrap_redirect(&parsed, &u) {
+        // A wrapper inside a wrapper (Safe Links around a Facebook link).
         return clean_url(&target);
     }
     Some(u)
@@ -1227,6 +1264,47 @@ mod tests {
         assert_eq!(classify("https://example.org/story", &c), Tier::Other);
         // Not fooled by a lookalike host.
         assert_eq!(classify("https://notyoutube.com/watch?v=x", &c), Tier::Other);
+    }
+
+    #[test]
+    fn redirect_wrappers_are_unwrapped_to_the_real_link() {
+        let cases = [
+            (
+                "https://l.facebook.com/l.php?u=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dfb1&h=AT0x",
+                "https://www.youtube.com/watch?v=fb1",
+            ),
+            ("https://www.google.com/url?q=https://youtu.be/g1&sa=D&ust=1", "https://youtu.be/g1"),
+            ("https://www.google.gr/url?sa=t&url=https%3A%2F%2Fvimeo.com%2F42", "https://vimeo.com/42"),
+            (
+                "https://urldefense.com/v3/__https://www.youtube.com/watch?v=pp3__;!!Ab12Cd!xyz$",
+                "https://www.youtube.com/watch?v=pp3",
+            ),
+            (
+                "https://urldefense.proofpoint.com/v2/url?u=https-3A__youtu.be_pp2&d=DwMF&c=x",
+                "https://youtu.be/pp2",
+            ),
+            (
+                "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fl.facebook.com%2Fl.php%3Fu%3Dhttps%253A%252F%252Fyoutu.be%252Fnested&data=05",
+                "https://youtu.be/nested",
+            ),
+        ];
+        for (wrapped, real) in cases {
+            assert_eq!(clean_url(wrapped).as_deref(), Some(real), "{wrapped}");
+        }
+        // Not wrappers: left alone.
+        assert_eq!(
+            clean_url("https://www.google.com/maps/place/Heraklion").as_deref(),
+            Some("https://www.google.com/maps/place/Heraklion")
+        );
+        assert_eq!(
+            clean_url("https://www.facebook.com/watch/?v=123").as_deref(),
+            Some("https://www.facebook.com/watch/?v=123")
+        );
+        // A wrapper whose target is not a web link stays as it is.
+        assert_eq!(
+            clean_url("https://www.google.com/url?q=javascript:alert(1)").as_deref(),
+            Some("https://www.google.com/url?q=javascript:alert(1)")
+        );
     }
 
     #[test]
