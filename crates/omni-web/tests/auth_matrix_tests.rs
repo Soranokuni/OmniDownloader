@@ -311,6 +311,48 @@ const MATRIX: &[Row] = &[
         "/api/journalists/PAPADAKI",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),
+    // ---- Taxonomy (plan P4.20): read for the MCR label; edits are admin ----
+    (
+        "GET",
+        "/api/groups",
+        &[(Anonymous, Denied), (AllowlistedIp, Reached), (Caller::User, Denied), (Mcr, Reached), (Admin, Reached)],
+    ),
+    ("POST", "/api/groups", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/groups/NEWS", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/journalists/PAPADAKI/groups", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // taxonomy.json lists staff and their addresses.
+    ("GET", "/api/admin/taxonomy", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/taxonomy", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     (
         "GET",
         "/api/system/status",

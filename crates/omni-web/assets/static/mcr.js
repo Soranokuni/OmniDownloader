@@ -224,7 +224,8 @@ function jobCard(job) {
       el('div', { class: 'progress' },
         el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),
       el('div', { class: 'job-meta' },
-        el('span', {}, `Journalist: ${job.journalist}`),
+        el('span', {}, `Journalist: ${job.journalist}`,
+          job.group_code ? el('span', { class: 'badge info', style: 'margin-left:8px', title: groupName(job.group_code) }, job.group_code) : null),
         el('span', {}, job.eta ? `ETA ${job.eta}` : ''),
       ),
     ),
@@ -310,26 +311,43 @@ async function discardJob(id) {
  * ------------------------------------------------------------------ */
 
 const filterSelect = document.getElementById('journalist-filter');
+const groupSelect = document.getElementById('group-filter');
 const searchInput = document.getElementById('archive-search');
 filterSelect.addEventListener('change', renderArchive);
+groupSelect.addEventListener('change', renderArchive);
 searchInput.addEventListener('input', renderArchive);
+
+/* Group labels (plan P4.20): code → name, for titles and the filter. */
+let groupNames = new Map();
+function groupName(code) {
+  return groupNames.get(code) || code;
+}
+api('/api/groups')
+  .then((data) => {
+    groupNames = new Map((data.groups || []).map((g) => [g.code, g.name]));
+    renderArchive();
+  })
+  .catch(() => { /* labels show as codes */ });
 
 function renderArchive() {
   syncJournalistFilter();
 
   const wanted = filterSelect.value;
+  const wantedGroup = groupSelect.value;
   const needle = searchInput.value.trim().toLowerCase();
 
   const rows = jobs.filter((job) => {
     if (wanted && job.journalist !== wanted) return false;
+    if (wantedGroup === '-' && job.group_code) return false;
+    if (wantedGroup && wantedGroup !== '-' && job.group_code !== wantedGroup) return false;
     if (!needle) return true;
-    return [job.slug, job.url, job.journalist, job.keyword]
+    return [job.slug, job.url, job.journalist, job.keyword, job.group_code]
       .some((field) => String(field || '').toLowerCase().includes(needle));
   });
 
   if (rows.length === 0) {
     render('archive-body', el('tr', {},
-      el('td', { colspan: '7', class: 'empty' }, 'No jobs match the filter.')));
+      el('td', { colspan: '8', class: 'empty' }, 'No jobs match the filter.')));
     return;
   }
 
@@ -337,6 +355,7 @@ function renderArchive() {
     el('td', { class: 'num' }, String(job.id)),
     el('td', { class: 'strong' }, `${job.slug}.mxf`),
     el('td', {}, el('span', { class: 'badge info' }, job.journalist)),
+    el('td', { title: job.group_code ? groupName(job.group_code) : '' }, job.group_code || '—'),
     el('td', {}, el('span', { class: `badge ${statusClass(job.status)}` }, job.status)),
     el('td', {}, fmtDuration(job.duration_secs)),
     // `media_format` is free text from ffprobe; it is a text node like
@@ -356,6 +375,15 @@ function syncJournalistFilter() {
     names.map((name) => el('option', { value: name, selected: name === current }, name)),
   );
   filterSelect.value = names.includes(current) ? current : '';
+
+  const codes = [...new Set([...groupNames.keys(), ...jobs.map((j) => j.group_code).filter(Boolean)])].sort();
+  const currentGroup = groupSelect.value;
+  render(groupSelect,
+    el('option', { value: '' }, 'All groups'),
+    el('option', { value: '-', selected: currentGroup === '-' }, 'No group'),
+    codes.map((code) => el('option', { value: code, selected: code === currentGroup }, `${code} — ${groupName(code)}`)),
+  );
+  groupSelect.value = currentGroup === '-' || codes.includes(currentGroup) ? currentGroup : '';
 }
 
 /* ------------------------------------------------------------------ *

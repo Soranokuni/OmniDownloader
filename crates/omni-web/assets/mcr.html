@@ -66,6 +66,8 @@
         <div class="row">
           <label for="journalist-filter" style="margin:0">Journalist</label>
           <select id="journalist-filter" style="width:auto"><option value="">All journalists</option></select>
+          <label for="group-filter" style="margin:0 0 0 12px">Group</label>
+          <select id="group-filter" style="width:auto"><option value="">All groups</option></select>
         </div>
         <input type="text" id="archive-search" placeholder="Search slug, keyword or URL…" style="width:280px">
       </div>
@@ -74,12 +76,12 @@
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>Broadcast slug</th><th>Journalist</th><th>Status</th>
+            <th>ID</th><th>Broadcast slug</th><th>Journalist</th><th>Group</th><th>Status</th>
             <th>Duration</th><th>Media format</th><th>Updated</th>
           </tr>
         </thead>
         <tbody id="archive-body">
-          <tr><td colspan="7" class="empty">Loading archive…</td></tr>
+          <tr><td colspan="8" class="empty">Loading archive…</td></tr>
         </tbody>
       </table>
     </div>
@@ -182,6 +184,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=2"></script>
+<script type="module" src="/static/mcr.js?v=3"></script>
 </body>
 </html>

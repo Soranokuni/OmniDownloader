@@ -55,6 +55,9 @@ impl WebServer {
                 get(api_get_journalists).post(api_save_journalist),
             )
             .route("/api/journalists/:surname", post(api_delete_journalist))
+            .route("/api/groups", get(api_get_groups).post(api_save_group))
+            .route("/api/groups/:code", post(api_delete_group))
+            .route("/api/journalists/:surname/groups", post(api_set_journalist_groups))
             .route("/api/system/status", get(api_system_status))
             .route("/api/events", get(api_events))
             // ---- Admin ----
@@ -70,6 +73,10 @@ impl WebServer {
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))
             .route("/api/admin/rollback-ytdl", post(api_admin_rollback_ytdl))
             .route("/api/admin/maintenance", get(api_admin_maintenance))
+            .route(
+                "/api/admin/taxonomy",
+                get(api_admin_export_taxonomy).post(api_admin_import_taxonomy),
+            )
             .route("/api/admin/maintenance/:name/run", post(api_admin_run_task))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))

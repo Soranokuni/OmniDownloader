@@ -745,6 +745,165 @@ pub async fn api_delete_journalist(
 }
 
 // ==========================================
+// Taxonomy: groups and membership (plan P4.20)
+// ==========================================
+
+/// The groups, for the MCR label and filter and the admin editor. Group
+/// names and descriptions are newsroom vocabulary, not personal data.
+pub async fn api_get_groups(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let groups = state
+        .repo
+        .list_groups()
+        .map_err(internal_error("Could not read the groups."))?;
+    Ok(Json(serde_json::json!({ "groups": groups })))
+}
+
+/// Create or update one group. Admin: groups shape what the LLM is told.
+pub async fn api_save_group(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(group): Json<omni_core::taxonomy::Group>,
+) -> JsonResult {
+    let group = group.normalized();
+    group.validate().map_err(ApiError::bad_request)?;
+    let saved = state
+        .repo
+        .save_group(&group)
+        .map_err(internal_error("Could not save the group."))?;
+    let _ = state
+        .repo
+        .log_audit("INFO", "ADMIN", &format!("Group {} saved by {}", saved.code, admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok", "group": saved })))
+}
+
+pub async fn api_delete_group(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(code): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let removed = state
+        .repo
+        .delete_group(&code)
+        .map_err(internal_error("Could not delete the group."))?;
+    if !removed {
+        return Err(ApiError::bad_request("No such group."));
+    }
+    let _ = state
+        .repo
+        .log_audit("WARN", "ADMIN", &format!("Group {} deleted by {}", code.to_uppercase(), admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+pub struct JournalistGroupsPayload {
+    /// Group codes, the default first.
+    groups: Vec<String>,
+}
+
+pub async fn api_set_journalist_groups(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(surname): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<JournalistGroupsPayload>,
+) -> JsonResult {
+    if payload.groups.len() > 20 {
+        return Err(ApiError::bad_request("At most 20 groups per person."));
+    }
+    let known: Vec<String> = state
+        .repo
+        .list_groups()
+        .map_err(internal_error("Could not read the groups."))?
+        .into_iter()
+        .map(|g| g.code)
+        .collect();
+    let codes: Vec<String> = payload.groups.iter().map(|g| g.trim().to_uppercase()).filter(|g| !g.is_empty()).collect();
+    if let Some(unknown) = codes.iter().find(|c| !known.contains(c)) {
+        return Err(ApiError::bad_request(format!("No group {unknown}.")));
+    }
+    let surname = surname.trim().to_uppercase();
+    if !state
+        .repo
+        .list_journalists()
+        .map_err(internal_error("Could not read the roster."))?
+        .iter()
+        .any(|j| j.surname == surname)
+    {
+        return Err(ApiError::bad_request("No such journalist."));
+    }
+    state
+        .repo
+        .set_journalist_groups(&surname, &codes)
+        .map_err(internal_error("Could not save the groups."))?;
+    let _ = state.repo.log_audit(
+        "INFO",
+        "ADMIN",
+        &format!("Groups of {surname} set to [{}] by {}", codes.join(", "), admin.email),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// taxonomy.json, for download. Admin only: it lists staff and addresses.
+pub async fn api_admin_export_taxonomy(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let t = state
+        .repo
+        .export_taxonomy()
+        .map_err(internal_error("Could not export the taxonomy."))?;
+    Ok(Json(serde_json::json!(t)))
+}
+
+#[derive(Deserialize)]
+pub struct ImportTaxonomyPayload {
+    taxonomy: omni_core::taxonomy::Taxonomy,
+    /// Also delete groups and people the file does not list.
+    #[serde(default)]
+    replace: bool,
+}
+
+pub async fn api_admin_import_taxonomy(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<ImportTaxonomyPayload>,
+) -> JsonResult {
+    // Check first, so a mistake in the file comes back as a list the admin
+    // can fix, not as "internal error".
+    let known: Vec<String> = if payload.replace {
+        Vec::new()
+    } else {
+        state
+            .repo
+            .list_groups()
+            .map_err(internal_error("Could not read the groups."))?
+            .into_iter()
+            .map(|g| g.code)
+            .collect()
+    };
+    if let Err(problems) = payload.taxonomy.checked(&known) {
+        return Err(ApiError::bad_request(format!("The file was not imported:\n- {}", problems.join("\n- "))));
+    }
+    if payload.taxonomy.people.iter().any(|p| p.surname.trim().eq_ignore_ascii_case("MCR")) {
+        return Err(ApiError::bad_request("The file was not imported: MCR is built in."));
+    }
+    let report = state
+        .repo
+        .import_taxonomy(&payload.taxonomy, payload.replace)
+        .map_err(internal_error("Could not import the taxonomy."))?;
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!(
+            "Taxonomy imported{} by {}: {} groups and {} people saved, {} groups and {} people removed",
+            if payload.replace { " (replace)" } else { "" },
+            admin.email,
+            report.groups_saved,
+            report.people_saved,
+            report.groups_removed,
+            report.people_removed
+        ),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok", "report": report })))
+}
+
+// ==========================================
 // Admin API
 // ==========================================
 

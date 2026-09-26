@@ -97,6 +97,86 @@
       </div>
     </section>
 
+    <section class="card stack" id="taxonomy">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Newsroom taxonomy</h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="taxonomy-export">Export taxonomy.json</button>
+          <button class="btn" type="button" id="taxonomy-import-btn">Import…</button>
+          <input type="file" id="taxonomy-file" accept="application/json,.json" hidden>
+        </div>
+      </div>
+      <p class="note">
+        Groups are the news desk, each show and each desk. A mail's group is
+        decided from its subject, from "για …" in the body, or from the
+        journalist's first group; the LLM chooses from this list only when
+        none of those decide. The group is a label on the job: it never
+        changes the file name or where the file is delivered.
+      </p>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="taxonomy-replace" style="width:auto">
+        <span>On import, also remove groups and people the file does not list</span>
+      </label>
+      <p id="taxonomy-result" class="note" style="white-space:pre-line"></p>
+
+      <h3 class="card-title" style="font-size:0.95rem">Groups</h3>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr><th>Code</th><th>Name</th><th>Kind</th><th>Keywords</th><th>Description</th><th class="right">Actions</th></tr>
+          </thead>
+          <tbody id="groups-body">
+            <tr><td colspan="6" class="empty">Loading groups…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <form id="group-form" class="stack">
+        <div class="grid-2">
+          <div>
+            <label for="g-code">Code (A–Z, 0–9, _)</label>
+            <input type="text" id="g-code" required maxlength="20" placeholder="NEWS" autocomplete="off">
+          </div>
+          <div>
+            <label for="g-name">Name</label>
+            <input type="text" id="g-name" required placeholder="Κεντρικό Δελτίο Ειδήσεων">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="g-kind">Kind</label>
+            <select id="g-kind">
+              <option value="news">News</option>
+              <option value="show" selected>Show</option>
+              <option value="desk">Desk</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+          <div>
+            <label for="g-keywords">Keywords that name it (comma-separated)</label>
+            <input type="text" id="g-keywords" placeholder="ΔΕΛΤΙΟ, ΚΕΝΤΡΙΚΟ ΔΕΛΤΙΟ">
+          </div>
+        </div>
+        <div>
+          <label for="g-description">Description (for people and the LLM)</label>
+          <textarea id="g-description" rows="2" maxlength="500"></textarea>
+        </div>
+        <button class="btn btn-primary" type="submit">Save group</button>
+      </form>
+
+      <h3 class="card-title" style="font-size:0.95rem">Who belongs where</h3>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr><th>Surname</th><th>Name</th><th>Addresses</th><th>Groups (default first)</th><th class="right"></th></tr>
+          </thead>
+          <tbody id="members-body">
+            <tr><td colspan="5" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">Journalists themselves are added on the MCR desk (Journalists tab) or by importing taxonomy.json.</p>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">Audit log</h2>
@@ -195,6 +275,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=3"></script>
+<script type="module" src="/static/admin.js?v=4"></script>
 </body>
 </html>
