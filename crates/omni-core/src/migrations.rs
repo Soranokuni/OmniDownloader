@@ -290,6 +290,30 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        7,
+        // The newsroom taxonomy (plan P4.17): groups (the news desk, each
+        // show) and who belongs to which. `position` orders a person's
+        // groups; position 0 is their default. A group is a label on the job
+        // and never changes a file name or a delivery path.
+        r#"
+        CREATE TABLE IF NOT EXISTS groups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            code        TEXT NOT NULL UNIQUE,
+            name        TEXT NOT NULL,
+            kind        TEXT NOT NULL DEFAULT 'show',
+            keywords    TEXT NOT NULL DEFAULT '[]',
+            description TEXT NOT NULL DEFAULT '',
+            created_at  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS journalist_groups (
+            journalist_id INTEGER NOT NULL REFERENCES journalists(id) ON DELETE CASCADE,
+            group_id      INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            position      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (journalist_id, group_id)
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -417,7 +441,7 @@ mod tests {
         let v = apply(&mut conn, None).unwrap();
         assert_eq!(v, target_version());
         // The baseline tables must exist.
-        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail", "mail_checkpoints"] {
+        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail", "mail_checkpoints", "groups", "journalist_groups"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",

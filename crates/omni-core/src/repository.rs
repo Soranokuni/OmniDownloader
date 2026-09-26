@@ -15,6 +15,7 @@ use crate::models::{
     ProcessedMail, QueueSummary, User,
     UserRole,
 };
+use crate::taxonomy::{Group, ImportReport, Person, Taxonomy};
 use crate::timestamps;
 
 /// Default window for treating a re-sent link as already delivered.
@@ -83,6 +84,7 @@ impl Repository {
         }
 
         self.seed_journalists_from_file(&conn)?;
+        self.seed_taxonomy_from_file(&conn)?;
 
         Ok(())
     }
@@ -1474,19 +1476,33 @@ impl Repository {
 
     pub fn list_journalists(&self) -> Result<Vec<Journalist>> {
         let conn = self.pool.get()?;
+        let mut memberships: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT jg.journalist_id, g.code FROM journalist_groups jg JOIN groups g ON g.id = jg.group_id
+                 ORDER BY jg.journalist_id, jg.position, g.code",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, code) = row?;
+                memberships.entry(id).or_default().push(code);
+            }
+        }
         let mut stmt = conn.prepare("SELECT * FROM journalists ORDER BY surname ASC")?;
         let rows = stmt.query_map([], |row| {
             let emails_raw: String = row.get("emails")?;
             let emails: Vec<String> = serde_json::from_str(&emails_raw).unwrap_or_default();
             let aliases_raw: String = row.get("aliases")?;
             let aliases: Vec<String> = serde_json::from_str(&aliases_raw).unwrap_or_default();
+            let id: i64 = row.get("id")?;
             Ok(Journalist {
-                id: row.get("id")?,
+                id,
                 surname: row.get("surname")?,
                 full_name: row.get("full_name")?,
                 emails,
                 default_priority: row.get("default_priority")?,
                 aliases,
+                groups: memberships.get(&id).cloned().unwrap_or_default(),
                 created_at: timestamps::parse_opt(row.get("created_at").ok()),
             })
         })?;
@@ -1536,6 +1552,179 @@ impl Repository {
     pub fn delete_journalist(&self, surname: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM journalists WHERE surname = ?", params![surname.to_uppercase()])?;
+        Ok(())
+    }
+
+    // ==========================================
+    // Taxonomy: groups and membership (plan P4.17)
+    // ==========================================
+
+    pub fn list_groups(&self) -> Result<Vec<Group>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT code, name, kind, keywords, description FROM groups ORDER BY code")?;
+        let rows = stmt.query_map([], |r| {
+            let keywords: String = r.get(3)?;
+            Ok(Group {
+                code: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                keywords: serde_json::from_str(&keywords).unwrap_or_default(),
+                description: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Insert or update one group by code. The group is normalised and
+    /// validated first; an invalid one is an error naming the problem.
+    pub fn save_group(&self, group: &Group) -> Result<Group> {
+        let g = group.normalized();
+        g.validate().map_err(anyhow::Error::msg)?;
+        let conn = self.pool.get()?;
+        upsert_group(&conn, &g)?;
+        Ok(g)
+    }
+
+    /// Delete a group; its memberships go with it (foreign-key cascade).
+    /// Jobs keep the label they were given.
+    pub fn delete_group(&self, code: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("DELETE FROM groups WHERE code = ?", params![code.trim().to_uppercase()])? == 1)
+    }
+
+    /// Replace a journalist's groups; the first becomes the default. Every
+    /// code must exist.
+    pub fn set_journalist_groups(&self, surname: &str, codes: &[String]) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        replace_memberships(&tx, &surname.trim().to_uppercase(), codes)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The whole taxonomy, for taxonomy.json.
+    pub fn export_taxonomy(&self) -> Result<Taxonomy> {
+        let people = self
+            .list_journalists()?
+            .into_iter()
+            .filter(|j| j.surname != "MCR")
+            .map(|j| Person {
+                surname: j.surname,
+                full_name: j.full_name,
+                emails: j.emails,
+                aliases: j.aliases,
+                default_priority: j.default_priority,
+                groups: j.groups,
+            })
+            .collect();
+        Ok(Taxonomy {
+            version: crate::taxonomy::TAXONOMY_VERSION,
+            groups: self.list_groups()?,
+            people,
+        })
+    }
+
+    /// Import taxonomy.json in one transaction: all of it or none of it.
+    ///
+    /// Groups and people in the file are inserted or updated. With
+    /// `replace`, groups and people *not* in the file are deleted too (MCR
+    /// always stays). A person's groups are replaced by the file's list.
+    /// Invalid input is refused with every problem listed.
+    pub fn import_taxonomy(&self, input: &Taxonomy, replace: bool) -> Result<ImportReport> {
+        let known: Vec<String> = if replace {
+            Vec::new()
+        } else {
+            self.list_groups()?.into_iter().map(|g| g.code).collect()
+        };
+        let t = input.checked(&known).map_err(|errors| anyhow::anyhow!("taxonomy refused:\n- {}", errors.join("\n- ")))?;
+        if t.people.iter().any(|p| p.surname == "MCR") {
+            anyhow::bail!("taxonomy refused:\n- MCR is built in and cannot be imported");
+        }
+
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let mut report = ImportReport::default();
+        for g in &t.groups {
+            upsert_group(&tx, g)?;
+            report.groups_saved += 1;
+        }
+        for p in &t.people {
+            tx.execute(
+                r#"
+                INSERT INTO journalists (surname, full_name, emails, default_priority, aliases)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(surname) DO UPDATE SET
+                    full_name = excluded.full_name,
+                    emails = excluded.emails,
+                    default_priority = excluded.default_priority,
+                    aliases = excluded.aliases
+                "#,
+                params![
+                    p.surname,
+                    p.full_name,
+                    serde_json::to_string(&p.emails)?,
+                    p.default_priority,
+                    serde_json::to_string(&p.aliases)?
+                ],
+            )?;
+            replace_memberships(&tx, &p.surname, &p.groups)?;
+            report.people_saved += 1;
+        }
+        if replace {
+            let keep_groups: Vec<&str> = t.groups.iter().map(|g| g.code.as_str()).collect();
+            for code in self.list_groups_in(&tx)? {
+                if !keep_groups.contains(&code.as_str()) {
+                    tx.execute("DELETE FROM groups WHERE code = ?", params![code])?;
+                    report.groups_removed += 1;
+                }
+            }
+            let keep_people: Vec<&str> = t.people.iter().map(|p| p.surname.as_str()).collect();
+            let surnames: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT surname FROM journalists WHERE surname <> 'MCR'")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for s in surnames {
+                if !keep_people.contains(&s.as_str()) {
+                    tx.execute("DELETE FROM journalists WHERE surname = ?", params![s])?;
+                    report.people_removed += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    fn list_groups_in(&self, conn: &rusqlite::Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT code FROM groups")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// First start with a `data/taxonomy.json` and no groups yet: import it
+    /// (merge). A bad file is logged and skipped; the daemon still starts.
+    fn seed_taxonomy_from_file(&self, conn: &rusqlite::Connection) -> Result<()> {
+        let groups: i64 = conn.query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))?;
+        if groups > 0 {
+            return Ok(());
+        }
+        let Some(path) = self.db_path.as_deref().and_then(|p| p.parent()).map(|d| d.join("taxonomy.json")) else {
+            return Ok(());
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let parsed: Taxonomy = match serde_json::from_str(&raw) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Ignoring {:?}: not a taxonomy file ({e})", path);
+                return Ok(());
+            }
+        };
+        match self.import_taxonomy(&parsed, false) {
+            Ok(r) => info!("Seeded {} groups and {} people from {:?}", r.groups_saved, r.people_saved, path),
+            Err(e) => warn!("Ignoring {:?}: {e:#}", path),
+        }
         Ok(())
     }
 
@@ -1784,3 +1973,40 @@ mod tests {
 }
 
 
+
+fn upsert_group(conn: &rusqlite::Connection, g: &Group) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO groups (code, name, kind, keywords, description, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            name = excluded.name,
+            kind = excluded.kind,
+            keywords = excluded.keywords,
+            description = excluded.description
+        "#,
+        params![g.code, g.name, g.kind, serde_json::to_string(&g.keywords)?, g.description, timestamps::now_string()],
+    )?;
+    Ok(())
+}
+
+/// Replace one journalist's memberships with `codes`, in order.
+fn replace_memberships(conn: &rusqlite::Connection, surname: &str, codes: &[String]) -> Result<()> {
+    let jid: i64 = conn
+        .query_row("SELECT id FROM journalists WHERE surname = ?", params![surname], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("no journalist named {surname}"))?;
+    conn.execute("DELETE FROM journalist_groups WHERE journalist_id = ?", params![jid])?;
+    for (pos, code) in codes.iter().enumerate() {
+        let code = code.trim().to_uppercase();
+        let gid: i64 = conn
+            .query_row("SELECT id FROM groups WHERE code = ?", params![code], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no group {code}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO journalist_groups (journalist_id, group_id, position) VALUES (?, ?, ?)",
+            params![jid, gid, pos as i64],
+        )?;
+    }
+    Ok(())
+}

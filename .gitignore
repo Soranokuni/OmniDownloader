@@ -82,6 +82,9 @@ desktop.ini
 
 # ---- Real newsroom roster: staff names and work addresses ----
 journalists.seed.json
+# The taxonomy export holds the same names and addresses; only the invented
+# example is tracked.
+taxonomy.json
 
 # ---- Internal working notes and agent instructions ----
 #
