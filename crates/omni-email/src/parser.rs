@@ -453,7 +453,8 @@ struct Line {
 fn find_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut found: Vec<(std::ops::Range<usize>, String)> = RE_URL
         .find_iter(text)
-        .filter_map(|m| clean_url(m.as_str()).map(|u| (m.range(), u)))
+        .flat_map(|m| split_glued(m.as_str()).into_iter().map(move |r| (m.start() + r.start)..(m.start() + r.end)))
+        .filter_map(|r| clean_url(&text[r.clone()]).map(|u| (r, u)))
         .collect();
     // Blank what was found (same byte length), so a bare match cannot start
     // inside a full URL.
@@ -507,6 +508,26 @@ fn rejoin_wrapped_urls(body: &str) -> String {
         out.push(line.to_string());
     }
     out.join("\n")
+}
+
+/// Two links written with no space between them (`…/a1,https://…/a2`,
+/// `…/a1https://…/a2`) are two links (plan P4.14). A scheme after `=`, `/`,
+/// `%` or `?` is part of the first link (`?url=https://…`, web archives)
+/// and does not split it.
+fn split_glued(m: &str) -> Vec<std::ops::Range<usize>> {
+    let lower = m.to_ascii_lowercase();
+    let mut cuts = vec![0];
+    for (i, _) in lower.match_indices("http") {
+        if i == 0 || !(lower[i..].starts_with("http://") || lower[i..].starts_with("https://")) {
+            continue;
+        }
+        let before = m[..i].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, ',' | ';' | '|')) {
+            cuts.push(i);
+        }
+    }
+    cuts.push(m.len());
+    cuts.windows(2).map(|w| w[0]..w[1]).collect()
 }
 
 /// `text` with every link found by [`find_urls`] removed.
@@ -615,11 +636,19 @@ fn unwrap_redirect(parsed: &Url, raw: &str) -> Option<String> {
 /// Trim punctuation a sentence glued to the link, add the scheme to a bare
 /// `www.` link, and unwrap redirect wrappers so the real target is queued.
 fn clean_url(raw: &str) -> Option<String> {
-    let mut u = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', '>', '»', '"', '\'']).to_string();
+    // Sentence punctuation, Greek included (ano teleia in both code points,
+    // Greek question mark),
+    // smart quotes, an ellipsis, markdown bold, and a separator left by
+    // split_glued.
+    const TRAILING: &[char] = &[
+        '.', ',', ';', ':', '!', '?', '>', '»', '"', '\'', '…', '\u{0387}', '\u{00B7}', '\u{037E}', '”', '’', '“', '‘',
+        '*', '_', '|',
+    ];
+    let mut u = raw.trim_start_matches(['*', '_']).trim_end_matches(TRAILING).to_string();
     // A closing parenthesis belongs to the URL only if it opened one.
     while u.ends_with(')') && u.matches(')').count() > u.matches('(').count() {
         u.pop();
-        u = u.trim_end_matches(['.', ',', ';', ':', '!', '?']).to_string();
+        u = u.trim_end_matches(TRAILING).to_string();
     }
     if u.to_ascii_lowercase().starts_with("www.") {
         u = format!("https://{u}");
@@ -1264,6 +1293,34 @@ mod tests {
         assert_eq!(classify("https://example.org/story", &c), Tier::Other);
         // Not fooled by a lookalike host.
         assert_eq!(classify("https://notyoutube.com/watch?v=x", &c), Tier::Other);
+    }
+
+    #[test]
+    fn links_come_out_of_brackets_quotes_markdown_and_greek_punctuation() {
+        let urls = |line: &str| find_urls(line).into_iter().map(|(_, u)| u).collect::<Vec<_>>();
+        let cases: &[(&str, &[&str])] = &[
+            ("<https://youtu.be/w1>", &["https://youtu.be/w1"]),
+            ("(δείτε https://youtu.be/w2)", &["https://youtu.be/w2"]),
+            ("[Δείτε το](https://youtu.be/w3)", &["https://youtu.be/w3"]),
+            ("**https://youtu.be/w4**", &["https://youtu.be/w4"]),
+            ("Εδώ: https://youtu.be/w5…", &["https://youtu.be/w5"]),
+            ("το βίντεο https://youtu.be/w6· και", &["https://youtu.be/w6"]),
+            ("το είδες https://youtu.be/w7\u{037E}", &["https://youtu.be/w7"]),
+            ("“https://youtu.be/w8”", &["https://youtu.be/w8"]),
+            ("https://youtu.be/w9!!", &["https://youtu.be/w9"]),
+            ("https://en.wikipedia.org/wiki/Knossos_(palace)", &["https://en.wikipedia.org/wiki/Knossos_(palace)"]),
+            ("https://youtu.be/w10,https://youtu.be/w11", &["https://youtu.be/w10", "https://youtu.be/w11"]),
+            ("https://youtu.be/w12https://youtu.be/w13", &["https://youtu.be/w12", "https://youtu.be/w13"]),
+            ("https://youtu.be/w14 | https://youtu.be/w15", &["https://youtu.be/w14", "https://youtu.be/w15"]),
+            (
+                "https://web.archive.org/web/2026/https://www.ertnews.gr/video/1",
+                &["https://web.archive.org/web/2026/https://www.ertnews.gr/video/1"],
+            ),
+            ("https://example.gr/r?next=https://youtu.be/w16", &["https://example.gr/r?next=https://youtu.be/w16"]),
+        ];
+        for (line, want) in cases {
+            assert_eq!(urls(line), want.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "{line}");
+        }
     }
 
     #[test]
