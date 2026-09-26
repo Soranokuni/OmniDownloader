@@ -465,3 +465,25 @@ async fn a_mail_deleted_between_listing_and_fetch_is_skipped_not_retried() {
     assert_eq!((r.retrying, r.failed, r.processed), (0, 0, 0), "{r:?}");
     assert!(repo.get_mail_checkpoint(&source.checkpoint_key()).unwrap().is_some());
 }
+
+/// Plan P4.18: the group is a label on the job, and only a label.
+#[tokio::test]
+async fn a_queued_job_carries_its_group_label_and_the_same_slug() {
+    let (_dir, repo) = repo();
+    repo.save_group(&omni_core::taxonomy::Group {
+        code: "MORNING".into(),
+        name: "Πρωινή εκπομπή".into(),
+        kind: "show".into(),
+        keywords: vec!["ΠΡΩΙΝΗ".into()],
+        description: String::new(),
+    })
+    .unwrap();
+    let source = FakeSource::with(vec![mail("m1", "Για την πρωινή", BODY)]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+
+    let mut jobs = repo.get_all_jobs().unwrap();
+    jobs.sort_by_key(|j| j.id);
+    assert!(jobs.iter().all(|j| j.group_code.as_deref() == Some("MORNING")), "{jobs:?}");
+    assert_eq!(jobs[0].slug, "1_PAPADAKI_PARELASIIRAKLEIO", "the group must not change the slug");
+}

@@ -126,6 +126,11 @@ impl Warning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParsedEmail {
     pub journalist: ResolvedJournalist,
+    /// The group the mail is for (plan P4.18), set by
+    /// [`crate::groups::resolve_group`] after parsing; `parse` leaves it
+    /// empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<crate::groups::ResolvedGroup>,
     pub outcome: Outcome,
     /// The subject carried an urgent keyword (`ΕΚΤΑΚΤΟ`, …).
     pub urgent: bool,
@@ -156,6 +161,8 @@ pub mod warnings {
     pub const ATTACHMENT_TOO_LARGE: &str = "ATTACHMENT_TOO_LARGE";
     /// The LLM was asked and something it said was used (plan P4.4).
     pub const LLM_ASSIST_APPLIED: &str = "LLM_ASSIST_APPLIED";
+    /// Several groups were named at one step and membership did not decide.
+    pub const GROUP_AMBIGUOUS: &str = "GROUP_AMBIGUOUS";
     /// The LLM was asked and nothing it said was used.
     pub const LLM_ASSIST_SKIPPED: &str = "LLM_ASSIST_SKIPPED";
 }
@@ -1019,16 +1026,23 @@ fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(St
     Some((display, keyword))
 }
 
+/// The body the parser reads: invisible characters, quoted replies and the
+/// signature removed, wrapped links joined, poison links stripped.
+pub fn cleaned_body(mail: &InboundMail) -> String {
+    // Zero-width and soft-hyphen characters come along when a link is copied
+    // out of a chat app or a web page, and split the URL.
+    let body = mail.readable_body().replace(INVISIBLE, "");
+    let body = strip_quotes_and_signature(&body, is_forward(&mail.subject));
+    let body = rejoin_wrapped_urls(&body);
+    decontaminate_email_body(&body)
+}
+
 pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> ParsedEmail {
     let mut warnings = Vec::new();
     let roster_ix = Roster::new(roster);
 
-    // 1. Cleanup. Zero-width and soft-hyphen characters come along when a
-    // link is copied out of a chat app or a web page, and split the URL.
-    let body = mail.readable_body().replace(INVISIBLE, "");
-    let body = strip_quotes_and_signature(&body, is_forward(&mail.subject));
-    let body = rejoin_wrapped_urls(&body);
-    let body = decontaminate_email_body(&body);
+    // 1. Cleanup.
+    let body = cleaned_body(mail);
 
     // 2. Journalist.
     let journalist = resolve_journalist(mail, &body, &roster_ix, &mut warnings);
@@ -1246,6 +1260,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
 
     ParsedEmail {
         journalist,
+        group: None,
         outcome,
         urgent,
         sections,
