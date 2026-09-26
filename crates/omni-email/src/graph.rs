@@ -47,6 +47,26 @@ impl std::fmt::Display for RetryAfter {
 
 impl std::error::Error for RetryAfter {}
 
+/// Graph answered with an error status. `message` is Graph's own
+/// `error.message`, which names the problem and carries no credential.
+#[derive(Debug, Clone)]
+pub struct GraphError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Graph returned {}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+fn graph_status(e: &anyhow::Error) -> Option<StatusCode> {
+    e.chain().find_map(|c| c.downcast_ref::<GraphError>()).map(|g| g.status)
+}
+
 struct Token {
     value: String,
     valid_until: Instant,
@@ -271,7 +291,10 @@ impl GraphMailSource {
                     .ok()
                     .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
                     .unwrap_or(body);
-                bail!("Graph returned {status}: {}", msg.chars().take(200).collect::<String>());
+                return Err(anyhow::Error::new(GraphError {
+                    status,
+                    message: msg.chars().take(200).collect(),
+                }));
             }
             return Ok(resp);
         }
@@ -372,6 +395,37 @@ impl GraphMailSource {
             body_html,
             attachments,
         }
+    }
+}
+
+impl GraphMailSource {
+    /// The admin panel's "Test mailbox" (plan P4.7): sign in, then read the
+    /// inbox folder and one message id. Reading the folder alone would not
+    /// prove the app may read messages. Each failure says what to fix.
+    pub async fn test_access(&self) -> Result<String> {
+        if !self.is_configured() {
+            bail!("Fill in tenant id, client id, mailbox and the client secret first.");
+        }
+        self.token(true).await?;
+        let explain = |e: anyhow::Error| match graph_status(&e) {
+            Some(StatusCode::FORBIDDEN) | Some(StatusCode::UNAUTHORIZED) => anyhow!(
+                "Signed in, but the app may not read {}: grant Mail.Read (application) with admin                  consent, and check the application access policy covers this mailbox.",
+                self.cfg.mailbox
+            ),
+            Some(StatusCode::NOT_FOUND) => anyhow!("Signed in, but there is no mailbox {} in this tenant.", self.cfg.mailbox),
+            _ => e,
+        };
+        let mut inbox_url = self.url(&["mailFolders", "Inbox"])?;
+        inbox_url.query_pairs_mut().append_pair("$select", "id,displayName,unreadItemCount");
+        let inbox: GFolder = self.get_json(inbox_url, false).await.map_err(explain)?;
+        let mut one = self.url(&["mailFolders", "Inbox", "messages"])?;
+        one.query_pairs_mut().append_pair("$top", "1").append_pair("$select", "id");
+        let _: GList<serde_json::Value> = self.get_json(one, false).await.map_err(explain)?;
+        Ok(format!(
+            "Signed in; the Inbox of {} is readable ({} unread).",
+            self.cfg.mailbox,
+            inbox.unread_item_count.unwrap_or(0)
+        ))
     }
 }
 

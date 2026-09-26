@@ -1047,10 +1047,6 @@ pub async fn api_secrets_set(
 
     // Mail uses its secret from the running config, so reflect the change
     // without a restart.
-    if payload.key == omni_core::secrets::keys::MAIL_PASSWORD {
-        let mut cfg = state.config.write().await;
-        cfg.email_password = payload.value.trim().to_string();
-    }
     if payload.key == omni_core::secrets::keys::GRAPH_CLIENT_SECRET {
         let mut cfg = state.config.write().await;
         cfg.graph.client_secret = payload.value.trim().to_string();
@@ -1186,41 +1182,42 @@ pub async fn api_system_logs(
     Ok(Json(serde_json::json!({ "logs": logs })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 pub struct TestEmailPayload {
-    server: String,
-    port: u16,
-    email: String,
-    pass: String,
+    tenant_id: String,
+    client_id: String,
+    mailbox: String,
+    /// Blank: test with the stored secret, which is then only ever paired
+    /// with the stored tenant and client id, never with typed-in ones.
+    client_secret: String,
 }
 
-/// Test the mailbox credentials.
+/// Test the Graph mailbox (plan P4.7): sign in and read the inbox.
 ///
 /// Admin-only: unauthenticated, this was a credential oracle — point it at the
 /// station's mailbox and the response distinguishes a right password from a
 /// wrong one, for free, from anywhere on the LAN.
 pub async fn api_test_email(
     RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
     Json(payload): Json<TestEmailPayload>,
 ) -> JsonResult {
-    let res: Result<anyhow::Result<()>, tokio::task::JoinError> =
-        tokio::task::spawn_blocking(move || {
-            omni_email::watcher::EmailWatcher::test_connection(
-                &payload.server,
-                payload.port,
-                &payload.email,
-                &payload.pass,
-            )
-        })
-        .await;
-
-    match res {
-        Ok(Ok(_)) => Ok(Json(serde_json::json!({"status": "ok"}))),
-        Ok(Err(e)) => Err(ApiError::bad_request(e.to_string())),
-        Err(join_err) => {
-            tracing::error!(error = ?join_err, "Mail test task failed");
-            Err(ApiError::internal("Mail test could not be run."))
-        }
+    let saved = state.config.read().await.graph.clone();
+    let pick = |typed: &str, saved: &str| {
+        let typed = typed.trim();
+        if typed.is_empty() { saved.to_string() } else { typed.to_string() }
+    };
+    let mut cfg = saved.clone();
+    cfg.mailbox = pick(&payload.mailbox, &saved.mailbox);
+    if !payload.client_secret.trim().is_empty() {
+        cfg.tenant_id = pick(&payload.tenant_id, &saved.tenant_id);
+        cfg.client_id = pick(&payload.client_id, &saved.client_id);
+        cfg.client_secret = payload.client_secret.trim().to_string();
+    }
+    match omni_email::graph::GraphMailSource::new(cfg).test_access().await {
+        Ok(detail) => Ok(Json(serde_json::json!({ "status": "ok", "detail": detail }))),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
 }
 
@@ -1244,10 +1241,16 @@ pub async fn api_test_llm(
 
 #[derive(Deserialize)]
 pub struct SetupPayload {
-    email_provider: String,
-    imap_server: String,
-    email_address: String,
-    email_password: String,
+    /// The Graph mailbox (plan P4.7). All blank: no email ingest.
+    #[serde(default)]
+    graph_tenant_id: String,
+    #[serde(default)]
+    graph_client_id: String,
+    #[serde(default)]
+    graph_mailbox: String,
+    /// Blank keeps the stored secret.
+    #[serde(default)]
+    graph_client_secret: String,
     ollama_endpoint: String,
     ollama_model: String,
     watchfolder_path: String,
@@ -1319,21 +1322,22 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
 
     {
         let mut cfg = state.config.write().await;
-        cfg.email_provider = payload.email_provider;
-        cfg.imap_server = payload.imap_server;
-        cfg.email_address = payload.email_address;
-        if !payload.email_password.is_empty() {
+        cfg.graph.tenant_id = payload.graph_tenant_id.trim().to_string();
+        cfg.graph.client_id = payload.graph_client_id.trim().to_string();
+        cfg.graph.mailbox = payload.graph_mailbox.trim().to_string();
+        let secret = payload.graph_client_secret.trim();
+        if !secret.is_empty() {
             // Into the encrypted store, never into config.json (plan P2.6).
             // The runtime copy is what the mail watcher reads.
             if let Err(e) = state
                 .secrets
-                .set(omni_core::secrets::keys::MAIL_PASSWORD, &payload.email_password)
+                .set(omni_core::secrets::keys::GRAPH_CLIENT_SECRET, secret)
             {
-                tracing::error!(error = ?e, "Storing the mailbox password failed");
-                return ApiError::internal("Could not store the mailbox password.")
+                tracing::error!(error = ?e, "Storing the Graph client secret failed");
+                return ApiError::internal("Could not store the Graph client secret.")
                     .into_response();
             }
-            cfg.email_password = payload.email_password;
+            cfg.graph.client_secret = secret.to_string();
         }
         cfg.ollama_endpoint = payload.ollama_endpoint;
         cfg.ollama_model = payload.ollama_model;
@@ -1352,10 +1356,28 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
 
 /// Whether the first-run page should still be offered in the UI.
 /// Public, because the login page links to it and must know.
-pub async fn api_setup_state(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+///
+/// To whoever may use the page (an admin, or loopback before the first admin)
+/// it also returns the current mailbox settings, so a reopened page does not
+/// blank them. Never a secret: only whether one is set.
+pub async fn api_setup_state(State(state): State<AppState>, req: Request) -> Json<serde_json::Value> {
+    let (parts, _) = req.into_parts();
+    let mut out = serde_json::json!({
         "needs_admin": !state.repo.has_active_admin().unwrap_or(true)
-    }))
+    });
+    if setup_window_open(&parts, &state).await {
+        let cfg = state.config.read().await;
+        out["graph"] = serde_json::json!({
+            "tenant_id": cfg.graph.tenant_id,
+            "client_id": cfg.graph.client_id,
+            "mailbox": cfg.graph.mailbox,
+            "secret_set": !cfg.graph.client_secret.is_empty(),
+        });
+        out["watchfolder_path"] = serde_json::json!(cfg.watchfolder_path);
+        out["ollama_endpoint"] = serde_json::json!(cfg.ollama_endpoint);
+        out["ollama_model"] = serde_json::json!(cfg.ollama_model);
+    }
+    Json(out)
 }
 
 // ==========================================

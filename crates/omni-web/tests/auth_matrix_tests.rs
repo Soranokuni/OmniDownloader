@@ -512,10 +512,10 @@ async fn w01_anonymous_callers_cannot_repoint_the_watchfolder() -> Result<()> {
     let h = Harness::new(true)?;
 
     let payload = serde_json::json!({
-        "email_provider": "Outlook",
-        "imap_server": "evil.example",
-        "email_address": "attacker@evil.example",
-        "email_password": "hunter2",
+        "graph_tenant_id": "attacker-tenant",
+        "graph_client_id": "attacker-app",
+        "graph_mailbox": "attacker@evil.example",
+        "graph_client_secret": "hunter2",
         "ollama_endpoint": "http://evil.example",
         "ollama_model": "x",
         "watchfolder_path": "\\\\attacker\\share"
@@ -580,10 +580,10 @@ async fn the_first_run_window_is_loopback_only_and_closes_once_an_admin_exists()
 
     // Claim it.
     let payload = serde_json::json!({
-        "email_provider": "Outlook",
-        "imap_server": "outlook.office365.com",
-        "email_address": "ingest@station.gr",
-        "email_password": "",
+        "graph_tenant_id": "",
+        "graph_client_id": "",
+        "graph_mailbox": "ingest@station.gr",
+        "graph_client_secret": "",
         "ollama_endpoint": "http://localhost:11434/v1",
         "ollama_model": "gemma",
         "watchfolder_path": "C:/watch",

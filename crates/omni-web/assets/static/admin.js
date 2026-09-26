@@ -157,7 +157,6 @@ document.getElementById('create-user-form').addEventListener('submit', async (ev
  * ------------------------------------------------------------------ */
 
 const SECRET_LABEL = {
-  'mail.password': 'Mailbox password',
   'graph.client_secret': 'Microsoft Graph client secret',
   'teams.webhook_url': 'Teams webhook URL',
   'web.tls_password': 'TLS certificate passphrase',
@@ -368,22 +367,33 @@ document.getElementById('test-llm-btn').addEventListener('click', async () => {
   } catch (e) { showTest(e.message, false); }
 });
 
+// The mailbox test starts from the saved settings; edit a field to try
+// another value before saving it on /setup.
+api('/api/setup/state')
+  .then((state) => {
+    if (!state.graph) return;
+    document.getElementById('test-mail-tenant').value = state.graph.tenant_id || '';
+    document.getElementById('test-mail-client').value = state.graph.client_id || '';
+    document.getElementById('test-mail-user').value = state.graph.mailbox || '';
+  })
+  .catch(() => { /* the fields stay blank; the server falls back to the saved values */ });
+
 document.getElementById('test-mail-btn').addEventListener('click', async () => {
   showTest('Testing…', true);
   try {
-    await api('/api/system/test-email', {
+    const res = await api('/api/system/test-email', {
       method: 'POST',
       body: {
-        server: document.getElementById('test-mail-server').value.trim(),
-        port: Number(document.getElementById('test-mail-port').value) || 993,
-        email: document.getElementById('test-mail-user').value.trim(),
-        pass: document.getElementById('test-mail-pass').value,
+        tenant_id: document.getElementById('test-mail-tenant').value.trim(),
+        client_id: document.getElementById('test-mail-client').value.trim(),
+        mailbox: document.getElementById('test-mail-user').value.trim(),
+        client_secret: document.getElementById('test-mail-secret').value,
       },
     });
-    showTest('Mailbox sign-in succeeded.', true);
+    showTest(res.detail || 'Mailbox readable.', true);
   } catch (e) { showTest(e.message, false); }
-  // The password is never left in the field after a test.
-  document.getElementById('test-mail-pass').value = '';
+  // The secret is never left in the field after a test.
+  document.getElementById('test-mail-secret').value = '';
 });
 
 document.getElementById('logout-btn').addEventListener('click', logout);

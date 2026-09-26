@@ -1,8 +1,9 @@
 //! Mail source abstraction (plan P4.1).
 //!
 //! The watcher only talks to [`MailSource`]. Graph (plan P4.2) is the primary
-//! implementation; IMAP stays for on-prem servers and tests. Both reduce a
-//! message to [`InboundMail`], so the parser never knows where mail came from.
+//! implementation (IMAP was removed in P4.7); tests use scripted doubles.
+//! Every source reduces a message to [`InboundMail`], so the parser never
+//! knows where mail came from.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -41,7 +42,7 @@ pub struct MailHealth {
 
 #[async_trait]
 pub trait MailSource: Send + Sync {
-    /// Short description for logs and the status bar, e.g. `imap mail.example.gr`.
+    /// Short description for logs and the status bar, e.g. `graph ingest@example.gr`.
     fn describe(&self) -> String;
 
     /// Credentials and addresses are present. An unconfigured source is

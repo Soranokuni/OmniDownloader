@@ -426,20 +426,20 @@ async fn the_secrets_api_never_returns_a_value() -> Result<()> {
     // Set it through the API.
     let (status, _) = send(
         "POST",
-        Some(json!({"key": "mail.password", "value": "the-actual-mailbox-secret"})),
+        Some(json!({"key": "graph.client_secret", "value": "the-actual-mailbox-secret"})),
         token.clone(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        store.get("mail.password")?.as_deref(),
+        store.get("graph.client_secret")?.as_deref(),
         Some("the-actual-mailbox-secret")
     );
 
     // Read it back: only `is_set`.
     let (status, body) = send("GET", None, token.clone()).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("\"mail.password\":true"), "{body}");
+    assert!(body.contains("\"graph.client_secret\":true"), "{body}");
     assert!(
         !body.contains("the-actual-mailbox-secret"),
         "the API handed back the secret itself: {body}"
@@ -457,7 +457,7 @@ async fn the_secrets_api_never_returns_a_value() -> Result<()> {
 
     // The audit row names the key and not the value.
     let logs = state_logs(&dir)?;
-    assert!(logs.iter().any(|m| m.contains("mail.password")), "{logs:?}");
+    assert!(logs.iter().any(|m| m.contains("graph.client_secret")), "{logs:?}");
     assert!(
         !logs.iter().any(|m| m.contains("the-actual-mailbox-secret")),
         "the secret leaked into the audit log: {logs:?}"

@@ -178,8 +178,6 @@ Assert-Step "Live Daemon Startup & Web Health Check on Port $TestPort" {
         auth_mode = "open_mcr"
         max_concurrent_downloads = 2
         max_concurrent_transcodes = 2
-        email_address = ""
-        email_password = ""
         ytdl_auto_update_nightly = $false
     }
     $cfg | ConvertTo-Json | Set-Content -Path $tempConfigPath -Force

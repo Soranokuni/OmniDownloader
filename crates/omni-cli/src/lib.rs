@@ -166,7 +166,7 @@ pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Res
         }
         SecretSubcommand::Set { key } => {
             ensure_known_key(&key)?;
-            // Piped stdin (`... | omni-ingest secrets set mail.password`) for a
+            // Piped stdin (`... | omni-ingest secrets set graph.client_secret`) for a
             // scripted install; an interactive masked prompt otherwise. Either
             // way the value never appears as a command-line argument, where it
             // would be visible in the process list and the shell history.
@@ -255,39 +255,41 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
         .with_help_message("Directory for transient downloads and intermediate transcodes")
         .prompt()?;
 
-    // 4. Email Ingest
-    let enable_email = Confirm::new("Enable Outlook / IMAP email monitoring watchdog?")
-        .with_default(!config.email_address.is_empty())
+    // 4. Email Ingest: the Office 365 mailbox through Microsoft Graph (P4.7).
+    let enable_email = Confirm::new("Enable email ingest from the Office 365 mailbox (Microsoft Graph)?")
+        .with_default(!config.graph.mailbox.trim().is_empty())
         .prompt()?;
 
     if enable_email {
-        config.imap_server = Text::new("IMAP Host:")
-            .with_default(&config.imap_server)
+        config.graph.tenant_id = Text::new("Directory (tenant) ID:")
+            .with_default(&config.graph.tenant_id)
+            .with_help_message("From the app registration's Overview page in Entra ID")
             .prompt()?;
 
-        config.imap_port = CustomType::<u16>::new("IMAP Port:")
-            .with_default(config.imap_port)
+        config.graph.client_id = Text::new("Application (client) ID:")
+            .with_default(&config.graph.client_id)
             .prompt()?;
 
-        config.email_address = Text::new("Email Address / Username:")
-            .with_default(&config.email_address)
+        config.graph.mailbox = Text::new("Ingest mailbox address:")
+            .with_default(&config.graph.mailbox)
             .prompt()?;
 
-        let pw = Password::new("Email Password / App Password:")
+        let secret = Password::new("Client secret value:")
             .without_confirmation()
-            .with_help_message("Leave empty to keep existing password")
+            .with_display_mode(inquire::PasswordDisplayMode::Masked)
+            .with_help_message("Leave empty to keep the stored secret")
             .prompt()?;
 
-        if !pw.is_empty() {
-            // Into the encrypted store, not config.json (plan P2.6, W-06).
-            // `config.email_password` is the runtime copy the mail watcher
-            // reads; `save_to_file` cannot serialise it.
+        if !secret.is_empty() {
+            // Into the encrypted store, never config.json (plan P2.6).
+            // `config.graph.client_secret` is the runtime copy; `save_to_file`
+            // cannot serialise it.
             let store = SecretStore::new(config.resolve_path("data/secrets.bin"));
             store
-                .set(secret_keys::MAIL_PASSWORD, &pw)
-                .context("Failed storing the mailbox password")?;
-            config.email_password = pw;
-            println!("  Mailbox password stored encrypted in data/secrets.bin.");
+                .set(secret_keys::GRAPH_CLIENT_SECRET, &secret)
+                .context("Failed storing the Graph client secret")?;
+            config.graph.client_secret = secret;
+            println!("  Client secret stored encrypted in data/secrets.bin.");
         }
 
         config.email_poll_interval_secs = CustomType::<u64>::new("Email Polling Interval (seconds):")

@@ -140,20 +140,14 @@
           <button class="btn btn-block" type="button" id="test-llm-btn" style="margin-top:10px">Test LLM</button>
         </div>
         <div>
-          <label for="test-mail-server">IMAP server</label>
-          <input type="text" id="test-mail-server" placeholder="outlook.office365.com">
-          <div class="grid-2" style="margin-top:8px">
-            <div>
-              <label for="test-mail-port">Port</label>
-              <input type="number" id="test-mail-port" value="993">
-            </div>
-            <div>
-              <label for="test-mail-user">Mailbox</label>
-              <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
-            </div>
-          </div>
-          <label for="test-mail-pass" style="margin-top:8px">Password</label>
-          <input type="password" id="test-mail-pass" autocomplete="off">
+          <label for="test-mail-tenant">Directory (tenant) ID</label>
+          <input type="text" id="test-mail-tenant" autocomplete="off" spellcheck="false">
+          <label for="test-mail-client" style="margin-top:8px">Application (client) ID</label>
+          <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
+          <label for="test-mail-user" style="margin-top:8px">Mailbox</label>
+          <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
+          <label for="test-mail-secret" style="margin-top:8px">Client secret (blank: test the stored one)</label>
+          <input type="password" id="test-mail-secret" autocomplete="off">
           <button class="btn btn-block" type="button" id="test-mail-btn" style="margin-top:10px">Test mailbox</button>
         </div>
       </div>
@@ -201,6 +195,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=2"></script>
+<script type="module" src="/static/admin.js?v=3"></script>
 </body>
 </html>
