@@ -30,8 +30,6 @@ use tracing::warn;
 
 /// Canonical secret names. String keys elsewhere would drift.
 pub mod keys {
-    /// IMAP / legacy mailbox password.
-    pub const MAIL_PASSWORD: &str = "mail.password";
     /// Microsoft Graph application secret (plan P4.2).
     pub const GRAPH_CLIENT_SECRET: &str = "graph.client_secret";
     /// Teams incoming-webhook URL (plan P5.3) — a URL that is itself a
@@ -42,11 +40,14 @@ pub mod keys {
 
     /// Every key the panel and CLI accept, for validation and listing.
     pub const ALL: &[&str] = &[
-        MAIL_PASSWORD,
         GRAPH_CLIENT_SECRET,
         TEAMS_WEBHOOK_URL,
         TLS_PASSWORD,
     ];
+
+    /// Keys no build reads any more; removed from the store at start-up.
+    /// `mail.password` was the IMAP password (IMAP removed in plan P4.7).
+    pub const RETIRED: &[&str] = &["mail.password"];
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -298,9 +299,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = SecretStore::new(dir.path().join("secrets.bin"));
 
-        store.set(keys::MAIL_PASSWORD, "s3cr3t-mailbox-pass").unwrap();
+        store.set(keys::GRAPH_CLIENT_SECRET, "s3cr3t-mailbox-pass").unwrap();
         assert_eq!(
-            store.get(keys::MAIL_PASSWORD).unwrap().as_deref(),
+            store.get(keys::GRAPH_CLIENT_SECRET).unwrap().as_deref(),
             Some("s3cr3t-mailbox-pass")
         );
 
@@ -319,7 +320,7 @@ mod tests {
         // an error: it is the normal state of a fresh install.
         let dir = TempDir::new().unwrap();
         let store = SecretStore::new(dir.path().join("nothing-here.bin"));
-        assert_eq!(store.get(keys::MAIL_PASSWORD).unwrap(), None);
+        assert_eq!(store.get(keys::GRAPH_CLIENT_SECRET).unwrap(), None);
         assert!(store.status().values().all(|set| !set));
     }
 
@@ -327,25 +328,25 @@ mod tests {
     fn setting_an_empty_value_removes_the_secret() {
         let dir = TempDir::new().unwrap();
         let store = SecretStore::new(dir.path().join("secrets.bin"));
-        store.set(keys::MAIL_PASSWORD, "something").unwrap();
-        store.set(keys::MAIL_PASSWORD, "").unwrap();
-        assert_eq!(store.get(keys::MAIL_PASSWORD).unwrap(), None);
-        assert_eq!(store.status()[keys::MAIL_PASSWORD], false);
+        store.set(keys::GRAPH_CLIENT_SECRET, "something").unwrap();
+        store.set(keys::GRAPH_CLIENT_SECRET, "").unwrap();
+        assert_eq!(store.get(keys::GRAPH_CLIENT_SECRET).unwrap(), None);
+        assert_eq!(store.status()[keys::GRAPH_CLIENT_SECRET], false);
     }
 
     #[test]
     fn several_secrets_coexist_and_survive_each_other_being_written() {
         let dir = TempDir::new().unwrap();
         let store = SecretStore::new(dir.path().join("secrets.bin"));
-        store.set(keys::MAIL_PASSWORD, "mailbox-one").unwrap();
+        store.set(keys::TLS_PASSWORD, "tls-one").unwrap();
         store.set(keys::GRAPH_CLIENT_SECRET, "graph-two").unwrap();
         store
             .set(keys::TEAMS_WEBHOOK_URL, "https://teams.example/hook")
             .unwrap();
 
         assert_eq!(
-            store.get(keys::MAIL_PASSWORD).unwrap().as_deref(),
-            Some("mailbox-one")
+            store.get(keys::TLS_PASSWORD).unwrap().as_deref(),
+            Some("tls-one")
         );
         assert_eq!(
             store.get(keys::GRAPH_CLIENT_SECRET).unwrap().as_deref(),
@@ -362,10 +363,10 @@ mod tests {
         let store = SecretStore::new(&path);
 
         // The strict read reports the problem...
-        assert!(store.get(keys::MAIL_PASSWORD).is_err() || store.get(keys::MAIL_PASSWORD).unwrap().is_none());
+        assert!(store.get(keys::GRAPH_CLIENT_SECRET).is_err() || store.get(keys::GRAPH_CLIENT_SECRET).unwrap().is_none());
         // ...and the start-up read degrades to "not configured", so the
         // station still ingests video from the web UI.
-        assert_eq!(store.get_lossy(keys::MAIL_PASSWORD), None);
+        assert_eq!(store.get_lossy(keys::GRAPH_CLIENT_SECRET), None);
     }
 
     #[test]
@@ -386,7 +387,7 @@ mod tests {
     fn an_interrupted_write_leaves_no_temp_file_behind() {
         let dir = TempDir::new().unwrap();
         let store = SecretStore::new(dir.path().join("secrets.bin"));
-        store.set(keys::MAIL_PASSWORD, "value").unwrap();
+        store.set(keys::GRAPH_CLIENT_SECRET, "value").unwrap();
         assert!(!dir.path().join("secrets.bin.tmp").exists());
     }
 }

@@ -1,6 +1,6 @@
 //! The provider-neutral shape of one inbound email (plan P4.1).
 //!
-//! Graph and IMAP both reduce a message to [`InboundMail`]; the parser only
+//! Every mail source reduces a message to [`InboundMail`]; the parser only
 //! ever sees this type, which is what lets it be tested offline from `.eml`
 //! fixtures.
 
@@ -24,7 +24,7 @@ pub struct AttachmentMeta {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboundMail {
-    /// Provider id used to mark / move / reply (Graph message id, IMAP UID).
+    /// Provider id used to mark / move / reply (the Graph message id).
     pub id: String,
     /// RFC 5322 `Message-ID`, the idempotency key (E-07). Kept with its angle
     /// brackets exactly as the header carried them.
@@ -51,7 +51,7 @@ impl InboundMail {
         self.body_html.as_deref().map(html_to_text).unwrap_or_default()
     }
 
-    /// Read a raw RFC 822 message (IMAP `RFC822` fetch, or an `.eml` file).
+    /// Read a raw RFC 822 message (an `.eml` file or a fixture).
     pub fn from_rfc822(id: &str, raw: &[u8]) -> Result<Self> {
         let parsed = parse_mail(raw).context("Failed parsing RFC822 MIME message")?;
         let headers = parsed.get_headers();

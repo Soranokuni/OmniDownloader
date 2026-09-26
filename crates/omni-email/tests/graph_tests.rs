@@ -35,6 +35,9 @@ struct Mock {
     reject_next: bool,
     /// Answer every Graph call with 429.
     throttle: bool,
+    /// Answer every Graph call with 403 (no Mail.Read, or outside the
+    /// application access policy).
+    forbid: bool,
     /// displayName → id, keyed by parent id ("" = mailbox root).
     folders: Vec<(String, String, String)>,
 }
@@ -77,6 +80,9 @@ async fn handler(State(mock): State<Shared>, req: Request) -> Response {
 
     if m.throttle {
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "7")], "").into_response();
+    }
+    if m.forbid {
+        return (StatusCode::FORBIDDEN, r#"{"error":{"code":"ErrorAccessDenied","message":"Access is denied."}}"#).into_response();
     }
     if m.reject_next {
         m.reject_next = false;
@@ -299,4 +305,30 @@ async fn an_unconfigured_source_says_so() {
     let src = source(addr, "");
     assert!(!src.is_configured());
     assert!(!src.health().await.ok);
+}
+
+#[tokio::test]
+async fn test_access_signs_in_and_reads_the_inbox_and_one_message() {
+    let (mock, addr) = start().await;
+    let detail = source(addr, "s3cret").test_access().await.unwrap();
+    assert_eq!(detail, "Signed in; the Inbox of ingest@example.gr is readable (4 unread).");
+    let m = mock.lock().unwrap();
+    let calls = graph_calls(&m);
+    assert!(calls.iter().all(|c| c.method == "GET"), "a test must not change the mailbox: {calls:?}");
+    assert!(calls.iter().any(|c| c.path.ends_with("/mailFolders/Inbox/messages") && c.query.contains("$top=1")));
+}
+
+#[tokio::test]
+async fn test_access_names_the_fix_for_a_bad_secret_and_for_a_missing_permission() {
+    let (mock, addr) = start().await;
+    let err = source(addr, "wrong-secret-value").test_access().await.unwrap_err().to_string();
+    assert!(err.contains("AADSTS7000215"), "{err}");
+    assert!(!err.contains("wrong-secret-value"), "{err}");
+
+    mock.lock().unwrap().forbid = true;
+    let err = source(addr, "s3cret").test_access().await.unwrap_err().to_string();
+    assert!(err.contains("Mail.Read") && err.contains("application access policy"), "{err}");
+
+    let err = source(addr, "").test_access().await.unwrap_err().to_string();
+    assert!(err.contains("client secret"), "{err}");
 }

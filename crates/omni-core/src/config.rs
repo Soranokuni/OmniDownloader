@@ -478,29 +478,12 @@ pub struct AppConfig {
     #[serde(default = "default_concurrent")]
     pub max_concurrent_transcodes: usize,
 
-    // Email / Outlook configuration
-    #[serde(default = "default_email_provider")]
-    pub email_provider: String,
-
-    #[serde(default = "default_imap_server")]
-    pub imap_server: String,
-
-    #[serde(default = "default_imap_port")]
-    pub imap_port: u16,
-
-    #[serde(default)]
-    pub email_address: String,
-
-    /// Mailbox password — **runtime only** (plan P2.6, defect W-06).
-    ///
-    /// `skip_serializing` is the whole point: the field still *deserializes*,
-    /// so a config.json written before Phase 2 is read once and its value
-    /// harvested into the encrypted store by [`AppConfig::adopt_secrets`], but
-    /// `save_to_file` can never write it back. Without that asymmetry the
-    /// first save after upgrading would put the password straight back into
-    /// plaintext, and nothing would look wrong.
-    #[serde(default, skip_serializing)]
-    pub email_password: String,
+    // Email ingest: the mailbox itself is `graph` below (plan P4.7).
+    /// Pre-Graph IMAP password, read so [`AppConfig::adopt_secrets`] can wipe
+    /// it from an old config.json. IMAP is gone; the value is never stored,
+    /// used or written back.
+    #[serde(default, skip_serializing, rename = "email_password")]
+    legacy_email_password: String,
 
     #[serde(default = "default_poll_interval")]
     pub email_poll_interval_secs: u64,
@@ -572,15 +555,6 @@ fn default_web_host() -> String {
 fn default_concurrent() -> usize {
     2
 }
-fn default_email_provider() -> String {
-    "Outlook".to_string()
-}
-fn default_imap_server() -> String {
-    "outlook.office365.com".to_string()
-}
-fn default_imap_port() -> u16 {
-    993
-}
 fn default_poll_interval() -> u64 {
     20
 }
@@ -615,11 +589,7 @@ impl Default for AppConfig {
             retention_days: default_retention_days(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
-            email_provider: default_email_provider(),
-            imap_server: default_imap_server(),
-            imap_port: default_imap_port(),
-            email_address: String::new(),
-            email_password: String::new(),
+            legacy_email_password: String::new(),
             email_poll_interval_secs: default_poll_interval(),
             ollama_endpoint: default_ollama_endpoint(),
             ollama_model: default_ollama_model(),
@@ -717,21 +687,24 @@ impl AppConfig {
 
         let mut rewrote = false;
 
-        if !self.email_password.is_empty() {
-            store
-                .set(keys::MAIL_PASSWORD, &self.email_password)
-                .context("Failed moving the mailbox password into the encrypted store")?;
+        if !self.legacy_email_password.is_empty() {
+            // IMAP is gone (plan P4.7): nothing reads this password any more,
+            // so it is dropped rather than moved into the store.
+            self.legacy_email_password.clear();
             tracing::warn!(
-                "Moved the mailbox password out of config.json and into the encrypted secret \
-                 store. The old value is still in any backup of config.json taken before now; \
-                 rotate it if that matters."
+                "Removed the old IMAP mailbox password from config.json; IMAP is no longer                  supported. The value is still in any backup of config.json taken before now."
             );
             rewrote = true;
+        }
+        for key in keys::RETIRED {
+            if store.get_lossy(key).is_some() {
+                store.remove(key).with_context(|| format!("Failed removing retired secret {key}"))?;
+                tracing::warn!("Removed the retired secret `{key}` from the encrypted store.");
+            }
         }
 
         // Always read back from the store, so the store is the single source
         // of truth and a secret removed there takes effect on restart.
-        self.email_password = store.get_lossy(keys::MAIL_PASSWORD).unwrap_or_default();
         self.graph.client_secret = store.get_lossy(keys::GRAPH_CLIENT_SECRET).unwrap_or_default();
         Ok(rewrote)
     }
@@ -773,54 +746,44 @@ mod tests {
         let path = dir.path().join("config.json");
 
         let mut config = AppConfig::default();
-        config.email_password = "plaintext-mailbox-password".to_string();
+        config.graph.client_secret = "plaintext-graph-secret".to_string();
         config.save_to_file(&path).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !written.contains("plaintext-mailbox-password"),
-            "the mailbox password was written to config.json: {written}"
+            !written.contains("plaintext-graph-secret"),
+            "the Graph secret was written to config.json: {written}"
         );
-        assert!(
-            !written.contains("email_password"),
-            "the key itself should not be emitted either: {written}"
-        );
+        assert!(!written.contains("client_secret"), "the key itself should not be emitted either: {written}");
     }
 
     #[test]
-    fn a_legacy_plaintext_password_is_harvested_into_the_store_once() {
-        // What an upgrade actually looks like: a config.json written by the
-        // pre-Phase-2 build, with the password sitting in it.
+    fn an_old_imap_password_is_wiped_from_config_json_and_not_kept() {
+        // A config.json from before P4.7, with the IMAP password (and its
+        // server fields) still in it, and the password in the store as well.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(
             &path,
-            r#"{ "email_address": "ingest@station.gr", "email_password": "legacy-secret-value" }"#,
+            r#"{ "imap_server": "outlook.office365.com", "imap_port": 993,
+                 "email_address": "ingest@station.gr", "email_password": "legacy-secret-value" }"#,
         )
         .unwrap();
-
         let store = SecretStore::new(dir.path().join("secrets.bin"));
+        store.set("mail.password", "legacy-secret-value").unwrap();
+
         let mut config = AppConfig::load_from_file(&path).unwrap();
-        assert_eq!(config.email_password, "legacy-secret-value");
+        assert!(config.adopt_secrets(&store).unwrap(), "the caller must be told to rewrite config.json");
+        assert_eq!(store.get("mail.password").unwrap(), None, "the retired secret stays in the store");
 
-        let rewrite_needed = config.adopt_secrets(&store).unwrap();
-        assert!(rewrite_needed, "the caller must be told to rewrite config.json");
-        assert_eq!(
-            store.get(keys::MAIL_PASSWORD).unwrap().as_deref(),
-            Some("legacy-secret-value")
-        );
-        // The runtime field still works, so the mail watcher keeps running.
-        assert_eq!(config.email_password, "legacy-secret-value");
-
-        // After the caller saves, the plaintext is gone from disk.
         config.save_to_file(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("legacy-secret-value"), "{written}");
+        assert!(!written.contains("imap"), "IMAP settings survived the rewrite: {written}");
 
-        // Second start: nothing to harvest, and the value still resolves.
+        // Second start: nothing left to wipe.
         let mut config2 = AppConfig::load_from_file(&path).unwrap();
         assert!(!config2.adopt_secrets(&store).unwrap());
-        assert_eq!(config2.email_password, "legacy-secret-value");
     }
 
     #[test]
@@ -830,16 +793,16 @@ mod tests {
         AppConfig::default().save_to_file(&path).unwrap();
 
         let store = SecretStore::new(dir.path().join("secrets.bin"));
-        store.set(keys::MAIL_PASSWORD, "current-value").unwrap();
+        store.set(keys::GRAPH_CLIENT_SECRET, "current-value").unwrap();
 
         let mut config = AppConfig::load_from_file(&path).unwrap();
         config.adopt_secrets(&store).unwrap();
-        assert_eq!(config.email_password, "current-value");
+        assert_eq!(config.graph.client_secret, "current-value");
 
-        store.remove(keys::MAIL_PASSWORD).unwrap();
+        store.remove(keys::GRAPH_CLIENT_SECRET).unwrap();
         let mut config = AppConfig::load_from_file(&path).unwrap();
         config.adopt_secrets(&store).unwrap();
-        assert_eq!(config.email_password, "");
+        assert_eq!(config.graph.client_secret, "");
     }
 
     #[test]

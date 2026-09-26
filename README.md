@@ -245,7 +245,7 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe setup
 
 # credentials never go in config.json
-.\target\release\omni-ingest.exe secrets set mail.password
+.\target\release\omni-ingest.exe secrets set graph.client_secret
 .\target\release\omni-ingest.exe secrets list
 
 # sniff a single URL through the headless browser
@@ -265,9 +265,9 @@ file has already been produced.
 
 ## Office 365 mailbox (Microsoft Graph)
 
-Exchange Online no longer accepts basic-auth IMAP, so an Office 365 ingest
-mailbox is read through Microsoft Graph with an app registration. IMAP remains
-for on-premises servers.
+Exchange Online no longer accepts basic-auth IMAP, so the ingest mailbox is
+read through Microsoft Graph with an app registration. Graph is the only mail
+source; IMAP support has been removed.
 
 1. **Entra ID → App registrations → New registration.** Single tenant, no
    redirect URI. Note the *Application (client) ID* and *Directory (tenant) ID*.

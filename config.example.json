@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.json and edit. Secrets never belong in this file: the mailbox password and any API secret live in the encrypted store (data/secrets.bin), set with `omni-ingest secrets set mail.password` or from the admin panel.",
+  "_comment": "Copy to config.json and edit. Secrets never belong in this file: the Graph client secret and any API secret live in the encrypted store (data/secrets.bin), set with `omni-ingest secrets set graph.client_secret` or from the admin panel.",
 
   "database_path": "data/omni.db",
   "watchfolder_path": "watchfolder",
@@ -33,14 +33,10 @@
   "max_concurrent_downloads": 2,
   "max_concurrent_transcodes": 2,
 
-  "email_provider": "Outlook",
-  "imap_server": "outlook.office365.com",
-  "imap_port": 993,
-  "email_address": "",
   "email_poll_interval_secs": 30,
 
   "graph": {
-    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, Graph is used and the IMAP fields above are ignored. See README, 'Office 365 mailbox'.",
+    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, the mailbox is polled; otherwise email ingest is off. See README, 'Office 365 mailbox'.",
     "tenant_id": "",
     "client_id": "",
     "mailbox": "ingest@example.gr",

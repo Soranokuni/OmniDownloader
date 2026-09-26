@@ -55,31 +55,33 @@
       </section>
 
       <section class="card stack">
-        <h2 class="card-title">Mailbox</h2>
+        <h2 class="card-title">Mailbox (Microsoft Graph)</h2>
         <div class="grid-2">
           <div>
-            <label for="email-provider">Provider</label>
-            <select id="email-provider">
-              <option value="Outlook">Outlook / Office 365</option>
-              <option value="IMAP">Generic IMAP</option>
-            </select>
+            <label for="graph-tenant">Directory (tenant) ID</label>
+            <input type="text" id="graph-tenant" autocomplete="off" spellcheck="false">
           </div>
           <div>
-            <label for="imap-server">IMAP server</label>
-            <input type="text" id="imap-server" value="outlook.office365.com">
+            <label for="graph-client">Application (client) ID</label>
+            <input type="text" id="graph-client" autocomplete="off" spellcheck="false">
           </div>
         </div>
         <div class="grid-2">
           <div>
-            <label for="email-address">Ingest mailbox</label>
-            <input type="email" id="email-address" placeholder="ingest@station.gr" autocomplete="off">
+            <label for="graph-mailbox">Ingest mailbox</label>
+            <input type="email" id="graph-mailbox" placeholder="ingest@station.gr" autocomplete="off">
           </div>
           <div>
-            <label for="email-password">Mailbox password</label>
-            <input type="password" id="email-password" autocomplete="off">
+            <label for="graph-secret">Client secret value</label>
+            <input type="password" id="graph-secret" autocomplete="off">
           </div>
         </div>
-        <p class="note">Leave the mailbox blank to run without email ingest.</p>
+        <p class="note">
+          From the app registration in Entra ID; the app needs the Mail.Read
+          application permission. The secret is stored encrypted, never in
+          config.json. Leave all four blank to run without email ingest.
+          Changes take effect after a restart.
+        </p>
       </section>
 
       <section class="card stack">
@@ -102,6 +104,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/setup.js?v=2"></script>
+<script type="module" src="/static/setup.js?v=3"></script>
 </body>
 </html>

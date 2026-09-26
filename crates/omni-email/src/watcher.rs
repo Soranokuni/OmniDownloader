@@ -13,7 +13,6 @@ use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
 use crate::assist::Assist;
 use crate::graph::{GraphMailSource, RetryAfter};
-use crate::imap_source::ImapMailSource;
 use crate::mail::InboundMail;
 use crate::parser::{self, ParsedEmail, Tier};
 use crate::source::{MailOutcome, MailSource};
@@ -67,12 +66,9 @@ fn short_reason(e: &anyhow::Error) -> String {
     let lower = text.to_ascii_lowercase();
 
     // The two that matter are worth naming plainly, because the remedy differs
-    // and an operator should not have to read an IMAP error to tell them apart.
-    if lower.contains("authenticationfailed")
-        || lower.contains("login failed")
-        || lower.contains("invalid credentials")
-    {
-        return "mailbox rejected the credentials".to_string();
+    // and an operator should not have to read an AADSTS code to tell them apart.
+    if lower.contains("graph login failed") || lower.contains("aadsts") {
+        return "Microsoft sign-in rejected the app credentials".to_string();
     }
     if lower.contains("timed out") || lower.contains("connect") || lower.contains("dns") {
         return "cannot reach the mail server".to_string();
@@ -81,23 +77,13 @@ fn short_reason(e: &anyhow::Error) -> String {
 }
 
 impl EmailWatcher {
-    /// Graph when it is configured (the only option on Office 365, defect
-    /// E-01); IMAP otherwise, for on-prem servers.
+    /// The station mailbox, through Microsoft Graph (defect E-01, plan P4.7).
     pub fn new(config: AppConfig, repo: Repository) -> Self {
-        let source: Arc<dyn MailSource> = if config.graph.is_configured() {
-            Arc::new(GraphMailSource::new(config.graph.clone()))
-        } else {
-            Arc::new(ImapMailSource::new(
-                &config.imap_server,
-                config.imap_port,
-                &config.email_address,
-                &config.email_password,
-            ))
-        };
+        let source: Arc<dyn MailSource> = Arc::new(GraphMailSource::new(config.graph.clone()));
         Self::with_source(config, repo, source)
     }
 
-    /// A watcher over any mail source (Graph, IMAP, or a test double).
+    /// A watcher over any mail source (Graph, or a test double).
     pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
         let attachments_dir = config.resolve_path(&config.temp_path).join("attachments");
         let assist = Arc::new(Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone()));
@@ -131,10 +117,6 @@ impl EmailWatcher {
             // timestamp advance during an outage.
             h.set_if_changed(omni_core::health::checks::MAIL, check);
         }
-    }
-
-    pub fn test_connection(server: &str, port: u16, email: &str, pass: &str) -> Result<()> {
-        ImapMailSource::new(server, port, email, pass).test_connection_blocking()
     }
 
     pub async fn start_polling_loop(self: Arc<Self>, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
