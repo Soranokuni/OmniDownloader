@@ -425,8 +425,27 @@ static RE_BARE_URL: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
-static RE_NUMBERED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d{1,3})(\s*)([.)\-:])?(\s*)(.*)$").unwrap());
+/// `1.`, `2)`, `3 -`, and (plan P4.15) `1ο`, `2η`, `Θέμα 3:`, `#4`, `(5)`.
+static RE_NUMBERED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:(?i:θέμα|θεμα|thema)\s*|#\s*|\()?(\d{1,3})(?i:ος|ο|η|ον|º|°)?(\s*)([.)\-:])?(\s*)(.*)$").unwrap()
+});
+static RE_THEMA_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?i:θέμα|θεμα)\s*[:\-–]\s*").unwrap());
+/// A Greek-letter list: `Α.`, `Β)`, `ΣΤ.` (plan P4.15).
+static RE_LETTERED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(ΣΤ|[ΑΒΓΔΕΖΗΘΙΚΛΜ])([.)])\s+(\S.*)$").unwrap());
+
+/// Greek numerals in list order: Α Β Γ Δ Ε ΣΤ Ζ Η Θ Ι Κ Λ Μ.
+fn greek_letter_value(l: &str) -> Option<u32> {
+    const ORDER: [&str; 13] = ["Α", "Β", "Γ", "Δ", "Ε", "ΣΤ", "Ζ", "Η", "Θ", "Ι", "Κ", "Λ", "Μ"];
+    ORDER.iter().position(|o| *o == l).map(|i| i as u32 + 1)
+}
+
+/// A lettered line whose letter is the one expected next.
+fn lettered(line: &str, expected_next: u32) -> Option<(u32, String)> {
+    let c = RE_LETTERED.captures(line)?;
+    let n = greek_letter_value(&c[1])?;
+    (n == expected_next).then(|| (n, c[3].to_string()))
+}
 static RE_MARKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:GIA\s+PLANA|PLANA|VIDEO|VINTEO)\s*(?::|\s+(?:HTTP|WWW))").unwrap()
 });
@@ -813,7 +832,8 @@ fn numbered(line: &str, expected_next: u32) -> Option<(u32, String)> {
     let delim = c.get(3).is_some();
     // With a delimiter: is there a space after it? Without: before the title?
     let space = if delim { !c[4].is_empty() } else { !c[2].is_empty() || !c[4].is_empty() };
-    let rest = c[5].to_string();
+    // "1ο ΘΕΜΑ: ΤΙΤΛΟΣ": the word "θέμα" is the label, not the title.
+    let rest = RE_THEMA_LABEL.replace(&c[5], "").into_owned();
     if delim && !space && rest.starts_with(|ch: char| ch.is_ascii_digit()) {
         return None;
     }
@@ -833,8 +853,24 @@ fn split_sections(lines: &[Line], warnings: &mut Vec<Warning>) -> (Vec<Line>, Ve
     let mut sections: Vec<RawSection> = Vec::new();
     let mut seen = HashSet::new();
     let mut expected = 1u32;
+    // Letters number sections only in a mail with no digit numbering (where
+    // `Α)` `Β)` are sub-items), and only once both Α and Β appear: a lone
+    // "Α. Παπαδάκη" in a signature is an initial, not a list.
+    let digits = lines.iter().any(|l| {
+        RE_NUMBERED.captures(&l.text).is_some_and(|c| c.get(3).is_some() && !c[4].is_empty())
+    });
+    let letters = !digits
+        && lines.iter().any(|l| lettered(&l.text, 1).is_some())
+        && lines.iter().any(|l| lettered(&l.text, 2).is_some());
     for line in lines {
-        if let Some((n, rest)) = numbered(&line.text, expected) {
+        let numbered_line = numbered(&line.text, expected).or_else(|| {
+            if letters {
+                lettered(&line.text, expected)
+            } else {
+                None
+            }
+        });
+        if let Some((n, rest)) = numbered_line {
             let index = n.to_string();
             if !seen.insert(index.clone()) {
                 warnings.push(Warning::new(warnings::DUPLICATE_SECTION_NUMBER, Some(index.clone())));

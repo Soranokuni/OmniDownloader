@@ -1,0 +1,60 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "SYNEDRIASIDIMOTIKOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture2001"
+        }
+      ],
+      "keyword": "SYNEDRIASIDIMOTIKOU",
+      "title": "ΣΥΝΕΔΡΙΑΣΗ ΔΗΜΟΤΙΚΟΥ ΣΥΜΒΟΥΛΙΟΥ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "NEAPTISI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture2002"
+        }
+      ],
+      "keyword": "NEAPTISI",
+      "title": "ΝΕΑ ΠΤΗΣΗ ΣΤΟ ΑΕΡΟΔΡΟΜΙΟ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3",
+          "keyword": "TOURISMOSOKTOVRIO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture2003"
+        }
+      ],
+      "keyword": "TOURISMOSOKTOVRIO",
+      "title": "ΤΟΥΡΙΣΜΟΣ ΤΟΝ ΟΚΤΩΒΡΙΟ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}
