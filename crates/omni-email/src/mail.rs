@@ -197,8 +197,15 @@ static RE_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#).unwrap()
 });
 static RE_BREAKS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6]|table|blockquote|pre)\s*>|<(p|div|li|tr|h[1-6])\b[^>]*>").unwrap()
+    Regex::new(r"(?i)<br\s*/?>|<hr\b[^>]*>|</(p|div|li|tr|h[1-6]|table|blockquote|pre)\s*>|<(p|div|li|tr|h[1-6]|blockquote)\b[^>]*>").unwrap()
 });
+/// Table cells sit side by side: a space, or two cells' words run together.
+static RE_CELLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</t[dh]\s*>").unwrap());
+/// Anchor text that is itself an address, often shortened by the client
+/// (`youtube.com/watch?v=ab…`): the href replaces it, or the parser would see
+/// a second, broken link.
+static RE_DISPLAY_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(https?://|www\.)?[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?[…]?$").unwrap());
 static RE_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").unwrap());
 static RE_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z]{2,8});").unwrap());
@@ -217,12 +224,16 @@ pub fn html_to_text(html: &str) -> String {
         let inner = c.get(3).map(|m| m.as_str()).unwrap_or("");
         let inner_text = decode_entities(&RE_TAGS.replace_all(inner, ""));
         let is_web = href.starts_with("http://") || href.starts_with("https://");
-        if is_web && !inner_text.contains(href.as_str()) {
-            format!("{} {}", inner_text.trim(), href)
-        } else {
+        let inner_trimmed = inner_text.trim();
+        if !is_web || inner_text.contains(href.as_str()) {
             inner_text
+        } else if RE_DISPLAY_URL.is_match(inner_trimmed) {
+            href
+        } else {
+            format!("{inner_trimmed} {href}")
         }
     });
+    let s = RE_CELLS.replace_all(&s, " ");
     let s = RE_BREAKS.replace_all(&s, "\n");
     let s = RE_TAGS.replace_all(&s, "");
     let s = decode_entities(&s);
@@ -271,6 +282,19 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shortened_display_address_is_replaced_by_its_href() {
+        let html = r#"<p><a href="https://www.youtube.com/watch?v=abcdef123&amp;t=4">youtube.com/watch?v=abc…</a></p>
+            <p><a href="https://youtu.be/q1">www.youtu.be/q1</a></p>
+            <table><tr><td>ΚΕΛΙ</td><td>ΔΕΥΤΕΡΟ</td></tr></table>"#;
+        let text = html_to_text(html);
+        assert!(!text.contains("abc…"), "{text}");
+        assert_eq!(text.lines().next(), Some("https://www.youtube.com/watch?v=abcdef123&t=4"), "{text}");
+        assert!(text.contains("https://youtu.be/q1"), "{text}");
+        assert!(!text.contains("www.youtu.be"), "{text}");
+        assert!(text.contains("ΚΕΛΙ ΔΕΥΤΕΡΟ"), "{text}");
+    }
 
     #[test]
     fn html_keeps_hrefs_behind_headline_anchors() {

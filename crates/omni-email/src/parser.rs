@@ -406,6 +406,10 @@ fn strip_quotes_and_signature(body: &str, forward: bool) -> String {
 // Lines, URLs, classification
 // ---------------------------------------------------------------------------
 
+/// Characters with no width: zero-width space / joiners, word joiner, BOM,
+/// soft hyphen.
+const INVISIBLE: [char; 6] = ['\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}'];
+
 static RE_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\b(?:https?://|www\.)[^\s<>"'«»\[\]{}|\\^`]+"#).unwrap());
 static RE_NUMBERED: LazyLock<Regex> =
@@ -834,8 +838,10 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let mut warnings = Vec::new();
     let roster_ix = Roster::new(roster);
 
-    // 1. Cleanup.
-    let body = strip_quotes_and_signature(&mail.readable_body(), is_forward(&mail.subject));
+    // 1. Cleanup. Zero-width and soft-hyphen characters come along when a
+    // link is copied out of a chat app or a web page, and split the URL.
+    let body = mail.readable_body().replace(INVISIBLE, "");
+    let body = strip_quotes_and_signature(&body, is_forward(&mail.subject));
     let body = decontaminate_email_body(&body);
 
     // 2. Journalist.

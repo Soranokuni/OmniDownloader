@@ -316,18 +316,8 @@ impl GraphMailSource {
         }
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: Url, prefer_text: bool) -> Result<T> {
-        let resp = self
-            .send(|c| {
-                let r = c.get(url.clone());
-                if prefer_text {
-                    // Graph converts HTML bodies to text (defect E-06).
-                    r.header("Prefer", "outlook.body-content-type=\"text\"")
-                } else {
-                    r
-                }
-            })
-            .await?;
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
+        let resp = self.send(|c| c.get(url.clone())).await?;
         resp.json().await.context("unreadable Graph response")
     }
 
@@ -351,7 +341,7 @@ impl GraphMailSource {
                 .query_pairs_mut()
                 .append_pair("$filter", &format!("displayName eq '{}'", name.replace('\'', "''")))
                 .append_pair("$select", "id,displayName");
-            let found: GList<GFolder> = self.get_json(filtered, false).await?;
+            let found: GList<GFolder> = self.get_json(filtered).await?;
             let id = match found.value.into_iter().find(|f| f.display_name.eq_ignore_ascii_case(name)) {
                 Some(f) => f.id,
                 None => {
@@ -375,7 +365,7 @@ impl GraphMailSource {
     async fn attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>> {
         let mut url = self.url(&["messages", message_id, "attachments"])?;
         url.query_pairs_mut().append_pair("$select", "id,name,contentType,size,isInline");
-        let list: GList<GAttachment> = self.get_json(url, false).await?;
+        let list: GList<GAttachment> = self.get_json(url).await?;
         Ok(list
             .value
             .into_iter()
@@ -444,10 +434,10 @@ impl GraphMailSource {
         };
         let mut inbox_url = self.url(&["mailFolders", "Inbox"])?;
         inbox_url.query_pairs_mut().append_pair("$select", "id,displayName,unreadItemCount");
-        let inbox: GFolder = self.get_json(inbox_url, false).await.map_err(explain)?;
+        let inbox: GFolder = self.get_json(inbox_url).await.map_err(explain)?;
         let mut one = self.url(&["mailFolders", "Inbox", "messages"])?;
         one.query_pairs_mut().append_pair("$top", "1").append_pair("$select", "id");
-        let _: GList<serde_json::Value> = self.get_json(one, false).await.map_err(explain)?;
+        let _: GList<serde_json::Value> = self.get_json(one).await.map_err(explain)?;
         Ok(format!(
             "Signed in; the Inbox of {} is readable ({} unread).",
             self.cfg.mailbox,
@@ -499,7 +489,7 @@ impl MailSource for GraphMailSource {
         let mut out = Vec::new();
         let mut next = Some(url);
         while let Some(page_url) = next.take() {
-            let page: GList<GMessage> = self.get_json(page_url, false).await?;
+            let page: GList<GMessage> = self.get_json(page_url).await?;
             for m in page.value {
                 // Graph always sends it; a message without one cannot be
                 // placed against the checkpoint, so it is not listed.
@@ -531,7 +521,10 @@ impl MailSource for GraphMailSource {
     async fn fetch_mail(&self, id: &str) -> Result<InboundMail> {
         let mut url = self.url(&["messages", id])?;
         url.query_pairs_mut().append_pair("$select", MESSAGE_FIELDS);
-        let m: GMessage = match self.get_json(url, true).await {
+        // The HTML as sent, not Graph's text rendering: our own converter
+        // keeps the address behind a hyperlinked word and is what the
+        // golden fixtures test (plan P4.10).
+        let m: GMessage = match self.get_json(url).await {
             Ok(m) => m,
             Err(e) if graph_status(&e) == Some(StatusCode::NOT_FOUND) => {
                 return Err(anyhow::Error::new(MailGone(id.to_string())));
@@ -617,7 +610,7 @@ impl MailSource for GraphMailSource {
         let probe = async {
             let mut url = self.url(&["mailFolders", "Inbox"])?;
             url.query_pairs_mut().append_pair("$select", "id,displayName,unreadItemCount");
-            let inbox: GFolder = self.get_json(url, false).await?;
+            let inbox: GFolder = self.get_json(url).await?;
             Ok::<_, anyhow::Error>(inbox.unread_item_count.unwrap_or(0))
         };
         match probe.await {

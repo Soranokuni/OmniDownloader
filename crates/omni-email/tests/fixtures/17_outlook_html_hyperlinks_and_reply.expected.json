@@ -1,0 +1,78 @@
+{
+  "ignored_urls": [
+    "https://www.example.gr/"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "NIKOLAOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "SEISMOSSITEIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1701"
+        }
+      ],
+      "keyword": "SEISMOSSITEIA",
+      "title": "ΣΕΙΣΜΟΣ ΣΤΗ ΣΗΤΕΙΑ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "LIMANICHANION",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1702&t=30s"
+        }
+      ],
+      "keyword": "LIMANICHANION",
+      "title": "ΛΙΜΑΝΙ ΧΑΝΙΩΝ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3",
+          "keyword": "SYNENTEFXIDIMARCHOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1703"
+        }
+      ],
+      "keyword": "SYNENTEFXIDIMARCHOU",
+      "title": "ΣΥΝΕΝΤΕΥΞΗ ΔΗΜΑΡΧΟΥ"
+    },
+    {
+      "index_str": "4",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "4",
+          "keyword": "EKTHESIVIVLIOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.dailymotion.com/video/fixture1704"
+        }
+      ],
+      "keyword": "EKTHESIVIVLIOU",
+      "title": "ΕΚΘΕΣΗ ΒΙΒΛΙΟΥ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}
