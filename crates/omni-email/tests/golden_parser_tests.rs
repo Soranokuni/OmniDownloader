@@ -28,6 +28,7 @@ fn roster() -> Vec<Journalist> {
         emails: emails.iter().map(|s| s.to_string()).collect(),
         default_priority: 0,
         aliases: aliases.iter().map(|s| s.to_string()).collect(),
+        groups: vec![],
         created_at: None,
     };
     vec![

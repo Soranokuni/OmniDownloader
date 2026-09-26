@@ -16,6 +16,7 @@ fn roster() -> Vec<Journalist> {
         emails: vec!["g.nikolaou@example.gr".into()],
         default_priority: 0,
         aliases: vec![],
+        groups: vec![],
         created_at: None,
     }]
 }

@@ -9,6 +9,7 @@ pub mod process;
 pub mod repository;
 pub mod scheduler;
 pub mod secrets;
+pub mod taxonomy;
 pub mod selftest;
 pub mod timestamps;
 pub mod translit;

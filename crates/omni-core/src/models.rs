@@ -261,6 +261,10 @@ pub struct Journalist {
     /// Compared accent- and case-insensitively, in ELOT 743 Latin.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Group codes this person belongs to (plan P4.17); the first is their
+    /// default group.
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
 }
 
