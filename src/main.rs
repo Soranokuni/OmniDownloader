@@ -138,7 +138,16 @@ fn init_logging(cli: &Cli, paths: &AppPaths) -> Result<Option<LogGuard>> {
     // Seed the redaction set from the secret store before the first line is
     // written, so nothing can be logged in the window before it is populated.
     let store = SecretStore::new(paths.resolve("data/secrets.bin"));
-    let redactions = Redactions::new(store.all_values());
+    let mut values = store.all_values();
+    // A secret supplied through the environment (plan P4.9) is redacted too.
+    values.extend(
+        omni_core::config::env_vars::SECRETS
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+    );
+    let redactions = Redactions::new(values);
 
     let guard = omni_core::logging::init(&paths.logs, &config.log, console, redactions)?;
     Ok(Some(guard))
@@ -300,6 +309,12 @@ async fn run_daemon(
             .save_to_file(&config_path)
             .context("Failed rewriting config.json without the plaintext secret")?;
         info!("Rewrote {:?} without the plaintext mailbox password", config_path);
+    }
+    // Console / development runs may take the Graph settings from the
+    // environment (plan P4.9). Names only in the log, never values.
+    let from_env = config.apply_env_overrides(|name| std::env::var(name).ok());
+    if !from_env.is_empty() {
+        info!("Graph settings taken from the environment: {}", from_env.join(", "));
     }
     let config = config;
 
