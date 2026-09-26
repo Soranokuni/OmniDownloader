@@ -1,0 +1,60 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "APERGIALIMANIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture2101"
+        }
+      ],
+      "keyword": "APERGIALIMANIA",
+      "title": "ΑΠΕΡΓΙΑ ΣΤΑ ΛΙΜΑΝΙΑ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "EKLOGESEPIMELITIRIO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture2102"
+        }
+      ],
+      "keyword": "EKLOGESEPIMELITIRIO",
+      "title": "ΕΚΛΟΓΕΣ ΣΤΟ ΕΠΙΜΕΛΗΤΗΡΙΟ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3",
+          "keyword": "NEONOSOKOMEIO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture2103"
+        }
+      ],
+      "keyword": "NEONOSOKOMEIO",
+      "title": "ΝΕΟ ΝΟΣΟΚΟΜΕΙΟ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}
