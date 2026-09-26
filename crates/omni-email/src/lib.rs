@@ -5,6 +5,7 @@ pub mod interceptor;
 pub mod llm;
 pub mod mail;
 pub mod parser;
+pub mod preview;
 pub mod source;
 pub mod watcher;
 

@@ -68,6 +68,22 @@ enum Commands {
         #[command(subcommand)]
         action: AdblockAction,
     },
+    /// Show what the parser would do with recent mail, without queueing
+    /// anything or touching the mailbox (read-only)
+    MailPreview {
+        /// How many of the most recently changed Inbox messages to show
+        #[arg(long, default_value_t = 10)]
+        last: usize,
+        /// Look this many hours back
+        #[arg(long, default_value_t = 72)]
+        hours: i64,
+        /// Parse these .eml files instead of reading the mailbox
+        #[arg(long)]
+        eml: Vec<std::path::PathBuf>,
+        /// Also ask the LLM assist, as the daemon would
+        #[arg(long)]
+        llm: bool,
+    },
     /// Manage credentials in the encrypted secret store
     Secrets {
         #[command(subcommand)]
@@ -151,6 +167,81 @@ fn init_logging(cli: &Cli, paths: &AppPaths) -> Result<Option<LogGuard>> {
 
     let guard = omni_core::logging::init(&paths.logs, &config.log, console, redactions)?;
     Ok(Some(guard))
+}
+
+/// `omni-ingest mail-preview` (plan P4.16): parse recent mail, or .eml
+/// files, and print what would be queued. Reads the mailbox, the roster and
+/// `processed_mail`; writes nothing, marks nothing.
+async fn mail_preview(
+    paths: &AppPaths,
+    last: usize,
+    hours: i64,
+    eml: Vec<std::path::PathBuf>,
+    llm: bool,
+) -> Result<()> {
+    use omni_email::source::MailSource;
+
+    let mut config = AppConfig::load_from_file(&paths.config)
+        .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+    config.adopt_secrets(&SecretStore::new(paths.resolve("data/secrets.bin")))?;
+    config.apply_env_overrides(|name| std::env::var(name).ok());
+    let repo = Repository::new(paths.resolve(&config.database_path))?;
+    let roster = repo.list_journalists()?;
+    if roster.is_empty() {
+        println!("! The journalist roster is empty: every mail will resolve to MCR.");
+    }
+
+    let mails: Vec<omni_email::InboundMail> = if !eml.is_empty() {
+        let mut v = Vec::new();
+        for path in &eml {
+            let raw = std::fs::read(path).with_context(|| format!("Cannot read {path:?}"))?;
+            v.push(omni_email::InboundMail::from_rfc822(&path.display().to_string(), &raw)?);
+        }
+        v
+    } else {
+        let source = omni_email::graph::GraphMailSource::new(config.graph.clone());
+        if !source.is_configured() {
+            anyhow::bail!("The Graph mailbox is not configured (tenant id, client id, mailbox, client secret).");
+        }
+        let since = chrono::Utc::now() - chrono::Duration::hours(hours.max(1));
+        let mut headers = source.list_changed(since, 5000).await?;
+        headers.sort_by_key(|h| std::cmp::Reverse(h.modified_at));
+        headers.truncate(last.max(1));
+        println!(
+            "{} message(s) changed in the last {hours} h in {}; showing the newest {}.",
+            headers.len(),
+            config.graph.mailbox,
+            headers.len()
+        );
+        let mut v = Vec::new();
+        for h in headers {
+            match source.fetch_mail(&h.id).await {
+                Ok(m) => v.push(m),
+                Err(e) => println!("! '{}': could not be read: {e:#}", h.subject),
+            }
+        }
+        v
+    };
+
+    let assist = llm.then(|| {
+        omni_email::assist::Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
+    });
+    for mail in &mails {
+        let mut parsed = omni_email::parser::parse(mail, &roster, &config.parser);
+        if let Some(a) = &assist {
+            let body = mail.readable_body();
+            if a.wanted(&parsed, &body) {
+                a.refine(mail, &body, &mut parsed, &roster, &config.parser).await;
+            }
+        }
+        let seen = repo
+            .get_processed_mail(&omni_email::watcher::mail_key(mail))?
+            .map(|p| p.outcome);
+        print!("{}", omni_email::preview::render(mail, &parsed, seen.as_deref()));
+    }
+    println!("
+Nothing was queued and the mailbox was not changed.");
+    Ok(())
 }
 
 #[tokio::main]
@@ -243,6 +334,9 @@ async fn main() -> Result<()> {
                     eprintln!("\n✗ Stream sniffing failed: {}", e);
                 }
             }
+        }
+        Some(Commands::MailPreview { last, hours, eml, llm }) => {
+            mail_preview(&paths, last, hours, eml, llm).await?;
         }
         Some(Commands::Secrets { action }) => {
             let store = SecretStore::new(paths.resolve("data/secrets.bin"));
