@@ -314,6 +314,15 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        8,
+        // The group a job was queued for (plan P4.18): a label for the
+        // panels, never used for naming or delivery. A job keeps its label
+        // if the group is later deleted.
+        r#"
+        ALTER TABLE queue ADD COLUMN group_code TEXT;
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

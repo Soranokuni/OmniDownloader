@@ -198,6 +198,9 @@ pub struct Job {
     /// `{"download_ms": .., "transcode_ms": ..}` for the benchmarks.
     pub stage_timings_json: Option<String>,
     pub email_message_id: Option<String>,
+    /// The group the job was queued for (plan P4.18); a label only.
+    #[serde(default)]
+    pub group_code: Option<String>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 
@@ -428,6 +431,8 @@ pub struct NewJob {
     pub email_source: Option<String>,
     pub email_message_id: Option<String>,
     pub extraction_method: Option<String>,
+    /// Group label (plan P4.18).
+    pub group_code: Option<String>,
 }
 
 impl NewJob {
@@ -446,6 +451,7 @@ impl NewJob {
             email_source: None,
             email_message_id: None,
             extraction_method: None,
+            group_code: None,
         }
     }
 }

@@ -368,6 +368,10 @@ impl EmailWatcher {
         if self.assist.wanted(&parsed, &body) {
             self.assist.refine(mail, &body, &mut parsed, &roster, &self.config.parser).await;
         }
+        // After the assist, which may have named the journalist whose
+        // default group decides (plan P4.18).
+        let groups = self.repo.list_groups()?;
+        crate::groups::resolve_group(mail, &mut parsed, &roster, &groups);
         let default_priority = roster
             .iter()
             .find(|j| j.surname == parsed.journalist.surname)
@@ -482,6 +486,7 @@ impl EmailWatcher {
                 email_source: Some(mail.from_address.clone()),
                 email_message_id: Some(mail_key(mail)),
                 extraction_method: method.map(String::from),
+                group_code: parsed.group.as_ref().map(|g| g.code.clone()),
             };
             let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
             match &result {

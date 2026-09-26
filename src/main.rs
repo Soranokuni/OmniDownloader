@@ -187,6 +187,7 @@ async fn mail_preview(
     config.apply_env_overrides(|name| std::env::var(name).ok());
     let repo = Repository::new(paths.resolve(&config.database_path))?;
     let roster = repo.list_journalists()?;
+    let groups = repo.list_groups()?;
     if roster.is_empty() {
         println!("! The journalist roster is empty: every mail will resolve to MCR.");
     }
@@ -234,6 +235,7 @@ async fn mail_preview(
                 a.refine(mail, &body, &mut parsed, &roster, &config.parser).await;
             }
         }
+        omni_email::groups::resolve_group(mail, &mut parsed, &roster, &groups);
         let seen = repo
             .get_processed_mail(&omni_email::watcher::mail_key(mail))?
             .map(|p| p.outcome);

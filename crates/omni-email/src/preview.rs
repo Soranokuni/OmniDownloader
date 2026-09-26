@@ -41,6 +41,14 @@ pub fn render(mail: &InboundMail, parsed: &ParsedEmail, seen: Option<&str>) -> S
         parsed.journalist.how,
         if parsed.urgent { "   URGENT" } else { "" }
     );
+    match &parsed.group {
+        Some(g) => {
+            let _ = writeln!(out, "Group:      {} (found by {:?})", g.code, g.how);
+        }
+        None => {
+            let _ = writeln!(out, "Group:      (none)");
+        }
+    }
     let _ = writeln!(out, "Outcome:    {:?}", parsed.outcome);
 
     for s in &parsed.sections {
