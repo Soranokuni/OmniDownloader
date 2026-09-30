@@ -1,0 +1,55 @@
+{
+  "ignored_urls": [
+    "https://www.example-festival.gr/programma"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.9,
+          "index_str": "1A",
+          "keyword": "KRANIORINOKEROU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/kriti/lasithi/fixture2401-kranio-rinokeroy"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "KRANIORINOKEROU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture2402"
+        }
+      ],
+      "keyword": "KRANIORINOKEROU",
+      "title": "ΚΡΑΝΙΟ ΡΙΝΟΚΕΡΟΥ ΣΤΗ ΣΗΤΕΙΑ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "2",
+          "keyword": "FESTIVALKRASIOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.iefimerida.gr/ellada/fixture2403-festival-krasioy"
+        }
+      ],
+      "keyword": "FESTIVALKRASIOU",
+      "title": "ΦΕΣΤΙΒΑΛ ΚΡΑΣΙΟΥ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}
