@@ -353,6 +353,13 @@ base URL it was saved with.
 - **Online**: https is required, and email addresses and phone numbers in
   the mail are replaced with placeholders; the sender's address is never
   sent. Subject, part of the body, roster surnames and group names are.
+- The built-in prompt reads who the material is for ("για τον Γιώργο",
+  "ΓΙΑ ΕΥΗ", nicknames and cases, matched against full names and aliases)
+  and writes story keywords (place, person, event; never VIDEO, VIRAL or the
+  journalist's name). **Let the LLM write every keyword** asks it for all
+  sections, one call per mail. A recipient named in a mail but missing from
+  the roster appears as `JOURNALIST_SUGGESTED: <name>` in the job notes and
+  the audit log; the roster is never changed automatically.
 - Leave **Disable thinking** on for reasoning models (Gemma 4, Qwen 3.5):
   with thinking, Gemma 4 E4B took 63 s per mail on a Snapdragon X Elite
   instead of 8–29 s, or used its whole token budget and answered nothing.

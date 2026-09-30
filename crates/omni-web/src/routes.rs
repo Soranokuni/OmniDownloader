@@ -1450,6 +1450,10 @@ pub struct LlmSettingsPayload {
     max_tokens: u32,
     #[serde(default = "default_true_payload")]
     disable_thinking: bool,
+    /// The LLM writes every section's keyword, not only those the parser
+    /// could not make.
+    #[serde(default)]
+    keyword_polish: bool,
 }
 
 fn default_llm_timeout_payload() -> u64 {
@@ -1486,7 +1490,7 @@ fn llm_settings(
         mode: p.mode,
         timeout_secs: p.timeout_secs.clamp(5, 300),
         max_tokens: p.max_tokens.clamp(50, 8000),
-        keyword_polish: saved.llm.keyword_polish,
+        keyword_polish: p.keyword_polish,
         provider: {
             let v = p.provider.trim().to_lowercase();
             if v.is_empty() { "custom".into() } else { v.chars().take(30).collect() }
@@ -1509,6 +1513,7 @@ pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): Stat
         "timeout_secs": cfg.llm.timeout_secs,
         "max_tokens": cfg.llm.max_tokens,
         "disable_thinking": cfg.llm.disable_thinking,
+        "keyword_polish": cfg.llm.keyword_polish,
         "key_set": !cfg.llm.api_key.is_empty(),
         "online": !omni_email::llm::is_local_endpoint(&cfg.ollama_endpoint),
         "in_use": state.llm.current().describe(),

@@ -459,6 +459,7 @@ function llmPayload() {
     timeout_secs: Number(llm('llm-timeout').value) || 30,
     max_tokens: Number(llm('llm-tokens').value) || 400,
     disable_thinking: llm('llm-no-thinking').checked,
+    keyword_polish: llm('llm-polish').checked,
   };
 }
 
@@ -481,6 +482,7 @@ async function loadLlm() {
   llm('llm-timeout').value = s.timeout_secs;
   llm('llm-tokens').value = s.max_tokens;
   llm('llm-no-thinking').checked = !!s.disable_thinking;
+  llm('llm-polish').checked = !!s.keyword_polish;
   llm('llm-in-use').textContent = `In use: ${s.mode === 'off' ? 'off' : s.in_use}`;
   syncOnline();
 }

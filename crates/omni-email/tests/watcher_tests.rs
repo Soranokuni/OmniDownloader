@@ -533,3 +533,16 @@ async fn a_reprocess_of_a_mail_that_left_the_mailbox_is_dropped_and_logged() {
     assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "JOBS", "the old record was lost");
     assert!(repo.request_mail_reprocess("<nope@example.gr>", "x").is_err());
 }
+
+#[tokio::test]
+async fn a_suggested_recipient_reaches_the_job_notes_by_name() {
+    let (_dir, repo) = repo();
+    let mut m = mail("m1", "VIRAL ΓΙΑ ΕΥΗ", "https://www.facebook.com/reel/sg0001");
+    m.from_address = "someone@example.org".into();
+    let source = FakeSource::with(vec![m]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+    let job = repo.get_all_jobs().unwrap().pop().unwrap();
+    assert!(job.notes.as_deref().unwrap_or("").contains("JOURNALIST_SUGGESTED: ΕΥΗ"), "{:?}", job.notes);
+    assert_eq!(job.slug, "1_MCR_VIRAL", "the recipient's name leaked into the slug");
+}
