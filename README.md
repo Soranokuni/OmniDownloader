@@ -332,6 +332,27 @@ marked read and moved to `Omni/Processed`, and mail that could not be
 processed is moved to `Omni/Failed` and left **unread**. Both folders are
 created on first use.
 
+## LLM assist (optional)
+
+The deterministic parser decides every job; the LLM is asked only where it
+is unsure (a journalist, a keyword, a group) and its answers are checked
+before use. With the LLM off, down or slow, the jobs are the same.
+
+Set it on **Admin → LLM assist**: pick a provider preset (LM Studio,
+Ollama, GenieX, llama.cpp/vLLM, OpenAI, Azure OpenAI, Google Gemini,
+Anthropic, OpenRouter, Mistral, Groq, or any OpenAI-compatible server),
+**Load models**, **Test**, then **Save and apply**; no restart. Keys are
+stored encrypted (`llm.api_key`) and a stored key is only ever sent to the
+base URL it was saved with.
+
+- **Local** (this machine or the station network): the prompt is sent as is.
+- **Online**: https is required, and email addresses and phone numbers in
+  the mail are replaced with placeholders; the sender's address is never
+  sent. Subject, part of the body, roster surnames and group names are.
+- Leave **Disable thinking** on for reasoning models (Gemma 4, Qwen 3.5):
+  with thinking, Gemma 4 E4B took 63 s per mail on a Snapdragon X Elite
+  instead of 8–29 s, or used its whole token budget and answered nothing.
+
 ## Configuration and data that stay out of git
 
 | Path | Why |

@@ -12,7 +12,7 @@ use omni_core::health::{Check, HealthState};
 use omni_core::models::{Enqueued, JobStatus, NewJob, ProcessedMail};
 use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
-use crate::assist::Assist;
+use crate::assist::{Assist, LiveAssist};
 use crate::graph::{GraphMailSource, RetryAfter};
 use crate::mail::InboundMail;
 use crate::parser::{ParsedEmail, Tier};
@@ -58,7 +58,8 @@ pub struct EmailWatcher {
     /// Failed processing attempts per message id, since start-up.
     attempts: Arc<Mutex<HashMap<String, u32>>>,
     /// Second opinion on journalist and keywords (plan P4.4).
-    assist: Arc<Assist>,
+    /// Shared with the admin panel, which may swap it (plan P4.22).
+    assist: LiveAssist,
     /// Where video attachments are saved: `{dir}/{job_id}/source.{ext}`.
     /// Not under `temp/jobs`, which start-up sweeps for every job that is
     /// not running — a queued attachment job would lose its only source.
@@ -115,7 +116,7 @@ impl EmailWatcher {
     /// A watcher over any mail source (Graph, or a test double).
     pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
         let attachments_dir = config.resolve_path(&config.temp_path).join("attachments");
-        let assist = Arc::new(Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone()));
+        let assist = LiveAssist::new(Assist::from_config(&config));
         Self {
             attachments_dir,
             assist,
@@ -130,6 +131,12 @@ impl EmailWatcher {
     /// Save attachments here instead of `{temp}/attachments`.
     pub fn with_attachments_dir(mut self, dir: PathBuf) -> Self {
         self.attachments_dir = dir;
+        self
+    }
+
+    /// Use the daemon's live assist, which the admin panel can reconfigure.
+    pub fn with_live_assist(mut self, assist: LiveAssist) -> Self {
+        self.assist = assist;
         self
     }
 
@@ -365,7 +372,7 @@ impl EmailWatcher {
         let roster = self.repo.list_journalists()?;
         let groups = self.repo.list_groups()?;
         let parsed =
-            crate::assist::interpret(mail, &roster, &groups, &self.config.parser, Some(self.assist.as_ref())).await;
+            crate::assist::interpret(mail, &roster, &groups, &self.config.parser, Some(self.assist.current().as_ref())).await;
         let default_priority = roster
             .iter()
             .find(|j| j.surname == parsed.journalist.surname)

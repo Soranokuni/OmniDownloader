@@ -32,6 +32,8 @@ use tracing::warn;
 pub mod keys {
     /// Microsoft Graph application secret (plan P4.2).
     pub const GRAPH_CLIENT_SECRET: &str = "graph.client_secret";
+    /// The LLM provider's API key (plan P4.22). Empty for local runtimes.
+    pub const LLM_API_KEY: &str = "llm.api_key";
     /// Teams incoming-webhook URL (plan P5.3) — a URL that is itself a
     /// credential, since anyone holding it can post to the MCR channel.
     pub const TEAMS_WEBHOOK_URL: &str = "teams.webhook_url";
@@ -41,6 +43,7 @@ pub mod keys {
     /// Every key the panel and CLI accept, for validation and listing.
     pub const ALL: &[&str] = &[
         GRAPH_CLIENT_SECRET,
+        LLM_API_KEY,
         TEAMS_WEBHOOK_URL,
         TLS_PASSWORD,
     ];

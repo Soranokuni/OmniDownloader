@@ -1355,6 +1355,14 @@ mod tests {
     }
 
     #[test]
+    fn a_model_answering_nothing_as_a_word_gets_no_keyword() {
+        for nothing in ["null", "NULL", "None", "N/A", "undefined", "keyword", "asset"] {
+            assert_eq!(valid_keyword(nothing), None, "{nothing}");
+        }
+        assert_eq!(valid_keyword("λιμάνι").as_deref(), Some("LIMANI"));
+    }
+
+    #[test]
     fn links_come_out_of_brackets_quotes_markdown_and_greek_punctuation() {
         let urls = |line: &str| find_urls(line).into_iter().map(|(_, u)| u).collect::<Vec<_>>();
         let cases: &[(&str, &[&str])] = &[
@@ -1526,7 +1534,10 @@ static RE_KEYWORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Z0-9]{2,2
 /// into shape.
 pub fn valid_keyword(raw: &str) -> Option<String> {
     let k = translit(raw.trim());
-    (RE_KEYWORD.is_match(&k) && !STOPWORDS.contains(&k.as_str())).then_some(k)
+    // A model that has no keyword sometimes answers the word for "nothing"
+    // as a string; "NULL" would pass the pattern and name a file.
+    const NOTHING: &[&str] = &["NULL", "NONE", "NIL", "NA", "N/A", "UNDEFINED", "UNKNOWN", "EMPTY", "KEYWORD", "ASSET"];
+    (RE_KEYWORD.is_match(&k) && !STOPWORDS.contains(&k.as_str()) && !NOTHING.contains(&k.as_str())).then_some(k)
 }
 
 /// Adopt a journalist for a mail the parser left unresolved: the −0.2

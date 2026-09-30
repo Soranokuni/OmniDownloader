@@ -18,10 +18,9 @@
 use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
-use std::time::Duration;
 use tracing::{info, warn};
 
-use omni_core::config::{LlmConfig, LlmMode, ParserConfig};
+use omni_core::config::{AppConfig, LlmConfig, LlmMode, ParserConfig};
 use omni_core::models::Journalist;
 use omni_core::taxonomy::Group;
 use omni_core::translit::translit;
@@ -60,8 +59,35 @@ impl Assist {
         if cfg.mode == LlmMode::Primary {
             warn!("llm.mode = \"primary\" is not implemented; running as \"assist\"");
         }
-        let client = LlmClient::with_timeout(endpoint, model, Duration::from_secs(cfg.timeout_secs.clamp(5, 300)));
+        let cfg = LlmConfig {
+            timeout_secs: cfg.timeout_secs.clamp(5, 300),
+            ..cfg
+        };
+        let client = LlmClient::from_settings(endpoint, model, &cfg);
         Self { client, cfg }
+    }
+
+    /// The assist the configuration describes (plan P4.22).
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
+    }
+
+    pub fn client(&self) -> &LlmClient {
+        &self.client
+    }
+
+    pub fn mode(&self) -> LlmMode {
+        self.cfg.mode
+    }
+
+    /// For logs and the status bar. Never the key.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} at {} ({})",
+            self.client.model(),
+            self.client.endpoint().trim_end_matches("/chat/completions"),
+            if self.client.is_online() { "online" } else { "local" }
+        )
     }
 
     /// Whether this mail is worth a model call (plan P4.4 trigger rules;
@@ -106,7 +132,11 @@ impl Assist {
             return;
         }
 
-        let user = build_prompt(mail, body, roster, want_journalist, &sections, if want_group { groups } else { &[] });
+        // An online provider gets the prompt with contact details redacted
+        // (owner's decision, plan P4.22): addresses and phone numbers out, the
+        // sender's address never sent.
+        let redact = self.client.is_online();
+        let user = build_prompt(mail, body, roster, want_journalist, &sections, if want_group { groups } else { &[] }, redact);
         let answer = match self.client.chat_json(SYSTEM_PROMPT, &user, &schema(), self.cfg.max_tokens).await {
             Ok(v) => v,
             Err(e) => {
@@ -215,6 +245,7 @@ fn build_prompt(
     want_journalist: bool,
     sections: &[(String, String)],
     groups: &[Group],
+    redact: bool,
 ) -> String {
     let mut p = String::new();
     if want_journalist {
@@ -245,9 +276,74 @@ fn build_prompt(
             p.push('\n');
         }
     }
-    p.push_str(&format!("\nSubject: {}\nFrom: {} <{}>\n\nBody:\n", mail.subject, mail.from_name, mail.from_address));
-    p.extend(body.chars().take(MAX_BODY_CHARS));
+    let excerpt: String = body.chars().take(MAX_BODY_CHARS).collect();
+    if redact {
+        p.push_str(&format!(
+            "\nSubject: {}\nFrom: {}\n\nBody:\n{}",
+            redact_contacts(&mail.subject),
+            redact_contacts(&mail.from_name),
+            redact_contacts(&excerpt)
+        ));
+    } else {
+        p.push_str(&format!("\nSubject: {}\nFrom: {} <{}>\n\nBody:\n{excerpt}", mail.subject, mail.from_name, mail.from_address));
+    }
     p
+}
+
+static RE_EMAIL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b").unwrap());
+/// Phone numbers: 10+ digits, optionally with a +country code and spaces,
+/// dots or dashes between groups (Greek: 69x xxx xxxx, 2810 123456).
+static RE_PHONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:\+|00)?\d(?:[\s.\-/()]{0,2}\d){9,14}").unwrap());
+static RE_ANY_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:https?://|www\.)\S+").unwrap());
+
+/// Replace email addresses and phone numbers with placeholders, leaving
+/// links alone (a video id is digits too). For prompts sent off-site.
+pub fn redact_contacts(text: &str) -> String {
+    let urls: Vec<std::ops::Range<usize>> = RE_ANY_URL.find_iter(text).map(|m| m.range()).collect();
+    let in_url = |r: &std::ops::Range<usize>| urls.iter().any(|u| r.start < u.end && u.start < r.end);
+    let mut cuts: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    for m in RE_EMAIL.find_iter(text) {
+        if !in_url(&m.range()) {
+            cuts.push((m.range(), "[email]"));
+        }
+    }
+    for m in RE_PHONE.find_iter(text) {
+        let r = m.range();
+        if !in_url(&r) && !cuts.iter().any(|(c, _)| r.start < c.end && c.start < r.end) {
+            cuts.push((r, "[phone]"));
+        }
+    }
+    cuts.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+    let mut out = text.to_string();
+    for (r, with) in cuts {
+        out.replace_range(r, with);
+    }
+    out
+}
+
+/// The assist in use, swappable while the daemon runs: the admin panel
+/// saves new LLM settings and every later mail uses them, no restart.
+#[derive(Clone)]
+pub struct LiveAssist(std::sync::Arc<std::sync::RwLock<std::sync::Arc<Assist>>>);
+
+impl LiveAssist {
+    pub fn new(assist: Assist) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(assist))))
+    }
+
+    pub fn current(&self) -> std::sync::Arc<Assist> {
+        self.0.read().map(|a| a.clone()).unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    pub fn replace(&self, assist: Assist) {
+        let new = std::sync::Arc::new(assist);
+        match self.0.write() {
+            Ok(mut g) => *g = new,
+            Err(e) => *e.into_inner() = new,
+        }
+    }
 }
 
 /// Everything the daemon decides about a mail, in order (plan P4.18/P4.19):
@@ -275,4 +371,33 @@ pub async fn interpret(
         }
     }
     parsed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mail() -> InboundMail {
+        InboundMail {
+            from_name: "Eleni Georgiou".into(),
+            from_address: "e.georgiou@example.gr".into(),
+            subject: "Για την πρωινή, τηλ. 6941234567".into(),
+            body_text: "Ο κ. Παπάς (papas@example.org, 2810 555 666) μιλάει εδώ:\nhttps://youtu.be/abc1234567890".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_online_prompt_carries_no_address_or_phone_and_a_local_one_is_unchanged() {
+        let m = mail();
+        let body = m.readable_body();
+        let online = build_prompt(&m, &body, &[], true, &[], &[], true);
+        for leaked in ["e.georgiou@example.gr", "papas@example.org", "6941234567", "2810 555 666"] {
+            assert!(!online.contains(leaked), "{leaked} sent online:\n{online}");
+        }
+        assert!(online.contains("Eleni Georgiou") && online.contains("https://youtu.be/abc1234567890"), "{online}");
+
+        let local = build_prompt(&m, &body, &[], true, &[], &[], false);
+        assert!(local.contains("<e.georgiou@example.gr>") && local.contains("papas@example.org"), "{local}");
+    }
 }

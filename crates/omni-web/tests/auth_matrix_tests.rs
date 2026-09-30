@@ -494,11 +494,35 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
-    (
-        "POST",
-        "/api/system/test-llm",
-        &[(Anonymous, Denied), (Mcr, Denied), (Admin, Reached)],
-    ),
+    // ---- LLM settings (plan P4.22): the key and where mail text goes ----
+    ("GET", "/api/admin/llm", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/llm", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/llm/test", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/llm/models", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // ---- First-run only. With an admin present this is a 404 for everyone
     //      who is not one, including a loopback client.
     (
