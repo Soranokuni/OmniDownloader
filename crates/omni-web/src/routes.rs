@@ -726,7 +726,8 @@ pub async fn api_delete_journalist(
     }
     state
         .repo
-        .delete_journalist(&surname)
+        .backup_taxonomy("before-delete")
+        .and_then(|_| state.repo.delete_journalist(&surname))
         .map_err(internal_error("Could not delete the journalist."))?;
     audit_action(&state, &principal, &format!("Journalist {surname} deleted"));
     Ok(Json(serde_json::json!({ "status": "ok" })))
@@ -771,7 +772,8 @@ pub async fn api_delete_group(
 ) -> JsonResult {
     let removed = state
         .repo
-        .delete_group(&code)
+        .backup_taxonomy("before-delete")
+        .and_then(|_| state.repo.delete_group(&code))
         .map_err(internal_error("Could not delete the group."))?;
     if !removed {
         return Err(ApiError::bad_request("No such group."));
@@ -830,6 +832,60 @@ pub async fn api_set_journalist_groups(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+/// Taxonomy backups, newest first (plan P4.27).
+pub async fn api_admin_taxonomy_backups(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let backups = state
+        .repo
+        .list_taxonomy_backups()
+        .map_err(internal_error("Could not list the backups."))?;
+    Ok(Json(serde_json::json!({
+        "backups": backups,
+        "kept": omni_core::repository::TAXONOMY_BACKUPS_KEPT,
+    })))
+}
+
+pub async fn api_admin_taxonomy_backup_now(RequireAdmin(admin): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let b = state
+        .repo
+        .backup_taxonomy("manual")
+        .map_err(internal_error("Could not write the backup."))?;
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("Taxonomy backed up by {}: {}", admin.email, b.name));
+    Ok(Json(serde_json::json!({ "status": "ok", "backup": b })))
+}
+
+/// One backup, for download.
+pub async fn api_admin_taxonomy_backup_get(
+    RequireAdmin(_): RequireAdmin,
+    AxumPath(name): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let t = state
+        .repo
+        .read_taxonomy_backup(&name)
+        .map_err(|_| ApiError::bad_request("No such backup."))?;
+    Ok(Json(serde_json::json!(t)))
+}
+
+pub async fn api_admin_taxonomy_backup_restore(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(name): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    if state.repo.read_taxonomy_backup(&name).is_err() {
+        return Err(ApiError::bad_request("No such backup."));
+    }
+    let report = state
+        .repo
+        .restore_taxonomy_backup(&name)
+        .map_err(internal_error("Could not restore the backup."))?;
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("Taxonomy restored from {name} by {} (the state before was backed up)", admin.email),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok", "report": report })))
+}
+
 /// taxonomy.json, for download. Admin only: it lists staff and addresses.
 pub async fn api_admin_export_taxonomy(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
     let t = state
@@ -871,6 +927,11 @@ pub async fn api_admin_import_taxonomy(
     if payload.taxonomy.people.iter().any(|p| p.surname.trim().eq_ignore_ascii_case("MCR")) {
         return Err(ApiError::bad_request("The file was not imported: MCR is built in."));
     }
+    // What was there before, so an import can be undone from the panel.
+    state
+        .repo
+        .backup_taxonomy("before-import")
+        .map_err(internal_error("Could not back up the taxonomy before importing; nothing was imported."))?;
     let report = state
         .repo
         .import_taxonomy(&payload.taxonomy, payload.replace)
@@ -954,6 +1015,57 @@ pub async fn api_admin_create_user(
 #[derive(Deserialize)]
 pub struct UpdatePasswordPayload {
     password: String,
+}
+
+#[derive(Deserialize)]
+pub struct UserActivePayload {
+    active: bool,
+}
+
+/// Deactivate or reactivate an account (plan P2.4). A deactivated account
+/// cannot sign in and its sessions end at once. The last active
+/// administrator, and your own account, cannot be deactivated here: nobody
+/// could administer the station afterwards.
+pub async fn api_admin_set_user_active(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(user_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<UserActivePayload>,
+) -> JsonResult {
+    let users = state.repo.list_users().map_err(internal_error("Could not read the accounts."))?;
+    let Some(target) = users.iter().find(|u| u.id == user_id) else {
+        return Err(ApiError::bad_request("No such account."));
+    };
+    if !payload.active {
+        if target.email.eq_ignore_ascii_case(&admin.email) {
+            return Err(ApiError::bad_request("You cannot deactivate your own account."));
+        }
+        let other_admins = users
+            .iter()
+            .filter(|u| u.id != user_id && u.is_active && u.role == UserRole::Admin)
+            .count();
+        if target.role == UserRole::Admin && other_admins == 0 {
+            return Err(ApiError::bad_request("This is the last active administrator."));
+        }
+    }
+    state
+        .repo
+        .set_user_active_status(user_id, payload.active)
+        .map_err(internal_error("Could not change the account."))?;
+    if !payload.active {
+        let _ = state.repo.delete_sessions_for_user(user_id);
+    }
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!(
+            "Account {} {} by {}",
+            target.email,
+            if payload.active { "reactivated" } else { "deactivated" },
+            admin.email
+        ),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 pub async fn api_admin_update_password(

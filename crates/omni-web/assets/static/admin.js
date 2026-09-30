@@ -95,7 +95,7 @@ async function loadUsers() {
 
   if (users.length === 0) {
     render('users-body', el('tr', {},
-      el('td', { colspan: '5', class: 'empty' }, 'No accounts yet.')));
+      el('td', { colspan: '6', class: 'empty' }, 'No accounts yet.')));
     return;
   }
 
@@ -105,14 +105,31 @@ async function loadUsers() {
     el('td', {}, el('span', { class: user.role === 'admin' ? 'badge bad' : 'badge' },
       ROLE_LABEL[user.role] || user.role)),
     el('td', {}, user.journalist_surname || '—'),
+    el('td', {}, el('span', { class: user.is_active ? 'badge ok' : 'badge bad' }, user.is_active ? 'active' : 'deactivated')),
     el('td', { class: 'right' },
-      el('button', {
-        class: 'btn',
-        type: 'button',
-        onClick: () => resetPassword(user.id, user.email),
-      }, 'Reset password'),
+      el('div', { class: 'row tight', style: 'justify-content:flex-end' },
+        el('button', {
+          class: 'btn',
+          type: 'button',
+          onClick: () => resetPassword(user.id, user.email),
+        }, 'Reset password'),
+        el('button', {
+          class: user.is_active ? 'btn btn-danger' : 'btn',
+          type: 'button',
+          onClick: () => setActive(user, !user.is_active),
+        }, user.is_active ? 'Deactivate' : 'Reactivate'),
+      ),
     ),
   )));
+}
+
+async function setActive(user, active) {
+  if (!active && !confirm(`Deactivate ${user.email}? They are signed out at once and cannot sign in until reactivated.`)) return;
+  try {
+    await api(`/api/admin/users/${user.id}/active`, { method: 'POST', body: { active } });
+    toast(`${user.email} ${active ? 'reactivated' : 'deactivated'}.`, 'ok');
+    loadUsers();
+  } catch (e) { toast(e.message, 'bad'); }
 }
 
 async function resetPassword(id, email) {
@@ -593,25 +610,135 @@ async function loadTaxonomy() {
     )));
 
   const staff = people.filter((p) => p.surname !== 'MCR');
-  render('members-body', staff.length === 0
-    ? el('tr', {}, el('td', { colspan: '5', class: 'empty' }, 'No journalists yet.'))
-    : staff.map((p) => {
-      const input = el('input', {
-        type: 'text',
-        value: (p.groups || []).join(', '),
-        placeholder: groups.map((g) => g.code).slice(0, 3).join(', '),
-        'aria-label': `Groups of ${p.surname}`,
-      });
-      return el('tr', {},
-        el('td', { class: 'mono strong' }, p.surname),
-        el('td', {}, p.full_name),
-        el('td', { class: 'mono' }, (p.emails || []).join(', ')),
-        el('td', {}, input),
-        el('td', { class: 'right' },
-          el('button', { class: 'btn', type: 'button', onClick: () => saveMembership(p.surname, input) }, 'Save')),
-      );
-    }));
+  const known = new Set(groups.map((g) => g.code));
+  render('people-body', staff.length === 0
+    ? el('tr', {}, el('td', { colspan: '7', class: 'empty' }, 'Nobody yet. Add people below or import taxonomy.json.'))
+    : staff.map((p) => el('tr', {},
+      el('td', { class: 'mono strong' }, p.surname),
+      el('td', {}, p.full_name),
+      el('td', { class: 'mono' }, (p.emails || []).join(', ') || '—'),
+      el('td', {}, (p.aliases || []).join(', ') || '—'),
+      el('td', {}, (p.groups || []).length
+        ? (p.groups || []).map((code, i) => el('span', {
+          class: known.has(code) ? (i === 0 ? 'badge info' : 'badge') : 'badge bad',
+          style: 'margin-right:4px',
+          title: i === 0 ? 'default group' : '',
+        }, code))
+        : '—'),
+      el('td', { class: 'num' }, String(p.default_priority || 0)),
+      el('td', { class: 'right' },
+        el('div', { class: 'row tight', style: 'justify-content:flex-end' },
+          el('button', { class: 'btn', type: 'button', onClick: () => editPerson(p) }, 'Edit'),
+          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => deletePerson(p.surname) }, 'Delete'),
+        )),
+    )));
+  loadBackups();
 }
+
+const pf = (id) => document.getElementById(id);
+
+function editPerson(p) {
+  pf('pf-surname').value = p.surname;
+  pf('pf-name').value = p.full_name;
+  pf('pf-emails').value = (p.emails || []).join(', ');
+  pf('pf-aliases').value = (p.aliases || []).join(', ');
+  pf('pf-groups').value = (p.groups || []).join(', ');
+  pf('pf-priority').value = p.default_priority || 0;
+  pf('pf-name').focus();
+}
+
+pf('pf-clear').addEventListener('click', () => pf('person-form').reset());
+
+pf('person-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const surname = pf('pf-surname').value.trim().toUpperCase();
+  try {
+    await api('/api/journalists', {
+      method: 'POST',
+      body: {
+        surname,
+        full_name: pf('pf-name').value.trim(),
+        emails: splitList(pf('pf-emails').value).map((e) => e.toLowerCase()),
+        aliases: splitList(pf('pf-aliases').value),
+        priority: Number(pf('pf-priority').value) || 0,
+      },
+    });
+    await api(`/api/journalists/${encodeURIComponent(surname)}/groups`, {
+      method: 'POST',
+      body: { groups: splitList(pf('pf-groups').value).map((c) => c.toUpperCase()) },
+    });
+    toast(`${surname} saved.`, 'ok');
+    pf('person-form').reset();
+    loadTaxonomy();
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
+async function deletePerson(surname) {
+  if (!confirm(`Delete ${surname}? Their jobs keep their name; a backup is taken first.`)) return;
+  try {
+    await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
+    toast(`${surname} deleted.`, 'ok');
+    loadTaxonomy();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function loadBackups() {
+  let backups;
+  try {
+    backups = (await api('/api/admin/taxonomy/backups')).backups || [];
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  render('backups-body', backups.length === 0
+    ? el('tr', {}, el('td', { colspan: '4', class: 'empty' }, 'No backups yet.'))
+    : backups.map((b) => el('tr', {},
+      el('td', { class: 'mono' }, b.name),
+      el('td', { class: 'num' }, String(b.groups)),
+      el('td', { class: 'num' }, String(b.people)),
+      el('td', { class: 'right' },
+        el('div', { class: 'row tight', style: 'justify-content:flex-end' },
+          el('button', { class: 'btn', type: 'button', onClick: () => downloadBackup(b.name) }, 'Download'),
+          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => restoreBackup(b.name) }, 'Restore'),
+        )),
+    )));
+}
+
+function saveJson(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
+  // Our own JSON as a local blob: a plain anchor, since el() only allows
+  // http(s) links.
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+async function downloadBackup(name) {
+  try {
+    saveJson(name, await api(`/api/admin/taxonomy/backups/${encodeURIComponent(name)}`));
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function restoreBackup(name) {
+  if (!confirm(`Restore ${name}? Groups and people are set back exactly as in that backup; what is there now is backed up first.`)) return;
+  try {
+    const { report } = await api(`/api/admin/taxonomy/backups/${encodeURIComponent(name)}/restore`, { method: 'POST' });
+    showTaxonomy(`Restored ${name}: ${report.groups_saved} groups and ${report.people_saved} people; ${report.groups_removed} groups and ${report.people_removed} people removed.`, true);
+    loadTaxonomy();
+  } catch (e) { showTaxonomy(e.message, false); }
+}
+
+document.getElementById('taxonomy-backup-now').addEventListener('click', async () => {
+  try {
+    const { backup } = await api('/api/admin/taxonomy/backups', { method: 'POST' });
+    toast(`Backed up: ${backup.name}`, 'ok');
+    loadBackups();
+  } catch (e) { toast(e.message, 'bad'); }
+});
 
 function editGroup(g) {
   document.getElementById('g-code').value = g.code;
@@ -650,30 +777,10 @@ async function deleteGroup(code) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
-async function saveMembership(surname, input) {
-  try {
-    await api(`/api/journalists/${encodeURIComponent(surname)}/groups`, {
-      method: 'POST',
-      body: { groups: splitList(input.value).map((c) => c.toUpperCase()) },
-    });
-    toast(`Groups of ${surname} saved.`, 'ok');
-    loadTaxonomy();
-  } catch (e) { toast(e.message, 'bad'); }
-}
 
 document.getElementById('taxonomy-export').addEventListener('click', async () => {
   try {
-    const data = await api('/api/admin/taxonomy');
-    const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
-    // Our own JSON as a local blob: a plain anchor, since el() only allows
-    // http(s) links.
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'taxonomy.json';
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    saveJson('taxonomy.json', await api('/api/admin/taxonomy'));
     showTaxonomy('Exported. The file lists staff and their addresses: keep it out of shared folders and git.', true);
   } catch (e) { showTaxonomy(e.message, false); }
 });

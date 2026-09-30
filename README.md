@@ -251,6 +251,7 @@ copy config.example.json config.json
 # locked out? list the accounts, or set a new password (prompted, not an argument)
 .\target\release\omni-ingest.exe admin list-users
 .\target\release\omni-ingest.exe admin reset-password admin@station.gr
+.\target\release\omni-ingest.exe admin deactivate old-admin@station.gr
 
 # credentials never go in config.json
 .\target\release\omni-ingest.exe secrets set graph.client_secret

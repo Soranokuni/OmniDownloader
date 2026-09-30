@@ -67,6 +67,7 @@ impl WebServer {
                 get(api_admin_list_users).post(api_admin_create_user),
             )
             .route("/api/admin/users/:id/password", post(api_admin_update_password))
+            .route("/api/admin/users/:id/active", post(api_admin_set_user_active))
             .route("/api/admin/purge", post(api_admin_purge))
             .route("/api/admin/vacuum", post(api_admin_vacuum))
             .route("/api/admin/dependencies", get(api_admin_dependencies))
@@ -77,6 +78,12 @@ impl WebServer {
                 "/api/admin/taxonomy",
                 get(api_admin_export_taxonomy).post(api_admin_import_taxonomy),
             )
+            .route(
+                "/api/admin/taxonomy/backups",
+                get(api_admin_taxonomy_backups).post(api_admin_taxonomy_backup_now),
+            )
+            .route("/api/admin/taxonomy/backups/:name", get(api_admin_taxonomy_backup_get))
+            .route("/api/admin/taxonomy/backups/:name/restore", post(api_admin_taxonomy_backup_restore))
             .route("/api/admin/maintenance/:name/run", post(api_admin_run_task))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))

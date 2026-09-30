@@ -163,3 +163,29 @@ async fn bad_settings_are_refused_with_a_reason() -> Result<()> {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     Ok(())
 }
+
+
+/// Plan P2.4: accounts can be deactivated from the panel, never the last
+/// administrator or your own, and a deactivated account is signed out.
+#[tokio::test]
+async fn deactivating_an_account_signs_it_out_and_the_last_admin_is_protected() -> Result<()> {
+    let app = app()?;
+    let me = app.state.repo.list_users()?.into_iter().find(|u| u.email == "it@station.test").unwrap();
+    let (status, body) = call(&app, "POST", &format!("/api/admin/users/{}/active", me.id), Some(json!({"active": false}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let other = app.state.repo.create_user("desk@station.test", "correct-horse-battery", UserRole::Admin, "Desk", None)?;
+    let token = omni_core::auth::generate_session_token();
+    app.state.repo.create_session(other, &token, 1)?;
+    let (status, _) = call(&app, "POST", &format!("/api/admin/users/{other}/active"), Some(json!({"active": false}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(app.state.repo.delete_sessions_for_user(other)?, 0, "the deactivated account kept a session");
+    assert!(!app.state.repo.get_user_by_id(other)?.unwrap().is_active);
+
+    // Now "me" is the last active admin.
+    let (status, body) = call(&app, "POST", &format!("/api/admin/users/{}/active", me.id), Some(json!({"active": false}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) = call(&app, "POST", &format!("/api/admin/users/{other}/active"), Some(json!({"active": true}))).await;
+    assert_eq!(status, StatusCode::OK);
+    Ok(())
+}

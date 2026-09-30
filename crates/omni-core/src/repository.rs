@@ -1562,6 +1562,99 @@ impl Repository {
     // Taxonomy: groups and membership (plan P4.17)
     // ==========================================
 
+    /// The directory the database lives in (`data/`), for files that belong
+    /// with it: taxonomy backups, the seed files.
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        self.db_path.as_deref().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    }
+
+    /// Write the current taxonomy to `data/backups/taxonomy/` (plan P4.27)
+    /// and keep the newest [`TAXONOMY_BACKUPS_KEPT`]. `reason` is a short
+    /// word in the file name: "manual", "before-import", "before-restore",
+    /// "before-delete".
+    pub fn backup_taxonomy(&self, reason: &str) -> Result<TaxonomyBackup> {
+        let dir = self
+            .data_dir()
+            .ok_or_else(|| anyhow::anyhow!("no data directory for backups"))?
+            .join("backups")
+            .join("taxonomy");
+        std::fs::create_dir_all(&dir)?;
+        let reason: String = reason
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || *c == '-')
+            .take(20)
+            .collect();
+        // Milliseconds: two backups in one second (an import right after a
+        // manual one) must not overwrite each other.
+        let stamp = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let name = format!("taxonomy-{stamp}-{}.json", if reason.is_empty() { "manual" } else { &reason });
+        let t = self.export_taxonomy()?;
+        let body = serde_json::to_string_pretty(&t)? + "\n";
+        let tmp = dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, &body)?;
+        std::fs::rename(&tmp, dir.join(&name))?;
+        let mut all = self.list_taxonomy_backups()?;
+        while all.len() > TAXONOMY_BACKUPS_KEPT {
+            if let Some(oldest) = all.pop() {
+                let _ = std::fs::remove_file(dir.join(&oldest.name));
+            }
+        }
+        Ok(TaxonomyBackup {
+            name,
+            bytes: body.len() as u64,
+            groups: t.groups.len(),
+            people: t.people.len(),
+        })
+    }
+
+    /// Taxonomy backups, newest first.
+    pub fn list_taxonomy_backups(&self) -> Result<Vec<TaxonomyBackup>> {
+        let Some(dir) = self.data_dir().map(|d| d.join("backups").join("taxonomy")) else {
+            return Ok(Vec::new());
+        };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !valid_backup_name(&name) {
+                continue;
+            }
+            let raw = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let (groups, people) = serde_json::from_str::<Taxonomy>(&raw)
+                .map(|t| (t.groups.len(), t.people.len()))
+                .unwrap_or((0, 0));
+            out.push(TaxonomyBackup {
+                bytes: raw.len() as u64,
+                name,
+                groups,
+                people,
+            });
+        }
+        out.sort_by(|a, b| b.name.cmp(&a.name));
+        Ok(out)
+    }
+
+    /// One backup's contents. The name is checked, so no other file can be read.
+    pub fn read_taxonomy_backup(&self, name: &str) -> Result<Taxonomy> {
+        if !valid_backup_name(name) {
+            anyhow::bail!("not a taxonomy backup name: {name}");
+        }
+        let dir = self.data_dir().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
+        let raw = std::fs::read_to_string(dir.join("backups").join("taxonomy").join(name))
+            .with_context(|| format!("no backup {name}"))?;
+        Ok(serde_json::from_str(&raw).with_context(|| format!("backup {name} is not a taxonomy file"))?)
+    }
+
+    /// Put a backup back exactly: groups and people it does not list are
+    /// removed. The state before is backed up first.
+    pub fn restore_taxonomy_backup(&self, name: &str) -> Result<ImportReport> {
+        let t = self.read_taxonomy_backup(name)?;
+        self.backup_taxonomy("before-restore")?;
+        self.import_taxonomy(&t, true)
+    }
+
     pub fn list_groups(&self) -> Result<Vec<Group>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT code, name, kind, keywords, description FROM groups ORDER BY code")?;
@@ -2053,6 +2146,27 @@ mod tests {
 }
 
 
+
+/// How many taxonomy backups are kept (plan P4.27).
+pub const TAXONOMY_BACKUPS_KEPT: usize = 30;
+
+/// One file in `data/backups/taxonomy/`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TaxonomyBackup {
+    pub name: String,
+    pub bytes: u64,
+    pub groups: usize,
+    pub people: usize,
+}
+
+/// `taxonomy-20260930T134501123Z-before-import.json`, and nothing else: no
+/// separators, so a name from a request can never leave the directory.
+fn valid_backup_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("taxonomy-").and_then(|r| r.strip_suffix(".json")) else {
+        return false;
+    };
+    rest.len() <= 60 && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
 
 fn upsert_group(conn: &rusqlite::Connection, g: &Group) -> Result<()> {
     conn.execute(
