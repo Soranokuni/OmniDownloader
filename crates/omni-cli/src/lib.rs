@@ -165,6 +165,9 @@ pub enum AdminSubcommand {
     ListUsers,
     /// Set a new password for one account and end all its sessions.
     ResetPassword { email: String },
+    /// Deactivate (sign out, refuse sign-in) or reactivate an account. The
+    /// last active administrator is never deactivated.
+    SetActive { email: String, active: bool },
 }
 
 pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<()> {
@@ -179,6 +182,29 @@ pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<(
             for u in users {
                 println!("{:<40} {:<10} {}", u.email, u.role.as_str(), if u.is_active { "yes" } else { "NO" });
             }
+        }
+        AdminSubcommand::SetActive { email, active } => {
+            let users = repo.list_users()?;
+            let wanted = email.trim().to_lowercase();
+            let Some(user) = users.iter().find(|u| u.email.trim().to_lowercase() == wanted) else {
+                anyhow::bail!("No account signs in as `{}`. See `omni-ingest admin list-users`.", email.trim());
+            };
+            if !active
+                && user.role == UserRole::Admin
+                && !users.iter().any(|u| u.id != user.id && u.is_active && u.role == UserRole::Admin)
+            {
+                anyhow::bail!("{} is the last active administrator; create or reactivate another first.", user.email);
+            }
+            repo.set_user_active_status(user.id, active)?;
+            if !active {
+                repo.delete_sessions_for_user(user.id)?;
+            }
+            let _ = repo.log_audit(
+                "WARN",
+                "ADMIN",
+                &format!("Account {} {} from the command line", user.email, if active { "reactivated" } else { "deactivated" }),
+            );
+            println!("✓ {} {}.", user.email, if active { "reactivated" } else { "deactivated and signed out" });
         }
         AdminSubcommand::ResetPassword { email } => {
             let wanted = email.trim().to_lowercase();

@@ -143,3 +143,32 @@ fn the_shipped_example_file_imports_cleanly() {
     let r = repo.import_taxonomy(&t, false).unwrap();
     assert!(r.groups_saved >= 3 && r.people_saved >= 2, "{r:?}");
 }
+
+
+#[test]
+fn backups_are_written_listed_restored_and_pruned_and_names_cannot_escape() {
+    let (dir, repo) = repo();
+    repo.import_taxonomy(&file(), false).unwrap();
+    let first = repo.backup_taxonomy("manual").unwrap();
+    assert_eq!((first.groups, first.people), (3, 2));
+    assert!(dir.path().join("backups").join("taxonomy").join(&first.name).exists());
+
+    // Change things, then put the backup back exactly.
+    repo.delete_group("SPORTS").unwrap();
+    repo.save_journalist("GEORGIOU", "Eleni Georgiou", &[], 0).unwrap();
+    let r = repo.restore_taxonomy_backup(&first.name).unwrap();
+    assert_eq!(r.people_removed, 1, "{r:?}");
+    assert_eq!(repo.list_groups().unwrap().len(), 3);
+    let names: Vec<String> = repo.list_taxonomy_backups().unwrap().into_iter().map(|b| b.name).collect();
+    assert!(names.iter().any(|n| n.ends_with("-before-restore.json")), "{names:?}");
+    assert!(names.contains(&first.name));
+
+    for bad in ["../omni.db", "taxonomy-x/../../secrets.bin.json", "..\\secrets.bin", "taxonomy-..json", "omni.db"] {
+        assert!(repo.read_taxonomy_backup(bad).is_err(), "{bad}");
+    }
+
+    for _ in 0..(omni_core::repository::TAXONOMY_BACKUPS_KEPT + 5) {
+        repo.backup_taxonomy("manual").unwrap();
+    }
+    assert_eq!(repo.list_taxonomy_backups().unwrap().len(), omni_core::repository::TAXONOMY_BACKUPS_KEPT);
+}

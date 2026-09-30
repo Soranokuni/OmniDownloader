@@ -116,6 +116,10 @@ enum AdminAction {
     /// Set a new password for an account (prompted, never on the command
     /// line) and end all of its sessions
     ResetPassword { email: String },
+    /// Sign an account out and refuse its sign-in until reactivated
+    Deactivate { email: String },
+    /// Let a deactivated account sign in again
+    Activate { email: String },
 }
 
 #[derive(Subcommand)]
@@ -423,6 +427,8 @@ async fn main() -> Result<()> {
             let sub = match action {
                 AdminAction::ListUsers => omni_cli::AdminSubcommand::ListUsers,
                 AdminAction::ResetPassword { email } => omni_cli::AdminSubcommand::ResetPassword { email },
+                AdminAction::Deactivate { email } => omni_cli::AdminSubcommand::SetActive { email, active: false },
+                AdminAction::Activate { email } => omni_cli::AdminSubcommand::SetActive { email, active: true },
             };
             omni_cli::handle_admin_command(&repo, sub)?;
         }

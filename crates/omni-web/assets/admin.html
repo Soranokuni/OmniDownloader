@@ -88,10 +88,10 @@
       <div class="card flush">
         <table>
           <thead>
-            <tr><th>Email</th><th>Name</th><th>Role</th><th>Journalist</th><th class="right">Actions</th></tr>
+            <tr><th>Email</th><th>Name</th><th>Role</th><th>Journalist</th><th>Status</th><th class="right">Actions</th></tr>
           </thead>
           <tbody id="users-body">
-            <tr><td colspan="5" class="empty">Loading users…</td></tr>
+            <tr><td colspan="6" class="empty">Loading users…</td></tr>
           </tbody>
         </table>
       </div>
@@ -267,18 +267,65 @@
         <button class="btn btn-primary" type="submit">Save group</button>
       </form>
 
-      <h3 class="card-title" style="font-size:0.95rem">Who belongs where</h3>
-      <div class="card flush">
+      <h3 class="card-title" style="font-size:0.95rem">People</h3>
+      <div class="card flush" style="max-height:420px;overflow:auto">
         <table>
           <thead>
-            <tr><th>Surname</th><th>Name</th><th>Addresses</th><th>Groups (default first)</th><th class="right"></th></tr>
+            <tr><th>Surname (slug)</th><th>Name</th><th>Addresses</th><th>Other names</th><th>Groups</th><th class="num">Prio</th><th class="right"></th></tr>
           </thead>
-          <tbody id="members-body">
-            <tr><td colspan="5" class="empty">Loading…</td></tr>
+          <tbody id="people-body">
+            <tr><td colspan="7" class="empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="note">Journalists themselves are added on the MCR desk (Journalists tab) or by importing taxonomy.json.</p>
+      <form id="person-form" class="stack">
+        <div class="grid-2">
+          <div>
+            <label for="pf-surname">Surname as it appears in file names (Latin)</label>
+            <input type="text" id="pf-surname" required maxlength="40" placeholder="PAPADAKI" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="pf-name">Full name</label>
+            <input type="text" id="pf-name" required placeholder="Μαρία Παπαδάκη">
+          </div>
+        </div>
+        <div>
+          <label for="pf-emails">Addresses they send from (comma-separated)</label>
+          <input type="text" id="pf-emails" placeholder="m.papadaki@station.gr, papadaki@radio.gr" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="pf-aliases">Other names the mail may use: Greek surname, first name, nickname (comma-separated)</label>
+          <input type="text" id="pf-aliases" placeholder="ΠΑΠΑΔΑΚΗ, ΜΑΡΙΑ, ΜΑΙΡΗ">
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="pf-groups">Groups, default first (comma-separated codes)</label>
+            <input type="text" id="pf-groups" placeholder="NEWS" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="pf-priority">Queue priority (-100…100)</label>
+            <input type="number" id="pf-priority" value="0" min="-100" max="100">
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit">Save person</button>
+          <button class="btn" type="button" id="pf-clear">New person</button>
+        </div>
+      </form>
+
+      <h3 class="card-title" style="font-size:0.95rem">Backups</h3>
+      <div class="row" style="justify-content:space-between">
+        <p class="note" style="margin:0">A backup is taken automatically before every import, restore and delete; the newest 30 are kept in data\backups\taxonomy.</p>
+        <button class="btn" type="button" id="taxonomy-backup-now">Back up now</button>
+      </div>
+      <div class="card flush" style="max-height:260px;overflow:auto">
+        <table>
+          <thead><tr><th>Backup</th><th class="num">Groups</th><th class="num">People</th><th class="right"></th></tr></thead>
+          <tbody id="backups-body">
+            <tr><td colspan="4" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
@@ -372,6 +419,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=8"></script>
+<script type="module" src="/static/admin.js?v=9"></script>
 </body>
 </html>
