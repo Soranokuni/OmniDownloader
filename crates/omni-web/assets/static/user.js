@@ -2,7 +2,7 @@
 
 import {
   api, el, render, live, toast, fmtTime, statusClass, logout,
-} from '/static/app.js?v=2';
+} from '/static/app.js?v=3';
 
 /* ------------------------------------------------------------------ *
  * Identity

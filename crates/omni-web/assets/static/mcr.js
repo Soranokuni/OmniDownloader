@@ -9,7 +9,7 @@
 
 import {
   api, el, render, live, toast, fmtTime, fmtDuration, statusClass, logout, safeHref,
-} from '/static/app.js?v=2';
+} from '/static/app.js?v=3';
 
 let jobs = [];
 let journalists = [];
