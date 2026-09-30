@@ -370,6 +370,10 @@ fn resolve_journalist(
 static RE_ORIGINAL_MESSAGE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^-{2,}\s*(original message|αρχικό μήνυμα|forwarded message|προωθημένο μήνυμα)\s*-{2,}").unwrap()
 });
+/// Gmail's and Outlook's own forward marker: a forward, whatever the subject.
+static RE_FORWARD_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^-{2,}\s*(forwarded message|προωθημένο μήνυμα)\s*-{2,}").unwrap()
+});
 static RE_WROTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(on|στις|την)\s.+(wrote|έγραψε|γράψατε)\s*:?\s*$").unwrap());
 static RE_HEADER_FROM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\*?(from|από)\s*:").unwrap());
@@ -382,7 +386,27 @@ static RE_HEADER_ANY: LazyLock<Regex> = LazyLock::new(|| {
 /// A reply quotes what the journalist already sent, so everything below the
 /// reply header is dropped. A *forward* is different: the forwarded press
 /// release or colleague's mail is the content, so only the header lines go.
+/// Whether `lines` hold a link the parser would queue: a video platform, a
+/// news portal or a transfer. A signature's company website does not count.
+fn has_media_link(lines: &[&str]) -> bool {
+    let cfg = ParserConfig::default();
+    lines
+        .iter()
+        .flat_map(|l| find_urls(l))
+        .any(|(_, u)| matches!(classify(&u, &cfg), Tier::Tier1 | Tier::Tier2 | Tier::Locker))
+}
+
+/// Cut quoted history and the signature.
+///
+/// A forward (by subject prefix) keeps everything below the forwarded
+/// header. Without a prefix, a quoted/forwarded block is still read as a
+/// forward when the sender wrote no media link above it, or when it is
+/// marked "Forwarded message": the sender is passing that content on, and
+/// a subject edited on the way (the prefix deleted) must not lose it
+/// (plan P4.23). A reply whose new text has its own links still stops at
+/// the quote, so old links are not queued again.
 fn strip_quotes_and_signature(body: &str, forward: bool) -> String {
+    let mut forward = forward;
     let lines: Vec<&str> = body.lines().collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     let mut i = 0;
@@ -404,6 +428,11 @@ fn strip_quotes_and_signature(body: &str, forward: bool) -> String {
                 .take(4)
                 .any(|l| RE_HEADER_ANY.is_match(l.trim()) && !RE_HEADER_FROM.is_match(l.trim()));
         if !forward && (is_block_marker || is_header_block) {
+            if RE_FORWARD_MARKER.is_match(t) || !has_media_link(&out) {
+                forward = true;
+                i += 1;
+                continue;
+            }
             break;
         }
         if forward && (is_block_marker || RE_HEADER_ANY.is_match(t)) {
@@ -1352,6 +1381,41 @@ mod tests {
         assert_eq!(classify("https://example.org/story", &c), Tier::Other);
         // Not fooled by a lookalike host.
         assert_eq!(classify("https://notyoutube.com/watch?v=x", &c), Tier::Other);
+    }
+
+    #[test]
+    fn a_quote_is_read_as_a_forward_only_when_nothing_above_it_is_a_media_link() {
+        // Gmail's marker is a forward even with a link of the sender's own above it.
+        let gmail = "Και αυτό: https://youtu.be/mine
+---------- Forwarded message ---------
+From: X <x@example.org>
+Date: Wed
+Subject: y
+
+https://youtu.be/theirs";
+        let kept = strip_quotes_and_signature(gmail, false);
+        assert!(kept.contains("youtu.be/mine") && kept.contains("youtu.be/theirs"), "{kept}");
+        assert!(!kept.contains("From: X"), "{kept}");
+
+        // A reply with its own link keeps stopping at the quote.
+        let reply = "Ξέχασα ένα: https://youtu.be/new
+From: A <a@example.gr>
+Sent: Tuesday
+Subject: old
+
+https://youtu.be/old";
+        let kept = strip_quotes_and_signature(reply, false);
+        assert!(kept.contains("youtu.be/new") && !kept.contains("youtu.be/old"), "{kept}");
+
+        // Only a signature website above: the quoted part is what was sent on.
+        let fwd = "Δες αυτό
+www.example.gr
+Από: A <a@example.org>
+Εστάλη: Τετάρτη
+Θέμα: b
+
+https://youtu.be/sent-on";
+        assert!(strip_quotes_and_signature(fwd, false).contains("youtu.be/sent-on"));
     }
 
     #[test]
