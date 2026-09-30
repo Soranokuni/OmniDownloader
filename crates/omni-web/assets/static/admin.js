@@ -355,6 +355,42 @@ function showTest(message, ok) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Recent mail and reprocess (plan P4.25)
+ * ------------------------------------------------------------------ */
+
+async function loadMail() {
+  let mails;
+  try {
+    mails = (await api('/api/admin/mail')).mails || [];
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  render('mail-body', mails.length === 0
+    ? el('tr', {}, el('td', { colspan: '6', class: 'empty' }, 'No mail handled yet.'))
+    : mails.map((m) => el('tr', {},
+      el('td', { class: 'num' }, fmtTime(m.processed_at)),
+      el('td', {}, m.subject || '(no subject)'),
+      el('td', { class: 'mono' }, m.from_address || ''),
+      el('td', {}, el('span', { class: m.outcome === 'JOBS' ? 'badge ok' : (m.outcome === 'FAILED' ? 'badge bad' : 'badge warn') }, m.outcome)),
+      el('td', { class: 'num' }, String(m.jobs)),
+      el('td', { class: 'right' }, m.reprocess_pending
+        ? el('span', { class: 'badge info' }, 'next poll')
+        : el('button', { class: 'btn', type: 'button', onClick: () => reprocessMail(m) }, 'Reprocess')),
+    )));
+}
+
+async function reprocessMail(m) {
+  try {
+    await api('/api/admin/mail/reprocess', { method: 'POST', body: { internet_message_id: m.internet_message_id } });
+    toast(`'${m.subject || 'mail'}' will be read again on the next poll.`, 'ok');
+    loadMail();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+document.getElementById('mail-refresh').addEventListener('click', loadMail);
+
+/* ------------------------------------------------------------------ *
  * LLM assist (plan P4.22)
  * ------------------------------------------------------------------ */
 
@@ -673,6 +709,7 @@ loadSecrets();
 loadMaintenance();
 loadUsers();
 loadTaxonomy();
+loadMail();
 loadLlm();
 loadLogs();
 setInterval(loadLogs, 15000);

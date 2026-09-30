@@ -244,6 +244,10 @@ copy config.example.json config.json
 # or use the wizard
 .\target\release\omni-ingest.exe setup
 
+# what the daemon made of each mail; read one again on its next poll
+.\target\release\omni-ingest.exe mail-history
+.\target\release\omni-ingest.exe mail-reprocess --subject "VIRAL"
+
 # locked out? list the accounts, or set a new password (prompted, not an argument)
 .\target\release\omni-ingest.exe admin list-users
 .\target\release\omni-ingest.exe admin reset-password admin@station.gr

@@ -323,6 +323,22 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN group_code TEXT;
         "#,
     ),
+    (
+        9,
+        // Mail an operator asked to have read again (plan P4.25). The
+        // watcher fetches each by its provider id on its next poll and runs
+        // it through the parser as if new; a checkpoint rewind would not
+        // reach a mail changed long ago. `attempts` counts failed tries.
+        r#"
+        CREATE TABLE IF NOT EXISTS mail_reprocess (
+            internet_message_id TEXT PRIMARY KEY,
+            source_id    TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            requested_by TEXT,
+            attempts     INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -450,7 +466,7 @@ mod tests {
         let v = apply(&mut conn, None).unwrap();
         assert_eq!(v, target_version());
         // The baseline tables must exist.
-        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail", "mail_checkpoints", "groups", "journalist_groups"] {
+        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail", "mail_checkpoints", "groups", "journalist_groups", "mail_reprocess"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",

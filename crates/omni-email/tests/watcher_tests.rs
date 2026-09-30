@@ -487,3 +487,49 @@ async fn a_queued_job_carries_its_group_label_and_the_same_slug() {
     assert!(jobs.iter().all(|j| j.group_code.as_deref() == Some("MORNING")), "{jobs:?}");
     assert_eq!(jobs[0].slug, "1_PAPADAKI_PARELASIIRAKLEIO", "the group must not change the slug");
 }
+
+
+// ---------------------------------------------------------------------------
+// Reprocess on request (plan P4.25)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_mail_asked_for_again_is_fetched_and_parsed_as_new_adding_only_what_is_missing() {
+    let (_dir, repo) = repo();
+    let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑ", "1. ΤΕΣΤ\nκαμία σύνδεση ακόμα")]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+    assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "NO_LINKS");
+
+    // Polls without a request never read it again.
+    assert_eq!(watcher.poll_once().await.unwrap().fetched, 0);
+
+    // The mail as the mailbox now serves it (think: a parser that has since
+    // learned to read it) has a link.
+    source.inbox.lock().unwrap()[0].mail.body_text = "1. ΤΕΣΤ\nhttps://youtu.be/rp0001".into();
+    repo.request_mail_reprocess("<m1@example.gr>", "it@station.test").unwrap();
+    let r = watcher.poll_once().await.unwrap();
+    assert_eq!(r.reprocessed, 1, "{r:?}");
+    assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "JOBS");
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
+    assert!(repo.pending_mail_reprocess().unwrap().is_empty(), "the request was not cleared");
+
+    // Asked again: the job exists, so nothing is added.
+    repo.request_mail_reprocess("<m1@example.gr>", "it@station.test").unwrap();
+    assert_eq!(watcher.poll_once().await.unwrap().reprocessed, 1);
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 1, "a reprocess duplicated a job");
+}
+
+#[tokio::test]
+async fn a_reprocess_of_a_mail_that_left_the_mailbox_is_dropped_and_logged() {
+    let (_dir, repo) = repo();
+    let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑ", BODY)]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+    source.vanished.lock().unwrap().insert("m1".into());
+    repo.request_mail_reprocess("<m1@example.gr>", "it@station.test").unwrap();
+    assert_eq!(watcher.poll_once().await.unwrap().reprocessed, 0);
+    assert!(repo.pending_mail_reprocess().unwrap().is_empty());
+    assert_eq!(repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().outcome, "JOBS", "the old record was lost");
+    assert!(repo.request_mail_reprocess("<nope@example.gr>", "x").is_err());
+}

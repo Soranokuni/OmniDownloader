@@ -84,6 +84,8 @@ impl WebServer {
             .route("/api/admin/llm", get(api_admin_get_llm).post(api_admin_save_llm))
             .route("/api/admin/llm/test", post(api_admin_test_llm))
             .route("/api/admin/llm/models", post(api_admin_llm_models))
+            .route("/api/admin/mail", get(api_admin_mail_history))
+            .route("/api/admin/mail/reprocess", post(api_admin_mail_reprocess))
             // ---- Static assets (public; they contain no data) ----
             .route("/static/*file", get(serve_static))
             .layer(axum::middleware::from_fn(csrf_guard))

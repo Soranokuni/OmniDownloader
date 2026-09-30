@@ -1823,6 +1823,83 @@ impl Repository {
         Ok(())
     }
 
+    /// The newest handled mail first, for the admin panel and `mail-history`.
+    pub fn list_processed_mail(&self, limit: i64) -> Result<Vec<ProcessedMail>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM processed_mail ORDER BY processed_at DESC LIMIT ?")?;
+        let rows = stmt.query_map(params![limit.clamp(1, 1000)], |row| {
+            Ok(ProcessedMail {
+                internet_message_id: row.get("internet_message_id")?,
+                source_id: row.get("source_id")?,
+                processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
+                outcome: row.get("outcome")?,
+                from_address: row.get("from_address")?,
+                subject: row.get("subject")?,
+                jobs_json: row.get("jobs_json")?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Ask the watcher to read a handled mail again (plan P4.25). Returns
+    /// the mail's record, or an error when there is none or it has no
+    /// provider id to fetch it by.
+    pub fn request_mail_reprocess(&self, internet_message_id: &str, requested_by: &str) -> Result<ProcessedMail> {
+        let m = self
+            .get_processed_mail(internet_message_id)?
+            .ok_or_else(|| anyhow::anyhow!("no handled mail with Message-ID {internet_message_id}"))?;
+        let source = m
+            .source_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("the mail's mailbox id was not recorded; it cannot be fetched again"))?;
+        let conn = self.pool.get()?;
+        conn.execute(
+            r#"
+            INSERT INTO mail_reprocess (internet_message_id, source_id, requested_at, requested_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(internet_message_id) DO UPDATE SET
+                requested_at = excluded.requested_at,
+                requested_by = excluded.requested_by,
+                attempts = 0
+            "#,
+            params![m.internet_message_id, source, timestamps::now_string(), requested_by],
+        )?;
+        Ok(m)
+    }
+
+    /// Pending reprocess requests, oldest first: (Message-ID, provider id, attempts).
+    pub fn pending_mail_reprocess(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.pool.get()?;
+        let mut stmt =
+            conn.prepare("SELECT internet_message_id, source_id, attempts FROM mail_reprocess ORDER BY requested_at")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn note_mail_reprocess_failure(&self, internet_message_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE mail_reprocess SET attempts = attempts + 1 WHERE internet_message_id = ?",
+            params![internet_message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_mail_reprocess(&self, internet_message_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM mail_reprocess WHERE internet_message_id = ?", params![internet_message_id])?;
+        Ok(())
+    }
+
+    /// Forget that a mail was handled, so it is parsed as new. Only the
+    /// reprocess path calls this; its jobs are untouched.
+    pub fn forget_processed_mail(&self, internet_message_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM processed_mail WHERE internet_message_id = ?", params![internet_message_id])?;
+        Ok(())
+    }
+
     pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(

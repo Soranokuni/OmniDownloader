@@ -97,6 +97,26 @@
       </div>
     </section>
 
+    <section class="card">
+      <div class="section-head" style="margin-bottom:12px">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Recent mail</h2>
+        <button class="btn" type="button" id="mail-refresh">Refresh</button>
+      </div>
+      <p class="note" style="margin-bottom:10px">
+        What the daemon made of each mail. <b>Reprocess</b> reads a mail again on
+        the next poll (after a parser fix, or a journalist added to the roster);
+        jobs it already has are not queued twice.
+      </p>
+      <div class="card flush" style="max-height:360px;overflow:auto">
+        <table>
+          <thead><tr><th>Handled</th><th>Subject</th><th>From</th><th>Outcome</th><th class="num">Jobs</th><th class="right"></th></tr></thead>
+          <tbody id="mail-body">
+            <tr><td colspan="6" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card stack" id="llm">
       <div class="section-head">
         <h2 class="card-title" style="border:none;margin:0;padding:0">LLM assist</h2>
@@ -348,6 +368,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=6"></script>
+<script type="module" src="/static/admin.js?v=7"></script>
 </body>
 </html>
