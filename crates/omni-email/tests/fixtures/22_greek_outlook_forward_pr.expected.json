@@ -1,0 +1,37 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1A",
+          "keyword": "VIRAL",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/reel/fixture2201"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "VIRAL",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.tiktok.com/@viewer/video/fixture2202"
+        }
+      ],
+      "keyword": "VIRAL",
+      "title": "VIRAL ΓΙΑ ΕΛΕΝΗ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}
