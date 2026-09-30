@@ -1369,6 +1369,59 @@ pub async fn api_test_email(
 }
 
 // ==========================================
+// Handled mail and reprocess (plan P4.25)
+// ==========================================
+
+pub async fn api_admin_mail_history(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let rows = state.repo.list_processed_mail(100).map_err(internal_error("Could not read the mail history."))?;
+    let pending: Vec<String> = state
+        .repo
+        .pending_mail_reprocess()
+        .map_err(internal_error("Could not read the mail history."))?
+        .into_iter()
+        .map(|(k, _, _)| k)
+        .collect();
+    let mails: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|m| {
+            let jobs = serde_json::from_str::<Vec<serde_json::Value>>(&m.jobs_json).map(|v| v.len()).unwrap_or(0);
+            serde_json::json!({
+                "internet_message_id": m.internet_message_id,
+                "subject": m.subject,
+                "from_address": m.from_address,
+                "outcome": m.outcome,
+                "processed_at": m.processed_at,
+                "jobs": jobs,
+                "reprocess_pending": pending.contains(&m.internet_message_id),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "mails": mails })))
+}
+
+#[derive(Deserialize)]
+pub struct ReprocessPayload {
+    internet_message_id: String,
+}
+
+pub async fn api_admin_mail_reprocess(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<ReprocessPayload>,
+) -> JsonResult {
+    let m = state
+        .repo
+        .request_mail_reprocess(payload.internet_message_id.trim(), &admin.email)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let _ = state.repo.log_audit(
+        "INFO",
+        "EMAIL",
+        &format!("Reprocess of '{}' requested by {}", m.subject.unwrap_or_default(), admin.email),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
 // LLM settings (plan P4.22)
 // ==========================================
 

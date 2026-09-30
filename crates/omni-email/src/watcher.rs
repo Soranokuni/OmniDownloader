@@ -77,6 +77,8 @@ pub struct PollReport {
     pub too_old: usize,
     /// Fetched in full, to be processed.
     pub fetched: usize,
+    /// Read again on an operator's request (plan P4.25).
+    pub reprocessed: usize,
     pub processed: usize,
     /// Failed this time, will be retried next poll.
     pub retrying: usize,
@@ -210,6 +212,80 @@ impl EmailWatcher {
     /// parse silently lost the links). The mailbox may be read-only: nothing
     /// here depends on a message being marked.
     pub async fn poll_once(&self) -> Result<PollReport> {
+        let mut reprocessed = 0;
+        self.reprocess_requested(&mut reprocessed).await?;
+        let mut report = self.poll_changed().await?;
+        report.reprocessed = reprocessed;
+        Ok(report)
+    }
+
+    /// Mail an operator asked to have read again (plan P4.25): fetched by
+    /// its mailbox id and parsed as new. Jobs it already has are not queued
+    /// twice (URL dedup); only what is missing is added.
+    async fn reprocess_requested(&self, done: &mut usize) -> Result<()> {
+        for (key, source_id, attempts) in self.repo.pending_mail_reprocess()? {
+            let give_up = |why: &str| {
+                let _ = self.repo.finish_mail_reprocess(&key);
+                let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("Could not reprocess {key}: {why}"));
+            };
+            let mail = match self.source.fetch_mail(&source_id).await {
+                Ok(m) => m,
+                Err(e) if e.chain().any(|c| c.is::<MailGone>()) => {
+                    give_up("it is no longer in the mailbox");
+                    continue;
+                }
+                Err(e) => {
+                    warn!("EmailWatcher: reprocess of {key} failed to fetch: {e:#}");
+                    self.repo.note_mail_reprocess_failure(&key)?;
+                    if attempts + 1 >= MAX_PROCESS_ATTEMPTS as i64 {
+                        give_up(&short_reason(&e));
+                    }
+                    continue;
+                }
+            };
+            let previous = self.repo.get_processed_mail(&key)?;
+            self.repo.forget_processed_mail(&key)?;
+            match self.process_mail(&mail).await {
+                Ok(_) => {
+                    self.repo.finish_mail_reprocess(&key)?;
+                    let now = self.repo.get_processed_mail(&key)?;
+                    let jobs = now
+                        .as_ref()
+                        .and_then(|p| serde_json::from_str::<Vec<serde_json::Value>>(&p.jobs_json).ok())
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    info!("EmailWatcher: reprocessed '{}': {jobs} job(s)", mail.subject);
+                    let _ = self.repo.log_audit(
+                        "INFO",
+                        "EMAIL",
+                        &format!(
+                            "Reprocessed email '{}' from {}: {} ({jobs} job(s))",
+                            mail.subject,
+                            mail.from_address,
+                            now.map(|p| p.outcome).unwrap_or_default()
+                        ),
+                    );
+                    *done += 1;
+                }
+                Err(e) => {
+                    // Put the old record back: the mail stays "handled"
+                    // rather than being picked up half-done by a listing.
+                    if let Some(p) = previous {
+                        let _ = self.repo.record_processed_mail(&p);
+                    }
+                    error!("EmailWatcher: reprocessing '{}' failed: {e:#}", mail.subject);
+                    self.repo.note_mail_reprocess_failure(&key)?;
+                    if attempts + 1 >= MAX_PROCESS_ATTEMPTS as i64 {
+                        give_up(&short_reason(&e));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// List what changed since the checkpoint and process what is new.
+    async fn poll_changed(&self) -> Result<PollReport> {
         let now = Utc::now();
         let key = self.source.checkpoint_key();
         let checkpoint = self.repo.get_mail_checkpoint(&key)?;

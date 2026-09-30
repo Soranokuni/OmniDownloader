@@ -523,6 +523,21 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // ---- Handled mail (plan P4.25): subjects and senders; reprocess ----
+    ("GET", "/api/admin/mail", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/mail/reprocess", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // ---- First-run only. With an admin present this is a 404 for everyone
     //      who is not one, including a loopback client.
     (

@@ -84,6 +84,19 @@ enum Commands {
         #[arg(long)]
         llm: bool,
     },
+    /// The mail the daemon has handled, newest first
+    MailHistory {
+        #[arg(long, default_value_t = 20)]
+        last: i64,
+    },
+    /// Have the running daemon read a handled mail again on its next poll;
+    /// name it by Message-ID or by a part of its subject
+    MailReprocess {
+        #[arg(long)]
+        message_id: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+    },
     /// Account recovery on this machine: list accounts, reset a password
     Admin {
         #[command(subcommand)]
@@ -346,6 +359,62 @@ async fn main() -> Result<()> {
         }
         Some(Commands::MailPreview { last, hours, eml, llm }) => {
             mail_preview(&paths, last, hours, eml, llm).await?;
+        }
+        Some(Commands::MailHistory { last }) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let rows = repo.list_processed_mail(last)?;
+            if rows.is_empty() {
+                println!("\nNo mail handled yet.");
+            }
+            let pending: Vec<String> = repo.pending_mail_reprocess()?.into_iter().map(|(k, _, _)| k).collect();
+            for m in rows {
+                let jobs = serde_json::from_str::<Vec<serde_json::Value>>(&m.jobs_json).map(|v| v.len()).unwrap_or(0);
+                println!(
+                    "{}  {:<12} {:>2} job(s)  {}{}\n    {}",
+                    m.processed_at.map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default(),
+                    m.outcome,
+                    jobs,
+                    m.subject.unwrap_or_default(),
+                    if pending.contains(&m.internet_message_id) { "   [reprocess pending]" } else { "" },
+                    m.internet_message_id
+                );
+            }
+        }
+        Some(Commands::MailReprocess { message_id, subject }) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let key = match (message_id, subject) {
+                (Some(id), _) => id.trim().to_string(),
+                (None, Some(part)) => {
+                    let wanted = part.trim().to_lowercase();
+                    let hits: Vec<_> = repo
+                        .list_processed_mail(500)?
+                        .into_iter()
+                        .filter(|m| m.subject.as_deref().unwrap_or("").to_lowercase().contains(&wanted))
+                        .collect();
+                    match hits.len() {
+                        0 => anyhow::bail!("No handled mail has `{}` in its subject. See `omni-ingest mail-history`.", part.trim()),
+                        1 => hits[0].internet_message_id.clone(),
+                        n => {
+                            println!("{n} handled mails match; name one with --message-id:");
+                            for m in hits {
+                                println!("  {}  {}", m.internet_message_id, m.subject.unwrap_or_default());
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                (None, None) => anyhow::bail!("Name the mail: --message-id <id> or --subject <part of it>."),
+            };
+            let m = repo.request_mail_reprocess(&key, "command line")?;
+            let _ = repo.log_audit("INFO", "EMAIL", &format!("Reprocess of '{}' requested from the command line", m.subject.clone().unwrap_or_default()));
+            println!(
+                "✓ '{}' will be read again on the daemon's next poll (it must be running). Jobs it already has are not queued twice.",
+                m.subject.unwrap_or_default()
+            );
         }
         Some(Commands::Admin { action }) => {
             let config = AppConfig::load_from_file(&paths.config)
