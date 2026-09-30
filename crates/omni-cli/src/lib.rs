@@ -155,6 +155,71 @@ pub enum SecretSubcommand {
     List,
 }
 
+/// Account recovery from the machine itself (`omni-ingest admin …`).
+///
+/// Whoever can run this can already read the database file, so it adds no
+/// new access; it only saves them from editing SQL by hand when the one
+/// administrator's password (or address) is forgotten.
+pub enum AdminSubcommand {
+    /// List every account: address, role, active. No password data.
+    ListUsers,
+    /// Set a new password for one account and end all its sessions.
+    ResetPassword { email: String },
+}
+
+pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<()> {
+    match cmd {
+        AdminSubcommand::ListUsers => {
+            let users = repo.list_users()?;
+            if users.is_empty() {
+                println!("\nNo accounts. Open /setup on this machine, or run `omni-ingest setup`.");
+                return Ok(());
+            }
+            println!("\n{:<40} {:<10} {}", "Sign-in address", "Role", "Active");
+            for u in users {
+                println!("{:<40} {:<10} {}", u.email, u.role.as_str(), if u.is_active { "yes" } else { "NO" });
+            }
+        }
+        AdminSubcommand::ResetPassword { email } => {
+            let wanted = email.trim().to_lowercase();
+            let Some(user) = repo.list_users()?.into_iter().find(|u| u.email.trim().to_lowercase() == wanted) else {
+                let known: Vec<String> = repo.list_users()?.into_iter().map(|u| u.email).collect();
+                anyhow::bail!(
+                    "No account signs in as `{}`. Accounts: {}",
+                    email.trim(),
+                    if known.is_empty() { "none".to_string() } else { known.join(", ") }
+                );
+            };
+            // Piped for scripts, masked and confirmed otherwise; never an
+            // argument, which would sit in the shell history.
+            let password = match read_piped_secret()? {
+                Some(piped) => piped,
+                None => Password::new(&format!("New password for {}:", user.email))
+                    .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                    .with_custom_confirmation_message("Type it again:")
+                    .with_help_message("At least 12 characters")
+                    .prompt()?,
+            };
+            omni_core::auth::validate_password(&password).map_err(anyhow::Error::msg)?;
+            repo.update_user_password(user.id, &password)?;
+            let _ = repo.log_audit(
+                "WARN",
+                "ADMIN",
+                &format!("Password for {} reset from the command line", user.email),
+            );
+            println!("✓ Password for {} changed; every session of that account was ended.", user.email);
+            if !user.is_active {
+                println!("! This account is deactivated and still cannot sign in; reactivate it from another admin account.");
+            }
+            println!(
+                "  If sign-in was refused as too many attempts, wait up to an hour or restart the daemon: \
+                 the attempt counter is in memory."
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Result<()> {
     match cmd {
         SecretSubcommand::List => {

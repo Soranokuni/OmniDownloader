@@ -353,20 +353,8 @@ pub async fn api_change_password(
     }
 }
 
-/// Minimum password policy.
-///
-/// Length only. Composition rules ("one digit, one symbol") push operators
-/// towards `Password1!` and towards writing it on the desk; a 12-character
-/// floor is the part that actually helps.
-pub fn validate_password(password: &str) -> Result<(), String> {
-    if password.chars().count() < 12 {
-        return Err("Password must be at least 12 characters.".to_string());
-    }
-    if password.chars().count() > 256 {
-        return Err("Password must be at most 256 characters.".to_string());
-    }
-    Ok(())
-}
+/// Minimum password policy: one rule for the panels and the CLI.
+pub use omni_core::auth::validate_password;
 
 // ==========================================
 // Jobs API

@@ -244,6 +244,10 @@ copy config.example.json config.json
 # or use the wizard
 .\target\release\omni-ingest.exe setup
 
+# locked out? list the accounts, or set a new password (prompted, not an argument)
+.\target\release\omni-ingest.exe admin list-users
+.\target\release\omni-ingest.exe admin reset-password admin@station.gr
+
 # credentials never go in config.json
 .\target\release\omni-ingest.exe secrets set graph.client_secret
 .\target\release\omni-ingest.exe secrets list

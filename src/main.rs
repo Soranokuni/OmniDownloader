@@ -84,11 +84,25 @@ enum Commands {
         #[arg(long)]
         llm: bool,
     },
+    /// Account recovery on this machine: list accounts, reset a password
+    Admin {
+        #[command(subcommand)]
+        action: AdminAction,
+    },
     /// Manage credentials in the encrypted secret store
     Secrets {
         #[command(subcommand)]
         action: SecretAction,
     },
+}
+
+#[derive(Subcommand)]
+enum AdminAction {
+    /// List every account's sign-in address, role and whether it is active
+    ListUsers,
+    /// Set a new password for an account (prompted, never on the command
+    /// line) and end all of its sessions
+    ResetPassword { email: String },
 }
 
 #[derive(Subcommand)]
@@ -332,6 +346,16 @@ async fn main() -> Result<()> {
         }
         Some(Commands::MailPreview { last, hours, eml, llm }) => {
             mail_preview(&paths, last, hours, eml, llm).await?;
+        }
+        Some(Commands::Admin { action }) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let sub = match action {
+                AdminAction::ListUsers => omni_cli::AdminSubcommand::ListUsers,
+                AdminAction::ResetPassword { email } => omni_cli::AdminSubcommand::ResetPassword { email },
+            };
+            omni_cli::handle_admin_command(&repo, sub)?;
         }
         Some(Commands::Secrets { action }) => {
             let store = SecretStore::new(paths.resolve("data/secrets.bin"));
