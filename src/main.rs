@@ -567,9 +567,13 @@ async fn run_daemon(
     }
 
     // 1. Start Embedded Web Server
+    // One LLM assist for the watcher, the admin panel and the health check;
+    // the panel swaps it when the settings are saved (plan P4.22).
+    let live_llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_secret_store(secret_store.clone())
-        .with_health(health.clone());
+        .with_health(health.clone())
+        .with_llm(live_llm.clone());
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();
@@ -586,7 +590,8 @@ async fn run_daemon(
         let email_watcher = Arc::new(
             EmailWatcher::new(config.clone(), repo.clone())
                 .with_attachments_dir(temp_path.join("attachments"))
-                .with_health(health.clone()),
+                .with_health(health.clone())
+                .with_live_assist(live_llm.clone()),
         );
         let email_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -608,22 +613,26 @@ async fn run_daemon(
     // of that constraint, and the status must not imply otherwise.
     {
         let llm_health = health.clone();
-        let endpoint = config.ollama_endpoint.clone();
-        let model = config.ollama_model.clone();
+        let live = live_llm.clone();
         let mut llm_rx = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let client = omni_email::llm::LlmClient::new(&endpoint, &model);
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = llm_rx.recv() => break,
                     _ = tick.tick() => {
-                        let check = if client.ping().await {
-                            omni_core::health::Check::ok(format!("{model} at {endpoint}"))
+                        // The current settings each time: the panel may
+                        // have changed them since the last tick.
+                        let assist = live.current();
+                        let check = if assist.mode() == omni_core::config::LlmMode::Off {
+                            omni_core::health::Check::disabled("LLM assist")
+                        } else if assist.client().ping().await {
+                            omni_core::health::Check::ok(assist.describe())
                         } else {
                             omni_core::health::Check::degraded(format!(
-                                "{endpoint} unreachable; parsing continues without it"
+                                "{} unreachable or key refused; parsing continues without it",
+                                assist.describe()
                             ))
                         };
                         llm_health.set_if_changed(omni_core::health::checks::LLM, check);

@@ -337,9 +337,11 @@ pub mod env_vars {
     pub const GRAPH_CLIENT_ID: &str = "OMNI_GRAPH_CLIENT_ID";
     pub const GRAPH_MAILBOX: &str = "OMNI_GRAPH_MAILBOX";
     pub const GRAPH_CLIENT_SECRET: &str = "OMNI_GRAPH_CLIENT_SECRET";
+    /// The LLM provider's API key (plan P4.22).
+    pub const LLM_API_KEY: &str = "OMNI_LLM_API_KEY";
 
     /// Variables whose values must be redacted from every log line.
-    pub const SECRETS: &[&str] = &[GRAPH_CLIENT_SECRET];
+    pub const SECRETS: &[&str] = &[GRAPH_CLIENT_SECRET, LLM_API_KEY];
 }
 
 /// What the LLM may do with an email (plan P4.4).
@@ -357,6 +359,23 @@ pub enum LlmMode {
     Primary,
 }
 
+/// How the API key reaches the provider (plan P4.22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAuth {
+    /// Local runtimes: no key.
+    #[default]
+    None,
+    /// `Authorization: Bearer <key>`: OpenAI, Gemini, Anthropic, OpenRouter,
+    /// Mistral, Groq, LM Studio with authentication on.
+    Bearer,
+    /// `api-key: <key>`: Azure OpenAI.
+    ApiKeyHeader,
+}
+
+/// The LLM assist. The server itself is `ollama_endpoint` + `ollama_model`
+/// (their names predate other providers; they hold any OpenAI-compatible
+/// base URL and model id). The key is `llm.api_key` in the secret store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     #[serde(default)]
@@ -369,7 +388,27 @@ pub struct LlmConfig {
     /// back to `ASSET`.
     #[serde(default)]
     pub keyword_polish: bool,
+    /// Which preset the admin panel chose ("lmstudio", "openai", "custom",
+    /// …). Informational: the base URL and `auth` are what count.
+    #[serde(default = "default_llm_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub auth: LlmAuth,
+    /// Ask the model not to "think" first (`reasoning_effort: "none"`).
+    /// Reasoning models otherwise spend the whole token budget, and the
+    /// timeout, before answering (measured: Gemma 4 E4B, 63 s vs 8 s).
+    #[serde(default = "default_true")]
+    pub disable_thinking: bool,
+    /// API key — **runtime only**, from the secret store (`llm.api_key`) or
+    /// `OMNI_LLM_API_KEY`. Never read from or written to config.json.
+    #[serde(skip)]
+    pub api_key: String,
 }
+
+fn default_llm_provider() -> String {
+    "custom".into()
+}
+
 
 fn default_llm_timeout() -> u64 {
     30
@@ -386,6 +425,10 @@ impl Default for LlmConfig {
             timeout_secs: default_llm_timeout(),
             max_tokens: default_llm_max_tokens(),
             keyword_polish: false,
+            provider: default_llm_provider(),
+            auth: LlmAuth::None,
+            disable_thinking: true,
+            api_key: String::new(),
         }
     }
 }
@@ -730,6 +773,7 @@ impl AppConfig {
         // Always read back from the store, so the store is the single source
         // of truth and a secret removed there takes effect on restart.
         self.graph.client_secret = store.get_lossy(keys::GRAPH_CLIENT_SECRET).unwrap_or_default();
+        self.llm.api_key = store.get_lossy(keys::LLM_API_KEY).unwrap_or_default();
         Ok(rewrote)
     }
 
@@ -741,11 +785,12 @@ impl AppConfig {
     /// store for the life of the process and is never written anywhere.
     pub fn apply_env_overrides(&mut self, get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
         let mut applied = Vec::new();
-        let targets: [(&'static str, &mut String); 4] = [
+        let targets: [(&'static str, &mut String); 5] = [
             (env_vars::GRAPH_TENANT_ID, &mut self.graph.tenant_id),
             (env_vars::GRAPH_CLIENT_ID, &mut self.graph.client_id),
             (env_vars::GRAPH_MAILBOX, &mut self.graph.mailbox),
             (env_vars::GRAPH_CLIENT_SECRET, &mut self.graph.client_secret),
+            (env_vars::LLM_API_KEY, &mut self.llm.api_key),
         ];
         for (name, field) in targets {
             if let Some(value) = get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {

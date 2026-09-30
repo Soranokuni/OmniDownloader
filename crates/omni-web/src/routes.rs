@@ -1368,22 +1368,186 @@ pub async fn api_test_email(
     }
 }
 
+// ==========================================
+// LLM settings (plan P4.22)
+// ==========================================
+
+/// The LLM card of the admin panel: what is being saved, tested or asked
+/// for its model list. Nothing here is applied until it is saved.
 #[derive(Deserialize)]
-pub struct TestLlmPayload {
-    endpoint: String,
+pub struct LlmSettingsPayload {
+    #[serde(default)]
+    mode: omni_core::config::LlmMode,
+    #[serde(default)]
+    provider: String,
+    base_url: String,
+    #[serde(default)]
     model: String,
+    #[serde(default)]
+    auth: omni_core::config::LlmAuth,
+    /// Blank: keep the stored key, which is then only ever sent to the
+    /// stored base URL, never to a typed-in one.
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    clear_key: bool,
+    #[serde(default = "default_llm_timeout_payload")]
+    timeout_secs: u64,
+    #[serde(default = "default_llm_tokens_payload")]
+    max_tokens: u32,
+    #[serde(default = "default_true_payload")]
+    disable_thinking: bool,
 }
 
-pub async fn api_test_llm(
-    RequireAdmin(_): RequireAdmin,
-    Json(payload): Json<TestLlmPayload>,
-) -> JsonResult {
-    let client = omni_email::llm::LlmClient::new(&payload.endpoint, &payload.model);
-    if client.ping().await {
-        Ok(Json(serde_json::json!({"status": "ok"})))
+fn default_llm_timeout_payload() -> u64 {
+    30
+}
+fn default_llm_tokens_payload() -> u32 {
+    400
+}
+fn default_true_payload() -> bool {
+    true
+}
+
+fn same_base(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'))
+}
+
+/// Endpoint, model and LLM config for `p`, on top of the saved config.
+fn llm_settings(
+    p: &LlmSettingsPayload,
+    saved: &omni_core::config::AppConfig,
+) -> Result<(String, String, omni_core::config::LlmConfig), ApiError> {
+    let base = p.base_url.trim().to_string();
+    omni_email::llm::check_base_url(&base).map_err(ApiError::bad_request)?;
+    let key = if !p.api_key.trim().is_empty() {
+        p.api_key.trim().to_string()
+    } else if p.clear_key {
+        String::new()
+    } else if same_base(&base, &saved.ollama_endpoint) {
+        saved.llm.api_key.clone()
     } else {
-        Err(ApiError::bad_request("LLM endpoint unreachable"))
+        String::new()
+    };
+    let cfg = omni_core::config::LlmConfig {
+        mode: p.mode,
+        timeout_secs: p.timeout_secs.clamp(5, 300),
+        max_tokens: p.max_tokens.clamp(50, 8000),
+        keyword_polish: saved.llm.keyword_polish,
+        provider: {
+            let v = p.provider.trim().to_lowercase();
+            if v.is_empty() { "custom".into() } else { v.chars().take(30).collect() }
+        },
+        auth: p.auth,
+        disable_thinking: p.disable_thinking,
+        api_key: key,
+    };
+    Ok((base, p.model.trim().chars().take(200).collect(), cfg))
+}
+
+pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let cfg = state.config.read().await;
+    Ok(Json(serde_json::json!({
+        "mode": cfg.llm.mode,
+        "provider": cfg.llm.provider,
+        "base_url": cfg.ollama_endpoint,
+        "model": cfg.ollama_model,
+        "auth": cfg.llm.auth,
+        "timeout_secs": cfg.llm.timeout_secs,
+        "max_tokens": cfg.llm.max_tokens,
+        "disable_thinking": cfg.llm.disable_thinking,
+        "key_set": !cfg.llm.api_key.is_empty(),
+        "online": !omni_email::llm::is_local_endpoint(&cfg.ollama_endpoint),
+        "in_use": state.llm.current().describe(),
+    })))
+}
+
+/// Save and apply: the watcher uses the new settings from its next mail.
+pub async fn api_admin_save_llm(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<LlmSettingsPayload>,
+) -> JsonResult {
+    let mut cfg = state.config.write().await;
+    let (base, model, llm) = llm_settings(&payload, &cfg)?;
+    if llm.mode != omni_core::config::LlmMode::Off && model.is_empty() {
+        return Err(ApiError::bad_request("Choose a model (Load models lists what the server offers)."));
     }
+    // The key first: if it cannot be stored, nothing changes.
+    let key_key = omni_core::secrets::keys::LLM_API_KEY;
+    if !payload.api_key.trim().is_empty() {
+        state.secrets.set(key_key, payload.api_key.trim()).map_err(internal_error("Could not store the API key."))?;
+    } else if payload.clear_key {
+        state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
+    } else if !same_base(&base, &cfg.ollama_endpoint) && !cfg.llm.api_key.is_empty() {
+        // A new provider does not inherit the old one's key.
+        state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
+    }
+    cfg.ollama_endpoint = base;
+    cfg.ollama_model = model;
+    cfg.llm = llm;
+    cfg.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
+    let assist = omni_email::assist::Assist::from_config(&cfg);
+    let described = assist.describe();
+    state.llm.replace(assist);
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("LLM settings changed by {}: {:?}, {described}", admin.email, cfg.llm.mode),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok", "in_use": described })))
+}
+
+/// A real, small JSON request with the unsaved settings, timed.
+pub async fn api_admin_test_llm(
+    RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<LlmSettingsPayload>,
+) -> JsonResult {
+    let saved = state.config.read().await.clone();
+    let (base, model, llm) = llm_settings(&payload, &saved)?;
+    if model.is_empty() {
+        return Err(ApiError::bad_request("Choose a model first."));
+    }
+    let max_tokens = llm.max_tokens;
+    let client = omni_email::llm::LlmClient::from_settings(&base, &model, &llm);
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "word": { "type": "string" } },
+        "required": ["word"],
+        "additionalProperties": false
+    });
+    let started = std::time::Instant::now();
+    let answer = client
+        .chat_json(
+            "Answer with one JSON object and nothing else: {\"word\": string}.",
+            "Transliterate the Greek word ΛΙΜΑΝΙ to uppercase Latin letters.",
+            &schema,
+            max_tokens,
+        )
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        "answer": answer,
+        "online": client.is_online(),
+    })))
+}
+
+/// What models the server offers, with the unsaved settings.
+pub async fn api_admin_llm_models(
+    RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<LlmSettingsPayload>,
+) -> JsonResult {
+    let saved = state.config.read().await.clone();
+    let (base, model, llm) = llm_settings(&payload, &saved)?;
+    let models = omni_email::llm::LlmClient::from_settings(&base, &model, &llm)
+        .list_models()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 #[derive(Deserialize)]
@@ -1493,6 +1657,7 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
             tracing::error!(error = ?e, "Saving config failed");
             return ApiError::internal("Could not save the configuration.").into_response();
         }
+        state.llm.replace(omni_email::assist::Assist::from_config(&cfg));
     }
     let _ = state
         .repo

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — Systems Administration</title>
-<link rel="stylesheet" href="/static/app.css?v=2">
+<link rel="stylesheet" href="/static/app.css?v=3">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -95,6 +95,86 @@
           </tbody>
         </table>
       </div>
+    </section>
+
+    <section class="card stack" id="llm">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">LLM assist</h2>
+        <span id="llm-in-use" class="note mono"></span>
+      </div>
+      <p class="note">
+        The parser decides every job. The model is asked only where the parser is
+        unsure (a journalist, a keyword, a group), and what it answers is checked
+        before use. Any OpenAI-compatible server works, on this machine or online.
+      </p>
+      <div class="grid-2">
+        <div>
+          <label for="llm-mode">Mode</label>
+          <select id="llm-mode">
+            <option value="assist">Assist (ask where the parser is unsure)</option>
+            <option value="off">Off (parser only)</option>
+          </select>
+        </div>
+        <div>
+          <label for="llm-provider">Provider</label>
+          <select id="llm-provider"></select>
+        </div>
+      </div>
+      <div>
+        <label for="llm-base">Base URL</label>
+        <input type="text" id="llm-base" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:1234/v1">
+      </div>
+      <p id="llm-online" class="note warn" hidden>
+        Online provider: each assist call sends the subject, part of the mail
+        body, the roster surnames and the group names to this company. Email
+        addresses and phone numbers are replaced with placeholders first, and
+        the sender's address is never sent.
+      </p>
+      <div class="grid-2">
+        <div>
+          <label for="llm-auth">API key is sent as</label>
+          <select id="llm-auth">
+            <option value="none">No key (local server)</option>
+            <option value="bearer">Authorization: Bearer (most providers)</option>
+            <option value="api_key_header">api-key header (Azure OpenAI)</option>
+          </select>
+        </div>
+        <div>
+          <label for="llm-key">API key</label>
+          <input type="password" id="llm-key" autocomplete="off">
+          <label class="row tight" style="margin:4px 0 0 0">
+            <input type="checkbox" id="llm-clear-key" style="width:auto">
+            <span class="note">Remove the stored key</span>
+          </label>
+        </div>
+      </div>
+      <div>
+        <label for="llm-model">Model</label>
+        <div class="row">
+          <input type="text" id="llm-model" class="grow" list="llm-models" spellcheck="false" autocomplete="off" placeholder="google/gemma-4-e4b">
+          <datalist id="llm-models"></datalist>
+          <button class="btn" type="button" id="llm-load-models">Load models</button>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div>
+          <label for="llm-timeout">Timeout per call (seconds, 5–300)</label>
+          <input type="number" id="llm-timeout" min="5" max="300" value="30">
+        </div>
+        <div>
+          <label for="llm-tokens">Answer token limit (50–8000)</label>
+          <input type="number" id="llm-tokens" min="50" max="8000" value="400">
+        </div>
+      </div>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="llm-no-thinking" style="width:auto" checked>
+        <span>Disable thinking (reasoning models answer in seconds instead of minutes)</span>
+      </label>
+      <div class="row">
+        <button class="btn" type="button" id="llm-test">Test</button>
+        <button class="btn btn-primary" type="button" id="llm-save">Save and apply</button>
+      </div>
+      <p id="llm-result" class="note" style="white-space:pre-line"></p>
     </section>
 
     <section class="card stack" id="taxonomy">
@@ -210,15 +290,8 @@
     </section>
 
     <section class="card">
-      <h2 class="card-title">Connection tests</h2>
-      <div class="grid-2">
-        <div>
-          <label for="test-llm-endpoint">LLM endpoint</label>
-          <input type="text" id="test-llm-endpoint" placeholder="http://localhost:11434/v1">
-          <label for="test-llm-model" style="margin-top:8px">Model</label>
-          <input type="text" id="test-llm-model" placeholder="gemma3:4b">
-          <button class="btn btn-block" type="button" id="test-llm-btn" style="margin-top:10px">Test LLM</button>
-        </div>
+      <h2 class="card-title">Mailbox test</h2>
+      <div>
         <div>
           <label for="test-mail-tenant">Directory (tenant) ID</label>
           <input type="text" id="test-mail-tenant" autocomplete="off" spellcheck="false">
@@ -275,6 +348,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=5"></script>
+<script type="module" src="/static/admin.js?v=6"></script>
 </body>
 </html>

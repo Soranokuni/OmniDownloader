@@ -35,6 +35,9 @@ pub struct AppState {
     /// plain-HTTP deployment means the browser never sends it back, which
     /// presents to operators as "login does nothing".
     pub tls_enabled: bool,
+    /// The LLM assist in use, shared with the mail watcher: saving LLM
+    /// settings in the admin panel swaps it without a restart (plan P4.22).
+    pub llm: omni_email::assist::LiveAssist,
 }
 
 impl AppState {
@@ -45,6 +48,7 @@ impl AppState {
             config.security.login_rate_limit_per_account_hour,
         );
         let tls_enabled = config.tls.is_enabled();
+        let llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
         // Tests and callers that do not configure secrets get a store rooted
         // beside the config; the daemon replaces it with the real one.
         let default_store = omni_core::secrets::SecretStore::new(
@@ -63,6 +67,7 @@ impl AppState {
             secrets: Arc::new(default_store),
             health: omni_core::health::HealthState::new(),
             tls_enabled,
+            llm,
         }
     }
 
@@ -70,6 +75,12 @@ impl AppState {
     /// subsystems observed rather than a second, private copy.
     pub fn with_health(mut self, health: omni_core::health::HealthState) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Share the daemon's live LLM assist with the admin panel.
+    pub fn with_llm(mut self, llm: omni_email::assist::LiveAssist) -> Self {
+        self.llm = llm;
         self
     }
 

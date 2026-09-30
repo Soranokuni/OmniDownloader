@@ -158,6 +158,7 @@ document.getElementById('create-user-form').addEventListener('submit', async (ev
 
 const SECRET_LABEL = {
   'graph.client_secret': 'Microsoft Graph client secret',
+  'llm.api_key': 'LLM provider API key',
   'teams.webhook_url': 'Teams webhook URL',
   'web.tls_password': 'TLS certificate passphrase',
 };
@@ -353,19 +354,135 @@ function showTest(message, ok) {
   testResult.className = ok ? 'note ok' : 'note bad';
 }
 
-document.getElementById('test-llm-btn').addEventListener('click', async () => {
-  showTest('Testing…', true);
+/* ------------------------------------------------------------------ *
+ * LLM assist (plan P4.22)
+ * ------------------------------------------------------------------ */
+
+// Presets only fill the base URL and how the key is sent; every field stays
+// editable, and "Custom" is any other OpenAI-compatible server.
+const LLM_PRESETS = [
+  ['lmstudio', 'LM Studio (this machine)', 'http://127.0.0.1:1234/v1', 'none'],
+  ['ollama', 'Ollama (this machine)', 'http://127.0.0.1:11434/v1', 'none'],
+  ['geniex', 'Qualcomm GenieX (Snapdragon NPU)', 'http://127.0.0.1:18181/v1', 'none'],
+  ['llamacpp', 'llama.cpp / vLLM server', 'http://127.0.0.1:8000/v1', 'none'],
+  ['openai', 'OpenAI', 'https://api.openai.com/v1', 'bearer'],
+  ['azure', 'Azure OpenAI', 'https://YOUR-RESOURCE.openai.azure.com/openai/v1', 'api_key_header'],
+  ['gemini', 'Google Gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', 'bearer'],
+  ['anthropic', 'Anthropic Claude', 'https://api.anthropic.com/v1', 'bearer'],
+  ['openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', 'bearer'],
+  ['mistral', 'Mistral', 'https://api.mistral.ai/v1', 'bearer'],
+  ['groq', 'Groq', 'https://api.groq.com/openai/v1', 'bearer'],
+  ['custom', 'Custom (any OpenAI-compatible)', '', ''],
+];
+
+const llm = (id) => document.getElementById(id);
+const llmResult = llm('llm-result');
+
+function showLlm(message, ok) {
+  llmResult.textContent = message;
+  llmResult.className = ok ? 'note ok' : 'note bad';
+}
+
+render(llm('llm-provider'), LLM_PRESETS.map(([id, label]) => el('option', { value: id }, label)));
+
+/* Rough client-side check, to show the warning while typing; the server
+ * decides with the same rule when it builds the prompt. */
+function looksLocal(url) {
   try {
-    await api('/api/system/test-llm', {
-      method: 'POST',
-      body: {
-        endpoint: document.getElementById('test-llm-endpoint').value.trim(),
-        model: document.getElementById('test-llm-model').value.trim(),
-      },
-    });
-    showTest('LLM endpoint answered.', true);
-  } catch (e) { showTest(e.message, false); }
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')
+      || host.endsWith('.lan') || host.endsWith('.internal') || !host.includes('.')
+      || /^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)
+      || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host) || host === '::1';
+  } catch { return true; }
+}
+
+function syncOnline() {
+  llm('llm-online').hidden = looksLocal(llm('llm-base').value.trim());
+}
+
+llm('llm-base').addEventListener('input', syncOnline);
+llm('llm-provider').addEventListener('change', () => {
+  const preset = LLM_PRESETS.find(([id]) => id === llm('llm-provider').value);
+  if (preset && preset[2]) {
+    llm('llm-base').value = preset[2];
+    llm('llm-auth').value = preset[3];
+  }
+  syncOnline();
 });
+
+function llmPayload() {
+  return {
+    mode: llm('llm-mode').value,
+    provider: llm('llm-provider').value,
+    base_url: llm('llm-base').value.trim(),
+    model: llm('llm-model').value.trim(),
+    auth: llm('llm-auth').value,
+    api_key: llm('llm-key').value,
+    clear_key: llm('llm-clear-key').checked,
+    timeout_secs: Number(llm('llm-timeout').value) || 30,
+    max_tokens: Number(llm('llm-tokens').value) || 400,
+    disable_thinking: llm('llm-no-thinking').checked,
+  };
+}
+
+async function loadLlm() {
+  let s;
+  try {
+    s = await api('/api/admin/llm');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  llm('llm-mode').value = s.mode === 'off' ? 'off' : 'assist';
+  llm('llm-provider').value = LLM_PRESETS.some(([id]) => id === s.provider) ? s.provider : 'custom';
+  llm('llm-base').value = s.base_url || '';
+  llm('llm-model').value = s.model || '';
+  llm('llm-auth').value = s.auth || 'none';
+  llm('llm-key').value = '';
+  llm('llm-key').placeholder = s.key_set ? '•••••••• (set; blank keeps it)' : 'not set';
+  llm('llm-clear-key').checked = false;
+  llm('llm-timeout').value = s.timeout_secs;
+  llm('llm-tokens').value = s.max_tokens;
+  llm('llm-no-thinking').checked = !!s.disable_thinking;
+  llm('llm-in-use').textContent = `In use: ${s.mode === 'off' ? 'off' : s.in_use}`;
+  syncOnline();
+}
+
+async function llmCall(button, path, onOk) {
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = 'Working…';
+  showLlm('Waiting for the server…', true);
+  try {
+    onOk(await api(path, { method: 'POST', body: llmPayload() }));
+  } catch (e) {
+    showLlm(e.message, false);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+    // A key typed for a test is never left in the field.
+    llm('llm-key').value = '';
+  }
+}
+
+llm('llm-load-models').addEventListener('click', (event) => llmCall(event.currentTarget, '/api/admin/llm/models', (r) => {
+  const models = r.models || [];
+  render('llm-models', models.map((m) => el('option', { value: m })));
+  showLlm(models.length ? `${models.length} model(s): ${models.slice(0, 12).join(', ')}${models.length > 12 ? ', …' : ''}` : 'The server lists no models; type the model id.', models.length > 0);
+}));
+
+llm('llm-test').addEventListener('click', (event) => llmCall(event.currentTarget, '/api/admin/llm/test', (r) => {
+  const slow = r.seconds > Number(llm('llm-timeout').value) * 0.6;
+  showLlm(`Answered in ${r.seconds} s: ${JSON.stringify(r.answer)}` +
+    (slow ? '\nThat is close to the timeout; a real mail prompt is longer. Raise the timeout or use a faster machine.' : ''), true);
+}));
+
+llm('llm-save').addEventListener('click', (event) => llmCall(event.currentTarget, '/api/admin/llm', (r) => {
+  showLlm(`Saved. The next mail uses ${r.in_use}.`, true);
+  loadLlm();
+  loadSecrets();
+}));
 
 // The mailbox test starts from the saved settings; edit a field to try
 // another value before saving it on /setup.
@@ -556,5 +673,6 @@ loadSecrets();
 loadMaintenance();
 loadUsers();
 loadTaxonomy();
+loadLlm();
 loadLogs();
 setInterval(loadLogs, 15000);
