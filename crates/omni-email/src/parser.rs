@@ -258,7 +258,7 @@ static RE_OVERRIDE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bSTO\s+ONOMA\s+(TIS|TOU|THS|MOU)\b(?:\s+([A-Z0-9]+))?(?:\s+([A-Z0-9]+))?").unwrap()
 });
 static RE_SUBJECT_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(RE|FW|FWD|AP|PRTH|SCHET|TR|WG)\s*:\s*").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(RE|FW|FWD|AP|PRTH|PR|PROOTHISI|SCHET|TR|WG)\s*:\s*").unwrap());
 static RE_SUBJECT_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(THEMATA|EPIKAIROTITA|EPIKAIROTHTA|GIA)\b\s+(?:MONTAZ\b\s*)?(.+)").unwrap());
 
@@ -273,10 +273,17 @@ fn subject_without_prefixes(subject_latin: &str) -> String {
     }
 }
 
+/// Outlook's forward prefixes: English, French (TR), German (WG), and Greek
+/// in both spellings: the older "ΠΡΘ:" and "Πρ:" (Προώθηση), which current
+/// Outlook and Outlook on the web write. Missing "Πρ:" made a forwarded mail
+/// look like a reply, and the forwarded part, links and all, was cut away
+/// as the quoted original.
 fn is_forward(subject: &str) -> bool {
-    let s = translit(subject);
+    let s = translit(subject).to_uppercase();
     let s = s.trim_start();
-    ["FW:", "FWD:", "FW :", "PRTH:", "TR:", "WG:"].iter().any(|p| s.starts_with(p))
+    ["FW:", "FWD:", "FW :", "PRTH:", "PR:", "PR :", "PROOTHISI:", "TR:", "WG:"]
+        .iter()
+        .any(|p| s.starts_with(p))
 }
 
 fn resolve_journalist(
@@ -1003,7 +1010,7 @@ pub fn attachment_url(internet_message_id: &str, attachment_id: &str) -> String 
 }
 
 static RE_SUBJECT_PREFIX_ORIGINAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*(RE|FW|FWD|ΑΠ|ΠΡΘ|ΣΧΕΤ|TR|WG)\s*:\s*").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(RE|FW|FWD|ΑΠ|ΠΡΘ|ΠΡ|ΠΡΟΩΘΗΣΗ|ΣΧΕΤ|TR|WG)\s*:\s*").unwrap());
 
 /// Title and keyword from the subject of an unnumbered email: the title is
 /// the subject as written (minus `RE:`/`FW:`), the keyword leaves out routing
