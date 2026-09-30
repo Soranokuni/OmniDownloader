@@ -126,18 +126,23 @@ export async function api(path, options = {}) {
     throw new ApiError('NETWORK', 'The ingest daemon is not responding.');
   }
 
-  if (response.status === 401) {
-    // The session ended (idle timeout, or an admin ended it). Send the
-    // operator to the login screen rather than leaving a panel that silently
-    // stops updating.
-    if (!location.pathname.startsWith('/login')) location.href = '/login';
-    throw new ApiError('UNAUTHENTICATED', 'Session expired.');
-  }
-
   let payload = null;
   const text = await response.text();
   if (text) {
     try { payload = JSON.parse(text); } catch { payload = null; }
+  }
+
+  if (response.status === 401) {
+    // On a panel: the session ended (idle timeout, or an admin ended it), so
+    // go to the login screen rather than leave a panel that silently stops
+    // updating. On the login screen itself a 401 is the answer to a failed
+    // sign-in, and the server's own message ("wrong email or password") is
+    // the one to show: "Session expired." there sent people looking for a
+    // session problem when the address was wrong.
+    const onLogin = location.pathname.startsWith('/login');
+    if (!onLogin) location.href = '/login';
+    const serverMessage = payload && payload.error && payload.error.message;
+    throw new ApiError('UNAUTHENTICATED', onLogin && serverMessage ? serverMessage : 'Session expired.');
   }
 
   if (!response.ok) {
