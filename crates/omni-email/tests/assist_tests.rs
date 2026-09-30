@@ -91,7 +91,7 @@ async fn run(a: &Assist, m: &InboundMail) -> ParsedEmail {
     let cfg = ParserConfig::default();
     let mut p = parser::parse(m, &r, &cfg);
     let body = m.readable_body();
-    if a.wanted(&p, &body, &[]) {
+    if a.wanted(m, &p, &body, &[]) {
         a.refine(m, &body, &mut p, &r, &[], &cfg).await;
     }
     p
@@ -293,4 +293,76 @@ async fn with_a_group_decided_by_rules_the_model_is_not_asked_about_groups() {
     assert_eq!(p.group.unwrap().how, omni_email::groups::GroupResolution::Subject);
     // Journalist known, keyword made from the subject, group decided: no call.
     assert!(mock.lock().unwrap().requests.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Recipient from context, desk senders, suggested names (plan P4.26)
+// ---------------------------------------------------------------------------
+
+/// A desk address on the roster as MCR, and a journalist known by a short form.
+fn desk_roster() -> Vec<Journalist> {
+    let mut r = roster();
+    r.iter_mut().find(|j| j.surname == "MCR").unwrap().emails = vec!["desk@example.gr".into()];
+    r.push(Journalist {
+        id: 0,
+        surname: "STAVRAKI".into(),
+        full_name: "Evangelia Stavraki".into(),
+        emails: vec![],
+        default_priority: 0,
+        aliases: vec!["ΣΤΑΥΡΑΚΗ".into(), "ΕΥΑΓΓΕΛΙΑ".into()],
+        groups: vec![],
+        created_at: None,
+    });
+    r
+}
+
+async fn run_with(a: &Assist, m: &InboundMail, r: &[Journalist]) -> ParsedEmail {
+    omni_email::assist::interpret(m, r, &[], &ParserConfig::default(), Some(a)).await
+}
+
+#[tokio::test]
+async fn a_mail_from_the_desk_address_is_routed_to_the_journalist_it_names() {
+    let (mock, addr) = start(r#"{"journalist_surname_latin": "STAVRAKI", "journalist_named_in_mail": null, "keywords": {}, "group_code": null}"#).await;
+    let a = assist(&format!("http://{addr}/v1"));
+    let m = mail("desk@example.gr", "VIRAL ΓΙΑ ΕΥΗ", "https://www.youtube.com/watch?v=as0200");
+    let without = omni_email::assist::interpret(&m, &desk_roster(), &[], &ParserConfig::default(), None).await;
+    assert_eq!((without.journalist.surname.as_str(), without.journalist.how), ("MCR", Resolution::Sender));
+
+    let p = run_with(&a, &m, &desk_roster()).await;
+    assert_eq!((p.journalist.surname.as_str(), p.journalist.how), ("STAVRAKI", Resolution::LlmAssist));
+    // No unresolved penalty was taken, so none is given back.
+    assert_eq!(jobs(&p)[0]["confidence"], jobs(&without)[0]["confidence"]);
+
+    // The model saw the aliases, which is how "Εύη" can be matched.
+    let prompt = mock.lock().unwrap().requests[0]["messages"][1]["content"].as_str().unwrap().to_string();
+    assert!(prompt.contains("- STAVRAKI: Evangelia Stavraki; ΣΤΑΥΡΑΚΗ, ΕΥΑΓΓΕΛΙΑ"), "{prompt}");
+    let system = mock.lock().unwrap().requests[0]["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("Εύη = Ευαγγελία") && system.contains("never the recipient journalist's name"), "{system}");
+}
+
+#[tokio::test]
+async fn a_recipient_not_on_the_roster_is_suggested_to_mcr_and_changes_no_job() {
+    let (_m, addr) = start(r#"{"journalist_surname_latin": null, "journalist_named_in_mail": "Διαμαντής", "keywords": {}, "group_code": null}"#).await;
+    let a = assist(&format!("http://{addr}/v1"));
+    let m = mail("desk@example.gr", "Πρ: Για Διαμαντη", "https://www.instagram.com/reel/as0300/");
+    let without = omni_email::assist::interpret(&m, &desk_roster(), &[], &ParserConfig::default(), None).await;
+    let p = run_with(&a, &m, &desk_roster()).await;
+    assert_eq!(p.journalist.surname, "MCR");
+    // The subject says it plainly: the parser reports it as written, and the
+    // model's version is not added a second time.
+    let found: Vec<&str> = p.warnings.iter().filter(|w| w.code == warnings::JOURNALIST_SUGGESTED).filter_map(|w| w.detail.as_deref()).collect();
+    assert_eq!(found, vec!["Διαμαντη"]);
+    assert_eq!(jobs(&p), jobs(&without));
+
+    // Only the body names the recipient: that one needs the model.
+    let body_named = mail("desk@example.gr", "Βίντεο", "Για τον Διαμαντή, από τη συνέντευξη:
+https://www.instagram.com/reel/as0301/");
+    let p = run_with(&a, &body_named, &desk_roster()).await;
+    let found: Vec<&str> = p.warnings.iter().filter(|w| w.code == warnings::JOURNALIST_SUGGESTED).filter_map(|w| w.detail.as_deref()).collect();
+    assert_eq!(found, vec!["Διαμαντής"]);
+
+    // Anything that is not a plain name is not passed on.
+    let (_m, addr) = start(r#"{"journalist_surname_latin": null, "journalist_named_in_mail": "<script>x</script>", "keywords": {}, "group_code": null}"#).await;
+    let p = run_with(&assist(&format!("http://{addr}/v1")), &body_named, &desk_roster()).await;
+    assert!(!p.has_warning(warnings::JOURNALIST_SUGGESTED));
 }

@@ -161,6 +161,9 @@ pub mod warnings {
     pub const ATTACHMENT_TOO_LARGE: &str = "ATTACHMENT_TOO_LARGE";
     /// The LLM was asked and something it said was used (plan P4.4).
     pub const LLM_ASSIST_APPLIED: &str = "LLM_ASSIST_APPLIED";
+    /// The LLM read a recipient in the mail who is not on the roster; the
+    /// detail is the name as written, for MCR to add (plan P4.26).
+    pub const JOURNALIST_SUGGESTED: &str = "JOURNALIST_SUGGESTED";
     /// Several groups were named at one step and membership did not decide.
     pub const GROUP_AMBIGUOUS: &str = "GROUP_AMBIGUOUS";
     /// The LLM was asked and nothing it said was used.
@@ -329,6 +332,7 @@ fn resolve_journalist(
 
     // b. Subject patterns.
     let subject = subject_without_prefixes(&translit(&mail.subject));
+    let mut unknown_recipient: Option<String> = None;
     if let Some(c) = RE_SUBJECT_NAME.captures(&subject) {
         for t in tokens(&c[2]) {
             match roster.lookup(t) {
@@ -342,15 +346,36 @@ fn resolve_journalist(
                 Lookup::None => {}
             }
         }
+        // "ΓΙΑ ΕΥΗ" and nobody on the roster answers to it: remembered, and
+        // reported below if nobody else is found either.
+        if !ambiguous {
+            unknown_recipient = RE_SUBJECT_RECIPIENT.captures(&mail.subject).map(|c| c[1].to_string()).filter(|w| {
+                let l = translit(w);
+                w.chars().count() >= 3 && !ARTICLES.contains(&l.as_str()) && !NOT_A_NAME.contains(&l.as_str())
+            });
+        }
     }
+    // Tell MCR the name as written, so it can be added to the roster (plan
+    // P4.26), when the mail ends with nobody real: unresolved, or only the
+    // MCR desk by sender. Deterministic: a small model does not reliably
+    // report this itself.
+    let suggest = |warnings: &mut Vec<Warning>| {
+        if let Some(name) = &unknown_recipient {
+            warnings.push(Warning::new(warnings::JOURNALIST_SUGGESTED, Some(name.clone())));
+        }
+    };
 
     // c. Sender address.
     if let Some(s) = roster.by_sender(&mail.from_address) {
+        if s == "MCR" {
+            suggest(warnings);
+        }
         return ResolvedJournalist {
             surname: s,
             how: Resolution::Sender,
         };
     }
+    suggest(warnings);
 
     // d. MCR.
     if ambiguous {
@@ -473,6 +498,22 @@ static RE_NUMBERED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:(?i:θέμα|θεμα|thema)\s*|#\s*|\()?(\d{1,3})(?i:ος|ο|η|ον|º|°)?(\s*)([.)\-:])?(\s*)(.*)$").unwrap()
 });
 static RE_THEMA_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?i:θέμα|θεμα)\s*[:\-–]\s*").unwrap());
+/// The word after "για" (past "μοντάζ") in a subject, in its original script.
+static RE_SUBJECT_RECIPIENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:για|gia)\s+(?:(?:μοντάζ|μονταζ|montaz)\s+)?(\p{L}+)").unwrap());
+
+/// Words that follow "για" in a subject without being a person, in Latin.
+const NOT_A_NAME: &[&str] = &[
+    "AVRIO", "SIMERA", "APOPSE", "TORA", "METHAVRIO", "PROI", "VRADY", "MESIMERI", "MONTAZ", "PLANA", "EKPOMPI",
+    "DELTIO", "DELTIA", "PROVOLI", "METADOSI", "ARCHEIO", "EPIKAIROTITA", "THEMATA", "THEMA", "SENA", "ESENA", "SAS",
+    "ESAS", "OLOUS", "OLES", "OLA", "EMAS", "ESAS", "SOU", "SAS", "LIGO", "PARAKOLOUTHISI", "ENIMEROSI", "SYNENTEFXI",
+    "REPORTAZ", "VINTEO", "VIDEO", "FOTO", "FOTOGRAFIES", "SOCIAL", "SITE", "WEB", "ONLINE", "RADIO", "TV",
+];
+
+/// Greek articles and prepositions-with-article, in ELOT 743 Latin: after
+/// "ΓΙΑ" they introduce a topic, not a person.
+const ARTICLES: &[&str] = &["TO", "TA", "TI", "TIN", "TIS", "TON", "TOUS", "TOU", "THN", "TH", "O", "I", "OI", "ENA", "MIA", "ENAN"];
+
 /// A journalist saying a link is video: "απόσπασμα", "βίντεο", "video",
 /// "πλάνα", "ρεπορτάζ" (in ELOT 743 Latin).
 static RE_VIDEO_HINT: LazyLock<Regex> =
@@ -1050,7 +1091,29 @@ static RE_SUBJECT_PREFIX_ORIGINAL: LazyLock<Regex> =
 /// words and the journalist's own name. `None` if nothing usable remains.
 fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(String, String)> {
     let latin = subject_without_prefixes(&translit(subject));
-    let kept: Vec<&str> = tokens(&latin)
+    // "… ΓΙΑ ΕΥΗ", "ΓΙΑ ΜΟΝΤΑΖ ΓΙΩΡΓΟ": the word after ΓΙΑ (past ΜΟΝΤΑΖ) names
+    // who the mail is for, not the story, whether or not the roster knows
+    // them. After an article ("ΓΙΑ ΤΟ ΣΕΙΣΜΟ") it is the story (plan P4.26).
+    let all: Vec<&str> = tokens(&latin).collect();
+    let mut recipient_at = HashSet::new();
+    for (i, t) in all.iter().enumerate() {
+        if *t == "GIA" {
+            let mut k = i + 1;
+            if all.get(k) == Some(&"MONTAZ") {
+                k += 1;
+            }
+            if let Some(next) = all.get(k) {
+                if !ARTICLES.contains(next) {
+                    recipient_at.insert(k);
+                }
+            }
+        }
+    }
+    let kept: Vec<&str> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !recipient_at.contains(i))
+        .map(|(_, t)| *t)
         .filter(|t| !matches!(roster.lookup(t), Lookup::One(ref s) if s == journalist))
         .filter(|t| !["THEMATA", "EPIKAIROTITA", "EPIKAIROTHTA", "GIA", "MONTAZ", "EKTAKTO", "BREAKING", "URGENT"].contains(t))
         .collect();
@@ -1615,7 +1678,9 @@ pub fn valid_keyword(raw: &str) -> Option<String> {
 /// Adopt a journalist for a mail the parser left unresolved: the −0.2
 /// confidence penalty is taken back and every job's status recomputed.
 pub fn adopt_journalist(parsed: &mut ParsedEmail, surname: String, cfg: &ParserConfig) {
-    if parsed.journalist.how != Resolution::Unresolved {
+    // Unresolved, or only the MCR desk by sender address (plan P4.26).
+    let was_unresolved = parsed.journalist.how == Resolution::Unresolved;
+    if !was_unresolved && parsed.journalist.surname != "MCR" {
         return;
     }
     parsed.journalist = ResolvedJournalist {
@@ -1625,6 +1690,9 @@ pub fn adopt_journalist(parsed: &mut ParsedEmail, surname: String, cfg: &ParserC
     parsed
         .warnings
         .retain(|w| w.code != warnings::JOURNALIST_UNRESOLVED && w.code != warnings::JOURNALIST_AMBIGUOUS);
+    if !was_unresolved {
+        return; // no unresolved-journalist penalty was taken
+    }
     for s in &mut parsed.sections {
         for j in &mut s.jobs {
             j.confidence = round2(j.confidence + 0.2);

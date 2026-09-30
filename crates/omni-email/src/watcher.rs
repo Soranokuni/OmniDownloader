@@ -466,7 +466,7 @@ impl EmailWatcher {
             records.iter().filter(|r| r.result.is_new()).count()
         );
         if !parsed.warnings.is_empty() {
-            let codes: Vec<&str> = parsed.warnings.iter().map(|w| w.code.as_str()).collect();
+            let codes: Vec<String> = parsed.warnings.iter().map(warning_label).collect();
             let _ = self.repo.log_audit(
                 "WARN",
                 "EMAIL",
@@ -533,7 +533,7 @@ impl EmailWatcher {
         let journalist = &parsed.journalist.surname;
         let mut notes = format!("Email: {}", mail.subject);
         if !parsed.warnings.is_empty() {
-            let codes: Vec<&str> = parsed.warnings.iter().map(|w| w.code.as_str()).collect();
+            let codes: Vec<String> = parsed.warnings.iter().map(warning_label).collect();
             notes.push_str(&format!(" [{}]", codes.join(", ")));
         }
         // Urgent mail goes ahead of the journalist's usual place in the queue.
@@ -616,6 +616,15 @@ fn attachment_extension(name: &str) -> String {
         .map(|(_, e)| e.to_ascii_lowercase())
         .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or_else(|| "bin".into())
+}
+
+/// A warning for people: the code, and for a suggested recipient the name
+/// too ("JOURNALIST_SUGGESTED: Εύη"), which is what MCR acts on.
+fn warning_label(w: &crate::parser::Warning) -> String {
+    match (&w.detail, w.code.as_str()) {
+        (Some(d), crate::parser::warnings::JOURNALIST_SUGGESTED) => format!("{}: {d}", w.code),
+        _ => w.code.clone(),
+    }
 }
 
 /// Idempotency key: the Message-ID, or the provider id for the rare message

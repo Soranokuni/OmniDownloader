@@ -190,6 +190,10 @@
         <input type="checkbox" id="llm-no-thinking" style="width:auto" checked>
         <span>Disable thinking (reasoning models answer in seconds instead of minutes)</span>
       </label>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="llm-polish" style="width:auto">
+        <span>Let the LLM write every keyword (otherwise only where the parser cannot make one); one model call per mail</span>
+      </label>
       <div class="row">
         <button class="btn" type="button" id="llm-test">Test</button>
         <button class="btn btn-primary" type="button" id="llm-save">Save and apply</button>
@@ -368,6 +372,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=7"></script>
+<script type="module" src="/static/admin.js?v=8"></script>
 </body>
 </html>

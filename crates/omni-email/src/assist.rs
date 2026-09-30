@@ -36,18 +36,39 @@ const MAX_BODY_CHARS: usize = 4000;
 
 static RE_ROUTING_PHRASE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(GIA|STO\s+ONOMA)\b").unwrap());
 
-const SYSTEM_PROMPT: &str = "You help a Greek television newsroom file video links. \
-Answer with one JSON object and nothing else: \
-{\"journalist_surname_latin\": string or null, \"keywords\": {\"<section number>\": \"<KEYWORD>\"}, \
-\"group_code\": string or null}. \
-journalist_surname_latin: the surname of the journalist the email says the material is for, \
-chosen from the roster, in uppercase Latin letters exactly as the roster writes it; null if the \
-email does not say or you are unsure. keywords: for each section listed, one or two distinctive \
-words of its title transliterated to uppercase Latin, letters and digits only, no spaces, at most \
-20 characters. group_code: the code of the listed group (news desk or show) the material is for, \
-judged from the subject, the body and the group descriptions; null if the email does not make it \
-clear or no groups are listed. Never output URLs, section numbers or group codes that were not \
-listed, or any other field.";
+/// The built-in prompt (plan P4.26). Deliberately not editable from the
+/// panel (defect E-03): what the model may say is enforced in code, and the
+/// prompt is tuned to that contract.
+const SYSTEM_PROMPT: &str = "You help the video desk of a Greek regional television newsroom file \
+material that journalists send by email. Answer with one JSON object and nothing else, with exactly \
+these fields: {\"journalist_surname_latin\": string or null, \"journalist_named_in_mail\": string or \
+null, \"keywords\": {\"<section number>\": \"<KEYWORD>\"}, \"group_code\": string or null}.\n\
+\n\
+journalist_surname_latin: who the material is FOR (the journalist who will edit it), chosen from the \
+roster only, written exactly as the roster's surname. Read the routing: \"για τον/την X\", \"για X\", \
+\"στο όνομα του/της X\", \"Χ, σου στέλνω\", a greeting like \"Γιώργο,\" addressed to a colleague. Match \
+Greek first names, surnames, cases (Γιώργος/Γιώργο/Γιώργου, Παπαδάκη/Παπαδάκης), nicknames and short \
+forms (Εύη = Ευαγγελία, Κώστας = Κωνσταντίνος, Γιάννης = Ιωάννης, Μαίρη = Μαρία) against the full names \
+and aliases in the roster. The sender, people interviewed or shown in the video, and names inside \
+article titles are not the recipient. null when the email does not say or two roster people fit.\n\
+\n\
+journalist_named_in_mail: when the email names the recipient but nobody on the roster fits, that name \
+exactly as written (e.g. \"Εύη\"); otherwise null.\n\
+\n\
+keywords: for each listed section, the story's slug keyword: one or two words that name the story \
+itself (the place, person, institution or event: ΣΕΙΣΜΟΣ ΣΗΤΕΙΑ, ΛΙΜΑΝΙ ΧΑΝΙΩΝ, ΔΗΜΑΡΧΟΣ ΗΡΑΚΛΕΙΟΥ), \
+from the section title and the text and links around it. Transliterate Greek to Latin by ELOT 743 \
+(Χ=CH, Θ=TH, Ψ=PS, Ξ=X, Η=I, Υ=Y, ΟΥ=OU, Β=V), uppercase, letters and digits only, no spaces, at most \
+20 characters (drop the second word if it does not fit). Never a generic word (VIDEO, VINTEO, VIRAL, \
+THEMA, REPORTAZ, PLANA, LINK, NEWS, ASSET, KALIMERA), never the recipient journalist's name, never a \
+date. Omit a section you cannot name rather than guess.\n\
+\n\
+group_code: the listed group (news desk, show or desk) the material is for, judged from the subject, \
+the body and the group descriptions; null when unclear or no groups are listed.\n\
+\n\
+Never output URLs, section numbers or group codes that were not listed, or any other field.
+
+Example. Roster: - NIKOLAOU: Giorgos Nikolaou; ΓΙΩΡΓΟΣ. Subject: \"Πρ: VIRAL ΓΙΑ ΕΥΗ\". Body: a forwarded reel of a concert at the Heraklion harbour. Section 1 needs a keyword. Answer: {\"journalist_surname_latin\": null, \"journalist_named_in_mail\": \"Εύη\", \"keywords\": {\"1\": \"SYNAVLIALIMANI\"}, \"group_code\": null} (Εύη is not on this roster, so she is named, not chosen; the keyword names the story, not the word VIRAL; no group is stated).";
 
 pub struct Assist {
     client: LlmClient,
@@ -92,12 +113,14 @@ impl Assist {
 
     /// Whether this mail is worth a model call (plan P4.4 trigger rules;
     /// P4.19: also when groups exist and the rules chose none).
-    pub fn wanted(&self, parsed: &ParsedEmail, body: &str, groups: &[Group]) -> bool {
+    pub fn wanted(&self, mail: &InboundMail, parsed: &ParsedEmail, body: &str, groups: &[Group]) -> bool {
         if self.cfg.mode == LlmMode::Off || parsed.jobs().next().is_none() {
             return false;
         }
-        let routed_but_unresolved = parsed.journalist.how == Resolution::Unresolved
-            && RE_ROUTING_PHRASE.is_match(&translit(body));
+        // "MCR by sender" is a desk address on the roster as MCR, not a
+        // journalist: the mail may still name who it is for.
+        let routed_but_unresolved = journalist_open(parsed)
+            && (RE_ROUTING_PHRASE.is_match(&translit(body)) || RE_ROUTING_PHRASE.is_match(&translit(&mail.subject)));
         let group_undecided = parsed.group.is_none() && !groups.is_empty();
         self.cfg.keyword_polish
             || routed_but_unresolved
@@ -116,7 +139,7 @@ impl Assist {
         groups: &[Group],
         parser_cfg: &ParserConfig,
     ) {
-        let want_journalist = parsed.journalist.how == Resolution::Unresolved;
+        let want_journalist = journalist_open(parsed);
         let want_group = parsed.group.is_none() && !groups.is_empty();
         let sections: Vec<(String, String)> = if self.cfg.keyword_polish {
             parsed
@@ -138,7 +161,11 @@ impl Assist {
         let redact = self.client.is_online();
         let user = build_prompt(mail, body, roster, want_journalist, &sections, if want_group { groups } else { &[] }, redact);
         let answer = match self.client.chat_json(SYSTEM_PROMPT, &user, &schema(), self.cfg.max_tokens).await {
-            Ok(v) => v,
+            Ok(v) => {
+                // Names and keywords only, never the mail; for tuning.
+                tracing::debug!("LLM assist answer for '{}': {v}", mail.subject);
+                v
+            }
             Err(e) => {
                 warn!("LLM assist unavailable, keeping the parser's result: {e:#}");
                 skipped(parsed, "unavailable");
@@ -162,6 +189,22 @@ impl Assist {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // A recipient the model read in the mail but could not match: MCR is
+        // told the name, so it can be added to the roster (plan P4.26). The
+        // roster itself is never changed from a model's answer.
+        if want_journalist && journalist_open(parsed) && !parsed.has_warning(warnings::JOURNALIST_SUGGESTED) {
+            if let Some(Value::String(name)) = answer.get("journalist_named_in_mail") {
+                let name: String = name.trim().chars().take(60).collect();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphabetic() || c == ' ' || c == '.' || c == '-') {
+                    parsed.warnings.push(Warning {
+                        code: warnings::JOURNALIST_SUGGESTED.into(),
+                        detail: Some(name.clone()),
+                    });
+                    applied.push(format!("recipient named \"{name}\", not on the roster"));
+                }
             }
         }
 
@@ -219,6 +262,12 @@ impl Assist {
     }
 }
 
+/// The journalist is still open: nobody resolved, or only the MCR desk
+/// (a desk address mapped to MCR on the roster).
+fn journalist_open(parsed: &ParsedEmail) -> bool {
+    parsed.journalist.how == Resolution::Unresolved || parsed.journalist.surname == "MCR"
+}
+
 fn skipped(parsed: &mut ParsedEmail, why: &str) {
     parsed
         .warnings
@@ -230,10 +279,11 @@ fn schema() -> Value {
         "type": "object",
         "properties": {
             "journalist_surname_latin": { "type": ["string", "null"] },
+            "journalist_named_in_mail": { "type": ["string", "null"] },
             "keywords": { "type": "object", "additionalProperties": { "type": "string" } },
             "group_code": { "type": ["string", "null"] }
         },
-        "required": ["journalist_surname_latin", "keywords", "group_code"],
+        "required": ["journalist_surname_latin", "journalist_named_in_mail", "keywords", "group_code"],
         "additionalProperties": false
     })
 }
@@ -249,9 +299,14 @@ fn build_prompt(
 ) -> String {
     let mut p = String::new();
     if want_journalist {
-        p.push_str("Roster (surname: full name):\n");
+        p.push_str("Roster (surname: full name; other names used for them):\n");
         for j in roster.iter().filter(|j| j.surname != "MCR") {
-            p.push_str(&format!("- {}: {}\n", j.surname, j.full_name));
+            let aliases: Vec<&str> = j.aliases.iter().map(String::as_str).take(8).collect();
+            if aliases.is_empty() {
+                p.push_str(&format!("- {}: {}\n", j.surname, j.full_name));
+            } else {
+                p.push_str(&format!("- {}: {}; {}\n", j.surname, j.full_name, aliases.join(", ")));
+            }
         }
     } else {
         p.push_str("The journalist is known; answer null for journalist_surname_latin.\n");
@@ -361,7 +416,7 @@ pub async fn interpret(
     resolve_group(mail, &mut parsed, roster, groups);
     if let Some(a) = assist {
         let body = mail.readable_body();
-        if a.wanted(&parsed, &body, groups) {
+        if a.wanted(mail, &parsed, &body, groups) {
             a.refine(mail, &body, &mut parsed, roster, groups, parser_cfg).await;
             let from_model = parsed.group.clone();
             resolve_group(mail, &mut parsed, roster, groups);
