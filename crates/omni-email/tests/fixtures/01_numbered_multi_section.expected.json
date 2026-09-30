@@ -1,7 +1,5 @@
 {
-  "ignored_urls": [
-    "https://www.lifo.gr/now/politics/synenteyxi-perifereiarchi"
-  ],
+  "ignored_urls": [],
   "journalist": {
     "how": "sender",
     "surname": "PAPADAKI"
@@ -28,8 +26,17 @@
       "index_str": "2",
       "jobs": [
         {
+          "confidence": 0.8,
+          "index_str": "2A",
+          "keyword": "SYNENTEFXIPERIFEREIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.lifo.gr/now/politics/synenteyxi-perifereiarchi"
+        },
+        {
           "confidence": 0.95,
-          "index_str": "2",
+          "index_str": "2B",
           "keyword": "SYNENTEFXIPERIFEREIA",
           "marker": false,
           "status": "PENDING",

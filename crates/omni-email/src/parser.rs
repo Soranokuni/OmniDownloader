@@ -473,6 +473,10 @@ static RE_NUMBERED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:(?i:θέμα|θεμα|thema)\s*|#\s*|\()?(\d{1,3})(?i:ος|ο|η|ον|º|°)?(\s*)([.)\-:])?(\s*)(.*)$").unwrap()
 });
 static RE_THEMA_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?i:θέμα|θεμα)\s*[:\-–]\s*").unwrap());
+/// A journalist saying a link is video: "απόσπασμα", "βίντεο", "video",
+/// "πλάνα", "ρεπορτάζ" (in ELOT 743 Latin).
+static RE_VIDEO_HINT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(APOSPASMA\w*|VINTEO|VIDEO|PLANA|REPORTAZ|VID)\b").unwrap());
 /// A Greek-letter list: `Α.`, `Β)`, `ΣΤ.` (plan P4.15).
 static RE_LETTERED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(ΣΤ|[ΑΒΓΔΕΖΗΘΙΚΛΜ])([.)])\s+(\S.*)$").unwrap());
@@ -1131,36 +1135,39 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     for (s, (title, section_kw)) in raw.iter().zip(titles) {
         let marked = marked_urls(&s.lines, &mut warnings, &s.index);
         let mut candidates: Vec<(String, Tier, bool)> = Vec::new();
-        for line in &s.lines {
+        // Links a journalist called video ("απόσπασμα", "βίντεο" on the same
+        // line or the line above): a portal page among them is more likely
+        // to carry a player (plan P4.24).
+        let mut video_hinted: HashSet<String> = HashSet::new();
+        for (li, line) in s.lines.iter().enumerate() {
+            let hinted = RE_VIDEO_HINT.is_match(&line.latin)
+                || (li > 0 && s.lines[li - 1].urls.is_empty() && RE_VIDEO_HINT.is_match(&s.lines[li - 1].latin));
             for u in &line.urls {
                 if !seen_urls.insert(urlnorm::normalize(u)) {
                     continue;
+                }
+                if hinted {
+                    video_hinted.insert(u.clone());
                 }
                 candidates.push((u.clone(), classify(u, cfg), marked.contains(u)));
             }
         }
 
+        // Video platforms *and* news portals are queued: journalists send
+        // article links so the video embedded in the page is downloaded
+        // (owner, plan P4.24). An unknown site is queued only when a section
+        // has neither. A "ΓΙΑ ΠΛΑΝΑ:" marker still narrows to what it marks.
         let any_marked = candidates.iter().any(|(_, t, m)| *m && !matches!(t, Tier::Locker | Tier::Image));
-        let has = |tier: Tier| candidates.iter().any(|(_, t, _)| *t == tier);
-        let wanted = if any_marked {
-            None
-        } else if has(Tier::Tier1) {
-            Some(Tier::Tier1)
-        } else if has(Tier::Tier2) {
-            Some(Tier::Tier2)
-        } else {
-            Some(Tier::Other)
-        };
+        let has_media = candidates.iter().any(|(_, t, _)| matches!(t, Tier::Tier1 | Tier::Tier2));
 
         let mut selected: Vec<(String, Tier, bool)> = Vec::new();
         for (u, tier, m) in candidates {
             let take = match tier {
                 Tier::Locker => true,
                 Tier::Image => false,
-                _ => match wanted {
-                    None => m,
-                    Some(w) => tier == w,
-                },
+                _ if any_marked => m,
+                Tier::Tier1 | Tier::Tier2 => true,
+                _ => !has_media,
             };
             if tier == Tier::Image {
                 images += 1;
@@ -1182,7 +1189,8 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
             .enumerate()
             .map(|(i, (url, tier, marker))| {
                 let penalty = if unresolved { 0.2 } else { 0.0 };
-                let confidence = round2(base_confidence(tier, marker) - penalty);
+                let hint = if tier == Tier::Tier2 && video_hinted.contains(&url) { 0.1 } else { 0.0 };
+                let confidence = round2(base_confidence(tier, marker) + hint - penalty);
                 let keyword = section_kw
                     .clone()
                     .or_else(|| keyword_from_url(&url))
