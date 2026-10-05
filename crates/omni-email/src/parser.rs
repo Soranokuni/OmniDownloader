@@ -56,7 +56,13 @@ pub enum Resolution {
     Subject,
     /// The sender address is on the roster.
     Sender,
-    /// Nobody matched; the jobs go to `MCR`.
+    /// The mail came from the MCR desk (or an address not on the roster)
+    /// passing on a journalist's mail: the forwarded `From:`/`Από:` line in
+    /// the body names someone on the roster.
+    Forwarded,
+    /// Nobody matched; the jobs go to `MCR`. A mail *from* the MCR desk
+    /// that names nobody ends here too: MCR passes mail on, it is never the
+    /// journalist.
     Unresolved,
     /// Proposed by the LLM (plan P4.4) and confirmed against the roster.
     LlmAssist,
@@ -185,7 +191,8 @@ fn tokens(s: &str) -> impl Iterator<Item = &str> {
 
 enum Lookup {
     One(String),
-    Ambiguous,
+    /// Several people answer to it (sorted surnames).
+    Ambiguous(Vec<String>),
     None,
 }
 
@@ -226,7 +233,11 @@ impl<'a> Roster<'a> {
         let pick = |set: HashSet<&String>| match set.len() {
             0 => None,
             1 => Some(Lookup::One(set.into_iter().next().unwrap().clone())),
-            _ => Some(Lookup::Ambiguous),
+            _ => {
+                let mut all: Vec<String> = set.into_iter().cloned().collect();
+                all.sort();
+                Some(Lookup::Ambiguous(all))
+            }
         };
         let exact: HashSet<&String> = self.keys.iter().filter(|(k, _)| *k == tok).map(|(_, s)| s).collect();
         if let Some(l) = pick(exact) {
@@ -255,6 +266,71 @@ impl<'a> Roster<'a> {
             .find(|j| j.emails.iter().any(|e| e.trim().to_lowercase() == addr))
             .map(|j| j.surname.clone())
     }
+
+    /// The one person a display name ("Δανάη Λαμπράκη") refers to: every
+    /// word that names someone names the same person.
+    fn by_display_name(&self, name: &str) -> Option<String> {
+        let mut found: HashSet<String> = HashSet::new();
+        for t in tokens(name) {
+            if let Lookup::One(s) = self.lookup(t) {
+                found.insert(s);
+            }
+        }
+        (found.len() == 1).then(|| found.into_iter().next().unwrap())
+    }
+}
+
+/// `From:`, `To:`, `Cc:` lines of mail forwarded or quoted in the body, as
+/// Outlook (English and Greek: Από, Προς, Κοιν.) and Gmail write them.
+static RE_QUOTED_PARTIES: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\*?(from|από|to|προς|cc|κοιν\.?)\s*:\s*(.+)$").unwrap());
+static RE_ADDRESS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}").unwrap());
+
+/// The roster people in the headers of mail forwarded or quoted in the body.
+struct QuotedPeople {
+    /// Who sent each forwarded/quoted mail, newest (top of the body) first.
+    senders: Vec<String>,
+    /// Everyone on any of those From/To/Cc lines, and on the mail's own To/Cc.
+    everyone: HashSet<String>,
+}
+
+fn quoted_people(mail: &InboundMail, roster: &Roster) -> QuotedPeople {
+    let mut senders = Vec::new();
+    let mut everyone: HashSet<String> = HashSet::new();
+    for addr in mail.to.iter().chain(&mail.cc) {
+        if let Some(s) = RE_ADDRESS.find(addr).and_then(|m| roster.by_sender(m.as_str())) {
+            everyone.insert(s);
+        }
+    }
+    let body = mail.readable_body().replace(INVISIBLE, "");
+    for line in body.lines() {
+        let Some(c) = RE_QUOTED_PARTIES.captures(line.trim()) else {
+            continue;
+        };
+        let is_from = matches!(c[1].to_lowercase().as_str(), "from" | "από");
+        let parties = &c[2];
+        // Each party by its address; Exchange shows colleagues by name only
+        // ("Από: Λαμπράκη Δανάη"), and then the name is all there is.
+        let people: Vec<String> = parties
+            .split([';', ','])
+            .filter_map(|party| match RE_ADDRESS.find(party) {
+                Some(m) => roster.by_sender(m.as_str()),
+                None => roster.by_display_name(party),
+            })
+            .collect();
+        if is_from {
+            senders.extend(people.iter().cloned());
+        }
+        everyone.extend(people);
+    }
+    QuotedPeople { senders, everyone }
+}
+
+/// The one of `candidates` the mail's headers name, when exactly one is.
+fn named_in_headers(candidates: &[String], quoted: &QuotedPeople) -> Option<String> {
+    let named: Vec<&String> = candidates.iter().filter(|c| quoted.everyone.contains(*c)).collect();
+    (named.len() == 1).then(|| named[0].clone())
 }
 
 static RE_OVERRIDE: LazyLock<Regex> = LazyLock::new(|| {
@@ -296,6 +372,9 @@ fn resolve_journalist(
     warnings: &mut Vec<Warning>,
 ) -> ResolvedJournalist {
     let mut ambiguous = false;
+    // "ΓΙΑ ΕΥΗ" with two Evis on the roster: the one the forwarded headers
+    // name (To/Cc) is meant.
+    let quoted = quoted_people(mail, roster);
 
     // a. Body override.
     let body_latin = translit(body);
@@ -316,7 +395,15 @@ fn resolve_journalist(
                             how: Resolution::BodyOverride,
                         }
                     }
-                    Lookup::Ambiguous => ambiguous = true,
+                    Lookup::Ambiguous(all) => match named_in_headers(&all, &quoted) {
+                        Some(s) => {
+                            return ResolvedJournalist {
+                                surname: s,
+                                how: Resolution::BodyOverride,
+                            }
+                        }
+                        None => ambiguous = true,
+                    },
                     Lookup::None => {}
                 }
             }
@@ -342,7 +429,15 @@ fn resolve_journalist(
                         how: Resolution::Subject,
                     }
                 }
-                Lookup::Ambiguous => ambiguous = true,
+                Lookup::Ambiguous(all) => match named_in_headers(&all, &quoted) {
+                    Some(s) => {
+                        return ResolvedJournalist {
+                            surname: s,
+                            how: Resolution::Subject,
+                        }
+                    }
+                    None => ambiguous = true,
+                },
                 Lookup::None => {}
             }
         }
@@ -356,26 +451,32 @@ fn resolve_journalist(
         }
     }
     // Tell MCR the name as written, so it can be added to the roster (plan
-    // P4.26), when the mail ends with nobody real: unresolved, or only the
-    // MCR desk by sender. Deterministic: a small model does not reliably
-    // report this itself.
+    // P4.26), when the mail did not come from a journalist on the roster.
+    // Deterministic: a small model does not reliably report this itself.
     let suggest = |warnings: &mut Vec<Warning>| {
         if let Some(name) = &unknown_recipient {
             warnings.push(Warning::new(warnings::JOURNALIST_SUGGESTED, Some(name.clone())));
         }
     };
 
-    // c. Sender address.
-    if let Some(s) = roster.by_sender(&mail.from_address) {
-        if s == "MCR" {
-            suggest(warnings);
-        }
+    // c. Sender address. The MCR desk is never the journalist: it passes on
+    // what a journalist sent it (owner, 2026-10-05).
+    if let Some(s) = roster.by_sender(&mail.from_address).filter(|s| s != "MCR") {
         return ResolvedJournalist {
             surname: s,
             how: Resolution::Sender,
         };
     }
     suggest(warnings);
+
+    // c2. The journalist whose mail the desk (or an outsider) forwarded:
+    // the newest forwarded sender who is not the desk itself.
+    if let Some(s) = quoted.senders.iter().find(|s| *s != "MCR") {
+        return ResolvedJournalist {
+            surname: s.clone(),
+            how: Resolution::Forwarded,
+        };
+    }
 
     // d. MCR.
     if ambiguous {
@@ -403,7 +504,7 @@ static RE_WROTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(on|στις|την)\s.+(wrote|έγραψε|γράψατε)\s*:?\s*$").unwrap());
 static RE_HEADER_FROM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\*?(from|από)\s*:").unwrap());
 static RE_HEADER_ANY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^\*?(from|sent|date|to|cc|subject|από|εστάλη|ημερομηνία|προς|κοιν|θέμα)\s*:").unwrap()
+    Regex::new(r"(?i)^\*?(from|sent|date|to|cc|bcc|subject|από|εστάλη|στάλθηκε|σταλθηκε|ημερομηνία|προς|κοιν\.?|θέμα)\s*:").unwrap()
 });
 
 /// Remove quoted replies and signatures.
@@ -1117,7 +1218,20 @@ fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(St
         .filter(|t| !matches!(roster.lookup(t), Lookup::One(ref s) if s == journalist))
         .filter(|t| !["THEMATA", "EPIKAIROTITA", "EPIKAIROTHTA", "GIA", "MONTAZ", "EKTAKTO", "BREAKING", "URGENT"].contains(t))
         .collect();
-    let keyword = keyword_from_text(&kept.join(" "))?;
+    // "Για Διαμαντη" and nothing else: a name the roster does not know is
+    // as likely the story as a person, and it is the only word the subject
+    // has. Better than the first line of the body, which in a forward is
+    // a header ("Στάλθηκε: Τετάρτη" became the keyword).
+    let unlisted_recipient = || {
+        let words: Vec<&str> = recipient_at
+            .iter()
+            .filter_map(|i| all.get(*i).copied())
+            .filter(|t| matches!(roster.lookup(t), Lookup::None))
+            .filter(|t| !NOT_A_NAME.contains(t))
+            .collect();
+        keyword_from_text(&words.join(" "))
+    };
+    let keyword = keyword_from_text(&kept.join(" ")).or_else(unlisted_recipient)?;
     let mut display = subject.trim().to_string();
     loop {
         let next = RE_SUBJECT_PREFIX_ORIGINAL.replace(&display, "").into_owned();
@@ -1418,8 +1532,70 @@ mod tests {
         assert!(matches!(ix.lookup("ΝΙΚΟΛΑΟΥ"), Lookup::One(ref s) if s == "NIKOLAOU"));
         assert!(matches!(ix.lookup("Γιώργου"), Lookup::None));
         // Two staff called Anna: the first name alone must not pick one.
-        assert!(matches!(ix.lookup("ΑΝΝΑΣ"), Lookup::Ambiguous));
+        assert!(matches!(ix.lookup("ΑΝΝΑΣ"), Lookup::Ambiguous(_)));
         assert!(matches!(ix.lookup("ΤΟ"), Lookup::None));
+    }
+
+    /// The MCR desk on the roster by its addresses, as in the station's roster.
+    fn desk_roster() -> Vec<Journalist> {
+        let mut r = roster();
+        r[0].emails = vec!["master@example.gr".into(), "flow@example.gr".into()];
+        r
+    }
+
+    fn resolved(m: &InboundMail, r: &[Journalist]) -> (String, Resolution) {
+        let p = parse(m, r, &ParserConfig::default());
+        (p.journalist.surname, p.journalist.how)
+    }
+
+    /// "VIRAL ΓΙΑ ΕΥΗ" relayed by the desk (2026-10-05): two Evis on the
+    /// roster, and the forwarded mail had one of them on its Cc line.
+    #[test]
+    fn a_first_name_two_people_share_is_settled_by_the_forwarded_headers() {
+        let body = "Από: Master Desk <master@example.gr>\n\
+                    Προς: Flow Desk <flow@example.gr>\n\
+                    Από: Giorgos Nikolaou <g.nikolaou@example.gr>\n\
+                    Προς: Master Desk <master@example.gr>\n\
+                    Κοιν.: Άννα Γεωργίου; Graphics <graphics@example.gr>\n\
+                    https://www.youtube.com/watch?v=abcdefghijk";
+        let m = mail("VIRAL ΓΙΑ ΑΝΝΑ", "flow@example.gr", body);
+        assert_eq!(resolved(&m, &desk_roster()), ("GEORGIOU".into(), Resolution::Subject));
+
+        // Neither Anna in the headers: still ambiguous, and the desk is not
+        // the answer; the journalist who forwarded it is.
+        let m = mail("VIRAL ΓΙΑ ΑΝΝΑ", "flow@example.gr", &body.replace("Κοιν.: Άννα Γεωργίου; ", "Κοιν.: "));
+        assert_eq!(resolved(&m, &desk_roster()), ("NIKOLAOU".into(), Resolution::Forwarded));
+    }
+
+    #[test]
+    fn the_desk_is_never_the_journalist() {
+        let link = "https://www.youtube.com/watch?v=abcdefghijk";
+        // The desk naming nobody: unresolved (for MCR to place), not MCR by sender.
+        let m = mail("VIRAL", "flow@example.gr", link);
+        assert_eq!(resolved(&m, &desk_roster()), ("MCR".into(), Resolution::Unresolved));
+
+        // Exchange shows a colleague by name only, surname first.
+        let m = mail("Πρ: VIRAL", "flow@example.gr", &format!("Από: Νικολάου Giorgos\nΣτάλθηκε: Τετάρτη\nΘέμα: VIRAL\n{link}"));
+        assert_eq!(resolved(&m, &desk_roster()), ("NIKOLAOU".into(), Resolution::Forwarded));
+
+        // A journalist writing in person is still the journalist, whoever
+        // they quote.
+        let m = mail("Πρ: VIRAL", "a.papadaki@example.gr", &format!("From: Giorgos Nikolaou <g.nikolaou@example.gr>\nSent: Wednesday\n{link}"));
+        assert_eq!(resolved(&m, &desk_roster()), ("PAPADAKI".into(), Resolution::Sender));
+    }
+
+    /// Greek Outlook's "Στάλθηκε:" and "Κοιν.:" were not known as header
+    /// lines, and the forward's date became the story keyword.
+    #[test]
+    fn greek_outlook_forward_headers_are_not_content() {
+        let body = "Από: Giorgos Nikolaou <g.nikolaou@example.gr>\n\
+                    Στάλθηκε: Τετάρτη 30 Σεπτεμβρίου 2026 1:04:12 μ.μ.\n\
+                    Προς: Master Desk <master@example.gr>\n\
+                    Κοιν.: Anna Georgiou <a.georgiou@example.gr>\n\
+                    Θέμα: Fw: ΣΕΙΣΜΟΣ\n\
+                    https://www.youtube.com/watch?v=abcdefghijk";
+        let cleaned = strip_quotes_and_signature(body, true);
+        assert_eq!(cleaned, "https://www.youtube.com/watch?v=abcdefghijk");
     }
 
     #[test]

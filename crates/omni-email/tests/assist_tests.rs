@@ -326,12 +326,15 @@ async fn a_mail_from_the_desk_address_is_routed_to_the_journalist_it_names() {
     let a = assist(&format!("http://{addr}/v1"));
     let m = mail("desk@example.gr", "VIRAL ΓΙΑ ΕΥΗ", "https://www.youtube.com/watch?v=as0200");
     let without = omni_email::assist::interpret(&m, &desk_roster(), &[], &ParserConfig::default(), None).await;
-    assert_eq!((without.journalist.surname.as_str(), without.journalist.how), ("MCR", Resolution::Sender));
+    // The desk passes mail on and is never the journalist: a desk mail that
+    // names nobody the parser can place is unresolved, not "MCR by sender".
+    assert_eq!((without.journalist.surname.as_str(), without.journalist.how), ("MCR", Resolution::Unresolved));
 
     let p = run_with(&a, &m, &desk_roster()).await;
     assert_eq!((p.journalist.surname.as_str(), p.journalist.how), ("STAVRAKI", Resolution::LlmAssist));
-    // No unresolved penalty was taken, so none is given back.
-    assert_eq!(jobs(&p)[0]["confidence"], jobs(&without)[0]["confidence"]);
+    // The unresolved penalty is given back once the model placed the journalist.
+    assert_eq!(jobs(&without)[0]["confidence"], 0.75);
+    assert_eq!(jobs(&p)[0]["confidence"], 0.95);
 
     // The model saw the aliases, which is how "Εύη" can be matched.
     let prompt = mock.lock().unwrap().requests[0]["messages"][1]["content"].as_str().unwrap().to_string();
