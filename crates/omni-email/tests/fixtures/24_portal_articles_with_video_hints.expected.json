@@ -1,7 +1,5 @@
 {
-  "ignored_urls": [
-    "https://www.example-festival.gr/programma"
-  ],
+  "ignored_urls": [],
   "journalist": {
     "how": "sender",
     "surname": "PAPADAKI"
@@ -38,12 +36,21 @@
       "jobs": [
         {
           "confidence": 0.8,
-          "index_str": "2",
+          "index_str": "2A",
           "keyword": "FESTIVALKRASIOU",
           "marker": false,
           "status": "PENDING",
           "tier": "tier2",
           "url": "https://www.iefimerida.gr/ellada/fixture2403-festival-krasioy"
+        },
+        {
+          "confidence": 0.4,
+          "index_str": "2B",
+          "keyword": "FESTIVALKRASIOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "other",
+          "url": "https://www.example-festival.gr/programma"
         }
       ],
       "keyword": "FESTIVALKRASIOU",

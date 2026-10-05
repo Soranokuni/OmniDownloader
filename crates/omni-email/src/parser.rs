@@ -880,6 +880,68 @@ fn host_matches(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
+/// Links in mail that are never a story page: a sender's own tools and
+/// references, not something to put on air.
+const NOT_STORY_HOSTS: &[&str] = &[
+    "maps.google.com",
+    "maps.app.goo.gl",
+    "docs.google.com",
+    "forms.gle",
+    "forms.office.com",
+    "calendar.google.com",
+    "meet.google.com",
+    "teams.microsoft.com",
+    "teams.live.com",
+    "zoom.us",
+    "linkedin.com",
+    "wikipedia.org",
+    "list-manage.com",
+];
+
+/// Social sites whose one-segment pages (`facebook.com/CreteTV`) are a
+/// profile, as signatures link them, not a post.
+const PROFILE_HOSTS: &[&str] = &["facebook.com", "instagram.com", "x.com", "twitter.com", "tiktok.com", "threads.net"];
+
+const DOCUMENT_EXTENSIONS: &[&str] =
+    &[".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".txt", ".rtf", ".ics", ".vcf", ".csv"];
+
+/// Whether a link to a site the parser does not know may be a story page,
+/// and so goes to the sniffer. Not: a site's front page (a signature's
+/// "www.example.gr"), a document, a social profile, maps, forms, meetings,
+/// encyclopaedia references.
+pub fn could_be_a_story(url: &str) -> bool {
+    let Ok(u) = Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = u.path().to_ascii_lowercase();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let front_page = match segments.as_slice() {
+        [] => true,
+        [only] => ["index.html", "index.htm", "index.php", "home", "el", "en", "gr", "default.aspx"].contains(only),
+        _ => false,
+    };
+    if front_page && u.query().is_none() {
+        return false;
+    }
+    if DOCUMENT_EXTENSIONS.iter().any(|e| path.ends_with(e)) {
+        return false;
+    }
+    if NOT_STORY_HOSTS.iter().any(|d| host_matches(&host, d))
+        || (host_matches(&host, "google.com") && path.starts_with("/maps"))
+        || (host_matches(&host, "goo.gl") && path.starts_with("/maps"))
+    {
+        return false;
+    }
+    if PROFILE_HOSTS.iter().any(|d| host_matches(&host, d)) && segments.len() <= 1 && u.query().is_none() {
+        return false;
+    }
+    true
+}
+
 const LOCKER_DOMAINS: &[&str] = &[
     "wetransfer.com",
     "we.tl",
@@ -1345,10 +1407,11 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
 
         // Video platforms *and* news portals are queued: journalists send
         // article links so the video embedded in the page is downloaded
-        // (owner, plan P4.24). An unknown site is queued only when a section
-        // has neither. A "ΓΙΑ ΠΛΑΝΑ:" marker still narrows to what it marks.
+        // (owner, plan P4.24), and so is a site we do not know (owner,
+        // 2026-10-05): the sniffer tries it as it would a portal, and a page
+        // without a video goes to review instead of being dropped unseen.
+        // A "ΓΙΑ ΠΛΑΝΑ:" marker still narrows to what it marks.
         let any_marked = candidates.iter().any(|(_, t, m)| *m && !matches!(t, Tier::Locker | Tier::Image));
-        let has_media = candidates.iter().any(|(_, t, _)| matches!(t, Tier::Tier1 | Tier::Tier2));
 
         let mut selected: Vec<(String, Tier, bool)> = Vec::new();
         for (u, tier, m) in candidates {
@@ -1357,11 +1420,9 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 Tier::Image => false,
                 _ if any_marked => m,
                 Tier::Tier1 | Tier::Tier2 => true,
-                // A site we do not know, but the journalist said "+ ΠΛΑΝΑ":
-                // the sniffer tries it, as it would a portal (bovary.gr,
-                // 2026-10-05, was dropped next to the portal links).
+                // The journalist said it is video ("+ ΠΛΑΝΑ"): always tried.
                 _ if video_hinted.contains(&u) => true,
-                _ => !has_media,
+                _ => could_be_a_story(&u),
             };
             if tier == Tier::Image {
                 images += 1;
@@ -1599,6 +1660,52 @@ mod tests {
         // they quote.
         let m = mail("Πρ: VIRAL", "a.papadaki@example.gr", &format!("From: Giorgos Nikolaou <g.nikolaou@example.gr>\nSent: Wednesday\n{link}"));
         assert_eq!(resolved(&m, &desk_roster()), ("PAPADAKI".into(), Resolution::Sender));
+    }
+
+    /// Owner, 2026-10-05: a news site that is not on the portal list is still
+    /// downloaded, next to known links too; only links that cannot be a
+    /// story page are left out.
+    #[test]
+    fn links_to_unknown_sites_are_queued_unless_they_cannot_be_a_story() {
+        for story in [
+            "https://www.bovary.gr/people-and-style/glam-stars/tzoni-ntep-entyposiaki-metamorfosi",
+            "https://www.example-news.gr/article.php?id=4411",
+            "https://www.facebook.com/permalink.php?story_fbid=1&id=2",
+            "https://t.me/somechannel/1234",
+        ] {
+            assert!(could_be_a_story(story), "{story}");
+        }
+        for not in [
+            "https://www.example.gr/",
+            "https://www.example.gr/index.html",
+            "https://www.example.gr/el/",
+            "https://www.example.org/press/deltio.pdf",
+            "https://www.facebook.com/CreteTV",
+            "https://www.instagram.com/cretetv/",
+            "https://el.wikipedia.org/wiki/Σητεία",
+            "https://www.google.com/maps/place/Heraklion",
+            "https://maps.app.goo.gl/abc123",
+            "https://teams.microsoft.com/l/meetup-join/19%3a",
+            "https://docs.google.com/document/d/1/edit",
+            "mailto:desk@example.gr",
+        ] {
+            assert!(!could_be_a_story(not), "{not}");
+        }
+
+        // In the mail: a known video link and an unknown portal in one
+        // section, plus a signature front page.
+        let body = "ΣΕΙΣΜΟΣ ΣΤΗΝ ΚΡΗΤΗ\nhttps://www.youtube.com/watch?v=abcdefghijk\nhttps://www.example-news.gr/kriti/seismos-4-2-rihter\n\nwww.example.gr";
+        let m = mail("ΣΕΙΣΜΟΣ", "a.papadaki@example.gr", body);
+        let p = parse(&m, &roster(), &ParserConfig::default());
+        let queued: Vec<(&str, JobStatus)> = p.jobs().map(|j| (j.url.as_str(), j.status)).collect();
+        assert_eq!(
+            queued,
+            vec![
+                ("https://www.youtube.com/watch?v=abcdefghijk", JobStatus::Pending),
+                ("https://www.example-news.gr/kriti/seismos-4-2-rihter", JobStatus::Pending),
+            ]
+        );
+        assert_eq!(p.ignored_urls, vec!["https://www.example.gr".to_string()]);
     }
 
     /// Outlook's text part, 2026-10-05: the signature logo's "[cid:…]" was
