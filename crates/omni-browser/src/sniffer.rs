@@ -360,6 +360,39 @@ impl StreamSniffer {
                     if (t.getAttribute('cite')) found.push({ type: 'tiktok', url: t.getAttribute('cite') });
                 }
 
+                // 10b. Instagram posts: the official blockquote, or the
+                // embed iframe once it has loaded.
+                const igCanon = (u) => {
+                    const m = (u || '').match(/instagram\.com\/(p|reels?|tv)\/([A-Za-z0-9_-]+)/i);
+                    if (!m) return null;
+                    const kind = m[1].toLowerCase() === 'p' ? 'p' : (m[1].toLowerCase() === 'tv' ? 'tv' : 'reel');
+                    return `https://www.instagram.com/${kind}/${m[2]}/`;
+                };
+                const igNodes = Array.from(document.querySelectorAll(
+                    'blockquote.instagram-media, [data-instgrm-permalink], iframe[src*="instagram.com/"], iframe[data-src*="instagram.com/"]'
+                ));
+                for (const n of igNodes) {
+                    const u = igCanon(n.getAttribute('data-instgrm-permalink') || getSrc(n) || (n.querySelector('a') || {}).href);
+                    if (u) found.push({ type: 'instagram', url: u });
+                }
+
+                // 10c. Streamable players.
+                for (const f of Array.from(document.querySelectorAll('iframe[src*="streamable.com"], iframe[data-src*="streamable.com"], iframe[data-lazy-src*="streamable.com"]'))) {
+                    const m = getSrc(f).match(/streamable\.com\/(?:e|o|s)\/([A-Za-z0-9]+)/i);
+                    if (m) found.push({ type: 'streamable', url: 'https://streamable.com/' + m[1] });
+                }
+
+                // 10d. A portal's own oEmbed proxy (iefimerida.gr:
+                // <iframe data-src="/oembed?url=https%3A%2F%2Fwww.instagram.com%2Freel%2F…">),
+                // lazy, so the post inside never loads in a headless visit.
+                for (const f of Array.from(document.querySelectorAll('iframe[src*="oembed"], iframe[data-src*="oembed"], iframe[data-lazy-src*="oembed"]'))) {
+                    let inner = null;
+                    try { inner = new URL(getSrc(f), location.href).searchParams.get('url'); } catch (e) {}
+                    if (!inner || !/^https?:\/\//i.test(inner)) continue;
+                    const ig = igCanon(inner);
+                    found.push({ type: 'oembed', url: ig || inner.replace(/[?&]utm_[^&#]*/g, '') });
+                }
+
                 // 11. Direct HTML5 <video> and <source> elements (In.gr, Star.gr, ERT)
                 const videoElements = Array.from(document.querySelectorAll('video, video source, source'));
                 for (const el of videoElements) {
