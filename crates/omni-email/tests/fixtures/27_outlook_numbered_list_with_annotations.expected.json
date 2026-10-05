@@ -1,0 +1,92 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "NIKOLAOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "1",
+          "keyword": "FIXTUREARTHRO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/kriti/2209001_fixture-arthro-proto"
+        }
+      ],
+      "keyword": null,
+      "title": null
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.9,
+          "index_str": "2",
+          "keyword": "FIXTUREARTHRO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/life/2209002_fixture-arthro-deytero"
+        }
+      ],
+      "keyword": null,
+      "title": null
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3",
+          "keyword": "CHORODIASCHOLEIOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/fixture.page/videos/2701/"
+        }
+      ],
+      "keyword": "CHORODIASCHOLEIOU",
+      "title": "Η χορωδία του σχολείου τραγούδησε στην πλατεία"
+    },
+    {
+      "index_str": "5",
+      "jobs": [
+        {
+          "confidence": 0.9,
+          "index_str": "5",
+          "keyword": "FIXTURETRAILER",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.iefimerida.gr/politismos/fixture-trailer-tainias"
+        }
+      ],
+      "keyword": null,
+      "title": null
+    },
+    {
+      "index_str": "6",
+      "jobs": [
+        {
+          "confidence": 0.4,
+          "index_str": "6",
+          "keyword": "FIXTURENEA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "other",
+          "url": "https://www.lifestyle-example.gr/people/fixture-nea-emfanisi"
+        }
+      ],
+      "keyword": null,
+      "title": null
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

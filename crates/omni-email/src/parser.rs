@@ -766,7 +766,13 @@ impl Line {
 
     /// The line with links and any marker removed, if it reads as a title.
     fn title_text(&self) -> Option<String> {
-        let no_urls = strip_urls(&self.text);
+        // "https://… + ΕΙΚΟΝΕΣ", "https://… + ΑΠΟΣΠΑΣΜΑ 2:28 - 3:30": after a
+        // link, a "+" starts what MCR should take from it, not the story.
+        let text = match find_urls(&self.text).last() {
+            Some((r, _)) if self.text[r.end..].trim_start().starts_with('+') => &self.text[..r.end],
+            _ => self.text.as_str(),
+        };
+        let no_urls = strip_urls(text);
         let no_marker = RE_MARKER_PREFIX.replace(&no_urls, "");
         let t = no_marker
             .trim()
@@ -943,6 +949,8 @@ const STOPWORDS: &[&str] = &[
     "STOUS", "STIS", "ME", "GIA", "APO", "NA", "POU", "SE", "OI", "ENA", "MIA", "ENAS", "META", "KATA",
     "PROS", "OTAN", "OTI", "OLA", "EDO", "EINAI", "THEMA", "THEMATA", "VINTEO", "PLANA", "DEITE", "DEITE",
     "MONTAZ", "EPIKAIROTITA", "EPIKAIROTHTA", "LINK", "LINKS", "SYNDESMOS",
+    // What to take from a link, not what it is about ("+ ΕΙΚΟΝΕΣ", "ΑΠΟΣΠΑΣΜΑ ΜΕΧΡΙ 1:25")
+    "EIKONES", "EIKONA", "FOTOGRAFIES", "FOTOGRAFIA", "FOTO", "APOSPASMA", "APOSPASMATA", "MECHRI", "PLANO",
     // English
     "THE", "OF", "AND", "FOR", "WITH", "FROM", "VIDEO", "VIDEOS", "WATCH", "HERE", "NEW",
     // URL noise
@@ -1245,10 +1253,15 @@ fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(St
 
 /// The body the parser reads: invisible characters, quoted replies and the
 /// signature removed, wrapped links joined, poison links stripped.
+static RE_CID_PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[cid:[^\]\s]+\]").unwrap());
+
 pub fn cleaned_body(mail: &InboundMail) -> String {
     // Zero-width and soft-hyphen characters come along when a link is copied
     // out of a chat app or a web page, and split the URL.
     let body = mail.readable_body().replace(INVISIBLE, "");
+    // Outlook's text part stands "[cid:…]" where an inline image (a
+    // signature logo) was; it became a section's title and keyword.
+    let body = RE_CID_PLACEHOLDER.replace_all(&body, "");
     let body = strip_quotes_and_signature(&body, is_forward(&mail.subject));
     let body = rejoin_wrapped_urls(&body);
     decontaminate_email_body(&body)
@@ -1344,6 +1357,10 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 Tier::Image => false,
                 _ if any_marked => m,
                 Tier::Tier1 | Tier::Tier2 => true,
+                // A site we do not know, but the journalist said "+ ΠΛΑΝΑ":
+                // the sniffer tries it, as it would a portal (bovary.gr,
+                // 2026-10-05, was dropped next to the portal links).
+                _ if video_hinted.contains(&u) => true,
                 _ => !has_media,
             };
             if tier == Tier::Image {
@@ -1582,6 +1599,19 @@ mod tests {
         // they quote.
         let m = mail("Πρ: VIRAL", "a.papadaki@example.gr", &format!("From: Giorgos Nikolaou <g.nikolaou@example.gr>\nSent: Wednesday\n{link}"));
         assert_eq!(resolved(&m, &desk_roster()), ("PAPADAKI".into(), Resolution::Sender));
+    }
+
+    /// Outlook's text part, 2026-10-05: the signature logo's "[cid:…]" was
+    /// the last section's title, and its keyword CID475509D3.
+    #[test]
+    fn an_inline_image_placeholder_is_not_a_title() {
+        let m = mail(
+            "VIRAL",
+            "a.papadaki@example.gr",
+            "1.\nhttps://www.youtube.com/watch?v=abcdefghijk\n2.\nhttps://www.youtube.com/watch?v=bbcdefghijk\n\n[cid:475509d3-01d5-480c-80b4-e49e9ce41fb5]\n",
+        );
+        let p = parse(&m, &roster(), &ParserConfig::default());
+        assert!(p.sections.iter().all(|s| s.title.is_none() && s.keyword.is_none()), "{:?}", p.sections);
     }
 
     /// Greek Outlook's "Στάλθηκε:" and "Κοιν.:" were not known as header
