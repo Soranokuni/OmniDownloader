@@ -206,6 +206,48 @@ static RE_CELLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</t[dh]\s*>
 /// a second, broken link.
 static RE_DISPLAY_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(https?://|www\.)?[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?[…]?$").unwrap());
+static RE_LIST_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?)(ol|ul|li)\b([^>]*)>").unwrap());
+static RE_OL_START: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bstart\s*=\s*["']?(\d{1,4})"#).unwrap());
+
+/// Write the numbers of `<ol>` items into the text, as a mail client shows
+/// them, honouring `start="5"`. Outlook sends a numbered story list as
+/// `<ol>`; without the numbers every item fell into one section and lost
+/// the index the journalist gave it (and the numbering restarts the plain
+/// text part shows after an interruption, "1. 2. 3. 4. … 1. 2. 3.", are not
+/// there in the HTML).
+fn number_ordered_lists(html: &str) -> String {
+    // (ordered, next number) per open list.
+    let mut stack: Vec<(bool, u32)> = Vec::new();
+    let mut out = String::with_capacity(html.len());
+    let mut last = 0;
+    for c in RE_LIST_TAGS.captures_iter(html) {
+        let m = c.get(0).unwrap();
+        out.push_str(&html[last..m.end()]);
+        last = m.end();
+        let closing = !c[1].is_empty();
+        match (c[2].to_ascii_lowercase().as_str(), closing) {
+            ("ol", false) => {
+                let start = RE_OL_START.captures(&c[3]).and_then(|s| s[1].parse().ok()).unwrap_or(1);
+                stack.push((true, start));
+            }
+            ("ul", false) => stack.push((false, 0)),
+            ("ol" | "ul", true) => {
+                stack.pop();
+            }
+            ("li", false) => {
+                if let Some((true, n)) = stack.last_mut() {
+                    out.push_str(&format!("{n}. "));
+                    *n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
 static RE_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").unwrap());
 static RE_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z]{2,8});").unwrap());
@@ -233,6 +275,7 @@ pub fn html_to_text(html: &str) -> String {
             format!("{inner_trimmed} {href}")
         }
     });
+    let s = number_ordered_lists(&s);
     let s = RE_CELLS.replace_all(&s, " ");
     let s = RE_BREAKS.replace_all(&s, "\n");
     let s = RE_TAGS.replace_all(&s, "");
@@ -282,6 +325,22 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outlook on the web, 2026-10-05: a story list in two `<ol>`s around an
+    /// unnumbered paragraph, the second continuing at 5.
+    #[test]
+    fn ordered_list_items_keep_their_numbers() {
+        let html = r#"<ol start="1" data-x="{&quot;a&quot;:1}"><li><div><a href="https://a.example/x">https://a.example/x</a> + ΕΙΚΟΝΕΣ</div></li>
+            <li><div>Τίτλος</div></li></ol><div><a href="https://b.example/y">https://b.example/y</a></div>
+            <ol start="5"><li><div>https://c.example/z + ΠΛΑΝΑ</div></li><li>έκτο<ul><li>κουκκίδα</li></ul></li></ol>"#;
+        let text = html_to_text(html);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["1.", "https://a.example/x + ΕΙΚΟΝΕΣ", "2.", "Τίτλος", "https://b.example/y", "5.", "https://c.example/z + ΠΛΑΝΑ", "6. έκτο", "κουκκίδα"],
+            "{text}"
+        );
+    }
 
     #[test]
     fn a_shortened_display_address_is_replaced_by_its_href() {
