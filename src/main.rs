@@ -1082,6 +1082,9 @@ async fn run_job(
                     Some(JobStage::Extract),
                     &format!("Sniffer found no stream: {sniff_err}"),
                 )?;
+                if let Err(previous) = std::mem::replace(&mut process_result, Ok(())) {
+                    process_result = Err(after_failed_sniff(previous, sniff_err));
+                }
             }
         }
     }
@@ -1145,6 +1148,23 @@ async fn run_job(
             }
             Ok(())
         }
+    }
+}
+
+/// The job's failure once the sniffer has also come back empty-handed.
+///
+/// A page the browser opened and found no video on is reported as that
+/// (NO_STREAM_FOUND): yt-dlp's "Unsupported URL" for a news article only
+/// means it has no extractor for the portal, which is why the sniffer ran,
+/// and told MCR to "try a direct video link" for an article that has none.
+/// A browser that never got that far leaves yt-dlp's failure standing.
+fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyhow::Error {
+    match sniff_err.downcast_ref::<omni_browser::BrowserError>() {
+        Some(omni_browser::BrowserError::NoStreamFound(_)) => {
+            anyhow::anyhow!("{}: no video found in the page", ErrorCode::NoStreamFound.as_str())
+                .context(ErrorCode::NoStreamFound.as_str())
+        }
+        _ => previous,
     }
 }
 
@@ -1437,4 +1457,22 @@ async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, ke
         }
     }
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// neakriti.gr article without a video (2026-10-05): the card said
+    /// UNSUPPORTED_URL, "try a direct video link".
+    #[test]
+    fn a_page_without_a_video_is_reported_as_no_stream_not_unsupported() {
+        let yt_dlp = || anyhow::anyhow!("ERROR: Unsupported URL: https://www.neakriti.gr/x").context(ErrorCode::UnsupportedUrl.as_str());
+
+        let empty = anyhow::Error::from(omni_browser::BrowserError::NoStreamFound("https://www.neakriti.gr/x".into()));
+        assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), empty)), ErrorCode::NoStreamFound);
+
+        let no_browser = anyhow::Error::from(omni_browser::BrowserError::LaunchFailed("no Chrome".into()));
+        assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), no_browser)), ErrorCode::UnsupportedUrl);
+    }
 }
