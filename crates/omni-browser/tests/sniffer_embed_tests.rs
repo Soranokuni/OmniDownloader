@@ -99,3 +99,44 @@ async fn two_sniffs_at_once_both_run() {
     assert!(a.is_ok(), "first sniff: {:#}", a.unwrap_err());
     assert!(b.is_ok(), "second sniff: {:#}", b.unwrap_err());
 }
+
+/// iefimerida.gr, 2026-10-05: an Instagram reel behind the portal's own lazy
+/// oEmbed proxy, and Streamable players, were never found (ids invented).
+/// The official Instagram blockquote is covered too.
+const PROXIED_EMBEDS: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Άρθρο</title></head><body>
+<h1>Δοκιμαστικό άρθρο</h1>
+<iframe class="portal-embed lazyload" data-src="/oembed?url=https%3A%2F%2Fwww.instagram.com%2Freel%2FFixReel01%2F%3Futm_source%3Dig_embed%26amp%3Butm_campaign%3Dloading&amp;provider=default"></iframe>
+<figure><iframe class="lazyload" data-src="https://streamable.com/e/fix0001?"></iframe></figure>
+<figure><iframe class="lazyload" data-src="https://streamable.com/e/fix0002?"></iframe></figure>
+<blockquote class="instagram-media" data-instgrm-permalink="https://www.instagram.com/p/FixPost02/?utm_source=ig_embed"><a href="https://www.instagram.com/p/FixPost02/">post</a></blockquote>
+</body></html>"#;
+
+#[tokio::test]
+async fn proxied_instagram_and_streamable_embeds_are_found() {
+    if !browser_installed() {
+        eprintln!("WARNING: skipping sniffer embed test -- no Chrome/Edge installed");
+        return;
+    }
+    let adblock = tempfile::tempdir().unwrap();
+    UnifiedAdBlocker::init(adblock.path().to_path_buf());
+
+    let app = Router::new().route("/article", get(|| async { Html(PROXIED_EMBEDS) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let media = StreamSniffer::extract_media_bundle(&format!("http://{addr}/article"), 20)
+        .await
+        .expect("sniffer should find the embeds");
+    let mut found = media.all_streams.clone();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "https://streamable.com/fix0001",
+            "https://streamable.com/fix0002",
+            "https://www.instagram.com/p/FixPost02/",
+            "https://www.instagram.com/reel/FixReel01/",
+        ]
+    );
+}

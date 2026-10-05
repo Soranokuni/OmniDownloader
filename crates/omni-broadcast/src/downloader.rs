@@ -86,6 +86,7 @@ const VIDEO_PLATFORMS: &[&str] = &[
     "vimeo.com",
     "dailymotion.com",
     "dai.ly",
+    "streamable.com",
 ];
 
 /// Whether `url` is a page on a video platform (as opposed to a raw stream
@@ -142,6 +143,13 @@ impl Downloader {
             // A journalist's link often carries a playlist id; ingesting the
             // whole playlist would flood the watchfolder.
             "--no-playlist".into(),
+            // --no-playlist does not stop a news page that yt-dlp's generic
+            // extractor reads as a playlist of its embeds: an iefimerida.gr
+            // article with four Streamable videos downloaded all four into
+            // one job and delivered one of them. The page's other videos are
+            // queued as their own jobs (`page_videos`).
+            "--playlist-items".into(),
+            "1".into(),
             "--retries".into(),
             "5".into(),
             "--fragment-retries".into(),
@@ -277,6 +285,58 @@ impl Downloader {
     }
 }
 
+/// The videos yt-dlp sees on a page (`--flat-playlist -J`), in page order,
+/// when it reads the page as several; empty for a single video or anything
+/// else. Only http(s) entry URLs are kept, each once.
+pub fn parse_page_videos(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    if v.get("_type").and_then(|t| t.as_str()) != Some("playlist") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for e in v.get("entries").and_then(|e| e.as_array()).into_iter().flatten() {
+        let Some(u) = e.get("url").or_else(|| e.get("webpage_url")).and_then(|u| u.as_str()) else {
+            continue;
+        };
+        if !(u.starts_with("https://") || u.starts_with("http://")) {
+            continue;
+        }
+        let u = canonical_streamable(u).unwrap_or_else(|| u.to_string());
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+/// `https://streamable.com/ID` for the player forms (`/e/ID`, `/o/ID`,
+/// `/s/ID`), the form the sniffer reports too, so one video found by both
+/// is one job.
+pub fn canonical_streamable(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = rest.strip_prefix("streamable.com/")?;
+    let mut parts = path.split(['/', '?', '#']).filter(|p| !p.is_empty());
+    let first = parts.next()?;
+    let id = if matches!(first, "e" | "o" | "s") { parts.next()? } else { first };
+    id.chars().all(|c| c.is_ascii_alphanumeric()).then(|| format!("https://streamable.com/{id}"))
+}
+
+impl Downloader {
+    /// The videos on a news page, when yt-dlp reads it as several (see
+    /// [`parse_page_videos`]). A failure is no videos: the download that
+    /// follows reports it properly.
+    pub async fn page_videos(&self, url: &str, timeout: Duration) -> Vec<String> {
+        let args = ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30", url];
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_page_videos(&o.stdout),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// `downloaded total speed eta`, with `NA` for values yt-dlp does not know yet.
 fn parse_progress(rest: &str) -> Option<DownloadProgress> {
     let f: Vec<&str> = rest.split_whitespace().collect();
@@ -408,6 +468,28 @@ mod tests {
         ] {
             assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
         }
+    }
+
+    /// iefimerida.gr, 2026-10-05: four Streamable embeds read as a generic
+    /// playlist; one job downloaded all four.
+    #[test]
+    fn only_the_first_video_of_a_page_is_downloaded_into_a_job() {
+        let args = args_for(&DownloadOpts::default());
+        let i = args.iter().position(|a| a == "--playlist-items").expect("--playlist-items");
+        assert_eq!(args[i + 1], "1");
+    }
+
+    #[test]
+    fn a_page_read_as_several_videos_lists_them_in_order() {
+        let json = r#"{"_type": "playlist", "extractor": "generic", "entries": [
+            {"_type": "url", "url": "https://streamable.com/e/531cym", "ie_key": "Streamable"},
+            {"_type": "url", "url": "https://streamable.com/e/k98n7n", "ie_key": "Streamable"},
+            {"_type": "url", "url": "https://streamable.com/e/531cym", "ie_key": "Streamable"},
+            {"_type": "url", "url": "javascript:void(0)"}]}"#;
+        assert_eq!(parse_page_videos(json), vec!["https://streamable.com/531cym", "https://streamable.com/k98n7n"]);
+        assert!(parse_page_videos(r#"{"_type": "video", "id": "x", "webpage_url": "https://a/b"}"#).is_empty());
+        assert!(parse_page_videos("ERROR: Unsupported URL").is_empty());
+        assert!(is_video_platform("https://streamable.com/e/531cym"));
     }
 
     #[test]

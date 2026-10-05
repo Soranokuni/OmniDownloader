@@ -43,6 +43,14 @@ impl BroadcastEngine {
         }
     }
 
+    /// The videos yt-dlp sees on a news page that holds several, in page
+    /// order; empty otherwise. See [`crate::downloader::parse_page_videos`].
+    pub async fn page_videos(&self, url: &str) -> Vec<String> {
+        crate::downloader::Downloader::new(&self.ytdl_path)
+            .page_videos(url, std::time::Duration::from_secs(90))
+            .await
+    }
+
     pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
         self.process_job_with_context(job, owner, None, None, None).await
     }

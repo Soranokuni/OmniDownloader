@@ -982,7 +982,7 @@ pub fn classify(url: &str, cfg: &ParserConfig) -> Tier {
     } else if host_matches(&host, "x.com") || host_matches(&host, "twitter.com") {
         path.contains("/status/")
     } else {
-        ["vimeo.com", "dailymotion.com", "dai.ly"].iter().any(|d| host_matches(&host, d))
+        ["vimeo.com", "dailymotion.com", "dai.ly", "streamable.com"].iter().any(|d| host_matches(&host, d))
     };
     if tier1 {
         return Tier::Tier1;

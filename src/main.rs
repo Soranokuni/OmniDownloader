@@ -1030,7 +1030,32 @@ async fn run_job(
     }
 
     repo.set_stage(job_id, owner, JobStage::Download)?;
-    let mut process_result = engine.process_job(job.clone(), owner).await;
+
+    // A news page yt-dlp reads as several videos (an article with four
+    // Streamable embeds): this job takes the first, the others become
+    // sibling jobs or offers, as when the sniffer finds them. Before, all
+    // were downloaded into this job and one was delivered.
+    let mut job = job;
+    let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
+    let mut page_referer: Option<String> = None;
+    if is_web && !omni_broadcast::downloader::is_video_platform(&orig_url) {
+        let videos = engine.page_videos(&orig_url).await;
+        if videos.len() > 1 {
+            info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
+            repo.record_event(
+                job_id,
+                "INFO",
+                Some(JobStage::Extract),
+                &format!("The page holds {} videos; this job downloads the first: {}", videos.len(), videos[0]),
+            )?;
+            omni_broadcast::article::queue_article_siblings(repo, owner, &mut job, &videos[0], &videos);
+            job.url = videos[0].clone();
+            page_referer = Some(orig_url.clone());
+        }
+    }
+    let mut process_result = engine
+        .process_job_with_context(job.clone(), owner, page_referer.as_deref(), None, None)
+        .await;
 
     // yt-dlp could not resolve the page. For a news portal that is expected:
     // the video is behind an embedded player, so sniff the actual stream and
