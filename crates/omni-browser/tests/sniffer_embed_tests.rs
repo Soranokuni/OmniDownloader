@@ -140,3 +140,18 @@ async fn proxied_instagram_and_streamable_embeds_are_found() {
         ]
     );
 }
+
+/// The daily browser check (plan P6.7) passes on a working browser and says
+/// which one it drove.
+#[tokio::test]
+async fn the_browser_self_test_finds_its_test_video() {
+    if !browser_installed() {
+        eprintln!("WARNING: skipping browser self-test -- no Chrome/Edge installed");
+        return;
+    }
+    let adblock = tempfile::tempdir().unwrap();
+    UnifiedAdBlocker::init(adblock.path().to_path_buf());
+    let version = StreamSniffer::self_test().await.expect("self-test");
+    assert!(version.contains("Chrome/") || version.contains("Edg"), "{version}");
+    assert!(!version.contains("Headless"), "{version}");
+}

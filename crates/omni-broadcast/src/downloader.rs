@@ -324,7 +324,46 @@ pub fn canonical_streamable(url: &str) -> Option<String> {
     id.chars().all(|c| c.is_ascii_alphanumeric()).then(|| format!("https://streamable.com/{id}"))
 }
 
+/// What a probe of a link found: the extractor and the video id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probed {
+    pub extractor: String,
+    pub id: String,
+}
+
+/// `--print "%(extractor)s %(id)s"` output: the first non-empty line.
+pub fn parse_probe_line(stdout: &str) -> Option<Probed> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (extractor, id) = line.split_once(' ')?;
+    let id = id.trim();
+    (!extractor.is_empty() && !id.is_empty() && id != "NA").then(|| Probed { extractor: extractor.to_string(), id: id.to_string() })
+}
+
 impl Downloader {
+    /// Whether yt-dlp can still get the video at `url`, without downloading
+    /// it (`--simulate`: the page is read and the formats are chosen). The
+    /// self-check (plan P6.7) uses this. `Err` is the one-line reason.
+    pub async fn probe(&self, url: &str, timeout: Duration) -> std::result::Result<Probed, String> {
+        let args = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "30",
+            "--print",
+            "%(extractor)s %(id)s",
+            url,
+        ];
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
+            Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
+            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
+        }
+    }
+
     /// The videos on a news page, when yt-dlp reads it as several (see
     /// [`parse_page_videos`]). A failure is no videos: the download that
     /// follows reports it properly.
@@ -477,6 +516,16 @@ mod tests {
         let args = args_for(&DownloadOpts::default());
         let i = args.iter().position(|a| a == "--playlist-items").expect("--playlist-items");
         assert_eq!(args[i + 1], "1");
+    }
+
+    #[test]
+    fn a_probe_reads_the_extractor_and_the_id() {
+        assert_eq!(
+            parse_probe_line("\nInstagram Dd615LBN4QM\n"),
+            Some(Probed { extractor: "Instagram".into(), id: "Dd615LBN4QM".into() })
+        );
+        assert_eq!(parse_probe_line("generic NA"), None);
+        assert_eq!(parse_probe_line(""), None);
     }
 
     #[test]

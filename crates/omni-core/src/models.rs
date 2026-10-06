@@ -400,6 +400,23 @@ impl Enqueued {
     }
 }
 
+/// A link the nightly self-check tries (plan P6.7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfcheckLink {
+    pub id: i64,
+    /// What it stands for, for a person: "Instagram reel".
+    pub label: String,
+    pub url: String,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    /// `None` until first checked.
+    pub last_ok: Option<bool>,
+    /// The video found, or why none was.
+    pub last_detail: Option<String>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    /// Set when it started failing; cleared when it works again.
+    pub failing_since: Option<DateTime<Utc>>,
+}
+
 /// One row of `processed_mail` (plan P4.2, defect E-07).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessedMail {

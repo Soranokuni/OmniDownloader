@@ -1252,6 +1252,67 @@ pub async fn api_admin_run_task(
 }
 
 // ==========================================
+// Self-check (plan P6.7)
+// ==========================================
+
+/// The self-check links with their last results, and the browser's state.
+pub async fn api_admin_selfcheck(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let links = state
+        .repo
+        .list_selfcheck_links()
+        .map_err(internal_error("Could not read the self-check links."))?;
+    let checks = state.health.all();
+    Ok(Json(serde_json::json!({
+        "links": links,
+        "summary": checks.get(omni_core::health::checks::SELFCHECK),
+        "browser": checks.get(omni_core::health::checks::BROWSER),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct SelfcheckLinkPayload {
+    label: String,
+    url: String,
+}
+
+pub async fn api_admin_selfcheck_add(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<SelfcheckLinkPayload>,
+) -> JsonResult {
+    let url = payload.url.trim();
+    let label: String = payload.label.trim().chars().take(80).collect();
+    if !is_submittable_url(url) {
+        return Err(ApiError::bad_request("Enter an http:// or https:// link."));
+    }
+    if label.is_empty() {
+        return Err(ApiError::bad_request("Give the link a name, such as \"Instagram reel\"."));
+    }
+    let id = state
+        .repo
+        .add_selfcheck_link(&label, url)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("{} added self-check link {label}: {url}", admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok", "id": id })))
+}
+
+pub async fn api_admin_selfcheck_delete(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let removed = state
+        .repo
+        .delete_selfcheck_link(id)
+        .map_err(internal_error("Could not remove the link."))?;
+    if !removed {
+        return Err(ApiError::not_found());
+    }
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("{} removed self-check link #{id}", admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
 // Secrets API (plan P2.6)
 // ==========================================
 

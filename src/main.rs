@@ -24,6 +24,8 @@ use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
+mod selfcheck;
+
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
 #[command(author = "Alex Fountas <afountas@cretetv.gr>")]
@@ -58,6 +60,9 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Check the browser and every self-check link now, and print the
+    /// results (the same check that runs every morning; nothing is downloaded)
+    Selfcheck,
     /// Test headless browser stream sniffing on a target URL
     BrowserTest {
         /// URL to navigate and extract video stream from
@@ -335,6 +340,28 @@ async fn main() -> Result<()> {
                 ServiceAction::Status => omni_cli::ServiceSubcommand::Status,
             };
             omni_cli::handle_service_command(sub)?;
+        }
+        Some(Commands::Selfcheck) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let health = HealthState::new();
+            let ytdl = DependencyManager::new(&paths.bin).ytdl_live();
+            println!("Checking the browser…");
+            selfcheck::check_browser(&health).await;
+            if let Some(c) = health.get(omni_core::health::checks::BROWSER) {
+                println!("  {} {}", if c.state == omni_core::health::Health::Ok { "✓" } else { "✗" }, c.detail.unwrap_or_default());
+            }
+            let links = repo.list_selfcheck_links()?;
+            println!("Checking {} link(s); each takes a few seconds…", links.len());
+            let mut failing = 0;
+            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, &links).await {
+                if !outcome.ok {
+                    failing += 1;
+                }
+                println!("  {} {:<32} {}", if outcome.ok { "✓" } else { "✗" }, link.label, outcome.detail);
+            }
+            println!("{} of {} links work.", links.len() - failing, links.len());
         }
         Some(Commands::BrowserTest { url }) => {
             println!("Testing stream sniffer on URL: {}", url);
@@ -622,6 +649,16 @@ async fn run_daemon(
         }
     }
 
+    // The self-check's last results, and a browser launch in the background:
+    // a broken browser is reported now, not when the first article fails.
+    selfcheck::refresh_health(&repo, &health);
+    {
+        let health = health.clone();
+        tokio::spawn(async move {
+            selfcheck::check_browser(&health).await;
+        });
+    }
+
     match health.overall() {
         omni_core::health::Health::Ok => info!("Start-up self-test passed"),
         verdict => {
@@ -738,6 +775,7 @@ async fn run_daemon(
             adblock_enabled: config.adblock_auto_update_nightly,
             gate: update_gate.clone(),
             retention_days: config.retention_days.max(1),
+            health: health.clone(),
         };
 
         tokio::spawn(async move {
@@ -1252,6 +1290,23 @@ async fn nightly_ytdl_update(
         }
     };
 
+    // A build the self-check already rolled back is not tried again every
+    // night; the next release is.
+    let rejected_marker = dep_mgr.get_bin_dir().join("yt-dlp.exe.rejected");
+    let rejected = std::fs::read_to_string(&rejected_marker).unwrap_or_default();
+    if rejected.trim() == staged.sha256 {
+        let _ = std::fs::remove_file(&staged.path);
+        info!("yt-dlp update skipped: this build was rolled back before");
+        return TaskOutcome::Skipped;
+    }
+    // Live and also the release: nothing to do. (The download is still made,
+    // to know; it is a few seconds at 03:00.)
+    if sha256_of_file(&dep_mgr.ytdl_live()).as_deref() == Some(staged.sha256.as_str()) {
+        let _ = std::fs::remove_file(&staged.path);
+        info!("yt-dlp is already the latest release");
+        return TaskOutcome::Ok;
+    }
+
     // Up to ten minutes for in-flight downloads. Longer than any sane clip and
     // shorter than the gap to the next bulletin.
     if !gate.pause_and_drain(Duration::from_secs(600)).await {
@@ -1268,30 +1323,94 @@ async fn nightly_ytdl_update(
     }
 
     let outcome = dep_mgr.apply_staged_ytdl();
-    // Resume before reporting, so a logging failure cannot leave the queue
-    // paused.
-    gate.resume();
+    let installed = match outcome {
+        Ok(path) => path,
+        Err(e) => {
+            gate.resume();
+            warn!("Nightly yt-dlp update failed to install: {e:#}");
+            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+            return TaskOutcome::Failed;
+        }
+    };
 
-    match outcome {
-        Ok(path) => {
-            info!("Nightly yt-dlp updated to {:?}", path);
+    // Is the new build at least as good as the old one (plan P6.7)? The
+    // links that worked before the update are checked again, with downloads
+    // still paused. A link the new build fails and the old one passes means
+    // the release broke it: the old build goes back and this one is marked
+    // rejected. A link both fail is the site, not the update.
+    let verdict = verify_ytdl_update(dep_mgr, &installed, repo).await;
+    gate.resume();
+    match verdict {
+        UpdateVerdict::Kept { checked } => {
+            info!("Nightly yt-dlp updated to {:?} ({checked} self-check link(s) still work)", installed);
             let _ = repo.log_audit(
                 "INFO",
                 "SYSTEM",
                 &format!(
-                    "yt-dlp updated ({} channel, sha256 {}); previous build kept for rollback",
+                    "yt-dlp updated ({} channel, sha256 {}); {checked} self-check link(s) still work; previous build kept for rollback",
                     channel,
                     &staged.sha256[..16]
                 ),
             );
             TaskOutcome::Ok
         }
-        Err(e) => {
-            warn!("Nightly yt-dlp update failed to install: {e:#}");
-            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+        UpdateVerdict::RolledBack { broken } => {
+            let _ = std::fs::write(&rejected_marker, &staged.sha256);
+            warn!("yt-dlp update rolled back: it broke {}", broken.join(", "));
+            let _ = repo.log_audit(
+                "ERROR",
+                "SYSTEM",
+                &format!(
+                    "yt-dlp update rolled back automatically: the new build could not get {} while the previous one could. The previous build is in use; the next release will be tried.",
+                    broken.join(", ")
+                ),
+            );
             TaskOutcome::Failed
         }
     }
+}
+
+enum UpdateVerdict {
+    Kept { checked: usize },
+    RolledBack { broken: Vec<String> },
+}
+
+async fn verify_ytdl_update(dep_mgr: &DependencyManager, live: &std::path::Path, repo: &Repository) -> UpdateVerdict {
+    let worked: Vec<omni_core::models::SelfcheckLink> = repo
+        .list_selfcheck_links()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l.last_ok == Some(true))
+        .collect();
+    let results = selfcheck::check_and_record(repo, live, &worked).await;
+    let failed: Vec<omni_core::models::SelfcheckLink> =
+        results.into_iter().filter(|(_, o)| !o.ok).map(|(l, _)| l).collect();
+    if failed.is_empty() {
+        return UpdateVerdict::Kept { checked: worked.len() };
+    }
+
+    if let Err(e) = dep_mgr.rollback_ytdl() {
+        warn!("yt-dlp verification: could not put the previous build back to compare: {e:#}");
+        return UpdateVerdict::Kept { checked: worked.len() };
+    }
+    let with_old = selfcheck::check_and_record(repo, live, &failed).await;
+    let broken: Vec<String> = with_old.iter().filter(|(_, o)| o.ok).map(|(l, _)| l.label.clone()).collect();
+    if broken.is_empty() {
+        // Both builds fail those links: the sites changed or the network is
+        // down. The newer build is the better bet for a fix; put it back.
+        if let Err(e) = dep_mgr.rollback_ytdl() {
+            warn!("yt-dlp verification: could not reinstate the new build: {e:#}");
+        }
+        // Record what the build that stays in place sees.
+        selfcheck::check_and_record(repo, live, &failed).await;
+        return UpdateVerdict::Kept { checked: worked.len() };
+    }
+    UpdateVerdict::RolledBack { broken }
+}
+
+fn sha256_of_file(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(omni_core::dependencies::sha256_hex(&bytes))
 }
 
 /// Everything the maintenance tasks need, gathered once at start-up.
@@ -1303,6 +1422,7 @@ struct MaintenanceContext {
     adblock_enabled: bool,
     gate: UpdateGate,
     retention_days: i64,
+    health: HealthState,
 }
 
 /// Run whatever is due, recording the outcome of each (plan P6.6).
@@ -1383,7 +1503,18 @@ async fn run_one_task(
                 return Ok(TaskOutcome::Skipped);
             }
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
-            Ok(nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await)
+            let outcome = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
+            selfcheck::refresh_health(repo, &ctx.health);
+            Ok(outcome)
+        }
+
+        "selfcheck" => {
+            let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
+            let failing = selfcheck::run(repo, &ytdl, &ctx.health).await?;
+            if failing > 0 {
+                anyhow::bail!("{failing} self-check link(s) not working; see Administration → Self-check");
+            }
+            Ok(TaskOutcome::Ok)
         }
 
         "adblock_update" => {

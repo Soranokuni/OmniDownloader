@@ -169,6 +169,14 @@ pub fn default_tasks() -> Vec<TaskSpec> {
             jitter: Duration::ZERO,
         },
         TaskSpec {
+            name: "selfcheck",
+            description: "Check that the browser works and that a video can still be found at each self-check link",
+            // After the yt-dlp update (03:00-03:20) and the blocklists, so it
+            // checks what the newsroom will use that day.
+            cadence: Cadence::DailyAt { hour: 5, minute: 15 },
+            jitter: Duration::ZERO,
+        },
+        TaskSpec {
             name: "vacuum",
             description: "Compact the database",
             cadence: Cadence::EveryNDaysAt {

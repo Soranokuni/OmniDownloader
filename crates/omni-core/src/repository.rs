@@ -1917,6 +1917,75 @@ impl Repository {
     }
 
     /// The newest handled mail first, for the admin panel and `mail-history`.
+    // ------------------------------------------------------------------
+    // Self-check links (plan P6.7)
+    // ------------------------------------------------------------------
+
+    pub fn list_selfcheck_links(&self) -> Result<Vec<crate::models::SelfcheckLink>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM selfcheck_links ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::SelfcheckLink {
+                id: row.get("id")?,
+                label: row.get("label")?,
+                url: row.get("url")?,
+                last_checked_at: timestamps::parse_opt(row.get("last_checked_at").ok()),
+                last_ok: row.get::<_, Option<i64>>("last_ok")?.map(|v| v != 0),
+                last_detail: row.get("last_detail")?,
+                last_ok_at: timestamps::parse_opt(row.get("last_ok_at").ok()),
+                failing_since: timestamps::parse_opt(row.get("failing_since").ok()),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Add a link to the self-check. A link already there is an error, so an
+    /// operator is told rather than seeing nothing happen.
+    pub fn add_selfcheck_link(&self, label: &str, url: &str) -> Result<i64> {
+        let conn = self.pool.get()?;
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM selfcheck_links WHERE url = ?", params![url], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if exists {
+            anyhow::bail!("That link is already in the self-check.");
+        }
+        conn.execute("INSERT INTO selfcheck_links (label, url) VALUES (?, ?)", params![label, url])?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_selfcheck_link(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("DELETE FROM selfcheck_links WHERE id = ?", params![id])? > 0)
+    }
+
+    /// Store one link's result. Returns the previous `last_ok`, so the caller
+    /// can tell a link that just broke (or just recovered) from one that has
+    /// been failing for a week.
+    pub fn record_selfcheck_result(&self, id: i64, ok: bool, detail: &str) -> Result<Option<bool>> {
+        let conn = self.pool.get()?;
+        let previous: Option<Option<i64>> = conn
+            .query_row("SELECT last_ok FROM selfcheck_links WHERE id = ?", params![id], |r| r.get(0))
+            .optional()?;
+        let now = timestamps::now_string();
+        conn.execute(
+            r#"
+            UPDATE selfcheck_links
+            SET last_checked_at = ?1,
+                last_ok = ?2,
+                last_detail = ?3,
+                last_ok_at = CASE WHEN ?2 = 1 THEN ?1 ELSE last_ok_at END,
+                failing_since = CASE
+                    WHEN ?2 = 1 THEN NULL
+                    WHEN failing_since IS NULL THEN ?1
+                    ELSE failing_since END
+            WHERE id = ?4
+            "#,
+            params![now, ok as i64, detail, id],
+        )?;
+        Ok(previous.flatten().map(|v| v != 0))
+    }
+
     pub fn list_processed_mail(&self, limit: i64) -> Result<Vec<ProcessedMail>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT * FROM processed_mail ORDER BY processed_at DESC LIMIT ?")?;

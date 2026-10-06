@@ -328,6 +328,97 @@ async function runTask(name) {
 document.getElementById('maintenance-refresh').addEventListener('click', loadMaintenance);
 
 /* ------------------------------------------------------------------ *
+ * Self-check (plan P6.7)
+ * ------------------------------------------------------------------ */
+
+const CHECK_CLASS = { ok: 'ok', degraded: 'warn', down: 'bad' };
+
+function checkLine(title, check) {
+  if (!check) return el('div', { class: 'spec-row' }, el('span', {}, title), el('span', { class: 'note' }, 'not checked yet'));
+  return el('div', { class: 'spec-row' },
+    el('span', {}, title),
+    el('span', {},
+      el('span', { class: `badge ${CHECK_CLASS[check.state] ?? ''}`, style: 'margin-right:8px' }, check.state === 'ok' ? 'OK' : 'Problem'),
+      check.detail || ''),
+  );
+}
+
+async function loadSelfcheck() {
+  let data;
+  try {
+    data = await api('/api/admin/selfcheck');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  render('selfcheck-summary',
+    checkLine('Browser (for news articles)', data.browser),
+    checkLine('Links', data.summary),
+  );
+  const links = data.links || [];
+  if (links.length === 0) {
+    render('selfcheck-body', el('tr', {}, el('td', { colspan: '5', class: 'empty' }, 'No links. Add one below.')));
+    return;
+  }
+  render('selfcheck-body', links.map((link) => el('tr', {},
+    el('td', {},
+      el('div', { class: 'strong' }, link.label),
+      el('a', { class: 'note mono', href: link.url, target: '_blank', rel: 'noopener noreferrer' }, link.url),
+    ),
+    el('td', {},
+      link.last_ok === null || link.last_ok === undefined
+        ? el('span', { class: 'note' }, 'not checked yet')
+        : link.last_ok
+          ? el('span', { class: 'badge ok' }, 'Works')
+          : el('span', { class: 'badge bad', title: link.last_detail || '' },
+              `Not working since ${fmtTime(link.failing_since)}`),
+    ),
+    el('td', { class: 'num' }, fmtTime(link.last_checked_at)),
+    el('td', { class: 'note' }, link.last_detail || ''),
+    el('td', { class: 'right' },
+      el('button', {
+        class: 'btn btn-icon btn-danger',
+        type: 'button',
+        title: `Remove ${link.label}`,
+        onClick: () => removeSelfcheckLink(link),
+      }, '✕'),
+    ),
+  )));
+}
+
+async function removeSelfcheckLink(link) {
+  if (!confirm(`Remove "${link.label}" from the self-check?`)) return;
+  try {
+    await api(`/api/admin/selfcheck/links/${link.id}/delete`, { method: 'POST' });
+    loadSelfcheck();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+document.getElementById('selfcheck-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    await api('/api/admin/selfcheck/links', {
+      method: 'POST',
+      body: {
+        label: document.getElementById('selfcheck-label').value,
+        url: document.getElementById('selfcheck-url').value,
+      },
+    });
+    toast('Link added. It is checked on the next run.', 'ok');
+    event.target.reset();
+    loadSelfcheck();
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
+document.getElementById('selfcheck-refresh').addEventListener('click', loadSelfcheck);
+document.getElementById('selfcheck-run').addEventListener('click', async () => {
+  try {
+    await api('/api/admin/maintenance/selfcheck/run', { method: 'POST' });
+    toast('The check starts within a minute and takes a few minutes. Press Refresh to see the results.', 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
+/* ------------------------------------------------------------------ *
  * Audit log
  * ------------------------------------------------------------------ */
 
@@ -816,6 +907,7 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 loadDependencies();
 loadSecrets();
 loadMaintenance();
+loadSelfcheck();
 loadUsers();
 loadTaxonomy();
 loadMail();
