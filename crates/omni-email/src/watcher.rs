@@ -564,6 +564,7 @@ impl EmailWatcher {
                 email_message_id: Some(mail_key(mail)),
                 extraction_method: method.map(String::from),
                 group_code: parsed.group.as_ref().map(|g| g.code.clone()),
+                max_videos: job.max_videos.map(i64::from),
             };
             let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
             match &result {

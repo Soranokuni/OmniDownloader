@@ -74,6 +74,21 @@ fn suffixer(index: &str) -> (bool, impl Fn(usize) -> String + '_) {
 /// journalist sent. Queueing them delivered one X video four times, under four
 /// names, for an article that held three different ones.
 pub fn plan_article_videos(page: &str, primary: &str, all: &[String], index: &str) -> ArticlePlan {
+    plan_article_videos_limited(page, primary, all, index, None)
+}
+
+/// [`plan_article_videos`] for a journalist who asked for only the first
+/// `max_videos` ("ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ", plan P4.33): this job is the
+/// first, the next `max_videos - 1` in page order are queued whatever
+/// kind they are (the journalist chose them), and the rest are offered to
+/// MCR rather than dropped, in case the count was off.
+pub fn plan_article_videos_limited(
+    page: &str,
+    primary: &str,
+    all: &[String],
+    index: &str,
+    max_videos: Option<usize>,
+) -> ArticlePlan {
     if is_video_platform(page) {
         return ArticlePlan { primary_index: index.to_string(), siblings: Vec::new(), offered: Vec::new() };
     }
@@ -85,9 +100,29 @@ pub fn plan_article_videos(page: &str, primary: &str, all: &[String], index: &st
             others.push(u.clone());
         }
     }
+    let (numeric, name) = suffixer(index);
+
+    if let Some(max) = max_videos {
+        let wanted = max.max(1) - 1;
+        let mut next = 1usize;
+        let mut siblings = Vec::new();
+        let mut offered = Vec::new();
+        for (i, url) in others.into_iter().enumerate() {
+            if i < wanted {
+                siblings.push((url, name(next)));
+            } else if offered.len() < MAX_OFFERED {
+                offered.push(Offered { url, index_str: name(next), queued_job_id: None });
+            } else {
+                break;
+            }
+            next += 1;
+        }
+        let primary_index = if !siblings.is_empty() && numeric { name(0) } else { index.to_string() };
+        return ArticlePlan { primary_index, siblings, offered };
+    }
+
     let (platform, raw): (Vec<String>, Vec<String>) = others.into_iter().partition(|u| is_video_platform(u));
 
-    let (numeric, name) = suffixer(index);
     // Position 0 is the primary when it is renamed; siblings follow.
     let mut next = 1usize;
     let mut siblings = Vec::new();
@@ -147,7 +182,19 @@ pub fn queue_article_siblings(
     primary: &str,
     all_streams: &[String],
 ) {
-    let plan = plan_article_videos(&job.url, primary, all_streams, &job.index_str);
+    let max = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
+    let plan = plan_article_videos_limited(&job.url, primary, all_streams, &job.index_str, max);
+    if let Some(n) = max {
+        let found = 1 + plan.siblings.len() + plan.offered.len();
+        if found > n {
+            let line = format!(
+                "The journalist asked for the first {n} video(s); {found} found. The other {} are offered to MCR.",
+                found - n
+            );
+            tracing::info!("Job #{}: {line}", job.id);
+            let _ = repo.record_event(job.id, "INFO", Some(omni_core::models::JobStage::Extract), &line);
+        }
+    }
     if plan.siblings.is_empty() && plan.offered.is_empty() {
         return;
     }
@@ -295,6 +342,34 @@ mod tests {
         assert_eq!(fresh, format!("Another video in this article queued as 1B (job #7): {X2}"));
         let again = sibling_event(X2, "1A2", &Enqueued::DuplicateActive { existing_id: 7 });
         assert!(!again.contains("queued as") && again.contains("job #7"), "{again}");
+    }
+
+    /// iefimerida.gr, 2026-10-05: "ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ" on an article with
+    /// four Streamable videos. All four were delivered.
+    #[test]
+    fn the_first_n_asked_for_are_queued_and_the_rest_offered() {
+        let v: Vec<String> = (1..=4).map(|i| format!("https://streamable.com/v{i}")).collect();
+        let p = plan_article_videos_limited(ARTICLE, &v[0], &v, "8", Some(2));
+        assert_eq!(p.primary_index, "8A");
+        assert_eq!(p.siblings, vec![(v[1].clone(), "8B".to_string())]);
+        let offered: Vec<(&str, &str)> = p.offered.iter().map(|o| (o.url.as_str(), o.index_str.as_str())).collect();
+        assert_eq!(offered, vec![(v[2].as_str(), "8C"), (v[3].as_str(), "8D")]);
+
+        // Only the first: the job keeps its plain number, the rest offered.
+        let p = plan_article_videos_limited(ARTICLE, &v[0], &v, "8", Some(1));
+        assert_eq!(p.primary_index, "8");
+        assert!(p.siblings.is_empty());
+        assert_eq!(p.offered.len(), 3);
+
+        // A raw stream the journalist counted is queued, not just offered.
+        let raw = "https://cdn.portal.gr/video/master.m3u8";
+        let p = plan_article_videos_limited(ARTICLE, X1, &s(&[X1, raw, X2]), "2", Some(2));
+        assert_eq!(p.siblings, vec![(raw.to_string(), "2B".to_string())]);
+
+        // More asked for than found: everything is queued, nothing offered.
+        let p = plan_article_videos_limited(ARTICLE, X1, &s(&[X1, X2]), "1", Some(5));
+        assert_eq!(p.siblings.len(), 1);
+        assert!(p.offered.is_empty());
     }
 
     #[test]
