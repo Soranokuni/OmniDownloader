@@ -363,9 +363,16 @@ async function loadSelfcheck() {
   render('selfcheck-body', links.map((link) => el('tr', {},
     el('td', {},
       el('div', { class: 'strong' }, link.label),
-      el('a', { class: 'note mono', href: link.url, target: '_blank', rel: 'noopener noreferrer' }, link.url),
+      el('a', {
+        class: 'note mono',
+        href: link.url,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        title: link.url,
+        style: 'display:block;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+      }, link.url),
     ),
-    el('td', {},
+    el('td', { style: 'white-space:nowrap' },
       link.last_ok === null || link.last_ok === undefined
         ? el('span', { class: 'note' }, 'not checked yet')
         : link.last_ok

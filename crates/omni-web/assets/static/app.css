@@ -393,6 +393,15 @@ td.right, th.right { text-align: right; }
   color: var(--bad);
   word-break: break-word;
 }
+/* The MCR desk's reason: what happened and what to do, read by a person,
+   so plain text; the code underneath stays small and monospaced. */
+.reason strong {
+  font-family: var(--sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--warn);
+  margin-bottom: 4px;
+}
 
 /* ---------- dialogs ---------- */
 

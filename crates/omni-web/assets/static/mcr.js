@@ -1,25 +1,78 @@
-/* MCR panel behaviour (plan P2.3, P2.5).
+/* MCR panel behaviour (plan P2.3, P2.5, P7.1).
  *
  * Every value rendered here -- slug, url, error_message, journalist -- can
  * originate in an email sent to the ingest address. Nothing in this file
  * builds HTML from a string; `el()` creates nodes and text goes through
  * `textContent`, so a job whose URL is `"><img src=x onerror=...>` renders as
  * that exact text in the operator's browser and nothing else happens.
+ *
+ * The desk is written for operators who are not technical and for people on
+ * their first shift: every list says what it holds, every button says what it
+ * does, and anything that cannot be undone asks first, in plain words.
  */
 
 import {
-  api, el, render, live, toast, fmtTime, fmtDuration, statusClass, logout, safeHref,
+  api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref,
 } from '/static/app.js?v=3';
 
-let jobs = [];
-let journalists = [];
 let currentTab = 'queue';
+let journalists = [];
+
+/* ------------------------------------------------------------------ *
+ * Words
+ * ------------------------------------------------------------------ */
+
+/** What a job is doing, for a person. */
+const STAGE_TEXT = {
+  QUEUED: 'Waiting its turn',
+  EXTRACT: 'Finding the video on the page',
+  DOWNLOAD: 'Downloading',
+  PROBE: 'Checking the downloaded file',
+  TRANSCODE: 'Converting to the broadcast format',
+  REWRAP: 'Packaging as MXF',
+  VERIFY: 'Checking the broadcast format',
+  DELIVER: 'Delivering to the Dalet watchfolder',
+  ARCHIVE: 'Archiving',
+  DONE: 'Finishing',
+};
+const STAGE_ORDER = ['EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER'];
+
+function stageLine(job) {
+  if (job.status === 'PENDING') return 'Waiting its turn';
+  const text = STAGE_TEXT[job.stage] || 'Working';
+  const step = STAGE_ORDER.indexOf(job.stage);
+  return step >= 0 ? `Step ${step + 1} of ${STAGE_ORDER.length} · ${text}` : text;
+}
+
+function statusBadge(job) {
+  switch (job.status) {
+    case 'PENDING': return el('span', { class: 'badge' }, 'Waiting');
+    case 'RUNNING': return el('span', { class: 'badge info' }, 'Working');
+    case 'COMPLETED': return el('span', { class: 'badge ok' }, 'Delivered');
+    case 'COMPLETED_MANUAL': return el('span', { class: 'badge ok' }, 'Delivered by hand');
+    case 'MANUAL_DOWNLOAD': return el('span', { class: 'badge warn' }, 'Download by hand');
+    case 'FAILED': return el('span', { class: 'badge bad' }, 'Failed');
+    default: return el('span', { class: 'badge warn' }, 'Needs attention');
+  }
+}
+
+function fileName(job) {
+  return `${job.slug}.mxf`;
+}
+
+/** The delivered file's name, which differs from the slug when a file of
+ *  the same name was already in the watchfolder (`_2`). */
+function deliveredName(job) {
+  if (!job.file_path) return fileName(job);
+  const parts = String(job.file_path).split(/[\\/]/);
+  return parts[parts.length - 1] || fileName(job);
+}
 
 /* ------------------------------------------------------------------ *
  * Tabs
  * ------------------------------------------------------------------ */
 
-const TABS = ['queue', 'review', 'archive', 'journalists', 'manual'];
+const TABS = ['queue', 'review', 'completed', 'journalists', 'manual'];
 
 function switchTab(name) {
   currentTab = name;
@@ -30,7 +83,7 @@ function switchTab(name) {
     if (section) section.hidden = tab !== name;
   }
   if (name === 'journalists') loadJournalists();
-  if (name === 'archive') renderArchive();
+  refresh();
 }
 
 for (const button of document.querySelectorAll('.tab[data-tab]')) {
@@ -43,6 +96,17 @@ for (const button of document.querySelectorAll('.tab[data-tab]')) {
 
 /** Health state -> dot colour. */
 const DOT = { ok: 'ok', degraded: 'warn', down: 'bad' };
+
+/** Check names as an operator reads them in the banner. */
+const CHECK_NAME = {
+  tools: 'Tools',
+  encoder: 'Encoder',
+  watchfolder: 'Watchfolder',
+  browser: 'Browser',
+  disk: 'Disk',
+  queue: 'Queue',
+  selfcheck: 'Self-check',
+};
 
 async function loadStatus() {
   let data;
@@ -77,19 +141,21 @@ async function loadStatus() {
   const wf = checks.watchfolder;
   storage.title = wf?.detail || '';
 
-  // Anything not already on the bar — tools, disk, queue — surfaces here
-  // rather than staying invisible until a job fails on it.
+  // Anything not already on the bar — tools, disk, queue, self-check —
+  // surfaces here rather than staying invisible until a job fails on it.
   const problems = Object.entries(checks)
     .filter(([name, c]) => c.state !== 'ok' && name !== 'mail' && name !== 'llm')
-    .map(([name, c]) => `${name}: ${c.detail || c.state}`);
+    .map(([name, c]) => `${CHECK_NAME[name] || name}: ${c.detail || c.state}`);
   const banner = document.getElementById('health-banner');
   if (problems.length === 0) {
     banner.hidden = true;
   } else {
     banner.hidden = false;
     render(banner, el('div', { class: 'card attention' },
-      el('strong', {}, data.status === 'down' ? 'Ingest is blocked: ' : 'Attention: '),
+      el('strong', {}, data.status === 'down' ? 'Ingest is blocked. ' : 'Attention. '),
       problems.join(' · '),
+      el('span', { class: 'note', style: 'display:block;margin-top:6px' },
+        'Tell the engineer on call; the Administration page has the detail.'),
     ));
   }
 }
@@ -111,24 +177,94 @@ function setStatus(prefix, text, dotClass, title) {
 }
 
 /* ------------------------------------------------------------------ *
- * Jobs
+ * Paging
  * ------------------------------------------------------------------ */
 
-async function loadJobs() {
-  try {
-    const data = await api('/api/jobs');
-    jobs = data.jobs || [];
-  } catch (e) {
-    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+/** Page state per list. */
+const pages = {
+  live: { page: 1, perPage: 15 },
+  review: { page: 1, perPage: 10 },
+  completed: { page: 1, perPage: 25 },
+};
+
+/** "Showing 26–50 of 132  ‹ Previous  Page 2 of 6  Next ›". Hidden when
+ *  everything fits on one page. */
+function pager(targetId, state, total, onChange) {
+  const pageCount = Math.max(1, Math.ceil(total / state.perPage));
+  if (state.page > pageCount) state.page = pageCount;
+  if (total <= state.perPage) {
+    render(targetId);
     return;
   }
-  renderOffers();
-  renderQueue();
-  renderReview();
-  if (currentTab === 'archive') renderArchive();
+  const first = (state.page - 1) * state.perPage + 1;
+  const last = Math.min(total, state.page * state.perPage);
+  const go = (p) => { state.page = p; onChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+  render(targetId, el('div', { class: 'section-head card', style: 'padding:10px 14px' },
+    el('span', { class: 'note' }, `Showing ${first}–${last} of ${total}`),
+    el('div', { class: 'row tight' },
+      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(1) }, '« First'),
+      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(state.page - 1) }, '‹ Previous'),
+      el('span', { class: 'note', style: 'padding:0 8px' }, `Page ${state.page} of ${pageCount}`),
+      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(state.page + 1) }, 'Next ›'),
+      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(pageCount) }, 'Last »'),
+    ),
+  ));
 }
 
-const NEEDS_REVIEW = new Set(['REQUIRES_REVIEW', 'MANUAL_DOWNLOAD']);
+async function fetchPage(view, extra = {}) {
+  const state = pages[view];
+  const params = new URLSearchParams({ view, page: String(state.page), per_page: String(state.perPage), ...extra });
+  return api(`/api/jobs?${params}`);
+}
+
+function showCounts(counts) {
+  if (!counts) return;
+  const set = (id, n) => {
+    const b = document.getElementById(id);
+    b.hidden = !n;
+    b.textContent = String(n || 0);
+  };
+  set('queue-count', counts.active);
+  set('review-count', counts.review);
+  set('completed-count', counts.completed);
+  const clear = document.getElementById('clear-finished');
+  clear.disabled = !counts.finished;
+  clear.textContent = counts.finished
+    ? `Clear delivered from this list (${counts.finished})`
+    : 'Clear delivered from this list';
+  clear.dataset.count = String(counts.finished || 0);
+}
+
+/** Refresh what is on screen: the open list, and the tab counts. */
+let refreshing = false;
+let refreshAgain = false;
+async function refresh() {
+  // One at a time; a request that arrives meanwhile (a tab click during the
+  // five-second refresh) runs as soon as the current one ends, instead of
+  // being dropped and leaving the new tab's placeholder on screen.
+  if (refreshing) { refreshAgain = true; return; }
+  refreshing = true;
+  try {
+    do {
+      refreshAgain = false;
+      if (currentTab === 'review') await loadReview();
+      else if (currentTab === 'completed') await loadCompleted();
+      // The live queue (also the journalists and add-a-link tabs) keeps the
+      // tab counts current.
+      else await loadQueue();
+    } while (refreshAgain);
+  } finally {
+    refreshing = false;
+  }
+}
+
+function failed(e) {
+  if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+}
+
+/* ------------------------------------------------------------------ *
+ * Other videos found in an article
+ * ------------------------------------------------------------------ */
 
 /* Videos the sniffer found in a submitted article and left for MCR to
  * decide (raw page streams, and platform posts beyond the automatic limit).
@@ -143,20 +279,22 @@ function offersOf(job) {
   }
 }
 
-function renderOffers() {
+function renderOffers(targetId, jobs) {
   const withOffers = jobs.filter((j) => offersOf(j).length > 0);
   if (withOffers.length === 0) {
-    render('article-offers');
+    render(targetId);
     return;
   }
-  render('article-offers', el('div', { class: 'card stack' },
-    el('h3', { class: 'job-name' }, 'Other videos found in submitted articles'),
+  render(targetId, el('div', { class: 'card stack' },
+    el('h3', { class: 'job-name' }, 'More videos were found in these articles'),
+    el('p', { class: 'note', style: 'margin:0' },
+      'They were not added on their own. Open one to look, and add it if it belongs to the story.'),
     ...withOffers.flatMap((job) => offersOf(job).map((offer) => {
       const href = safeHref(offer.url);
       return el('div', { class: 'job-head', style: 'border-top:1px solid var(--line);padding-top:10px' },
         el('div', {},
           el('p', { class: 'job-meta' },
-            `Job #${job.id} (${job.slug}) — would be ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
+            `From job #${job.id} (${fileName(job)}) — would be ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
           el('p', { class: 'job-url', title: offer.url }, offer.url),
         ),
         el('div', { class: 'row tight' },
@@ -165,7 +303,7 @@ function renderOffers() {
             class: 'btn btn-warn',
             type: 'button',
             onClick: () => queueOffer(job.id, offer),
-          }, `Queue as ${offer.index_str}`),
+          }, `Add as ${offer.index_str}`),
         ),
       );
     })),
@@ -175,75 +313,123 @@ function renderOffers() {
 async function queueOffer(id, offer) {
   try {
     const r = await api(`/api/jobs/${id}/offers/queue`, { method: 'POST', body: { url: offer.url } });
-    toast(`Queued as ${r.index_str} (job #${r.job_id}).`, 'ok');
-    loadJobs();
+    toast(`Added as ${r.index_str} (job #${r.job_id}).`, 'ok');
+    refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
-function renderQueue() {
-  const active = jobs.filter((j) => !NEEDS_REVIEW.has(j.status));
-  if (active.length === 0) {
+/* ------------------------------------------------------------------ *
+ * Live queue
+ * ------------------------------------------------------------------ */
+
+async function loadQueue() {
+  let data;
+  try {
+    data = await fetchPage('live');
+  } catch (e) { failed(e); return; }
+  showCounts(data.counts);
+  const jobs = data.jobs || [];
+  renderOffers('article-offers', jobs);
+  if (jobs.length === 0) {
     render('queue-cards', el('div', { class: 'card center' },
-      'Ingest queue is clear. No active jobs.'));
-    return;
+      'Nothing is waiting. New links from email appear here on their own.'));
+  } else {
+    render('queue-cards', jobs.map((j) => (j.status === 'PENDING' || j.status === 'RUNNING' ? activeCard(j) : deliveredCard(j))));
   }
-  render('queue-cards', active.map(jobCard));
+  pager('queue-pager', pages.live, data.total || 0, loadQueue);
 }
 
-function jobCard(job) {
+function activeCard(job) {
   const progress = Number(job.progress) || 0;
-  const stageText =
-    job.status === 'DOWNLOADING' ? `Downloading${job.speed ? ` @ ${job.speed}` : ''}`
-    : job.status === 'TRANSCODING' ? 'Transcoding to XDCAM HD422'
-    : job.status;
-
+  const running = job.status === 'RUNNING';
   return el('div', { class: 'card stack' },
     el('div', { class: 'job-head' },
       el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
-          el('h3', { class: 'job-name' }, `${job.slug}.mxf`),
+          el('h3', { class: 'job-name' }, fileName(job)),
           el('p', { class: 'job-url', title: job.url }, job.url),
         ),
       ),
       el('div', { class: 'row tight' },
-        el('span', { class: `badge ${statusClass(job.status)}` }, job.status),
+        statusBadge(job),
         el('button', {
-          class: 'btn btn-icon btn-danger',
+          class: 'btn btn-danger',
           type: 'button',
-          title: 'Discard',
-          onClick: () => discardJob(job.id),
-        }, '✕'),
+          title: 'Take this video off the queue',
+          onClick: () => discardJob(job),
+        }, 'Remove'),
       ),
     ),
     el('div', {},
       el('div', { class: 'job-meta' },
-        el('span', {}, stageText),
-        el('span', {}, `${progress.toFixed(1)}%`),
+        el('span', {}, stageLine(job), running && job.speed && job.stage === 'DOWNLOAD' ? ` @ ${job.speed}` : ''),
+        el('span', {}, running ? `${progress.toFixed(0)}%` : ''),
       ),
-      el('div', { class: 'progress' },
-        el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),
+      running
+        ? el('div', { class: 'progress' },
+            el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` }))
+        : null,
       el('div', { class: 'job-meta' },
         el('span', {}, `Journalist: ${job.journalist}`,
           job.group_code ? el('span', { class: 'badge info', style: 'margin-left:8px', title: groupName(job.group_code) }, job.group_code) : null),
-        el('span', {}, job.eta ? `ETA ${job.eta}` : ''),
+        el('span', {}, running && job.eta && job.eta !== '--:--' ? `About ${job.eta} left` : ''),
       ),
     ),
   );
 }
 
-function renderReview() {
-  const review = jobs.filter((j) => NEEDS_REVIEW.has(j.status));
-  const badge = document.getElementById('review-count');
-  badge.hidden = review.length === 0;
-  badge.textContent = String(review.length);
+function deliveredCard(job) {
+  return el('div', { class: 'card' },
+    el('div', { class: 'job-head' },
+      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+        el('span', { class: 'job-id' }, String(job.id)),
+        el('div', {},
+          el('h3', { class: 'job-name' }, deliveredName(job)),
+          el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
+            `Delivered ${fmtTime(job.completed_at || job.updated_at)} · ${fmtDuration(job.duration_secs)} · ${job.journalist}`),
+        ),
+      ),
+      el('div', { class: 'row tight' },
+        statusBadge(job),
+        el('button', { class: 'btn', type: 'button', onClick: () => redownload(job) }, 'Download again'),
+      ),
+    ),
+  );
+}
 
-  if (review.length === 0) {
-    render('review-cards', el('div', { class: 'card center' },
-      'No jobs require operator review.'));
-    return;
+document.getElementById('clear-finished').addEventListener('click', async (event) => {
+  const n = Number(event.currentTarget.dataset.count || 0);
+  if (!n) return;
+  if (!confirm(
+    `Take the ${n} delivered video(s) off the live queue?\n\n` +
+    'Nothing is deleted. They stay under Completed, where you can download them again.',
+  )) return;
+  try {
+    const r = await api('/api/jobs/clear-finished', { method: 'POST' });
+    toast(`${r.cleared} delivered video(s) moved off the live queue. They are under Completed.`, 'ok');
+    pages.live.page = 1;
+    refresh();
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
+/* ------------------------------------------------------------------ *
+ * Needs attention
+ * ------------------------------------------------------------------ */
+
+async function loadReview() {
+  let data;
+  try {
+    data = await fetchPage('review');
+  } catch (e) { failed(e); return; }
+  showCounts(data.counts);
+  const jobs = data.jobs || [];
+  if (jobs.length === 0) {
+    render('review-cards', el('div', { class: 'card center' }, 'Nothing needs attention.'));
+  } else {
+    render('review-cards', jobs.map(reviewCard));
   }
-  render('review-cards', review.map(reviewCard));
+  pager('review-pager', pages.review, data.total || 0, loadReview);
 }
 
 function reviewCard(job) {
@@ -253,137 +439,176 @@ function reviewCard(job) {
     id: `override-${job.id}`,
     value: job.url,
   });
+  const href = safeHref(job.url);
+  const locker = job.status === 'MANUAL_DOWNLOAD';
 
   return el('div', { class: 'card attention stack' },
     el('div', { class: 'job-head', style: 'border-bottom:1px solid var(--line);padding-bottom:12px' },
-      el('div', {},
-        el('h3', { class: 'job-name' }, `${job.slug}.mxf`),
-        el('p', { class: 'job-url', title: job.url }, job.url),
+      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+        el('span', { class: 'job-id' }, String(job.id)),
+        el('div', {},
+          el('h3', { class: 'job-name' }, fileName(job)),
+          el('p', { class: 'job-url', title: job.url }, job.url),
+          el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
+            `Journalist: ${job.journalist} · since ${fmtTime(job.updated_at)}`),
+        ),
       ),
-      el('span', { class: 'badge warn' },
-        job.status === 'MANUAL_DOWNLOAD' ? 'File locker intercepted' : 'Requires review'),
+      statusBadge(job),
     ),
     el('div', { class: 'reason' },
-      job.error_message || 'The video stream could not be captured automatically.'),
-    el('div', {},
+      el('strong', { style: 'display:block' }, job.hint
+        || (locker
+          ? 'A file-transfer link: download the file from the link by hand and drop it in Dalet.'
+          : 'The video could not be captured automatically.')),
+      job.error_code ? el('span', { class: 'note mono' }, `Code: ${job.error_code}`) : null,
+    ),
+    el('div', { class: 'row' },
+      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Open the link') : null,
+      locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Try again'),
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Remove'),
+    ),
+    locker ? null : el('div', {},
       el('label', { for: `override-${job.id}` },
-        'Direct stream (.m3u8 / .mp4) or a corrected page URL'),
+        'Or paste a different link to the same video (the post itself, or a direct .mp4 / .m3u8 link):'),
       el('div', { class: 'row' },
         el('div', { class: 'grow' }, input),
-        el('a', { class: 'btn', href: job.url, target: '_blank', rel: 'noopener noreferrer' },
-          'Open link'),
         el('button', {
           class: 'btn btn-warn',
           type: 'button',
-          onClick: () => overrideJob(job.id, input.value),
-        }, 'Force ingest'),
-        el('button', {
-          class: 'btn btn-danger',
-          type: 'button',
-          onClick: () => discardJob(job.id),
-        }, 'Discard'),
+          onClick: () => overrideJob(job, input.value),
+        }, 'Use this link'),
       ),
     ),
   );
 }
 
-async function overrideJob(id, url) {
-  const trimmed = (url || '').trim();
-  if (!trimmed) { toast('Enter a URL first.', 'bad'); return; }
+async function retryJob(job) {
   try {
-    await api(`/api/jobs/${id}/override`, { method: 'POST', body: { url: trimmed } });
-    toast(`Job #${id} re-queued.`, 'ok');
-    loadJobs();
+    await api(`/api/jobs/${job.id}/retry`, { method: 'POST' });
+    toast(`${fileName(job)} is back in the live queue.`, 'ok');
+    refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
-async function discardJob(id) {
-  if (!confirm(`Discard job #${id}?`)) return;
+async function overrideJob(job, url) {
+  const trimmed = (url || '').trim();
+  if (!trimmed) { toast('Paste a link first.', 'bad'); return; }
   try {
-    await api(`/api/jobs/${id}/discard`, { method: 'POST' });
-    toast(`Job #${id} discarded.`, 'ok');
-    loadJobs();
+    await api(`/api/jobs/${job.id}/override`, { method: 'POST', body: { url: trimmed } });
+    toast(`${fileName(job)} is back in the live queue with the new link.`, 'ok');
+    refresh();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function discardJob(job) {
+  if (!confirm(
+    `Remove ${fileName(job)} (job #${job.id})?\n\n` +
+    'It is taken off the lists for good. A file already delivered to Dalet is not touched.',
+  )) return;
+  try {
+    await api(`/api/jobs/${job.id}/discard`, { method: 'POST' });
+    toast(`Job #${job.id} removed.`, 'ok');
+    refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
 /* ------------------------------------------------------------------ *
- * Archive
+ * Completed
  * ------------------------------------------------------------------ */
 
 const filterSelect = document.getElementById('journalist-filter');
 const groupSelect = document.getElementById('group-filter');
-const searchInput = document.getElementById('archive-search');
-filterSelect.addEventListener('change', renderArchive);
-groupSelect.addEventListener('change', renderArchive);
-searchInput.addEventListener('input', renderArchive);
+const searchInput = document.getElementById('completed-search');
+const restartCompleted = () => { pages.completed.page = 1; loadCompleted(); };
+filterSelect.addEventListener('change', restartCompleted);
+groupSelect.addEventListener('change', restartCompleted);
+let searchTimer = null;
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(restartCompleted, 300);
+});
 
 /* Group labels (plan P4.20): code → name, for titles and the filter. */
 let groupNames = new Map();
 function groupName(code) {
   return groupNames.get(code) || code;
 }
-api('/api/groups')
-  .then((data) => {
-    groupNames = new Map((data.groups || []).map((g) => [g.code, g.name]));
-    renderArchive();
-  })
-  .catch(() => { /* labels show as codes */ });
 
-function renderArchive() {
-  syncJournalistFilter();
-
-  const wanted = filterSelect.value;
-  const wantedGroup = groupSelect.value;
-  const needle = searchInput.value.trim().toLowerCase();
-
-  const rows = jobs.filter((job) => {
-    if (wanted && job.journalist !== wanted) return false;
-    if (wantedGroup === '-' && job.group_code) return false;
-    if (wantedGroup && wantedGroup !== '-' && job.group_code !== wantedGroup) return false;
-    if (!needle) return true;
-    return [job.slug, job.url, job.journalist, job.keyword, job.group_code]
-      .some((field) => String(field || '').toLowerCase().includes(needle));
-  });
-
-  if (rows.length === 0) {
-    render('archive-body', el('tr', {},
-      el('td', { colspan: '8', class: 'empty' }, 'No jobs match the filter.')));
-    return;
-  }
-
-  render('archive-body', rows.map((job) => el('tr', {},
-    el('td', { class: 'num' }, String(job.id)),
-    el('td', { class: 'strong' }, `${job.slug}.mxf`),
-    el('td', {}, el('span', { class: 'badge info' }, job.journalist)),
-    el('td', { title: job.group_code ? groupName(job.group_code) : '' }, job.group_code || '—'),
-    el('td', {}, el('span', { class: `badge ${statusClass(job.status)}` }, job.status)),
-    el('td', {}, fmtDuration(job.duration_secs)),
-    // `media_format` is free text from ffprobe; it is a text node like
-    // everything else here.
-    el('td', { class: 'mono' }, job.media_format || '—'),
-    // Timestamps are Option on the wire: a missing one renders blank, never
-    // as "now" (which is what the old archive showed for every job).
-    el('td', { class: 'num' }, fmtTime(job.updated_at)),
-  )));
-}
-
-function syncJournalistFilter() {
-  const names = [...new Set(jobs.map((j) => j.journalist).filter(Boolean))].sort();
-  const current = filterSelect.value;
+async function loadFilters() {
+  try {
+    const [g, j] = await Promise.all([api('/api/groups'), api('/api/journalists')]);
+    groupNames = new Map((g.groups || []).map((x) => [x.code, x.name]));
+    journalists = j.journalists || [];
+  } catch { /* the lists show codes and the filter stays at "all" */ }
+  const surnames = journalists.map((x) => x.surname).filter(Boolean).sort();
   render(filterSelect,
     el('option', { value: '' }, 'All journalists'),
-    names.map((name) => el('option', { value: name, selected: name === current }, name)),
+    surnames.map((name) => el('option', { value: name }, name)),
   );
-  filterSelect.value = names.includes(current) ? current : '';
-
-  const codes = [...new Set([...groupNames.keys(), ...jobs.map((j) => j.group_code).filter(Boolean)])].sort();
-  const currentGroup = groupSelect.value;
   render(groupSelect,
     el('option', { value: '' }, 'All groups'),
-    el('option', { value: '-', selected: currentGroup === '-' }, 'No group'),
-    codes.map((code) => el('option', { value: code, selected: code === currentGroup }, `${code} — ${groupName(code)}`)),
+    el('option', { value: '-' }, 'No group'),
+    [...groupNames.keys()].sort().map((code) => el('option', { value: code }, `${code} — ${groupName(code)}`)),
   );
-  groupSelect.value = currentGroup === '-' || codes.includes(currentGroup) ? currentGroup : '';
+  render('m-journalists', surnames.map((name) => el('option', { value: name })));
+}
+
+async function loadCompleted() {
+  let data;
+  try {
+    data = await fetchPage('completed', {
+      q: searchInput.value.trim(),
+      journalist: filterSelect.value,
+      group: groupSelect.value,
+    });
+  } catch (e) { failed(e); return; }
+  showCounts(data.counts);
+  const jobs = data.jobs || [];
+  renderOffers('completed-offers', jobs);
+  if (jobs.length === 0) {
+    const filtered = searchInput.value.trim() || filterSelect.value || groupSelect.value;
+    render('completed-body', el('tr', {},
+      el('td', { colspan: '6', class: 'empty' }, filtered ? 'Nothing matches the search.' : 'Nothing delivered yet.')));
+  } else {
+    render('completed-body', jobs.map(completedRow));
+  }
+  pager('completed-pager', pages.completed, data.total || 0, loadCompleted);
+}
+
+function completedRow(job) {
+  const href = safeHref(job.url);
+  return el('tr', {},
+    el('td', {},
+      el('div', { class: 'strong' }, deliveredName(job)),
+      el('div', { class: 'note mono', title: job.url, style: 'max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, job.url),
+    ),
+    el('td', {}, el('span', { class: 'badge info' }, job.journalist)),
+    el('td', { title: job.group_code ? groupName(job.group_code) : '' }, job.group_code || '—'),
+    // Timestamps are Option on the wire: a missing one renders blank, never
+    // as "now" (which is what the old archive showed for every job).
+    el('td', { class: 'num' }, fmtTime(job.completed_at || job.delivered_at)),
+    el('td', {}, fmtDuration(job.duration_secs)),
+    el('td', { class: 'right' },
+      el('div', { class: 'row tight', style: 'justify-content:flex-end;flex-wrap:nowrap' },
+        href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Open the original link' }, 'Open link') : null,
+        el('button', { class: 'btn btn-primary', type: 'button', onClick: () => redownload(job) }, 'Download again'),
+      ),
+    ),
+  );
+}
+
+async function redownload(job) {
+  const name = deliveredName(job);
+  if (!confirm(
+    `Download ${name} again?\n\n` +
+    'The video is fetched from its link, converted and delivered to the watchfolder once more. ' +
+    'If the old file is still there, the new one is saved next to it with a number added (…_2.mxf); nothing is overwritten.',
+  )) return;
+  try {
+    await api(`/api/jobs/${job.id}/redownload`, { method: 'POST' });
+    toast(`${name} is back in the live queue.`, 'ok');
+    refresh();
+  } catch (e) { toast(e.message, 'bad'); }
 }
 
 /* ------------------------------------------------------------------ *
@@ -394,10 +619,7 @@ async function loadJournalists() {
   try {
     const data = await api('/api/journalists');
     journalists = data.journalists || [];
-  } catch (e) {
-    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
-    return;
-  }
+  } catch (e) { failed(e); return; }
 
   if (journalists.length === 0) {
     render('journalists-body', el('tr', {},
@@ -443,21 +665,32 @@ document.getElementById('journalist-form').addEventListener('submit', async (eve
     event.target.reset();
     document.getElementById('j-priority').value = '0';
     loadJournalists();
+    loadFilters();
   } catch (e) { toast(e.message, 'bad'); }
 });
 
 async function deleteJournalist(surname) {
-  if (!confirm(`Delete journalist ${surname}?`)) return;
+  if (!confirm(`Delete journalist ${surname}?\n\nVideos already delivered keep their names.`)) return;
   try {
     await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
     toast(`${surname} deleted.`, 'ok');
     loadJournalists();
+    loadFilters();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
 /* ------------------------------------------------------------------ *
- * Quick queue
+ * Add a link
  * ------------------------------------------------------------------ */
+
+const manualFields = ['m-index', 'm-journalist', 'm-keyword'].map((id) => document.getElementById(id));
+function showManualPreview() {
+  const [index, journalist, keyword] = manualFields.map((f) => f.value.trim().toUpperCase());
+  document.getElementById('m-preview').textContent = index && journalist && keyword
+    ? `The file will be called ${index}_${journalist}_${keyword}.mxf`
+    : '';
+}
+for (const f of manualFields) f.addEventListener('input', showManualPreview);
 
 document.getElementById('manual-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -472,12 +705,11 @@ document.getElementById('manual-form').addEventListener('submit', async (event) 
         priority: document.getElementById('m-priority').checked ? 10 : 0,
       },
     });
-    toast(`Queued as ${result.slug}.mxf`, 'ok');
+    toast(`Added: ${result.slug}.mxf`, 'ok');
     event.target.reset();
-    document.getElementById('m-journalist').value = 'MCR';
     document.getElementById('m-index').value = '1';
+    showManualPreview();
     switchTab('queue');
-    loadJobs();
   } catch (e) { toast(e.message, 'bad'); }
 });
 
@@ -495,4 +727,5 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') specsModal
 
 document.getElementById('logout-btn').addEventListener('click', logout);
 
-live(() => { loadJobs(); loadStatus(); });
+loadFilters();
+live(() => { refresh(); loadStatus(); });

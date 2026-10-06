@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — MCR Handler Portal</title>
-<link rel="stylesheet" href="/static/app.css?v=3">
+<link rel="stylesheet" href="/static/app.css?v=5">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -33,34 +33,51 @@
   <div id="health-banner" hidden></div>
 
   <div class="tabs" role="tablist">
-    <button class="tab" type="button" role="tab" data-tab="queue" aria-selected="true">Live Queue</button>
-    <button class="tab" type="button" role="tab" data-tab="review" aria-selected="false">
-      Action Required <span id="review-count" class="badge warn" hidden>0</span>
+    <button class="tab" type="button" role="tab" data-tab="queue" aria-selected="true">
+      Live queue <span id="queue-count" class="badge info" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" data-tab="archive" aria-selected="false">Broadcast Archive</button>
+    <button class="tab" type="button" role="tab" data-tab="review" aria-selected="false">
+      Needs attention <span id="review-count" class="badge warn" hidden>0</span>
+    </button>
+    <button class="tab" type="button" role="tab" data-tab="completed" aria-selected="false">
+      Completed <span id="completed-count" class="badge" hidden>0</span>
+    </button>
     <button class="tab" type="button" role="tab" data-tab="journalists" aria-selected="false">Journalists</button>
-    <button class="tab" type="button" role="tab" data-tab="manual" aria-selected="false">Quick Queue</button>
-    <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Mezzanine Specs</button>
+    <button class="tab" type="button" role="tab" data-tab="manual" aria-selected="false">Add a link</button>
+    <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Broadcast format</button>
   </div>
 
   <!-- Live queue -->
   <section id="tab-queue" class="stack">
+    <div class="section-head">
+      <p class="note" style="margin:0">
+        Videos waiting and being converted come first, then the ones already delivered.
+        Delivered videos also stay under <b>Completed</b>.
+      </p>
+      <button class="btn" type="button" id="clear-finished" disabled>Clear delivered from this list</button>
+    </div>
     <!-- Other videos found in submitted articles, for MCR to queue (empty when none) -->
     <div id="article-offers" class="stack"></div>
     <div id="queue-cards" class="stack">
-      <div class="card center">Loading live queue…</div>
+      <div class="card center">Loading the live queue…</div>
     </div>
+    <div id="queue-pager"></div>
   </section>
 
-  <!-- Action required -->
+  <!-- Needs attention -->
   <section id="tab-review" class="stack" hidden>
+    <p class="note" style="margin:0">
+      These videos could not be delivered on their own. Each card says why and what to do.
+      <b>Try again</b> is safe to press: nothing already delivered is touched.
+    </p>
     <div id="review-cards" class="stack">
-      <div class="card center">No items require operator review.</div>
+      <div class="card center">Nothing needs attention.</div>
     </div>
+    <div id="review-pager"></div>
   </section>
 
-  <!-- Archive -->
-  <section id="tab-archive" class="stack" hidden>
+  <!-- Completed -->
+  <section id="tab-completed" class="stack" hidden>
     <div class="card">
       <div class="section-head">
         <div class="row">
@@ -69,22 +86,29 @@
           <label for="group-filter" style="margin:0 0 0 12px">Group</label>
           <select id="group-filter" style="width:auto"><option value="">All groups</option></select>
         </div>
-        <input type="text" id="archive-search" placeholder="Search slug, keyword or URL…" style="width:280px">
+        <input type="search" id="completed-search" placeholder="Search file name, keyword or link…" style="width:300px">
       </div>
+      <p class="note" style="margin:10px 0 0">
+        Every delivered video, newest first. If a file was deleted or came out wrong, press
+        <b>Download again</b>: the video is fetched from its link and delivered once more,
+        next to the old file if that is still there, never over it.
+      </p>
     </div>
+    <div id="completed-offers" class="stack"></div>
     <div class="card flush">
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>Broadcast slug</th><th>Journalist</th><th>Group</th><th>Status</th>
-            <th>Duration</th><th>Media format</th><th>Updated</th>
+            <th>File</th><th>Journalist</th><th>Group</th><th>Delivered</th>
+            <th>Length</th><th class="right"></th>
           </tr>
         </thead>
-        <tbody id="archive-body">
-          <tr><td colspan="8" class="empty">Loading archive…</td></tr>
+        <tbody id="completed-body">
+          <tr><td colspan="6" class="empty">Loading…</td></tr>
         </tbody>
       </table>
     </div>
+    <div id="completed-pager"></div>
   </section>
 
   <!-- Journalists -->
@@ -127,47 +151,53 @@
     </div>
   </section>
 
-  <!-- Quick queue -->
+  <!-- Add a link -->
   <section id="tab-manual" class="stack" hidden>
     <div class="card" style="max-width:680px;margin:0 auto">
-      <h2 class="card-title">Manual broadcast ingest</h2>
+      <h2 class="card-title">Add a link by hand</h2>
+      <p class="note" style="margin-bottom:12px">
+        For a video that did not come by email. Paste the link to the video or to the
+        article it is in; the file is named <span class="mono">NUMBER_JOURNALIST_KEYWORD.mxf</span>.
+      </p>
       <form id="manual-form" class="stack">
         <div>
-          <label for="m-url">Media or page URL</label>
+          <label for="m-url">Link to the video or the article</label>
           <input type="url" id="m-url" required placeholder="https://…">
         </div>
         <div class="grid-2">
           <div>
             <label for="m-journalist">Journalist surname</label>
-            <input type="text" id="m-journalist" required placeholder="PAPADAKI or MCR" value="MCR">
+            <input type="text" id="m-journalist" required placeholder="PAPADAKI" list="m-journalists">
+            <datalist id="m-journalists"></datalist>
           </div>
           <div>
-            <label for="m-keyword">Keyword</label>
-            <input type="text" id="m-keyword" required placeholder="KNICKS">
+            <label for="m-keyword">Keyword (what the story is about)</label>
+            <input type="text" id="m-keyword" required placeholder="SEISMOS">
           </div>
         </div>
         <div class="grid-2">
           <div>
-            <label for="m-index">Section number / index</label>
+            <label for="m-index">Number</label>
             <input type="text" id="m-index" value="1" required>
           </div>
           <div class="checkbox-row" style="align-self:end;padding-bottom:9px">
             <input type="checkbox" id="m-priority">
-            <label for="m-priority">High priority</label>
+            <label for="m-priority">Urgent (goes before the others)</label>
           </div>
         </div>
-        <button class="btn btn-primary btn-block" type="submit">Queue for ingest</button>
+        <p class="note" id="m-preview" style="margin:0"></p>
+        <button class="btn btn-primary btn-block" type="submit">Add to the queue</button>
       </form>
     </div>
   </section>
 </main>
 
-<!-- Mezzanine specifications -->
+<!-- Broadcast format -->
 <div class="modal" id="specs-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="specs-title">
     <div class="section-head" style="border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px">
       <h2 id="specs-title" style="margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.07em">
-        Mezzanine broadcast specification
+        Broadcast format of every delivered file
       </h2>
       <button class="btn btn-icon" type="button" id="specs-close" aria-label="Close">✕</button>
     </div>
@@ -184,6 +214,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=4"></script>
+<script type="module" src="/static/mcr.js?v=6"></script>
 </body>
 </html>

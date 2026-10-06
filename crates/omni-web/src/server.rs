@@ -48,6 +48,8 @@ impl WebServer {
             .route("/api/jobs/:id", get(api_get_job))
             .route("/api/jobs/:id/override", post(api_override_job))
             .route("/api/jobs/:id/retry", post(api_retry_job))
+            .route("/api/jobs/:id/redownload", post(api_redownload_job))
+            .route("/api/jobs/clear-finished", post(api_clear_finished))
             .route("/api/jobs/:id/offers/queue", post(api_queue_offer))
             .route("/api/jobs/:id/discard", post(api_discard_job))
             .route(

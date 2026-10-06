@@ -56,6 +56,38 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Every code. A new variant goes here too, or `from_code` cannot read it.
+    pub const ALL: [ErrorCode; 23] = [
+        Self::UnsupportedUrl,
+        Self::Http403,
+        Self::LoginRequired,
+        Self::GeoBlocked,
+        Self::PrivateOrRemoved,
+        Self::LiveStream,
+        Self::Network,
+        Self::NoStreamFound,
+        Self::ProbeFailed,
+        Self::TranscodeFailed,
+        Self::RewrapFailed,
+        Self::ComplianceFailed,
+        Self::DeliveryFailed,
+        Self::LowDisk,
+        Self::SourceTooLong,
+        Self::ExtractTimeout,
+        Self::DownloadTimeout,
+        Self::TranscodeTimeout,
+        Self::RewrapTimeout,
+        Self::DeliverTimeout,
+        Self::LeaseExpired,
+        Self::ManualDownload,
+        Self::PipelineFailed,
+    ];
+
+    /// The code stored on a job, back as a code.
+    pub fn from_code(code: &str) -> Option<ErrorCode> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == code.trim())
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::UnsupportedUrl => "UNSUPPORTED_URL",
@@ -127,7 +159,7 @@ impl ErrorCode {
             Self::PrivateOrRemoved => "Το βίντεο είναι ιδιωτικό ή έχει αφαιρεθεί. Ζητήστε άλλον σύνδεσμο.",
             Self::LiveStream => "Ζωντανή μετάδοση. Περιμένετε να γίνει διαθέσιμη η εγγραφή.",
             Self::Network => "Πρόβλημα δικτύου. Γίνεται αυτόματη επανάληψη.",
-            Self::NoStreamFound => "Δεν βρέθηκε βίντεο στη σελίδα. Επικολλήστε τον σύνδεσμο ροής από το πρόγραμμα περιήγησης.",
+            Self::NoStreamFound => "Δεν βρέθηκε βίντεο στη σελίδα. Ανοίξτε τον σύνδεσμο: αν δεν έχει βίντεο, πατήστε Remove· αν έχει, επικολλήστε παρακάτω τον σύνδεσμο της ανάρτησης με το βίντεο (YouTube, Instagram, Facebook…).",
             Self::ProbeFailed => "Το αρχείο που κατέβηκε δεν διαβάζεται. Πιθανώς ατελής λήψη.",
             Self::TranscodeFailed => "Απέτυχε η μετατροπή. Δείτε το σφάλμα στις λεπτομέρειες.",
             Self::RewrapFailed => "Απέτυχε η ενθυλάκωση σε MXF.",
@@ -439,5 +471,18 @@ mod tests {
         assert_eq!(ErrorCode::ComplianceFailed.as_str(), "COMPLIANCE_FAILED");
         assert_eq!(ErrorCode::NoStreamFound.as_str(), "NO_STREAM_FOUND");
         assert_eq!(ErrorCode::ManualDownload.as_str(), "MANUAL_DOWNLOAD");
+    }
+
+    /// The MCR desk shows a stored code's Greek hint (plan P7.1); every code
+    /// must read back, each once.
+    #[test]
+    fn every_stored_code_reads_back() {
+        let mut seen = std::collections::HashSet::new();
+        for c in ErrorCode::ALL {
+            assert!(seen.insert(c.as_str()), "{} listed twice", c.as_str());
+            assert_eq!(ErrorCode::from_code(c.as_str()), Some(c));
+            assert!(!c.hint_el().is_empty());
+        }
+        assert_eq!(ErrorCode::from_code("NOT_A_CODE"), None);
     }
 }

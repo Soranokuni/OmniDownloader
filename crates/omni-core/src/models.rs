@@ -271,6 +271,48 @@ pub struct Journalist {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Which list of the MCR desk (plan P7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobsView {
+    /// Waiting and working, then delivered ones nobody has cleared yet.
+    Live,
+    /// Needs a person: review, file-locker downloads, failures.
+    Review,
+    /// Every delivered job, cleared or not, newest first.
+    Completed,
+}
+
+/// Filters for a page of jobs; empty strings mean "any".
+#[derive(Debug, Clone, Default)]
+pub struct JobsFilter {
+    /// Matched against slug, link, keyword and journalist.
+    pub search: String,
+    pub journalist: String,
+    /// A group code, or "-" for jobs without a group.
+    pub group: String,
+}
+
+/// One page of a job list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobPage {
+    pub jobs: Vec<Job>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
+/// How many jobs each MCR tab holds, for the tab badges.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobCounts {
+    /// Waiting or being worked on.
+    pub active: i64,
+    /// Delivered and still shown on the live queue.
+    pub finished: i64,
+    pub review: i64,
+    pub completed: i64,
+}
+
 /// Queue depth, for the status panel (plan P6.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueSummary {
