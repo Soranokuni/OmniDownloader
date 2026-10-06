@@ -53,6 +53,9 @@ pub struct DownloadOpts<'a> {
     pub concurrent_fragments: u32,
     pub timeout: Duration,
     pub cancel: Option<CancellationToken>,
+    /// Deno, for YouTube's JavaScript challenge (plan P6.8). `download`
+    /// fills it from `bin/` when the caller leaves it empty.
+    pub js_runtime: Option<&'a Path>,
 }
 
 impl Default for DownloadOpts<'_> {
@@ -67,6 +70,7 @@ impl Default for DownloadOpts<'_> {
             concurrent_fragments: 4,
             timeout: Duration::from_secs(1800),
             cancel: None,
+            js_runtime: None,
         }
     }
 }
@@ -88,6 +92,30 @@ const VIDEO_PLATFORMS: &[&str] = &[
     "dai.ly",
     "streamable.com",
 ];
+
+/// Whether `url` is on YouTube.
+pub fn is_youtube(url: &str) -> bool {
+    let host = host_of(url);
+    ["youtube.com", "youtu.be", "youtube-nocookie.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+fn host_of(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
 
 /// Whether `url` is a page on a video platform (as opposed to a raw stream
 /// or a news portal's article).
@@ -113,13 +141,24 @@ pub fn is_video_platform(url: &str) -> bool {
 
 pub struct Downloader {
     ytdl_path: PathBuf,
+    /// `deno.exe` next to yt-dlp, when it is there.
+    deno: Option<PathBuf>,
+}
+
+/// `--js-runtimes deno:<path>`: yt-dlp only looks for Deno on PATH by
+/// itself, and the service's PATH has no bin/.
+fn js_runtime_args(deno: Option<&Path>) -> Vec<String> {
+    match deno {
+        Some(p) => vec!["--js-runtimes".into(), format!("deno:{}", p.display())],
+        None => Vec::new(),
+    }
 }
 
 impl Downloader {
     pub fn new<P: AsRef<Path>>(ytdl_path: P) -> Self {
-        Self {
-            ytdl_path: ytdl_path.as_ref().to_path_buf(),
-        }
+        let ytdl_path = ytdl_path.as_ref().to_path_buf();
+        let deno = ytdl_path.parent().map(|d| d.join("deno.exe")).filter(|p| p.is_file());
+        Self { ytdl_path, deno }
     }
 
     /// Build the yt-dlp argument vector.
@@ -182,6 +221,7 @@ impl Downloader {
         if opts.insecure_tls {
             args.push("--no-check-certificates".into());
         }
+        args.extend(js_runtime_args(opts.js_runtime));
         // The article page's session (referer, browser UA, its cookies) is for
         // raw streams on the portal's own CDN. A video platform the sniffer
         // found embedded in the article is fetched by yt-dlp's own extractor,
@@ -226,6 +266,10 @@ impl Downloader {
         F: FnMut(DownloadProgress) + Send + 'static,
     {
         tokio::fs::create_dir_all(output_dir).await?;
+        let mut opts = opts;
+        if opts.js_runtime.is_none() {
+            opts.js_runtime = self.deno.as_deref();
+        }
         let args = Self::build_args(url, output_dir, &opts);
 
         info!("Job #{job_id}: downloading {url}");
@@ -344,7 +388,7 @@ impl Downloader {
     /// it (`--simulate`: the page is read and the formats are chosen). The
     /// self-check (plan P6.7) uses this. `Err` is the one-line reason.
     pub async fn probe(&self, url: &str, timeout: Duration) -> std::result::Result<Probed, String> {
-        let args = [
+        let mut args: Vec<String> = [
             "--simulate",
             "--no-playlist",
             "--playlist-items",
@@ -354,8 +398,12 @@ impl Downloader {
             "30",
             "--print",
             "%(extractor)s %(id)s",
-            url,
-        ];
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
@@ -368,7 +416,10 @@ impl Downloader {
     /// [`parse_page_videos`]). A failure is no videos: the download that
     /// follows reports it properly.
     pub async fn page_videos(&self, url: &str, timeout: Duration) -> Vec<String> {
-        let args = ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30", url];
+        let mut args: Vec<String> =
+            ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()).collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => parse_page_videos(&o.stdout),
             _ => Vec::new(),
@@ -516,6 +567,22 @@ mod tests {
         let args = args_for(&DownloadOpts::default());
         let i = args.iter().position(|a| a == "--playlist-items").expect("--playlist-items");
         assert_eq!(args[i + 1], "1");
+    }
+
+    /// 2026-10-06: two YouTube jobs failed with HTTP 403; yt-dlp said "No
+    /// supported JavaScript runtime could be found".
+    #[test]
+    fn deno_is_handed_to_yt_dlp_when_it_is_there() {
+        let deno = PathBuf::from(r"C:\omni\bin\deno.exe");
+        let args = args_for(&DownloadOpts { js_runtime: Some(&deno), ..Default::default() });
+        let i = args.iter().position(|a| a == "--js-runtimes").expect("--js-runtimes");
+        assert_eq!(args[i + 1], r"deno:C:\omni\bin\deno.exe");
+        assert!(!args_for(&DownloadOpts::default()).iter().any(|a| a == "--js-runtimes"));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Downloader::new(dir.path().join("yt-dlp.exe")).deno.is_none());
+        std::fs::write(dir.path().join("deno.exe"), b"x").unwrap();
+        assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe")).deno, Some(dir.path().join("deno.exe")));
     }
 
     #[test]

@@ -125,6 +125,11 @@ impl ErrorCode {
         matches!(
             self,
             Self::Network
+                // A bare 403 is a CDN or platform refusing for now: YouTube
+                // turned two videos away for a few minutes on 2026-10-06
+                // that downloaded fine minutes later. Geo blocks and logins
+                // have codes of their own and are not retried.
+                | Self::Http403
                 | Self::DeliveryFailed
                 | Self::LowDisk
                 | Self::DownloadTimeout
@@ -153,7 +158,7 @@ impl ErrorCode {
     pub fn hint_el(&self) -> &'static str {
         match self {
             Self::UnsupportedUrl => "Δεν αναγνωρίζεται η σελίδα. Δοκιμάστε απευθείας σύνδεσμο βίντεο.",
-            Self::Http403 => "Η πηγή μπλοκάρει την απευθείας λήψη. Δοκιμάστε ξανά ή δώστε άλλο σύνδεσμο.",
+            Self::Http403 => "Η πηγή αρνήθηκε τη λήψη. Έγιναν αυτόματες επαναλήψεις χωρίς επιτυχία· πατήστε «Δοκιμή ξανά» αργότερα ή δώστε άλλο σύνδεσμο.",
             Self::LoginRequired => "Απαιτείται σύνδεση. Ανεβάστε cookies για αυτόν τον ιστότοπο (Διαχείριση → Cookies).",
             Self::GeoBlocked => "Το βίντεο δεν είναι διαθέσιμο από την Ελλάδα.",
             Self::PrivateOrRemoved => "Το βίντεο είναι ιδιωτικό ή έχει αφαιρεθεί. Ζητήστε άλλον σύνδεσμο.",
@@ -190,7 +195,15 @@ impl ErrorCode {
     /// yt-dlp's extractor knows which video belongs to the post; the page does
     /// not. An X reply without a video of its own plays the thread parent's,
     /// and sniffing it delivered someone else's video under the reply's name.
+    ///
+    /// YouTube: never. Its page holds sign-in and recommendation links, not
+    /// a stream the browser can see, and sniffing it after a 403 on
+    /// 2026-10-06 "found" a video id read out of a `/ServiceLogin` link,
+    /// which then failed under a misleading error.
     pub fn should_sniff(&self, url: &str) -> bool {
+        if crate::downloader::is_youtube(url) {
+            return false;
+        }
         !crate::downloader::is_video_platform(url) || self.should_try_sniffer()
     }
 }
@@ -368,6 +381,7 @@ mod tests {
     fn only_genuinely_transient_failures_are_retried() {
         for retryable in [
             ErrorCode::Network,
+            ErrorCode::Http403,
             ErrorCode::DeliveryFailed,
             ErrorCode::LowDisk,
             ErrorCode::DownloadTimeout,
@@ -427,6 +441,12 @@ mod tests {
         // Transient: retried, not sniffed.
         assert!(!ErrorCode::Network.should_sniff(reply));
         assert!(ErrorCode::Http403.should_sniff(reply));
+        // YouTube's own extractor is the only way to its video.
+        for yt in ["https://www.youtube.com/watch?v=Eksg5qHdZho&t=89s", "https://youtu.be/l0lr6MGpMu4"] {
+            for code in [ErrorCode::Http403, ErrorCode::UnsupportedUrl, ErrorCode::PipelineFailed] {
+                assert!(!code.should_sniff(yt), "{code} sniffed {yt}");
+            }
+        }
         // An article is sniffed whatever yt-dlp said.
         assert!(ErrorCode::PipelineFailed.should_sniff(article));
         assert!(ErrorCode::UnsupportedUrl.should_sniff(article));

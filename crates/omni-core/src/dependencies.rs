@@ -34,6 +34,8 @@ impl DependencyManager {
             ("ffmpeg", "ffmpeg.exe", "-version"),
             ("ffprobe", "ffprobe.exe", "-version"),
             ("bmxtranswrap", "bmxtranswrap.exe", ""),
+            // yt-dlp's JavaScript runtime for YouTube (plan P6.8).
+            ("deno", "deno.exe", "--version"),
         ];
 
         let mut results = Vec::new();
@@ -92,7 +94,7 @@ impl DependencyManager {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let combined = format!("{}\n{}", stdout, stderr);
 
-                if name == "yt-dlp" {
+                if name == "yt-dlp" || name == "deno" {
                     stdout.lines().next().unwrap_or("Installed").trim().to_string()
                 } else if name == "ffmpeg" || name == "ffprobe" {
                     let re = Regex::new(r"version\s+([^\s]+)").unwrap();
@@ -304,6 +306,163 @@ impl DependencyManager {
         self.stage_ytdl(channel).await?;
         self.apply_staged_ytdl()
     }
+
+    // ------------------------------------------------------------------
+    // Deno: the JavaScript runtime yt-dlp needs for YouTube (plan P6.8)
+    // ------------------------------------------------------------------
+    //
+    // Since late 2025 yt-dlp solves YouTube's JavaScript challenge with an
+    // external runtime. Without one it falls back to YouTube clients that
+    // are deprecated, and downloads fail at random with HTTP 403 (two jobs
+    // on 2026-10-06). yt-dlp.exe bundles the solver; only the runtime is
+    // missing, and it is fetched like yt-dlp: verified, staged, previous
+    // build kept.
+
+    pub fn deno_live(&self) -> PathBuf {
+        self.bin_dir.join("deno.exe")
+    }
+    pub fn deno_previous(&self) -> PathBuf {
+        self.bin_dir.join("deno.exe.prev")
+    }
+
+    /// `deno --version`'s first line ("deno 2.9.7 (stable, …)") reduced to
+    /// "2.9.7"; `None` when there is no working deno.
+    pub fn deno_version(&self) -> Option<String> {
+        let live = self.deno_live();
+        if !live.is_file() {
+            return None;
+        }
+        let out = self.get_tool_version(&live, "deno", "--version");
+        parse_deno_version(&out)
+    }
+
+    /// The newest Deno release tag ("v2.9.7").
+    pub async fn latest_deno_tag(&self) -> Result<String> {
+        let client = reqwest::Client::builder()
+            .user_agent("OmniDownloader-Rust/1.0")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let resp = client
+            .get("https://api.github.com/repos/denoland/deno/releases/latest")
+            .send()
+            .await
+            .context("Deno release lookup failed")?
+            .error_for_status()
+            .context("Deno release lookup failed")?
+            .json::<serde_json::Value>()
+            .await?;
+        resp.get("tag_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("the Deno release has no tag"))
+    }
+
+    /// Download the latest Deno, check it against the release's SHA-256,
+    /// prove it runs, and put it in place (the old one kept as `.prev`).
+    /// Returns the installed version.
+    pub async fn install_deno(&self) -> Result<String> {
+        const ZIP: &str = "deno-x86_64-pc-windows-msvc.zip";
+        let base = "https://github.com/denoland/deno/releases/latest/download";
+        let client = reqwest::Client::builder()
+            .user_agent("OmniDownloader-Rust/1.0")
+            .timeout(std::time::Duration::from_secs(600))
+            .build()?;
+
+        let sums = client
+            .get(format!("{base}/{ZIP}.sha256sum"))
+            .send()
+            .await
+            .context("Failed fetching the Deno checksum")?
+            .error_for_status()
+            .context("Deno checksum request failed")?
+            .text()
+            .await?;
+        let expected = sha256_in_text(&sums)
+            .ok_or_else(|| anyhow::anyhow!("the Deno checksum file has no SHA-256; refusing an unverified binary"))?;
+
+        info!("Downloading Deno from {base}/{ZIP}");
+        let bytes = client
+            .get(format!("{base}/{ZIP}"))
+            .send()
+            .await
+            .context("Failed downloading Deno")?
+            .error_for_status()
+            .context("Deno download failed")?
+            .bytes()
+            .await?;
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            anyhow::bail!(
+                "Deno failed checksum verification (expected {expected}, got {actual}, {} bytes). Nothing was installed.",
+                bytes.len()
+            );
+        }
+
+        let exe = extract_from_zip(&bytes, "deno.exe")?;
+        let staged = self.bin_dir.join("deno.exe.staged");
+        std::fs::write(&staged, &exe).with_context(|| format!("Failed writing {staged:?}"))?;
+        let version = parse_deno_version(&self.get_tool_version(&staged, "deno", "--version"));
+        let Some(version) = version else {
+            let _ = std::fs::remove_file(&staged);
+            anyhow::bail!("the downloaded Deno does not run on this machine; nothing was installed");
+        };
+
+        let live = self.deno_live();
+        let prev = self.deno_previous();
+        if live.exists() {
+            let _ = std::fs::remove_file(&prev);
+            std::fs::rename(&live, &prev).with_context(|| format!("Failed moving {live:?} aside"))?;
+        }
+        if let Err(e) = std::fs::rename(&staged, &live) {
+            if prev.exists() {
+                let _ = std::fs::rename(&prev, &live);
+            }
+            return Err(e).with_context(|| format!("Failed installing Deno as {live:?}"));
+        }
+        info!("Deno {version} installed at {live:?} (sha256 {})", &actual[..16]);
+        Ok(version)
+    }
+
+    /// Put the previous Deno back after an update that made things worse.
+    pub fn rollback_deno(&self) -> Result<()> {
+        let prev = self.deno_previous();
+        if !prev.exists() {
+            anyhow::bail!("No previous Deno to roll back to");
+        }
+        let live = self.deno_live();
+        let _ = std::fs::remove_file(&live);
+        std::fs::rename(&prev, &live)?;
+        info!("Rolled Deno back to the previous build");
+        Ok(())
+    }
+}
+
+/// "deno 2.9.7 (stable, release, x86_64-pc-windows-msvc)" → "2.9.7".
+pub fn parse_deno_version(output: &str) -> Option<String> {
+    let line = output.lines().find(|l| l.trim_start().starts_with("deno "))?;
+    let v = line.trim_start().strip_prefix("deno ")?.split_whitespace().next()?;
+    (v.chars().next()?.is_ascii_digit()).then(|| v.to_string())
+}
+
+/// The SHA-256 in a checksum file of any common shape: coreutils
+/// (`<hex>  name`) or PowerShell's `Get-FileHash` table (`Hash : <HEX>`),
+/// which is what Deno publishes for Windows.
+pub fn sha256_in_text(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_hexdigit())
+        .find(|t| t.len() == 64)
+        .map(|t| t.to_ascii_lowercase())
+}
+
+/// One file out of a zip held in memory.
+fn extract_from_zip(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("the Deno download is not a zip file")?;
+    let mut file = archive
+        .by_name(name)
+        .with_context(|| format!("the Deno download has no {name}"))?;
+    let mut out = Vec::with_capacity(file.size() as usize);
+    file.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// A verified, staged tool binary.
@@ -359,6 +518,42 @@ fn which(exe_name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn deno_checksums_and_versions_read_in_the_shapes_deno_publishes() {
+        // What deno-x86_64-pc-windows-msvc.zip.sha256sum contains (v2.9.7).
+        let ps = "\r\nAlgorithm : SHA256\r\nHash      : A0C3101B4158D1DFB7D6A78A7BF0F3DE80C96BB423C152BEEC8BEB22786F2238\r\nPath      : C:\\a\\deno\\deno-x86_64-pc-windows-msvc.zip\r\n";
+        assert_eq!(
+            sha256_in_text(ps).as_deref(),
+            Some("a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238")
+        );
+        assert_eq!(
+            sha256_in_text("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  deno.zip").map(|s| s.len()),
+            Some(64)
+        );
+        assert_eq!(sha256_in_text("no hash here, only deadbeef"), None);
+
+        assert_eq!(
+            parse_deno_version("deno 2.9.7 (stable, release, x86_64-pc-windows-msvc)\nv8 14.1\ntypescript 5.9").as_deref(),
+            Some("2.9.7")
+        );
+        assert_eq!(parse_deno_version("Error running binary"), None);
+    }
+
+    #[test]
+    fn deno_is_taken_out_of_its_release_zip() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            z.start_file("deno.exe", zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(b"MZ fake exe").unwrap();
+            z.finish().unwrap();
+        }
+        assert_eq!(extract_from_zip(buf.get_ref(), "deno.exe").unwrap(), b"MZ fake exe");
+        assert!(extract_from_zip(buf.get_ref(), "other.exe").is_err());
+        assert!(extract_from_zip(b"not a zip", "deno.exe").is_err());
+    }
 
     #[test]
     fn a_checksum_file_is_parsed_the_way_github_writes_it() {
