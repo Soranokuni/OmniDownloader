@@ -863,6 +863,139 @@ impl Repository {
         Ok(list)
     }
 
+    /// One page of an MCR desk list (plan P7.1). The WHERE clauses are
+    /// fixed text chosen by `view`; every value is a bound parameter.
+    pub fn list_jobs_page(
+        &self,
+        view: crate::models::JobsView,
+        filter: &crate::models::JobsFilter,
+        page: i64,
+        per_page: i64,
+    ) -> Result<crate::models::JobPage> {
+        use crate::models::JobsView;
+        let per_page = per_page.clamp(5, 100);
+        let page = page.max(1);
+
+        let (scope, order) = match view {
+            JobsView::Live => (
+                "(status IN ('PENDING','RUNNING') OR (status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL))",
+                // Working first, then waiting in the order they will run,
+                // then delivered, newest first.
+                "CASE WHEN status = 'RUNNING' THEN 0 WHEN status = 'PENDING' THEN 1 ELSE 2 END, \
+                 CASE WHEN status IN ('RUNNING','PENDING') THEN -priority ELSE 0 END, \
+                 CASE WHEN status IN ('RUNNING','PENDING') THEN created_at END ASC, \
+                 COALESCE(completed_at, updated_at) DESC, id DESC",
+            ),
+            JobsView::Review => (
+                "status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')",
+                "updated_at DESC, id DESC",
+            ),
+            JobsView::Completed => (
+                "status IN ('COMPLETED','COMPLETED_MANUAL')",
+                "COALESCE(completed_at, updated_at) DESC, id DESC",
+            ),
+        };
+
+        let mut clauses = vec![scope.to_string()];
+        let mut values: Vec<String> = Vec::new();
+        let search = filter.search.trim();
+        if !search.is_empty() {
+            let like = format!(
+                "%{}%",
+                search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            clauses.push(
+                "(slug LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR keyword LIKE ? ESCAPE '\\' OR journalist LIKE ? ESCAPE '\\')"
+                    .into(),
+            );
+            values.extend(std::iter::repeat(like).take(4));
+        }
+        if !filter.journalist.trim().is_empty() {
+            clauses.push("journalist = ?".into());
+            values.push(filter.journalist.trim().to_uppercase());
+        }
+        match filter.group.trim() {
+            "" => {}
+            "-" => clauses.push("group_code IS NULL".into()),
+            code => {
+                clauses.push("group_code = ?".into());
+                values.push(code.to_string());
+            }
+        }
+        let where_sql = clauses.join(" AND ");
+
+        let conn = self.pool.get()?;
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM queue WHERE {where_sql}"),
+            rusqlite::params_from_iter(values.iter()),
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM queue WHERE {where_sql} ORDER BY {order} LIMIT {per_page} OFFSET {}",
+            (page - 1) * per_page
+        ))?;
+        let jobs = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), Self::map_job_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(crate::models::JobPage { jobs, total, page, per_page })
+    }
+
+    /// Tab badge counts for the MCR desk, in one query.
+    pub fn job_counts(&self) -> Result<crate::models::JobCounts> {
+        let conn = self.pool.get()?;
+        Ok(conn.query_row(
+            r#"
+            SELECT
+              COALESCE(SUM(status IN ('PENDING','RUNNING')), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL), 0),
+              COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL')), 0)
+            FROM queue
+            "#,
+            [],
+            |r| {
+                Ok(crate::models::JobCounts {
+                    active: r.get(0)?,
+                    finished: r.get(1)?,
+                    review: r.get(2)?,
+                    completed: r.get(3)?,
+                })
+            },
+        )?)
+    }
+
+    /// Take delivered jobs off the live queue. They are not deleted: the
+    /// Completed list still has them. Returns how many were cleared.
+    pub fn clear_finished_jobs(&self) -> Result<usize> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute(
+            "UPDATE queue SET cleared_at = ? WHERE status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL",
+            params![timestamps::now_string()],
+        )?)
+    }
+
+    /// Run a delivered job again from its link (plan P7.1): the file was
+    /// deleted, or the wrong video came out. Everything about the last run
+    /// is reset; the new file is delivered next to the old one if that is
+    /// still there (`_2`), never over it. `false` if the job is not a
+    /// delivered one.
+    pub fn redownload_job(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
+                file_path = NULL, delivered_at = NULL, completed_at = NULL, cleared_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND status IN ('COMPLETED','COMPLETED_MANUAL')
+            "#,
+            params![timestamps::now_string(), id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<()> {
         let conn = self.pool.get()?;
         if let Some(url) = new_url {

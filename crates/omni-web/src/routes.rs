@@ -364,6 +364,23 @@ pub use omni_core::auth::validate_password;
 pub struct JobsQuery {
     my: Option<bool>,
     journalist: Option<String>,
+    /// `live`, `review` or `completed`: one page of an MCR desk list
+    /// (plan P7.1). Without it, the old unpaged list.
+    view: Option<omni_core::models::JobsView>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+    q: Option<String>,
+    group: Option<String>,
+}
+
+/// A job as the MCR desk shows it: the row, plus what its error code means
+/// and what to do about it, in the operators' language.
+fn job_for_desk(job: &omni_core::models::Job) -> serde_json::Value {
+    let mut v = serde_json::to_value(job).unwrap_or_default();
+    if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
+        v["hint"] = serde_json::Value::String(code.hint_el().to_string());
+    }
+    v
 }
 
 pub async fn api_get_jobs(
@@ -371,6 +388,26 @@ pub async fn api_get_jobs(
     Query(query): Query<JobsQuery>,
     State(state): State<AppState>,
 ) -> JsonResult {
+    if let Some(view) = query.view {
+        let filter = omni_core::models::JobsFilter {
+            search: query.q.clone().unwrap_or_default(),
+            journalist: query.journalist.clone().unwrap_or_default(),
+            group: query.group.clone().unwrap_or_default(),
+        };
+        let page = state
+            .repo
+            .list_jobs_page(view, &filter, query.page.unwrap_or(1), query.per_page.unwrap_or(20))
+            .map_err(internal_error("Could not read the job queue."))?;
+        let counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+        let jobs: Vec<serde_json::Value> = page.jobs.iter().map(job_for_desk).collect();
+        return Ok(Json(serde_json::json!({
+            "jobs": jobs,
+            "total": page.total,
+            "page": page.page,
+            "per_page": page.per_page,
+            "counts": counts,
+        })));
+    }
     let jobs = if query.my == Some(true) {
         let Some(user) = principal.user() else {
             return Err(ApiError::unauthorized());
@@ -619,6 +656,44 @@ pub async fn api_retry_job(
         .map_err(internal_error("Could not retry the job."))?;
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// Take every delivered job off the live queue. Nothing is deleted.
+pub async fn api_clear_finished(RequireMcr(principal): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let cleared = state
+        .repo
+        .clear_finished_jobs()
+        .map_err(internal_error("Could not clear the finished jobs."))?;
+    audit_action(&state, &principal, &format!("Cleared {cleared} finished job(s) from the live queue"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "cleared": cleared })))
+}
+
+/// Download and convert a delivered job again from its link: the file was
+/// deleted, or something went wrong with it.
+pub async fn api_redownload_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let done = state
+        .repo
+        .redownload_job(job_id)
+        .map_err(internal_error("Could not queue the job again."))?;
+    if !done {
+        return Err(ApiError::bad_request(
+            "Only a delivered job can be downloaded again. For one that needs attention, use Try again.",
+        ));
+    }
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Download again requested by {}", principal.audit_label()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: download again"));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }

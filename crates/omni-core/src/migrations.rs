@@ -369,6 +369,16 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
             ('News article, YouTube embed', 'https://www.bovary.gr/people-and-style/glam-stars/tzoni-ntep-entyposiaki-metamorfosi-gkriza-mallia');
         "#,
     ),
+    (
+        11,
+        // MCR desk paging (plan P7.1): "Clear finished" takes delivered jobs
+        // off the live queue without deleting them; they stay under
+        // Completed, where they can be downloaded again.
+        r#"
+        ALTER TABLE queue ADD COLUMN cleared_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_queue_status_completed ON queue(status, completed_at);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

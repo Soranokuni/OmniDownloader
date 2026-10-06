@@ -286,7 +286,18 @@ const MATRIX: &[Row] = &[
         "POST",
         "/api/jobs/1/retry",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
-    ),    (
+    ),    // MCR desk (plan P7.1): download a delivered job again; clear the live list.
+    (
+        "POST",
+        "/api/jobs/1/redownload",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/clear-finished",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
         "POST",
         "/api/jobs/1/offers/queue",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
