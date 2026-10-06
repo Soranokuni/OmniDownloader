@@ -7,13 +7,14 @@
  * that exact text in the operator's browser and nothing else happens.
  *
  * The desk is written for operators who are not technical and for people on
- * their first shift: every list says what it holds, every button says what it
- * does, and anything that cannot be undone asks first, in plain words.
+ * their first shift, in Greek: every list says what it holds, every button
+ * says what it does, and anything that cannot be undone asks first, in plain
+ * words.
  */
 
 import {
   api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref,
-} from '/static/app.js?v=3';
+} from '/static/app.js?v=4';
 
 let currentTab = 'queue';
 let journalists = [];
@@ -24,36 +25,44 @@ let journalists = [];
 
 /** What a job is doing, for a person. */
 const STAGE_TEXT = {
-  QUEUED: 'Waiting its turn',
-  EXTRACT: 'Finding the video on the page',
-  DOWNLOAD: 'Downloading',
-  PROBE: 'Checking the downloaded file',
-  TRANSCODE: 'Converting to the broadcast format',
-  REWRAP: 'Packaging as MXF',
-  VERIFY: 'Checking the broadcast format',
-  DELIVER: 'Delivering to the Dalet watchfolder',
-  ARCHIVE: 'Archiving',
-  DONE: 'Finishing',
+  QUEUED: 'Σε αναμονή',
+  EXTRACT: 'Αναζήτηση του βίντεο στη σελίδα',
+  DOWNLOAD: 'Λήψη',
+  PROBE: 'Έλεγχος του αρχείου που κατέβηκε',
+  TRANSCODE: 'Μετατροπή στη μορφή εκπομπής',
+  REWRAP: 'Πακετάρισμα σε MXF',
+  VERIFY: 'Έλεγχος προδιαγραφών εκπομπής',
+  DELIVER: 'Παράδοση στο watchfolder του Dalet',
+  ARCHIVE: 'Αρχειοθέτηση',
+  DONE: 'Ολοκλήρωση',
 };
 const STAGE_ORDER = ['EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER'];
 
 function stageLine(job) {
-  if (job.status === 'PENDING') return 'Waiting its turn';
-  const text = STAGE_TEXT[job.stage] || 'Working';
+  if (job.status === 'PENDING') return 'Σε αναμονή';
+  const text = STAGE_TEXT[job.stage] || 'Σε επεξεργασία';
   const step = STAGE_ORDER.indexOf(job.stage);
-  return step >= 0 ? `Step ${step + 1} of ${STAGE_ORDER.length} · ${text}` : text;
+  return step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ${text}` : text;
 }
 
 function statusBadge(job) {
   switch (job.status) {
-    case 'PENDING': return el('span', { class: 'badge' }, 'Waiting');
-    case 'RUNNING': return el('span', { class: 'badge info' }, 'Working');
-    case 'COMPLETED': return el('span', { class: 'badge ok' }, 'Delivered');
-    case 'COMPLETED_MANUAL': return el('span', { class: 'badge ok' }, 'Delivered by hand');
-    case 'MANUAL_DOWNLOAD': return el('span', { class: 'badge warn' }, 'Download by hand');
-    case 'FAILED': return el('span', { class: 'badge bad' }, 'Failed');
-    default: return el('span', { class: 'badge warn' }, 'Needs attention');
+    case 'PENDING': return el('span', { class: 'badge' }, 'Σε αναμονή');
+    case 'RUNNING': return el('span', { class: 'badge info' }, 'Σε επεξεργασία');
+    case 'COMPLETED': return el('span', { class: 'badge ok' }, 'Παραδόθηκε');
+    case 'COMPLETED_MANUAL': return el('span', { class: 'badge ok' }, 'Παραδόθηκε χειροκίνητα');
+    case 'MANUAL_DOWNLOAD': return el('span', { class: 'badge warn' }, 'Χειροκίνητη λήψη');
+    case 'FAILED': return el('span', { class: 'badge bad' }, 'Απέτυχε');
+    default: return el('span', { class: 'badge warn' }, 'Χρειάζεται έλεγχο');
   }
+}
+
+/** "Μόνο τα 2 πρώτα βίντεο", when the journalist asked for that. */
+function limitNote(job) {
+  const n = Number(job.max_videos) || 0;
+  if (!n) return null;
+  return el('span', { class: 'badge', style: 'margin-left:8px', title: 'Όπως ζήτησε ο δημοσιογράφος· τα υπόλοιπα βίντεο του άρθρου προτείνονται για προσθήκη' },
+    n === 1 ? 'Μόνο το πρώτο βίντεο' : `Μόνο τα ${n} πρώτα βίντεο`);
 }
 
 function fileName(job) {
@@ -99,13 +108,13 @@ const DOT = { ok: 'ok', degraded: 'warn', down: 'bad' };
 
 /** Check names as an operator reads them in the banner. */
 const CHECK_NAME = {
-  tools: 'Tools',
-  encoder: 'Encoder',
+  tools: 'Εργαλεία',
+  encoder: 'Κωδικοποιητής',
   watchfolder: 'Watchfolder',
-  browser: 'Browser',
-  disk: 'Disk',
-  queue: 'Queue',
-  selfcheck: 'Self-check',
+  browser: 'Πρόγραμμα περιήγησης',
+  disk: 'Δίσκος',
+  queue: 'Ουρά',
+  selfcheck: 'Αυτοέλεγχος',
 };
 
 async function loadStatus() {
@@ -113,8 +122,8 @@ async function loadStatus() {
   try {
     data = await api('/api/system/status');
   } catch {
-    setStatus('mail', 'Mail: unknown', 'bad', '');
-    setStatus('llm', 'LLM: unknown', 'bad', '');
+    setStatus('mail', 'Email: άγνωστο', 'bad', '');
+    setStatus('llm', 'LLM: άγνωστο', 'bad', '');
     return;
   }
 
@@ -125,7 +134,7 @@ async function loadStatus() {
   // "Ready", which said the mailbox was fine while it was refusing the
   // password (defect W-09).
   const mail = checks.mail || { state: 'ok' };
-  setStatus('mail', `Mail: ${label(mail)}`, DOT[mail.state] || '', mail.detail || '');
+  setStatus('mail', `Email: ${label(mail)}`, DOT[mail.state] || '', mail.detail || '');
 
   const llm = checks.llm || { state: 'ok' };
   setStatus('llm', `LLM: ${label(llm)}`, DOT[llm.state] || '', llm.detail || '');
@@ -134,8 +143,8 @@ async function loadStatus() {
   const storage = document.getElementById('storage-status');
   storage.textContent =
     free === undefined || free === null
-      ? 'Watchfolder: unknown'
-      : `Watchfolder: ${free.toFixed(1)} GB free`;
+      ? 'Watchfolder: άγνωστο'
+      : `Watchfolder: ${free.toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`;
   // Whatever the watchfolder check says is the authoritative word on whether
   // delivery will work at all.
   const wf = checks.watchfolder;
@@ -152,10 +161,10 @@ async function loadStatus() {
   } else {
     banner.hidden = false;
     render(banner, el('div', { class: 'card attention' },
-      el('strong', {}, data.status === 'down' ? 'Ingest is blocked. ' : 'Attention. '),
+      el('strong', {}, data.status === 'down' ? 'Η λήψη βίντεο έχει σταματήσει. ' : 'Προσοχή. '),
       problems.join(' · '),
       el('span', { class: 'note', style: 'display:block;margin-top:6px' },
-        'Tell the engineer on call; the Administration page has the detail.'),
+        'Ενημερώστε τον μηχανικό βάρδιας· η σελίδα «Διαχείριση» έχει τις λεπτομέρειες.'),
     ));
   }
 }
@@ -163,9 +172,9 @@ async function loadStatus() {
 function label(check) {
   switch (check.state) {
     case 'ok': return 'OK';
-    case 'degraded': return 'degraded';
-    case 'down': return 'down';
-    default: return 'unknown';
+    case 'degraded': return 'με πρόβλημα';
+    case 'down': return 'εκτός λειτουργίας';
+    default: return 'άγνωστο';
   }
 }
 
@@ -187,8 +196,8 @@ const pages = {
   completed: { page: 1, perPage: 25 },
 };
 
-/** "Showing 26–50 of 132  ‹ Previous  Page 2 of 6  Next ›". Hidden when
- *  everything fits on one page. */
+/** "Εμφανίζονται 26–50 από 132  ‹ Προηγούμενη  Σελίδα 2 από 6  Επόμενη ›".
+ *  Hidden when everything fits on one page. */
 function pager(targetId, state, total, onChange) {
   const pageCount = Math.max(1, Math.ceil(total / state.perPage));
   if (state.page > pageCount) state.page = pageCount;
@@ -200,13 +209,13 @@ function pager(targetId, state, total, onChange) {
   const last = Math.min(total, state.page * state.perPage);
   const go = (p) => { state.page = p; onChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); };
   render(targetId, el('div', { class: 'section-head card', style: 'padding:10px 14px' },
-    el('span', { class: 'note' }, `Showing ${first}–${last} of ${total}`),
+    el('span', { class: 'note' }, `Εμφανίζονται ${first}–${last} από ${total}`),
     el('div', { class: 'row tight' },
-      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(1) }, '« First'),
-      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(state.page - 1) }, '‹ Previous'),
-      el('span', { class: 'note', style: 'padding:0 8px' }, `Page ${state.page} of ${pageCount}`),
-      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(state.page + 1) }, 'Next ›'),
-      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(pageCount) }, 'Last »'),
+      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(1) }, '« Πρώτη'),
+      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(state.page - 1) }, '‹ Προηγούμενη'),
+      el('span', { class: 'note', style: 'padding:0 8px' }, `Σελίδα ${state.page} από ${pageCount}`),
+      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(state.page + 1) }, 'Επόμενη ›'),
+      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(pageCount) }, 'Τελευταία »'),
     ),
   ));
 }
@@ -230,8 +239,8 @@ function showCounts(counts) {
   const clear = document.getElementById('clear-finished');
   clear.disabled = !counts.finished;
   clear.textContent = counts.finished
-    ? `Clear delivered from this list (${counts.finished})`
-    : 'Clear delivered from this list';
+    ? `Αφαίρεση παραδοθέντων από τη λίστα (${counts.finished})`
+    : 'Αφαίρεση παραδοθέντων από τη λίστα';
   clear.dataset.count = String(counts.finished || 0);
 }
 
@@ -267,8 +276,9 @@ function failed(e) {
  * ------------------------------------------------------------------ */
 
 /* Videos the sniffer found in a submitted article and left for MCR to
- * decide (raw page streams, and platform posts beyond the automatic limit).
- * Platform posts within the limit were already queued as 1B, 1C, … */
+ * decide (raw page streams, platform posts beyond the automatic limit, and
+ * the ones past a journalist's "first N"). Platform posts within the limit
+ * were already queued as 1B, 1C, … */
 function offersOf(job) {
   if (!job.candidates_json) return [];
   try {
@@ -286,24 +296,24 @@ function renderOffers(targetId, jobs) {
     return;
   }
   render(targetId, el('div', { class: 'card stack' },
-    el('h3', { class: 'job-name' }, 'More videos were found in these articles'),
+    el('h3', { class: 'job-name' }, 'Βρέθηκαν κι άλλα βίντεο σε αυτά τα άρθρα'),
     el('p', { class: 'note', style: 'margin:0' },
-      'They were not added on their own. Open one to look, and add it if it belongs to the story.'),
+      'Δεν προστέθηκαν αυτόματα. Ανοίξτε ένα για να το δείτε και προσθέστε το αν ανήκει στο θέμα.'),
     ...withOffers.flatMap((job) => offersOf(job).map((offer) => {
       const href = safeHref(offer.url);
       return el('div', { class: 'job-head', style: 'border-top:1px solid var(--line);padding-top:10px' },
         el('div', {},
           el('p', { class: 'job-meta' },
-            `From job #${job.id} (${fileName(job)}) — would be ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
+            `Από την εργασία #${job.id} (${fileName(job)}) — θα γίνει ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
           el('p', { class: 'job-url', title: offer.url }, offer.url),
         ),
         el('div', { class: 'row tight' },
-          href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Open') : null,
+          href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα') : null,
           el('button', {
             class: 'btn btn-warn',
             type: 'button',
             onClick: () => queueOffer(job.id, offer),
-          }, `Add as ${offer.index_str}`),
+          }, `Προσθήκη ως ${offer.index_str}`),
         ),
       );
     })),
@@ -313,7 +323,7 @@ function renderOffers(targetId, jobs) {
 async function queueOffer(id, offer) {
   try {
     const r = await api(`/api/jobs/${id}/offers/queue`, { method: 'POST', body: { url: offer.url } });
-    toast(`Added as ${r.index_str} (job #${r.job_id}).`, 'ok');
+    toast(`Προστέθηκε ως ${r.index_str} (εργασία #${r.job_id}).`, 'ok');
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -332,7 +342,7 @@ async function loadQueue() {
   renderOffers('article-offers', jobs);
   if (jobs.length === 0) {
     render('queue-cards', el('div', { class: 'card center' },
-      'Nothing is waiting. New links from email appear here on their own.'));
+      'Δεν περιμένει τίποτα. Οι νέοι σύνδεσμοι από email εμφανίζονται εδώ αυτόματα.'));
   } else {
     render('queue-cards', jobs.map((j) => (j.status === 'PENDING' || j.status === 'RUNNING' ? activeCard(j) : deliveredCard(j))));
   }
@@ -356,9 +366,9 @@ function activeCard(job) {
         el('button', {
           class: 'btn btn-danger',
           type: 'button',
-          title: 'Take this video off the queue',
+          title: 'Αφαίρεση του βίντεο από την ουρά',
           onClick: () => discardJob(job),
-        }, 'Remove'),
+        }, 'Αφαίρεση'),
       ),
     ),
     el('div', {},
@@ -371,9 +381,10 @@ function activeCard(job) {
             el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` }))
         : null,
       el('div', { class: 'job-meta' },
-        el('span', {}, `Journalist: ${job.journalist}`,
-          job.group_code ? el('span', { class: 'badge info', style: 'margin-left:8px', title: groupName(job.group_code) }, job.group_code) : null),
-        el('span', {}, running && job.eta && job.eta !== '--:--' ? `About ${job.eta} left` : ''),
+        el('span', {}, `Δημοσιογράφος: ${job.journalist}`,
+          job.group_code ? el('span', { class: 'badge info', style: 'margin-left:8px', title: groupName(job.group_code) }, job.group_code) : null,
+          limitNote(job)),
+        el('span', {}, running && job.eta && job.eta !== '--:--' ? `Απομένουν περίπου ${job.eta}` : ''),
       ),
     ),
   );
@@ -387,12 +398,13 @@ function deliveredCard(job) {
         el('div', {},
           el('h3', { class: 'job-name' }, deliveredName(job)),
           el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
-            `Delivered ${fmtTime(job.completed_at || job.updated_at)} · ${fmtDuration(job.duration_secs)} · ${job.journalist}`),
+            `Παραδόθηκε ${fmtTime(job.completed_at || job.updated_at)} · ${fmtDuration(job.duration_secs)} · ${job.journalist}`,
+            limitNote(job)),
         ),
       ),
       el('div', { class: 'row tight' },
         statusBadge(job),
-        el('button', { class: 'btn', type: 'button', onClick: () => redownload(job) }, 'Download again'),
+        el('button', { class: 'btn', type: 'button', onClick: () => redownload(job) }, 'Νέα λήψη'),
       ),
     ),
   );
@@ -402,12 +414,12 @@ document.getElementById('clear-finished').addEventListener('click', async (event
   const n = Number(event.currentTarget.dataset.count || 0);
   if (!n) return;
   if (!confirm(
-    `Take the ${n} delivered video(s) off the live queue?\n\n` +
-    'Nothing is deleted. They stay under Completed, where you can download them again.',
+    `Να φύγουν ${n === 1 ? 'το 1 παραδοθέν βίντεο' : `τα ${n} παραδοθέντα βίντεο`} από τη λίστα «Σε εξέλιξη»;\n\n` +
+    'Δεν διαγράφεται τίποτα. Μένουν στα «Ολοκληρωμένα», από όπου μπορείτε να τα κατεβάσετε ξανά.',
   )) return;
   try {
     const r = await api('/api/jobs/clear-finished', { method: 'POST' });
-    toast(`${r.cleared} delivered video(s) moved off the live queue. They are under Completed.`, 'ok');
+    toast(`${r.cleared} παραδοθέντα βίντεο έφυγαν από τη λίστα. Βρίσκονται στα «Ολοκληρωμένα».`, 'ok');
     pages.live.page = 1;
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
@@ -425,7 +437,7 @@ async function loadReview() {
   showCounts(data.counts);
   const jobs = data.jobs || [];
   if (jobs.length === 0) {
-    render('review-cards', el('div', { class: 'card center' }, 'Nothing needs attention.'));
+    render('review-cards', el('div', { class: 'card center' }, 'Δεν υπάρχει κάτι για έλεγχο.'));
   } else {
     render('review-cards', jobs.map(reviewCard));
   }
@@ -450,7 +462,7 @@ function reviewCard(job) {
           el('h3', { class: 'job-name' }, fileName(job)),
           el('p', { class: 'job-url', title: job.url }, job.url),
           el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
-            `Journalist: ${job.journalist} · since ${fmtTime(job.updated_at)}`),
+            `Δημοσιογράφος: ${job.journalist} · από ${fmtTime(job.updated_at)}`),
         ),
       ),
       statusBadge(job),
@@ -458,25 +470,25 @@ function reviewCard(job) {
     el('div', { class: 'reason' },
       el('strong', { style: 'display:block' }, job.hint
         || (locker
-          ? 'A file-transfer link: download the file from the link by hand and drop it in Dalet.'
-          : 'The video could not be captured automatically.')),
-      job.error_code ? el('span', { class: 'note mono' }, `Code: ${job.error_code}`) : null,
+          ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet.'
+          : 'Το βίντεο δεν ελήφθη αυτόματα.')),
+      job.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${job.error_code}`) : null,
     ),
     el('div', { class: 'row' },
-      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Open the link') : null,
-      locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Try again'),
-      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Remove'),
+      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
+      locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά'),
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
     ),
     locker ? null : el('div', {},
       el('label', { for: `override-${job.id}` },
-        'Or paste a different link to the same video (the post itself, or a direct .mp4 / .m3u8 link):'),
+        'Ή επικολλήστε άλλον σύνδεσμο για το ίδιο βίντεο (την ίδια την ανάρτηση, ή απευθείας σύνδεσμο .mp4 / .m3u8):'),
       el('div', { class: 'row' },
         el('div', { class: 'grow' }, input),
         el('button', {
           class: 'btn btn-warn',
           type: 'button',
           onClick: () => overrideJob(job, input.value),
-        }, 'Use this link'),
+        }, 'Χρήση αυτού του συνδέσμου'),
       ),
     ),
   );
@@ -485,29 +497,29 @@ function reviewCard(job) {
 async function retryJob(job) {
   try {
     await api(`/api/jobs/${job.id}/retry`, { method: 'POST' });
-    toast(`${fileName(job)} is back in the live queue.`, 'ok');
+    toast(`Το ${fileName(job)} μπήκε ξανά στην ουρά.`, 'ok');
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
 async function overrideJob(job, url) {
   const trimmed = (url || '').trim();
-  if (!trimmed) { toast('Paste a link first.', 'bad'); return; }
+  if (!trimmed) { toast('Επικολλήστε πρώτα έναν σύνδεσμο.', 'bad'); return; }
   try {
     await api(`/api/jobs/${job.id}/override`, { method: 'POST', body: { url: trimmed } });
-    toast(`${fileName(job)} is back in the live queue with the new link.`, 'ok');
+    toast(`Το ${fileName(job)} μπήκε ξανά στην ουρά με τον νέο σύνδεσμο.`, 'ok');
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
 async function discardJob(job) {
   if (!confirm(
-    `Remove ${fileName(job)} (job #${job.id})?\n\n` +
-    'It is taken off the lists for good. A file already delivered to Dalet is not touched.',
+    `Να αφαιρεθεί το ${fileName(job)} (εργασία #${job.id});\n\n` +
+    'Φεύγει οριστικά από τις λίστες. Ένα αρχείο που έχει ήδη παραδοθεί στο Dalet δεν επηρεάζεται.',
   )) return;
   try {
     await api(`/api/jobs/${job.id}/discard`, { method: 'POST' });
-    toast(`Job #${job.id} removed.`, 'ok');
+    toast(`Η εργασία #${job.id} αφαιρέθηκε.`, 'ok');
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -542,15 +554,17 @@ async function loadFilters() {
   } catch { /* the lists show codes and the filter stays at "all" */ }
   const surnames = journalists.map((x) => x.surname).filter(Boolean).sort();
   render(filterSelect,
-    el('option', { value: '' }, 'All journalists'),
+    el('option', { value: '' }, 'Όλοι οι δημοσιογράφοι'),
     surnames.map((name) => el('option', { value: name }, name)),
   );
   render(groupSelect,
-    el('option', { value: '' }, 'All groups'),
-    el('option', { value: '-' }, 'No group'),
+    el('option', { value: '' }, 'Όλες οι ομάδες'),
+    el('option', { value: '-' }, 'Χωρίς ομάδα'),
     [...groupNames.keys()].sort().map((code) => el('option', { value: code }, `${code} — ${groupName(code)}`)),
   );
-  render('m-journalists', surnames.map((name) => el('option', { value: name })));
+  render('m-journalists', journalists
+    .filter((x) => x.surname && x.surname !== 'MCR')
+    .map((x) => el('option', { value: x.surname }, x.full_name || x.surname)));
 }
 
 async function loadCompleted() {
@@ -568,7 +582,7 @@ async function loadCompleted() {
   if (jobs.length === 0) {
     const filtered = searchInput.value.trim() || filterSelect.value || groupSelect.value;
     render('completed-body', el('tr', {},
-      el('td', { colspan: '6', class: 'empty' }, filtered ? 'Nothing matches the search.' : 'Nothing delivered yet.')));
+      el('td', { colspan: '6', class: 'empty' }, filtered ? 'Τίποτα δεν ταιριάζει με την αναζήτηση.' : 'Δεν έχει παραδοθεί τίποτα ακόμη.')));
   } else {
     render('completed-body', jobs.map(completedRow));
   }
@@ -579,7 +593,7 @@ function completedRow(job) {
   const href = safeHref(job.url);
   return el('tr', {},
     el('td', {},
-      el('div', { class: 'strong' }, deliveredName(job)),
+      el('div', { class: 'strong' }, deliveredName(job), limitNote(job)),
       el('div', { class: 'note mono', title: job.url, style: 'max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, job.url),
     ),
     el('td', {}, el('span', { class: 'badge info' }, job.journalist)),
@@ -590,8 +604,8 @@ function completedRow(job) {
     el('td', {}, fmtDuration(job.duration_secs)),
     el('td', { class: 'right' },
       el('div', { class: 'row tight', style: 'justify-content:flex-end;flex-wrap:nowrap' },
-        href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Open the original link' }, 'Open link') : null,
-        el('button', { class: 'btn btn-primary', type: 'button', onClick: () => redownload(job) }, 'Download again'),
+        href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Άνοιγμα του αρχικού συνδέσμου' }, 'Άνοιγμα') : null,
+        el('button', { class: 'btn btn-primary', type: 'button', onClick: () => redownload(job) }, 'Νέα λήψη'),
       ),
     ),
   );
@@ -600,13 +614,13 @@ function completedRow(job) {
 async function redownload(job) {
   const name = deliveredName(job);
   if (!confirm(
-    `Download ${name} again?\n\n` +
-    'The video is fetched from its link, converted and delivered to the watchfolder once more. ' +
-    'If the old file is still there, the new one is saved next to it with a number added (…_2.mxf); nothing is overwritten.',
+    `Νέα λήψη του ${name};\n\n` +
+    'Το βίντεο κατεβαίνει από τον σύνδεσμό του, μετατρέπεται και παραδίδεται ξανά στο watchfolder. ' +
+    'Αν το παλιό αρχείο υπάρχει ακόμη, το νέο αποθηκεύεται δίπλα του με έναν αριθμό στο τέλος (…_2.mxf)· τίποτα δεν αντικαθίσταται.',
   )) return;
   try {
     await api(`/api/jobs/${job.id}/redownload`, { method: 'POST' });
-    toast(`${name} is back in the live queue.`, 'ok');
+    toast(`Το ${name} μπήκε ξανά στην ουρά.`, 'ok');
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -623,7 +637,7 @@ async function loadJournalists() {
 
   if (journalists.length === 0) {
     render('journalists-body', el('tr', {},
-      el('td', { colspan: '5', class: 'empty' }, 'No journalists configured.')));
+      el('td', { colspan: '5', class: 'empty' }, 'Δεν υπάρχουν δημοσιογράφοι.')));
     return;
   }
 
@@ -634,13 +648,13 @@ async function loadJournalists() {
     el('td', { class: 'num' }, String(j.default_priority)),
     el('td', { class: 'right' },
       j.surname === 'MCR'
-        // MCR is structural: the parser files every unresolved job under it
-        // and delivery uses it as a folder name.
-        ? el('span', { class: 'note' }, 'fallback')
+        // MCR is structural: unresolved jobs are filed under it and the desk
+        // addresses are recognised by it. It is never the journalist.
+        ? el('span', { class: 'note', title: 'Οι διευθύνσεις του MCR αναγνωρίζονται, αλλά το MCR δεν θεωρείται ποτέ δημοσιογράφος' }, 'σταθερό')
         : el('button', {
             class: 'btn btn-icon btn-danger',
             type: 'button',
-            title: `Delete ${j.surname}`,
+            title: `Διαγραφή ${j.surname}`,
             onClick: () => deleteJournalist(j.surname),
           }, '✕'),
     ),
@@ -661,7 +675,7 @@ document.getElementById('journalist-form').addEventListener('submit', async (eve
         priority: Number(document.getElementById('j-priority').value) || 0,
       },
     });
-    toast('Journalist saved.', 'ok');
+    toast('Ο δημοσιογράφος αποθηκεύτηκε.', 'ok');
     event.target.reset();
     document.getElementById('j-priority').value = '0';
     loadJournalists();
@@ -670,10 +684,10 @@ document.getElementById('journalist-form').addEventListener('submit', async (eve
 });
 
 async function deleteJournalist(surname) {
-  if (!confirm(`Delete journalist ${surname}?\n\nVideos already delivered keep their names.`)) return;
+  if (!confirm(`Διαγραφή του δημοσιογράφου ${surname};\n\nΤα βίντεο που έχουν ήδη παραδοθεί κρατούν τα ονόματά τους.`)) return;
   try {
     await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
-    toast(`${surname} deleted.`, 'ok');
+    toast(`Ο ${surname} διαγράφηκε.`, 'ok');
     loadJournalists();
     loadFilters();
   } catch (e) { toast(e.message, 'bad'); }
@@ -685,15 +699,22 @@ async function deleteJournalist(surname) {
 
 const manualFields = ['m-index', 'm-journalist', 'm-keyword'].map((id) => document.getElementById(id));
 function showManualPreview() {
-  const [index, journalist, keyword] = manualFields.map((f) => f.value.trim().toUpperCase());
-  document.getElementById('m-preview').textContent = index && journalist && keyword
-    ? `The file will be called ${index}_${journalist}_${keyword}.mxf`
-    : '';
+  const [index, journalist, keyword] = manualFields.map((f) => f.value.trim());
+  // The server makes the Latin form (ELOT 743). The page does not guess it:
+  // a Greek word is announced as converted, not shown as a name it will
+  // not get.
+  const greek = /[^\x00-\x7F]/.test(`${index}${journalist}${keyword}`);
+  document.getElementById('m-preview').textContent = !(index && journalist && keyword)
+    ? ''
+    : greek
+      ? `Το όνομα του αρχείου θα έχει τη μορφή ΑΡΙΘΜΟΣ_ΔΗΜΟΣΙΟΓΡΑΦΟΣ_ΛΕΞΗ.mxf, με τα ελληνικά σε λατινικούς χαρακτήρες (π.χ. Σεισμός → SEISMOS).`
+      : `Το αρχείο θα ονομαστεί ${index}_${journalist.toUpperCase()}_${keyword.toUpperCase()}.mxf`;
 }
 for (const f of manualFields) f.addEventListener('input', showManualPreview);
 
 document.getElementById('manual-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const max = Number(document.getElementById('m-max').value) || null;
   try {
     const result = await api('/api/jobs', {
       method: 'POST',
@@ -703,9 +724,10 @@ document.getElementById('manual-form').addEventListener('submit', async (event) 
         keyword: document.getElementById('m-keyword').value.trim(),
         index_str: document.getElementById('m-index').value.trim(),
         priority: document.getElementById('m-priority').checked ? 10 : 0,
+        max_videos: max,
       },
     });
-    toast(`Added: ${result.slug}.mxf`, 'ok');
+    toast(`Προστέθηκε: ${result.slug}.mxf`, 'ok');
     event.target.reset();
     document.getElementById('m-index').value = '1';
     showManualPreview();

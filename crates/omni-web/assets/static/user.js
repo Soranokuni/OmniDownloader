@@ -1,8 +1,20 @@
-/* Journalist panel behaviour (plan P2.3, P2.5). */
+/* Journalist panel behaviour (plan P2.3, P2.5), in Greek. */
 
 import {
   api, el, render, live, toast, fmtTime, statusClass, logout,
-} from '/static/app.js?v=3';
+} from '/static/app.js?v=4';
+
+/** A job's state, for the journalist who sent it. */
+const STATUS_TEXT = {
+  PENDING: 'Σε αναμονή',
+  RUNNING: 'Σε επεξεργασία',
+  COMPLETED: 'Παραδόθηκε',
+  COMPLETED_MANUAL: 'Παραδόθηκε',
+  REQUIRES_REVIEW: 'Το εξετάζει το MCR',
+  MANUAL_DOWNLOAD: 'Το κατεβάζει το MCR',
+  FAILED: 'Απέτυχε',
+  CANCELLED: 'Ακυρώθηκε',
+};
 
 /* ------------------------------------------------------------------ *
  * Identity
@@ -35,7 +47,7 @@ async function loadMyJobs() {
 
   if (jobs.length === 0) {
     render('my-jobs', el('div', { class: 'card center' },
-      'Nothing submitted yet. Paste a link above and it goes straight to MCR.'));
+      'Δεν έχετε στείλει κάτι ακόμη. Επικολλήστε έναν σύνδεσμο παραπάνω και πηγαίνει κατευθείαν στο MCR.'));
     return;
   }
 
@@ -55,13 +67,15 @@ function jobCard(job) {
           el('p', { class: 'job-url', title: job.url }, job.url),
         ),
       ),
-      el('span', { class: `badge ${statusClass(job.status)}` }, job.status),
+      el('span', { class: `badge ${statusClass(job.status)}` }, STATUS_TEXT[job.status] || job.status),
     ),
     !done && el('div', { class: 'progress' },
       el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),
-    job.error_message && el('div', { class: 'reason' }, job.error_message),
+    (job.status === 'REQUIRES_REVIEW' || job.status === 'FAILED')
+      && el('div', { class: 'reason' }, el('strong', { style: 'display:block' },
+        'Δεν κατέβηκε αυτόματα· το MCR το έχει δει. Αν έχετε άλλον σύνδεσμο για το ίδιο βίντεο, στείλτε τον.')),
     el('div', { class: 'job-meta' },
-      el('span', {}, job.notes ? `Note: ${job.notes}` : ''),
+      el('span', {}, job.notes ? `Σημείωση: ${job.notes}` : ''),
       el('span', {}, fmtTime(job.updated_at)),
     ),
   );
@@ -80,7 +94,7 @@ document.getElementById('submit-form').addEventListener('submit', async (event) 
         priority: document.getElementById('priority').checked ? 10 : 0,
       },
     });
-    toast(`Sent to MCR as ${result.slug}.mxf`, 'ok');
+    toast(`Στάλθηκε στο MCR ως ${result.slug}.mxf`, 'ok');
     event.target.reset();
     document.getElementById('index').value = '1';
     loadMyJobs();
@@ -110,7 +124,7 @@ document.getElementById('password-form').addEventListener('submit', async (event
     });
     // The server ended every session, including this one, so there is nothing
     // to stay on this page for.
-    toast('Password changed. Signing you in again…', 'ok');
+    toast('Ο κωδικός άλλαξε. Συνδεθείτε ξανά…', 'ok');
     setTimeout(() => { location.href = '/login'; }, 1200);
   } catch (e) { toast(e.message, 'bad'); }
 });

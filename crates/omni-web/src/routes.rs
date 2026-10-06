@@ -163,7 +163,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         let mut response = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
-            "Too many failed sign-in attempts. Try again shortly.",
+            "Πάρα πολλές αποτυχημένες προσπάθειες σύνδεσης. Δοκιμάστε ξανά σε λίγο.",
         )
         .into_response();
         response.headers_mut().insert(
@@ -191,7 +191,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         }
         Err(e) => {
             tracing::error!(error = ?e, "Login lookup failed");
-            return ApiError::internal("Sign-in is temporarily unavailable.").into_response();
+            return ApiError::internal("Η σύνδεση δεν είναι διαθέσιμη αυτή τη στιγμή.").into_response();
         }
     };
 
@@ -265,7 +265,7 @@ fn invalid_credentials() -> Response {
     ApiError::new(
         StatusCode::UNAUTHORIZED,
         "INVALID_CREDENTIALS",
-        "Invalid email or password.",
+        "Λάθος email ή κωδικός.",
     )
     .into_response()
 }
@@ -457,6 +457,8 @@ pub struct CreateJobPayload {
     priority: Option<i32>,
     journalist: Option<String>,
     index_str: Option<String>,
+    /// Only the first N videos of the article (plan P4.33).
+    max_videos: Option<i64>,
 }
 
 pub async fn api_create_job(
@@ -467,7 +469,7 @@ pub async fn api_create_job(
     let url = payload.url.trim();
     if !is_submittable_url(url) {
         return Err(ApiError::bad_request(
-            "Enter an http:// or https:// link.",
+            "Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://.",
         ));
     }
 
@@ -488,24 +490,22 @@ pub async fn api_create_job(
     let priority = payload.priority.unwrap_or(0).clamp(-100, 100);
     let submitted_by = auth_user.map(|u| u.id);
 
+    let mut new = omni_core::models::NewJob::new(url, slug.clone(), journalist.clone());
+    new.keyword = keyword.clone();
+    new.index_str = index_str.clone();
+    new.priority = priority;
+    new.status = JobStatus::Pending;
+    new.submitted_by_user_id = submitted_by;
+    new.notes = payload.notes.clone();
+    new.max_videos = payload.max_videos.filter(|n| (1..=20).contains(n));
     let job_id = state
         .repo
-        .add_job(
-            url,
-            &slug,
-            &journalist,
-            &keyword,
-            &index_str,
-            priority,
-            JobStatus::Pending,
-            submitted_by,
-            payload.notes.as_deref(),
-            None,
-        )
+        .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
         .map_err(|e| {
             tracing::error!(error = ?e, "Enqueue failed");
-            ApiError::bad_request("Could not queue that link.")
-        })?;
+            ApiError::bad_request("Ο σύνδεσμος δεν μπήκε στην ουρά.")
+        })?
+        .job_id();
 
     state.broadcast_event("job_created");
     Ok(Json(
@@ -532,7 +532,10 @@ fn is_submittable_url(url: &str) -> bool {
 /// separately) but because a slug is a filename and a filename with a quote,
 /// a slash or a NUL in it is a delivery failure at best.
 fn sanitize_token(raw: &str, fallback: &str) -> String {
-    let cleaned: String = raw
+    // Greek typed in the form ("Σεισμός") becomes the house Latin form
+    // (ELOT 743, as the email parser makes keywords), not a row of dashes.
+    let latin = omni_core::translit::translit(raw.trim());
+    let cleaned: String = latin
         .trim()
         .to_uppercase()
         .chars()
@@ -561,7 +564,7 @@ pub async fn api_override_job(
     Json(payload): Json<OverridePayload>,
 ) -> JsonResult {
     if !is_submittable_url(&payload.url) {
-        return Err(ApiError::bad_request("Enter an http:// or https:// link."));
+        return Err(ApiError::bad_request("Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://."));
     }
     state
         .repo
@@ -603,10 +606,10 @@ pub async fn api_queue_offer(
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
     let Some(offer) = offers.iter_mut().find(|o| o.url == payload.url.trim()) else {
-        return Err(ApiError::bad_request("That video is not among this job's offers."));
+        return Err(ApiError::bad_request("Αυτό το βίντεο δεν είναι ανάμεσα στα προτεινόμενα αυτής της εργασίας."));
     };
     if let Some(existing) = offer.queued_job_id {
-        return Err(ApiError::bad_request(format!("Already queued as job #{existing}.")));
+        return Err(ApiError::bad_request(format!("Έχει ήδη μπει στην ουρά ως εργασία #{existing}.")));
     }
 
     let mut new = omni_core::models::NewJob::new(
@@ -684,7 +687,7 @@ pub async fn api_redownload_job(
         .map_err(internal_error("Could not queue the job again."))?;
     if !done {
         return Err(ApiError::bad_request(
-            "Only a delivered job can be downloaded again. For one that needs attention, use Try again.",
+            "Νέα λήψη γίνεται μόνο για βίντεο που έχει παραδοθεί. Για ένα που χρειάζεται έλεγχο, πατήστε «Δοκιμή ξανά».",
         ));
     }
     let _ = state.repo.record_event(
@@ -758,10 +761,10 @@ pub async fn api_save_journalist(
 ) -> JsonResult {
     let surname = sanitize_token(&payload.surname, "");
     if surname.is_empty() {
-        return Err(ApiError::bad_request("Surname is required."));
+        return Err(ApiError::bad_request("Το επώνυμο είναι υποχρεωτικό."));
     }
     if payload.emails.len() > 20 {
-        return Err(ApiError::bad_request("At most 20 addresses per journalist."));
+        return Err(ApiError::bad_request("Έως 20 διευθύνσεις ανά δημοσιογράφο."));
     }
     if let Some(aliases) = &payload.aliases {
         if aliases.len() > 30 || aliases.iter().any(|a| a.chars().count() > 40) {
@@ -2036,6 +2039,8 @@ mod tests {
         assert_eq!(sanitize_token("../../etc", "MCR"), "ETC");
         assert_eq!(sanitize_token("a\"b", "MCR"), "A-B");
         assert_eq!(sanitize_token("", "MCR"), "MCR");
+        assert_eq!(sanitize_token("Σεισμός", "ASSET"), "SEISMOS");
+        assert_eq!(sanitize_token("Παπαδάκη", "MCR"), "PAPADAKI");
         assert_eq!(sanitize_token("---", "MCR"), "MCR");
         assert_eq!(sanitize_token(&"X".repeat(200), "MCR").len(), 40);
     }
