@@ -155,3 +155,38 @@ async fn the_browser_self_test_finds_its_test_video() {
     assert!(version.contains("Chrome/") || version.contains("Edg"), "{version}");
     assert!(!version.contains("Headless"), "{version}");
 }
+
+/// 2026-10-06: a sign-in iframe whose address mentions youtube.com was read
+/// as the video "ServiceLogi". Only real YouTube addresses count (ids
+/// invented).
+const YOUTUBE_LOOKALIKES: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Άρθρο</title></head><body>
+<iframe src="https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.youtube.com%2Fsignin_passive"></iframe>
+<a href="https://www.youtube.com/watch?v=FixtureYT01&amp;t=10">βίντεο</a>
+<div class="rll-youtube-player" data-id="FixtureYT02"></div>
+<div data-id="not-a-youtube-thing-123"></div>
+</body></html>"#;
+
+#[tokio::test]
+async fn only_real_youtube_addresses_become_videos() {
+    if !browser_installed() {
+        eprintln!("WARNING: skipping sniffer embed test -- no Chrome/Edge installed");
+        return;
+    }
+    let adblock = tempfile::tempdir().unwrap();
+    UnifiedAdBlocker::init(adblock.path().to_path_buf());
+
+    let app = Router::new().route("/article", get(|| async { Html(YOUTUBE_LOOKALIKES) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let media = StreamSniffer::extract_media_bundle(&format!("http://{addr}/article"), 20)
+        .await
+        .expect("sniffer should find the embeds");
+    let mut found = media.all_streams.clone();
+    found.sort();
+    assert_eq!(
+        found,
+        vec!["https://www.youtube.com/watch?v=FixtureYT01", "https://www.youtube.com/watch?v=FixtureYT02"]
+    );
+}

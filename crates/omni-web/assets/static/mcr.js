@@ -115,6 +115,7 @@ const CHECK_NAME = {
   disk: 'Δίσκος',
   queue: 'Ουρά',
   selfcheck: 'Αυτοέλεγχος',
+  deno: 'YouTube (Deno)',
 };
 
 async function loadStatus() {

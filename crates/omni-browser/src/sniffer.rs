@@ -325,19 +325,28 @@ impl StreamSniffer {
                 }
 
                 // 6. YouTube embeds (standard iframes, WP Rocket lazyload, ProtoThema custom plugins, explicit article links)
+                // Only a real YouTube address yields an id: the old pattern took
+                // any 11 characters after a "/", and read "ServiceLogi" out of a
+                // sign-in link (2026-10-06).
+                const ytId = (value) => {
+                    const m = String(value || '').match(
+                        /(?:youtube(?:-nocookie)?\.com\/(?:embed\/|shorts\/|live\/|v\/|watch\?(?:[^#]*&)?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})(?![a-zA-Z0-9_-])/i
+                    );
+                    return m ? m[1] : null;
+                };
                 const ytNodes = Array.from(document.querySelectorAll(
                     'iframe[src*="youtube.com"], iframe[src*="youtube-nocookie.com"], iframe[src*="youtu.be"],' +
                     'iframe[data-src*="youtube.com"], iframe[data-lazy-src*="youtube.com"],' +
-                    '.rll-youtube-player, [data-plugin-youtube], [data-id]'
+                    '.rll-youtube-player, [data-plugin-youtube]'
                 ));
                 for (const y of ytNodes) {
-                    const src = getSrc(y) || y.getAttribute('data-id') || '';
-                    const m = src.match(/(?:embed\/|v=|\/)([a-zA-Z0-9_-]{11})/);
-                    if (m) {
-                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + m[1] });
-                    }
+                    let id = ytId(getSrc(y));
+                    // WP Rocket's lazy player carries the bare id.
+                    const dataId = y.getAttribute('data-id') || '';
+                    if (!id && y.classList.contains('rll-youtube-player') && /^[a-zA-Z0-9_-]{11}$/.test(dataId)) id = dataId;
+                    if (id) found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
                     const pluginAttr = y.getAttribute('data-plugin-youtube') || '';
-                    const pm = pluginAttr.match(/"ID":\s*"([^"]+)"/);
+                    const pm = pluginAttr.match(/"ID":\s*"([a-zA-Z0-9_-]{11})"/);
                     if (pm) {
                         found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + pm[1] });
                     }
@@ -345,9 +354,9 @@ impl StreamSniffer {
 
                 const ytLinks = Array.from(document.querySelectorAll('a[href*="youtube.com/watch"], a[href*="youtu.be/"]'));
                 for (const a of ytLinks) {
-                    const m = (a.href || '').match(/(?:v=|\/)([a-zA-Z0-9_-]{11})/);
-                    if (m) {
-                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + m[1] });
+                    const id = ytId(a.href);
+                    if (id) {
+                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
                         break;
                     }
                 }

@@ -347,6 +347,12 @@ async fn main() -> Result<()> {
             let repo = Repository::new(paths.resolve(&config.database_path))?;
             let health = HealthState::new();
             let ytdl = DependencyManager::new(&paths.bin).ytdl_live();
+            let deps = DependencyManager::new(&paths.bin);
+            if !ensure_deno(&deps, &health, config.ytdl_auto_update_nightly).await {
+                println!("  ✗ Deno: {}", health.get(omni_core::health::checks::DENO).and_then(|c| c.detail).unwrap_or_default());
+            } else {
+                println!("  ✓ Deno {} (for YouTube)", deps.deno_version().unwrap_or_default());
+            }
             println!("Checking the browser…");
             selfcheck::check_browser(&health).await;
             if let Some(c) = health.get(omni_core::health::checks::BROWSER) {
@@ -647,6 +653,18 @@ async fn run_daemon(
                 omni_core::health::Check::down(format!("{e} — jobs are held; fix the tool and restart")),
             );
         }
+    }
+
+    // Deno for YouTube (plan P6.8): reported now, and fetched in the
+    // background when it is missing, so a fresh install or a deleted
+    // bin/deno.exe repairs itself instead of failing YouTube jobs.
+    {
+        let health = health.clone();
+        let bin_dir = bin_dir.clone();
+        let auto = config.ytdl_auto_update_nightly;
+        tokio::spawn(async move {
+            ensure_deno(&DependencyManager::new(&bin_dir), &health, auto).await;
+        });
     }
 
     // The self-check's last results, and a browser launch in the background:
@@ -1370,6 +1388,110 @@ async fn nightly_ytdl_update(
     }
 }
 
+/// Report Deno's state, and install it when it is missing and automatic
+/// updates are on. Returns whether a working Deno is in place.
+async fn ensure_deno(dep_mgr: &DependencyManager, health: &HealthState, auto: bool) -> bool {
+    use omni_core::health::{checks, Check};
+    if let Some(v) = dep_mgr.deno_version() {
+        health.set(checks::DENO, Check::ok(format!("Deno {v}")));
+        return true;
+    }
+    if !auto {
+        health.set(
+            checks::DENO,
+            Check::degraded(
+                "deno.exe is missing from bin/: YouTube downloads fail. Automatic updates are off; put deno.exe in bin/ or turn them on",
+            ),
+        );
+        return false;
+    }
+    health.set(checks::DENO, Check::degraded("deno.exe is missing: downloading it now; YouTube downloads may fail until it is in place"));
+    match dep_mgr.install_deno().await {
+        Ok(v) => {
+            info!("Deno {v} installed for yt-dlp's YouTube support");
+            health.set(checks::DENO, Check::ok(format!("Deno {v}")));
+            true
+        }
+        Err(e) => {
+            warn!("Deno could not be installed: {e:#}");
+            health.set(
+                checks::DENO,
+                Check::degraded(format!("deno.exe is missing and could not be downloaded ({e:#}): YouTube downloads fail; it is tried again tonight")),
+            );
+            false
+        }
+    }
+}
+
+/// The nightly Deno step (plan P6.8): install it if missing; take a newer
+/// release only if every self-check link that worked still works, else put
+/// the previous one back.
+async fn nightly_deno_update(
+    dep_mgr: &DependencyManager,
+    gate: &UpdateGate,
+    repo: &Repository,
+    health: &HealthState,
+) -> omni_core::scheduler::TaskOutcome {
+    use omni_core::scheduler::TaskOutcome;
+    let Some(installed) = dep_mgr.deno_version() else {
+        return if ensure_deno(dep_mgr, health, true).await { TaskOutcome::Ok } else { TaskOutcome::Failed };
+    };
+    let latest = match dep_mgr.latest_deno_tag().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Deno update check failed: {e:#}");
+            return TaskOutcome::Skipped;
+        }
+    };
+    if latest.trim_start_matches('v') == installed {
+        return TaskOutcome::Ok;
+    }
+    if !gate.pause_and_drain(Duration::from_secs(600)).await {
+        gate.resume();
+        return TaskOutcome::Skipped;
+    }
+    let result = dep_mgr.install_deno().await;
+    let outcome = match result {
+        Err(e) => {
+            warn!("Deno update not installed: {e:#}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
+            TaskOutcome::Failed
+        }
+        Ok(new_version) => {
+            let worked: Vec<omni_core::models::SelfcheckLink> = repo
+                .list_selfcheck_links()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|l| l.last_ok == Some(true))
+                .collect();
+            let ytdl = dep_mgr.ytdl_live();
+            let broken: Vec<String> = selfcheck::check_and_record(repo, &ytdl, &worked)
+                .await
+                .into_iter()
+                .filter(|(_, o)| !o.ok)
+                .map(|(l, _)| l.label)
+                .collect();
+            if broken.is_empty() {
+                let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                TaskOutcome::Ok
+            } else {
+                let _ = dep_mgr.rollback_deno();
+                let _ = repo.log_audit(
+                    "ERROR",
+                    "SYSTEM",
+                    &format!("Deno {new_version} rolled back to {installed}: {} stopped working with it", broken.join(", ")),
+                );
+                TaskOutcome::Failed
+            }
+        }
+    };
+    gate.resume();
+    if let Some(v) = dep_mgr.deno_version() {
+        health.set(omni_core::health::checks::DENO, omni_core::health::Check::ok(format!("Deno {v}")));
+    }
+    outcome
+}
+
 enum UpdateVerdict {
     Kept { checked: usize },
     RolledBack { broken: Vec<String> },
@@ -1503,9 +1625,15 @@ async fn run_one_task(
                 return Ok(TaskOutcome::Skipped);
             }
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
-            let outcome = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
+            let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
+            let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health).await;
             selfcheck::refresh_health(repo, &ctx.health);
-            Ok(outcome)
+            // The worse of the two is what the maintenance panel shows.
+            Ok(match (ytdl, deno) {
+                (TaskOutcome::Failed, _) | (_, TaskOutcome::Failed) => TaskOutcome::Failed,
+                (TaskOutcome::Ok, _) | (_, TaskOutcome::Ok) => TaskOutcome::Ok,
+                _ => TaskOutcome::Skipped,
+            })
         }
 
         "selfcheck" => {

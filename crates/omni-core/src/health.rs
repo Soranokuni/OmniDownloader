@@ -137,6 +137,8 @@ pub mod checks {
     pub const QUEUE: &str = "queue";
     /// The nightly self-check links (plan P6.7).
     pub const SELFCHECK: &str = "selfcheck";
+    /// Deno, which yt-dlp needs for YouTube (plan P6.8).
+    pub const DENO: &str = "deno";
 }
 
 impl Default for HealthState {
