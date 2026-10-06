@@ -339,6 +339,36 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        10,
+        // The nightly self-check (plan P6.7): links known to hold a video,
+        // one per route a job can take, checked without downloading. The
+        // defaults are seeded here, once, so links an operator deletes stay
+        // deleted. `last_ok` is NULL until the first check.
+        r#"
+        CREATE TABLE IF NOT EXISTS selfcheck_links (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            label           TEXT NOT NULL,
+            url             TEXT NOT NULL UNIQUE,
+            last_checked_at TEXT,
+            last_ok         INTEGER,
+            last_detail     TEXT,
+            last_ok_at      TEXT,
+            failing_since   TEXT,
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        INSERT OR IGNORE INTO selfcheck_links (label, url) VALUES
+            ('YouTube', 'https://www.youtube.com/watch?v=jNQXAC9IVRw'),
+            ('Instagram reel', 'https://www.instagram.com/reel/Dd615LBN4QM/'),
+            ('Facebook video', 'https://www.facebook.com/ingr.officialpage/videos/1245278808680006/'),
+            ('TikTok', 'https://www.tiktok.com/@glasatnabulgaria/video/7690626350159318305'),
+            ('X (Twitter) video', 'https://x.com/i/status/2100509173943288138'),
+            ('Streamable', 'https://streamable.com/531cym'),
+            ('News article, glomex player', 'https://www.neakriti.gr/life/2202679_katerina-liolioy-makari-na-me-axiosei-o-theos-na-kano-ena-i-dyo-paidia-ti-eipe-gia'),
+            ('News article, Instagram embed', 'https://www.iefimerida.gr/zoi/keit-mintleton-doyleies-spitioy-prigkipa-goyiliam'),
+            ('News article, YouTube embed', 'https://www.bovary.gr/people-and-style/glam-stars/tzoni-ntep-entyposiaki-metamorfosi-gkriza-mallia');
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

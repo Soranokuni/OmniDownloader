@@ -135,6 +135,8 @@ pub mod checks {
     pub const BROWSER: &str = "browser";
     pub const DISK: &str = "disk";
     pub const QUEUE: &str = "queue";
+    /// The nightly self-check links (plan P6.7).
+    pub const SELFCHECK: &str = "selfcheck";
 }
 
 impl Default for HealthState {

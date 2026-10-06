@@ -497,6 +497,27 @@ const MATRIX: &[Row] = &[
         "/api/admin/maintenance/vacuum/run",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
     ),
+    // Self-check links (plan P6.7): admin only, like the rest of maintenance.
+    (
+        "GET",
+        "/api/admin/selfcheck",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/admin/selfcheck/links",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
+    ),
+    (
+        "POST",
+        "/api/admin/selfcheck/links/1/delete",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
+    ),
     (
         "GET",
         "/api/secrets",

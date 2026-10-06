@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{EventRequestWillBeSent, SetBlockedUrLsParams};
 use futures::StreamExt;
@@ -86,6 +86,36 @@ impl StreamSniffer {
     pub async fn extract_video_stream(target_url: &str, timeout_secs: u64) -> Result<String> {
         let media = Self::extract_media_bundle(target_url, timeout_secs).await?;
         Ok(media.primary_stream)
+    }
+
+    /// Launch the browser and find the video on a built-in test page (an X
+    /// post as portals embed it; nothing is fetched from the network).
+    /// Returns the browser's own version string ("Chrome/141.0.7390.55").
+    ///
+    /// This is the daily "does the browser still work?" check (plan P6.7):
+    /// a Chrome/Edge update that the browser library no longer understands
+    /// otherwise shows up as news-article jobs failing one by one.
+    pub async fn self_test() -> Result<String> {
+        const PAGE: &str = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Cmeta%20charset%3Dutf-8%3E\
+            %3Ch1%3EOmniDownloader%20self-test%3C%2Fh1%3E%3Cblockquote%20class%3D%22twitter-tweet%22%3E\
+            %3Ca%20href%3D%22https%3A%2F%2Fx.com%2FSelfTest%2Fstatus%2F1900000000000000042%22%3Epost%3C%2Fa%3E\
+            %3C%2Fblockquote%3E";
+        const EXPECTED: &str = "https://x.com/SelfTest/status/1900000000000000042";
+
+        let mut session = HeadlessBrowserManager::launch().await?;
+        let version = session
+            .browser
+            .version()
+            .await
+            .map(|v| v.product.replace("HeadlessChrome", "Chrome"))
+            .unwrap_or_else(|_| "unknown version".into());
+        let result = Self::sniff(&session.browser, PAGE, 10).await;
+        session.shutdown().await;
+        let media = result.context("the browser could not read its test page")?;
+        if !media.all_streams.iter().any(|u| u == EXPECTED) {
+            anyhow::bail!("the browser opened its test page but did not find the video on it");
+        }
+        Ok(version)
     }
 
     /// Full media extraction pipeline returning primary stream, all discovered streams,

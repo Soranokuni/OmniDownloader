@@ -85,6 +85,51 @@ fn sweep_stale_profiles(root: &Path, older_than: Duration) {
     }
 }
 
+/// Used when the installed version cannot be read. Only a fallback: a fixed
+/// version ages a month at a time, and portals start treating an old
+/// browser as a bot (the old hard-coded "Chrome/126" was 28 versions behind
+/// the installed Chrome 154 by October 2026).
+const FALLBACK_MAJOR: u32 = 154;
+
+/// The highest major version among Chrome/Edge's version-named folders
+/// (`141.0.7390.55`), which sit next to the executable.
+pub fn major_from_dir_names<I: IntoIterator<Item = String>>(names: I) -> Option<u32> {
+    names
+        .into_iter()
+        .filter(|n| {
+            let parts: Vec<&str> = n.split('.').collect();
+            parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        })
+        .filter_map(|n| n.split('.').next()?.parse().ok())
+        .max()
+}
+
+/// The installed browser's major version, if it can be read from disk.
+pub fn installed_major_version(exe: &Path) -> Option<u32> {
+    let dir = exe.parent()?;
+    let names = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned());
+    major_from_dir_names(names)
+}
+
+/// The user agent the installed browser would send if it were not headless.
+/// Headless Chrome says "HeadlessChrome", which portals block; this says
+/// what a desktop browser of the same version says, Chrome's reduced form
+/// (`141.0.0.0`), plus Edge's own token for Edge.
+pub fn desktop_user_agent(edge: bool, major: u32) -> String {
+    let base = format!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    );
+    if edge {
+        format!("{base} Edg/{major}.0.0.0")
+    } else {
+        base
+    }
+}
+
 impl HeadlessBrowserManager {
     pub fn find_system_browser() -> Option<PathBuf> {
         let candidates = [
@@ -112,12 +157,18 @@ impl HeadlessBrowserManager {
 
         let mut builder = BrowserConfig::builder().user_data_dir(&profile);
 
-        if let Some(edge_or_chrome) = Self::find_system_browser() {
+        let exe = Self::find_system_browser();
+        if let Some(edge_or_chrome) = &exe {
             info!("Found host system browser for CDP automation: {:?}", edge_or_chrome);
             builder = builder.chrome_executable(edge_or_chrome);
         } else {
             info!("System browser not in default path. Letting chromiumoxide auto-detect browser.");
         }
+        let edge = exe
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("msedge.exe"));
+        let major = exe.as_deref().and_then(installed_major_version).unwrap_or(FALLBACK_MAJOR);
 
         let config = builder
             .arg("--headless=new")
@@ -125,7 +176,7 @@ impl HeadlessBrowserManager {
             .arg("--mute-audio")
             .arg("--no-sandbox")
             .arg("--disable-dev-shm-usage")
-            .arg("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+            .arg(format!("--user-agent={}", desktop_user_agent(edge, major)))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building BrowserConfig: {}", e))?;
 
@@ -150,6 +201,16 @@ impl HeadlessBrowserManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_user_agent_follows_the_installed_version() {
+        let dirs = ["141.0.7390.55", "140.0.7339.208", "SetupMetrics", "Dictionaries", "141.0", "1.2.3.x"];
+        assert_eq!(major_from_dir_names(dirs.iter().map(|s| s.to_string())), Some(141));
+        assert_eq!(major_from_dir_names(["Locales".to_string()]), None);
+        let chrome = desktop_user_agent(false, 141);
+        assert!(chrome.contains("Chrome/141.0.0.0 Safari/537.36") && !chrome.contains("Headless") && !chrome.contains("Edg/"), "{chrome}");
+        assert!(desktop_user_agent(true, 141).ends_with(" Edg/141.0.0.0"));
+    }
 
     #[test]
     fn every_launch_gets_its_own_profile() {

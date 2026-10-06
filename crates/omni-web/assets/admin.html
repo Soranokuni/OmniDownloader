@@ -80,6 +80,39 @@
   </div>
 
   <div class="stack" style="grid-column:span 2">
+    <section class="card stack" id="selfcheck">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Self-check</h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="selfcheck-refresh">Refresh</button>
+          <button class="btn btn-primary" type="button" id="selfcheck-run">Run the check now</button>
+        </div>
+      </div>
+      <p class="note">
+        Every morning at 05:15 the system checks that it can still find a video at each
+        link below, without downloading it, and that the browser it uses for news
+        articles works. When a link stops working, it shows here in red with the date it
+        started. A new yt-dlp is kept only if every link that worked before still works.
+        If one stops working, the previous yt-dlp is put back automatically.
+      </p>
+      <div id="selfcheck-summary" class="stack"></div>
+      <div class="card flush">
+        <table>
+          <thead><tr><th>Link</th><th>Status</th><th>Last checked</th><th>What it found</th><th class="right"></th></tr></thead>
+          <tbody id="selfcheck-body"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <form id="selfcheck-form" class="row">
+        <input type="text" id="selfcheck-label" placeholder="Name, e.g. Instagram reel" style="width:220px" required>
+        <input type="url" id="selfcheck-url" class="grow" placeholder="https://… a link that has a video" required>
+        <button class="btn" type="submit">Add link</button>
+      </form>
+      <p class="note">
+        Use links that will stay online (an official account's video, not a breaking-news
+        post that may be deleted). Keep at least one per kind of link the newsroom sends.
+      </p>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
