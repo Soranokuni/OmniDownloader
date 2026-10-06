@@ -123,7 +123,7 @@ export async function api(path, options = {}) {
   try {
     response = await fetch(path, init);
   } catch (networkError) {
-    throw new ApiError('NETWORK', 'The ingest daemon is not responding.');
+    throw new ApiError('NETWORK', 'Η υπηρεσία λήψης δεν απαντά. Ελέγξτε ότι τρέχει και ξαναδοκιμάστε.');
   }
 
   let payload = null;
@@ -142,12 +142,12 @@ export async function api(path, options = {}) {
     const onLogin = location.pathname.startsWith('/login');
     if (!onLogin) location.href = '/login';
     const serverMessage = payload && payload.error && payload.error.message;
-    throw new ApiError('UNAUTHENTICATED', onLogin && serverMessage ? serverMessage : 'Session expired.');
+    throw new ApiError('UNAUTHENTICATED', onLogin && serverMessage ? serverMessage : 'Η σύνδεση έληξε. Συνδεθείτε ξανά.');
   }
 
   if (!response.ok) {
     const err = payload && payload.error ? payload.error : {};
-    throw new ApiError(err.code || String(response.status), err.message || 'Request failed.');
+    throw new ApiError(err.code || String(response.status), err.message || 'Το αίτημα απέτυχε.');
   }
   return payload;
 }
@@ -211,14 +211,17 @@ export function live(onUpdate, intervalMs = 5000) {
 export function fmtTime(value) {
   if (!value) return '—';
   const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  // Greek date and 24-hour time, whatever the browser's own language is.
+  return Number.isNaN(d.getTime())
+    ? '—'
+    : d.toLocaleString('el-GR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 export function fmtDuration(seconds) {
   if (!seconds || seconds <= 0) return '—';
+  // "4:25", "0:47": minutes and seconds, as on a clip's timecode.
   const s = Math.round(seconds);
-  const m = Math.floor(s / 60);
-  return m > 0 ? `${m}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
 /** Map a job status to a badge colour class. */

@@ -315,7 +315,7 @@ async fn html_pages_render_for_the_roles_that_may_see_them() -> Result<()> {
 
     for (uri, token, needle) in [
         ("/mcr", &app.mcr_token, "MCR"),
-        ("/user", &app.user_token, "Ingest"),
+        ("/user", &app.user_token, "Οι αποστολές μου"),
         ("/admin", &app.admin_token, "Administration"),
     ] {
         let res = app
