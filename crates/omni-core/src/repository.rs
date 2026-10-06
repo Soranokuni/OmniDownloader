@@ -207,6 +207,7 @@ impl Repository {
             email_message_id: None,
             extraction_method: None,
             group_code: None,
+            max_videos: None,
         };
         Ok(self.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id())
     }
@@ -296,8 +297,8 @@ impl Repository {
             INSERT INTO queue (
                 url, url_normalized, slug, journalist, keyword, index_str, priority,
                 status, stage, submitted_by_user_id, notes, email_source,
-                email_message_id, extraction_method, group_code, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?)
+                email_message_id, extraction_method, group_code, max_videos, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 job.url,
@@ -314,6 +315,7 @@ impl Repository {
                 job.email_message_id,
                 job.extraction_method,
                 job.group_code,
+                job.max_videos.filter(|n| *n > 0),
                 now,
                 now
             ],
@@ -1111,6 +1113,7 @@ impl Repository {
             stage_timings_json: row.get("stage_timings_json").ok().flatten(),
             email_message_id: row.get("email_message_id").ok().flatten(),
             group_code: row.get("group_code").ok().flatten(),
+            max_videos: row.get("max_videos").ok().flatten(),
             delivered_at: timestamps::parse_opt(row.get("delivered_at").ok().flatten()),
             completed_at: timestamps::parse_opt(row.get("completed_at").ok().flatten()),
 

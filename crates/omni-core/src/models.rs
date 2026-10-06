@@ -201,6 +201,9 @@ pub struct Job {
     /// The group the job was queued for (plan P4.18); a label only.
     #[serde(default)]
     pub group_code: Option<String>,
+    /// Only the first N videos of the article (plan P4.33); `None` is all.
+    #[serde(default)]
+    pub max_videos: Option<i64>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 
@@ -492,6 +495,9 @@ pub struct NewJob {
     pub extraction_method: Option<String>,
     /// Group label (plan P4.18).
     pub group_code: Option<String>,
+    /// The journalist asked for only the first N videos of the article
+    /// (plan P4.33); `None` is all of them.
+    pub max_videos: Option<i64>,
 }
 
 impl NewJob {
@@ -511,6 +517,7 @@ impl NewJob {
             email_message_id: None,
             extraction_method: None,
             group_code: None,
+            max_videos: None,
         }
     }
 }

@@ -88,6 +88,10 @@ pub struct ParsedJob {
     /// Provider attachment id, for `Tier::Attachment` jobs (plan P4.6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_id: Option<String>,
+    /// "2 ΠΡΩΤΑ ΒΙΝΤΕΟ": only the first N videos of the article
+    /// (plan P4.33). `None` is all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_videos: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -614,6 +618,55 @@ const NOT_A_NAME: &[&str] = &[
 /// Greek articles and prepositions-with-article, in ELOT 743 Latin: after
 /// "ΓΙΑ" they introduce a topic, not a person.
 const ARTICLES: &[&str] = &["TO", "TA", "TI", "TIN", "TIS", "TON", "TOUS", "TOU", "THN", "TH", "O", "I", "OI", "ENA", "MIA", "ENAN"];
+
+/// "2 ΠΡΩΤΑ ΒΙΝΤΕΟ", "ΤΑ ΔΥΟ ΠΡΩΤΑ", "τα 3 πρώτα βίντεο", "first 2 videos"
+/// (in ELOT 743 Latin). The number word or digit before ΠΡΩΤΑ, and what
+/// follows it: a video word, or nothing.
+static RE_FIRST_N: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(\d{1,2}|ENA|MIA|DYO|DIO|TRIA|TESSERA|PENTE|EXI|EKSI)\s+PROT(?:A|ES|OUS)\b\s*(VINTEO|VIDEOS?|PLANA|APOSPASMATA|KLIP)?(.*)$",
+    )
+    .unwrap()
+});
+static RE_PLANA_MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bGIA\s+PLANA\b").unwrap());
+static RE_FIRST_N_EN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bFIRST\s+(\d{1,2}|ONE|TWO|THREE|FOUR|FIVE|SIX)\s+(?:VIDEOS?|CLIPS?)\b").unwrap()
+});
+/// "ΜΟΝΟ ΤΟ ΠΡΩΤΟ (ΒΙΝΤΕΟ)", "only the first video": one. "ΜΟΝΟ" is required
+/// in Greek, so a sentence that merely mentions "το πρώτο βίντεο" is not
+/// read as an instruction.
+static RE_FIRST_ONE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bMONO\s+TO\s+PROTO\b|\bONLY\s+THE\s+FIRST\s+(?:VIDEO|CLIP)\b").unwrap()
+});
+
+/// How many of a page's videos a line asks for, if it says.
+pub fn first_n_videos(line: &str) -> Option<u32> {
+    let latin = translit(line);
+    if RE_FIRST_ONE.is_match(&latin) {
+        return Some(1);
+    }
+    // "Τα 2 πρώτα γκολ" in a story title is not an instruction: the count
+    // is read only before a video word, at the end of the line, or on a
+    // "ΓΙΑ ΠΛΑΝΑ:" line.
+    let greek = RE_FIRST_N.captures(&latin).filter(|c| {
+        c.get(2).is_some()
+            || !c[3].chars().any(|ch| ch.is_alphanumeric())
+            || RE_PLANA_MARKER.is_match(&latin)
+    });
+    let word = greek
+        .or_else(|| RE_FIRST_N_EN.captures(&latin))
+        .map(|c| c[1].to_uppercase())?;
+    let n = match word.as_str() {
+        "ENA" | "MIA" | "ONE" => 1,
+        "DYO" | "DIO" | "TWO" => 2,
+        "TRIA" | "THREE" => 3,
+        "TESSERA" | "FOUR" => 4,
+        "PENTE" | "FIVE" => 5,
+        "EXI" | "EKSI" | "SIX" => 6,
+        digits => digits.parse().ok()?,
+    };
+    (1..=20).contains(&n).then_some(n)
+}
 
 /// A journalist saying a link is video: "απόσπασμα", "βίντεο", "video",
 /// "πλάνα", "ρεπορτάζ" (in ELOT 743 Latin).
@@ -1438,6 +1491,9 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
             warnings.push(Warning::new(warnings::SECTION_WITHOUT_LINKS, Some(s.index.clone())));
         }
 
+        // "ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ" anywhere in the section: for the
+        // article links in it (a platform post is one video already).
+        let first_n = s.header.iter().chain(s.lines.iter()).find_map(|l| first_n_videos(&l.text));
         let many = selected.len() > 1;
         let jobs = selected
             .into_iter()
@@ -1463,6 +1519,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                     confidence,
                     marker,
                     attachment_id: None,
+                    max_videos: if matches!(tier, Tier::Tier2 | Tier::Other) { first_n } else { None },
                 }
             })
             .collect();
@@ -1540,6 +1597,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 status: status_for(Tier::Attachment, confidence, cfg),
                 marker: false,
                 attachment_id: Some(a.id.clone()),
+                max_videos: None,
             });
         }
     }
@@ -1719,6 +1777,30 @@ mod tests {
         );
         let p = parse(&m, &roster(), &ParserConfig::default());
         assert!(p.sections.iter().all(|s| s.title.is_none() && s.keyword.is_none()), "{:?}", p.sections);
+    }
+
+    #[test]
+    fn first_n_videos_is_read_only_as_an_instruction() {
+        for (line, n) in [
+            ("ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ", 2),
+            ("τα δύο πρώτα βίντεο", 2),
+            ("ΤΑ 3 ΠΡΩΤΑ", 3),
+            ("Θέλω τα 3 πρώτα πλάνα", 3),
+            ("ΜΟΝΟ ΤΟ ΠΡΩΤΟ ΒΙΝΤΕΟ", 1),
+            ("μόνο το πρώτο", 1),
+            ("first 2 videos please", 2),
+        ] {
+            assert_eq!(first_n_videos(line), Some(n), "{line}");
+        }
+        for line in [
+            "Τα 2 πρώτα γκολ του Ολυμπιακού",
+            "ΣΤΙΣ 3 ΠΡΩΤΕΣ ΘΕΣΕΙΣ ΤΗΣ ΒΑΘΜΟΛΟΓΙΑΣ",
+            "Το πρώτο βίντεο είναι καλύτερο",
+            "ΓΙΑ ΠΛΑΝΑ: ΒΙΝΤΕΟ ΑΠΟ ΙΝΣΤΑΓΚΡΑΜ",
+            "ΓΙΑ ΠΛΑΝΑ: 99 ΠΡΩΤΑ ΒΙΝΤΕΟ",
+        ] {
+            assert_eq!(first_n_videos(line), None, "{line}");
+        }
     }
 
     /// Greek Outlook's "Στάλθηκε:" and "Κοιν.:" were not known as header

@@ -379,6 +379,14 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_queue_status_completed ON queue(status, completed_at);
         "#,
     ),
+    (
+        12,
+        // "ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ" (plan P4.33): how many of an article's
+        // videos the journalist asked for. NULL means all of them.
+        r#"
+        ALTER TABLE queue ADD COLUMN max_videos INTEGER;
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
