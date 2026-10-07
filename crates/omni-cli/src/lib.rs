@@ -1,3 +1,5 @@
+pub mod install;
+
 use anyhow::{Context, Result};
 use inquire::{Confirm, CustomType, Password, Text};
 use omni_core::config::AppConfig;
