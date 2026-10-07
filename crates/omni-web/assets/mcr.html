@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — MCR</title>
-<link rel="stylesheet" href="/static/app.css?v=5">
+<link rel="stylesheet" href="/static/app.css?v=7">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -33,7 +33,10 @@
   <div id="health-banner" hidden></div>
 
   <div class="tabs" role="tablist">
-    <button class="tab" type="button" role="tab" data-tab="queue" aria-selected="true">
+    <button class="tab" type="button" role="tab" data-tab="email" aria-selected="true">
+      Email <span id="email-count" class="badge info" hidden>0</span>
+    </button>
+    <button class="tab" type="button" role="tab" data-tab="queue" aria-selected="false">
       Σε εξέλιξη <span id="queue-count" class="badge info" hidden>0</span>
     </button>
     <button class="tab" type="button" role="tab" data-tab="review" aria-selected="false">
@@ -47,8 +50,24 @@
     <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Προδιαγραφές εκπομπής</button>
   </div>
 
+  <!-- Every mail and every link added by hand, each with its videos (plan P7.10) -->
+  <section id="tab-email" class="stack">
+    <div class="ib-toolbar">
+      <div class="ib-filters" id="inbox-filters" role="group" aria-label="Φίλτρο"></div>
+      <input type="search" id="inbox-search" placeholder="Αναζήτηση θέματος, αποστολέα, δημοσιογράφου ή συνδέσμου…" aria-label="Αναζήτηση">
+    </div>
+    <p class="note" style="margin:0">
+      Κάθε email που ήρθε, με τα βίντεο που βγήκαν από αυτό. Ανοίξτε ένα για να δείτε το κείμενό του:
+      κάθε σύνδεσμος έχει δίπλα τον αριθμό του αρχείου που έγινε και το χρώμα της κατάστασής του.
+    </p>
+    <div id="inbox-list" class="ib-list">
+      <div class="card center">Φόρτωση…</div>
+    </div>
+    <div id="inbox-pager"></div>
+  </section>
+
   <!-- Live queue -->
-  <section id="tab-queue" class="stack">
+  <section id="tab-queue" class="stack" hidden>
     <div class="section-head">
       <p class="note" style="margin:0">
         Πρώτα όσα βίντεο περιμένουν ή μετατρέπονται, μετά όσα έχουν ήδη παραδοθεί.
@@ -218,6 +237,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=7"></script>
+<script type="module" src="/static/mcr.js?v=11"></script>
 </body>
 </html>

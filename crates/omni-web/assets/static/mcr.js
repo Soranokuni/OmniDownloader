@@ -14,74 +14,30 @@
 
 import {
   api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref,
-} from '/static/app.js?v=4';
+} from '/static/app.js?v=5';
+import {
+  stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
+  retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
+  redownloadJob as deskRedownload, queueOffer as deskQueueOffer,
+} from '/static/desk.js?v=1';
+import { initInbox, loadInbox } from '/static/inbox.js?v=4';
 
-let currentTab = 'queue';
 let journalists = [];
-
-/* ------------------------------------------------------------------ *
- * Words
- * ------------------------------------------------------------------ */
-
-/** What a job is doing, for a person. */
-const STAGE_TEXT = {
-  QUEUED: 'Σε αναμονή',
-  EXTRACT: 'Αναζήτηση του βίντεο στη σελίδα',
-  DOWNLOAD: 'Λήψη',
-  PROBE: 'Έλεγχος του αρχείου που κατέβηκε',
-  TRANSCODE: 'Μετατροπή στη μορφή εκπομπής',
-  REWRAP: 'Πακετάρισμα σε MXF',
-  VERIFY: 'Έλεγχος προδιαγραφών εκπομπής',
-  DELIVER: 'Παράδοση στο watchfolder του Dalet',
-  ARCHIVE: 'Αρχειοθέτηση',
-  DONE: 'Ολοκλήρωση',
-};
-const STAGE_ORDER = ['EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER'];
-
-function stageLine(job) {
-  if (job.status === 'PENDING') return 'Σε αναμονή';
-  const text = STAGE_TEXT[job.stage] || 'Σε επεξεργασία';
-  const step = STAGE_ORDER.indexOf(job.stage);
-  return step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ${text}` : text;
-}
-
-function statusBadge(job) {
-  switch (job.status) {
-    case 'PENDING': return el('span', { class: 'badge' }, 'Σε αναμονή');
-    case 'RUNNING': return el('span', { class: 'badge info' }, 'Σε επεξεργασία');
-    case 'COMPLETED': return el('span', { class: 'badge ok' }, 'Παραδόθηκε');
-    case 'COMPLETED_MANUAL': return el('span', { class: 'badge ok' }, 'Παραδόθηκε χειροκίνητα');
-    case 'MANUAL_DOWNLOAD': return el('span', { class: 'badge warn' }, 'Χειροκίνητη λήψη');
-    case 'FAILED': return el('span', { class: 'badge bad' }, 'Απέτυχε');
-    default: return el('span', { class: 'badge warn' }, 'Χρειάζεται έλεγχο');
-  }
-}
-
-/** "Μόνο τα 2 πρώτα βίντεο", when the journalist asked for that. */
-function limitNote(job) {
-  const n = Number(job.max_videos) || 0;
-  if (!n) return null;
-  return el('span', { class: 'badge', style: 'margin-left:8px', title: 'Όπως ζήτησε ο δημοσιογράφος· τα υπόλοιπα βίντεο του άρθρου προτείνονται για προσθήκη' },
-    n === 1 ? 'Μόνο το πρώτο βίντεο' : `Μόνο τα ${n} πρώτα βίντεο`);
-}
-
-function fileName(job) {
-  return `${job.slug}.mxf`;
-}
-
-/** The delivered file's name, which differs from the slug when a file of
- *  the same name was already in the watchfolder (`_2`). */
-function deliveredName(job) {
-  if (!job.file_path) return fileName(job);
-  const parts = String(job.file_path).split(/[\\/]/);
-  return parts[parts.length - 1] || fileName(job);
-}
 
 /* ------------------------------------------------------------------ *
  * Tabs
  * ------------------------------------------------------------------ */
 
-const TABS = ['queue', 'review', 'completed', 'journalists', 'manual'];
+const TABS = ['email', 'queue', 'review', 'completed', 'journalists', 'manual'];
+
+/* The Email tab is where the desk opens (plan P7.10); `/mcr#review` and the
+ * like open another one, so a bookmark or a second screen can keep its own. */
+function tabFromHash() {
+  const name = location.hash.replace('#', '');
+  return TABS.includes(name) ? name : 'email';
+}
+
+let currentTab = tabFromHash();
 
 function switchTab(name) {
   currentTab = name;
@@ -91,6 +47,8 @@ function switchTab(name) {
     if (button) button.setAttribute('aria-selected', String(tab === name));
     if (section) section.hidden = tab !== name;
   }
+  document.body.classList.toggle('desk-wide', name === 'email');
+  if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
   if (name === 'journalists') loadJournalists();
   refresh();
 }
@@ -197,30 +155,6 @@ const pages = {
   completed: { page: 1, perPage: 25 },
 };
 
-/** "Εμφανίζονται 26–50 από 132  ‹ Προηγούμενη  Σελίδα 2 από 6  Επόμενη ›".
- *  Hidden when everything fits on one page. */
-function pager(targetId, state, total, onChange) {
-  const pageCount = Math.max(1, Math.ceil(total / state.perPage));
-  if (state.page > pageCount) state.page = pageCount;
-  if (total <= state.perPage) {
-    render(targetId);
-    return;
-  }
-  const first = (state.page - 1) * state.perPage + 1;
-  const last = Math.min(total, state.page * state.perPage);
-  const go = (p) => { state.page = p; onChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  render(targetId, el('div', { class: 'section-head card', style: 'padding:10px 14px' },
-    el('span', { class: 'note' }, `Εμφανίζονται ${first}–${last} από ${total}`),
-    el('div', { class: 'row tight' },
-      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(1) }, '« Πρώτη'),
-      el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(state.page - 1) }, '‹ Προηγούμενη'),
-      el('span', { class: 'note', style: 'padding:0 8px' }, `Σελίδα ${state.page} από ${pageCount}`),
-      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(state.page + 1) }, 'Επόμενη ›'),
-      el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(pageCount) }, 'Τελευταία »'),
-    ),
-  ));
-}
-
 async function fetchPage(view, extra = {}) {
   const state = pages[view];
   const params = new URLSearchParams({ view, page: String(state.page), per_page: String(state.perPage), ...extra });
@@ -229,6 +163,7 @@ async function fetchPage(view, extra = {}) {
 
 function showCounts(counts) {
   if (!counts) return;
+  // (Also called by the Email tab, with the same counts.)
   const set = (id, n) => {
     const b = document.getElementById(id);
     b.hidden = !n;
@@ -257,7 +192,8 @@ async function refresh() {
   try {
     do {
       refreshAgain = false;
-      if (currentTab === 'review') await loadReview();
+      if (currentTab === 'email') await loadInbox();
+      else if (currentTab === 'review') await loadReview();
       else if (currentTab === 'completed') await loadCompleted();
       // The live queue (also the journalists and add-a-link tabs) keeps the
       // tab counts current.
@@ -321,13 +257,7 @@ function renderOffers(targetId, jobs) {
   ));
 }
 
-async function queueOffer(id, offer) {
-  try {
-    const r = await api(`/api/jobs/${id}/offers/queue`, { method: 'POST', body: { url: offer.url } });
-    toast(`Προστέθηκε ως ${r.index_str} (εργασία #${r.job_id}).`, 'ok');
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
-}
+const queueOffer = (id, offer) => deskQueueOffer(id, offer, refresh);
 
 /* ------------------------------------------------------------------ *
  * Live queue
@@ -495,35 +425,9 @@ function reviewCard(job) {
   );
 }
 
-async function retryJob(job) {
-  try {
-    await api(`/api/jobs/${job.id}/retry`, { method: 'POST' });
-    toast(`Το ${fileName(job)} μπήκε ξανά στην ουρά.`, 'ok');
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
-}
-
-async function overrideJob(job, url) {
-  const trimmed = (url || '').trim();
-  if (!trimmed) { toast('Επικολλήστε πρώτα έναν σύνδεσμο.', 'bad'); return; }
-  try {
-    await api(`/api/jobs/${job.id}/override`, { method: 'POST', body: { url: trimmed } });
-    toast(`Το ${fileName(job)} μπήκε ξανά στην ουρά με τον νέο σύνδεσμο.`, 'ok');
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
-}
-
-async function discardJob(job) {
-  if (!confirm(
-    `Να αφαιρεθεί το ${fileName(job)} (εργασία #${job.id});\n\n` +
-    'Φεύγει οριστικά από τις λίστες. Ένα αρχείο που έχει ήδη παραδοθεί στο Dalet δεν επηρεάζεται.',
-  )) return;
-  try {
-    await api(`/api/jobs/${job.id}/discard`, { method: 'POST' });
-    toast(`Η εργασία #${job.id} αφαιρέθηκε.`, 'ok');
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
-}
+const retryJob = (job) => deskRetry(job, refresh);
+const overrideJob = (job, url) => deskOverride(job, url, refresh);
+const discardJob = (job) => deskDiscard(job, refresh);
 
 /* ------------------------------------------------------------------ *
  * Completed
@@ -612,19 +516,7 @@ function completedRow(job) {
   );
 }
 
-async function redownload(job) {
-  const name = deliveredName(job);
-  if (!confirm(
-    `Νέα λήψη του ${name};\n\n` +
-    'Το βίντεο κατεβαίνει από τον σύνδεσμό του, μετατρέπεται και παραδίδεται ξανά στο watchfolder. ' +
-    'Αν το παλιό αρχείο υπάρχει ακόμη, το νέο αποθηκεύεται δίπλα του με έναν αριθμό στο τέλος (…_2.mxf)· τίποτα δεν αντικαθίσταται.',
-  )) return;
-  try {
-    await api(`/api/jobs/${job.id}/redownload`, { method: 'POST' });
-    toast(`Το ${name} μπήκε ξανά στην ουρά.`, 'ok');
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
-}
+const redownload = (job) => deskRedownload(job, refresh);
 
 /* ------------------------------------------------------------------ *
  * Journalists
@@ -750,5 +642,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') specsModal
 
 document.getElementById('logout-btn').addEventListener('click', logout);
 
+initInbox({ onCounts: showCounts, refresh: () => refresh(), groupName });
 loadFilters();
+switchTab(currentTab);
 live(() => { refresh(); loadStatus(); });
