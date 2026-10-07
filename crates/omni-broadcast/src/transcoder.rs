@@ -208,6 +208,19 @@ pub fn build_video_chain(video: &crate::probe::VideoStream) -> (String, &'static
         // pairs into 25 interlaced frames. A 25p source becomes PsF: both fields
         // of each output frame come from one source frame, so there is no
         // interline twitter and the motion cadence is the source's own.
+        //
+        // Up to 50 fps the frames are scaled at the source rate, before `fps`
+        // duplicates them (P1.12): scale, pad and format are per-frame and
+        // `fps` only picks frames, so the output is bit-identical (framemd5
+        // checked) and a 25p source is scaled 25 times a second, not 50.
+        // Above 50 the rate comes down first, for the same reason.
+        ScanType::Progressive | ScanType::Unknown if video.fps > 0.0 && video.fps <= 50.05 => (
+            format!(
+                "{},fps=50,tinterlace=mode=interleave_top:flags=vlpf",
+                scale_pad(false)
+            ),
+            "progressive_to_25i",
+        ),
         ScanType::Progressive | ScanType::Unknown => (
             format!(
                 "fps=50,{},tinterlace=mode=interleave_top:flags=vlpf",
