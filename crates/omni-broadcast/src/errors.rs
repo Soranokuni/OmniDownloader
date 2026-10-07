@@ -211,6 +211,11 @@ impl ErrorCode {
         if *self == Self::PageNotFound || crate::downloader::is_youtube(url) {
             return false;
         }
+        // yt-dlp's extractor read the post and found no video in it; the
+        // post's page would only offer the browser someone else's.
+        if *self == Self::NoStreamFound && crate::downloader::is_video_platform(url) {
+            return false;
+        }
         !crate::downloader::is_video_platform(url) || self.should_try_sniffer()
     }
 }
@@ -272,6 +277,11 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     }
     if s.contains("http error 403") || s.contains("403 forbidden") {
         return ErrorCode::Http403;
+    }
+    // A post with photos, or text only: yt-dlp's extractor read the post and
+    // it has no video. Not unexpected, and not something to sniff for.
+    if s.contains("no video could be found in this tweet") || s.contains("there's no video in this post") {
+        return ErrorCode::NoStreamFound;
     }
     // The page, not a media segment: "Unable to download webpage: HTTP Error
     // 404". A 404 on video data can be an expired signed URL and is not this.
@@ -372,9 +382,11 @@ mod tests {
                 ErrorCode::Network,
             ),
             (
-                // A reply that has no video: final, not a sniffer case.
+                // A reply that has no video: final (not retried), and not a
+                // sniffer case either (`should_sniff` refuses NO_STREAM_FOUND
+                // on a platform post). It used to read "unexpected error".
                 "ERROR: [twitter] 1900000000000000011: No video could be found in this tweet",
-                ErrorCode::PipelineFailed,
+                ErrorCode::NoStreamFound,
             ),
             (
                 "ERROR: [generic] Requested format is not available",
@@ -480,6 +492,8 @@ mod tests {
         // yt-dlp said the reply has no video. Its page plays the thread
         // parent's video, and that must not be delivered under this job.
         assert!(!ErrorCode::PipelineFailed.should_sniff(reply));
+        // Now classified as such ("No video could be found in this tweet").
+        assert!(!ErrorCode::NoStreamFound.should_sniff(reply));
         // A page that does not exist has no player either (P3.10).
         assert!(!ErrorCode::PageNotFound.should_sniff(article));
         // Transient: retried, not sniffed.
