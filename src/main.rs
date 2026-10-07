@@ -1818,4 +1818,16 @@ mod tests {
         let no_browser = anyhow::Error::from(omni_browser::BrowserError::LaunchFailed("no Chrome".into()));
         assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), no_browser)), ErrorCode::UnsupportedUrl);
     }
+
+    /// A mistyped YouTube id (2026-10-07): the card said «Απρόβλεπτο
+    /// σφάλμα». The downloader's code must come back out of the chain the
+    /// pipeline wraps around it.
+    #[test]
+    fn an_unavailable_video_keeps_its_code_through_the_pipeline() {
+        let line = "ERROR: [youtube] zzzzzzzzzz0: This video is unavailable";
+        let code = omni_broadcast::errors::classify_download_error(line);
+        let e = anyhow::Error::from(omni_broadcast::downloader::DownloadError { code, message: line.into() })
+            .context(code.as_str());
+        assert_eq!(classify_pipeline_error(&e), ErrorCode::PrivateOrRemoved);
+    }
 }

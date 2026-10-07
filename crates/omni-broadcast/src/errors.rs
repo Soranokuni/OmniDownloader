@@ -234,8 +234,11 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     {
         return ErrorCode::GeoBlocked;
     }
+    // YouTube says "Video unavailable. …" for a removed video and "This video
+    // is unavailable" for an id it does not know (a mistyped link).
     if s.contains("private video")
         || s.contains("video unavailable")
+        || s.contains("this video is unavailable")
         || s.contains("has been removed")
         || s.contains("account associated with this video has been terminated")
         || s.contains("this video is no longer available")
@@ -375,6 +378,23 @@ mod tests {
         let code = classify_download_error("ERROR: Video unavailable");
         assert_eq!(code, ErrorCode::PrivateOrRemoved);
         assert!(!code.is_retryable());
+    }
+
+    #[test]
+    fn a_mistyped_youtube_id_asks_for_another_link() {
+        // yt-dlp's other wording, for an id YouTube does not know. Verbatim
+        // from the dev instance, 2026-10-07: it fell through to
+        // PIPELINE_FAILED, and the card said «Απρόβλεπτο σφάλμα» instead of
+        // asking for another link.
+        let code = classify_download_error("ERROR: [youtube] zzzzzzzzzz0: This video is unavailable");
+        assert_eq!(code, ErrorCode::PrivateOrRemoved);
+        assert!(!code.is_retryable());
+        // Not verbatim: the same words with a geo reason stay a geo block,
+        // which is why the geo phrases are matched first.
+        assert_eq!(
+            classify_download_error("ERROR: [youtube] zzzzzzzzzz0: This video is unavailable in your country"),
+            ErrorCode::GeoBlocked
+        );
     }
 
     #[test]
