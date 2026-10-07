@@ -1267,26 +1267,49 @@ async fn run_job(
 
         match StreamSniffer::extract_media_bundle(&orig_url, 25).await {
             Ok(bundle) => {
-                info!("Job #{job_id}: sniffer found {}", bundle.primary_stream);
-                repo.record_event(
-                    job_id,
-                    "INFO",
-                    Some(JobStage::Extract),
-                    &format!("Sniffed stream: {}", bundle.primary_stream),
-                )?;
-                let mut retry_job = job.clone();
-                omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &bundle.primary_stream, &bundle.all_streams);
-                retry_job.url = bundle.primary_stream;
-                repo.set_stage(job_id, owner, JobStage::Download)?;
-                process_result = engine
-                    .process_job_with_context(
-                        retry_job,
-                        owner,
-                        Some(&bundle.referer),
-                        Some(&bundle.user_agent),
-                        bundle.cookies.as_deref(),
-                    )
-                    .await;
+                // An article's embedded posts are not all videos: the first
+                // X post in a news247 article was a photo, became the job's
+                // video, and sent the job to review while its two real
+                // videos were delivered as siblings (P3.13). Ask yt-dlp
+                // about each post first; keep the ones it cannot rule out.
+                let streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams).await;
+                let primary = if streams.contains(&bundle.primary_stream) {
+                    Some(bundle.primary_stream.clone())
+                } else {
+                    streams.first().cloned()
+                };
+                match primary {
+                    Some(primary) => {
+                        info!("Job #{job_id}: sniffer found {primary}");
+                        repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Sniffed stream: {primary}"))?;
+                        let mut retry_job = job.clone();
+                        omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams);
+                        retry_job.url = primary;
+                        repo.set_stage(job_id, owner, JobStage::Download)?;
+                        process_result = engine
+                            .process_job_with_context(
+                                retry_job,
+                                owner,
+                                Some(&bundle.referer),
+                                Some(&bundle.user_agent),
+                                bundle.cookies.as_deref(),
+                            )
+                            .await;
+                    }
+                    None => {
+                        repo.record_event(
+                            job_id,
+                            "ERROR",
+                            Some(JobStage::Extract),
+                            "The page's embedded posts have no video (photos or text only)",
+                        )?;
+                        process_result = Err(anyhow::anyhow!(
+                            "{}: the page's embedded posts have no video",
+                            ErrorCode::NoStreamFound.as_str()
+                        )
+                        .context(ErrorCode::NoStreamFound.as_str()));
+                    }
+                }
             }
             Err(sniff_err) => {
                 warn!("Job #{job_id}: sniffer found nothing: {sniff_err}");
@@ -1363,6 +1386,31 @@ async fn run_job(
             Ok(())
         }
     }
+}
+
+/// `streams` without the social posts yt-dlp says have no video, in page
+/// order (P3.13). YouTube is not asked (it has no photo posts) and raw
+/// streams cannot be; a post that cannot be checked (network, login) stays.
+/// About a second per post with the folder build of yt-dlp.
+async fn without_videoless_posts(repo: &Repository, engine: &BroadcastEngine, job_id: i64, streams: &[String]) -> Vec<String> {
+    use omni_broadcast::downloader::{is_video_platform, is_youtube};
+    let mut kept = Vec::with_capacity(streams.len());
+    let mut seen = std::collections::HashSet::new();
+    for (i, url) in streams.iter().enumerate() {
+        // One post under two addresses (".../visegrad24/status/N" and
+        // ".../i/status/N") is asked about, and kept, once.
+        if !seen.insert(omni_core::urlnorm::normalize(url)) {
+            continue;
+        }
+        let ask = i < 12 && is_video_platform(url) && !is_youtube(url);
+        if ask && engine.post_has_video(url).await == Some(false) {
+            info!("Job #{job_id}: {url} has no video; not a candidate");
+            let _ = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Embedded post without a video, skipped: {url}"));
+            continue;
+        }
+        kept.push(url.clone());
+    }
+    kept
 }
 
 /// The job's failure once the sniffer has also come back empty-handed.

@@ -92,6 +92,18 @@ impl BroadcastEngine {
             .await
     }
 
+    /// Whether the post at `url` has a video, as yt-dlp's own extractor
+    /// sees it without downloading (P3.13). `Some(false)` only when it says
+    /// so ("No video could be found in this tweet"); a failure that proves
+    /// nothing (network, login, timeout) is `None`.
+    pub async fn post_has_video(&self, url: &str) -> Option<bool> {
+        match Downloader::new(&self.ytdl_path).probe(url, std::time::Duration::from_secs(60)).await {
+            Ok(_) => Some(true),
+            Err(line) if crate::errors::classify_download_error(&line) == ErrorCode::NoStreamFound => Some(false),
+            Err(_) => None,
+        }
+    }
+
     pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
         self.process_job_with_context(job, owner, None, None, None).await
     }
