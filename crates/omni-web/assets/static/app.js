@@ -96,7 +96,7 @@ export function icon(name, extraClass = '') {
  * ------------------------------------------------------------------ */
 
 /** Cache-busting stamp, replaced per release; also on the sprite URL. */
-export const BUILD = '2';
+export const BUILD = '3';
 
 /**
  * The single API entry point.

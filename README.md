@@ -262,6 +262,10 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe mail-preview --last 10
 .\target\release\omni-ingest.exe mail-preview --eml .\sample.eml
 
+# queue saved .eml files as if they had arrived (the running daemon downloads
+# them; a file handled before is skipped; no mailbox is touched)
+.\target\release\omni-ingest.exe mail-ingest --eml .\sample.eml
+
 # sniff a single URL through the headless browser
 .\target\release\omni-ingest.exe browser-test "https://example.com/video/..."
 
@@ -271,6 +275,14 @@ copy config.example.json config.json
 ```
 
 Panels: `/mcr` (operators), `/admin`, `/user`, `/login` on port 8080 by default.
+
+The MCR desk opens on **Email**: every mail (and every link added by hand), newest
+first, each with a bar of its videos' states. Opened, a mail shows its text with
+every link tagged by the file it became and coloured by how that file is doing,
+and its videos beside it; pointing at one lights up the other. A link the parser
+left out shows why, and can be queued from there. The text is kept for
+`mail_text_retention_days` (30) and then cleared; `/mcr#queue`, `#review` and
+`#completed` open the other lists directly.
 
 If the watchfolder is a network share, install the service under a domain
 account. LocalSystem authenticates to SMB as the computer account, which most
