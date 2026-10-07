@@ -21,6 +21,7 @@ import {
   redownloadJob as deskRedownload, queueOffer as deskQueueOffer,
 } from '/static/desk.js?v=1';
 import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=5';
+import { initNotify } from '/static/notify.js?v=3';
 
 let journalists = [];
 
@@ -668,6 +669,12 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') specsModal
 document.getElementById('logout-btn').addEventListener('click', logout);
 
 initInbox({ onCounts: showCounts, refresh: () => refresh(), groupName });
+// Jingle and notification when every video of an email has finished (P5.4).
+initNotify(document.querySelector('.topbar-status'), (id) => {
+  const cut = id.indexOf(':');
+  switchTab('email');
+  openMail(id.slice(0, cut), id.slice(cut + 1));
+});
 loadFilters();
 switchTab(currentTab);
 live(() => { refresh(); loadStatus(); });

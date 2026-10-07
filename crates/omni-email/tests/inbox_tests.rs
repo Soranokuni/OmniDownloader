@@ -203,3 +203,32 @@ fn the_page_that_holds_an_entry_is_found_by_its_id() {
     let p = inbox::page_with_focus(list(&repo), InboxFilter::All, "", 2, 5, Some("mail:<gone@x>"));
     assert_eq!(p.page, 2);
 }
+
+#[test]
+fn a_mail_is_settled_only_when_none_of_its_videos_waits_or_runs() {
+    // P5.4: the desk chimes when a whole email is done. A mail with one
+    // video in review and another still downloading needs attention but is
+    // not done yet, so it must not chime until the second one ends.
+    let (_d, repo) = repo();
+    mail(&repo, "<done@x>", "ΚΑΙΡΟΣ", 50, &[("https://youtu.be/d1", JobStatus::Completed), ("https://youtu.be/d2", JobStatus::Completed)]);
+    let mixed = mail(&repo, "<mixed@x>", "ΣΕΙΣΜΟΣ", 40, &[("https://youtu.be/m1", JobStatus::RequiresReview), ("https://youtu.be/m2", JobStatus::Running)]);
+    mail(&repo, "<none@x>", "ΔΕΛΤΙΟ ΤΥΠΟΥ", 20, &[]);
+    mail(&repo, "<old@x>", "ΠΑΛΙΟ", 60 * 72, &[("https://youtu.be/o1", JobStatus::Completed)]);
+
+    let since = Utc::now() - Duration::hours(48);
+    let s = inbox::settlements(&list(&repo), since);
+    let by = |id: &str| s.iter().find(|x| x.id == id).cloned();
+
+    let done = by("mail:<done@x>").expect("a recent mail with videos is reported");
+    assert!(done.settled && done.ok, "{done:?}");
+    assert_eq!((done.delivered, done.total), (2, 2));
+    assert!(!by("mail:<mixed@x>").unwrap().settled, "a video is still running");
+    assert!(by("mail:<none@x>").is_none(), "nothing to chime for in a mail without videos");
+    assert!(by("mail:<old@x>").is_none(), "older than `since`");
+
+    set_status(&repo, mixed[1], JobStatus::Completed);
+    let s = inbox::settlements(&list(&repo), since);
+    let mixed = s.iter().find(|x| x.id == "mail:<mixed@x>").unwrap();
+    assert!(mixed.settled && !mixed.ok, "settled, but one video needs MCR: {mixed:?}");
+    assert_eq!((mixed.delivered, mixed.total), (1, 2));
+}

@@ -1657,6 +1657,27 @@ pub struct MailsQuery {
 
 /// One page of the mail view's list: handled mail and links added by hand,
 /// newest first, within the days the mail text is kept.
+/// The Email tab's entries received since `since`.
+fn inbox_entries(state: &AppState, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<omni_email::inbox::Entry>, ApiError> {
+    let mails = state.repo.inbox_mail_rows(since).map_err(internal_error("Could not read the mail list."))?;
+    let extra = omni_email::inbox::referenced_job_ids(&mails);
+    // A day of slack for jobs: a mail's received time is the server's clock.
+    let jobs = state
+        .repo
+        .inbox_job_rows(since - chrono::Duration::days(1), &extra)
+        .map_err(internal_error("Could not read the mail list."))?;
+    Ok(omni_email::inbox::entries(mails, jobs, since))
+}
+
+/// Recent emails (and links added by hand) with whether all their videos
+/// have ended (plan P5.4). The desk polls this on every tab and chimes for
+/// an entry that turned settled. Two days back: what is still in play.
+pub async fn api_get_mail_settlements(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let since = chrono::Utc::now() - chrono::Duration::days(2);
+    let entries = inbox_entries(&state, since)?;
+    Ok(Json(serde_json::json!({ "entries": omni_email::inbox::settlements(&entries, since) })))
+}
+
 pub async fn api_get_mails(
     RequireMcr(_): RequireMcr,
     Query(query): Query<MailsQuery>,
@@ -1664,15 +1685,7 @@ pub async fn api_get_mails(
 ) -> JsonResult {
     let days = state.config.read().await.mail_text_retention_days.clamp(1, 3650);
     let since = chrono::Utc::now() - chrono::Duration::days(days);
-    let read_failed = internal_error("Could not read the mail list.");
-    let mails = state.repo.inbox_mail_rows(since).map_err(read_failed)?;
-    let extra = omni_email::inbox::referenced_job_ids(&mails);
-    // A day of slack for jobs: a mail's received time is the server's clock.
-    let jobs = state
-        .repo
-        .inbox_job_rows(since - chrono::Duration::days(1), &extra)
-        .map_err(internal_error("Could not read the mail list."))?;
-    let entries = omni_email::inbox::entries(mails, jobs, since);
+    let entries = inbox_entries(&state, since)?;
     let page = omni_email::inbox::page_with_focus(
         entries,
         query.filter,

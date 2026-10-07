@@ -422,6 +422,18 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
+    // Subjects and journalists of recent mail: the same policy (plan P5.4).
+    (
+        "GET",
+        "/api/mails/settled",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     (
         "GET",
         "/api/mails/view",

@@ -64,6 +64,7 @@ impl WebServer {
             .route("/api/events", get(api_events))
             // The mail view (plan P7.8).
             .route("/api/mails", get(api_get_mails))
+            .route("/api/mails/settled", get(api_get_mail_settlements))
             .route("/api/mails/view", get(api_get_mail_view))
             .route("/api/mails/queue-link", post(api_mail_queue_link))
             .route("/api/mails/reprocess", post(api_mail_reprocess))
