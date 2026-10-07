@@ -48,7 +48,11 @@ pub async fn probe_tools(bin_dir: &Path) -> Vec<ToolReport> {
     let mut reports = Vec::new();
 
     for (name, flag) in REQUIRED_TOOLS {
-        let path = bin_dir.join(format!("{name}.exe"));
+        let path = if *name == "yt-dlp" {
+            crate::dependencies::ytdl_exe_in(bin_dir)
+        } else {
+            bin_dir.join(format!("{name}.exe"))
+        };
         if !path.exists() {
             reports.push(ToolReport {
                 name: name.to_string(),

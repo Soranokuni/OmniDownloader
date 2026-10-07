@@ -619,6 +619,9 @@ async fn run_daemon(
 
     // Dependency manager and tool paths
     let dep_mgr = DependencyManager::new(&bin_dir);
+    if config.ytdl_path.is_none() {
+        ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
+    }
     let ffmpeg_path = config
         .ffmpeg_path
         .as_ref()
@@ -1412,14 +1415,14 @@ async fn nightly_ytdl_update(
     let rejected_marker = dep_mgr.get_bin_dir().join("yt-dlp.exe.rejected");
     let rejected = std::fs::read_to_string(&rejected_marker).unwrap_or_default();
     if rejected.trim() == staged.sha256 {
-        let _ = std::fs::remove_file(&staged.path);
+        dep_mgr.discard_staged_ytdl();
         info!("yt-dlp update skipped: this build was rolled back before");
         return TaskOutcome::Skipped;
     }
     // Live and also the release: nothing to do. (The download is still made,
     // to know; it is a few seconds at 03:00.)
-    if sha256_of_file(&dep_mgr.ytdl_live()).as_deref() == Some(staged.sha256.as_str()) {
-        let _ = std::fs::remove_file(&staged.path);
+    if dep_mgr.ytdl_live_sha256().as_deref() == Some(staged.sha256.as_str()) {
+        dep_mgr.discard_staged_ytdl();
         info!("yt-dlp is already the latest release");
         return TaskOutcome::Ok;
     }
@@ -1629,9 +1632,39 @@ async fn verify_ytdl_update(dep_mgr: &DependencyManager, live: &std::path::Path,
     UpdateVerdict::RolledBack { broken }
 }
 
-fn sha256_of_file(path: &std::path::Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
-    Some(omni_core::dependencies::sha256_hex(&bytes))
+/// Replace a one-file yt-dlp with the folder build of the *same release*
+/// (plan P2.10): same extractors, ~3-17 s less per yt-dlp start. A newer
+/// release still only arrives through the nightly update and its
+/// self-check. Any failure leaves the one-file exe in use.
+async fn ensure_ytdl_folder_build(dep_mgr: &DependencyManager, channel: &str, auto: bool) {
+    if !auto || dep_mgr.ytdl_is_folder_build() || !dep_mgr.ytdl_legacy().is_file() {
+        return;
+    }
+    let legacy = dep_mgr.ytdl_legacy();
+    let version = match omni_core::process::run_capture(&legacy, ["--version"], Duration::from_secs(60)).await {
+        Ok(o) if o.success => o.stdout.lines().next().unwrap_or("").trim().to_string(),
+        _ => String::new(),
+    };
+    if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        warn!("yt-dlp folder build not installed: could not read the version of {legacy:?}");
+        return;
+    }
+    info!("Installing the folder build of yt-dlp {version} (starts in ~1 s instead of 4-18 s)");
+    let staged = tokio::time::timeout(Duration::from_secs(120), dep_mgr.stage_ytdl_release(channel, Some(&version))).await;
+    match staged {
+        Ok(Ok(_)) => match dep_mgr.apply_staged_ytdl() {
+            Ok(p) => info!("yt-dlp {version} now runs from {p:?}; {legacy:?} is kept as the fallback"),
+            Err(e) => {
+                dep_mgr.discard_staged_ytdl();
+                warn!("yt-dlp folder build not installed: {e:#}");
+            }
+        },
+        Ok(Err(e)) => warn!("yt-dlp folder build not installed: {e:#}"),
+        Err(_) => {
+            dep_mgr.discard_staged_ytdl();
+            warn!("yt-dlp folder build not installed: download took over 2 minutes");
+        }
+    }
 }
 
 /// Everything the maintenance tasks need, gathered once at start-up.
