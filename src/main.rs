@@ -89,6 +89,14 @@ enum Commands {
         #[arg(long)]
         llm: bool,
     },
+    /// Queue saved .eml files as if they had arrived in the mailbox: parsed,
+    /// queued, attachments saved, the mail kept for the MCR mail view. A file
+    /// already handled is skipped. The running daemon downloads the jobs.
+    MailIngest {
+        /// The .eml files
+        #[arg(long, required = true)]
+        eml: Vec<std::path::PathBuf>,
+    },
     /// The mail the daemon has handled, newest first
     MailHistory {
         #[arg(long, default_value_t = 20)]
@@ -275,6 +283,43 @@ Nothing was queued and the mailbox was not changed.");
     Ok(())
 }
 
+/// `omni-ingest mail-ingest --eml …` (plan P7.9): saved mail through the
+/// watcher's own path into the configured database. Reads no mailbox.
+async fn mail_ingest(paths: &AppPaths, files: &[std::path::PathBuf]) -> Result<()> {
+    use omni_email::watcher::Ingested;
+
+    let mut config = AppConfig::load_from_file(&paths.config)
+        .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+    config.adopt_secrets(&SecretStore::new(paths.resolve("data/secrets.bin")))?;
+    let repo = Repository::new(paths.resolve(&config.database_path))?;
+    let source = std::sync::Arc::new(omni_email::eml::EmlSource::from_files(files)?);
+    let watcher = omni_email::EmailWatcher::with_source(config, repo.clone(), source.clone());
+
+    for id in source.ids() {
+        let mail = omni_email::source::MailSource::fetch_mail(source.as_ref(), &id).await?;
+        let key = omni_email::watcher::mail_key(&mail);
+        match watcher.ingest(&mail).await {
+            Ok(Ingested::AlreadyHandled) => println!("{id}: already handled ({key}); skipped"),
+            Ok(Ingested::Processed) => {
+                let row = repo.get_processed_mail(&key)?;
+                let queued: Vec<omni_email::watcher::QueuedFromMail> = row
+                    .as_ref()
+                    .and_then(|r| serde_json::from_str(&r.jobs_json).ok())
+                    .unwrap_or_default();
+                println!(
+                    "{id}: {} — {} job(s){}",
+                    row.map(|r| r.outcome).unwrap_or_default(),
+                    queued.len(),
+                    queued.iter().map(|q| format!("\n    {}  {}", q.slug, q.url)).collect::<String>()
+                );
+            }
+            Err(e) => println!("{id}: not queued: {e:#}"),
+        }
+    }
+    println!("\nThe running daemon downloads what was queued; the MCR desk shows it under Email.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -396,6 +441,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::MailPreview { last, hours, eml, llm }) => {
             mail_preview(&paths, last, hours, eml, llm).await?;
+        }
+        Some(Commands::MailIngest { eml }) => {
+            mail_ingest(&paths, &eml).await?;
         }
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)

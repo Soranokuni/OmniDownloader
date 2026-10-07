@@ -1,5 +1,6 @@
 pub mod assist;
 pub mod decontaminate;
+pub mod eml;
 pub mod graph;
 pub mod groups;
 pub mod inbox;
