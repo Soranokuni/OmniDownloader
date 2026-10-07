@@ -55,6 +55,34 @@ enum Commands {
     RunService,
     /// Run the interactive CLI setup wizard
     Setup,
+    /// Install (or upgrade) from this release folder: copy to the install
+    /// directory, register and start the Windows service, check it answers
+    Install {
+        /// Install directory
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Dalet watchfolder (asked on a new installation when not given)
+        #[arg(long)]
+        watchfolder: Option<String>,
+        /// Web panel port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Run the service as this account (a domain account for a network
+        /// watchfolder); LocalSystem when not given
+        #[arg(long)]
+        account: Option<String>,
+        /// Ask nothing; take the defaults
+        #[arg(long)]
+        yes: bool,
+        /// Leave the Windows firewall alone
+        #[arg(long)]
+        no_firewall: bool,
+    },
+    /// Remove the Windows service and its firewall rule; files stay
+    Uninstall {
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Manage the Windows Service (install, uninstall, start, stop, status)
     Service {
         #[command(subcommand)]
@@ -324,6 +352,24 @@ async fn mail_ingest(paths: &AppPaths, files: &[std::path::PathBuf]) -> Result<(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // The installer runs from a release folder, which is not an install:
+    // nothing is created or logged next to it (plan P9).
+    match &cli.command {
+        Some(Commands::Install { dir, watchfolder, port, account, yes, no_firewall }) => {
+            return omni_cli::install::install(omni_cli::install::InstallOptions {
+                dir: dir.clone(),
+                watchfolder: watchfolder.clone(),
+                port: *port,
+                account: account.clone(),
+                yes: *yes,
+                no_firewall: *no_firewall,
+            })
+            .await;
+        }
+        Some(Commands::Uninstall { dir }) => return omni_cli::install::uninstall(dir.clone()).await,
+        _ => {}
+    }
+
     // Anchor every relative path to the install directory exactly once, before
     // anything can accidentally resolve one against the CWD (plan P0.1).
     let paths = match &cli.root {
@@ -365,6 +411,7 @@ async fn main() -> Result<()> {
         Some(Commands::Setup) => {
             omni_cli::run_setup_wizard(Some(&cli.config))?;
         }
+        Some(Commands::Install { .. } | Commands::Uninstall { .. }) => unreachable!("handled before paths"),
         Some(Commands::Service { action }) => {
             let sub = match action {
                 ServiceAction::Install { account } => {
