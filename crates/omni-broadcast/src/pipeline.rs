@@ -14,6 +14,27 @@ use crate::errors::ErrorCode;
 use crate::rewrapper::Rewrapper;
 use crate::transcoder::Transcoder;
 
+/// `Err(why)` when the temp or watchfolder volume lacks room for a clip of
+/// `duration_secs` (see [`omni_core::selftest::space_needed`]). A volume
+/// whose free space cannot be read is not held against the job.
+pub fn room_for(duration_secs: f64, temp: &std::path::Path, watchfolder: &std::path::Path) -> std::result::Result<(), String> {
+    let (need_temp, need_watch) = omni_core::selftest::space_needed(duration_secs);
+    let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    for (label, path, need) in [("temp", temp, need_temp), ("watchfolder", watchfolder, need_watch)] {
+        if let Some((free, _)) = omni_core::selftest::disk_space(path) {
+            if free < need {
+                return Err(format!(
+                    "Not enough disk space for a {:.0} min clip: {label} has {:.1} GB free, needs {:.1} GB",
+                    duration_secs / 60.0,
+                    gb(free),
+                    gb(need)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Encoders running at once unless the daemon says otherwise. One MPEG-2
 /// 50 Mbps 1080i encode keeps about six cores busy; two fill the reference
 /// MCR machine (12 threads).
@@ -240,6 +261,20 @@ impl BroadcastEngine {
         let _ = self.repo.update_job_progress(job_id, 0.0, "Transcoding", "--:--");
 
         let transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
+
+        // Room for this file before it is made (plan P1.4): a full disk
+        // mid-encode fails late, after minutes of work, and can take the
+        // database down with it. Waiting is the fix (LOW_DISK retries in
+        // 10 min), so the job goes back to the queue, not to review.
+        if let Ok(probe) = transcoder.probe_source(&downloaded_file).await {
+            if let Err(why) = room_for(probe.duration_secs, &job_temp, &self.watchfolder_dir) {
+                warn!("Job #{job_id}: {why}");
+                let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Transcode), &why);
+                drop(encoder);
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+                return Err(anyhow::anyhow!("{}: {why}", ErrorCode::LowDisk.as_str()).context(ErrorCode::LowDisk.as_str()));
+            }
+        }
         let repo_clone = self.repo.clone();
         let transcode_res = transcoder
             .transcode(job_id, &downloaded_file, &job_temp, move |prog| {
@@ -283,6 +318,9 @@ impl BroadcastEngine {
                 return Err(e);
             }
         };
+        // The intermediate has served its purpose: dropping it now halves
+        // what a long clip holds on the temp disk until delivery (P1.4).
+        let _ = tokio::fs::remove_file(&intermediate_mxf).await;
 
         // 4. Compliance gate (plan P1.6, defect D-06).
         //

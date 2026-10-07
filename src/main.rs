@@ -985,6 +985,9 @@ async fn run_daemon(
     let worker_hostname = hostname.clone();
     let worker_gate = update_gate.clone();
     let worker_encoder_ok = encoder_ok.clone();
+    let worker_health = health.clone();
+    let worker_watchfolder = watchfolder_path.clone();
+    let worker_temp = temp_path.clone();
 
     tokio::spawn(async move {
         info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
@@ -1017,6 +1020,17 @@ async fn run_daemon(
                 tokio::select! {
                     _ = worker_rx.recv() => break,
                     _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                }
+            }
+
+            // Under STOP_DISK_GB free, no new job starts (plan P1.4): the
+            // `disk` check goes red and the queue waits until there is room
+            // again, rather than every job failing in turn mid-encode.
+            if !omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp) {
+                drop(permit);
+                tokio::select! {
+                    _ = worker_rx.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
                 }
             }
 
