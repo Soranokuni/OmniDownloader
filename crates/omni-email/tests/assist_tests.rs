@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use omni_core::config::{LlmConfig, LlmMode, ParserConfig};
 use omni_core::models::{JobStatus, Journalist};
 use omni_email::assist::Assist;
+use omni_email::link_titles::TitleSource;
 use omni_email::mail::InboundMail;
 use omni_email::parser::{self, warnings, ParsedEmail, Resolution};
 
@@ -73,6 +74,7 @@ fn roster() -> Vec<Journalist> {
 
 fn assist(endpoint: &str) -> Assist {
     Assist::new(endpoint, "test-model", LlmConfig { mode: LlmMode::Assist, timeout_secs: 5, ..Default::default() })
+        .with_titles(TitleSource::Fixed(Default::default()))
 }
 
 fn mail(from: &str, subject: &str, body: &str) -> InboundMail {
@@ -368,4 +370,82 @@ https://www.instagram.com/reel/as0301/");
     let (_m, addr) = start(r#"{"journalist_surname_latin": null, "journalist_named_in_mail": "<script>x</script>", "keywords": {}, "group_code": null}"#).await;
     let p = run_with(&assist(&format!("http://{addr}/v1")), &body_named, &desk_roster()).await;
     assert!(!p.has_warning(warnings::JOURNALIST_SUGGESTED));
+}
+
+// ---------------------------------------------------------------------------
+// Keyword confidence (plan P4.34)
+// ---------------------------------------------------------------------------
+
+/// The desk's mail of 2026-10-07: four film trailers, one subject word.
+const TRAILERS: &str = "Καλημέρα κι ευχαριστώ!\nhttps://www.youtube.com/watch?v=tr0000001aa\nhttps://www.youtube.com/watch?v=tr0000002aa\nhttps://www.youtube.com/watch?v=tr0000003aa\nhttps://www.youtube.com/watch?v=tr0000004aa";
+
+fn trailer_titles() -> TitleSource {
+    TitleSource::Fixed(
+        [
+            ("https://www.youtube.com/watch?v=tr0000001aa", "Dune: Part Three | Official Trailer"),
+            ("https://www.youtube.com/watch?v=tr0000002aa", "Mission Kalyx - Official Trailer (HD)"),
+            ("https://www.youtube.com/watch?v=tr0000004aa", "Official Teaser"),
+        ]
+        .into_iter()
+        .map(|(u, t)| (u.to_string(), t.to_string()))
+        .collect(),
+    )
+}
+
+fn keywords(p: &ParsedEmail) -> Vec<(String, String)> {
+    p.jobs().map(|j| (j.index_str.clone(), j.keyword.clone())).collect()
+}
+
+#[tokio::test]
+async fn uncertain_keywords_are_asked_about_with_the_videos_own_titles() {
+    // The model names 1A, answers a generic word for 1B and junk for 1C.
+    let (mock, addr) = start(
+        r#"{"journalist_surname_latin": null, "journalist_named_in_mail": null, "keywords": {},
+            "video_keywords": {"1A": "DUNE", "1B": "TRAILER", "1C": "NULL", "9Z": "EVIL"}, "group_code": null}"#,
+    )
+    .await;
+    let a = assist(&format!("http://{addr}/v1")).with_titles(trailer_titles());
+    let p = run(&a, &mail("a.papadaki@example.gr", "Πρ: τρέιλερ 9-10", TRAILERS)).await;
+
+    let prompt = mock.lock().unwrap().requests[0].to_string();
+    assert!(prompt.contains("Dune: Part Three | Official Trailer"), "the title reaches the model: {prompt}");
+    assert!(prompt.contains("1C: https://www.youtube.com/watch?v=tr0000003aa | unknown | TREILER"), "{prompt}");
+
+    assert_eq!(
+        keywords(&p),
+        [
+            ("1A".to_string(), "DUNE".to_string()),      // the model
+            ("1B".to_string(), "MISSIONKALYX".to_string()), // "TRAILER" refused; its own title
+            ("1C".to_string(), "TREILER".to_string()),   // nothing to go on
+            ("1D".to_string(), "TREILER".to_string()),   // its title is only "Official Teaser"
+        ]
+    );
+    // Same videos, same order, same statuses: only names moved.
+    assert_eq!(p.jobs().count(), 4);
+    let uncertain = p.warnings.iter().find(|w| w.code == warnings::KEYWORD_UNCERTAIN).expect("MCR is told");
+    let detail = uncertain.detail.as_deref().unwrap();
+    assert!(detail.contains("1C TREILER") && detail.contains("1D TREILER") && !detail.contains("1A"), "{detail}");
+}
+
+#[tokio::test]
+async fn with_the_llm_down_the_videos_own_titles_still_name_them() {
+    let a = assist("http://127.0.0.1:9/v1").with_titles(trailer_titles());
+    let p = run(&a, &mail("a.papadaki@example.gr", "Πρ: τρέιλερ 9-10", TRAILERS)).await;
+    let k = keywords(&p);
+    assert_eq!(k[0].1, "DUNEPART");
+    assert_eq!(k[1].1, "MISSIONKALYX");
+    assert!(p.has_warning(warnings::KEYWORD_FROM_TITLES));
+    assert!(p.has_warning(warnings::LLM_ASSIST_SKIPPED));
+}
+
+#[tokio::test]
+async fn a_mail_whose_keywords_are_sure_asks_nothing_and_fetches_nothing() {
+    let (mock, addr) = start("{}").await;
+    // A title source that would show up in the keywords if it were used.
+    let a = assist(&format!("http://{addr}/v1")).with_titles(TitleSource::Fixed(
+        [("https://youtu.be/sure0000001".to_string(), "Something Else Entirely".to_string())].into_iter().collect(),
+    ));
+    let p = run(&a, &mail("a.papadaki@example.gr", "Σεισμός στη Σητεία", "https://youtu.be/sure0000001")).await;
+    assert!(mock.lock().unwrap().requests.is_empty());
+    assert_eq!(keywords(&p)[0].1, "SEISMOSSITEIA");
 }

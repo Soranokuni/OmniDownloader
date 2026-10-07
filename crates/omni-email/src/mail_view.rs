@@ -489,6 +489,10 @@ fn notes(mail: &ProcessedMail, summary: Option<&MailParseSummary>) -> Vec<Note> 
             )),
             warnings::GROUP_AMBIGUOUS => info("Η ομάδα δεν ήταν σαφής από το email.".into()),
             warnings::LLM_ASSIST_APPLIED => info("Το LLM βοήθησε στο όνομα ή στη λέξη-κλειδί.".into()),
+            warnings::KEYWORD_FROM_TITLES => info(format!("Λέξεις-κλειδιά από τους τίτλους των ίδιων των βίντεο: {detail}.")),
+            warnings::KEYWORD_UNCERTAIN => warn(format!(
+                "Λέξη-κλειδί αβέβαιη (δεν ξεχωρίζει τα βίντεο ή είναι γενική λέξη): {detail}. Ελέγξτε το όνομα του αρχείου."
+            )),
             _ => continue,
         };
         out.push(note);

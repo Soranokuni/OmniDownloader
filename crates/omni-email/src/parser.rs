@@ -10,7 +10,7 @@
 use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use omni_core::models::{JobStatus, Journalist};
@@ -92,6 +92,35 @@ pub struct ParsedJob {
     /// (plan P4.33). `None` is all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_videos: Option<u32>,
+    /// Where `keyword` came from (P4.34): what [`keyword_verdicts`] judges
+    /// it by. Not serialised: decided and used between parse and enqueue.
+    #[serde(skip)]
+    pub keyword_from: KeywordSource,
+}
+
+/// Where a job's keyword came from, best first (P4.34).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeywordSource {
+    /// A line written for this link alone ("Διαγωνισμός ύπνου" above it).
+    Caption,
+    /// The numbered section's title.
+    Title,
+    /// The LLM, from the link's own title and the mail (validated).
+    Llm,
+    /// The video's or page's own title (oEmbed, `<title>`), without the LLM.
+    LinkTitle,
+    /// An attachment's file name.
+    FileName,
+    /// The subject of an unnumbered mail: one name for every link in it.
+    Subject,
+    /// The first text line of an unnumbered mail.
+    Preamble,
+    /// The link's own slug.
+    Url,
+    /// Nothing usable: `ASSET`.
+    #[default]
+    Fallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +207,12 @@ pub mod warnings {
     pub const GROUP_AMBIGUOUS: &str = "GROUP_AMBIGUOUS";
     /// The LLM was asked and nothing it said was used.
     pub const LLM_ASSIST_SKIPPED: &str = "LLM_ASSIST_SKIPPED";
+    /// Keywords made from the videos' own titles (P4.34); detail
+    /// `1A=DUNEPART, 1B=…`.
+    pub const KEYWORD_FROM_TITLES: &str = "KEYWORD_FROM_TITLES";
+    /// Keywords the meter still scores low after every source was tried
+    /// (P4.34); detail `1A TREILER (generic, shared by 4 links), …`.
+    pub const KEYWORD_UNCERTAIN: &str = "KEYWORD_UNCERTAIN";
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +682,9 @@ const NOT_A_NAME: &[&str] = &[
     "DELTIO", "DELTIA", "PROVOLI", "METADOSI", "ARCHEIO", "EPIKAIROTITA", "THEMATA", "THEMA", "SENA", "ESENA", "SAS",
     "ESAS", "OLOUS", "OLES", "OLA", "EMAS", "ESAS", "SOU", "SAS", "LIGO", "PARAKOLOUTHISI", "ENIMEROSI", "SYNENTEFXI",
     "REPORTAZ", "VINTEO", "VIDEO", "FOTO", "FOTOGRAFIES", "SOCIAL", "SITE", "WEB", "ONLINE", "RADIO", "TV",
+    // "ΓΙΑ ΣΗΜΕΡΙΝΟ ΚΑΛΕΣΜΕΝΟ": a day or a role, not who the mail is for.
+    "SIMERINO", "SIMERINI", "SIMERINA", "SIMERINOU", "AVRIANO", "AVRIANI", "AVRIANA", "KALESMENO", "KALESMENI",
+    "KALESMENOUS",
 ];
 
 /// Greek articles and prepositions-with-article, in ELOT 743 Latin: after
@@ -1192,10 +1230,72 @@ pub fn keyword_from_text(text: &str) -> Option<String> {
     keyword_from_tokens(tokens(&translit(text)).map(|t| t.to_string()).collect(), false)
 }
 
+/// "VINTEOOO" → "VINTEO": a letter typed three or more times in a row is
+/// emphasis ("βιντεοοο"), never spelling. Greek and Latin words double a
+/// letter at most.
+fn fold_stretched(t: &str) -> String {
+    let chars: Vec<char> = t.chars().collect();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let mut j = i;
+        while j < chars.len() && chars[j] == c {
+            j += 1;
+        }
+        let run = j - i;
+        let keep = if run >= 3 && c.is_alphabetic() { 1 } else { run };
+        out.extend(std::iter::repeat(c).take(keep));
+        i = j;
+    }
+    out
+}
+
+/// Words that, alone, do not name a story: what kind of material it is,
+/// not what it is about (P4.34). "TREILER" ×4 named four different films.
+const GENERIC: &[&str] = &[
+    "VINTEO", "VINTEAKI", "VIDEO", "VIDEOS", "TREILER", "TRAILER", "TRAILERS", "TEASER", "PLANA", "PLANO", "YLIKO",
+    "VIRAL", "THEMA", "THEMATA", "REPORTAZ", "NEWS", "LINK", "LINKS", "ASSET", "KLIP", "CLIP", "EIKONES", "FOTO",
+    "APOSPASMA", "APOSPASMATA", "DILOSI", "DILOSEIS", "SYNENTEFXI", "OFFICIAL", "EPISIMO", "PROMO", "SPOT", "DELTIO",
+    "TYPOU", "EPIKAIROTITA", "DIETHNI", "DIETHNES", "KALIMERA", "EFCHARISTO", "STOICHEIA", "EPIKOINONIAS",
+    // A platform's own name: the title of its login wall ("Instagram",
+    // "Log in • Instagram") or of a page it would not show, never the story.
+    "INSTAGRAM", "FACEBOOK", "YOUTUBE", "TIKTOK", "TWITTER", "VIMEO", "DAILYMOTION", "THREADS", "LOGIN", "LOG",
+    "SIGN", "WATCH", "POST", "REEL", "REELS", "SHORTS", "STATUS",
+];
+
+/// Whether `keyword` is only generic words (one, or two run together), the
+/// kind that names nothing: TREILER, VINTEOOO, PLANAVINTEO.
+pub fn is_generic_keyword(keyword: &str) -> bool {
+    let k = fold_stretched(keyword);
+    let generic = |s: &str| GENERIC.contains(&s) || STOPWORDS.contains(&s);
+    generic(&k) || (1..k.len()).any(|i| k.is_char_boundary(i) && generic(&k[..i]) && generic(&k[i..]))
+}
+
+/// Words in `text` a keyword could be made from (not stopwords, 3+ chars).
+fn meaningful_words(text: &str) -> usize {
+    tokens(&translit(text))
+        .map(|t| fold_stretched(&t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()))
+        .filter(|t| t.len() >= 3 && !STOPWORDS.contains(&t.as_str()))
+        .count()
+}
+
+/// A keyword from a video's or page's own title ("Dune: Part Three |
+/// Official Trailer" → DUNEPARTTHREE): generic words dropped first, so the
+/// kind of clip does not crowd out its subject. `None` when only generic
+/// words are left.
+pub fn keyword_from_title(title: &str) -> Option<String> {
+    let toks: Vec<String> = tokens(&translit(title))
+        .map(|t| t.to_string())
+        .filter(|t| !GENERIC.contains(&fold_stretched(t).as_str()))
+        .collect();
+    keyword_from_tokens(toks, false).filter(|k| !is_generic_keyword(k))
+}
+
 fn keyword_from_tokens(toks: Vec<String>, letters_only: bool) -> Option<String> {
     let picked: Vec<String> = toks
         .into_iter()
-        .map(|t| t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+        .map(|t| fold_stretched(&t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()))
         .filter(|t| t.len() >= 3)
         .filter(|t| !letters_only || t.chars().all(|c| c.is_ascii_alphabetic()))
         .filter(|t| !STOPWORDS.contains(&t.as_str()))
@@ -1233,6 +1333,124 @@ fn keyword_from_filename(name: &str) -> Option<String> {
     let stem = name.rsplit_once('.').map(|(a, _)| a).unwrap_or(name);
     let toks = tokens(&translit(stem)).map(|t| t.to_string()).collect();
     keyword_from_tokens(toks, true)
+}
+
+/// Each link's own line, as a keyword: the text before it on its line, or
+/// the line right above it when that line has no link of its own. Only a
+/// line with one link (two links on a line share whatever it says), and
+/// only a caption that names something (not "Καλημέρα", not "βίντεο").
+fn link_captions(lines: &[Line]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.urls.len() != 1 {
+            continue;
+        }
+        let same_line = line.title_text();
+        let above = (i > 0 && lines[i - 1].urls.is_empty() && !lines[i - 1].is_marker())
+            .then(|| lines[i - 1].title_text())
+            .flatten();
+        let keyword = [same_line, above]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| keyword_from_text(&t))
+            .find(|k| !is_generic_keyword(k));
+        if let Some(k) = keyword {
+            out.insert(line.urls[0].clone(), k);
+        }
+    }
+    out
+}
+
+/// How sure the parser is that a job's keyword names its video (P4.34).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct KeywordVerdict {
+    pub index_str: String,
+    pub keyword: String,
+    pub from: KeywordSource,
+    /// 0.0–1.0. Below [`KEYWORD_SURE`] the keyword is worth a second look.
+    pub score: f64,
+    /// Why it is lower than its source alone would make it, in English
+    /// (`generic`, `shared by 4 links`, `2 of 7 words`).
+    pub reasons: Vec<String>,
+}
+
+impl KeywordVerdict {
+    pub fn is_low(&self) -> bool {
+        self.score < KEYWORD_SURE
+    }
+}
+
+/// A keyword scored below this gets the link's own title and, when the LLM
+/// is on, a proposal from it.
+pub const KEYWORD_SURE: f64 = 0.6;
+
+/// The keyword confidence meter (P4.34), one verdict per job.
+///
+/// * the source: a caption or numbered title names the story; a subject
+///   names a whole mail; a URL slug or ASSET names nothing in particular;
+/// * a generic keyword (TREILER, VINTEOOO, PLANA) names nothing whatever
+///   its source;
+/// * one subject or first line on several links ("ΤΡΕΪΛΕΡ" on four
+///   films, the subject on nine clips) cannot tell them apart. Links under
+///   one numbered title share it by design and are not marked down;
+/// * a keyword that kept two words of a long subject may have kept the
+///   wrong two ("ΣΤΟΙΧΕΙΑ ΕΠΙΚΟΙΝΩΝΙΑΣ" of a mail about a guest).
+pub fn keyword_verdicts(parsed: &ParsedEmail) -> Vec<KeywordVerdict> {
+    let mut uses: HashMap<&str, usize> = HashMap::new();
+    for j in parsed.jobs() {
+        *uses.entry(j.keyword.as_str()).or_default() += 1;
+    }
+    let mut out = Vec::new();
+    for s in &parsed.sections {
+        let source_words = s.title.as_deref().map(meaningful_words).unwrap_or(0);
+        for j in &s.jobs {
+            let mut score: f64 = match j.keyword_from {
+                KeywordSource::Caption | KeywordSource::Title | KeywordSource::Llm => 0.9,
+                KeywordSource::LinkTitle | KeywordSource::FileName => 0.8,
+                KeywordSource::Subject => 0.7,
+                KeywordSource::Preamble => 0.6,
+                KeywordSource::Url => 0.5,
+                KeywordSource::Fallback => 0.0,
+            };
+            let mut reasons = Vec::new();
+            if is_generic_keyword(&j.keyword) {
+                score = score.min(0.2);
+                reasons.push("generic".to_string());
+            }
+            let shared = uses.get(j.keyword.as_str()).copied().unwrap_or(1);
+            if shared > 1 && matches!(j.keyword_from, KeywordSource::Subject | KeywordSource::Preamble | KeywordSource::Url) {
+                score -= 0.3;
+                reasons.push(format!("shared by {shared} links"));
+            }
+            if matches!(j.keyword_from, KeywordSource::Subject | KeywordSource::Preamble | KeywordSource::Title) && source_words > 3 {
+                score -= 0.15;
+                reasons.push(format!("2 of {source_words} words"));
+            }
+            out.push(KeywordVerdict {
+                index_str: j.index_str.clone(),
+                keyword: j.keyword.clone(),
+                from: j.keyword_from,
+                score: round2(score.max(0.0)),
+                reasons,
+            });
+        }
+    }
+    out
+}
+
+/// Give one job a better keyword (P4.34): from the LLM or the link's own
+/// title. An attachment named by its file keeps that name.
+pub fn set_job_keyword(parsed: &mut ParsedEmail, index: &str, keyword: &str, from: KeywordSource) -> bool {
+    for s in &mut parsed.sections {
+        for j in &mut s.jobs {
+            if j.index_str == index && j.keyword_from != KeywordSource::FileName {
+                j.keyword = keyword.to_string();
+                j.keyword_from = from;
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,13 +1787,21 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
         let k = t.as_deref().and_then(keyword_from_text);
         (t, k)
     };
-    let mut titles: Vec<(Option<String>, Option<String>)> =
-        raw.iter().map(|s| with_keyword(section_title(s))).collect();
+    let mut titles: Vec<(Option<String>, Option<String>, KeywordSource)> = raw
+        .iter()
+        .map(|s| {
+            let (t, k) = with_keyword(section_title(s));
+            (t, k, KeywordSource::Title)
+        })
+        .collect();
 
     if raw.is_empty() {
         let title = match subject_title(&mail.subject, &roster_ix, &journalist.surname) {
-            Some((t, k)) => (Some(t), Some(k)),
-            None => with_keyword(preamble.iter().filter(|l| !l.is_marker()).find_map(|l| l.title_text())),
+            Some((t, k)) => (Some(t), Some(k), KeywordSource::Subject),
+            None => {
+                let (t, k) = with_keyword(preamble.iter().filter(|l| !l.is_marker()).find_map(|l| l.title_text()));
+                (t, k, KeywordSource::Preamble)
+            }
         };
         raw.push(RawSection {
             index: "1".into(),
@@ -1596,8 +1822,10 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let mut ignored_urls = Vec::new();
     let mut images = 0usize;
     let mut sections = Vec::new();
+    let mut section_sources: Vec<KeywordSource> = Vec::new();
+    let mut inherited_from = KeywordSource::Fallback;
 
-    for (s, (title, section_kw)) in raw.iter().zip(titles) {
+    for (s, (title, section_kw, kw_source)) in raw.iter().zip(titles) {
         let marked = marked_urls(&s.lines, &mut warnings, &s.index);
         let mut candidates: Vec<(String, Tier, bool)> = Vec::new();
         // Links a journalist called video ("απόσπασμα", "βίντεο" on the same
@@ -1655,6 +1883,21 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
         // article links in it (a platform post is one video already).
         let first_n = s.header.iter().chain(s.lines.iter()).find_map(|l| first_n_videos(&l.text));
         let many = selected.len() > 1;
+        // Several links, each with its own line ("Διαγωνισμός ύπνου" above
+        // one, "ΔΙΑΓΩΝΙΣΜΟΣ ΠΑΡΚΑΡΙΣΜΑΤΟΣ" above the next) in a mail whose
+        // only other name for them is the subject ("βιντεοοο"): each link
+        // is named by its own line (P4.34). A numbered section's real title
+        // still names all its links, even a generic one ("ΣΥΝΕΝΤΕΥΞΗ ΤΥΠΟΥ
+        // ΔΗΜΑΡΧΟΥ"); its lines describe the clips ("Πρώτα αυτό, είναι
+        // επείγον"). A generic title is the meter's to flag, not theirs.
+        let section_names_them = kw_source == KeywordSource::Title && section_kw.is_some();
+        let captions: HashMap<String, String> = if many && !section_names_them {
+            let found = link_captions(&s.lines);
+            let usable = selected.iter().filter(|(u, _, _)| found.contains_key(u)).count();
+            if usable >= 2 { found } else { HashMap::new() }
+        } else {
+            HashMap::new()
+        };
         let jobs = selected
             .into_iter()
             .enumerate()
@@ -1662,10 +1905,15 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 let penalty = if unresolved { 0.2 } else { 0.0 };
                 let hint = if tier == Tier::Tier2 && video_hinted.contains(&url) { 0.1 } else { 0.0 };
                 let confidence = round2(base_confidence(tier, marker) + hint - penalty);
-                let keyword = section_kw
-                    .clone()
-                    .or_else(|| keyword_from_url(&url))
-                    .unwrap_or_else(|| "ASSET".into());
+                let (keyword, keyword_from) = if let Some(k) = captions.get(&url) {
+                    (k.clone(), KeywordSource::Caption)
+                } else if let Some(k) = section_kw.clone() {
+                    (k, kw_source)
+                } else if let Some(k) = keyword_from_url(&url) {
+                    (k, KeywordSource::Url)
+                } else {
+                    ("ASSET".into(), KeywordSource::Fallback)
+                };
                 ParsedJob {
                     index_str: if many {
                         format!("{}{}", s.index, index_suffix(i))
@@ -1680,10 +1928,12 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                     marker,
                     attachment_id: None,
                     max_videos: if matches!(tier, Tier::Tier2 | Tier::Other) { first_n } else { None },
+                    keyword_from,
                 }
             })
             .collect();
 
+        section_sources.push(kw_source);
         sections.push(Section {
             index_str: s.index.clone(),
             title,
@@ -1718,6 +1968,9 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 .first()
                 .map(|s| (s.title.clone(), s.keyword.clone()))
                 .unwrap_or_default();
+            // The attachments inherit the mail's subject or first section's
+            // name: judged as that, not as a file name (P4.34).
+            inherited_from = section_sources.first().copied().unwrap_or_default();
             sections.retain(|s| !s.jobs.is_empty());
             warnings.retain(|w| w.code != warnings::SECTION_WITHOUT_LINKS);
             sections.push(Section {
@@ -1750,6 +2003,13 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 },
                 url: attachment_url(&mail.internet_message_id, &a.id),
                 tier: Tier::Attachment,
+                keyword_from: if keyword_from_filename(&a.name).is_some() {
+                    KeywordSource::FileName
+                } else if section_kw.is_some() {
+                    inherited_from
+                } else {
+                    KeywordSource::Fallback
+                },
                 keyword: keyword_from_filename(&a.name)
                     .or_else(|| section_kw.clone())
                     .unwrap_or_else(|| "ASSET".into()),
@@ -1989,6 +2249,93 @@ mod tests {
         assert_eq!(numbered("1 ΠΑΡΕΛΑΣΗ", 1), Some((1, "ΠΑΡΕΛΑΣΗ".into())));
         assert_eq!(numbered("3 νεκροί σε τροχαίο", 1), None);
         assert_eq!(numbered("1. 2024: χρονιά ρεκόρ", 1), Some((1, "2024: χρονιά ρεκόρ".into())));
+    }
+
+    #[test]
+    fn stretched_and_generic_words_name_nothing() {
+        assert_eq!(fold_stretched("VINTEOOO"), "VINTEO");
+        assert_eq!(fold_stretched("KAAALIMERA"), "KALIMERA");
+        assert_eq!(fold_stretched("ANNA2000"), "ANNA2000", "digits and doubled letters stay");
+        for k in ["TREILER", "VINTEOOO", "PLANAVINTEO", "YLIKO", "VIRAL"] {
+            assert!(is_generic_keyword(k), "{k}");
+        }
+        for k in ["FIKTAKIS", "DUNE", "SEISMOSSITEIA", "AEKOFI"] {
+            assert!(!is_generic_keyword(k), "{k}");
+        }
+        assert_eq!(keyword_from_title("Dune: Part Three | Official Trailer").as_deref(), Some("DUNEPART"));
+        assert_eq!(keyword_from_title("Official Trailer 2 (HD)"), None, "only the kind of clip is left");
+        // Instagram's login wall answered a plain request with this title.
+        assert_eq!(keyword_from_title("Instagram"), None);
+        assert_eq!(keyword_from_title("Log in • Instagram"), None);
+    }
+
+    #[test]
+    fn a_models_keyword_is_spelled_by_our_elot_not_its_own() {
+        // Gemini wrote "AEKOFY" and "EREUNITRIA"; ELOT 743 is OFI, EREVNITRIA.
+        assert_eq!(keyword_from_model("ΑΕΚ ΟΦΗ").as_deref(), Some("AEKOFI"));
+        assert_eq!(keyword_from_model("Ερευνήτρια Ρωσία").as_deref(), Some("EREVNITRIAROSIA"));
+        assert_eq!(keyword_from_model("The Social Reckoning").as_deref(), Some("THESOCIALRECKONING"));
+        assert_eq!(keyword_from_model("ΣΥΝΕΝΤΕΥΞΗ ΤΥΠΟΥ ΠΕΡΙΦΕΡΕΙΑΡΧΗ").map(|k| k.len()), Some(20), "capped like every keyword");
+        for refused in ["TRAILER", "τρέιλερ", "null", "", "Βίντεοοο"] {
+            assert_eq!(keyword_from_model(refused), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn attachments_that_only_inherit_the_subject_are_judged_by_it() {
+        // The desk's "ΠΛΑΝΑ ΚΑΙ ΣΤΟΙΧΕΙΑ ΕΠΙΚΟΙΝΩΝΙΑΣ ΓΙΑ ΣΗΜΕΡΙΝΟ ΚΑΛΕΣΜΕΝΟ
+        // ΣΤΕΛΙΟ ΦΙΚΤΑΚΗ": five attached clips, all STOICHEIAEPIKOINONIA.
+        let mut m = mail("ΠΛΑΝΑ ΚΑΙ ΣΤΟΙΧΕΙΑ ΕΠΙΚΟΙΝΩΝΙΑΣ ΓΙΑ ΣΗΜΕΡΙΝΟ ΚΑΛΕΣΜΕΝΟ ΣΤΕΛΙΟ ΦΙΚΤΑΚΗ", "a.papadaki@example.gr", "Καλησπέρα");
+        for (i, name) in ["VID_20261006_101010.mp4", "VID_20261006_101511.mp4", "Λιμάνι Χανίων.mp4"].iter().enumerate() {
+            m.attachments.push(crate::mail::AttachmentMeta {
+                id: i.to_string(),
+                name: name.to_string(),
+                content_type: "video/mp4".into(),
+                size: 1000,
+            });
+        }
+        let p = parse(&m, &roster(), &ParserConfig::default());
+        assert!(!p.has_warning(warnings::JOURNALIST_SUGGESTED), "ΣΗΜΕΡΙΝΟ is a day, not a name: {:?}", p.warnings);
+        let v = keyword_verdicts(&p);
+        let by = |i: &str| v.iter().find(|x| x.index_str == i).unwrap();
+        assert!(by("1A").is_low() && by("1A").from == KeywordSource::Subject, "{:?}", by("1A"));
+        assert!(by("1B").is_low());
+        assert_eq!((by("1C").keyword.as_str(), by("1C").from), ("LIMANICHANION", KeywordSource::FileName));
+        assert!(!by("1C").is_low(), "a file name that names something stands");
+    }
+
+    #[test]
+    fn the_keyword_meter_flags_names_that_cannot_tell_videos_apart() {
+        let v = |subject: &str, body: &str| keyword_verdicts(&parse(&mail(subject, "a.papadaki@example.gr", body), &roster(), &ParserConfig::default()));
+
+        // P4.34, from the desk: four different films, one subject word.
+        let trailers = v(
+            "Πρ: τρέιλερ 9-10",
+            "Καλημέρα κι ευχαριστώ!\nhttps://youtu.be/aaaaaaaaaa1\nhttps://youtu.be/aaaaaaaaaa2\nhttps://youtu.be/aaaaaaaaaa3\nhttps://youtu.be/aaaaaaaaaa4",
+        );
+        assert_eq!(trailers.len(), 4);
+        for t in &trailers {
+            assert!(t.is_low(), "{t:?}");
+            assert!(t.reasons.iter().any(|r| r == "generic"), "{t:?}");
+            assert!(t.reasons.iter().any(|r| r == "shared by 4 links"), "{t:?}");
+        }
+
+        // Two words kept of a long subject about a guest.
+        let guest = v("ΠΛΑΝΑ ΚΑΙ ΣΤΟΙΧΕΙΑ ΕΠΙΚΟΙΝΩΝΙΑΣ ΓΙΑ ΣΗΜΕΡΙΝΟ ΚΑΛΕΣΜΕΝΟ ΣΤΕΛΙΟ ΦΙΚΤΑΚΗ", "https://youtu.be/bbbbbbbbbb1");
+        assert!(guest[0].is_low(), "{:?}", guest[0]);
+
+        // One subject naming one link is fine.
+        let one = v("Σεισμός στη Σητεία", "https://youtu.be/cccccccccc1");
+        assert!(!one[0].is_low(), "{:?}", one[0]);
+
+        // A numbered title names all its links; sharing it is the design.
+        let numbered = v("Θέματα", "1. ΣΕΙΣΜΟΣ ΣΤΗ ΣΗΤΕΙΑ\nhttps://youtu.be/dddddddddd1\nhttps://youtu.be/dddddddddd2");
+        assert!(numbered.iter().all(|x| !x.is_low() && x.from == KeywordSource::Title), "{numbered:?}");
+
+        // A line above each link names it.
+        let captions = v("βιντεοοο", "Διαγωνισμός ύπνου\nhttps://youtu.be/eeeeeeeeee1\nΧορός στη Σητεία\nhttps://youtu.be/eeeeeeeeee2");
+        assert_eq!(captions.iter().map(|x| x.keyword.as_str()).collect::<Vec<_>>(), ["DIAGONISMOSYPNOU", "CHOROSSITEIA"]);
+        assert!(captions.iter().all(|x| x.from == KeywordSource::Caption && !x.is_low()));
     }
 
     #[test]
@@ -2254,6 +2601,17 @@ pub fn valid_keyword(raw: &str) -> Option<String> {
     // as a string; "NULL" would pass the pattern and name a file.
     const NOTHING: &[&str] = &["NULL", "NONE", "NIL", "NA", "N/A", "UNDEFINED", "UNKNOWN", "EMPTY", "KEYWORD", "ASSET"];
     (RE_KEYWORD.is_match(&k) && !STOPWORDS.contains(&k.as_str()) && !NOTHING.contains(&k.as_str())).then_some(k)
+}
+
+/// A video keyword as the LLM wrote it (P4.34), in Greek or Latin, one or
+/// two words: transliterated by this crate's ELOT 743 (so ΟΦΗ is OFI here
+/// as everywhere else, not the model's own "OFY"), spaces and punctuation
+/// dropped, at most 20 characters like every keyword, and refused when it
+/// is a placeholder or names nothing (TRAILER).
+pub fn keyword_from_model(raw: &str) -> Option<String> {
+    let joined: String = translit(raw.trim()).chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let k: String = fold_stretched(&joined.to_ascii_uppercase()).chars().take(MAX_KEYWORD).collect();
+    valid_keyword(&k).filter(|k| !is_generic_keyword(k))
 }
 
 /// Adopt a journalist for a mail the parser left unresolved: the −0.2

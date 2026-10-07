@@ -5,6 +5,7 @@ pub mod graph;
 pub mod groups;
 pub mod inbox;
 pub mod interceptor;
+pub mod link_titles;
 pub mod llm;
 pub mod mail;
 pub mod mail_view;
