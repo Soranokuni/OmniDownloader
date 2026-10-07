@@ -77,6 +77,10 @@ enum Commands {
         /// Leave the Windows firewall alone
         #[arg(long)]
         no_firewall: bool,
+        /// Bring the configuration, database, secrets and seeds of an older
+        /// installation (or a dev checkout) on this PC into the new one
+        #[arg(long)]
+        import: Option<std::path::PathBuf>,
     },
     /// Remove the Windows service and its firewall rule; files stay
     Uninstall {
@@ -355,7 +359,7 @@ async fn main() -> Result<()> {
     // The installer runs from a release folder, which is not an install:
     // nothing is created or logged next to it (plan P9).
     match &cli.command {
-        Some(Commands::Install { dir, watchfolder, port, account, yes, no_firewall }) => {
+        Some(Commands::Install { dir, watchfolder, port, account, yes, no_firewall, import }) => {
             return omni_cli::install::install(omni_cli::install::InstallOptions {
                 dir: dir.clone(),
                 watchfolder: watchfolder.clone(),
@@ -363,6 +367,7 @@ async fn main() -> Result<()> {
                 account: account.clone(),
                 yes: *yes,
                 no_firewall: *no_firewall,
+                import: import.clone(),
             })
             .await;
         }

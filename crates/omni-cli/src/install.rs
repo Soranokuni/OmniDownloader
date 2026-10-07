@@ -59,6 +59,57 @@ pub struct InstallOptions {
     /// Ask nothing; take defaults.
     pub yes: bool,
     pub no_firewall: bool,
+    /// An existing installation (or a dev checkout) whose configuration,
+    /// database, secrets and seeds move into this new one.
+    pub import: Option<PathBuf>,
+}
+
+/// Bring an older installation's state into a new, empty one: its
+/// config.json, data\omni.db, data\secrets.bin (machine-scope DPAPI: valid on
+/// this PC only), seeds and adblock lists. Paths in its config that were
+/// relative to the old folder and point at things that stay there (the
+/// watchfolder) are made absolute, so they still point where they did; the
+/// database, temp and archive paths stay relative and follow the move.
+fn import_from(old: &Path, new: &AppPaths) -> Result<AppConfig> {
+    let old_paths = AppPaths::with_root(old, "config.json");
+    if !old_paths.config.is_file() {
+        bail!("{} has no config.json to import", old.display());
+    }
+    if new.config.exists() || new.data.join("omni.db").exists() {
+        bail!("{} already has a configuration or a database; import only into a new installation", new.root.display());
+    }
+    let mut config = AppConfig::load_from_file(&old_paths.config).context("The old config.json cannot be read")?;
+    let db = old_paths.resolve(&config.database_path);
+    let wal = db.with_extension("db-wal");
+    if std::fs::metadata(&wal).map(|m| m.len() > 0).unwrap_or(false) {
+        bail!(
+            "{} is still in use (its write-ahead log is not empty). Stop the old OmniDownloader first \
+             (close its console window or stop its service), then run the installer again.",
+            db.display()
+        );
+    }
+    config.watchfolder_path = absolute(&old_paths, &config.watchfolder_path);
+    std::fs::create_dir_all(&new.data)?;
+    std::fs::copy(&db, new.data.join("omni.db")).with_context(|| format!("Cannot copy {}", db.display()))?;
+    config.database_path = "data/omni.db".into();
+    for f in ["secrets.bin", "journalists.seed.json", "taxonomy.json"] {
+        let src = old_paths.data.join(f);
+        if src.is_file() {
+            std::fs::copy(&src, new.data.join(f))?;
+        }
+    }
+    if old_paths.data.join("adblock").is_dir() {
+        copy_recursive(&old_paths.data.join("adblock"), &new.data.join("adblock"))?;
+    }
+    println!("  Imported the configuration, database, secrets and seeds from {}.", old.display());
+    println!("  Watchfolder stays {}.", config.watchfolder_path);
+    Ok(config)
+}
+
+/// A config path as an absolute one, resolved against the folder it was
+/// relative to; UNC and absolute paths unchanged.
+fn absolute(paths: &AppPaths, p: &str) -> String {
+    paths.resolve(p).display().to_string()
 }
 
 pub async fn install(o: InstallOptions) -> Result<()> {
@@ -83,14 +134,22 @@ pub async fn install(o: InstallOptions) -> Result<()> {
     println!("  {}", if upgrade { "Upgrading the existing installation." } else { "New installation." });
 
     // ---- configuration (decided before anything is stopped) --------------
+    let imported = match &o.import {
+        Some(old) => Some(import_from(old, &paths)?),
+        None => None,
+    };
     let fresh_config = !paths.config.exists();
-    let mut config = if fresh_config {
+    let mut config = if let Some(c) = imported.clone() {
+        c
+    } else if fresh_config {
         AppConfig::default()
     } else {
         AppConfig::load_from_file(&paths.config).context("The existing config.json cannot be read")?
     };
     if let Some(w) = &o.watchfolder {
         config.watchfolder_path = w.clone();
+    } else if imported.is_some() {
+        // The old installation's watchfolder, made absolute by the import.
     } else if fresh_config && !o.yes {
         let default = paths.root.join("watchfolder").display().to_string();
         let answer = Text::new("Dalet watchfolder (local folder or \\\\server\\share):")
@@ -485,6 +544,39 @@ mod tests {
         assert_eq!(std::fs::read(to.join("deno.exe")).unwrap(), b"nightly-updated deno", "never downgraded");
         assert_eq!(std::fs::read(to.join("yt-dlp").join("yt-dlp.exe")).unwrap(), b"release yt-dlp", "installed when missing");
         assert!(!to.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn an_import_keeps_the_watchfolder_where_it_was_and_moves_the_state() {
+        // Moving this PC's production from D:\OmniDownloader: a relative
+        // "watchfolder" copied as-is would quietly point into the new folder.
+        let d = tempfile::tempdir().unwrap();
+        let (old, new_root) = (d.path().join("old"), d.path().join("new"));
+        std::fs::create_dir_all(old.join("data").join("adblock")).unwrap();
+        let mut c = AppConfig::default();
+        c.watchfolder_path = "watchfolder".into();
+        c.web_port = 8080;
+        c.save_to_file(old.join("config.json")).unwrap();
+        std::fs::write(old.join("data").join("omni.db"), b"db").unwrap();
+        std::fs::write(old.join("data").join("secrets.bin"), b"dpapi").unwrap();
+        std::fs::write(old.join("data").join("adblock").join("list.txt"), b"x").unwrap();
+
+        let new = AppPaths::with_root(&new_root, "config.json");
+        let imported = import_from(&old, &new).unwrap();
+        assert_eq!(PathBuf::from(&imported.watchfolder_path), AppPaths::with_root(&old, "config.json").resolve("watchfolder"));
+        assert_eq!(imported.database_path, "data/omni.db");
+        assert_eq!(std::fs::read(new.data.join("secrets.bin")).unwrap(), b"dpapi");
+        assert!(new.data.join("adblock").join("list.txt").exists());
+
+        // Never over an installation that has state of its own.
+        imported.save_to_file(&new.config).unwrap();
+        assert!(import_from(&old, &new).is_err());
+
+        // Nor from a database the old daemon still writes to.
+        let busy = AppPaths::with_root(d.path().join("other"), "config.json");
+        std::fs::write(old.join("data").join("omni.db-wal"), b"pending pages").unwrap();
+        let why = import_from(&old, &busy).unwrap_err().to_string();
+        assert!(why.contains("still in use"), "{why}");
     }
 
     #[test]
