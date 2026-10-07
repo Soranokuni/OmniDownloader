@@ -1156,11 +1156,33 @@ async fn run_job(
 
     repo.set_stage(job_id, owner, JobStage::Download)?;
 
+    // A word typed onto the end of the link that the parser did not know
+    // ("…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", plan P3.10): used only when the site says
+    // the address as given does not exist and confirms the one without it.
+    let mut job = job;
+    let orig_url = if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
+        match omni_browser::pages::repair_dead_link(&orig_url).await {
+            Some(fixed) => {
+                info!("Job #{job_id}: {orig_url} does not exist; {fixed} does");
+                repo.record_event(
+                    job_id,
+                    "WARN",
+                    Some(JobStage::Extract),
+                    &format!("The link as sent does not exist (404); the site has it without the ending the sender added: {fixed}"),
+                )?;
+                job.url = fixed.clone();
+                fixed
+            }
+            None => orig_url,
+        }
+    } else {
+        orig_url
+    };
+
     // A news page yt-dlp reads as several videos (an article with four
     // Streamable embeds): this job takes the first, the others become
     // sibling jobs or offers, as when the sniffer finds them. Before, all
     // were downloaded into this job and one was delivered.
-    let mut job = job;
     let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
     let mut page_referer: Option<String> = None;
     // yt-dlp already said it cannot read this page: skip the download
@@ -1365,6 +1387,7 @@ fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
         ErrorCode::LoginRequired,
         ErrorCode::GeoBlocked,
         ErrorCode::PrivateOrRemoved,
+        ErrorCode::PageNotFound,
         ErrorCode::LiveStream,
         ErrorCode::Http403,
         ErrorCode::UnsupportedUrl,
