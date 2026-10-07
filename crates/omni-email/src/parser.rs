@@ -1048,7 +1048,6 @@ const LOCKER_DOMAINS: &[&str] = &[
     "we.tl",
     "transfernow.net",
     "myairbridge.com",
-    "amna.gr",
     "filemail.com",
     "1drv.ms",
     "onedrive.live.com",
@@ -1942,6 +1941,12 @@ mod tests {
         assert_eq!(classify("https://www.neakriti.gr/img/1.jpg", &c), Tier::Image);
         assert_eq!(classify("https://we.tl/t-abc", &c), Tier::Locker);
         assert_eq!(classify("https://1drv.ms/v/s!abc", &c), Tier::Locker);
+        // ΑΠΕ-ΜΠΕ video pages are YouTube embeds the pipeline resolves; they
+        // were parked as MANUAL_DOWNLOAD without ever being tried.
+        assert_eq!(
+            classify("https://www.amna.gr/home/videos/1028434/Proores-ekloges-ΒΙΝΤΕΟ", &c),
+            Tier::Tier2
+        );
         assert_eq!(classify("https://example.org/story", &c), Tier::Other);
         // Not fooled by a lookalike host.
         assert_eq!(classify("https://notyoutube.com/watch?v=x", &c), Tier::Other);

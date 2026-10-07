@@ -473,6 +473,9 @@ pub fn default_tier2_domains() -> Vec<String> {
         "bbc.com",
         "bbc.co.uk",
         "cnn.com",
+        // ΑΠΕ-ΜΠΕ: its /home/videos/ pages are public YouTube embeds, not a
+        // subscriber file locker (they used to be parked for MCR by hand).
+        "amna.gr",
     ]
     .iter()
     .map(|s| s.to_string())
