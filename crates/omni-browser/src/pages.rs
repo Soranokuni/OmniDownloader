@@ -90,6 +90,44 @@ pub async fn resolve(page_url: &str) -> Result<Option<String>> {
     Ok(amna_video_from_answer(&answer))
 }
 
+/// The address a decorated dead link was meant to be (plan P3.10).
+///
+/// Only when the site itself confirms it: `url` answers 404 or 410, and one
+/// of [`omni_core::urlnorm::undecorated_candidates`] answers with success.
+/// Anything else (the page exists, a bot wall answers 403 to everything, no
+/// network) is `None` and the job goes on with the address it has. Costs
+/// nothing for an address that does not look decorated.
+pub async fn repair_dead_link(url: &str) -> Option<String> {
+    let candidates = omni_core::urlnorm::undecorated_candidates(url);
+    if candidates.is_empty() {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(PAGE_CHECK_UA)
+        .build()
+        .ok()?;
+    let status = |u: String| {
+        let client = client.clone();
+        async move { client.get(u).send().await.ok().map(|r| r.status()) }
+    };
+    let gone = status(url.to_string()).await.is_some_and(|s| s.as_u16() == 404 || s.as_u16() == 410);
+    if !gone {
+        return None;
+    }
+    for c in candidates {
+        if status(c.clone()).await.is_some_and(|s| s.is_success()) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// A desktop browser's identity: some portals answer a bare HTTP client
+/// with 403 whatever the address.
+const PAGE_CHECK_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
 #[cfg(test)]
 mod tests {
     use super::*;

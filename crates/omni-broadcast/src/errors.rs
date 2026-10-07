@@ -29,6 +29,9 @@ pub enum ErrorCode {
     LoginRequired,
     GeoBlocked,
     PrivateOrRemoved,
+    /// The page itself does not exist (HTTP 404/410): a mistyped or decorated
+    /// link, or a deleted article. Waiting and the browser cannot help.
+    PageNotFound,
     /// A live stream, with no VOD yet.
     LiveStream,
     /// Timeouts, resets, DNS. The one class where waiting genuinely helps.
@@ -57,12 +60,13 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 23] = [
+    pub const ALL: [ErrorCode; 24] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
         Self::GeoBlocked,
         Self::PrivateOrRemoved,
+        Self::PageNotFound,
         Self::LiveStream,
         Self::Network,
         Self::NoStreamFound,
@@ -95,6 +99,7 @@ impl ErrorCode {
             Self::LoginRequired => "LOGIN_REQUIRED",
             Self::GeoBlocked => "GEO_BLOCKED",
             Self::PrivateOrRemoved => "PRIVATE_OR_REMOVED",
+            Self::PageNotFound => "PAGE_NOT_FOUND",
             Self::LiveStream => "LIVE_STREAM",
             Self::Network => "NETWORK",
             Self::NoStreamFound => "NO_STREAM_FOUND",
@@ -162,6 +167,7 @@ impl ErrorCode {
             Self::LoginRequired => "Απαιτείται σύνδεση. Ανεβάστε cookies για αυτόν τον ιστότοπο (Διαχείριση → Cookies).",
             Self::GeoBlocked => "Το βίντεο δεν είναι διαθέσιμο από την Ελλάδα.",
             Self::PrivateOrRemoved => "Το βίντεο είναι ιδιωτικό ή έχει αφαιρεθεί. Ζητήστε άλλον σύνδεσμο.",
+            Self::PageNotFound => "Η σελίδα δεν υπάρχει (404). Ελέγξτε τον σύνδεσμο: συχνά έχει κολλήσει μια λέξη στο τέλος του (π.χ. «-ΒΙΝΤΕΟ»). Διορθώστε τον ή ζητήστε τον σωστό.",
             Self::LiveStream => "Ζωντανή μετάδοση. Περιμένετε να γίνει διαθέσιμη η εγγραφή.",
             Self::Network => "Πρόβλημα δικτύου. Γίνεται αυτόματη επανάληψη.",
             Self::NoStreamFound => "Δεν βρέθηκε βίντεο στη σελίδα. Ανοίξτε τον σύνδεσμο: αν δεν έχει βίντεο, πατήστε «Αφαίρεση»· αν έχει, επικολλήστε παρακάτω τον σύνδεσμο της ανάρτησης με το βίντεο (YouTube, Instagram, Facebook…).",
@@ -201,7 +207,8 @@ impl ErrorCode {
     /// 2026-10-06 "found" a video id read out of a `/ServiceLogin` link,
     /// which then failed under a misleading error.
     pub fn should_sniff(&self, url: &str) -> bool {
-        if crate::downloader::is_youtube(url) {
+        // A page that does not exist has no player to find.
+        if *self == Self::PageNotFound || crate::downloader::is_youtube(url) {
             return false;
         }
         !crate::downloader::is_video_platform(url) || self.should_try_sniffer()
@@ -265,6 +272,11 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     }
     if s.contains("http error 403") || s.contains("403 forbidden") {
         return ErrorCode::Http403;
+    }
+    // The page, not a media segment: "Unable to download webpage: HTTP Error
+    // 404". A 404 on video data can be an expired signed URL and is not this.
+    if s.contains("unable to download webpage: http error 404") || s.contains("unable to download webpage: http error 410") {
+        return ErrorCode::PageNotFound;
     }
     if s.contains("unsupported url") || s.contains("no suitable extractor") {
         return ErrorCode::UnsupportedUrl;
@@ -334,6 +346,16 @@ mod tests {
             (
                 "ERROR: Unsupported URL: https://www.example.gr/article/12345",
                 ErrorCode::UnsupportedUrl,
+            ),
+            (
+                // Verbatim (job 82, 2026-10-07): a link with "-ΒΙΝΤΕΟ" glued on.
+                "ERROR: [generic] -ΒΙΝΤΕΟ: Unable to download webpage: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)",
+                ErrorCode::PageNotFound,
+            ),
+            (
+                // A media segment, not the page: not a dead link.
+                "ERROR: unable to download video data: HTTP Error 404: Not Found",
+                ErrorCode::PipelineFailed,
             ),
             (
                 "ERROR: unable to download video data: <urlopen error [Errno 110] Connection timed out>",
@@ -458,6 +480,8 @@ mod tests {
         // yt-dlp said the reply has no video. Its page plays the thread
         // parent's video, and that must not be delivered under this job.
         assert!(!ErrorCode::PipelineFailed.should_sniff(reply));
+        // A page that does not exist has no player either (P3.10).
+        assert!(!ErrorCode::PageNotFound.should_sniff(article));
         // Transient: retried, not sniffed.
         assert!(!ErrorCode::Network.should_sniff(reply));
         assert!(ErrorCode::Http403.should_sniff(reply));
