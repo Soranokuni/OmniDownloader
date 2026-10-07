@@ -1143,8 +1143,30 @@ async fn run_job(
     let mut job = job;
     let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
     let mut page_referer: Option<String> = None;
-    if is_web && !omni_broadcast::downloader::is_video_platform(&orig_url) {
-        let videos = engine.page_videos(&orig_url).await;
+    // yt-dlp already said it cannot read this page: skip the download
+    // attempt that would only say so again (one more yt-dlp start and page
+    // fetch, several seconds) and go straight to the sniffer.
+    let mut known_unsupported = false;
+
+    // A portal whose video one API request names (plan P3.8): no yt-dlp
+    // page scan, no browser. A failed request just takes the usual way.
+    if is_web {
+        match omni_browser::pages::resolve(&orig_url).await {
+            Ok(Some(video)) => {
+                info!("Job #{job_id}: the page's own API names {video}");
+                repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Video named by the site's API: {video}"))?;
+                job.url = video;
+                page_referer = Some(orig_url.clone());
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Job #{job_id}: site API lookup failed, trying the usual way: {e:#}"),
+        }
+    }
+
+    if is_web && page_referer.is_none() && !omni_broadcast::downloader::is_video_platform(&orig_url) {
+        let scan = engine.page_videos(&orig_url).await;
+        known_unsupported = scan.unsupported;
+        let videos = scan.videos;
         if videos.len() > 1 {
             info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
             repo.record_event(
@@ -1158,9 +1180,20 @@ async fn run_job(
             page_referer = Some(orig_url.clone());
         }
     }
-    let mut process_result = engine
-        .process_job_with_context(job.clone(), owner, page_referer.as_deref(), None, None)
-        .await;
+    let mut process_result = if known_unsupported {
+        repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Extract),
+            "yt-dlp has no extractor for this page; going straight to the browser",
+        )?;
+        Err(anyhow::anyhow!("{}: yt-dlp has no extractor for the page", ErrorCode::UnsupportedUrl.as_str())
+            .context(ErrorCode::UnsupportedUrl.as_str()))
+    } else {
+        engine
+            .process_job_with_context(job.clone(), owner, page_referer.as_deref(), None, None)
+            .await
+    };
 
     // yt-dlp could not resolve the page. For a news portal that is expected:
     // the video is behind an embedded player, so sniff the actual stream and

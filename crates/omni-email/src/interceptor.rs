@@ -7,7 +7,6 @@ static VOLATILE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"(?i)https?://[^\s]*we\.tl[^\s]*").unwrap(),
         Regex::new(r"(?i)https?://[^\s]*transfernow\.net[^\s]*").unwrap(),
         Regex::new(r"(?i)https?://[^\s]*myairbridge\.com[^\s]*").unwrap(),
-        Regex::new(r"(?i)https?://[^\s]*amna\.gr[^\s]*").unwrap(),
         Regex::new(r"(?i)https?://[^\s]*filemail\.com[^\s]*").unwrap(),
     ]
 });

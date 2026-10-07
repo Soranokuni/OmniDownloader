@@ -413,18 +413,34 @@ impl Downloader {
     }
 
     /// The videos on a news page, when yt-dlp reads it as several (see
-    /// [`parse_page_videos`]). A failure is no videos: the download that
-    /// follows reports it properly.
-    pub async fn page_videos(&self, url: &str, timeout: Duration) -> Vec<String> {
+    /// [`parse_page_videos`]), and whether yt-dlp said it has no extractor
+    /// for the page at all. Any other failure is no videos: the download
+    /// that follows reports it properly.
+    pub async fn page_videos(&self, url: &str, timeout: Duration) -> PageScan {
         let mut args: Vec<String> =
             ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()).collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
-            Ok(o) if o.success => parse_page_videos(&o.stdout),
-            _ => Vec::new(),
+            Ok(o) if o.success => PageScan { videos: parse_page_videos(&o.stdout), unsupported: false },
+            Ok(o) if !o.timed_out => PageScan {
+                videos: Vec::new(),
+                unsupported: crate::errors::classify_download_error(&o.stderr_tail) == ErrorCode::UnsupportedUrl,
+            },
+            _ => PageScan::default(),
         }
     }
+}
+
+/// What `--flat-playlist -J` made of a page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageScan {
+    /// The page's videos when it holds several, in page order.
+    pub videos: Vec<String>,
+    /// yt-dlp has no extractor for the page ("Unsupported URL"): a download
+    /// attempt would only read the page again to say the same, so the
+    /// caller can go straight to the sniffer.
+    pub unsupported: bool,
 }
 
 /// `downloaded total speed eta`, with `NA` for values yt-dlp does not know yet.
