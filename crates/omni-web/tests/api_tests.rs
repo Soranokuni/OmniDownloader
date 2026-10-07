@@ -622,3 +622,24 @@ async fn a_link_added_by_hand_is_an_entry_of_its_own_with_a_timeline() -> Result
     assert!(detail["events"][0]["message"].as_str().unwrap_or("").starts_with("Queued as"), "{detail}");
     Ok(())
 }
+
+/// Plan P7.11: a video on the desk says which mail it came from, and the
+/// mail list can be asked for the page that holds that mail.
+#[tokio::test]
+async fn a_video_on_the_desk_names_its_mail_and_the_list_finds_it() -> Result<()> {
+    let app = App::new()?;
+    let id = seed_mail(&app, "<m9@example.gr>", "1. Α\nhttps://youtu.be/m9m9m9m9", "https://youtu.be/m9m9m9m9")?;
+    let (status, page) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    let job = page["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap();
+    assert_eq!(job["mail_subject"], "ΘΕΜΑΤΑ ΕΛΕΝΗΣ");
+    assert_eq!(job["email_message_id"], "<m9@example.gr>");
+
+    let (status, list) = app
+        .send("GET", &format!("/api/mails?per_page=5&focus=mail%3A{}", q("<m9@example.gr>")), &app.mcr_token, None)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["page"], 1);
+    assert_eq!(list["entries"][0]["key"], "<m9@example.gr>");
+    Ok(())
+}

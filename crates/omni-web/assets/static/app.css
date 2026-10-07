@@ -922,6 +922,28 @@ body.desk-wide main { max-width: 1480px; }
 .skipcard.offer .why { margin-top: 0; color: var(--warn); }
 .empty-mail { font-size: 13px; color: var(--text-faint); margin: 4px 0; }
 
+/* From a video elsewhere on the desk to its mail (plan P7.11). */
+.mail-link {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  margin-top: 4px;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--accent);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 46ch;
+  text-align: left;
+}
+.mail-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-link .icon { width: 13px; height: 13px; }
+.mail-link:hover span { text-decoration: underline; }
+.mail-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 /* ---------- narrower screens ---------- */
 
 @media (max-width: 1180px) {

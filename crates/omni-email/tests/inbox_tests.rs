@@ -186,3 +186,20 @@ fn a_duplicate_link_shows_the_job_that_does_the_work_even_when_older_than_the_wi
     assert_eq!(dup.jobs.iter().map(|j| j.id).collect::<Vec<_>>(), vec![old]);
     assert!(entries.iter().all(|e| e.kind == EntryKind::Mail), "the old job is not listed on its own");
 }
+
+/// Plan P7.11: opening a mail from a video lands on the page that holds it.
+#[test]
+fn the_page_that_holds_an_entry_is_found_by_its_id() {
+    let (_d, repo) = repo();
+    for i in 0..12 {
+        mail(&repo, &format!("<f{i:02}@x>"), "ΘΕΜΑ", 100 - i, &[(&format!("https://youtu.be/f{i}"), JobStatus::Pending)]);
+    }
+    // Newest first: <f11@x> is on page 1, <f00@x> on page 3 of 5 per page.
+    let p = inbox::page_with_focus(list(&repo), InboxFilter::All, "", 1, 5, Some("mail:<f00@x>"));
+    assert_eq!(p.page, 3);
+    assert!(p.entries.iter().any(|e| e.key == "<f00@x>"));
+    assert_eq!(p.entries.iter().find(|e| e.key == "<f00@x>").unwrap().id(), "mail:<f00@x>");
+    // Not in the list: the page asked for.
+    let p = inbox::page_with_focus(list(&repo), InboxFilter::All, "", 2, 5, Some("mail:<gone@x>"));
+    assert_eq!(p.page, 2);
+}

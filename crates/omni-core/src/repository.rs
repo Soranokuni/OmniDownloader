@@ -2374,6 +2374,18 @@ impl Repository {
         Ok(n == 1)
     }
 
+    /// The subjects of the mails `keys` (plan P7.11): a video on the desk
+    /// says which mail it came from.
+    pub fn mail_subjects(&self, keys: &[String]) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT internet_message_id, COALESCE(subject, '') FROM processed_mail
+             WHERE internet_message_id IN (SELECT value FROM json_each(?))",
+        )?;
+        let rows = stmt.query_map(params![serde_json::to_string(keys)?], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Forget the text of mail handled more than `older_than_days` ago
     /// (plan P7.6). The row stays: sender, subject and the jobs it produced
     /// are the record of what came in. Returns how many texts were cleared.
