@@ -271,6 +271,18 @@ const MATRIX: &[Row] = &[
         "/api/jobs/1",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Admin, Reached)],
     ),
+    // The file name a video is delivered under: the desk's to fix (P7.12).
+    (
+        "POST",
+        "/api/jobs/1/rename",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Denied),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     (
         "POST",
         "/api/jobs/1/override",

@@ -581,6 +581,29 @@ impl Repository {
         Ok(changed == 1)
     }
 
+    /// MCR gives a job a better keyword (P7.12): `{index}_{JOURNALIST}_{KEYWORD}`
+    /// becomes its slug, the file name it is delivered under. Only while the
+    /// file is not being made yet: waiting, needing review, or running up to
+    /// the transcode (the worker reads the slug again when it starts the
+    /// rewrap, which names the clip). One statement, so a job that moves on
+    /// meanwhile is refused rather than half-renamed. `(old, new)` slug, or
+    /// `None` when it is too late (or the job is gone).
+    pub fn rename_job_keyword(&self, job_id: i64, keyword: &str) -> Result<Option<(String, String)>> {
+        let Some(job) = self.get_job(job_id)? else {
+            return Ok(None);
+        };
+        let slug = format!("{}_{}_{}", job.index_str, job.journalist, keyword);
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE queue SET keyword = ?, slug = ?, updated_at = ?
+             WHERE id = ?
+               AND (status IN ('PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED')
+                    OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))",
+            params![keyword, slug, timestamps::now_string(), job_id],
+        )?;
+        Ok((changed == 1).then_some((job.slug, slug)))
+    }
+
     /// Correct a running job's address (a word the sender glued to it,
     /// plan P3.12), dedup key included, so the desk opens and dedups the
     /// address that works. Only the worker holding the lease may do it.

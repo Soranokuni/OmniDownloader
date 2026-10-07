@@ -19,8 +19,8 @@
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=5';
 import {
   STAGE_TEXT, STAGE_ORDER, tone, needsAttention, limitNote, fileName, deliveredName,
-  pager, retryJob, overrideJob, discardJob, redownloadJob, queueOffer,
-} from '/static/desk.js?v=1';
+  pager, retryJob, overrideJob, discardJob, redownloadJob, queueOffer, canRename, renameJob,
+} from '/static/desk.js?v=2';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -880,6 +880,7 @@ function moreNode(j, sel) {
         },
       }, 'Άλλος σύνδεσμος…'),
       sel || locker ? openLink : null,
+      sel && canRename(j) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(j, afterAction) }, 'Μετονομασία…') : null,
       sel || locker ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση') : null));
     if (overrideOpen.has(j.id)) {
       const input = el('input', { type: 'url', class: 'mono', placeholder: 'https://… ο σύνδεσμος του ίδιου του βίντεο', 'aria-label': 'Άλλος σύνδεσμος για το ίδιο βίντεο' });
@@ -894,6 +895,7 @@ function moreNode(j, sel) {
     const done = j.status === 'COMPLETED' || j.status === 'COMPLETED_MANUAL';
     box.append(el('div', { class: 'jc-actions' },
       openLink,
+      canRename(j) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(j, afterAction) }, 'Μετονομασία…') : null,
       done
         ? el('button', { class: 'btn', type: 'button', onClick: () => redownloadJob(j, afterAction) }, 'Νέα λήψη')
         : el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));

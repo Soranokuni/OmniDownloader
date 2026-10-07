@@ -19,8 +19,9 @@ import {
   stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
   redownloadJob as deskRedownload, queueOffer as deskQueueOffer,
-} from '/static/desk.js?v=1';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=5';
+  canRename, renameJob as deskRename,
+} from '/static/desk.js?v=2';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=6';
 import { initNotify } from '/static/notify.js?v=3';
 
 let journalists = [];
@@ -317,6 +318,12 @@ function activeCard(job) {
       ),
       el('div', { class: 'row tight' },
         statusBadge(job),
+        canRename(job) ? el('button', {
+          class: 'btn',
+          type: 'button',
+          title: 'Αλλαγή της λέξης-κλειδιού στο όνομα του αρχείου, πριν παραδοθεί',
+          onClick: () => renameJob(job),
+        }, 'Μετονομασία…') : null,
         el('button', {
           class: 'btn btn-danger',
           type: 'button',
@@ -433,6 +440,7 @@ function reviewCard(job) {
     el('div', { class: 'row' },
       href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
       locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά'),
+      canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, 'Μετονομασία…') : null,
       el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
     ),
     locker ? null : el('div', {},
@@ -453,6 +461,7 @@ function reviewCard(job) {
 const retryJob = (job) => deskRetry(job, refresh);
 const overrideJob = (job, url) => deskOverride(job, url, refresh);
 const discardJob = (job) => deskDiscard(job, refresh);
+const renameJob = (job) => deskRename(job, refresh);
 
 /* ------------------------------------------------------------------ *
  * Completed
