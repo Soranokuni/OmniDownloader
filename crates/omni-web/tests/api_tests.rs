@@ -420,6 +420,7 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     let queued = app.repo.get_job(new_id)?.unwrap();
     assert_eq!((queued.url.as_str(), queued.slug.as_str()), (raw, "1D_MCR_SEISMOS"));
     assert_eq!(queued.status, JobStatus::Pending);
+    assert_eq!(queued.parent_job_id, Some(id), "the mail view files it under its article (plan P7.6)");
 
     // Twice: refused, and the offer remembers the job it became.
     let (status, body) = app.send("POST", &uri, &app.mcr_token, Some(json!({ "url": raw }))).await?;

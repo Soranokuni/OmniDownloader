@@ -387,6 +387,39 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN max_videos INTEGER;
         "#,
     ),
+    (
+        13,
+        // The MCR mail view (plan P7.6): what each mail said, so the desk can
+        // show it next to the jobs it produced. `body_text` is the readable
+        // text (never the HTML) and is cleared by the nightly retention task
+        // after `mail_text_retention_days`; the rest stays with the row.
+        //
+        // `parent_job_id`: the job whose article an article sibling (1B, 1C)
+        // or an offer MCR queued came from. Rows queued before this have it
+        // only in their notes, in the two forms the planner and the offer
+        // route write; CAST keeps the leading digits of "123: https://…".
+        r#"
+        ALTER TABLE processed_mail ADD COLUMN received_at      TEXT;
+        ALTER TABLE processed_mail ADD COLUMN from_name        TEXT;
+        ALTER TABLE processed_mail ADD COLUMN to_addrs         TEXT;
+        ALTER TABLE processed_mail ADD COLUMN cc_addrs         TEXT;
+        ALTER TABLE processed_mail ADD COLUMN body_text        TEXT;
+        ALTER TABLE processed_mail ADD COLUMN attachments_json TEXT;
+        ALTER TABLE processed_mail ADD COLUMN parse_json       TEXT;
+        CREATE INDEX IF NOT EXISTS idx_processed_mail_received ON processed_mail(received_at);
+
+        ALTER TABLE queue ADD COLUMN parent_job_id INTEGER;
+        UPDATE queue
+           SET parent_job_id = CAST(substr(notes, length('Also in the article of job #') + 1) AS INTEGER)
+         WHERE notes LIKE 'Also in the article of job #%';
+        UPDATE queue
+           SET parent_job_id = CAST(substr(notes, length('Offered from the article of job #') + 1) AS INTEGER)
+         WHERE notes LIKE 'Offered from the article of job #%';
+        UPDATE queue SET parent_job_id = NULL WHERE parent_job_id <= 0;
+        CREATE INDEX IF NOT EXISTS idx_queue_email_message ON queue(email_message_id);
+        CREATE INDEX IF NOT EXISTS idx_queue_parent        ON queue(parent_job_id);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -588,6 +621,54 @@ mod tests {
         apply(&mut conn, Some(&db)).unwrap();
         let after = std::fs::read_dir(tmp.path().join("backups")).unwrap().count();
         assert_eq!(after, 1, "a no-op start-up wrote another backup");
+    }
+
+    /// Article siblings and queued offers from before migration 13 learn
+    /// their parent from the notes they were written with (plan P7.6).
+    #[test]
+    fn earlier_article_siblings_get_their_parent_from_their_notes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 12) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status, notes) VALUES
+                (7,  'https://portal.gr/a', '1A_PAPADAKI_X', 'COMPLETED', 'Email: ΘΕΜΑΤΑ'),
+                (8,  'https://x.com/i/status/2', '1B_PAPADAKI_X', 'PENDING', 'Also in the article of job #7: https://portal.gr/a'),
+                (9,  'https://cdn.portal.gr/m.m3u8', '1C_PAPADAKI_X', 'PENDING', 'Offered from the article of job #7: https://portal.gr/a'),
+                (10, 'https://youtu.be/q', '2_PAPADAKI_Y', 'PENDING', NULL),
+                (11, 'https://youtu.be/r', '3_PAPADAKI_Y', 'PENDING', 'Also in the article of job #: broken');",
+        )
+        .unwrap();
+
+        apply(&mut conn, None).unwrap();
+
+        let parent = |id: i64| -> Option<i64> {
+            conn.query_row("SELECT parent_job_id FROM queue WHERE id = ?", rusqlite::params![id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(parent(8), Some(7));
+        assert_eq!(parent(9), Some(7));
+        assert_eq!(parent(7), None);
+        assert_eq!(parent(10), None);
+        assert_eq!(parent(11), None, "a note without a number must not invent parent 0");
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('processed_mail')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in ["received_at", "from_name", "to_addrs", "cc_addrs", "body_text", "attachments_json", "parse_json"] {
+            assert!(columns.iter().any(|x| x == c), "processed_mail.{c} missing: {columns:?}");
+        }
     }
 
     /// Upgrading a real v1 database: the rows survive, the UNIQUE(url)

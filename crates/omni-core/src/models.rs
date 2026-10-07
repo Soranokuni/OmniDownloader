@@ -204,6 +204,10 @@ pub struct Job {
     /// Only the first N videos of the article (plan P4.33); `None` is all.
     #[serde(default)]
     pub max_videos: Option<i64>,
+    /// The job whose article this video was found in: set on article
+    /// siblings (1B, 1C) and on offers MCR queued (plan P7.6).
+    #[serde(default)]
+    pub parent_job_id: Option<i64>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 
@@ -463,6 +467,10 @@ pub struct SelfcheckLink {
 }
 
 /// One row of `processed_mail` (plan P4.2, defect E-07).
+///
+/// The fields after `jobs_json` are what the MCR mail view shows (plan
+/// P7.6). They are empty for mail handled before that, and `body_text` is
+/// cleared again after `mail_text_retention_days`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessedMail {
     /// RFC 5322 Message-ID, or `source:{provider id}` when a message has none.
@@ -476,6 +484,47 @@ pub struct ProcessedMail {
     pub subject: Option<String>,
     /// What the message produced, as the email crate records it.
     pub jobs_json: String,
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
+    /// The sender's display name.
+    #[serde(default)]
+    pub from_name: Option<String>,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// The readable text the parser read (the text part, or the HTML reduced
+    /// to text), before any cleanup. Never the HTML itself.
+    #[serde(default)]
+    pub body_text: Option<String>,
+    /// The attachments' metadata, as the email crate records it.
+    #[serde(default)]
+    pub attachments_json: Option<String>,
+    /// What the parser decided (journalist, group, warnings, sections), as
+    /// the email crate records it.
+    #[serde(default)]
+    pub parse_json: Option<String>,
+}
+
+impl Default for ProcessedMail {
+    fn default() -> Self {
+        Self {
+            internet_message_id: String::new(),
+            source_id: None,
+            processed_at: None,
+            outcome: String::new(),
+            from_address: None,
+            subject: None,
+            jobs_json: "[]".into(),
+            received_at: None,
+            from_name: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            body_text: None,
+            attachments_json: None,
+            parse_json: None,
+        }
+    }
 }
 
 /// A job to be queued (plan P1.1).
@@ -498,6 +547,8 @@ pub struct NewJob {
     /// The journalist asked for only the first N videos of the article
     /// (plan P4.33); `None` is all of them.
     pub max_videos: Option<i64>,
+    /// The job whose article this video was found in (plan P7.6).
+    pub parent_job_id: Option<i64>,
 }
 
 impl NewJob {
@@ -518,6 +569,7 @@ impl NewJob {
             extraction_method: None,
             group_code: None,
             max_videos: None,
+            parent_job_id: None,
         }
     }
 }

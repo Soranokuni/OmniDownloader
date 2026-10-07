@@ -624,6 +624,8 @@ pub async fn api_queue_offer(
     new.email_message_id = job.email_message_id.clone();
     new.submitted_by_user_id = principal.user().map(|u| u.id).or(job.submitted_by_user_id);
     new.extraction_method = Some("sniffer".into());
+    new.group_code = job.group_code.clone();
+    new.parent_job_id = Some(job_id);
     new.notes = Some(format!("Offered from the article of job #{job_id}: {}", job.url));
     let result = state
         .repo

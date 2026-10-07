@@ -208,6 +208,7 @@ impl Repository {
             extraction_method: None,
             group_code: None,
             max_videos: None,
+            parent_job_id: None,
         };
         Ok(self.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id())
     }
@@ -297,8 +298,9 @@ impl Repository {
             INSERT INTO queue (
                 url, url_normalized, slug, journalist, keyword, index_str, priority,
                 status, stage, submitted_by_user_id, notes, email_source,
-                email_message_id, extraction_method, group_code, max_videos, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                email_message_id, extraction_method, group_code, max_videos, parent_job_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 job.url,
@@ -316,6 +318,7 @@ impl Repository {
                 job.extraction_method,
                 job.group_code,
                 job.max_videos.filter(|n| *n > 0),
+                job.parent_job_id,
                 now,
                 now
             ],
@@ -1114,6 +1117,7 @@ impl Repository {
             email_message_id: row.get("email_message_id").ok().flatten(),
             group_code: row.get("group_code").ok().flatten(),
             max_videos: row.get("max_videos").ok().flatten(),
+            parent_job_id: row.get("parent_job_id").ok().flatten(),
             delivered_at: timestamps::parse_opt(row.get("delivered_at").ok().flatten()),
             completed_at: timestamps::parse_opt(row.get("completed_at").ok().flatten()),
 
@@ -2007,19 +2011,35 @@ impl Repository {
             .query_row(
                 "SELECT * FROM processed_mail WHERE internet_message_id = ?",
                 params![internet_message_id],
-                |row| {
-                    Ok(ProcessedMail {
-                        internet_message_id: row.get("internet_message_id")?,
-                        source_id: row.get("source_id")?,
-                        processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
-                        outcome: row.get("outcome")?,
-                        from_address: row.get("from_address")?,
-                        subject: row.get("subject")?,
-                        jobs_json: row.get("jobs_json")?,
-                    })
-                },
+                Self::map_processed_mail,
             )
             .optional()?)
+    }
+
+    fn map_processed_mail(row: &rusqlite::Row) -> rusqlite::Result<ProcessedMail> {
+        let list = |col: &str| -> Vec<String> {
+            row.get::<_, Option<String>>(col)
+                .ok()
+                .flatten()
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default()
+        };
+        Ok(ProcessedMail {
+            internet_message_id: row.get("internet_message_id")?,
+            source_id: row.get("source_id")?,
+            processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
+            outcome: row.get("outcome")?,
+            from_address: row.get("from_address")?,
+            subject: row.get("subject")?,
+            jobs_json: row.get("jobs_json")?,
+            received_at: timestamps::parse_opt(row.get("received_at").ok().flatten()),
+            from_name: row.get("from_name").ok().flatten(),
+            to: list("to_addrs"),
+            cc: list("cc_addrs"),
+            body_text: row.get("body_text").ok().flatten(),
+            attachments_json: row.get("attachments_json").ok().flatten(),
+            parse_json: row.get("parse_json").ok().flatten(),
+        })
     }
 
     /// Record (or update) what a message produced. Called only after its
@@ -2125,17 +2145,7 @@ impl Repository {
     pub fn list_processed_mail(&self, limit: i64) -> Result<Vec<ProcessedMail>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT * FROM processed_mail ORDER BY processed_at DESC LIMIT ?")?;
-        let rows = stmt.query_map(params![limit.clamp(1, 1000)], |row| {
-            Ok(ProcessedMail {
-                internet_message_id: row.get("internet_message_id")?,
-                source_id: row.get("source_id")?,
-                processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
-                outcome: row.get("outcome")?,
-                from_address: row.get("from_address")?,
-                subject: row.get("subject")?,
-                jobs_json: row.get("jobs_json")?,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit.clamp(1, 1000)], Self::map_processed_mail)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -2198,18 +2208,32 @@ impl Repository {
         Ok(())
     }
 
+    /// Record what a mail produced, and (plan P7.6) what it said.
+    ///
+    /// On a second record of the same mail the content columns are replaced
+    /// only by a value: a FAILED record, which knows only the headers, must
+    /// not erase a text an earlier attempt stored.
     pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
         let conn = self.pool.get()?;
+        let list = |v: &Vec<String>| (!v.is_empty()).then(|| serde_json::to_string(v).unwrap_or_default());
         conn.execute(
             r#"
             INSERT INTO processed_mail
-                (internet_message_id, source_id, processed_at, outcome, from_address, subject, jobs_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (internet_message_id, source_id, processed_at, outcome, from_address, subject, jobs_json,
+                 received_at, from_name, to_addrs, cc_addrs, body_text, attachments_json, parse_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(internet_message_id) DO UPDATE SET
-                source_id    = excluded.source_id,
-                processed_at = excluded.processed_at,
-                outcome      = excluded.outcome,
-                jobs_json    = excluded.jobs_json
+                source_id        = excluded.source_id,
+                processed_at     = excluded.processed_at,
+                outcome          = excluded.outcome,
+                jobs_json        = excluded.jobs_json,
+                received_at      = COALESCE(excluded.received_at, received_at),
+                from_name        = COALESCE(excluded.from_name, from_name),
+                to_addrs         = COALESCE(excluded.to_addrs, to_addrs),
+                cc_addrs         = COALESCE(excluded.cc_addrs, cc_addrs),
+                body_text        = COALESCE(excluded.body_text, body_text),
+                attachments_json = COALESCE(excluded.attachments_json, attachments_json),
+                parse_json       = COALESCE(excluded.parse_json, parse_json)
             "#,
             params![
                 m.internet_message_id,
@@ -2218,10 +2242,30 @@ impl Repository {
                 m.outcome,
                 m.from_address,
                 m.subject,
-                m.jobs_json
+                m.jobs_json,
+                m.received_at.map(timestamps::format),
+                m.from_name.as_deref().filter(|s| !s.trim().is_empty()),
+                list(&m.to),
+                list(&m.cc),
+                m.body_text,
+                m.attachments_json,
+                m.parse_json,
             ],
         )?;
         Ok(())
+    }
+
+    /// Forget the text of mail handled more than `older_than_days` ago
+    /// (plan P7.6). The row stays: sender, subject and the jobs it produced
+    /// are the record of what came in. Returns how many texts were cleared.
+    pub fn purge_mail_text(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(Utc::now() - Duration::days(older_than_days.max(1)));
+        Ok(conn.execute(
+            "UPDATE processed_mail SET body_text = NULL
+             WHERE body_text IS NOT NULL AND COALESCE(received_at, processed_at) < ?",
+            params![cutoff],
+        )?)
     }
 
     // ==========================================

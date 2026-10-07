@@ -226,6 +226,8 @@ pub fn queue_article_siblings(
         sibling.email_message_id = job.email_message_id.clone();
         sibling.submitted_by_user_id = job.submitted_by_user_id;
         sibling.extraction_method = Some("sniffer".into());
+        sibling.group_code = job.group_code.clone();
+        sibling.parent_job_id = Some(job_id);
         sibling.notes = Some(format!("Also in the article of job #{job_id}: {}", job.url));
         match repo.enqueue(&sibling, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS) {
             Ok(r) => {

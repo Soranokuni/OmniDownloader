@@ -793,6 +793,7 @@ async fn run_daemon(
             adblock_enabled: config.adblock_auto_update_nightly,
             gate: update_gate.clone(),
             retention_days: config.retention_days.max(1),
+            mail_text_retention_days: config.mail_text_retention_days.max(1),
             health: health.clone(),
         };
 
@@ -1544,6 +1545,7 @@ struct MaintenanceContext {
     adblock_enabled: bool,
     gate: UpdateGate,
     retention_days: i64,
+    mail_text_retention_days: i64,
     health: HealthState,
 }
 
@@ -1665,6 +1667,15 @@ async fn run_one_task(
                 Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("Retention: login records not purged: {e:#}"),
+            }
+
+            // The text of handled mail (plan P7.6): the MCR mail view needs it
+            // for a few weeks, nobody needs it for ever. Sender, subject and
+            // jobs stay with the row.
+            match repo.purge_mail_text(ctx.mail_text_retention_days) {
+                Ok(n) if n > 0 => info!("Retention: cleared the text of {n} handled mail(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: mail text not cleared: {e:#}"),
             }
 
             // Orphaned per-job workspaces. The start-up sweep only runs at

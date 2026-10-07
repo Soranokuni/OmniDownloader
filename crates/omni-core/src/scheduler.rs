@@ -164,7 +164,7 @@ pub fn default_tasks() -> Vec<TaskSpec> {
         },
         TaskSpec {
             name: "retention",
-            description: "Delete expired archive copies, orphaned temp files and old login records",
+            description: "Delete expired archive copies, orphaned temp files, old login records and the text of old mail",
             cadence: Cadence::DailyAt { hour: 4, minute: 0 },
             jitter: Duration::ZERO,
         },
