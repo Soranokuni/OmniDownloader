@@ -1159,17 +1159,26 @@ async fn run_job(
     // A word typed onto the end of the link that the parser did not know
     // ("…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", plan P3.10): used only when the site says
     // the address as given does not exist and confirms the one without it.
+    //
+    // First the words the parser knows (P3.12): a job queued before P3.9
+    // still carries "…-ΒΙΝΤΕΟ", and some sites (amna.gr) answer 200 for the
+    // decorated address, so a 404 never says so. The same rule as the
+    // parser: no guess, no request.
     let mut job = job;
     let orig_url = if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
-        match omni_browser::pages::repair_dead_link(&orig_url).await {
+        let known = omni_email::parser::without_annotation(&orig_url);
+        let (fixed, why) = if known != orig_url {
+            (Some(known.to_string()), "the word the sender glued to it removed")
+        } else {
+            (omni_browser::pages::repair_dead_link(&orig_url).await, "it does not exist as sent (404); the site has it without the ending the sender added")
+        };
+        match fixed {
             Some(fixed) => {
-                info!("Job #{job_id}: {orig_url} does not exist; {fixed} does");
-                repo.record_event(
-                    job_id,
-                    "WARN",
-                    Some(JobStage::Extract),
-                    &format!("The link as sent does not exist (404); the site has it without the ending the sender added: {fixed}"),
-                )?;
+                info!("Job #{job_id}: {orig_url} -> {fixed}");
+                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed}"))?;
+                if let Err(e) = repo.set_leased_job_url(job_id, owner, &fixed) {
+                    warn!("Job #{job_id}: could not store the corrected link: {e:#}");
+                }
                 job.url = fixed.clone();
                 fixed
             }

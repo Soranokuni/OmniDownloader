@@ -465,3 +465,22 @@ fn leasing_holds_only_briefly_under_contention() {
         start.elapsed()
     );
 }
+
+#[test]
+fn only_the_lease_holder_corrects_a_jobs_link_and_dedup_follows_it() {
+    // P3.12: a job queued as "…/arthro/-ΒΙΝΤΕΟ" is corrected while it runs;
+    // the desk then opens, and dedups, the address that works.
+    let (_d, repo) = repo();
+    let id = queue(&repo, "https://www.example.gr/kosmos/arthro/-ΒΙΝΤΕΟ", "1_MCR_ARTHRO", "MCR").job_id();
+    let job = repo.lease_job("hostA:1:1", 120).unwrap().expect("a job");
+    assert_eq!(job.id, id);
+
+    assert!(!repo.set_leased_job_url(id, "hostA:1:2", "https://www.example.gr/kosmos/arthro/").unwrap(), "not the lease holder");
+    assert!(repo.set_leased_job_url(id, "hostA:1:1", "https://www.example.gr/kosmos/arthro/").unwrap());
+    assert_eq!(repo.get_job(id).unwrap().unwrap().url, "https://www.example.gr/kosmos/arthro/");
+    assert_eq!(
+        queue(&repo, "https://www.example.gr/kosmos/arthro/", "2_MCR_ARTHRO", "MCR"),
+        Enqueued::DuplicateActive { existing_id: id },
+        "the corrected address is the one dedup knows"
+    );
+}

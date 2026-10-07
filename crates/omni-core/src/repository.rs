@@ -581,6 +581,19 @@ impl Repository {
         Ok(changed == 1)
     }
 
+    /// Correct a running job's address (a word the sender glued to it,
+    /// plan P3.12), dedup key included, so the desk opens and dedups the
+    /// address that works. Only the worker holding the lease may do it.
+    pub fn set_leased_job_url(&self, job_id: i64, owner: &str, url: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE queue SET url = ?, url_normalized = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![url, crate::urlnorm::normalize(url), timestamps::now_string(), job_id, owner],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Store the videos offered to MCR for this job (`candidates_json`).
     pub fn set_candidates(&self, job_id: i64, candidates_json: Option<&str>) -> Result<()> {
         let conn = self.pool.get()?;
