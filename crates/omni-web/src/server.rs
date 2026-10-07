@@ -62,6 +62,11 @@ impl WebServer {
             .route("/api/journalists/:surname/groups", post(api_set_journalist_groups))
             .route("/api/system/status", get(api_system_status))
             .route("/api/events", get(api_events))
+            // The mail view (plan P7.8).
+            .route("/api/mails", get(api_get_mails))
+            .route("/api/mails/view", get(api_get_mail_view))
+            .route("/api/mails/queue-link", post(api_mail_queue_link))
+            .route("/api/mails/reprocess", post(api_mail_reprocess))
             // ---- Admin ----
             .route("/admin", get(view_admin))
             .route(
