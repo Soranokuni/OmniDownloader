@@ -17,6 +17,7 @@ fn leased_article_job() -> (tempfile::TempDir, Repository, omni_core::models::Jo
     j.keyword = "SEISMOS".into();
     j.priority = 3;
     j.email_message_id = Some("<m1@example.gr>".into());
+    j.group_code = Some("NEWS".into());
     repo.enqueue(&j, DEFAULT_DEDUP_WINDOW_HOURS).unwrap();
     let job = repo.lease_job("host:1:1", 180).unwrap().unwrap();
     (dir, repo, job)
@@ -46,6 +47,10 @@ fn platform_videos_become_sibling_jobs_and_raw_streams_are_offered() {
         vec![(X2, "1B_MCR_SEISMOS", JobStatus::Pending), (X3, "1C_MCR_SEISMOS", JobStatus::Pending)]
     );
     assert!(siblings.iter().all(|j| j.priority == 3 && j.email_message_id.as_deref() == Some("<m1@example.gr>")));
+    // The MCR mail view files them under the article's link (plan P7.6),
+    // and they carry the article's group label.
+    assert!(siblings.iter().all(|j| j.parent_job_id == Some(job.id)), "{siblings:?}");
+    assert!(siblings.iter().all(|j| j.group_code.as_deref() == Some("NEWS")), "{siblings:?}");
 
     // The raw stream is offered, with the next index in the sequence.
     let offered: Vec<Offered> = serde_json::from_str(row.candidates_json.as_deref().unwrap()).unwrap();

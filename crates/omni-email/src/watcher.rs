@@ -411,6 +411,8 @@ impl EmailWatcher {
             from_address: Some(h.from_address.clone()),
             subject: Some(h.subject.clone()),
             jobs_json: "[]".into(),
+            received_at: h.received_at,
+            ..Default::default()
         }) {
             // Not recorded: it must keep holding the checkpoint, or it is lost.
             warn!("EmailWatcher: could not record '{}' as failed: {db:#}", h.subject);
@@ -482,6 +484,16 @@ impl EmailWatcher {
             from_address: Some(mail.from_address.clone()),
             subject: Some(mail.subject.clone()),
             jobs_json: serde_json::to_string(&records)?,
+            // What the MCR mail view shows (plan P7.6).
+            received_at: mail.received_at,
+            from_name: Some(mail.from_name.clone()),
+            to: mail.to.clone(),
+            cc: mail.cc.clone(),
+            body_text: Some(crate::mail_view::stored_text(&mail.readable_body())),
+            attachments_json: (!mail.attachments.is_empty())
+                .then(|| serde_json::to_string(&mail.attachments))
+                .transpose()?,
+            parse_json: Some(serde_json::to_string(&crate::mail_view::MailParseSummary::of(&parsed))?),
         })?;
         Ok(Handled::Done)
     }
@@ -565,6 +577,7 @@ impl EmailWatcher {
                 extraction_method: method.map(String::from),
                 group_code: parsed.group.as_ref().map(|g| g.code.clone()),
                 max_videos: job.max_videos.map(i64::from),
+                parent_job_id: None,
             };
             let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
             match &result {

@@ -183,6 +183,9 @@ fn default_session_days_mcr() -> i64 {
 fn default_retention_days() -> i64 {
     7
 }
+fn default_mail_text_retention_days() -> i64 {
+    30
+}
 fn default_session_idle_hours() -> i64 {
     12
 }
@@ -539,6 +542,13 @@ pub struct AppConfig {
     #[serde(default = "default_retention_days")]
     pub retention_days: i64,
 
+    /// How long the text of each handled mail is kept for the MCR mail
+    /// view (plan P7.6). The nightly retention task clears it after this;
+    /// the mail's sender, subject and jobs stay. Also how far back the
+    /// view's list reaches.
+    #[serde(default = "default_mail_text_retention_days")]
+    pub mail_text_retention_days: i64,
+
     #[serde(default = "default_concurrent")]
     pub max_concurrent_downloads: usize,
 
@@ -654,6 +664,7 @@ impl Default for AppConfig {
             parser: ParserConfig::default(),
             graph: GraphConfig::default(),
             retention_days: default_retention_days(),
+            mail_text_retention_days: default_mail_text_retention_days(),
             max_concurrent_downloads: default_concurrent(),
             max_concurrent_transcodes: default_concurrent(),
             legacy_email_password: String::new(),

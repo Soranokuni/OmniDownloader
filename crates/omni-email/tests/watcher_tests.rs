@@ -546,3 +546,50 @@ async fn a_suggested_recipient_reaches_the_job_notes_by_name() {
     assert!(job.notes.as_deref().unwrap_or("").contains("JOURNALIST_SUGGESTED: ΕΥΗ"), "{:?}", job.notes);
     assert_eq!(job.slug, "1_MCR_VIRAL", "the recipient's name leaked into the slug");
 }
+
+/// Plan P7.6: what a handled mail said stays with it, for the MCR mail view.
+#[tokio::test]
+async fn a_handled_mail_keeps_its_text_headers_attachments_and_the_parsers_decision() {
+    let (_dir, repo) = repo();
+    let mut m = mail("m1", "ΘΕΜΑΤΑ", BODY);
+    m.from_name = "Άννα Παπαδάκη".into();
+    m.to = vec!["ingest@example.gr".into()];
+    m.cc = vec!["master@example.gr".into()];
+    m.received_at = Some(Utc::now() - Duration::minutes(5));
+    m.attachments = vec![AttachmentMeta { id: "2".into(), name: "plano.mp4".into(), content_type: "video/mp4".into(), size: 1024 }];
+    let source = FakeSource::with(vec![m]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    watcher.poll_once().await.unwrap();
+
+    let row = repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap();
+    assert_eq!(row.body_text.as_deref(), Some(BODY));
+    assert_eq!(row.from_name.as_deref(), Some("Άννα Παπαδάκη"));
+    assert_eq!((row.to.len(), row.cc.len()), (1, 1));
+    assert!(row.received_at.is_some());
+    assert!(row.attachments_json.as_deref().unwrap_or("").contains("plano.mp4"));
+
+    let parse: omni_email::mail_view::MailParseSummary = serde_json::from_str(row.parse_json.as_deref().unwrap()).unwrap();
+    assert_eq!(parse.journalist, "PAPADAKI");
+    assert_eq!(parse.how, omni_email::parser::Resolution::Sender);
+    let sections: Vec<&str> = parse.sections.iter().map(|s| s.index_str.as_str()).collect();
+    assert_eq!(sections, vec!["1", "2", "3"], "two numbered sections and the attachment's");
+    assert_eq!(parse.sections[0].keyword.as_deref(), Some("PARELASIIRAKLEIO"));
+}
+
+/// A mail given up on keeps at least when it arrived.
+#[tokio::test]
+async fn a_mail_given_up_on_keeps_when_it_arrived() {
+    let (dir, repo) = repo();
+    break_queue(&dir);
+    let mut m = mail("m1", "ΘΕΜΑΤΑ", BODY);
+    m.received_at = Some(Utc::now() - Duration::minutes(5));
+    let source = FakeSource::with(vec![m]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    for _ in 0..MAX_PROCESS_ATTEMPTS {
+        watcher.poll_once().await.unwrap();
+    }
+    let row = repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap();
+    assert_eq!(row.outcome, "FAILED");
+    assert!(row.received_at.is_some());
+    assert!(row.body_text.is_none(), "a mail that was never read has no text to show");
+}
