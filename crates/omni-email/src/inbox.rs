@@ -244,6 +244,46 @@ pub fn entries(mails: Vec<InboxMailRow>, jobs: Vec<InboxJobRow>, since: DateTime
     out
 }
 
+/// Where a recent entry's videos stand, for the desk's chime (plan P5.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Settlement {
+    /// [`Entry::id`].
+    pub id: String,
+    pub subject: String,
+    pub journalist: Option<String>,
+    /// Every video has reached an end state: nothing waits or runs.
+    pub settled: bool,
+    /// Settled with every video delivered (or discarded by MCR).
+    pub ok: bool,
+    pub delivered: usize,
+    pub total: usize,
+}
+
+/// The entries received at or after `since` that have videos, each with
+/// whether all of them have ended. The desk compares two answers and chimes
+/// for an entry that went from unsettled to settled: "this email is done".
+/// Settled is not [`EntryState::Done`]: a mail with one video in review and
+/// another still downloading is Attention, and not finished yet.
+pub fn settlements(entries: &[Entry], since: DateTime<Utc>) -> Vec<Settlement> {
+    use JobStatus::*;
+    entries
+        .iter()
+        .filter(|e| !e.jobs.is_empty() && e.at.is_some_and(|at| at >= since))
+        .map(|e| {
+            let status = |j: &EntryJob| JobStatus::parse(&j.status);
+            Settlement {
+                id: e.id(),
+                subject: e.subject.clone(),
+                journalist: e.journalist.clone(),
+                settled: !e.jobs.iter().any(|j| matches!(status(j), Some(Pending | Running))),
+                ok: e.state == EntryState::Done,
+                delivered: e.jobs.iter().filter(|j| matches!(status(j), Some(Completed | CompletedManual))).count(),
+                total: e.jobs.len(),
+            }
+        })
+        .collect()
+}
+
 impl Entry {
     /// `mail:<Message-ID>` or `manual:<job id>`: what the desk calls it.
     pub fn id(&self) -> String {
