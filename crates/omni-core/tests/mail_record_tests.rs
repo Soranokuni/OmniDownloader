@@ -99,3 +99,42 @@ fn a_video_found_in_an_article_points_at_the_article_job() {
     assert_eq!(repo.get_job(child).unwrap().unwrap().parent_job_id, Some(parent));
     assert_eq!(repo.get_job(parent).unwrap().unwrap().parent_job_id, None);
 }
+
+/// A link MCR queues from a mail's text (plan P7.8) is recorded with the
+/// mail, so the view files the job under that link.
+#[test]
+fn a_job_queued_from_a_mail_is_appended_to_what_the_mail_produced() {
+    let (_d, repo) = repo();
+    repo.record_processed_mail(&handled("<m1@example.gr>", 0)).unwrap();
+    let entry = serde_json::json!({
+        "index_str": "3", "slug": "3_GEORGIOU_SEISMOS", "url": "https://www.example.gr/a",
+        "status": "PENDING", "result": { "outcome": "created", "id": 42 },
+    });
+    assert!(repo.append_mail_job("<m1@example.gr>", &entry).unwrap());
+    assert!(repo.append_mail_job("<m1@example.gr>", &entry).unwrap());
+    let jobs: serde_json::Value =
+        serde_json::from_str(&repo.get_processed_mail("<m1@example.gr>").unwrap().unwrap().jobs_json).unwrap();
+    assert_eq!(jobs.as_array().unwrap().len(), 2);
+    assert_eq!(jobs[1]["result"]["id"], 42);
+    assert!(!repo.append_mail_job("<nope@example.gr>", &entry).unwrap());
+}
+
+#[test]
+fn a_mails_jobs_are_its_own_and_the_ones_its_duplicate_links_point_at() {
+    let (_d, repo) = repo();
+    let elsewhere = repo
+        .enqueue(&NewJob::new("https://youtu.be/elsewhere", "1_MCR_X", "MCR"), DEFAULT_DEDUP_WINDOW_HOURS)
+        .unwrap()
+        .job_id();
+    let mut own = NewJob::new("https://youtu.be/own", "1_GEORGIOU_X", "GEORGIOU");
+    own.email_message_id = Some("<m1@example.gr>".into());
+    let own = repo.enqueue(&own, DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let mut child = NewJob::new("https://x.com/i/status/3", "1B_MCR_X", "MCR");
+    child.parent_job_id = Some(elsewhere);
+    let child = repo.enqueue(&child, DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+
+    let ids = |v: Vec<omni_core::models::Job>| v.into_iter().map(|j| j.id).collect::<Vec<_>>();
+    assert_eq!(ids(repo.jobs_for_mail("<m1@example.gr>", &[]).unwrap()), vec![own]);
+    assert_eq!(ids(repo.jobs_for_mail("<m1@example.gr>", &[elsewhere]).unwrap()), vec![elsewhere, own]);
+    assert_eq!(ids(repo.jobs_with_children(elsewhere).unwrap()), vec![elsewhere, child]);
+}
