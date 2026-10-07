@@ -552,10 +552,14 @@ pub struct AppConfig {
     #[serde(default = "default_mail_text_retention_days")]
     pub mail_text_retention_days: i64,
 
-    #[serde(default = "default_concurrent")]
+    /// Jobs downloading (or being sniffed) at once. A job hands its slot
+    /// back when its source is on disk (plan P1.13).
+    #[serde(default = "default_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
 
-    #[serde(default = "default_concurrent")]
+    /// Encodes at once. CPU-bound: one 1080i50 MPEG-2 encode keeps about
+    /// six cores busy, so more than cores/6 only slows each one down.
+    #[serde(default = "default_concurrent_transcodes")]
     pub max_concurrent_transcodes: usize,
 
     // Email ingest: the mailbox itself is `graph` below (plan P4.7).
@@ -632,7 +636,10 @@ fn default_web_port() -> u16 {
 fn default_web_host() -> String {
     "0.0.0.0".to_string()
 }
-fn default_concurrent() -> usize {
+fn default_concurrent_downloads() -> usize {
+    3
+}
+fn default_concurrent_transcodes() -> usize {
     2
 }
 fn default_poll_interval() -> u64 {
@@ -668,8 +675,8 @@ impl Default for AppConfig {
             graph: GraphConfig::default(),
             retention_days: default_retention_days(),
             mail_text_retention_days: default_mail_text_retention_days(),
-            max_concurrent_downloads: default_concurrent(),
-            max_concurrent_transcodes: default_concurrent(),
+            max_concurrent_downloads: default_concurrent_downloads(),
+            max_concurrent_transcodes: default_concurrent_transcodes(),
             legacy_email_password: String::new(),
             email_poll_interval_secs: default_poll_interval(),
             ollama_endpoint: default_ollama_endpoint(),

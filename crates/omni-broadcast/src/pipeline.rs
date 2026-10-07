@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 
 use omni_core::models::{Job, JobStage, JobStatus};
@@ -11,6 +14,11 @@ use crate::errors::ErrorCode;
 use crate::rewrapper::Rewrapper;
 use crate::transcoder::Transcoder;
 
+/// Encoders running at once unless the daemon says otherwise. One MPEG-2
+/// 50 Mbps 1080i encode keeps about six cores busy; two fill the reference
+/// MCR machine (12 threads).
+pub const DEFAULT_ENCODER_SLOTS: usize = 2;
+
 #[derive(Clone)]
 pub struct BroadcastEngine {
     repo: Repository,
@@ -20,9 +28,39 @@ pub struct BroadcastEngine {
     bmxtranswrap_path: PathBuf,
     temp_dir: PathBuf,
     watchfolder_dir: PathBuf,
+    /// Encodes in progress (plan P1.13). Downloading is network-bound and
+    /// encoding CPU-bound, so they are counted apart: a job finished
+    /// downloading hands back its download slot and waits here, and the
+    /// next download starts instead of sitting behind someone's encode.
+    encoder_slots: Arc<Semaphore>,
+    /// The download slot each job holds until it reaches the encoder.
+    download_slots: Arc<Mutex<HashMap<i64, OwnedSemaphorePermit>>>,
 }
 
 impl BroadcastEngine {
+    /// At most `n` encodes at once (at least one).
+    pub fn with_encoder_slots(mut self, n: usize) -> Self {
+        self.encoder_slots = Arc::new(Semaphore::new(n.max(1)));
+        self
+    }
+
+    /// Give the engine the download slot job `job_id` was leased under; it
+    /// is released when the job starts waiting for an encoder, or by
+    /// [`Self::release_download_slot`] when the job ends before that.
+    pub fn hold_download_slot(&self, job_id: i64, permit: OwnedSemaphorePermit) {
+        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, permit);
+    }
+
+    /// Hand back job `job_id`'s download slot, if it still holds one.
+    pub fn release_download_slot(&self, job_id: i64) {
+        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).remove(&job_id);
+    }
+
+    /// Whether job `job_id` still holds its download slot.
+    pub fn holds_download_slot(&self, job_id: i64) -> bool {
+        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&job_id)
+    }
+
     pub fn new(
         repo: Repository,
         ytdl_path: PathBuf,
@@ -40,6 +78,8 @@ impl BroadcastEngine {
             bmxtranswrap_path,
             temp_dir,
             watchfolder_dir,
+            encoder_slots: Arc::new(Semaphore::new(DEFAULT_ENCODER_SLOTS)),
+            download_slots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -167,6 +207,24 @@ impl BroadcastEngine {
 
         // 2. Transcode stage (Sony XDCAM HD422 PAL 1080i50)
         let _ = self.repo.set_stage(job_id, owner, JobStage::Transcode);
+
+        // The source is on disk: let the next download start, then wait for
+        // an encoder (plan P1.13). Held until the encode ends; rewrap and
+        // delivery are disk-bound and do not need it.
+        self.release_download_slot(job_id);
+        let encoder = match self.encoder_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let _ = self.repo.update_job_progress(job_id, 0.0, "Waiting for encoder", "--:--");
+                let _ = self.repo.record_event(
+                    job_id,
+                    "INFO",
+                    Some(JobStage::Transcode),
+                    "Downloaded; waiting for a free encoder",
+                );
+                self.encoder_slots.clone().acquire_owned().await.context("encoder slots closed")?
+            }
+        };
         let _ = self.repo.update_job_progress(job_id, 0.0, "Transcoding", "--:--");
 
         let transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
@@ -181,6 +239,7 @@ impl BroadcastEngine {
                 );
             })
             .await;
+        drop(encoder);
 
         let (intermediate_mxf, duration) = match transcode_res {
             Ok(res) => res,

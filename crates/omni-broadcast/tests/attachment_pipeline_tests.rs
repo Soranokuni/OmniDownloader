@@ -43,7 +43,11 @@ fn rig(ffmpeg: PathBuf, ffprobe: PathBuf, bmx: PathBuf) -> Rig {
 /// Queue an attachment job the way the watcher does: parked, then released
 /// with its source.
 fn queue_attachment(r: &Rig, source: Option<&Path>) -> i64 {
-    let mut job = NewJob::new("attachment://m1@example.gr/2", "1_DIMITRIOU_LIMANI", "DIMITRIOU");
+    queue_attachment_as(r, source, "attachment://m1@example.gr/2", "1_DIMITRIOU_LIMANI")
+}
+
+fn queue_attachment_as(r: &Rig, source: Option<&Path>, url: &str, slug: &str) -> i64 {
+    let mut job = NewJob::new(url, slug, "DIMITRIOU");
     job.keyword = "LIMANI".into();
     job.status = JobStatus::ManualDownload;
     job.extraction_method = Some("attachment".into());
@@ -55,6 +59,79 @@ fn queue_attachment(r: &Rig, source: Option<&Path>) -> i64 {
     id
 }
 
+/// A 2 s 720p25 clip with a tone at `path`.
+async fn make_source(ffmpeg: &Path, path: &Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let args: Vec<String> = [
+        "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=2", "-f", "lavfi",
+        "-i", "sine=frequency=1000:sample_rate=48000:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([path.to_string_lossy().into_owned()])
+    .collect();
+    let made = omni_core::process::run(ffmpeg, &args, omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)))
+        .await
+        .unwrap();
+    assert!(made.success, "could not build the synthetic attachment");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_downloaded_job_frees_its_download_slot_and_queues_for_the_encoder() {
+    // P1.13: one slot covered download *and* encode, so a job encoding held
+    // a download slot and the next link waited for someone's transcode.
+    // Two jobs, one encoder: one must wait for it, both must deliver, and
+    // neither may keep its download slot once its source is on disk.
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping encoder slot test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let mut r = rig(ffmpeg.clone(), ffprobe, bmx);
+    r.engine = r.engine.clone().with_encoder_slots(1);
+
+    let downloads = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    let mut leased = Vec::new();
+    for (n, slug) in [(1, "1_DIMITRIOU_LIMANI"), (2, "2_DIMITRIOU_LIMANI")] {
+        let source = r.root.join("attachments").join(n.to_string()).join("source.mp4");
+        make_source(&ffmpeg, &source).await;
+        queue_attachment_as(&r, Some(&source), &format!("attachment://m1@example.gr/{n}"), slug);
+        let owner = format!("test:1:{n}");
+        let job = r.repo.lease_job(&owner, 180).unwrap().expect("released job is leasable");
+        r.engine.hold_download_slot(job.id, downloads.clone().acquire_owned().await.unwrap());
+        leased.push((job, owner));
+    }
+    // Both sources are on disk before either starts, so they reach the
+    // encoder together.
+    let runs: Vec<_> = leased
+        .into_iter()
+        .map(|(job, owner)| {
+            let engine = r.engine.clone();
+            tokio::spawn(async move {
+                let id = job.id;
+                engine.process_job(job, &owner).await.map(|_| id)
+            })
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for run in runs {
+        ids.push(run.await.unwrap().expect("both jobs deliver"));
+    }
+
+    assert_eq!(downloads.available_permits(), 2, "a finished job kept its download slot");
+    assert!(ids.iter().all(|id| !r.engine.holds_download_slot(*id)));
+    let waited = ids
+        .iter()
+        .filter(|id| {
+            r.repo.get_job_events(**id, 100).unwrap().iter().any(|e| e.message.contains("waiting for a free encoder"))
+        })
+        .count();
+    assert_eq!(waited, 1, "with one encoder exactly one of two simultaneous jobs waits for it");
+    for slug in ["1_DIMITRIOU_LIMANI", "2_DIMITRIOU_LIMANI"] {
+        assert!(r.root.join("watchfolder").join(format!("{slug}.mxf")).exists(), "{slug} not delivered");
+    }
+}
+
 #[tokio::test]
 async fn an_attached_video_is_built_from_its_saved_file() {
     let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
@@ -64,22 +141,9 @@ async fn an_attached_video_is_built_from_its_saved_file() {
     let r = rig(ffmpeg.clone(), ffprobe, bmx);
 
     let source = r.root.join("attachments").join("saved").join("source.mp4");
-    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     // 2 s, as short social clips are: this is also the original reproduction
     // of the short-clip loudness failure, through the whole engine.
-    let args: Vec<String> = [
-        "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=2", "-f", "lavfi",
-        "-i", "sine=frequency=1000:sample_rate=48000:duration=2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-shortest",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([source.to_string_lossy().into_owned()])
-    .collect();
-    let made = omni_core::process::run(&ffmpeg, &args, omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)))
-        .await
-        .unwrap();
-    assert!(made.success, "could not build the synthetic attachment");
+    make_source(&ffmpeg, &source).await;
 
     let id = queue_attachment(&r, Some(&source));
     let job = r.repo.lease_job("test:1:1", 180).unwrap().expect("released job is leasable");
