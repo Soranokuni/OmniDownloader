@@ -92,11 +92,15 @@ pub fn plan_article_videos_limited(
     if is_video_platform(page) {
         return ArticlePlan { primary_index: index.to_string(), siblings: Vec::new(), offered: Vec::new() };
     }
-    let mut seen = vec![primary.to_string()];
+    // One video under two addresses is one video: the page embeds
+    // "x.com/visegrad24/status/N" and links "x.com/i/status/N" (2026-10-07,
+    // the primary was queued again as a sibling). Compared as dedup keys.
+    let key = |u: &str| omni_core::urlnorm::normalize(u);
+    let mut seen = vec![key(primary)];
     let mut others = Vec::new();
     for u in all {
-        if !seen.contains(u) {
-            seen.push(u.clone());
+        if !seen.contains(&key(u)) {
+            seen.push(key(u));
             others.push(u.clone());
         }
     }
@@ -275,6 +279,19 @@ mod tests {
         assert_eq!(p.primary_index, "1A");
         assert_eq!(p.siblings, vec![(X2.to_string(), "1B".to_string()), (X3.to_string(), "1C".to_string())]);
         assert!(p.offered.is_empty());
+    }
+
+    #[test]
+    fn the_primary_under_another_address_is_not_queued_again() {
+        // news247, 2026-10-07: the embed said ".../visegrad24/status/N", a
+        // link on the page ".../i/status/N"; the second became a sibling job
+        // downloading the primary's own post again.
+        let embed = "https://x.com/visegrad24/status/1";
+        let p = plan_article_videos(ARTICLE, embed, &s(&[embed, X2, X1]), "1");
+        assert_eq!(p.siblings, vec![(X2.to_string(), "1B".to_string())]);
+        // ...and two addresses of one sibling are one sibling.
+        let p = plan_article_videos(ARTICLE, X1, &s(&[X1, X2, "https://twitter.com/someone/status/2?s=20"]), "1");
+        assert_eq!(p.siblings.len(), 1, "{:?}", p.siblings);
     }
 
     #[test]
