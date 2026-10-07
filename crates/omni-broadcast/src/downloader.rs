@@ -157,7 +157,14 @@ fn js_runtime_args(deno: Option<&Path>) -> Vec<String> {
 impl Downloader {
     pub fn new<P: AsRef<Path>>(ytdl_path: P) -> Self {
         let ytdl_path = ytdl_path.as_ref().to_path_buf();
-        let deno = ytdl_path.parent().map(|d| d.join("deno.exe")).filter(|p| p.is_file());
+        // bin/deno.exe sits next to the legacy bin/yt-dlp.exe, and one level
+        // up from the folder build's bin/yt-dlp/yt-dlp.exe (plan P2.10).
+        let deno = ytdl_path
+            .ancestors()
+            .skip(1)
+            .take(2)
+            .map(|d| d.join("deno.exe"))
+            .find(|p| p.is_file());
         Self { ytdl_path, deno }
     }
 
@@ -599,6 +606,12 @@ mod tests {
         assert!(Downloader::new(dir.path().join("yt-dlp.exe")).deno.is_none());
         std::fs::write(dir.path().join("deno.exe"), b"x").unwrap();
         assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe")).deno, Some(dir.path().join("deno.exe")));
+        // The folder build (P2.10) is one level down: without this YouTube
+        // would lose its JavaScript runtime and 403 at random.
+        assert_eq!(
+            Downloader::new(dir.path().join("yt-dlp").join("yt-dlp.exe")).deno,
+            Some(dir.path().join("deno.exe"))
+        );
     }
 
     #[test]
