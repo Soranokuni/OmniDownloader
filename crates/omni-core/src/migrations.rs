@@ -420,6 +420,20 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_queue_parent        ON queue(parent_job_id);
         "#,
     ),
+    (
+        14,
+        // Self-check links for the routes added on 2026-10-07 (P3.8–P3.13):
+        // a news agency page whose video only its own API names, an article
+        // whose first embedded X post is photos only, and the same article
+        // with the "-ΒΙΝΤΕΟ" a sender glued on (404 as sent). Seeded once,
+        // like migration 10's: an operator's deletion sticks.
+        r#"
+        INSERT OR IGNORE INTO selfcheck_links (label, url) VALUES
+            ('News agency video page (ΑΠΕ-ΜΠΕ API)', 'https://www.amna.gr/home/videos/1028434/Proores-ekloges-stin-Ispania-stis-29-Noembriou--anakoinose-o-P-Santseth'),
+            ('News article, X embeds, first one photos only', 'https://www.news247.gr/kosmos/rosia-apo-agnosti-pnevmonia-o-thanatos-tis-erevnitrias-ti-leei-gia-tin-panoli-o-pou/'),
+            ('Link with "-ΒΙΝΤΕΟ" glued on by the sender', 'https://www.news247.gr/kosmos/rosia-apo-agnosti-pnevmonia-o-thanatos-tis-erevnitrias-ti-leei-gia-tin-panoli-o-pou/-ΒΙΝΤΕΟ');
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

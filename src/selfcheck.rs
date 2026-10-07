@@ -49,15 +49,33 @@ async fn probe_twice(dl: &Downloader, url: &str, give_up_early: impl Fn(&str) ->
     Err(last)
 }
 
-/// Check one link the way a job would take it.
+/// Check one link the way a job would take it: the same corrections first
+/// (a glued "-ΒΙΝΤΕΟ", a confirmed 404 repair, a site's own API), then
+/// yt-dlp, then the browser, whose finds are tried in turn as a job skips
+/// an embedded post without a video.
 pub async fn check_link(ytdl: &Path, url: &str) -> LinkOutcome {
     let dl = Downloader::new(ytdl);
+    let mut url = omni_email::parser::without_annotation(url).to_string();
+    let mut route = String::new();
+    if url.starts_with("http") {
+        if let Some(fixed) = omni_browser::pages::repair_dead_link(&url).await {
+            route = " (link repaired)".into();
+            url = fixed;
+        }
+        if let Ok(Some(video)) = omni_browser::pages::resolve(&url).await {
+            return match probe_twice(&dl, &video, |_| false).await {
+                Ok(found) => LinkOutcome { ok: true, detail: format!("found {found} named by the site's API{route}") },
+                Err(e) => LinkOutcome { ok: false, detail: format!("the site's API named {video}, which could not be read: {e}") },
+            };
+        }
+    }
+    let url = url.as_str();
     let platform = is_video_platform(url);
     // A news page yt-dlp has no extractor for is the browser's job, not a
     // failure worth a second try.
     let direct = probe_twice(&dl, url, |e| !platform && e.contains("Unsupported URL")).await;
     let reason = match direct {
-        Ok(found) => return LinkOutcome { ok: true, detail: format!("found {found}") },
+        Ok(found) => return LinkOutcome { ok: true, detail: format!("found {found}{route}") },
         Err(e) => e,
     };
     if platform {
@@ -70,12 +88,20 @@ pub async fn check_link(ytdl: &Path, url: &str) -> LinkOutcome {
             tokio::time::sleep(RETRY_PAUSE).await;
         }
         match StreamSniffer::extract_media_bundle(url, 25).await {
-            Ok(media) => match probe_twice(&dl, &media.primary_stream, |_| false).await {
-                Ok(found) => {
-                    return LinkOutcome { ok: true, detail: format!("found {found} in the page's player") };
+            Ok(media) => {
+                // The primary first, then the page's other finds: a job
+                // skips an embedded post that has no video (P3.13).
+                let mut candidates = vec![media.primary_stream.clone()];
+                candidates.extend(media.all_streams.iter().filter(|s| **s != media.primary_stream).take(5).cloned());
+                for c in &candidates {
+                    match probe_twice(&dl, c, |e| e.contains("No video could be found")).await {
+                        Ok(found) => {
+                            return LinkOutcome { ok: true, detail: format!("found {found} in the page's player{route}") };
+                        }
+                        Err(e) => last = format!("the page's video ({c}) could not be read: {e}"),
+                    }
                 }
-                Err(e) => last = format!("the page's video ({}) could not be read: {e}", media.primary_stream),
-            },
+            }
             Err(e) => last = format!("no video found on the page ({e})"),
         }
     }
