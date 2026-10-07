@@ -18,6 +18,13 @@ INSTALL (new PC)
        Install.cmd --watchfolder "\\dalet\ingest" --account "DOMAIN\svc_omni"
   Other options:  --dir D:\OmniIngest   --port 8081   --yes   --no-firewall
 
+MOVING AN EXISTING SETUP ON THE SAME PC (e.g. from D:\OmniDownloader)
+  Stop the old one first (close its console window), then:
+       Install.cmd --import D:\OmniDownloader
+  The configuration, database, keys and seeds come along; the watchfolder
+  stays where it was. Keys only work on the PC they were saved on: on a
+  different PC, enter them again in Admin.
+
 UPGRADE
   Unzip the new release and run its Install.cmd. The service is stopped, the
   program and tools replaced, and the service started again. Data,
