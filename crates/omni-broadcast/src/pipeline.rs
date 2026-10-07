@@ -302,6 +302,10 @@ impl BroadcastEngine {
 
         // 3. Rewrap stage (SMPTE RDD9 OP1a MXF)
         let _ = self.repo.set_stage(job_id, owner, JobStage::Rewrap);
+        // A rename by MCR up to now names the file (P7.12). Read after the
+        // stage is REWRAP, which is when a rename starts being refused, so
+        // one either lands here or is turned down; never half-applied.
+        let slug = self.repo.get_job(job_id).ok().flatten().map(|j| j.slug).unwrap_or(slug);
         let _ = self.repo.update_job_progress(job_id, 99.0, "Rewrapping", "--:--");
 
         let rewrapper = Rewrapper::new(&self.bmxtranswrap_path);

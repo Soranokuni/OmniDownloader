@@ -131,6 +131,31 @@ export async function overrideJob(job, url, after) {
   } catch (e) { toast(e.message, 'bad'); return false; }
 }
 
+/** Whether the file name can still change (P7.12): the server refuses
+ *  once the file is being made (rewrap onwards) or delivered. */
+export function canRename(job) {
+  if (['PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED'].includes(job.status)) return true;
+  return job.status === 'RUNNING' && ['QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE'].includes(job.stage);
+}
+
+/** Give a video a better keyword before it is delivered: the last part of
+ *  its file name, typed in Greek or Latin. */
+export async function renameJob(job, after) {
+  const now = job.keyword || '';
+  const typed = prompt(
+    `Νέα λέξη-κλειδί για το ${fileName(job)}\n\n` +
+    `Γράψτε το θέμα του βίντεο, ελληνικά ή λατινικά (π.χ. ΣΕΙΣΜΟΣ ΣΗΤΕΙΑ). ` +
+    `Το αρχείο θα παραδοθεί ως ${job.index_str}_${job.journalist}_ΛΕΞΗ.mxf.`,
+    now,
+  );
+  if (typed === null || !typed.trim() || typed.trim() === now) return;
+  try {
+    const r = await api(`/api/jobs/${job.id}/rename`, { method: 'POST', body: { keyword: typed } });
+    toast(`Θα παραδοθεί ως ${r.slug}.mxf.`, 'ok');
+    after();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
 export async function discardJob(job, after) {
   if (!confirm(
     `Να αφαιρεθεί το ${fileName(job)} (εργασία #${job.id});\n\n` +

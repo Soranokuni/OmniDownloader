@@ -596,6 +596,54 @@ pub async fn api_override_job(
 }
 
 #[derive(Deserialize)]
+pub struct RenamePayload {
+    keyword: String,
+}
+
+/// MCR renames a video before it is made (P7.12): the keyword part of the
+/// file name, typed in Greek or Latin, kept in the house form (ELOT 743,
+/// letters and digits, at most 20).
+pub async fn api_rename_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<RenamePayload>,
+) -> JsonResult {
+    let keyword = house_keyword(&payload.keyword)
+        .ok_or_else(|| ApiError::bad_request("Γράψτε μια λέξη-κλειδί με τουλάχιστον 2 γράμματα ή ψηφία."))?;
+    let renamed = state
+        .repo
+        .rename_job_keyword(job_id, &keyword)
+        .map_err(internal_error("Could not rename the job."))?;
+    let Some((old, new)) = renamed else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "TOO_LATE",
+            "Το αρχείο αυτού του βίντεο δημιουργείται ή έχει ήδη παραδοθεί· το όνομά του δεν αλλάζει πια.",
+        ));
+    };
+    let who = principal.audit_label();
+    let _ = state
+        .repo
+        .record_event(job_id, "INFO", None, &format!("Renamed by {who}: {old} → {new}"));
+    audit_action(&state, &principal, &format!("Job #{job_id}: renamed {old} → {new}"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "slug": new, "keyword": keyword })))
+}
+
+/// A keyword as typed by a person: transliterated, letters and digits only,
+/// upper case, at most 20; `None` under 2 characters.
+fn house_keyword(raw: &str) -> Option<String> {
+    let k: String = omni_core::translit::translit(raw.trim())
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(20)
+        .collect();
+    (k.len() >= 2).then_some(k)
+}
+
+#[derive(Deserialize)]
 pub struct QueueOfferPayload {
     url: String,
 }

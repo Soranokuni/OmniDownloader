@@ -484,3 +484,26 @@ fn only_the_lease_holder_corrects_a_jobs_link_and_dedup_follows_it() {
         "the corrected address is the one dedup knows"
     );
 }
+
+#[test]
+fn a_job_can_be_renamed_until_its_file_is_being_made() {
+    // P7.12: MCR fixes an uncertain keyword before delivery, never after
+    // the rewrap has named the clip.
+    let (_d, repo) = repo();
+    let id = queue(&repo, "https://example.gr/rename", "1_MCR_TREILER", "MCR").job_id();
+    let (old, new) = repo.rename_job_keyword(id, "DUNE").unwrap().expect("a waiting job");
+    assert_eq!((old.as_str(), new.as_str()), ("1_MCR_TREILER", "1_MCR_DUNE"));
+    let job = repo.get_job(id).unwrap().unwrap();
+    assert_eq!((job.slug.as_str(), job.keyword.as_str()), ("1_MCR_DUNE", "DUNE"));
+
+    repo.lease_job("hostA:1:1", 120).unwrap().expect("leased");
+    repo.set_stage(id, "hostA:1:1", JobStage::Transcode).unwrap();
+    assert!(repo.rename_job_keyword(id, "DUNEPART").unwrap().is_some(), "still before the rewrap");
+    repo.set_stage(id, "hostA:1:1", JobStage::Rewrap).unwrap();
+    assert!(repo.rename_job_keyword(id, "LATE").unwrap().is_none(), "the clip is being named");
+    assert_eq!(repo.get_job(id).unwrap().unwrap().slug, "1_MCR_DUNEPART");
+
+    repo.finish(id, "hostA:1:1", JobStatus::Completed, None, None, Some("x.mxf")).unwrap();
+    assert!(repo.rename_job_keyword(id, "AFTER").unwrap().is_none(), "delivered files are never renamed");
+    assert!(repo.rename_job_keyword(99_999, "GONE").unwrap().is_none());
+}

@@ -47,6 +47,7 @@ impl WebServer {
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))
             .route("/api/jobs/:id", get(api_get_job))
             .route("/api/jobs/:id/override", post(api_override_job))
+            .route("/api/jobs/:id/rename", post(api_rename_job))
             .route("/api/jobs/:id/retry", post(api_retry_job))
             .route("/api/jobs/:id/redownload", post(api_redownload_job))
             .route("/api/jobs/clear-finished", post(api_clear_finished))

@@ -180,3 +180,25 @@ fn a_clip_too_big_for_the_disk_is_refused_before_it_is_made() {
     assert!(why.contains("temp has") && why.contains("needs"), "{why}");
     assert!(omni_broadcast::pipeline::room_for(60.0, d.path(), d.path()).is_ok(), "a minute fits on the test disk");
 }
+
+#[tokio::test]
+async fn a_video_renamed_while_it_downloads_is_delivered_under_the_new_name() {
+    // P7.12: the worker leased the job as 1_DIMITRIOU_LIMANI; MCR renamed
+    // it before the rewrap. The clip and the file carry the new name.
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping rename pipeline test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let r = rig(ffmpeg.clone(), ffprobe, bmx);
+    let source = r.root.join("attachments").join("ren").join("source.mp4");
+    make_source(&ffmpeg, &source).await;
+    let id = queue_attachment(&r, Some(&source));
+    let job = r.repo.lease_job("test:1:1", 180).unwrap().expect("leasable");
+    assert_eq!(job.slug, "1_DIMITRIOU_LIMANI");
+
+    r.repo.rename_job_keyword(id, "LIMANICHANION").unwrap().expect("renamable while running");
+    r.engine.process_job(job, "test:1:1").await.expect("delivers");
+
+    assert!(r.root.join("watchfolder").join("1_DIMITRIOU_LIMANICHANION.mxf").exists(), "delivered under the new name");
+    assert!(!r.root.join("watchfolder").join("1_DIMITRIOU_LIMANI.mxf").exists());
+}
