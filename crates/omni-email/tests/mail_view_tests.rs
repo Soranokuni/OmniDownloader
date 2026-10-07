@@ -442,3 +442,22 @@ fn jobs_keep_their_statuses_in_the_view_input() {
     let view = build(&row, &jobs_now, &ParserConfig::default());
     assert_eq!(view.links[0].jobs, vec![jobs[0].id]);
 }
+
+#[test]
+fn keyword_notes_say_what_was_named_from_titles_and_what_is_still_unsure() {
+    // P4.34: MCR sees which names came from the videos' own titles and which
+    // are still unsure, so it knows which file names to check.
+    let (_d, repo) = repo();
+    let (mut row, jobs) = ingest(&repo, &mail("τρέιλερ", "https://youtu.be/kwnote00001\nhttps://youtu.be/kwnote00002"));
+    let mut summary: serde_json::Value = serde_json::from_str(row.parse_json.as_deref().unwrap()).unwrap();
+    summary["warnings"] = serde_json::json!([
+        {"code": "KEYWORD_FROM_TITLES", "detail": "1A=DUNEPART"},
+        {"code": "KEYWORD_UNCERTAIN", "detail": "1B TREILER (generic, shared by 2 links)"}
+    ]);
+    row.parse_json = Some(summary.to_string());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let titles = view.notes.iter().find(|n| n.text.contains("τίτλους των ίδιων των βίντεο")).expect("titles note");
+    assert!(titles.text.contains("1A=DUNEPART") && titles.level == NoteLevel::Info);
+    let unsure = view.notes.iter().find(|n| n.text.starts_with("Λέξη-κλειδί αβέβαιη")).expect("uncertain note");
+    assert!(unsure.text.contains("1B TREILER") && unsure.level == NoteLevel::Warn);
+}

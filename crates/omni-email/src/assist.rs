@@ -17,6 +17,7 @@
 
 use regex::Regex;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tracing::{info, warn};
 
@@ -25,10 +26,11 @@ use omni_core::models::Journalist;
 use omni_core::taxonomy::Group;
 use omni_core::translit::translit;
 
+use crate::link_titles::TitleSource;
 use crate::llm::LlmClient;
 use crate::mail::InboundMail;
 use crate::groups::{resolve_group, GroupResolution, ResolvedGroup};
-use crate::parser::{self, warnings, ParsedEmail, Resolution, Warning};
+use crate::parser::{self, warnings, KeywordSource, ParsedEmail, Resolution, Warning};
 
 /// Most of a long rundown is irrelevant to "who is this for"; the model gets
 /// the start of the body, which is where routing phrases are written.
@@ -42,7 +44,7 @@ static RE_ROUTING_PHRASE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(GIA
 const SYSTEM_PROMPT: &str = "You help the video desk of a Greek regional television newsroom file \
 material that journalists send by email. Answer with one JSON object and nothing else, with exactly \
 these fields: {\"journalist_surname_latin\": string or null, \"journalist_named_in_mail\": string or \
-null, \"keywords\": {\"<section number>\": \"<KEYWORD>\"}, \"group_code\": string or null}.\n\
+null, \"keywords\": {\"<section number>\": \"<KEYWORD>\"}, \"video_keywords\": {\"<video id>\": \"<KEYWORD>\"}, \"group_code\": string or null}.\n\
 \n\
 journalist_surname_latin: who the material is FOR (the journalist who will edit it), chosen from the \
 roster only, written exactly as the roster's surname. Read the routing: \"για τον/την X\", \"για X\", \
@@ -63,17 +65,30 @@ from the section title and the text and links around it. Transliterate Greek to 
 THEMA, REPORTAZ, PLANA, LINK, NEWS, ASSET, KALIMERA), never the recipient journalist's name, never a \
 date. Omit a section you cannot name rather than guess.\n\
 \n\
+video_keywords: for each listed video id, one or two words naming THAT video, from its own title \
+first, then the text written next to its link: the film, person, place, team or event it shows (a \
+trailer is named by its film: DUNE, not TRAILER; a match by its teams: ΑΕΚ ΟΦΗ). Write Greek words in \
+Greek capitals (they are transliterated for you); names written in Latin stay as they are. Never a \
+generic word or the recipient journalist's name. Videos that are parts of one story (clips of one \
+interview) may share one keyword. Omit a video you cannot name.\n\
+\n\
 group_code: the listed group (news desk, show or desk) the material is for, judged from the subject, \
 the body and the group descriptions; null when unclear or no groups are listed.\n\
 \n\
-Never output URLs, section numbers or group codes that were not listed, or any other field.
+Never output URLs, section numbers, video ids or group codes that were not listed, or any other field.
 
-Example. Roster: - NIKOLAOU: Giorgos Nikolaou; ΓΙΩΡΓΟΣ. Subject: \"Πρ: VIRAL ΓΙΑ ΕΥΗ\". Body: a forwarded reel of a concert at the Heraklion harbour. Section 1 needs a keyword. Answer: {\"journalist_surname_latin\": null, \"journalist_named_in_mail\": \"Εύη\", \"keywords\": {\"1\": \"SYNAVLIALIMANI\"}, \"group_code\": null} (Εύη is not on this roster, so she is named, not chosen; the keyword names the story, not the word VIRAL; no group is stated).";
+Example. Roster: - NIKOLAOU: Giorgos Nikolaou; ΓΙΩΡΓΟΣ. Subject: \"Πρ: VIRAL ΓΙΑ ΕΥΗ\". Body: a forwarded reel of a concert at the Heraklion harbour. Section 1 needs a keyword. Answer: {\"journalist_surname_latin\": null, \"journalist_named_in_mail\": \"Εύη\", \"keywords\": {\"1\": \"SYNAVLIALIMANI\"}, \"video_keywords\": {}, \"group_code\": null} (Εύη is not on this roster, so she is named, not chosen; the keyword names the story, not the word VIRAL; no group is stated).";
 
 pub struct Assist {
     client: LlmClient,
     cfg: LlmConfig,
+    /// Where a low-scored video's own title comes from (P4.34).
+    titles: TitleSource,
 }
+
+/// At most this many uncertain videos are looked up and asked about per
+/// mail: a 40-link rundown should not become 40 lookups.
+const MAX_UNCERTAIN: usize = 20;
 
 impl Assist {
     pub fn new(endpoint: &str, model: &str, cfg: LlmConfig) -> Self {
@@ -85,7 +100,13 @@ impl Assist {
             ..cfg
         };
         let client = LlmClient::from_settings(endpoint, model, &cfg);
-        Self { client, cfg }
+        Self { client, cfg, titles: TitleSource::Web }
+    }
+
+    /// Titles from somewhere other than the web (tests).
+    pub fn with_titles(mut self, titles: TitleSource) -> Self {
+        self.titles = titles;
+        self
     }
 
     /// The assist the configuration describes (plan P4.22).
@@ -126,6 +147,7 @@ impl Assist {
             || routed_but_unresolved
             || group_undecided
             || !parser::sections_needing_keyword(parsed).is_empty()
+            || !uncertain_videos(parsed).is_empty()
     }
 
     /// Ask, validate, apply. Never fails: a problem is recorded as a
@@ -151,7 +173,18 @@ impl Assist {
         } else {
             parser::sections_needing_keyword(parsed)
         };
-        if !want_journalist && !want_group && sections.is_empty() {
+        // Videos whose keyword cannot tell them apart or names nothing
+        // (P4.34), with their own titles: the context the mail lacks.
+        let uncertain = uncertain_videos(parsed);
+        let titles = if uncertain.is_empty() {
+            HashMap::new()
+        } else {
+            // Web links only: an attachment has no title to look up.
+            let urls: Vec<String> =
+                uncertain.iter().map(|v| v.url.clone()).filter(|u| u.starts_with("http://") || u.starts_with("https://")).collect();
+            self.titles.titles(&urls).await
+        };
+        if !want_journalist && !want_group && sections.is_empty() && uncertain.is_empty() {
             return;
         }
 
@@ -159,7 +192,17 @@ impl Assist {
         // (owner's decision, plan P4.22): addresses and phone numbers out, the
         // sender's address never sent.
         let redact = self.client.is_online();
-        let user = build_prompt(mail, body, roster, want_journalist, &sections, if want_group { groups } else { &[] }, redact);
+        let user = build_prompt(
+            mail,
+            body,
+            roster,
+            want_journalist,
+            &sections,
+            if want_group { groups } else { &[] },
+            &uncertain,
+            &titles,
+            redact,
+        );
         let answer = match self.client.chat_json(SYSTEM_PROMPT, &user, &schema(), self.cfg.max_tokens).await {
             Ok(v) => {
                 // Names and keywords only, never the mail; for tuning.
@@ -169,6 +212,8 @@ impl Assist {
             Err(e) => {
                 warn!("LLM assist unavailable, keeping the parser's result: {e:#}");
                 skipped(parsed, "unavailable");
+                // The titles were fetched anyway: still better than TREILER ×4.
+                keywords_from_titles(parsed, &uncertain, &titles);
                 return;
             }
         };
@@ -249,6 +294,32 @@ impl Assist {
             }
         }
 
+        // One keyword per uncertain video (P4.34): only for the ones asked
+        // about, only a valid keyword that names something.
+        if let Some(Value::Object(map)) = answer.get("video_keywords") {
+            let asked: Vec<&str> = uncertain.iter().map(|v| v.index.as_str()).collect();
+            let mut set = Vec::new();
+            for (index, kw) in map {
+                if !asked.contains(&index.as_str()) {
+                    rejected.push(format!("video {index} was not asked about"));
+                    continue;
+                }
+                let Some(k) = kw.as_str().and_then(parser::keyword_from_model) else {
+                    rejected.push(format!("keyword for video {index} is not a specific [A-Z0-9]{{2,20}}"));
+                    continue;
+                };
+                if parser::set_job_keyword(parsed, index, &k, KeywordSource::Llm) {
+                    set.push(format!("{index}={k}"));
+                }
+            }
+            if !set.is_empty() {
+                set.sort();
+                applied.push(format!("video keywords {}", set.join(" ")));
+            }
+        }
+        // What the model left uncertain, its own title names if it can.
+        keywords_from_titles(parsed, &uncertain, &titles);
+
         if !rejected.is_empty() {
             warn!("LLM assist: discarded {}", rejected.join("; "));
         }
@@ -259,6 +330,62 @@ impl Assist {
                 .warnings
                 .push(Warning { code: warnings::LLM_ASSIST_APPLIED.into(), detail: Some(applied.join(", ")) });
         }
+    }
+}
+
+/// A video whose keyword the meter scores low (P4.34).
+pub struct Uncertain {
+    pub index: String,
+    pub url: String,
+    pub keyword: String,
+    pub reasons: Vec<String>,
+}
+
+/// The jobs whose keyword is worth a second look, at most
+/// [`MAX_UNCERTAIN`]. An attachment that only inherited the subject's
+/// name is one of them; one named by its file name is not.
+pub fn uncertain_videos(parsed: &ParsedEmail) -> Vec<Uncertain> {
+    let jobs: HashMap<&str, &parser::ParsedJob> = parsed.jobs().map(|j| (j.index_str.as_str(), j)).collect();
+    parser::keyword_verdicts(parsed)
+        .into_iter()
+        .filter(|v| v.is_low() && v.from != KeywordSource::FileName)
+        .filter_map(|v| {
+            let j = jobs.get(v.index_str.as_str())?;
+            Some(Uncertain {
+                index: v.index_str,
+                url: j.url.clone(),
+                keyword: v.keyword,
+                reasons: v.reasons,
+            })
+        })
+        .take(MAX_UNCERTAIN)
+        .collect()
+}
+
+/// Keywords from the videos' own titles, for those still uncertain; then a
+/// note for MCR naming what is still unsure (P4.34). No model involved.
+fn keywords_from_titles(parsed: &mut ParsedEmail, uncertain: &[Uncertain], titles: &HashMap<String, String>) {
+    let still: HashSet<String> = uncertain_videos(parsed).into_iter().map(|u| u.index).collect();
+    let mut set = Vec::new();
+    for u in uncertain.iter().filter(|u| still.contains(&u.index)) {
+        let Some(k) = titles.get(&u.url).and_then(|t| parser::keyword_from_title(t)) else {
+            continue;
+        };
+        if k != u.keyword && parser::set_job_keyword(parsed, &u.index, &k, KeywordSource::LinkTitle) {
+            set.push(format!("{}={k}", u.index));
+        }
+    }
+    if !set.is_empty() {
+        info!("Keywords from the videos' titles: {}", set.join(", "));
+        parsed.warnings.push(Warning { code: warnings::KEYWORD_FROM_TITLES.into(), detail: Some(set.join(", ")) });
+    }
+    let left: Vec<String> = uncertain_videos(parsed)
+        .into_iter()
+        .map(|u| format!("{} {} ({})", u.index, u.keyword, u.reasons.join(", ")))
+        .collect();
+    parsed.warnings.retain(|w| w.code != warnings::KEYWORD_UNCERTAIN);
+    if !left.is_empty() {
+        parsed.warnings.push(Warning { code: warnings::KEYWORD_UNCERTAIN.into(), detail: Some(left.join("; ")) });
     }
 }
 
@@ -281,13 +408,15 @@ fn schema() -> Value {
             "journalist_surname_latin": { "type": ["string", "null"] },
             "journalist_named_in_mail": { "type": ["string", "null"] },
             "keywords": { "type": "object", "additionalProperties": { "type": "string" } },
+            "video_keywords": { "type": "object", "additionalProperties": { "type": "string" } },
             "group_code": { "type": ["string", "null"] }
         },
-        "required": ["journalist_surname_latin", "journalist_named_in_mail", "keywords", "group_code"],
+        "required": ["journalist_surname_latin", "journalist_named_in_mail", "keywords", "video_keywords", "group_code"],
         "additionalProperties": false
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_prompt(
     mail: &InboundMail,
     body: &str,
@@ -295,6 +424,8 @@ fn build_prompt(
     want_journalist: bool,
     sections: &[(String, String)],
     groups: &[Group],
+    uncertain: &[Uncertain],
+    titles: &HashMap<String, String>,
     redact: bool,
 ) -> String {
     let mut p = String::new();
@@ -317,6 +448,16 @@ fn build_prompt(
         p.push_str("\nSections that need a keyword (number: title):\n");
         for (i, t) in sections {
             p.push_str(&format!("{i}: {t}\n"));
+        }
+    }
+    if uncertain.is_empty() {
+        p.push_str("\nNo video keywords are needed; answer {} for video_keywords.\n");
+    } else {
+        p.push_str("\nVideos whose keyword is uncertain (id: link | its own title, if known | current keyword):\n");
+        for u in uncertain {
+            let title = titles.get(&u.url).map(String::as_str).unwrap_or("unknown");
+            let title = if redact { redact_contacts(title) } else { title.to_string() };
+            p.push_str(&format!("{}: {} | {} | {}\n", u.index, u.url, title, u.keyword));
         }
     }
     if groups.is_empty() {
@@ -446,13 +587,13 @@ mod tests {
     fn an_online_prompt_carries_no_address_or_phone_and_a_local_one_is_unchanged() {
         let m = mail();
         let body = m.readable_body();
-        let online = build_prompt(&m, &body, &[], true, &[], &[], true);
+        let online = build_prompt(&m, &body, &[], true, &[], &[], &[], &HashMap::new(), true);
         for leaked in ["e.georgiou@example.gr", "papas@example.org", "6941234567", "2810 555 666"] {
             assert!(!online.contains(leaked), "{leaked} sent online:\n{online}");
         }
         assert!(online.contains("Eleni Georgiou") && online.contains("https://youtu.be/abc1234567890"), "{online}");
 
-        let local = build_prompt(&m, &body, &[], true, &[], &[], false);
+        let local = build_prompt(&m, &body, &[], true, &[], &[], &[], &HashMap::new(), false);
         assert!(local.contains("<e.georgiou@example.gr>") && local.contains("papas@example.org"), "{local}");
     }
 }
