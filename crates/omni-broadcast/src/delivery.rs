@@ -29,6 +29,34 @@ pub struct Delivered {
     pub bytes: u64,
 }
 
+/// Copy `source` to `dest` and flush `dest` to the device; the size on disk.
+///
+/// The copy is the operating system's (`CopyFileExW` on Windows: large
+/// pipelined I/O, server-side copy on an SMB share). It replaces a
+/// `tokio::io::copy`, whose 8 KiB chunks each went through the blocking pool
+/// — a 5.8 GB file (15 min at 50 Mbps) took 66 s to deliver.
+///
+/// Flushed *before* the caller renames it. Without this the rename can be
+/// visible to Dalet while the data is still in the write cache; a power cut
+/// then leaves a correctly named, truncated file in the running order — the
+/// worst possible failure mode here, because nothing downstream reports an
+/// error. FlushFileBuffers needs write access, so the file is reopened for
+/// writing (a read-only handle fails with ERROR_ACCESS_DENIED).
+async fn copy_durably(source: &Path, dest: &Path) -> Result<u64> {
+    let (source, dest) = (source.to_path_buf(), dest.to_path_buf());
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        std::fs::copy(&source, &dest).with_context(|| format!("Failed copying {source:?} to {dest:?}"))?;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dest)
+            .with_context(|| format!("Failed reopening {dest:?} to flush it"))?;
+        f.sync_all().with_context(|| format!("Failed flushing {dest:?} to disk"))?;
+        Ok(f.metadata().with_context(|| format!("Failed reading the size of {dest:?}"))?.len())
+    })
+    .await
+    .context("delivery copy task")?
+}
+
 pub struct WatchfolderDelivery;
 
 impl WatchfolderDelivery {
@@ -70,32 +98,12 @@ impl WatchfolderDelivery {
             let _ = tokio::fs::remove_file(&temp_dest).await;
         }
 
-        // Copy through a handle we own, so the same handle can be flushed.
-        // `tokio::fs::copy` hides the destination handle, and re-opening the
-        // file read-only to flush it fails on Windows with ERROR_ACCESS_DENIED:
-        // FlushFileBuffers requires write access.
-        let written = {
-            let mut reader = tokio::fs::File::open(source_file)
-                .await
-                .with_context(|| format!("Failed opening delivery source {source_file:?}"))?;
-            let mut writer = tokio::fs::File::create(&temp_dest)
-                .await
-                .with_context(|| format!("Failed creating {temp_dest:?}"))?;
-
-            let copied = tokio::io::copy(&mut reader, &mut writer)
-                .await
-                .with_context(|| format!("Failed copying to {temp_dest:?}"))?;
-
-            // Flush to the device *before* the rename. Without this the rename
-            // can be visible to Dalet while the data is still in the write
-            // cache; a power cut then leaves a correctly named, truncated file
-            // in the running order — the worst possible failure mode here,
-            // because nothing downstream reports an error.
-            writer
-                .sync_all()
-                .await
-                .with_context(|| format!("Failed flushing {temp_dest:?} to disk"))?;
-            copied
+        let written = match copy_durably(source_file, &temp_dest).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp_dest).await;
+                return Err(e);
+            }
         };
         if written != source_bytes {
             let _ = tokio::fs::remove_file(&temp_dest).await;
@@ -239,6 +247,34 @@ mod tests {
             .filter(|n| n.starts_with('.') || n.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "staging files left behind: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_large_file_arrives_byte_for_byte_and_quickly() {
+        // P1.11: the OS copy replaced an 8 KiB-chunk tokio copy that
+        // delivered at ~90 MB/s. 48 MiB of non-repeating bytes, so a copy
+        // that dropped or reordered a block cannot pass.
+        let (_d, watchfolder, work) = scratch().await;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let content: Vec<u8> = (0..48 * 1024 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let src = source(&work, "big.mxf", &content).await;
+
+        let started = std::time::Instant::now();
+        let delivered = WatchfolderDelivery::deliver(&src, &watchfolder, "2_NIKOLAOU_BIG").await.unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(delivered.bytes, content.len() as u64);
+        assert!(std::fs::read(&delivered.path).unwrap() == content, "delivered bytes differ from the source");
+        // Generous (the old copy needed ~0.5 s here, an OS copy ~0.05 s):
+        // only a return to per-chunk round trips on a slow disk trips it.
+        assert!(took < std::time::Duration::from_secs(5), "delivery of 48 MiB took {took:?}");
     }
 
     #[tokio::test]
