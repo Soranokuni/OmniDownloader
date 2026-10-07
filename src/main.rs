@@ -659,7 +659,8 @@ async fn run_daemon(
         bmxtranswrap_path,
         temp_path.clone(),
         watchfolder_path.clone(),
-    ));
+    )
+    .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8)));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -918,8 +919,16 @@ async fn run_daemon(
     // and twenty pending jobs, eighteen sat in DOWNLOADING with nobody working
     // on them -- and the MCR panel showed eighteen phantom downloads while the
     // operator waited for files that were not being made.
+    //
+    // Two limits (plan P1.13): `max_concurrent_downloads` jobs fetching
+    // their source, and the engine's encoder slots. A job hands its download
+    // slot back once its source is on disk, so the next download starts
+    // while it waits for an encoder. Jobs in flight are capped at downloads
+    // + encoders, so downloads run ahead of the encoders by a bounded amount.
     let max_concurrency = config.max_concurrent_downloads.clamp(1, 10);
+    let max_encoders = config.max_concurrent_transcodes.clamp(1, 8);
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
+    let in_flight = Arc::new(Semaphore::new(max_concurrency + max_encoders));
     let mut worker_rx = shutdown_tx.subscribe();
     let repo_worker = repo.clone();
     let engine_worker = broadcast_engine.clone();
@@ -928,7 +937,7 @@ async fn run_daemon(
     let worker_encoder_ok = encoder_ok.clone();
 
     tokio::spawn(async move {
-        info!("Queue worker pool active (concurrency: {max_concurrency})");
+        info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
         let mut worker_seq: u64 = 0;
 
         loop {
@@ -938,7 +947,11 @@ async fn run_daemon(
                     info!("Worker pool shutting down.");
                     break;
                 }
-                p = semaphore.clone().acquire_owned() => match p {
+                p = async {
+                    let job_slot = in_flight.clone().acquire_owned().await?;
+                    let download_slot = semaphore.clone().acquire_owned().await?;
+                    Ok::<_, tokio::sync::AcquireError>((job_slot, download_slot))
+                } => match p {
                     Ok(p) => p,
                     Err(_) => break,
                 },
@@ -999,6 +1012,8 @@ async fn run_daemon(
                 // it is what tells a waiting updater the downloader is idle.
                 let _gate_pass = gate_pass;
                 let job_id = job.id;
+                let (job_slot, download_slot) = permit;
+                eng.hold_download_slot(job_id, download_slot);
 
                 // Keep the lease alive while we work. If it stops succeeding we
                 // have lost the job -- the reaper requeued it, or an operator
@@ -1050,7 +1065,9 @@ async fn run_daemon(
                     );
                 }
 
-                drop(permit);
+                // A job that ended before reaching the encoder still holds it.
+                eng.release_download_slot(job_id);
+                drop(job_slot);
             });
         }
     });
