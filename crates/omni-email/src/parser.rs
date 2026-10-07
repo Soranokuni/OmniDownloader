@@ -536,18 +536,49 @@ fn has_media_link(lines: &[&str]) -> bool {
 /// (plan P4.23). A reply whose new text has its own links still stops at
 /// the quote, so old links are not queued again.
 fn strip_quotes_and_signature(body: &str, forward: bool) -> String {
-    let mut forward = forward;
     let lines: Vec<&str> = body.lines().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let roles = line_roles(&lines, forward);
+    lines
+        .iter()
+        .zip(roles)
+        .filter(|(_, role)| *role == LineRole::Read)
+        .map(|(line, _)| *line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a line of a mail is to the parser (plan P7.7): only `Read` lines
+/// are parsed. The MCR mail view shows the others too, folded or dimmed,
+/// so an operator can see what the parser left out and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineRole {
+    Read,
+    /// The header lines and markers of a forwarded message.
+    Forwarded,
+    /// Quoted history: `>` lines, and everything below a reply's header.
+    Quoted,
+    /// Everything below the `--` signature delimiter.
+    Signature,
+}
+
+/// The role of each of `lines`; see [`strip_quotes_and_signature`].
+fn line_roles(lines: &[&str], forward: bool) -> Vec<LineRole> {
+    let mut forward = forward;
+    let mut roles = vec![LineRole::Read; lines.len()];
+    let mut read: Vec<&str> = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         let t = line.trim();
 
         if t == "--" {
-            break; // signature delimiter ("-- ", often trimmed)
+            // signature delimiter ("-- ", often trimmed)
+            roles[i..].fill(LineRole::Signature);
+            break;
         }
         if t.starts_with('>') {
+            roles[i] = LineRole::Quoted;
             i += 1;
             continue;
         }
@@ -558,21 +589,24 @@ fn strip_quotes_and_signature(body: &str, forward: bool) -> String {
                 .take(4)
                 .any(|l| RE_HEADER_ANY.is_match(l.trim()) && !RE_HEADER_FROM.is_match(l.trim()));
         if !forward && (is_block_marker || is_header_block) {
-            if RE_FORWARD_MARKER.is_match(t) || !has_media_link(&out) {
+            if RE_FORWARD_MARKER.is_match(t) || !has_media_link(&read) {
                 forward = true;
+                roles[i] = LineRole::Forwarded;
                 i += 1;
                 continue;
             }
+            roles[i..].fill(LineRole::Quoted);
             break;
         }
         if forward && (is_block_marker || RE_HEADER_ANY.is_match(t)) {
+            roles[i] = LineRole::Forwarded;
             i += 1;
             continue;
         }
-        out.push(line);
+        read.push(line);
         i += 1;
     }
-    out.join("\n")
+    roles
 }
 
 // ---------------------------------------------------------------------------
@@ -744,24 +778,11 @@ fn find_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
 /// (plan P4.12). A next line that is a new link, a number, or has any
 /// non-URL character (Greek, a space) is never joined.
 fn rejoin_wrapped_urls(body: &str) -> String {
-    const WRAP_WIDTH: usize = 70;
-    let is_url_char = |c: char| c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
     let mut out: Vec<String> = Vec::new();
     for line in body.lines() {
-        let next = line.trim();
         if let Some(prev) = out.last_mut() {
-            let prev_trim = prev.trim_end();
-            let ends_in_url = find_urls(prev_trim).last().is_some_and(|(r, _)| r.end == prev_trim.len());
-            let continues = !next.is_empty()
-                && next.chars().all(is_url_char)
-                && !next.to_ascii_lowercase().starts_with("http")
-                && !next.to_ascii_lowercase().starts_with("www.")
-                && !next.starts_with(|c: char| c.is_ascii_digit() && next.len() <= 4);
-            let at_separator = prev_trim.ends_with(['&', '=', '?', '/', '-', '_', '%', '.'])
-                || next.starts_with(['&', '=', '?', '/', '#', '%']);
-            let wrap_long = prev.chars().count() >= WRAP_WIDTH;
-            if ends_in_url && continues && (at_separator || wrap_long) {
-                let joined = format!("{prev_trim}{next}");
+            if continues_wrapped_url(prev, line) {
+                let joined = format!("{}{}", prev.trim_end(), line.trim());
                 *prev = joined;
                 continue;
             }
@@ -769,6 +790,25 @@ fn rejoin_wrapped_urls(body: &str) -> String {
         out.push(line.to_string());
     }
     out.join("\n")
+}
+
+/// Whether `next` is the rest of a link that `prev` ends with, broken by a
+/// client's line wrap; see [`rejoin_wrapped_urls`].
+fn continues_wrapped_url(prev: &str, next: &str) -> bool {
+    const WRAP_WIDTH: usize = 70;
+    let is_url_char = |c: char| c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
+    let next = next.trim();
+    let prev_trim = prev.trim_end();
+    let ends_in_url = find_urls(prev_trim).last().is_some_and(|(r, _)| r.end == prev_trim.len());
+    let continues = !next.is_empty()
+        && next.chars().all(is_url_char)
+        && !next.to_ascii_lowercase().starts_with("http")
+        && !next.to_ascii_lowercase().starts_with("www.")
+        && !next.starts_with(|c: char| c.is_ascii_digit() && next.len() <= 4);
+    let at_separator = prev_trim.ends_with(['&', '=', '?', '/', '-', '_', '%', '.'])
+        || next.starts_with(['&', '=', '?', '/', '#', '%']);
+    let wrap_long = prev.chars().count() >= WRAP_WIDTH;
+    ends_in_url && continues && (at_separator || wrap_long)
 }
 
 /// Two links written with no space between them (`…/a1,https://…/a2`,
@@ -900,23 +940,31 @@ fn unwrap_redirect(parsed: &Url, raw: &str) -> Option<String> {
     None
 }
 
+/// Sentence punctuation, Greek included (ano teleia in both code points,
+/// Greek question mark), smart quotes, an ellipsis, markdown bold, and a
+/// separator left by split_glued.
+const TRAILING: &[char] = &[
+    '.', ',', ';', ':', '!', '?', '>', '»', '"', '\'', '…', '\u{0387}', '\u{00B7}', '\u{037E}', '”', '’', '“', '‘',
+    '*', '_', '|',
+];
+
+/// Where the link is inside `raw`, a match of the URL patterns: without the
+/// markdown emphasis before it and the punctuation a sentence glued after
+/// it. The mail view marks exactly this much of the text.
+fn link_bounds(raw: &str) -> std::ops::Range<usize> {
+    let start = raw.len() - raw.trim_start_matches(['*', '_']).len();
+    let mut u = raw[start..].trim_end_matches(TRAILING);
+    // A closing parenthesis belongs to the URL only if it opened one.
+    while u.ends_with(')') && u.matches(')').count() > u.matches('(').count() {
+        u = u[..u.len() - 1].trim_end_matches(TRAILING);
+    }
+    start..start + u.len()
+}
+
 /// Trim punctuation a sentence glued to the link, add the scheme to a bare
 /// `www.` link, and unwrap redirect wrappers so the real target is queued.
 fn clean_url(raw: &str) -> Option<String> {
-    // Sentence punctuation, Greek included (ano teleia in both code points,
-    // Greek question mark),
-    // smart quotes, an ellipsis, markdown bold, and a separator left by
-    // split_glued.
-    const TRAILING: &[char] = &[
-        '.', ',', ';', ':', '!', '?', '>', '»', '"', '\'', '…', '\u{0387}', '\u{00B7}', '\u{037E}', '”', '’', '“', '‘',
-        '*', '_', '|',
-    ];
-    let mut u = raw.trim_start_matches(['*', '_']).trim_end_matches(TRAILING).to_string();
-    // A closing parenthesis belongs to the URL only if it opened one.
-    while u.ends_with(')') && u.matches(')').count() > u.matches('(').count() {
-        u.pop();
-        u = u.trim_end_matches(TRAILING).to_string();
-    }
+    let mut u = raw[link_bounds(raw)].to_string();
     if u.to_ascii_lowercase().starts_with("www.") {
         u = format!("https://{u}");
     }
@@ -1380,6 +1428,56 @@ pub fn cleaned_body(mail: &InboundMail) -> String {
     let body = strip_quotes_and_signature(&body, is_forward(&mail.subject));
     let body = rejoin_wrapped_urls(&body);
     decontaminate_email_body(&body)
+}
+
+/// One line of a mail as the MCR mail view shows it (plan P7.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewLine {
+    pub role: LineRole,
+    pub text: String,
+    /// Each link on the line: the bytes of `text` to mark, and the address
+    /// the parser reads there (scheme added, redirect wrappers removed).
+    pub links: Vec<(std::ops::Range<usize>, String)>,
+}
+
+/// A stored mail text (`InboundMail::readable_body`) line by line, with the
+/// role the parser gives each line and every link it would find on it.
+///
+/// The same steps as [`cleaned_body`] up to the cut, so what the view calls
+/// read is what the parser read; but nothing is dropped, and a link a
+/// plain-text client wrapped over two lines is joined back into one line, as
+/// the parser joins it.
+pub fn view_lines(body: &str, subject: &str) -> Vec<ViewLine> {
+    let body = body.replace(INVISIBLE, "");
+    let body = RE_CID_PLACEHOLDER.replace_all(&body, "");
+    let lines: Vec<&str> = body.lines().collect();
+    let roles = line_roles(&lines, is_forward(subject));
+    let mut out: Vec<ViewLine> = Vec::with_capacity(lines.len());
+    for (line, role) in lines.iter().zip(roles) {
+        if let Some(prev) = out.last_mut() {
+            if prev.role == role && continues_wrapped_url(&prev.text, line) {
+                prev.text = format!("{}{}", prev.text.trim_end(), line.trim());
+                continue;
+            }
+        }
+        out.push(ViewLine { role, text: line.to_string(), links: Vec::new() });
+    }
+    for line in &mut out {
+        line.links = find_urls(&line.text)
+            .into_iter()
+            .map(|(r, url)| {
+                let inner = link_bounds(&line.text[r.clone()]);
+                (r.start + inner.start..r.start + inner.end, url)
+            })
+            .collect();
+    }
+    out
+}
+
+/// A link to a document (PDF, Office, calendar, contact card), not a page.
+pub fn is_document_link(url: &str) -> bool {
+    let path = Url::parse(url).map(|u| u.path().to_ascii_lowercase()).unwrap_or_default();
+    DOCUMENT_EXTENSIONS.iter().any(|e| path.ends_with(e))
 }
 
 pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> ParsedEmail {

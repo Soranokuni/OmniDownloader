@@ -527,6 +527,41 @@ impl Default for ProcessedMail {
     }
 }
 
+/// One handled mail as the MCR mail view's list needs it (plan P7.7).
+#[derive(Debug, Clone, Default)]
+pub struct InboxMailRow {
+    pub internet_message_id: String,
+    pub received_at: Option<DateTime<Utc>>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub outcome: String,
+    pub from_address: Option<String>,
+    pub from_name: Option<String>,
+    pub subject: Option<String>,
+    /// The start of the stored text, for the one-line preview.
+    pub body_head: Option<String>,
+    pub attachments_json: Option<String>,
+    pub parse_json: Option<String>,
+    pub jobs_json: String,
+}
+
+/// One job as the MCR mail view's list needs it (plan P7.7).
+#[derive(Debug, Clone, Default)]
+pub struct InboxJobRow {
+    pub id: i64,
+    pub url: String,
+    pub slug: String,
+    pub journalist: String,
+    pub index_str: String,
+    pub status: String,
+    pub stage: String,
+    pub progress: f64,
+    pub email_message_id: Option<String>,
+    pub parent_job_id: Option<i64>,
+    pub submitted_by_user_id: Option<i64>,
+    pub group_code: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// A job to be queued (plan P1.1).
 #[derive(Debug, Clone)]
 pub struct NewJob {

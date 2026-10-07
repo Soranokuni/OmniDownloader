@@ -2255,6 +2255,103 @@ impl Repository {
         Ok(())
     }
 
+    // ==========================================
+    // MCR mail view (plan P7.7)
+    // ==========================================
+
+    /// Every mail received (or, for mail from before plan P7.6, handled)
+    /// since `since`, with the start of its text.
+    pub fn inbox_mail_rows(&self, since: chrono::DateTime<Utc>) -> Result<Vec<crate::models::InboxMailRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT internet_message_id, received_at, processed_at, outcome, from_address, from_name, subject,
+                    substr(body_text, 1, 4000) AS body_head, attachments_json, parse_json, jobs_json
+             FROM processed_mail
+             WHERE COALESCE(received_at, processed_at) >= ?",
+        )?;
+        let rows = stmt.query_map(params![timestamps::format(since)], |r| {
+            Ok(crate::models::InboxMailRow {
+                internet_message_id: r.get("internet_message_id")?,
+                received_at: timestamps::parse_opt(r.get("received_at").ok().flatten()),
+                processed_at: timestamps::parse_opt(r.get("processed_at").ok().flatten()),
+                outcome: r.get("outcome")?,
+                from_address: r.get("from_address")?,
+                from_name: r.get("from_name").ok().flatten(),
+                subject: r.get("subject")?,
+                body_head: r.get("body_head").ok().flatten(),
+                attachments_json: r.get("attachments_json").ok().flatten(),
+                parse_json: r.get("parse_json").ok().flatten(),
+                jobs_json: r.get("jobs_json")?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The jobs created since `since`, and the ones in `extra_ids` whenever
+    /// they were created (an older job a mail's duplicate link points at).
+    pub fn inbox_job_rows(&self, since: chrono::DateTime<Utc>, extra_ids: &[i64]) -> Result<Vec<crate::models::InboxJobRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, url, slug, journalist, index_str, status, stage, progress, email_message_id,
+                    parent_job_id, submitted_by_user_id, group_code, created_at
+             FROM queue
+             WHERE created_at >= ? OR id IN (SELECT value FROM json_each(?))",
+        )?;
+        let extra = serde_json::to_string(extra_ids)?;
+        let rows = stmt.query_map(params![timestamps::format(since), extra], |r| {
+            Ok(crate::models::InboxJobRow {
+                id: r.get("id")?,
+                url: r.get("url")?,
+                slug: r.get("slug")?,
+                journalist: r.get("journalist")?,
+                index_str: r.get("index_str")?,
+                status: r.get("status")?,
+                stage: r.get::<_, Option<String>>("stage")?.unwrap_or_else(|| "QUEUED".into()),
+                progress: r.get::<_, Option<f64>>("progress")?.unwrap_or(0.0),
+                email_message_id: r.get("email_message_id")?,
+                parent_job_id: r.get("parent_job_id")?,
+                submitted_by_user_id: r.get("submitted_by_user_id")?,
+                group_code: r.get("group_code")?,
+                created_at: timestamps::parse_opt(r.get("created_at").ok().flatten()),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A mail's own jobs (its Message-ID, article siblings included) and the
+    /// jobs in `also` (those its duplicate links point at), oldest first.
+    pub fn jobs_for_mail(&self, internet_message_id: &str, also: &[i64]) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM queue
+             WHERE email_message_id = ? OR id IN (SELECT value FROM json_each(?))
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![internet_message_id, serde_json::to_string(also)?], Self::map_job_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A job added by hand and the videos found in its article.
+    pub fn jobs_with_children(&self, id: i64) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM queue WHERE id = ? OR parent_job_id = ? ORDER BY id")?;
+        let rows = stmt.query_map(params![id, id], Self::map_job_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Add one entry to a handled mail's `jobs_json`: a link MCR queued from
+    /// the mail's text (plan P7.8), so the view files the job under it.
+    /// `false` when the mail is not there.
+    pub fn append_mail_job(&self, internet_message_id: &str, entry: &serde_json::Value) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE processed_mail SET jobs_json = json_insert(COALESCE(jobs_json, '[]'), '$[#]', json(?))
+             WHERE internet_message_id = ?",
+            params![entry.to_string(), internet_message_id],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Forget the text of mail handled more than `older_than_days` ago
     /// (plan P7.6). The row stays: sender, subject and the jobs it produced
     /// are the record of what came in. Returns how many texts were cleared.

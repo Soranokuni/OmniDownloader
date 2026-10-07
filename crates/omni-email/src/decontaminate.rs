@@ -9,6 +9,12 @@ static POISON_LINKS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)https?://(?:aka\.ms/\S+|go\.microsoft\.com/fwlink/\S+|outlook\.\S+/mail\S*)").unwrap()
 });
 
+/// A link the mail client added (Outlook's "Get Outlook for iOS", Microsoft
+/// help links), never one the sender meant.
+pub fn is_mail_client_link(url: &str) -> bool {
+    POISON_LINKS.is_match(url)
+}
+
 pub fn decontaminate_email_body(email_body: &str) -> String {
     let without_sig = SIGNATURE_PATTERNS.replace_all(email_body, "");
     let without_poison = POISON_LINKS.replace_all(&without_sig, "");
