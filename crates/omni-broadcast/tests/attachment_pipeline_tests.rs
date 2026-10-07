@@ -169,3 +169,14 @@ async fn a_missing_attachment_is_a_manual_download_not_a_yt_dlp_call() {
     assert!(chain.contains("MANUAL_DOWNLOAD"), "{chain}");
     assert!(chain.contains("attachment is not on disk"), "{chain}");
 }
+
+#[test]
+fn a_clip_too_big_for_the_disk_is_refused_before_it_is_made() {
+    // P1.4: LOW_DISK was a code nothing raised. A clip whose two temp
+    // copies cannot fit is refused before the encoder spends minutes on it.
+    let d = tempfile::tempdir().unwrap();
+    let ten_years = 10.0 * 365.0 * 24.0 * 3600.0;
+    let why = omni_broadcast::pipeline::room_for(ten_years, d.path(), d.path()).unwrap_err();
+    assert!(why.contains("temp has") && why.contains("needs"), "{why}");
+    assert!(omni_broadcast::pipeline::room_for(60.0, d.path(), d.path()).is_ok(), "a minute fits on the test disk");
+}

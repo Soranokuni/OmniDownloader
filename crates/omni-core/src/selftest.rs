@@ -237,37 +237,91 @@ pub async fn run(
     }
 
     // ---- disk ----
-    let mut disk_detail = Vec::new();
-    let mut disk_state = Health::Ok;
+    check_disks(health, watchfolder, temp_dir);
+
+    health.overall()
+}
+
+/// Below this, no new job starts (plan P1.4): one more 50 Mbps file could
+/// fill the disk mid-write, and a full system disk takes the database and
+/// the logs down with it.
+pub const STOP_DISK_GB: f64 = 5.0;
+
+/// Free space on the temp and watchfolder volumes, recorded as the `disk`
+/// check: amber under [`LOW_DISK_GB`], red under [`STOP_DISK_GB`]. Returns
+/// whether there is room to start a job. Called at start-up and before
+/// every lease; `set_if_changed`, so a steady state does not churn.
+pub fn check_disks(health: &HealthState, watchfolder: &Path, temp_dir: &Path) -> bool {
+    let mut detail = Vec::new();
+    let mut state = Health::Ok;
     for (label, path) in [("temp", temp_dir), ("watchfolder", watchfolder)] {
         if let Some((free, _total)) = disk_space(path) {
             let free_gb = free as f64 / BYTES_PER_GB;
-            disk_detail.push(format!("{label}: {free_gb:.0} GB free"));
-            if free_gb < LOW_DISK_GB {
-                disk_state = disk_state.worse(Health::Degraded);
+            // Whole GB, so the detail (and the check) changes when it matters.
+            detail.push(format!("{label}: {free_gb:.0} GB free"));
+            if free_gb < STOP_DISK_GB {
+                state = state.worse(Health::Down);
+            } else if free_gb < LOW_DISK_GB {
+                state = state.worse(Health::Degraded);
             }
         }
     }
-    let detail = if disk_detail.is_empty() {
-        "free space unknown".to_string()
-    } else {
-        disk_detail.join(", ")
-    };
-    health.set(
+    let detail = if detail.is_empty() { "free space unknown".to_string() } else { detail.join(", ") };
+    health.set_if_changed(
         checks::DISK,
-        match disk_state {
+        match state {
             Health::Ok => Check::ok(detail),
-            _ => Check::degraded(format!("low free space — {detail}")),
+            Health::Degraded => Check::degraded(format!("low free space — {detail}")),
+            Health::Down => Check::down(format!(
+                "almost full — {detail}; no new job starts below {STOP_DISK_GB:.0} GB"
+            )),
         },
     );
+    state != Health::Down
+}
 
-    health.overall()
+/// Bytes a finished file takes per second of programme: 50 Mbps video, eight
+/// 24-bit 48 kHz PCM tracks (9.2 Mbps) and MXF overhead. Measured: a 60 s
+/// clip is 450 MB.
+pub const MXF_BYTES_PER_SEC: f64 = 7.5e6;
+
+/// What a job of `duration_secs` needs free before its transcode: on the
+/// temp volume the intermediate and the rewrapped file at once (the
+/// intermediate is deleted after the rewrap), on the watchfolder volume the
+/// delivered file. Each with a 2 GB margin for everything else writing.
+pub fn space_needed(duration_secs: f64) -> (u64, u64) {
+    let file = (duration_secs.max(0.0) * MXF_BYTES_PER_SEC) as u64;
+    const MARGIN: u64 = 2 * 1024 * 1024 * 1024;
+    (2 * file + MARGIN, file + MARGIN)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_clip_needs_room_for_two_copies_in_temp_and_one_in_the_watchfolder() {
+        // P1.4: 60 s measured at 450 MB; temp holds the intermediate and
+        // the rewrapped file at once, the watchfolder the delivered one.
+        let gb = |b: u64| b as f64 / 1_073_741_824.0;
+        let (temp, watch) = space_needed(60.0);
+        assert!((gb(temp) - (0.838 + 2.0)).abs() < 0.01, "{}", gb(temp));
+        assert!((gb(watch) - (0.419 + 2.0)).abs() < 0.01, "{}", gb(watch));
+        // A 30-minute programme: ~25 GB of temp at the peak.
+        assert!((gb(space_needed(1800.0).0) - 27.1).abs() < 0.2);
+        assert_eq!(space_needed(-5.0), space_needed(0.0), "an unknown duration is not negative space");
+    }
+
+    #[test]
+    fn the_disk_check_lets_jobs_start_when_there_is_room() {
+        let d = TempDir::new().unwrap();
+        let health = HealthState::new();
+        // The test machine's disk has more than 5 GB free.
+        assert!(check_disks(&health, d.path(), d.path()));
+        let c = health.get(checks::DISK).expect("recorded");
+        assert!(c.detail.unwrap_or_default().contains("temp:"));
+    }
 
     #[test]
     fn a_writable_directory_passes_and_leaves_nothing_behind() {
