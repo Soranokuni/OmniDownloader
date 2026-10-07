@@ -995,6 +995,16 @@ pub fn trailing_annotation(url: &str) -> Option<usize> {
     (parsed.host_str().is_some() && (parsed.path().len() > 1 || parsed.query().is_some())).then_some(cut)
 }
 
+/// `url` without an annotation glued to its end ("…/arthro/-ΒΙΝΤΕΟ" →
+/// "…/arthro/"); unchanged when it has none. For links recorded before the
+/// parser cut these off (P3.9): their jobs still carry the word.
+pub fn without_annotation(url: &str) -> &str {
+    match trailing_annotation(url) {
+        Some(cut) => url[..cut].trim_end_matches(TRAILING),
+        None => url,
+    }
+}
+
 /// Where the link is inside `raw`, a match of the URL patterns: without the
 /// markdown emphasis before it, the punctuation a sentence glued after it,
 /// and a "-ΒΙΝΤΕΟ" the sender glued on (P3.9). The mail view marks exactly

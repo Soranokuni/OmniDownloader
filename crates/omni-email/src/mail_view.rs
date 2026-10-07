@@ -235,13 +235,17 @@ pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView
     };
 
     // What the watcher (and MCR, from the mail) queued for each link.
+    // Compared without a "-ΒΙΝΤΕΟ" glued on (P3.12): mail handled before
+    // the parser cut those off recorded "…-ΒΙΝΤΕΟ", the text now yields
+    // "…", and the delivered videos showed as links nobody downloaded.
+    let link_key = |u: &str| urlnorm::normalize(parser::without_annotation(u));
     let mut recorded: Vec<(String, i64)> = Vec::new();
     let mut by_attachment: HashMap<String, Vec<i64>> = HashMap::new();
     for q in &queued {
         let id = q.result.job_id();
         match &q.attachment_id {
             Some(a) => by_attachment.entry(a.clone()).or_default().push(id),
-            None => recorded.push((urlnorm::normalize(&q.url), id)),
+            None => recorded.push((link_key(&q.url), id)),
         }
     }
     let filed_under = |key: &str| -> (Vec<i64>, bool) {
@@ -277,7 +281,7 @@ pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView
                     segs.push(Segment::Text { t: line.text[at..range.start].to_string() });
                 }
                 let id = format!("l{}", links.len() + 1);
-                let (ids, removed) = filed_under(&urlnorm::normalize(url));
+                let (ids, removed) = filed_under(&link_key(url));
                 let skip = ids.is_empty().then(|| skip_for(url, line.role, removed, cfg));
                 links.push(LinkView { id: id.clone(), url: url.clone(), role: line.role, jobs: ids, skip });
                 segs.push(Segment::Link { l: id, t: line.text[range.clone()].to_string() });

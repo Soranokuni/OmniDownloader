@@ -296,6 +296,52 @@ fn a_discarded_job_leaves_its_link_queueable_again() {
 }
 
 #[test]
+fn jobs_recorded_with_a_glued_annotation_stay_filed_under_their_links() {
+    // P3.12, from the desk on 2026-10-07: mail handled before P3.9 recorded
+    // "…-BINTEO" / "…/-ΒΙΝΤΕΟ" as the links. The text now ends each link
+    // before the word, so every job, delivered ones included, was shown as
+    // a link nobody downloaded ("Δεν επιλέχθηκε…").
+    let body = "https://www.youtube.com/watch?v=fixture3001-BINTEO\nhttps://www.news247.gr/kosmos/fixture3002-arthro/-ΒΙΝΤΕΟ";
+    let (_d, repo) = repo();
+    let key = "<old@example.gr>".to_string();
+    let mut records = Vec::new();
+    for (i, url) in body.lines().enumerate() {
+        let index = format!("1{}", ['A', 'B'][i]);
+        let slug = format!("{index}_GEORGIOU_PLANA");
+        let mut new = NewJob::new(url, slug.clone(), "GEORGIOU");
+        new.index_str = index.clone();
+        new.email_message_id = Some(key.clone());
+        let result = repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS).unwrap();
+        records.push(QueuedFromMail {
+            index_str: index,
+            slug,
+            url: url.to_string(),
+            status: "PENDING".into(),
+            result,
+            attachment_id: None,
+        });
+    }
+    let row = ProcessedMail {
+        internet_message_id: key.clone(),
+        outcome: "JOBS".into(),
+        subject: Some("ΥΛΙΚΟ ΓΙΑ ΠΛΑΝΑ".into()),
+        jobs_json: serde_json::to_string(&records).unwrap(),
+        body_text: Some(body.into()),
+        ..Default::default()
+    };
+    let jobs = repo.jobs_for_mail(&key, &[]).unwrap();
+    let view = build(&row, &jobs, &ParserConfig::default());
+
+    assert_eq!(view.links.len(), 2);
+    assert_eq!(view.links[0].url, "https://www.youtube.com/watch?v=fixture3001");
+    assert_eq!(view.links[1].url, "https://www.news247.gr/kosmos/fixture3002-arthro/");
+    for (l, j) in view.links.iter().zip(&jobs) {
+        assert_eq!(l.jobs, vec![j.id], "{} lost its job", l.url);
+        assert!(l.skip.is_none(), "{} shown as not downloaded: {:?}", l.url, l.skip);
+    }
+}
+
+#[test]
 fn a_link_already_queued_by_another_mail_shows_that_job() {
     let (_d, repo) = repo();
     let first = repo
