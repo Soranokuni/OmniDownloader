@@ -593,3 +593,34 @@ async fn a_mail_given_up_on_keeps_when_it_arrived() {
     assert!(row.received_at.is_some());
     assert!(row.body_text.is_none(), "a mail that was never read has no text to show");
 }
+
+/// Plan P7.9: a saved mail replayed through the watcher's own path queues
+/// what the mailbox would have, attachments saved from the file.
+#[tokio::test]
+async fn a_saved_mail_is_queued_like_one_from_the_mailbox_and_only_once() {
+    use omni_email::eml::EmlSource;
+    use omni_email::watcher::Ingested;
+
+    let (dir, repo) = repo();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/11_attachment_only.eml");
+    let raw = std::fs::read(&path).unwrap();
+    let source = Arc::new(EmlSource::new([("saved.eml".to_string(), raw)]));
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone())
+        .with_attachments_dir(dir.path().join("attachments"));
+
+    let mail = source.fetch_mail("saved.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&mail).await.unwrap(), Ingested::Processed);
+
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 2, "two video attachments");
+    for j in &jobs {
+        assert_eq!(j.status, JobStatus::Pending, "{} waits for a worker with its file saved", j.slug);
+        let saved = PathBuf::from(j.source_path.as_deref().unwrap());
+        assert!(saved.starts_with(dir.path().join("attachments")) && saved.exists(), "{saved:?}");
+    }
+    let row = repo.get_processed_mail("<fixture-11@example.gr>").unwrap().unwrap();
+    assert!(row.attachments_json.unwrap().contains("limani_kataplous.mp4"));
+
+    assert_eq!(watcher.ingest(&mail).await.unwrap(), Ingested::AlreadyHandled);
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 2);
+}

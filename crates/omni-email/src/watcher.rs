@@ -427,6 +427,18 @@ impl EmailWatcher {
         true
     }
 
+    /// Handle one mail that did not come from a listing, such as a saved
+    /// `.eml` (plan P7.9): the same steps as a poll (parse, queue, save the
+    /// attachments, record the mail and its text), without touching a
+    /// mailbox. A mail handled before is left alone.
+    pub async fn ingest(&self, mail: &InboundMail) -> Result<Ingested> {
+        if self.repo.get_processed_mail(&mail_key(mail))?.is_some() {
+            return Ok(Ingested::AlreadyHandled);
+        }
+        self.process_mail(mail).await?;
+        Ok(Ingested::Processed)
+    }
+
     /// Parse one message and queue its jobs (plan P4.5).
     ///
     /// Returns only after every job is persisted; any error leaves the
@@ -608,6 +620,15 @@ pub const URGENT_PRIORITY_BOOST: i32 = 10;
 enum Handled {
     Done,
     GaveUpEarlier,
+}
+
+/// What [`EmailWatcher::ingest`] did with a mail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingested {
+    /// Parsed; its jobs (if any) are queued and the mail is recorded.
+    Processed,
+    /// Recorded before: nothing was done.
+    AlreadyHandled,
 }
 
 /// One entry of `processed_mail.jobs_json`: what the summary reply (plan
