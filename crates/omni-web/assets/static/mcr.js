@@ -13,14 +13,14 @@
  */
 
 import {
-  api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref,
+  api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=5';
 import {
   stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
   redownloadJob as deskRedownload, queueOffer as deskQueueOffer,
 } from '/static/desk.js?v=1';
-import { initInbox, loadInbox } from '/static/inbox.js?v=4';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=5';
 
 let journalists = [];
 
@@ -208,6 +208,27 @@ function failed(e) {
   if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
 }
 
+/* «Email: …»: from a video to the mail it came from, opened in the Email
+ * tab with its text and its other videos (plan P7.11). A link added by hand
+ * opens as its own entry. */
+function mailLink(job) {
+  const fromMail = !!job.email_message_id;
+  const kind = fromMail ? 'mail' : 'manual';
+  const key = fromMail ? job.email_message_id : String(job.parent_job_id || job.id);
+  const label = fromMail
+    ? (job.mail_subject ? `Email: «${job.mail_subject}»` : 'Email: (χωρίς θέμα)')
+    : 'Χειροκίνητη προσθήκη';
+  return el('button', {
+    class: 'mail-link',
+    type: 'button',
+    title: 'Άνοιγμα στην καρτέλα Email, με το κείμενο και τα άλλα βίντεό του',
+    onClick: () => {
+      switchTab('email');
+      openMail(kind, key);
+    },
+  }, icon('mail'), el('span', {}, label));
+}
+
 /* ------------------------------------------------------------------ *
  * Other videos found in an article
  * ------------------------------------------------------------------ */
@@ -290,6 +311,7 @@ function activeCard(job) {
         el('div', {},
           el('h3', { class: 'job-name' }, fileName(job)),
           el('p', { class: 'job-url', title: job.url }, job.url),
+          mailLink(job),
         ),
       ),
       el('div', { class: 'row tight' },
@@ -331,6 +353,7 @@ function deliveredCard(job) {
           el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
             `Παραδόθηκε ${fmtTime(job.completed_at || job.updated_at)} · ${fmtDuration(job.duration_secs)} · ${job.journalist}`,
             limitNote(job)),
+          mailLink(job),
         ),
       ),
       el('div', { class: 'row tight' },
@@ -394,6 +417,7 @@ function reviewCard(job) {
           el('p', { class: 'job-url', title: job.url }, job.url),
           el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
             `Δημοσιογράφος: ${job.journalist} · από ${fmtTime(job.updated_at)}`),
+          mailLink(job),
         ),
       ),
       statusBadge(job),
@@ -500,6 +524,7 @@ function completedRow(job) {
     el('td', {},
       el('div', { class: 'strong' }, deliveredName(job), limitNote(job)),
       el('div', { class: 'note mono', title: job.url, style: 'max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, job.url),
+      mailLink(job),
     ),
     el('td', {}, el('span', { class: 'badge info' }, job.journalist)),
     el('td', { title: job.group_code ? groupName(job.group_code) : '' }, job.group_code || '—'),

@@ -244,8 +244,31 @@ pub fn entries(mails: Vec<InboxMailRow>, jobs: Vec<InboxJobRow>, since: DateTime
     out
 }
 
+impl Entry {
+    /// `mail:<Message-ID>` or `manual:<job id>`: what the desk calls it.
+    pub fn id(&self) -> String {
+        match self.kind {
+            EntryKind::Mail => format!("mail:{}", self.key),
+            EntryKind::Manual => format!("manual:{}", self.key),
+        }
+    }
+}
+
 /// One page of `entries` for a filter chip and a search.
 pub fn page(entries: Vec<Entry>, filter: InboxFilter, search: &str, page: usize, per_page: usize) -> InboxPage {
+    page_with_focus(entries, filter, search, page, per_page, None)
+}
+
+/// [`page`], but the page that holds the entry `focus` (an [`Entry::id`])
+/// when it is in the list: the desk opening a mail from a video.
+pub fn page_with_focus(
+    entries: Vec<Entry>,
+    filter: InboxFilter,
+    search: &str,
+    page: usize,
+    per_page: usize,
+    focus: Option<&str>,
+) -> InboxPage {
     let q = search.trim().to_lowercase();
     let q_latin = translit(search.trim()).to_lowercase();
     let matching: Vec<Entry> = if q.is_empty() {
@@ -268,7 +291,10 @@ pub fn page(entries: Vec<Entry>, filter: InboxFilter, search: &str, page: usize,
     let per_page = per_page.clamp(5, 100);
     let total = filtered.len();
     let pages = total.div_ceil(per_page).max(1);
-    let page = page.clamp(1, pages);
+    let page = match focus.and_then(|id| filtered.iter().position(|e| e.id() == id)) {
+        Some(at) => at / per_page + 1,
+        None => page.clamp(1, pages),
+    };
     InboxPage {
         entries: filtered.into_iter().skip((page - 1) * per_page).take(per_page).collect(),
         total,

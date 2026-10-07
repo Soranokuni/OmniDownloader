@@ -400,7 +400,20 @@ pub async fn api_get_jobs(
             .list_jobs_page(view, &filter, query.page.unwrap_or(1), query.per_page.unwrap_or(20))
             .map_err(internal_error("Could not read the job queue."))?;
         let counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
-        let jobs: Vec<serde_json::Value> = page.jobs.iter().map(job_for_desk).collect();
+        // Which mail each came from, so the desk can open it (plan P7.11).
+        let keys: Vec<String> = page.jobs.iter().filter_map(|j| j.email_message_id.clone()).collect();
+        let subjects = state.repo.mail_subjects(&keys).unwrap_or_default();
+        let jobs: Vec<serde_json::Value> = page
+            .jobs
+            .iter()
+            .map(|j| {
+                let mut v = job_for_desk(j);
+                if let Some(subject) = j.email_message_id.as_ref().and_then(|k| subjects.get(k)) {
+                    v["mail_subject"] = serde_json::Value::String(subject.clone());
+                }
+                v
+            })
+            .collect();
         return Ok(Json(serde_json::json!({
             "jobs": jobs,
             "total": page.total,
@@ -1638,6 +1651,8 @@ pub struct MailsQuery {
     q: Option<String>,
     page: Option<usize>,
     per_page: Option<usize>,
+    /// `mail:<Message-ID>` or `manual:<id>`: return the page that holds it.
+    focus: Option<String>,
 }
 
 /// One page of the mail view's list: handled mail and links added by hand,
@@ -1658,12 +1673,13 @@ pub async fn api_get_mails(
         .inbox_job_rows(since - chrono::Duration::days(1), &extra)
         .map_err(internal_error("Could not read the mail list."))?;
     let entries = omni_email::inbox::entries(mails, jobs, since);
-    let page = omni_email::inbox::page(
+    let page = omni_email::inbox::page_with_focus(
         entries,
         query.filter,
         query.q.as_deref().unwrap_or(""),
         query.page.unwrap_or(1),
         query.per_page.unwrap_or(20),
+        query.focus.as_deref(),
     );
 
     // Who added a link by hand, by name.

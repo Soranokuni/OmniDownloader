@@ -224,21 +224,29 @@ export function initInbox(h) {
   });
 }
 
-let loading = false;
+let running = null;
 let again = false;
+/** The entry the next load must show (`openMail`). */
+let focus = null;
 
-/** Refresh the list (and the open mail). One request at a time. */
-export async function loadInbox() {
-  if (loading) { again = true; return; }
-  loading = true;
-  try {
-    do {
-      again = false;
-      await loadOnce();
-    } while (again);
-  } finally {
-    loading = false;
+/** Refresh the list (and the open mail). One request at a time; a call
+ *  made meanwhile runs once more after it, and waits for that. */
+export function loadInbox() {
+  if (running) {
+    again = true;
+    return running;
   }
+  running = (async () => {
+    try {
+      do {
+        again = false;
+        await loadOnce();
+      } while (again);
+    } finally {
+      running = null;
+    }
+  })();
+  return running;
 }
 
 async function loadOnce() {
@@ -246,12 +254,14 @@ async function loadOnce() {
   try {
     const params = new URLSearchParams({ filter: list.filter, page: String(list.page), per_page: String(list.perPage) });
     if (list.q) params.set('q', list.q);
+    if (focus) params.set('focus', focus);
     data = await api(`/api/mails?${params}`);
   } catch (e) {
     if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
     return;
   }
   windowDays = data.window_days || windowDays;
+  list.page = data.page || list.page;
   hooks.onCounts(data.job_counts);
   entries = data.entries || [];
   renderFilters(data.counts || {});
@@ -1123,21 +1133,27 @@ async function refreshOpen() {
  * From elsewhere on the desk (plan P7.11)
  * ------------------------------------------------------------------ */
 
-/** Open the entry `kind:key`, searching for it when it is not on screen. */
+/** Open the entry `kind:key` from elsewhere on the desk: on the page that
+ *  holds it, whatever filter or search was on. */
 export async function openMail(kind, key) {
   const id = `${kind}:${key}`;
   if (!cards.has(id)) {
     list.filter = 'all';
-    list.page = 1;
     list.q = '';
     const search = document.getElementById('inbox-search');
     if (search) search.value = '';
-    await loadInbox();
+    focus = id;
+    try {
+      await loadInbox();
+    } finally {
+      focus = null;
+    }
   }
-  if (!cards.has(id)) {
-    toast('Αυτό το email δεν είναι πια στη λίστα: είναι παλιότερο από τις ημέρες που κρατιούνται.', 'bad');
+  const c = cards.get(id);
+  if (!c) {
+    toast(`Το email δεν είναι πια στη λίστα: η λίστα κρατά τις τελευταίες ${windowDays} ημέρες.`, 'bad');
     return;
   }
   if (!open || open.id !== id) toggle(id);
-  cards.get(id).card.scrollIntoView({ block: 'start', behavior: smooth() });
+  c.card.scrollIntoView({ block: 'start', behavior: smooth() });
 }
