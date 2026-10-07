@@ -409,6 +409,40 @@ const MATRIX: &[Row] = &[
         "/api/events",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
     ),
+    // MCR mail view (plan P7.8): mail text and senders are newsroom data,
+    // so the desk policy: never anonymous, never a reporter.
+    (
+        "GET",
+        "/api/mails",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "GET",
+        "/api/mails/view",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/mails/queue-link",
+        &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/mails/reprocess",
+        &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
+    ),
     // ---- Logged in ----
     (
         "GET",

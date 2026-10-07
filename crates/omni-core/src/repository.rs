@@ -637,6 +637,28 @@ impl Repository {
         Ok(out)
     }
 
+    /// The newest `limit` lines of the job's timeline, oldest first: a job
+    /// retried many times keeps its latest story, not its first.
+    pub fn recent_job_events(&self, job_id: i64, limit: usize) -> Result<Vec<JobEvent>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, job_id, at, stage, level, message FROM (
+                 SELECT * FROM job_events WHERE job_id = ? ORDER BY id DESC LIMIT ?
+             ) ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id, limit as i64], |row| {
+            Ok(JobEvent {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                at: timestamps::parse_opt(row.get(2).ok()),
+                stage: row.get(3)?,
+                level: row.get(4)?,
+                message: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Requeue jobs whose lease expired (plan P1.1).
     ///
     /// A lease expires when the worker died without releasing it -- a crash, a

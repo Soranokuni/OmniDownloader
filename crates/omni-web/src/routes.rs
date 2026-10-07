@@ -6,6 +6,7 @@ use axum::Json;
 use chrono::Duration as ChronoDuration;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -446,7 +447,12 @@ pub async fn api_get_job(
         .get_job(job_id)
         .map_err(internal_error("Could not read the job."))?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(serde_json::json!({ "job": job })))
+    // The timeline the mail view shows for a selected video (plan P7.8).
+    let events = state
+        .repo
+        .recent_job_events(job_id, 80)
+        .map_err(internal_error("Could not read the job."))?;
+    Ok(Json(serde_json::json!({ "job": job_for_desk(&job), "events": events })))
 }
 
 #[derive(Deserialize)]
@@ -1619,6 +1625,351 @@ pub async fn api_test_email(
         Ok(detail) => Ok(Json(serde_json::json!({ "status": "ok", "detail": detail }))),
         Err(e) => Err(ApiError::bad_request(e.to_string())),
     }
+}
+
+// ==========================================
+// MCR mail view (plan P7.8)
+// ==========================================
+
+#[derive(Deserialize)]
+pub struct MailsQuery {
+    #[serde(default)]
+    filter: omni_email::inbox::InboxFilter,
+    q: Option<String>,
+    page: Option<usize>,
+    per_page: Option<usize>,
+}
+
+/// One page of the mail view's list: handled mail and links added by hand,
+/// newest first, within the days the mail text is kept.
+pub async fn api_get_mails(
+    RequireMcr(_): RequireMcr,
+    Query(query): Query<MailsQuery>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let days = state.config.read().await.mail_text_retention_days.clamp(1, 3650);
+    let since = chrono::Utc::now() - chrono::Duration::days(days);
+    let read_failed = internal_error("Could not read the mail list.");
+    let mails = state.repo.inbox_mail_rows(since).map_err(read_failed)?;
+    let extra = omni_email::inbox::referenced_job_ids(&mails);
+    // A day of slack for jobs: a mail's received time is the server's clock.
+    let jobs = state
+        .repo
+        .inbox_job_rows(since - chrono::Duration::days(1), &extra)
+        .map_err(internal_error("Could not read the mail list."))?;
+    let entries = omni_email::inbox::entries(mails, jobs, since);
+    let page = omni_email::inbox::page(
+        entries,
+        query.filter,
+        query.q.as_deref().unwrap_or(""),
+        query.page.unwrap_or(1),
+        query.per_page.unwrap_or(20),
+    );
+
+    // Who added a link by hand, by name.
+    let names: HashMap<i64, String> = if page.entries.iter().any(|e| e.added_by.is_some()) {
+        state
+            .repo
+            .list_users()
+            .map_err(internal_error("Could not read the mail list."))?
+            .into_iter()
+            .map(|u| (u.id, u.full_name))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let entries: Vec<serde_json::Value> = page
+        .entries
+        .iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(e).unwrap_or_default();
+            if let Some(name) = e.added_by.and_then(|id| names.get(&id)) {
+                v["added_by_name"] = serde_json::Value::String(name.clone());
+            }
+            v
+        })
+        .collect();
+    let job_counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+    Ok(Json(serde_json::json!({
+        "entries": entries,
+        "total": page.total,
+        "page": page.page,
+        "per_page": page.per_page,
+        "counts": page.counts,
+        "job_counts": job_counts,
+        "window_days": days,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MailViewQuery {
+    /// `mail` (default) or `manual`.
+    kind: Option<String>,
+    key: String,
+    /// `jobs`: only what changes while the mail is open, for the live refresh.
+    parts: Option<String>,
+}
+
+/// A link added by hand, shaped as a mail whose text is the link, so the
+/// desk shows it the way it shows mail.
+fn manual_entry_as_mail(root: &omni_core::models::Job) -> omni_core::models::ProcessedMail {
+    omni_core::models::ProcessedMail {
+        internet_message_id: String::new(),
+        outcome: "JOBS".into(),
+        subject: Some(root.url.clone()),
+        jobs_json: serde_json::json!([{
+            "index_str": root.index_str,
+            "slug": root.slug,
+            "url": root.url,
+            "status": root.status.as_str(),
+            "result": { "outcome": "created", "id": root.id },
+        }])
+        .to_string(),
+        received_at: root.created_at,
+        body_text: Some(root.url.clone()),
+        ..Default::default()
+    }
+}
+
+/// The mail (or manual entry) `key` and its jobs.
+fn load_mail(
+    state: &AppState,
+    kind: Option<&str>,
+    key: &str,
+) -> Result<(omni_core::models::ProcessedMail, Vec<omni_core::models::Job>), ApiError> {
+    if kind == Some("manual") {
+        let id: i64 = key.trim().parse().map_err(|_| ApiError::not_found())?;
+        let jobs = state.repo.jobs_with_children(id).map_err(internal_error("Could not read the job."))?;
+        let root = jobs
+            .iter()
+            .find(|j| j.id == id && j.email_message_id.is_none())
+            .ok_or_else(ApiError::not_found)?;
+        return Ok((manual_entry_as_mail(root), jobs));
+    }
+    let mail = state
+        .repo
+        .get_processed_mail(key)
+        .map_err(internal_error("Could not read the mail."))?
+        .ok_or_else(ApiError::not_found)?;
+    let pointed_at: Vec<i64> = serde_json::from_str::<Vec<omni_email::watcher::QueuedFromMail>>(&mail.jobs_json)
+        .unwrap_or_default()
+        .iter()
+        .map(|q| q.result.job_id())
+        .collect();
+    let jobs = state
+        .repo
+        .jobs_for_mail(&mail.internet_message_id, &pointed_at)
+        .map_err(internal_error("Could not read the mail's jobs."))?;
+    Ok((mail, jobs))
+}
+
+/// The videos an article offered MCR and nobody has queued yet, per job.
+fn open_offers(jobs: &[omni_core::models::Job]) -> Vec<serde_json::Value> {
+    jobs.iter()
+        .flat_map(|j| {
+            j.candidates_json
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<Vec<omni_broadcast::article::Offered>>(c).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|o| o.queued_job_id.is_none())
+                .map(move |o| serde_json::json!({ "job_id": j.id, "url": o.url, "index_str": o.index_str }))
+        })
+        .collect()
+}
+
+pub async fn api_get_mail_view(
+    RequireMcr(_): RequireMcr,
+    Query(query): Query<MailViewQuery>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let cfg = state.config.read().await.parser.clone();
+    let (mail, jobs) = load_mail(&state, query.kind.as_deref(), &query.key)?;
+    let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
+
+    let by_id: HashMap<i64, &omni_core::models::Job> = jobs.iter().map(|j| (j.id, j)).collect();
+    let desk_jobs: Vec<serde_json::Value> = view
+        .jobs
+        .iter()
+        .filter_map(|p| {
+            by_id.get(&p.job_id).map(|j| {
+                let mut v = job_for_desk(j);
+                v["place"] = serde_json::json!({ "link": p.link, "parent": p.parent, "shared": p.shared });
+                v
+            })
+        })
+        .collect();
+    let links: Vec<serde_json::Value> = view
+        .links
+        .iter()
+        .map(|l| serde_json::json!({ "id": l.id, "url": l.url, "role": l.role, "jobs": l.jobs, "skip": l.skip }))
+        .collect();
+
+    if query.parts.as_deref() == Some("jobs") {
+        return Ok(Json(serde_json::json!({
+            "jobs": desk_jobs,
+            "links": links,
+            "attachments": view.attachments,
+            "offers": open_offers(&jobs),
+            "next_index": view.next_index,
+        })));
+    }
+
+    let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
+    Ok(Json(serde_json::json!({
+        "kind": if query.kind.as_deref() == Some("manual") { "manual" } else { "mail" },
+        "key": query.key,
+        "subject": mail.subject,
+        "from_name": mail.from_name,
+        "from_address": mail.from_address,
+        "to": mail.to,
+        "cc": mail.cc,
+        "received_at": mail.received_at,
+        "processed_at": mail.processed_at,
+        "outcome": mail.outcome,
+        "journalist": summary.as_ref().map(|s| s.journalist.clone()).or_else(|| jobs.first().map(|j| j.journalist.clone())),
+        "how": summary.as_ref().map(|s| omni_email::mail_view::how_el(s.how)),
+        "group_code": summary.as_ref().and_then(|s| s.group.as_ref().map(|g| g.code.clone())),
+        "urgent": summary.as_ref().is_some_and(|s| s.urgent),
+        "notes": view.notes,
+        "text": view.text,
+        "links": links,
+        "attachments": view.attachments,
+        "jobs": desk_jobs,
+        "offers": open_offers(&jobs),
+        "next_index": view.next_index,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct QueueLinkPayload {
+    key: String,
+    url: String,
+}
+
+/// Queue a link from a mail's text that became no job: «Λήψη και αυτού».
+///
+/// Only a link that is in that mail's stored text, is not already a job,
+/// and is not a photo or a document. It is named as the mail's own links
+/// are (journalist, the next number, the neighbouring story's keyword) and
+/// recorded with the mail, so the desk files the job under that link.
+pub async fn api_mail_queue_link(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    Json(payload): Json<QueueLinkPayload>,
+) -> JsonResult {
+    let cfg = state.config.read().await.parser.clone();
+    let (mail, jobs) = load_mail(&state, None, &payload.key)?;
+    let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
+    let wanted = payload.url.trim();
+    let Some(link) = view.links.iter().find(|l| l.url == wanted) else {
+        return Err(ApiError::bad_request("Αυτός ο σύνδεσμος δεν υπάρχει στο κείμενο αυτού του email."));
+    };
+    match &link.skip {
+        None => return Err(ApiError::bad_request("Αυτός ο σύνδεσμος έχει ήδη μπει στην ουρά.")),
+        Some(s) if !s.can_queue => {
+            return Err(ApiError::bad_request("Φωτογραφίες και έγγραφα δεν κατεβαίνουν ως βίντεο."))
+        }
+        Some(_) => {}
+    }
+    if !is_submittable_url(&link.url) {
+        return Err(ApiError::bad_request("Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://."));
+    }
+    let (journalist, keyword, index) = omni_email::mail_view::naming_for_link(&mail, &view, &jobs, &link.id)
+        .ok_or_else(|| ApiError::bad_request("Αυτός ο σύνδεσμος δεν υπάρχει στο κείμενο αυτού του email."))?;
+    let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
+    let subject = mail.subject.clone().unwrap_or_default();
+    let slug = format!("{index}_{journalist}_{keyword}");
+
+    let locker = omni_email::parser::classify(&link.url, &cfg) == omni_email::parser::Tier::Locker;
+    let mut new = omni_core::models::NewJob::new(link.url.clone(), slug.clone(), journalist.clone());
+    new.keyword = keyword;
+    new.index_str = index.clone();
+    new.status = if locker { JobStatus::ManualDownload } else { JobStatus::Pending };
+    new.extraction_method = locker.then(|| "locker".to_string());
+    new.email_message_id = Some(mail.internet_message_id.clone());
+    new.email_source = mail.from_address.clone();
+    new.group_code = summary
+        .as_ref()
+        .and_then(|s| s.group.as_ref().map(|g| g.code.clone()))
+        .or_else(|| jobs.iter().find_map(|j| j.group_code.clone()));
+    new.priority = if summary.as_ref().is_some_and(|s| s.urgent) {
+        omni_email::watcher::URGENT_PRIORITY_BOOST
+    } else {
+        0
+    };
+    new.submitted_by_user_id = principal.user().map(|u| u.id);
+    new.notes = Some(format!("Queued by MCR from the email: {subject}"));
+    let result = state
+        .repo
+        .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+        .map_err(internal_error("Could not queue that link."))?;
+    state
+        .repo
+        .append_mail_job(
+            &mail.internet_message_id,
+            &serde_json::json!({
+                "index_str": index,
+                "slug": slug,
+                "url": link.url,
+                "status": new.status.as_str(),
+                "result": result,
+            }),
+        )
+        .map_err(internal_error("Could not record the link with its email."))?;
+    let job_id = result.job_id();
+    if result.is_new() {
+        let _ = state.repo.record_event(
+            job_id,
+            "INFO",
+            None,
+            &format!("Queued by {} from the email '{subject}'", principal.audit_label()),
+        );
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: queued from the email '{subject}'"));
+    state.broadcast_event("job_created");
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "job_id": job_id,
+        "slug": slug,
+        "index_str": index,
+        "duplicate": !result.is_new(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MailKeyPayload {
+    key: String,
+}
+
+/// Read again a mail the watcher gave up on. Only that: a handled mail read
+/// again after a day could queue its delivered links a second time, so that
+/// stays with the administrator (plan P4.25).
+pub async fn api_mail_reprocess(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    Json(payload): Json<MailKeyPayload>,
+) -> JsonResult {
+    let mail = state
+        .repo
+        .get_processed_mail(payload.key.trim())
+        .map_err(internal_error("Could not read the mail."))?
+        .ok_or_else(ApiError::not_found)?;
+    if mail.outcome != "FAILED" {
+        return Err(ApiError::bad_request(
+            "Ξανά διαβάζεται μόνο ένα email που το σύστημα δεν μπόρεσε να διαβάσει.",
+        ));
+    }
+    state
+        .repo
+        .request_mail_reprocess(&mail.internet_message_id, &principal.audit_label())
+        .map_err(|_| ApiError::bad_request("Αυτό το email δεν μπορεί να διαβαστεί ξανά από το γραμματοκιβώτιο."))?;
+    audit_action(
+        &state,
+        &principal,
+        &format!("Reprocess of the email '{}' requested", mail.subject.unwrap_or_default()),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 // ==========================================

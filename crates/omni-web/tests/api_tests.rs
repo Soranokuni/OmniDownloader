@@ -433,3 +433,192 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     assert!(status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED, "{status}");
     Ok(())
 }
+// ==========================================
+// MCR mail view (plan P7.8)
+// ==========================================
+
+/// A Message-ID in a query string.
+fn q(key: &str) -> String {
+    key.replace('%', "%25").replace('<', "%3C").replace('>', "%3E").replace('@', "%40").replace('+', "%2B")
+}
+
+/// A handled mail from GEORGIOU whose first link became a job; returns the job id.
+fn seed_mail(app: &App, key: &str, body: &str, job_url: &str) -> Result<i64> {
+    let mut new = omni_core::models::NewJob::new(job_url, "1_GEORGIOU_SEISMOS", "GEORGIOU");
+    new.keyword = "SEISMOS".into();
+    new.email_message_id = Some(key.into());
+    let result = app.repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)?;
+    app.repo.record_processed_mail(&omni_core::models::ProcessedMail {
+        internet_message_id: key.into(),
+        source_id: Some("AAMk-graph-id".into()),
+        outcome: "JOBS".into(),
+        from_address: Some("e.georgiou@example.gr".into()),
+        from_name: Some("Ελένη Γεωργίου".into()),
+        subject: Some("ΘΕΜΑΤΑ ΕΛΕΝΗΣ".into()),
+        jobs_json: json!([{ "index_str": "1", "slug": "1_GEORGIOU_SEISMOS", "url": job_url, "status": "PENDING", "result": result }])
+            .to_string(),
+        received_at: Some(chrono::Utc::now()),
+        body_text: Some(body.into()),
+        parse_json: Some(
+            json!({ "journalist": "GEORGIOU", "how": "sender", "outcome": "JOBS",
+                    "sections": [{ "index_str": "1", "keyword": "SEISMOS" }] })
+            .to_string(),
+        ),
+        ..Default::default()
+    })?;
+    Ok(result.job_id())
+}
+
+#[tokio::test]
+async fn the_mail_view_lists_a_mail_and_shows_its_text_links_and_jobs() -> Result<()> {
+    let app = App::new()?;
+    let body = "1. ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=api00000001\nΔείτε και https://www.portal-news.example/";
+    let id = seed_mail(&app, "<m1@example.gr>", body, "https://www.youtube.com/watch?v=api00000001")?;
+
+    let (status, list) = app.send("GET", "/api/mails", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["entries"][0]["key"], "<m1@example.gr>");
+    assert_eq!(list["entries"][0]["state"], "active");
+    assert_eq!(list["entries"][0]["jobs"][0]["id"], id);
+    assert_eq!(list["counts"]["all"], 1);
+    assert!(list["job_counts"]["active"].as_i64().is_some());
+
+    let uri = format!("/api/mails/view?key={}", q("<m1@example.gr>"));
+    let (status, view) = app.send("GET", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["from_name"], "Ελένη Γεωργίου");
+    assert_eq!(view["how"], "από τη διεύθυνση του αποστολέα");
+    assert_eq!(view["links"][0]["jobs"], json!([id]));
+    assert_eq!(view["links"][1]["skip"]["can_queue"], true);
+    assert_eq!(view["jobs"][0]["id"], id);
+    assert_eq!(view["jobs"][0]["place"]["link"], "l1");
+    assert_eq!(view["next_index"], "2");
+    assert_eq!(view["text"][0]["role"], "read");
+
+    // The live refresh carries what changes, not the text.
+    let (_, part) = app.send("GET", &format!("{uri}&parts=jobs"), &app.mcr_token, None).await?;
+    assert!(part.get("text").is_none() && part["jobs"][0]["id"] == id, "{part}");
+
+    let (status, _) = app.send("GET", "/api/mails/view?key=%3Cnope%40x%3E", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// The mail's text reaches the panel as JSON strings, never as markup.
+#[tokio::test]
+async fn a_hostile_mail_text_is_returned_as_data() -> Result<()> {
+    let app = App::new()?;
+    let body = "<img src=x onerror=alert(1)>\nhttps://www.youtube.com/watch?v=xss00000002\n</div><script>alert(2)</script>";
+    seed_mail(&app, "<x1@example.gr>", body, "https://www.youtube.com/watch?v=xss00000002")?;
+    let res = app
+        .router
+        .clone()
+        .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/mails/view?key={}", q("<x1@example.gr>")))
+                .header("cookie", format!("omni_session={}", app.mcr_token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.headers()["content-type"], "application/json");
+    let view: Value = serde_json::from_slice(&res.into_body().collect().await?.to_bytes())?;
+    assert_eq!(view["text"][0]["lines"][0][0]["t"], "<img src=x onerror=alert(1)>");
+    assert_eq!(view["text"][0]["lines"][2][0]["t"], "</div><script>alert(2)</script>");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skipped_link_can_be_queued_from_its_mail_once() -> Result<()> {
+    let app = App::new()?;
+    let body = "1. ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=api00000003\nΔείτε και https://www.portal-news.example/\nΦωτο: https://www.example.gr/photo.jpg";
+    seed_mail(&app, "<m3@example.gr>", body, "https://www.youtube.com/watch?v=api00000003")?;
+    let send = |url: &str| json!({ "key": "<m3@example.gr>", "url": url });
+
+    // Not in this mail: refused.
+    let (status, _) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://evil.example/x")))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A photo: refused.
+    let (status, _) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://www.example.gr/photo.jpg")))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://www.portal-news.example/")))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["slug"], "2_GEORGIOU_SEISMOS", "next number, the mail's journalist, the story next to it");
+    let job = app.repo.get_job(body["job_id"].as_i64().unwrap())?.unwrap();
+    assert_eq!(job.email_message_id.as_deref(), Some("<m3@example.gr>"));
+    assert_eq!(job.status, JobStatus::Pending);
+
+    // Filed under its link in the view; a second click is refused.
+    let (_, view) = app
+        .send("GET", &format!("/api/mails/view?key={}", q("<m3@example.gr>")), &app.mcr_token, None)
+        .await?;
+    assert_eq!(view["links"][1]["jobs"], json!([job.id]), "{view}");
+    let (status, _) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://www.portal-news.example/")))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_a_mail_the_watcher_gave_up_on_can_be_read_again_from_the_desk() -> Result<()> {
+    let app = App::new()?;
+    seed_mail(&app, "<ok@example.gr>", "x https://youtu.be/okokokok", "https://youtu.be/okokokok")?;
+    app.repo.record_processed_mail(&omni_core::models::ProcessedMail {
+        internet_message_id: "<failed@example.gr>".into(),
+        source_id: Some("AAMk-failed".into()),
+        outcome: "FAILED".into(),
+        subject: Some("Πλάνα λιμάνι".into()),
+        ..Default::default()
+    })?;
+    let ask = |key: &str| json!({ "key": key });
+
+    let (status, _) = app.send("POST", "/api/mails/reprocess", &app.mcr_token, Some(ask("<ok@example.gr>"))).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a handled mail stays with the administrator");
+    let (status, _) = app.send("POST", "/api/mails/reprocess", &app.mcr_token, Some(ask("<nope@example.gr>"))).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) =
+        app.send("POST", "/api/mails/reprocess", &app.mcr_token, Some(ask("<failed@example.gr>"))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pending: Vec<String> = app.repo.pending_mail_reprocess()?.into_iter().map(|(k, _, _)| k).collect();
+    assert_eq!(pending, vec!["<failed@example.gr>"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_link_added_by_hand_is_an_entry_of_its_own_with_a_timeline() -> Result<()> {
+    let app = App::new()?;
+    let (status, created) = app
+        .send(
+            "POST",
+            "/api/jobs",
+            &app.mcr_token,
+            Some(json!({ "url": "https://www.ertnews.gr/video/kairos/", "journalist": "MCR", "keyword": "KAIROS" })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["job_id"].as_i64().unwrap();
+
+    let (_, list) = app.send("GET", "/api/mails", &app.mcr_token, None).await?;
+    assert_eq!(list["entries"][0]["kind"], "manual");
+    assert_eq!(list["entries"][0]["key"], id.to_string());
+    assert_eq!(list["entries"][0]["added_by_name"], "MCR Desk");
+
+    let (status, view) =
+        app.send("GET", &format!("/api/mails/view?kind=manual&key={id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["links"][0]["jobs"], json!([id]));
+    assert_eq!(view["jobs"][0]["place"]["shared"], false);
+
+    let (status, detail) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail["events"][0]["message"].as_str().unwrap_or("").starts_with("Queued as"), "{detail}");
+    Ok(())
+}

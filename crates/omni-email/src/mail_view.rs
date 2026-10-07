@@ -328,6 +328,10 @@ pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView
     // The desk's order: as queued, each followed by its article's videos;
     // then anything of the mail's own queued since (by MCR, from the mail).
     let own = |j: &Job| j.email_message_id.as_deref() == Some(mail.internet_message_id.as_str());
+    // A link that was already queued elsewhere (another mail, or by hand):
+    // the job shown for it is that one.
+    let duplicates: HashSet<i64> = queued.iter().filter(|q| !q.result.is_new()).map(|q| q.result.job_id()).collect();
+    let shared = |j: &Job| duplicates.contains(&j.id) && !own(j);
     let mut order: Vec<JobPlace> = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
     let push = |order: &mut Vec<JobPlace>, seen: &mut HashSet<i64>, j: &Job, parent: Option<i64>| {
@@ -338,7 +342,7 @@ pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView
             job_id: j.id,
             link: place_of.get(&j.id).cloned(),
             parent,
-            shared: !own(j),
+            shared: shared(j),
         });
         if let Some(list) = children.get(&j.id) {
             for c in list {
