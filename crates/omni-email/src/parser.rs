@@ -948,15 +948,68 @@ const TRAILING: &[char] = &[
     '*', '_', '|',
 ];
 
+/// What a sender glues onto the end of a link to say what it holds
+/// ("…/arthro/-ΒΙΝΤΕΟ", "watch?v=…-BINTEO", "…-ΦΩΤΟ"), in capitals.
+/// Greek capitals never end a real link (sites write slugs in lowercase
+/// Latin, or percent-encoded), so these go whether or not a separator
+/// precedes them. The Latin ones are the same words typed on a Latin
+/// keyboard ("BINTEO" is ΒΙΝΤΕΟ letter for letter), and are taken only
+/// after a `-`, `_` or `/`. Not "VIDEO" or "PHOTO": real paths end in those.
+const GREEK_ANNOTATIONS: &[&str] = &[
+    "ΒΙΝΤΕΟ", "ΒΊΝΤΕΟ", "ΒΙΝΤΕΑ", "ΦΩΤΟ", "ΦΩΤΟΓΡΑΦΙΑ", "ΦΩΤΟΓΡΑΦΙΕΣ", "ΕΙΚΟΝΑ", "ΕΙΚΟΝΕΣ", "ΠΛΑΝΑ",
+    "ΑΠΟΣΠΑΣΜΑ", "ΔΗΛΩΣΕΙΣ", "ΗΧΟΣ",
+];
+const LATIN_ANNOTATIONS: &[&str] = &["BINTEO", "VINTEO", "FOTO", "EIKONES", "PLANA"];
+
+/// A word, or its percent-encoded form (a link copied from a browser's
+/// address bar): `%CE%92%CE%99…` in either hex case.
+fn annotation_forms(word: &str) -> [String; 3] {
+    let upper: String = word.bytes().map(|b| format!("%{b:02X}")).collect();
+    [word.to_string(), upper.clone(), upper.to_lowercase()]
+}
+
+static RE_TRAILING_ANNOTATION: LazyLock<Regex> = LazyLock::new(|| {
+    let alt = |words: &[&str]| -> String {
+        let mut forms: Vec<String> = words.iter().flat_map(|w| annotation_forms(w)).map(|f| regex::escape(&f)).collect();
+        forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+        forms.join("|")
+    };
+    let greek = alt(GREEK_ANNOTATIONS);
+    let any = format!("{greek}|{}", alt(LATIN_ANNOTATIONS));
+    // One word or several ("-ΒΙΝΤΕΟ+ΦΩΤΟ"), at the very end.
+    Regex::new(&format!(
+        r"(?:(?:[-_/]|%20)+(?:{any})|(?:{greek}))(?:(?:[-_/+&]|%20)+(?:{any}))*$"
+    ))
+    .unwrap()
+});
+
+/// The annotation a sender glued to the end of `url`, if any (see
+/// [`GREEK_ANNOTATIONS`]): its byte offset, so the link ends before it.
+pub fn trailing_annotation(url: &str) -> Option<usize> {
+    let m = RE_TRAILING_ANNOTATION.find(url)?;
+    // "…/arthro/-ΒΙΝΤΕΟ": the slash is the article's own (sites answer for
+    // "…/arthro/", and may not for "…/arthro").
+    let cut = if url[m.start()..].starts_with('/') { m.start() + 1 } else { m.start() };
+    // Something must be left that is still a link with a path or a query.
+    let parsed = Url::parse(&url[..cut]).ok()?;
+    (parsed.host_str().is_some() && (parsed.path().len() > 1 || parsed.query().is_some())).then_some(cut)
+}
+
 /// Where the link is inside `raw`, a match of the URL patterns: without the
-/// markdown emphasis before it and the punctuation a sentence glued after
-/// it. The mail view marks exactly this much of the text.
+/// markdown emphasis before it, the punctuation a sentence glued after it,
+/// and a "-ΒΙΝΤΕΟ" the sender glued on (P3.9). The mail view marks exactly
+/// this much of the text, so the annotation shows as the sender's words.
 fn link_bounds(raw: &str) -> std::ops::Range<usize> {
     let start = raw.len() - raw.trim_start_matches(['*', '_']).len();
     let mut u = raw[start..].trim_end_matches(TRAILING);
     // A closing parenthesis belongs to the URL only if it opened one.
     while u.ends_with(')') && u.matches(')').count() > u.matches('(').count() {
         u = u[..u.len() - 1].trim_end_matches(TRAILING);
+    }
+    let with_scheme = if u.to_ascii_lowercase().starts_with("www.") { format!("https://{u}") } else { u.to_string() };
+    if let Some(cut) = trailing_annotation(&with_scheme) {
+        let cut = cut - (with_scheme.len() - u.len());
+        u = u[..cut].trim_end_matches(TRAILING);
     }
     start..start + u.len()
 }
@@ -1926,6 +1979,26 @@ mod tests {
         assert_eq!(numbered("1 ΠΑΡΕΛΑΣΗ", 1), Some((1, "ΠΑΡΕΛΑΣΗ".into())));
         assert_eq!(numbered("3 νεκροί σε τροχαίο", 1), None);
         assert_eq!(numbered("1. 2024: χρονιά ρεκόρ", 1), Some((1, "2024: χρονιά ρεκόρ".into())));
+    }
+
+    #[test]
+    fn a_word_the_sender_glued_to_a_link_is_not_part_of_it() {
+        // P3.9: one sender glued "-ΒΙΝΤΕΟ" / "-ΦΩΤΟ" / "-BINTEO" to every
+        // link; news247 answers 404 for the decorated address.
+        let cut = |u: &str| trailing_annotation(u).map(|i| u[..i].to_string());
+        assert_eq!(cut("https://www.news247.gr/kosmos/arthro/-ΒΙΝΤΕΟ").as_deref(), Some("https://www.news247.gr/kosmos/arthro/"));
+        assert_eq!(cut("https://www.news247.gr/kosmos/arthro/-ΦΩΤΟ").as_deref(), Some("https://www.news247.gr/kosmos/arthro/"));
+        assert_eq!(cut("https://www.youtube.com/watch?v=u2BU7HFTb54-BINTEO").as_deref(), Some("https://www.youtube.com/watch?v=u2BU7HFTb54"));
+        assert_eq!(cut("https://www.amna.gr/home/videos/1/Title-o-P-Name-ΒΙΝΤΕΟ").as_deref(), Some("https://www.amna.gr/home/videos/1/Title-o-P-Name"));
+        assert_eq!(cut("https://site.gr/a/arthroΒΙΝΤΕΟ").as_deref(), Some("https://site.gr/a/arthro"), "Greek capitals: no separator needed");
+        assert_eq!(cut("https://site.gr/a/arthro-ΒΙΝΤΕΟ+ΦΩΤΟ").as_deref(), Some("https://site.gr/a/arthro"));
+        assert_eq!(cut("https://site.gr/a/arthro-%CE%92%CE%99%CE%9D%CE%A4%CE%95%CE%9F").as_deref(), Some("https://site.gr/a/arthro"));
+        assert_eq!(cut("https://site.gr/a/arthro-%ce%a6%ce%a9%ce%a4%ce%9f").as_deref(), Some("https://site.gr/a/arthro"));
+        // Real addresses that only look similar stay whole.
+        assert_eq!(cut("https://www.protothema.gr/world/to-viral-binteo/"), None, "a lowercase slug is the site's own");
+        assert_eq!(cut("https://www.star.gr/tv/clip-VIDEO"), None, "English words end real paths");
+        assert_eq!(cut("https://site.gr/a/MYBINTEO"), None, "a Latin word needs a separator");
+        assert_eq!(cut("https://site.gr/-ΒΙΝΤΕΟ"), None, "nothing but the front page would be left");
     }
 
     #[test]
