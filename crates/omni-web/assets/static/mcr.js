@@ -22,7 +22,7 @@ import {
   canRename, renameJob as deskRename,
 } from '/static/desk.js?v=2';
 import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=6';
-import { initNotify } from '/static/notify.js?v=3';
+import { initNotify, watchStatus, CHECK_INFO } from '/static/notify.js?v=6';
 
 let journalists = [];
 
@@ -66,20 +66,25 @@ for (const button of document.querySelectorAll('.tab[data-tab]')) {
 /** Health state -> dot colour. */
 const DOT = { ok: 'ok', degraded: 'warn', down: 'bad' };
 
-/** Check names as an operator reads them in the banner. */
-const CHECK_NAME = {
-  tools: 'Εργαλεία',
-  encoder: 'Κωδικοποιητής',
-  watchfolder: 'Watchfolder',
-  browser: 'Πρόγραμμα περιήγησης',
-  disk: 'Δίσκος',
-  queue: 'Ουρά',
-  selfcheck: 'Αυτοέλεγχος',
-  deno: 'YouTube (Deno)',
-  accounts: 'Λογαριασμοί',
-};
-
+// One status request at a time (P7.14): the 5 s tick and an SSE event can
+// overlap, and a slow answer landing after a newer one made the review count
+// go 15 -> 14 -> 15 and sound the alert twice.
+let statusBusy = false;
+let statusAgain = false;
 async function loadStatus() {
+  if (statusBusy) { statusAgain = true; return; }
+  statusBusy = true;
+  try {
+    do {
+      statusAgain = false;
+      await loadStatusOnce();
+    } while (statusAgain);
+  } finally {
+    statusBusy = false;
+  }
+}
+
+async function loadStatusOnce() {
   let data;
   try {
     data = await api('/api/system/status');
@@ -114,21 +119,25 @@ async function loadStatus() {
 
   // Anything not already on the bar — tools, disk, queue, self-check —
   // surfaces here rather than staying invisible until a job fails on it.
-  const problems = Object.entries(checks)
-    .filter(([name, c]) => c.state !== 'ok' && name !== 'mail' && name !== 'llm')
-    .map(([name, c]) => `${CHECK_NAME[name] || name}: ${c.detail || c.state}`);
+  const problems = Object.entries(checks).filter(([name, c]) => c.state !== 'ok' && name !== 'llm');
   const banner = document.getElementById('health-banner');
   if (problems.length === 0) {
     banner.hidden = true;
   } else {
     banner.hidden = false;
     render(banner, el('div', { class: 'card attention' },
-      el('strong', {}, data.status === 'down' ? 'Η λήψη βίντεο έχει σταματήσει. ' : 'Προσοχή. '),
-      problems.join(' · '),
-      el('span', { class: 'note', style: 'display:block;margin-top:6px' },
-        'Ενημερώστε τον μηχανικό βάρδιας· η σελίδα «Διαχείριση» έχει τις λεπτομέρειες.'),
+      el('strong', {}, problems.some(([name, c]) => name !== 'mail' && c.state === 'down') ? 'Η λήψη βίντεο έχει σταματήσει' : 'Προσοχή'),
+      ...problems.map(([name, c]) => {
+        const info = CHECK_INFO[name];
+        return el('div', { style: 'margin-top:8px' },
+          el('div', {}, info ? info.name : name),
+          info?.action ? el('div', {}, info.action) : null,
+          el('div', { class: 'note mono', style: 'font-size:12px' }, c.detail || c.state),
+        );
+      }),
     ));
   }
+  watchStatus(data);
 }
 
 function label(check) {
@@ -684,7 +693,7 @@ initNotify(document.querySelector('.topbar-status'), (id) => {
   const cut = id.indexOf(':');
   switchTab('email');
   openMail(id.slice(0, cut), id.slice(cut + 1));
-});
+}, () => switchTab('review'));
 loadFilters();
 switchTab(currentTab);
 live(() => { refresh(); loadStatus(); });
