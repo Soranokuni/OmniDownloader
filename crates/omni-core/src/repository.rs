@@ -30,6 +30,16 @@ pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 pub const DEFAULT_ADMIN_LOGIN: &str = "admin";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "Admin";
 
+/// What [`Repository::cancel_job`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled,
+    /// The job is already delivering; the file cannot be stopped.
+    TooLate,
+    /// Not waiting or running (or no such job).
+    NotCancellable,
+}
+
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
@@ -894,6 +904,19 @@ impl Repository {
         Ok(())
     }
 
+    /// Record the delivered file and its duration on a job, without touching
+    /// its status: the worker holding the lease decides the terminal status
+    /// (`finish`). Only the lease holder may write it.
+    pub fn set_delivered_file(&self, id: i64, owner: &str, file_path: &str, duration: f64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![file_path, duration, timestamps::now_string(), id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn update_job_progress(&self, id: i64, progress: f64, speed: &str, eta: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
@@ -1181,6 +1204,36 @@ impl Repository {
             params![now, now, now, id],
         )?;
         Ok(n > 0)
+    }
+
+    /// MCR cancels a video that waits or downloads (plan P7.20). The row and
+    /// its history stay as CANCELLED; the lease is taken away, so a worker
+    /// still running the job stops before its next stage (P1.14). Once the
+    /// job is in DELIVER the file is on its way to the watchfolder and the
+    /// cancel is refused.
+    pub fn cancel_job(&self, id: i64) -> Result<CancelOutcome> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, updated_at = ?
+            WHERE id = ? AND (status = 'PENDING' OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
+            "#,
+            params![now, now, id],
+        )?;
+        if n > 0 {
+            self.log_audit("WARN", "QUEUE", &format!("Cancelled Job #{}", id))?;
+            return Ok(CancelOutcome::Cancelled);
+        }
+        let row: Option<(String, String)> = conn
+            .query_row("SELECT status, stage FROM queue WHERE id = ?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(match row {
+            Some((status, stage)) if status == "RUNNING" && matches!(stage.as_str(), "DELIVER" | "ARCHIVE" | "DONE") => CancelOutcome::TooLate,
+            _ => CancelOutcome::NotCancellable,
+        })
     }
 
     pub fn delete_job(&self, id: i64) -> Result<()> {

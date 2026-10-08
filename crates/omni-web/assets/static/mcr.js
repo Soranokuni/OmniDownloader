@@ -17,11 +17,11 @@ import {
 } from '/static/app.js?v=6';
 import {
   stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
-  retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
+  retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=7';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=13';
+} from '/static/desk.js?v=8';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=14';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=8';
 
 let journalists = [];
@@ -424,9 +424,9 @@ function activeCard(job) {
         el('button', {
           class: 'btn btn-danger',
           type: 'button',
-          title: 'Αφαίρεση του βίντεο από την ουρά',
-          onClick: () => discardJob(job),
-        }, 'Αφαίρεση'),
+          title: 'Ακύρωση του βίντεο: δεν θα σταλεί στο Dalet',
+          onClick: () => cancelJob(job),
+        }, 'Ακύρωση'),
       ),
     ),
     el('div', {},
@@ -663,6 +663,7 @@ function reviewCard(job) {
 const retryJob = (job) => deskRetry(job, refresh);
 const overrideJob = (job, url) => deskOverride(job, url, refresh);
 const discardJob = (job) => deskDiscard(job, refresh);
+const cancelJob = (job) => deskCancel(job, refresh);
 const renameJob = (job) => deskRename(job, refresh);
 const markDoneJob = (job) => deskMarkDone(job, refresh);
 

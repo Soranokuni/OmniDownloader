@@ -30,6 +30,7 @@ struct App {
     mcr_token: String,
     user_token: String,
     admin_token: String,
+    busy: omni_core::busy::BusyJobs,
     _dir: TempDir,
 }
 
@@ -70,6 +71,7 @@ impl App {
         repo.create_session(admin_id, &admin_token, 1)?;
 
         let state = AppState::new(repo.clone(), config, dir.path().join("config.json"));
+        let busy = state.busy_jobs.clone();
         let router = WebServer::build_router(state);
 
         Ok(Self {
@@ -78,6 +80,7 @@ impl App {
             mcr_token,
             user_token,
             admin_token,
+            busy,
             _dir: dir,
         })
     }
@@ -735,5 +738,81 @@ async fn mcr_can_mark_a_review_video_as_put_into_dalet_once() -> Result<()> {
     let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(json["error"]["code"], "NOT_MARKABLE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcr_cancels_a_waiting_video_and_it_stays_in_the_list() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/cancel", "1_NIKOLAOU_CANCEL", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    let uri = format!("/api/jobs/{id}/cancel");
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Cancelled);
+    let events = app.repo.get_job_events(id, 100)?;
+    assert!(events.iter().any(|e| e.level == "WARN" && e.message.starts_with("Cancelled by")), "no event");
+
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "NOT_CANCELLABLE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_video_that_is_delivering_is_too_late_to_cancel() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/late", "1_NIKOLAOU_LATE", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    assert!(app.repo.set_stage(id, "test-worker", omni_core::models::JobStage::Deliver)?);
+
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/cancel"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "TOO_LATE");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_whose_worker_is_still_stopping_is_not_queued_again() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/stop", "1_NIKOLAOU_STOP", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    assert!(app.repo.cancel_job(id)? == omni_core::repository::CancelOutcome::Cancelled);
+    app.busy.insert(id);
+
+    for (uri, body) in [
+        (format!("/api/jobs/{id}/retry"), None),
+        (format!("/api/jobs/{id}/override"), Some(serde_json::json!({ "url": "https://example.gr/other" }))),
+        (format!("/api/jobs/{id}/redownload"), None),
+    ] {
+        let (status, json) = app.send("POST", &uri, &app.mcr_token, body).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {json}");
+        assert_eq!(json["error"]["code"], "STILL_STOPPING", "{uri}");
+    }
+    let row = app.repo.get_job(id)?.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled, "the row must not be touched");
+
+    app.busy.remove(id);
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/retry"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
     Ok(())
 }

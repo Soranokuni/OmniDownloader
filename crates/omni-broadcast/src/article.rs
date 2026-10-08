@@ -186,6 +186,19 @@ pub fn queue_article_siblings(
     primary: &str,
     all_streams: &[String],
 ) {
+    // A job MCR cancelled (or another worker took) while its page was being
+    // resolved must not put the article's other videos on air (plan P7.20).
+    match repo.owns_lease(job.id, owner) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!("Job #{}: no longer ours; not queuing the article's other videos", job.id);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Job #{}: lease check failed, not queuing the article's other videos: {e:#}", job.id);
+            return;
+        }
+    }
     let max = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
     let plan = plan_article_videos_limited(&job.url, primary, all_streams, &job.index_str, max);
     if let Some(n) = max {

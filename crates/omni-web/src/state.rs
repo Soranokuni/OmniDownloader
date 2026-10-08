@@ -38,6 +38,9 @@ pub struct AppState {
     /// The LLM assist in use, shared with the mail watcher: saving LLM
     /// settings in the admin panel swaps it without a restart (plan P4.22).
     pub llm: omni_email::assist::LiveAssist,
+    /// Jobs a worker is still busy with; a retry waits until it has stopped
+    /// (plan P7.20). Shared with the worker pool by the daemon.
+    pub busy_jobs: omni_core::busy::BusyJobs,
 }
 
 impl AppState {
@@ -68,6 +71,7 @@ impl AppState {
             health: omni_core::health::HealthState::new(),
             tls_enabled,
             llm,
+            busy_jobs: omni_core::busy::BusyJobs::new(),
         }
     }
 
@@ -75,6 +79,12 @@ impl AppState {
     /// subsystems observed rather than a second, private copy.
     pub fn with_health(mut self, health: omni_core::health::HealthState) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Share the worker pool's busy-job set.
+    pub fn with_busy_jobs(mut self, busy: omni_core::busy::BusyJobs) -> Self {
+        self.busy_jobs = busy;
         self
     }
 

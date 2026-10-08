@@ -586,6 +586,19 @@ pub struct OverridePayload {
     url: String,
 }
 
+/// A worker that was cancelled is still stopping: the job must not start again
+/// in the same workspace yet (plan P7.20).
+fn refuse_while_stopping(state: &AppState, job_id: i64) -> Result<(), ApiError> {
+    if state.busy_jobs.contains(job_id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "STILL_STOPPING",
+            "Η προηγούμενη επεξεργασία αυτού του βίντεο σταματά ακόμη· δοκιμάστε ξανά σε λίγα δευτερόλεπτα.",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn api_override_job(
     RequireMcr(principal): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
@@ -595,6 +608,7 @@ pub async fn api_override_job(
     if !is_submittable_url(&payload.url) {
         return Err(ApiError::bad_request("Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://."));
     }
+    refuse_while_stopping(&state, job_id)?;
     let retried = state
         .repo
         .retry_job(job_id, Some(payload.url.trim()))
@@ -744,6 +758,7 @@ pub async fn api_retry_job(
     AxumPath(job_id): AxumPath<i64>,
     State(state): State<AppState>,
 ) -> JsonResult {
+    refuse_while_stopping(&state, job_id)?;
     let retried = state
         .repo
         .retry_job(job_id, None)
@@ -775,6 +790,7 @@ pub async fn api_redownload_job(
     AxumPath(job_id): AxumPath<i64>,
     State(state): State<AppState>,
 ) -> JsonResult {
+    refuse_while_stopping(&state, job_id)?;
     let done = state
         .repo
         .redownload_job(job_id)
@@ -819,6 +835,42 @@ pub async fn api_mark_done_job(
         &format!("Finished as COMPLETED_MANUAL: put into Dalet by hand by {}", principal.audit_label()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: marked as put into Dalet by hand"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// MCR cancels a video that waits or downloads: the row and its history stay.
+pub async fn api_cancel_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    use omni_core::repository::CancelOutcome;
+    let outcome = state
+        .repo
+        .cancel_job(job_id)
+        .map_err(internal_error("Could not cancel the job."))?;
+    match outcome {
+        CancelOutcome::Cancelled => {}
+        CancelOutcome::TooLate => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "TOO_LATE",
+                "Το αρχείο παραδίδεται αυτή τη στιγμή στο Dalet· δεν ακυρώνεται πια.",
+            ));
+        }
+        CancelOutcome::NotCancellable => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "NOT_CANCELLABLE",
+                "Ακυρώνεται μόνο βίντεο που περιμένει ή κατεβαίνει.",
+            ));
+        }
+    }
+    let _ = state
+        .repo
+        .record_event(job_id, "WARN", None, &format!("Cancelled by {}", principal.audit_label()));
+    audit_action(&state, &principal, &format!("Job #{job_id}: cancelled"));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }

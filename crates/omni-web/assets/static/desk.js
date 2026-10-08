@@ -216,6 +216,20 @@ export async function discardJob(job, after) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
+/** MCR cancels a waiting or running video; the row and its history stay (P7.20). */
+export async function cancelJob(job, after) {
+  const name = fileName(job);
+  if (!confirm(
+    `Ακύρωση του ${name};\n\n` +
+    'Δεν θα σταλεί στο Dalet. Μπορείτε να το ξαναβάλετε στην ουρά από την καρτέλα Email («Δοκιμή ξανά»).',
+  )) return;
+  try {
+    await api(`/api/jobs/${job.id}/cancel`, { method: 'POST' });
+    toast(`Το ${name} ακυρώθηκε.`, 'ok');
+    after();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
 export async function redownloadJob(job, after) {
   const name = deliveredName(job);
   if (!confirm(

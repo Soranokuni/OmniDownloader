@@ -816,10 +816,13 @@ async fn run_daemon(
     // One LLM assist for the watcher, the admin panel and the health check;
     // the panel swaps it when the settings are saved (plan P4.22).
     let live_llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
+    // Jobs a worker is still busy with: a retry from MCR waits for them.
+    let busy_jobs = omni_core::busy::BusyJobs::new();
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
-        .with_llm(live_llm.clone());
+        .with_llm(live_llm.clone())
+        .with_busy_jobs(busy_jobs.clone());
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();
@@ -1011,6 +1014,7 @@ async fn run_daemon(
     let in_flight = Arc::new(Semaphore::new(max_concurrency + max_encoders));
     let mut worker_rx = shutdown_tx.subscribe();
     let repo_worker = repo.clone();
+    let busy_worker = busy_jobs.clone();
     let engine_worker = broadcast_engine.clone();
     let worker_hostname = hostname.clone();
     let worker_gate = update_gate.clone();
@@ -1100,11 +1104,15 @@ async fn run_daemon(
 
             let eng = engine_worker.clone();
             let rep = repo_worker.clone();
+            let busy_guard = busy_worker.guard(job.id);
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
                 // it is what tells a waiting updater the downloader is idle.
                 let _gate_pass = gate_pass;
+                // Until this task is done with the job, MCR cannot queue it
+                // again (a cancelled job stops only at its next stage).
+                let _busy = busy_guard;
                 let job_id = job.id;
                 let (job_slot, download_slot) = permit;
                 eng.hold_download_slot(job_id, download_slot);
@@ -1235,6 +1243,12 @@ fn hostname_for_lease() -> String {
         .unwrap_or_else(|_| "unknown-host".to_string())
 }
 
+/// Whether this worker still holds the job. A failed check counts as lost:
+/// better to stop than to queue or deliver for a job MCR may have cancelled.
+fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
+    repo.owns_lease(job_id, owner).unwrap_or(false)
+}
+
 /// Run one leased job through the pipeline.
 ///
 /// Extracted from the worker loop so the lease, the heartbeat and the permit are
@@ -1346,10 +1360,18 @@ async fn run_job(
                 Some(JobStage::Extract),
                 &format!("The page holds {} videos; this job downloads the first: {}", videos.len(), videos[0]),
             )?;
+            if !still_ours(repo, job_id, owner) {
+                warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+                return Ok(());
+            }
             omni_broadcast::article::queue_article_siblings(repo, owner, &mut job, &videos[0], &videos);
             job.url = videos[0].clone();
             page_referer = Some(orig_url.clone());
         }
+    }
+    if !still_ours(repo, job_id, owner) {
+        warn!("Job #{job_id}: no longer ours; not downloading");
+        return Ok(());
     }
     let mut process_result = if known_unsupported {
         repo.record_event(
@@ -1411,6 +1433,10 @@ async fn run_job(
                         info!("Job #{job_id}: sniffer found {primary}");
                         repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Sniffed stream: {primary}"))?;
                         let mut retry_job = job.clone();
+                        if !still_ours(repo, job_id, owner) {
+                            warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+                            return Ok(());
+                        }
                         omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams);
                         retry_job.url = primary;
                         if !repo.set_stage(job_id, owner, JobStage::Download)? {
