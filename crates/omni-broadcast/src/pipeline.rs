@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use omni_core::models::{Job, JobStage};
@@ -48,6 +49,10 @@ pub const DEFAULT_ENCODER_SLOTS: usize = 2;
 pub struct LeaseLost {
     pub job_id: i64,
     pub stage: JobStage,
+}
+
+fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
+    cancel.as_ref().is_some_and(|t| t.is_cancelled())
 }
 
 #[derive(Clone)]
@@ -159,12 +164,22 @@ impl BroadcastEngine {
     }
 
     /// The error for a job that is no longer ours. Its workspace is removed
-    /// only when the row is gone (discarded): otherwise another worker may
-    /// hold the very same `temp/jobs/{id}` and be reading its source.
+    /// when the row is gone (discarded) or CANCELLED: otherwise another
+    /// worker may hold the very same `temp/jobs/{id}` and be reading its
+    /// source.
+    ///
+    /// A cancelled job's directory goes too (P1.15): a killed download
+    /// leaves a `.part`, and a retry or override of the same job would
+    /// resume it into a different link. That is safe because the retry,
+    /// override and redownload routes answer STILL_STOPPING while this
+    /// worker's BusyJobs guard is alive, and this runs inside its task.
     async fn lost(&self, job_id: i64, stage: JobStage, job_temp: &Path) -> anyhow::Error {
         warn!("Job #{job_id}: no longer ours at {}; stopping without delivering", stage.as_str());
         match self.repo.get_job(job_id) {
             Ok(None) => WatchfolderDelivery::cleanup_job_temp_files(job_temp).await,
+            Ok(Some(row)) if row.status == omni_core::models::JobStatus::Cancelled => {
+                WatchfolderDelivery::cleanup_job_temp_files(job_temp).await
+            }
             Ok(Some(_)) => {}
             Err(e) => warn!("Job #{job_id}: could not tell whether the job still exists, leaving its workspace: {e:#}"),
         }
@@ -186,6 +201,22 @@ impl BroadcastEngine {
         referer: Option<&str>,
         user_agent: Option<&str>,
         cookies: Option<&str>,
+    ) -> Result<()> {
+        self.process_job_cancellable(job, owner, referer, user_agent, cookies, None).await
+    }
+
+    /// [`Self::process_job_with_context`] with the run's token (plan P1.15).
+    /// When it is cancelled the running tool is killed, and whatever error
+    /// the stage then produces comes out as [`LeaseLost`]: the worker writes
+    /// nothing for a job somebody else (MCR) has taken.
+    pub async fn process_job_cancellable(
+        &self,
+        job: Job,
+        owner: &str,
+        referer: Option<&str>,
+        user_agent: Option<&str>,
+        cookies: Option<&str>,
+        cancel: Option<CancellationToken>,
     ) -> Result<()> {
         let job_id = job.id;
         let slug = job.slug.clone();
@@ -221,7 +252,7 @@ impl BroadcastEngine {
                 Some(JobStage::Download),
                 "Source is the file attached to the email; nothing to download",
             );
-            return self.finish_from_source(job, owner, source, job_temp).await;
+            return self.finish_from_source(job, owner, source, job_temp, cancel).await;
         }
 
         // 1. Download stage
@@ -236,6 +267,7 @@ impl BroadcastEngine {
                     referer,
                     user_agent,
                     cookie_header: cookies,
+                    cancel: cancel.clone(),
                     ..Default::default()
                 },
                 move |prog| {
@@ -252,6 +284,9 @@ impl BroadcastEngine {
         let downloaded_file = match raw_download_res {
             Ok(path) => path,
             Err(e) => {
+                if is_cancelled(&cancel) {
+                    return Err(self.lost(job_id, JobStage::Download, &job_temp).await);
+                }
                 // The downloader already classified the failure, so the pipeline
                 // does not have to re-read stderr to decide whether a retry could
                 // possibly help (plan P1.9).
@@ -272,11 +307,18 @@ impl BroadcastEngine {
             }
         };
 
-        self.finish_from_source(job, owner, downloaded_file, job_temp).await
+        self.finish_from_source(job, owner, downloaded_file, job_temp, cancel).await
     }
 
     /// Stages 2–6, from a source file on disk to the watchfolder.
-    async fn finish_from_source(&self, job: Job, owner: &str, downloaded_file: PathBuf, job_temp: PathBuf) -> Result<()> {
+    async fn finish_from_source(
+        &self,
+        job: Job,
+        owner: &str,
+        downloaded_file: PathBuf,
+        job_temp: PathBuf,
+        cancel: Option<CancellationToken>,
+    ) -> Result<()> {
         let job_id = job.id;
         let slug = job.slug.clone();
 
@@ -301,7 +343,14 @@ impl BroadcastEngine {
                     Some(JobStage::Transcode),
                     "Downloaded; waiting for a free encoder",
                 );
-                self.encoder_slots.clone().acquire_owned().await.context("encoder slots closed")?
+                let wait = self.encoder_slots.clone().acquire_owned();
+                match &cancel {
+                    Some(t) => tokio::select! {
+                        _ = t.cancelled() => return Err(self.lost(job_id, JobStage::Transcode, &job_temp).await),
+                        p = wait => p.context("encoder slots closed")?,
+                    },
+                    None => wait.await.context("encoder slots closed")?,
+                }
             }
         };
         // Discarded or taken while it waited for an encoder: do not burn
@@ -312,7 +361,10 @@ impl BroadcastEngine {
         }
         let _ = self.repo.update_job_progress(job_id, 0.0, "Transcoding", "--:--");
 
-        let transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
+        let mut transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
+        if let Some(t) = &cancel {
+            transcoder = transcoder.with_cancel(t.clone());
+        }
 
         // Room for this file before it is made (plan P1.4): a full disk
         // mid-encode fails late, after minutes of work, and can take the
@@ -343,6 +395,9 @@ impl BroadcastEngine {
         let (intermediate_mxf, duration) = match transcode_res {
             Ok(res) => res,
             Err(e) => {
+                if is_cancelled(&cancel) {
+                    return Err(self.lost(job_id, JobStage::Transcode, &job_temp).await);
+                }
                 let err_msg = format!("FFmpeg Transcode failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
@@ -362,10 +417,13 @@ impl BroadcastEngine {
 
         let rewrapper = Rewrapper::new(&self.bmxtranswrap_path);
         let final_temp_mxf = match rewrapper
-            .rewrap_with_clip(job_id, &intermediate_mxf, &job_temp, Some(&slug), None)
+            .rewrap_with_clip(job_id, &intermediate_mxf, &job_temp, Some(&slug), cancel.clone())
             .await {
             Ok(path) => path,
             Err(e) => {
+                if is_cancelled(&cancel) {
+                    return Err(self.lost(job_id, JobStage::Rewrap, &job_temp).await);
+                }
                 let err_msg = format!("bmxtranswrap RDD9 failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
                 let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);

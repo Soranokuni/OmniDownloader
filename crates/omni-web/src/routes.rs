@@ -892,6 +892,8 @@ pub async fn api_cancel_job(
             ));
         }
     }
+    // Stop the running tool now, not at the worker's next stage (P1.15).
+    state.busy_jobs.cancel(job_id);
     let _ = state
         .repo
         .record_event(job_id, "WARN", None, &format!("Cancelled by {}", principal.audit_label()));
@@ -909,6 +911,7 @@ pub async fn api_discard_job(
         .repo
         .delete_job(job_id)
         .map_err(internal_error("Could not discard the job."))?;
+    state.busy_jobs.cancel(job_id);
 
     audit_action(&state, &principal, &format!("Job #{job_id}: discarded"));
     state.broadcast_event("job_deleted");

@@ -316,7 +316,8 @@ async fn a_job_discarded_during_verify_is_not_delivered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_cancelled_during_transcode_is_not_delivered() {
     // P7.20: MCR cancels instead of deleting. The worker stops as for a
-    // discard, but the row, its history and the workspace stay.
+    // discard; the row and its history stay. The workspace goes (P1.15): a
+    // retry or override must not meet a half-written source.
     let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
         eprintln!("WARNING: skipping lost-lease test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
         return;
@@ -347,5 +348,148 @@ async fn a_job_cancelled_during_transcode_is_not_delivered() {
     let row = r.repo.get_job(id).unwrap().expect("the cancelled row is kept");
     assert_eq!(row.status, JobStatus::Cancelled);
     assert!(!r.repo.get_job_events(id, 100).unwrap().is_empty(), "the history was lost");
-    assert!(job_dir(&r, id).exists(), "the workspace of an existing row is left in place");
+    assert!(!job_dir(&r, id).exists(), "a cancelled job's workspace was left for its retry to find");
+}
+
+/// A `secs`-long 1080p25 clip with a tone at `path`: an encode of it to
+/// XDCAM HD422 takes many seconds.
+async fn make_long_source(ffmpeg: &Path, path: &Path, secs: u32) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let video = format!("testsrc2=size=1920x1080:rate=25:duration={secs}");
+    let audio = format!("sine=frequency=1000:sample_rate=48000:duration={secs}");
+    let args: Vec<String> = [
+        "-y", "-v", "error", "-f", "lavfi", "-i", &video, "-f", "lavfi", "-i", &audio, "-c:v", "libx264", "-preset",
+        "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([path.to_string_lossy().into_owned()])
+    .collect();
+    let made = omni_core::process::run(ffmpeg, &args, omni_core::process::RunOpts::new(std::time::Duration::from_secs(300)))
+        .await
+        .unwrap();
+    assert!(made.success, "could not build the long synthetic source");
+}
+
+/// P1.15: a cancel kills the running encode at once. Before, the encode ran
+/// to its end and the worker noticed only at the next stage boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_kills_the_running_encode() {
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping cancel-kills-encode test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    for round in 1..=3 {
+        let r = rig(ffmpeg.clone(), ffprobe.clone(), bmx.clone());
+        let source = r.root.join("attachments").join("long").join("source.mp4");
+        make_long_source(&ffmpeg, &source, 60).await;
+        let id = queue_attachment(&r, Some(&source));
+        let owner = "test:1:A";
+        let job = r.repo.lease_job(owner, 180).unwrap().expect("leasable");
+
+        let busy = omni_core::busy::BusyJobs::new();
+        let guard = busy.guard(id, owner);
+        let token = guard.token();
+        let engine = r.engine.clone();
+        let run = tokio::spawn(async move { engine.process_job_cancellable(job, owner, None, None, None, Some(token)).await });
+
+        let started = std::time::Instant::now();
+        loop {
+            if r.repo.get_job(id).unwrap().map(|j| j.stage) == Some(omni_core::models::JobStage::Transcode) {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 60, "the job never reached TRANSCODE");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Let ffmpeg really start encoding.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // What the cancel route does.
+        assert_eq!(r.repo.cancel_job(id).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+        let cancelled_at = std::time::Instant::now();
+        assert_eq!(busy.cancel(id), 1);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(CANCEL_BOUND_SECS), run)
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the encode was still running {CANCEL_BOUND_SECS} s after the cancel"))
+            .unwrap();
+        let err = result.expect_err("a job cancelled mid-encode must not complete");
+        eprintln!("round {round}: engine stopped {:?} after the cancel", cancelled_at.elapsed());
+        assert!(err.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some(), "{err:#}");
+        assert_nothing_delivered(&r);
+        assert_eq!(r.repo.get_job(id).unwrap().unwrap().status, JobStatus::Cancelled);
+        assert!(
+            !r.repo.get_job_events(id, 100).unwrap().iter().any(|e| e.message.contains("FFmpeg Transcode failed")),
+            "a cancel was written up as a failed transcode"
+        );
+    }
+}
+
+/// Well under a full encode of the 60 s source (about 11 s on the dev machine).
+const CANCEL_BOUND_SECS: u64 = 5;
+
+/// P1.15: a job waiting for a free encoder stops at the cancel, and the job
+/// holding the encoder is not touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_ends_the_wait_for_an_encoder() {
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping encoder-wait cancel test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let mut r = rig(ffmpeg.clone(), ffprobe, bmx);
+    r.engine = r.engine.clone().with_encoder_slots(1);
+    let busy = omni_core::busy::BusyJobs::new();
+
+    let long = r.root.join("attachments").join("1").join("source.mp4");
+    make_long_source(&ffmpeg, &long, 60).await;
+    let short = r.root.join("attachments").join("2").join("source.mp4");
+    make_source(&ffmpeg, &short).await;
+
+    let mut runs = Vec::new();
+    for (n, source, slug) in [(1, &long, "1_DIMITRIOU_LIMANI"), (2, &short, "2_DIMITRIOU_LIMANI")] {
+        let id = queue_attachment_as(&r, Some(source), &format!("attachment://m1@example.gr/{n}"), slug);
+        let owner = format!("test:1:{n}");
+        let job = r.repo.lease_job(&owner, 180).unwrap().expect("leasable");
+        assert_eq!(job.id, id);
+        let guard = busy.guard(id, &owner);
+        let token = guard.token();
+        let engine = r.engine.clone();
+        runs.push((id, guard, tokio::spawn(async move {
+            engine.process_job_cancellable(job, &owner, None, None, None, Some(token)).await
+        })));
+        if n == 1 {
+            // Job 1 must hold the only encoder before job 2 starts.
+            let started = std::time::Instant::now();
+            while r.repo.get_job(id).unwrap().map(|j| j.stage) != Some(omni_core::models::JobStage::Transcode) {
+                assert!(started.elapsed().as_secs() < 60, "job 1 never reached TRANSCODE");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+    let (id1, _g1, run1) = runs.remove(0);
+    let (id2, _g2, run2) = runs.remove(0);
+
+    let started = std::time::Instant::now();
+    while !r.repo.get_job_events(id2, 100).unwrap().iter().any(|e| e.message.contains("waiting for a free encoder")) {
+        assert!(started.elapsed().as_secs() < 60, "job 2 never reached the encoder wait");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(r.repo.cancel_job(id2).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    assert_eq!(busy.cancel(id2), 1);
+    let err = tokio::time::timeout(std::time::Duration::from_secs(3), run2)
+        .await
+        .expect("the cancelled job kept waiting for an encoder")
+        .unwrap()
+        .expect_err("a cancelled job must not complete");
+    assert!(err.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some(), "{err:#}");
+    assert_eq!(r.repo.get_job(id2).unwrap().unwrap().status, JobStatus::Cancelled);
+
+    // Job 1 is untouched: still encoding.
+    assert!(!run1.is_finished(), "cancelling job 2 stopped job 1");
+    assert_eq!(r.repo.get_job(id1).unwrap().unwrap().status, JobStatus::Running);
+    assert_eq!(busy.cancel(id1), 1);
+    let _ = r.repo.cancel_job(id1);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run1).await;
 }

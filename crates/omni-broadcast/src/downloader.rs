@@ -206,6 +206,9 @@ impl Downloader {
             "30".into(),
             "--concurrent-fragments".into(),
             opts.concurrent_fragments.to_string(),
+            // Never resume a `.part` left by an earlier or cancelled run: the
+            // same job may be retried with a different link (P1.15).
+            "--no-continue".into(),
             "--newline".into(),
             "--no-warnings".into(),
             "--no-color".into(),
@@ -543,6 +546,12 @@ mod tests {
             ..Default::default()
         });
         assert!(args.iter().any(|a| a == "--no-check-certificates"));
+    }
+
+    #[test]
+    fn a_stale_part_file_is_never_resumed() {
+        let args = args_for(&DownloadOpts::default());
+        assert!(args.iter().any(|a| a == "--no-continue"), "{args:?}");
     }
 
     #[test]
