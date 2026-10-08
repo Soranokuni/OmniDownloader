@@ -660,6 +660,48 @@ async fn a_video_on_the_desk_names_its_mail_and_the_list_finds_it() -> Result<()
     Ok(())
 }
 
+/// Plan P7.19: a waiting video says its place; one in back-off has none.
+#[tokio::test]
+async fn waiting_videos_get_a_queue_position_and_back_off_ones_do_not() -> Result<()> {
+    let app = App::new()?;
+    let new = |n: u32| omni_core::models::NewJob::new(format!("https://example.gr/q{n}"), format!("{n}_ANNA_QUEUE"), "ANNA");
+    let backoff = app.repo.enqueue(&new(1), 24)?.job_id();
+    app.repo.lease_job("W", 180)?.expect("leasable");
+    assert!(app.repo.requeue_after(backoff, "W", chrono::Duration::minutes(5), "E_TEST", "later")?);
+    let first = app.repo.enqueue(&new(2), 24)?.job_id();
+    let second = app.repo.enqueue(&new(3), 24)?.job_id();
+
+    let (status, page) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    let find = |id: i64| page["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone();
+    assert_eq!(find(first)["queue_position"], 1);
+    assert_eq!(find(second)["queue_position"], 2);
+    assert!(find(backoff).get("queue_position").is_none(), "{}", find(backoff));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_mail_view_gives_a_queue_position_to_ready_videos_only() -> Result<()> {
+    let app = App::new()?;
+    let ready = seed_mail(&app, "<m19@example.gr>", "1. Α\nhttps://example.gr/q19a", "https://example.gr/q19a")?;
+    let mut other = omni_core::models::NewJob::new("https://example.gr/q19b", "2_GEORGIOU_SEISMOS", "GEORGIOU");
+    other.email_message_id = Some("<m19@example.gr>".into());
+    let waiting = app.repo.enqueue(&other, 24)?.job_id();
+    // Lease the second one by hand so it can go into back-off.
+    app.repo.lease_job("W", 180)?; // takes `ready`
+    app.repo.lease_job("W2", 180)?; // takes `waiting`
+    assert!(app.repo.requeue_after(waiting, "W2", chrono::Duration::minutes(5), "E_TEST", "later")?);
+    assert!(app.repo.requeue_after(ready, "W", chrono::Duration::seconds(-1), "E_TEST", "later")?);
+
+    let uri = format!("/api/mails/view?key={}", q("<m19@example.gr>"));
+    let (status, view) = app.send("GET", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let find = |id: i64| view["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone();
+    assert_eq!(find(ready)["queue_position"], 1, "{view}");
+    assert!(find(waiting).get("queue_position").is_none(), "{view}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn mcr_can_mark_a_review_video_as_put_into_dalet_once() -> Result<()> {
     let app = App::new()?;

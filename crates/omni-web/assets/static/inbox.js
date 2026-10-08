@@ -19,8 +19,8 @@
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
-  pager, retryJob, overrideJob, discardJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=5';
+  waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
+} from '/static/desk.js?v=7';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -770,7 +770,7 @@ function jobCard(j) {
 }
 
 const jobSig = (j) => JSON.stringify([j.status, j.stage, pct(j), j.speed, j.eta, j.error_code, j.hint, j.file_path,
-  j.completed_at, j.slug, j.index_str, j.attempts, j.url, j.place, j.max_videos]);
+  j.completed_at, j.slug, j.index_str, j.attempts, j.url, j.place, j.max_videos, waitLine(j), j.status === 'RUNNING' && stepIsLong(j)]);
 
 function paintJob(card, j, force) {
   const sel = !!selected && selected.job === j.id;
@@ -811,13 +811,13 @@ function subLine(j) {
       const step = STAGE_ORDER.indexOf(j.stage);
       left = [step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ` : '', el('span', { class: 'st' }, STAGE_TEXT[j.stage] || 'Σε επεξεργασία')];
       if (j.stage === 'DOWNLOAD' && j.speed && !/^0(\.0+)? /.test(j.speed)) left.push(` · ${j.speed}`);
+      left.push(stepTimeNode(j));
       right = j.stage === 'DOWNLOAD' && j.eta && j.eta !== '--:--' ? `${pct(j)}% · ${j.eta}` : `${pct(j)}%`;
       break;
     }
     case 'PENDING':
-      left = [j.error_code && j.attempts
-        ? `Νέα προσπάθεια σε λίγο (έγιναν ${j.attempts} από ${j.max_attempts})`
-        : 'Σε αναμονή'];
+      left = [waitLine(j)];
+      if (j.attempts >= 1 && j.not_before) left.push(` (έγιναν ${j.attempts} από ${j.max_attempts})`);
       break;
     case 'COMPLETED':
     case 'COMPLETED_MANUAL':

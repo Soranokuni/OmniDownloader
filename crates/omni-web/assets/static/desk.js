@@ -30,6 +30,54 @@ export function stageLine(job) {
   return step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ${text}` : text;
 }
 
+/* Time in the step, place in the queue, next retry (plan P7.19). The server
+ * sends RFC 3339 UTC; a missing or unreadable time shows nothing. */
+const STEP_WARN_MIN = 20;
+
+function msSince(iso, now) {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isNaN(t) ? null : now - t;
+}
+
+/** What a waiting or running video's sub-line adds to the step text.
+ *  PENDING: the retry countdown, the place in the queue, or plain
+ *  «Σε αναμονή». RUNNING: «· σε αυτό το βήμα N′», or '' when unknown. */
+export function waitLine(job, now = Date.now()) {
+  if (job.status === 'PENDING') {
+    const since = msSince(job.not_before, now); // negative while the back-off lasts
+    if (since !== null && since < 0) {
+      const secs = Math.ceil(-since / 1000);
+      return secs < 90 ? `Νέα προσπάθεια σε ${secs}″` : `Νέα προσπάθεια σε ${Math.round(secs / 60)}′`;
+    }
+    const pos = Number(job.queue_position);
+    if (pos > 0) return `Σε αναμονή · ${pos}ο στη σειρά`;
+    return 'Σε αναμονή';
+  }
+  if (job.status === 'RUNNING') {
+    const ms = msSince(job.stage_started_at, now);
+    if (ms === null) return '';
+    const mins = Math.max(0, Math.floor(ms / 60000));
+    return ` · σε αυτό το βήμα ${mins < 1 ? '<1' : mins}′`;
+  }
+  return '';
+}
+
+/** True when a RUNNING video has been in its step longer than it should. */
+export function stepIsLong(job, now = Date.now()) {
+  const ms = job.status === 'RUNNING' ? msSince(job.stage_started_at, now) : null;
+  return ms !== null && ms > STEP_WARN_MIN * 60000;
+}
+
+/** The running video's time in step as a small node (amber when long), or null. */
+export function stepTimeNode(job, now = Date.now()) {
+  const text = waitLine(job, now);
+  if (!text) return null;
+  const long = stepIsLong(job, now);
+  return el('span', long
+    ? { class: 'warn', style: 'color:var(--warn);margin-left:6px', title: 'Ασυνήθιστα πολλή ώρα στο ίδιο βήμα' }
+    : { style: 'margin-left:6px' }, text);
+}
+
 export function statusBadge(job) {
   switch (job.status) {
     case 'PENDING': return el('span', { class: 'badge' }, 'Σε αναμονή');
