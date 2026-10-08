@@ -19,7 +19,7 @@
  * when the desk is opened stays quiet.
  */
 
-import { api, el, toast } from '/static/app.js?v=5';
+import { api, el, toast } from '/static/app.js?v=6';
 
 const POLL_MS = 8000;
 const PREF_KEY = 'omni.mcr.chime';
@@ -176,13 +176,13 @@ let lastBadNews = 0;
 let unseenBad = false;
 let onOpenReview = () => {};
 
-function plainNotification(title, tag) {
+function plainNotification(title, tag, onClick = () => onOpenReview()) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   try {
     const n = new Notification(title, { tag, silent: true });
     n.onclick = () => {
       window.focus();
-      onOpenReview();
+      onClick();
       n.close();
     };
   } catch { /* some browsers allow Notification only from a service worker */ }
@@ -212,6 +212,17 @@ export function watchStatus(data) {
   for (const name of diff.recovered) {
     toast(`Αποκαταστάθηκε: ${CHECK_INFO[name]?.name || name}`, 'ok');
   }
+}
+
+/** The service stopped answering: sound once and say so outside the tab too. */
+export function serviceDown() {
+  alarm();
+  plainNotification('Η υπηρεσία λήψης δεν απαντά', 'omni-offline', () => {});
+}
+
+/** The service answers again (same tag, so it replaces the outage notification). */
+export function serviceBack() {
+  plainNotification('Η υπηρεσία λήψης απαντά ξανά', 'omni-offline', () => {});
 }
 
 function describe(s) {

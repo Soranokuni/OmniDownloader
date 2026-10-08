@@ -2,7 +2,7 @@
 
 import {
   api, el, render, live, toast, fmtTime, statusClass, logout,
-} from '/static/app.js?v=5';
+} from '/static/app.js?v=6';
 
 /** A job's state, for the journalist who sent it. */
 const STATUS_TEXT = {

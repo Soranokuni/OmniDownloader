@@ -147,15 +147,25 @@ export async function api(path, options = {}) {
 
   if (!response.ok) {
     const err = payload && payload.error ? payload.error : {};
-    throw new ApiError(err.code || String(response.status), err.message || 'Το αίτημα απέτυχε.');
+    let message = err.message || 'Το αίτημα απέτυχε.';
+    // The server's internal errors are English; on a Greek page say it in Greek.
+    if (document.documentElement.lang === 'el') {
+      if (err.code === 'INTERNAL') {
+        message = 'Σφάλμα στον διακομιστή. Δοκιμάστε ξανά· αν επαναλαμβάνεται, ενημερώστε τον διαχειριστή.';
+      } else if (err.code === 'NOT_FOUND') {
+        message = 'Δεν βρέθηκε· ίσως αφαιρέθηκε στο μεταξύ.';
+      }
+    }
+    throw new ApiError(err.code || String(response.status), message, response.status);
   }
   return payload;
 }
 
 export class ApiError extends Error {
-  constructor(code, message) {
+  constructor(code, message, status = 0) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 

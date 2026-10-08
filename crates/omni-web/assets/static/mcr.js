@@ -14,15 +14,15 @@
 
 import {
   api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref, icon,
-} from '/static/app.js?v=5';
+} from '/static/app.js?v=6';
 import {
   stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
   redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=4';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=9';
-import { initNotify, watchStatus, CHECK_INFO } from '/static/notify.js?v=6';
+} from '/static/desk.js?v=5';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=11';
+import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=8';
 
 let journalists = [];
 
@@ -46,7 +46,10 @@ function switchTab(name) {
   for (const tab of TABS) {
     const button = document.querySelector(`.tab[data-tab="${tab}"]`);
     const section = document.getElementById(`tab-${tab}`);
-    if (button) button.setAttribute('aria-selected', String(tab === name));
+    if (button) {
+      button.setAttribute('aria-selected', String(tab === name));
+      button.tabIndex = tab === name ? 0 : -1;
+    }
     if (section) section.hidden = tab !== name;
   }
   document.body.classList.toggle('desk-wide', name === 'email');
@@ -57,7 +60,27 @@ function switchTab(name) {
 
 for (const button of document.querySelectorAll('.tab[data-tab]')) {
   button.addEventListener('click', () => switchTab(button.dataset.tab));
+  // Arrow keys, Home and End move to a tab and open it (WAI-ARIA tabs pattern).
+  button.addEventListener('keydown', (ev) => {
+    const at = TABS.indexOf(button.dataset.tab);
+    let to = -1;
+    if (ev.key === 'ArrowRight') to = (at + 1) % TABS.length;
+    else if (ev.key === 'ArrowLeft') to = (at - 1 + TABS.length) % TABS.length;
+    else if (ev.key === 'Home') to = 0;
+    else if (ev.key === 'End') to = TABS.length - 1;
+    if (to < 0) return;
+    ev.preventDefault();
+    switchTab(TABS[to]);
+    document.getElementById(`tabbtn-${TABS[to]}`)?.focus();
+  });
 }
+
+// A link or back/forward that changes only the hash. switchTab's replaceState
+// does not fire this, so there is no loop.
+window.addEventListener('hashchange', () => {
+  const name = tabFromHash();
+  if (name !== currentTab) switchTab(name);
+});
 
 /* ------------------------------------------------------------------ *
  * Status bar
@@ -84,15 +107,74 @@ async function loadStatus() {
   }
 }
 
+// Consecutive status loads that failed because the service is not answering
+// (no connection, or a 5xx). Two in a row (~10 s) raise the banner.
+const OUTAGE_AFTER = 2;
+let outageFails = 0;
+let outageSince = null;
+let outageShown = false;
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function showOutage() {
+  const at = `${pad2(outageSince.getHours())}:${pad2(outageSince.getMinutes())}`;
+  // Shown before it is filled: a live region that is display:none while its
+  // text arrives may not be announced by a screen reader.
+  const banner = document.getElementById('offline-banner');
+  banner.hidden = false;
+  render(banner, el('div', { class: 'card attention' },
+    el('strong', {}, 'Η υπηρεσία λήψης δεν απαντά'),
+    ` από ${at}`,
+    el('div', { style: 'margin-top:8px' },
+      'Οι λίστες δεν ενημερώνονται και οι λήψεις μπορεί να έχουν σταματήσει. Αν δεν επανέλθει σε λίγα λεπτά, ενημερώστε τον διαχειριστή.'),
+  ));
+}
+
+function noteStatusFailure(e) {
+  if (e.code !== 'NETWORK' && !(e.status >= 500)) return;
+  outageFails += 1;
+  if (outageFails === 1) outageSince = new Date();
+  if (outageFails >= OUTAGE_AFTER && !outageShown) {
+    outageShown = true;
+    showOutage();
+    serviceDown();
+  }
+}
+
+function noteStatusSuccess() {
+  outageFails = 0;
+  outageSince = null;
+  if (!outageShown) return;
+  outageShown = false;
+  document.getElementById('offline-banner').hidden = true;
+  toast('Η υπηρεσία λήψης απαντά ξανά.', 'ok');
+  serviceBack();
+  refresh();
+}
+
+// A service that accepts the connection but never answers (frozen) would
+// keep this request, and the single-flight lock, pending forever: the banner
+// would never rise. Past the deadline it counts as not answering.
+const STATUS_DEADLINE_MS = 15000;
+function statusWithDeadline() {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error('Η υπηρεσία λήψης δεν απαντά.'), { code: 'NETWORK' })), STATUS_DEADLINE_MS);
+  });
+  return Promise.race([api('/api/system/status'), late]).finally(() => clearTimeout(timer));
+}
+
 async function loadStatusOnce() {
   let data;
   try {
-    data = await api('/api/system/status');
-  } catch {
+    data = await statusWithDeadline();
+  } catch (e) {
     setStatus('mail', 'Email: άγνωστο', 'bad', '');
     setStatus('llm', 'LLM: άγνωστο', 'bad', '');
+    noteStatusFailure(e);
     return;
   }
+  noteStatusSuccess();
 
   const checks = data.checks || {};
 
@@ -217,7 +299,12 @@ async function refresh() {
 }
 
 function failed(e) {
-  if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+  if (e.code === 'UNAUTHENTICATED') return;
+  // The lists reload every 5 s: an unreachable service is the outage
+  // banner's to say (within ~10 s), not a toast per list per poll. Actions
+  // MCR clicks report their own errors.
+  if (e.code === 'NETWORK') return;
+  toast(e.message, 'bad');
 }
 
 /* «Email: …»: from a video to the mail it came from, opened in the Email
@@ -794,7 +881,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') specsModal
 
 document.getElementById('logout-btn').addEventListener('click', logout);
 
-initInbox({ onCounts: showCounts, refresh: () => refresh(), groupName });
+initInbox({ onCounts: showCounts, refresh: () => refresh(), groupName, onLoadError: failed });
 // Jingle and notification when every video of an email has finished (P5.4).
 initNotify(document.querySelector('.topbar-status'), (id) => {
   const cut = id.indexOf(':');

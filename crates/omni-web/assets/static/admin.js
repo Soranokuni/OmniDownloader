@@ -5,7 +5,7 @@
  * to `innerHTML`; here they are text nodes.
  */
 
-import { api, el, render, toast, fmtTime, logout } from '/static/app.js?v=5';
+import { api, el, render, toast, fmtTime, logout } from '/static/app.js?v=6';
 
 /* ------------------------------------------------------------------ *
  * Dependencies
