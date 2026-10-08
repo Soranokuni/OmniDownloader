@@ -209,6 +209,10 @@ impl Downloader {
             // Never resume a `.part` left by an earlier or cancelled run: the
             // same job may be retried with a different link (P1.15).
             "--no-continue".into(),
+            // Nor take a complete `source.*` left in a kept workspace (a
+            // restart or reap, then an override to a new link) as "already
+            // downloaded": that would deliver the old link's video (P1.16).
+            "--force-overwrites".into(),
             "--newline".into(),
             "--no-warnings".into(),
             "--no-color".into(),
@@ -552,6 +556,13 @@ mod tests {
     fn a_stale_part_file_is_never_resumed() {
         let args = args_for(&DownloadOpts::default());
         assert!(args.iter().any(|a| a == "--no-continue"), "{args:?}");
+    }
+
+    #[test]
+    fn a_leftover_complete_file_is_never_taken_as_already_downloaded() {
+        let args = args_for(&DownloadOpts::default());
+        assert!(args.iter().any(|a| a == "--force-overwrites"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--no-overwrites" || a == "-w"), "{args:?}");
     }
 
     #[test]
