@@ -320,6 +320,18 @@ pub struct JobCounts {
     pub completed: i64,
 }
 
+/// What the `queue` health check looks at (plan P7.19).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueWatch {
+    /// PENDING jobs `lease_job` could take now (not in back-off).
+    pub waiting: i64,
+    pub running: i64,
+    /// How long the oldest ready PENDING job has waited.
+    pub oldest_ready_wait_secs: Option<i64>,
+    /// The RUNNING job with the oldest `stage_started_at`: (job id, stage, secs).
+    pub longest_step: Option<(i64, String, i64)>,
+}
+
 /// Queue depth, for the status panel (plan P6.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueSummary {

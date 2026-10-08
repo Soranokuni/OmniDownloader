@@ -12,7 +12,7 @@ use crate::auth::{hash_password, verify_password};
 use crate::migrations;
 use crate::models::{
     AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob,
-    ProcessedMail, QueueSummary, User,
+    ProcessedMail, QueueSummary, QueueWatch, User,
     UserRole,
 };
 use crate::taxonomy::{Group, ImportReport, Person, Taxonomy};
@@ -489,7 +489,7 @@ impl Repository {
                 SELECT id FROM queue
                 WHERE status = 'PENDING'
                   AND (not_before IS NULL OR not_before <= ?)
-                ORDER BY priority DESC, created_at ASC
+                ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1
                 "#,
                 params![now],
@@ -531,6 +531,63 @@ impl Repository {
         tx.commit()?;
 
         self.get_job(id)
+    }
+
+    /// 1-based place in the queue of every PENDING job `lease_job` could take
+    /// now, in its order. Jobs in back-off have no place (plan P7.19).
+    pub fn pending_positions(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id FROM queue
+            WHERE status = 'PENDING'
+              AND (not_before IS NULL OR not_before <= ?)
+            ORDER BY priority DESC, created_at ASC, id ASC
+            "#,
+        )?;
+        let ids = stmt
+            .query_map(params![timestamps::now_string()], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids.into_iter().zip(1..).collect())
+    }
+
+    /// Waiting and running figures for the `queue` health check (plan P7.19).
+    pub fn queue_watch(&self, now: chrono::DateTime<Utc>) -> Result<QueueWatch> {
+        let conn = self.pool.get()?;
+        let now_s = timestamps::format(now);
+        let (waiting, oldest): (i64, Option<String>) = conn.query_row(
+            r#"
+            SELECT COUNT(*), MIN(updated_at) FROM queue
+            WHERE status = 'PENDING' AND (not_before IS NULL OR not_before <= ?)
+            "#,
+            params![now_s],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM queue WHERE status = 'RUNNING'",
+            [],
+            |r| r.get(0),
+        )?;
+        let step: Option<(i64, String, Option<String>)> = conn
+            .query_row(
+                r#"
+                SELECT id, stage, stage_started_at FROM queue
+                WHERE status = 'RUNNING' AND stage_started_at IS NOT NULL
+                ORDER BY stage_started_at ASC LIMIT 1
+                "#,
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let secs = |raw: Option<String>| {
+            timestamps::parse_opt(raw).map(|t| (now - t).num_seconds().max(0))
+        };
+        Ok(QueueWatch {
+            waiting,
+            running,
+            oldest_ready_wait_secs: secs(oldest),
+            longest_step: step.and_then(|(id, stage, at)| secs(at).map(|s| (id, stage, s))),
+        })
     }
 
     /// Extend the lease. Called every ~30 s by the worker that holds it.
@@ -615,7 +672,9 @@ impl Repository {
         let slug = format!("{}_{}_{}", job.index_str, job.journalist, keyword);
         let conn = self.pool.get()?;
         let changed = conn.execute(
-            "UPDATE queue SET keyword = ?, slug = ?, updated_at = ?
+            // A waiting job keeps its updated_at: it is the start of its wait (plan P7.19).
+            "UPDATE queue SET keyword = ?, slug = ?,
+                    updated_at = CASE WHEN status = 'PENDING' THEN updated_at ELSE ? END
              WHERE id = ?
                AND (status IN ('PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED')
                     OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))",
@@ -2557,6 +2616,88 @@ mod tests {
         assert!(!repo.owns_lease(id, "B")?);
         repo.delete_job(id)?;
         assert!(!repo.owns_lease(id, "A")?, "a deleted row is nobody's");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_positions_follow_lease_order_and_skip_backoff() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let mut ids = Vec::new();
+        for n in 0..4 {
+            let job = NewJob::new(format!("https://example.gr/p{n}"), format!("{n}_ANNA_TEST"), "ANNA");
+            ids.push(repo.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id());
+        }
+        {
+            let conn = repo.pool.get()?;
+            // ids[0] oldest, ids[1] newer, ids[2] high priority but newest, ids[3] in back-off.
+            for (i, id) in ids.iter().enumerate() {
+                conn.execute(
+                    "UPDATE queue SET created_at = ? WHERE id = ?",
+                    params![format!("2030-01-01T00:00:0{i}.000Z"), id],
+                )?;
+            }
+            conn.execute("UPDATE queue SET priority = 9 WHERE id = ?", params![ids[2]])?;
+            conn.execute(
+                "UPDATE queue SET not_before = '2999-01-01T00:00:00.000Z' WHERE id = ?",
+                params![ids[3]],
+            )?;
+        }
+        let pos = repo.pending_positions()?;
+        assert_eq!(pos.get(&ids[2]), Some(&1), "priority first");
+        assert_eq!(pos.get(&ids[0]), Some(&2));
+        assert_eq!(pos.get(&ids[1]), Some(&3));
+        assert_eq!(pos.get(&ids[3]), None, "back-off has no place");
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_a_waiting_job_does_not_restart_its_wait() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/r", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        {
+            let conn = repo.pool.get()?;
+            conn.execute("UPDATE queue SET updated_at = '2030-01-01T00:00:00.000Z' WHERE id = ?", params![id])?;
+        }
+        assert!(repo.rename_job_keyword(id, "NEWWORD")?.is_some());
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.keyword, "NEWWORD");
+        assert_eq!(timestamps::format(job.updated_at.unwrap()), "2030-01-01T00:00:00.000Z");
+        Ok(())
+    }
+
+    #[test]
+    fn queue_watch_reports_oldest_wait_and_longest_step() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let now = Utc::now();
+        assert_eq!(repo.queue_watch(now)?, QueueWatch::default());
+
+        let a = repo.enqueue(&NewJob::new("https://example.gr/a", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let b = repo.enqueue(&NewJob::new("https://example.gr/b", "2_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let c = repo.enqueue(&NewJob::new("https://example.gr/c", "3_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let d = repo.enqueue(&NewJob::new("https://example.gr/d", "4_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let leased = repo.lease_job("A", 180)?.expect("leasable");
+        {
+            let conn = repo.pool.get()?;
+            let ago = |m: i64| timestamps::format(now - Duration::minutes(m));
+            // Leased job is the one with the highest priority, oldest created_at: a.
+            assert_eq!(leased.id, a);
+            conn.execute("UPDATE queue SET stage = 'DOWNLOAD', stage_started_at = ? WHERE id = ?", params![ago(35), a])?;
+            conn.execute("UPDATE queue SET updated_at = ? WHERE id = ?", params![ago(42), b])?;
+            conn.execute("UPDATE queue SET updated_at = ? WHERE id = ?", params![ago(10), c])?;
+            // In back-off and very old: must not count as waiting.
+            conn.execute(
+                "UPDATE queue SET updated_at = ?, not_before = '2999-01-01T00:00:00.000Z' WHERE id = ?",
+                params![ago(500), d],
+            )?;
+        }
+        let w = repo.queue_watch(now)?;
+        assert_eq!(w.waiting, 2);
+        assert_eq!(w.running, 1);
+        assert_eq!(w.oldest_ready_wait_secs, Some(42 * 60));
+        assert_eq!(w.longest_step, Some((a, "DOWNLOAD".to_string(), 35 * 60)));
         Ok(())
     }
 

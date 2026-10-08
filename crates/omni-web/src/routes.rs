@@ -404,11 +404,20 @@ pub async fn api_get_jobs(
         // Which mail each came from, so the desk can open it (plan P7.11).
         let keys: Vec<String> = page.jobs.iter().filter_map(|j| j.email_message_id.clone()).collect();
         let subjects = state.repo.mail_subjects(&keys).unwrap_or_default();
+        // Place in the queue, for waiting jobs on the live view (plan P7.19).
+        let positions = if view == omni_core::models::JobsView::Live {
+            state.repo.pending_positions().unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let jobs: Vec<serde_json::Value> = page
             .jobs
             .iter()
             .map(|j| {
                 let mut v = job_for_desk(j);
+                if let Some(pos) = positions.get(&j.id) {
+                    v["queue_position"] = serde_json::json!(pos);
+                }
                 if let Some(subject) = j.email_message_id.as_ref().and_then(|k| subjects.get(k)) {
                     v["mail_subject"] = serde_json::Value::String(subject.clone());
                 }
@@ -1911,12 +1920,17 @@ pub async fn api_get_mail_view(
     let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
 
     let by_id: HashMap<i64, &omni_core::models::Job> = jobs.iter().map(|j| (j.id, j)).collect();
+    // The Email tab's cards say the place in the queue too (plan P7.19).
+    let positions = state.repo.pending_positions().unwrap_or_default();
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
                 let mut v = job_for_desk(j);
+                if let Some(pos) = positions.get(&j.id) {
+                    v["queue_position"] = serde_json::json!(pos);
+                }
                 v["place"] = serde_json::json!({ "link": p.link, "parent": p.parent, "shared": p.shared });
                 v
             })

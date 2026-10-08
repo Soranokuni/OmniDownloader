@@ -16,12 +16,12 @@ import {
   api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
 import {
-  stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
+  stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
   redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=5';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=11';
+} from '/static/desk.js?v=7';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=13';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=8';
 
 let journalists = [];
@@ -431,7 +431,10 @@ function activeCard(job) {
     ),
     el('div', {},
       el('div', { class: 'job-meta' },
-        el('span', {}, stageLine(job), running && job.speed && job.stage === 'DOWNLOAD' ? ` @ ${job.speed}` : ''),
+        el('span', {},
+          running ? stageLine(job) : waitLine(job),
+          running && job.speed && job.stage === 'DOWNLOAD' ? ` @ ${job.speed}` : '',
+          running ? stepTimeNode(job) : null),
         el('span', {}, running ? `${progress.toFixed(0)}%` : ''),
       ),
       running

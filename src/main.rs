@@ -959,6 +959,7 @@ async fn run_daemon(
     // 6. Lease reaper: requeue jobs whose owner died without releasing them.
     {
         let repo_reaper = repo.clone();
+        let queue_health = health.clone();
         let mut reaper_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(LEASE_REAP_INTERVAL);
@@ -972,6 +973,18 @@ async fn run_daemon(
                                 "Lease reaper: {requeued} job(s) requeued, {review} sent to review"
                             ),
                             Err(e) => error!("Lease reaper failed: {e:?}"),
+                        }
+                        match repo_reaper.queue_watch(chrono::Utc::now()) {
+                            Ok(w) => {
+                                let was_degraded = queue_health
+                                    .get(omni_core::health::checks::QUEUE)
+                                    .is_some_and(|c| c.state == omni_core::health::Health::Degraded);
+                                queue_health.set_if_changed(
+                                    omni_core::health::checks::QUEUE,
+                                    queue_check(&w, was_degraded),
+                                );
+                            }
+                            Err(e) => warn!("Queue check could not read the queue: {e:?}"),
                         }
                     }
                 }
@@ -1185,6 +1198,32 @@ async fn run_daemon(
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const LEASE_SECS: i64 = 180;
 const LEASE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A ready video waiting, or one step running, longer than this is a warning.
+const QUEUE_SLOW_SECS: i64 = 30 * 60;
+
+/// Once degraded, the check recovers only when both measures are under this,
+/// so a backlog hovering near 30 min does not alarm on every edge.
+const QUEUE_RECOVER_SECS: i64 = 25 * 60;
+
+/// The `queue` health check (plan P7.19). Never `down`: a slow queue is a warning.
+fn queue_check(w: &omni_core::models::QueueWatch, was_degraded: bool) -> omni_core::health::Check {
+    use omni_core::health::Check;
+    let limit = if was_degraded { QUEUE_RECOVER_SECS } else { QUEUE_SLOW_SECS };
+    let counts = format!("{} waiting, {} running", w.waiting, w.running);
+    let mut problems = Vec::new();
+    if let Some(secs) = w.oldest_ready_wait_secs.filter(|s| *s > limit) {
+        problems.push(format!("a video has waited {} min", secs / 60));
+    }
+    if let Some((id, stage, secs)) = w.longest_step.as_ref().filter(|(_, _, s)| *s > limit) {
+        problems.push(format!("job #{id} has been in {stage} for {} min", secs / 60));
+    }
+    if problems.is_empty() {
+        Check::ok(counts)
+    } else {
+        Check::degraded(format!("{}; {counts}", problems.join("; ")))
+    }
+}
 
 /// Host component of a lease owner string.
 ///
@@ -2159,6 +2198,59 @@ async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, ke
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omni_core::health::Health;
+    use omni_core::models::QueueWatch;
+
+    #[test]
+    fn queue_check_is_ok_until_something_is_slow_and_never_down() {
+        let ok = queue_check(&QueueWatch {
+            waiting: 2,
+            running: 1,
+            oldest_ready_wait_secs: Some(QUEUE_SLOW_SECS),
+            longest_step: Some((3, "DOWNLOAD".into(), 60)),
+        }, false);
+        assert_eq!(ok.state, Health::Ok);
+        assert_eq!(ok.detail.as_deref(), Some("2 waiting, 1 running"));
+
+        let wait = queue_check(&QueueWatch {
+            waiting: 1,
+            running: 0,
+            oldest_ready_wait_secs: Some(42 * 60 + 5),
+            longest_step: None,
+        }, false);
+        assert_eq!(wait.state, Health::Degraded);
+        assert!(wait.detail.unwrap().contains("a video has waited 42 min"));
+
+        let step = queue_check(&QueueWatch {
+            waiting: 0,
+            running: 1,
+            oldest_ready_wait_secs: None,
+            longest_step: Some((17, "DOWNLOAD".into(), 35 * 60)),
+        }, false);
+        assert_eq!(step.state, Health::Degraded);
+        assert!(step.detail.unwrap().contains("job #17 has been in DOWNLOAD for 35 min"));
+
+        let both = queue_check(&QueueWatch {
+            waiting: 1,
+            running: 1,
+            oldest_ready_wait_secs: Some(42 * 60),
+            longest_step: Some((17, "DOWNLOAD".into(), 35 * 60)),
+        }, false);
+        assert_eq!(both.state, Health::Degraded);
+        let d = both.detail.unwrap();
+        assert!(d.contains("a video has waited 42 min") && d.contains("job #17 has been in DOWNLOAD for 35 min"));
+
+        // Hysteresis: 27 min stays degraded once degraded, is ok when not; 24 min recovers.
+        let near = |mins: i64, was: bool| queue_check(&QueueWatch {
+            waiting: 1,
+            running: 1,
+            oldest_ready_wait_secs: Some(mins * 60),
+            longest_step: Some((5, "DOWNLOAD".into(), mins * 60)),
+        }, was);
+        assert_eq!(near(27, true).state, Health::Degraded);
+        assert_eq!(near(27, false).state, Health::Ok);
+        assert_eq!(near(24, true).state, Health::Ok);
+    }
 
     /// Job #20 (2026-10-08): the card said PIPELINE_FAILED; the reason was only
     /// in the timeline.
