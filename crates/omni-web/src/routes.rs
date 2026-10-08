@@ -786,6 +786,34 @@ pub async fn api_redownload_job(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+/// MCR put the video into Dalet by hand: the job is recorded as done.
+pub async fn api_mark_done_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let done = state
+        .repo
+        .mark_completed_manually(job_id)
+        .map_err(internal_error("Could not mark the job as done."))?;
+    if !done {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "NOT_MARKABLE",
+            "Μόνο ένα βίντεο που περιμένει έλεγχο μπορεί να σημειωθεί ως παραδομένο χειροκίνητα.",
+        ));
+    }
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Finished as COMPLETED_MANUAL: put into Dalet by hand by {}", principal.audit_label()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: marked as put into Dalet by hand"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
 pub async fn api_discard_job(
     RequireMcr(principal): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,

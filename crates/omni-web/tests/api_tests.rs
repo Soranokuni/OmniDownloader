@@ -659,3 +659,39 @@ async fn a_video_on_the_desk_names_its_mail_and_the_list_finds_it() -> Result<()
     assert_eq!(list["entries"][0]["key"], "<m9@example.gr>");
     Ok(())
 }
+
+#[tokio::test]
+async fn mcr_can_mark_a_review_video_as_put_into_dalet_once() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/locker", "1_NIKOLAOU_LOCKER", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+
+    // A running job is refused.
+    let uri = format!("/api/jobs/{id}/mark-done");
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "NOT_MARKABLE");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Running);
+
+    app.repo
+        .finish(id, "test-worker", JobStatus::RequiresReview, Some("E_TEST"), Some("why"), None)?;
+    let (status, _) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::CompletedManual);
+    let events = app.repo.get_job_events(id, 100)?;
+    assert!(
+        events.iter().any(|e| e.message.starts_with("Finished as COMPLETED_MANUAL: put into Dalet by hand")),
+        "no event recorded"
+    );
+
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "NOT_MARKABLE");
+    Ok(())
+}

@@ -182,6 +182,20 @@ export async function redownloadJob(job, after) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
+/** MCR put the video into Dalet by hand: record it as done (P7.16). */
+export async function markDoneJob(job, after) {
+  const name = fileName(job);
+  if (!confirm(
+    `Σημείωση του ${name} ως παραδομένου χειροκίνητα;\n\n` +
+    'Βεβαιωθείτε ότι το βίντεο είναι ήδη στο Dalet: από εδώ δεν θα σταλεί αρχείο.',
+  )) return;
+  try {
+    await api(`/api/jobs/${job.id}/mark-done`, { method: 'POST' });
+    toast(`Το ${name} σημειώθηκε ως παραδομένο.`, 'ok');
+    after();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
 /** Queue one of the videos the sniffer found in a job's article. */
 export async function queueOffer(jobId, offer, after) {
   try {
