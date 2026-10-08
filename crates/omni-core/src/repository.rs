@@ -1079,31 +1079,29 @@ impl Repository {
         Ok(n > 0)
     }
 
-    pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<()> {
+    /// MCR's «Δοκιμή ξανά» / «Χρήση αυτού του συνδέσμου»: the job starts a
+    /// clean new run, like a fresh queue entry (attempts, error, back-off and
+    /// lease all reset). Refused (`false`) for a running or delivered job:
+    /// a worker still holds the lease of the first, and the second has its
+    /// own action, `redownload_job`.
+    pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<bool> {
         let conn = self.pool.get()?;
-        if let Some(url) = new_url {
-            conn.execute(
-                r#"
-                UPDATE queue
-                SET url = ?, status = 'PENDING', progress = 0.0, speed = '0 Mbps', eta = '--:--',
-                    error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                WHERE id = ?
-                "#,
-                params![url, id],
-            )?;
-        } else {
-            conn.execute(
-                r#"
-                UPDATE queue
-                SET status = 'PENDING', progress = 0.0, speed = '0 Mbps', eta = '--:--',
-                    error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                WHERE id = ?
-                "#,
-                params![id],
-            )?;
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
+                completed_at = NULL, url = COALESCE(?, url),
+                url_normalized = COALESCE(?, url_normalized), updated_at = ?
+            WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED')
+            "#,
+            params![new_url, new_url.map(crate::urlnorm::normalize), timestamps::now_string(), id],
+        )?;
+        if n > 0 {
+            self.log_audit("INFO", "QUEUE", &format!("Retried Job #{}", id))?;
         }
-        self.log_audit("INFO", "QUEUE", &format!("Retried Job #{}", id))?;
-        Ok(())
+        Ok(n > 0)
     }
 
     pub fn delete_job(&self, id: i64) -> Result<()> {
@@ -2539,6 +2537,97 @@ mod tests {
         assert!(!repo.owns_lease(id, "B")?);
         repo.delete_job(id)?;
         assert!(!repo.owns_lease(id, "A")?, "a deleted row is nobody's");
+        Ok(())
+    }
+
+    #[test]
+    fn a_retried_job_starts_a_clean_run() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/v", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.lease_job("A", 180)?.expect("leasable");
+        assert!(repo.finish(id, "A", JobStatus::RequiresReview, Some("E_TEST"), Some("boom"), None)?);
+        {
+            let conn = repo.pool.get()?;
+            conn.execute(
+                "UPDATE queue SET attempts = max_attempts, not_before = '2999-01-01T00:00:00.000Z' WHERE id = ?",
+                params![id],
+            )?;
+        }
+        let before = repo.get_job(id)?.unwrap();
+        assert!(before.attempts > 0 && before.error_code.is_some() && before.not_before.is_some());
+
+        assert!(repo.retry_job(id, None)?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.stage, JobStage::Queued);
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.not_before, None);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.lease_expires_at, None);
+        assert_eq!(job.stage_started_at, None);
+        assert_eq!(job.completed_at, None);
+        assert!(repo.lease_job("B", 180)?.is_some(), "a cleared not_before lets it lease at once");
+        Ok(())
+    }
+
+    #[test]
+    fn retry_is_allowed_exactly_for_the_waiting_and_stopped_statuses() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let cases = [
+            (JobStatus::Pending, true),
+            (JobStatus::RequiresReview, true),
+            (JobStatus::ManualDownload, true),
+            (JobStatus::Failed, true),
+            (JobStatus::Cancelled, true),
+            (JobStatus::Completed, false),
+            (JobStatus::CompletedManual, false),
+        ];
+        for (n, (status, allowed)) in cases.into_iter().enumerate() {
+            let url = format!("https://example.gr/v{n}");
+            let id = repo.enqueue(&NewJob::new(&url, &format!("{n}_ANNA_TEST"), "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+            repo.update_job_status(id, status, None, None, None)?;
+            assert_eq!(repo.retry_job(id, None)?, allowed, "{}", status.as_str());
+            let expected = if allowed { JobStatus::Pending } else { status };
+            assert_eq!(repo.get_job(id)?.unwrap().status, expected, "{}", status.as_str());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_override_moves_the_dedup_key_with_the_link() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/dead", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.update_job_status(id, JobStatus::RequiresReview, None, None, None)?;
+        assert!(repo.retry_job(id, Some("https://example.gr/works"))?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.url, "https://example.gr/works");
+        assert_eq!(job.url_normalized.as_deref(), Some(crate::urlnorm::normalize("https://example.gr/works").as_str()));
+        // A plain retry keeps the link and its key.
+        repo.update_job_status(id, JobStatus::Failed, None, None, None)?;
+        assert!(repo.retry_job(id, None)?);
+        assert_eq!(repo.get_job(id)?.unwrap().url_normalized, job.url_normalized);
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_or_delivered_job_cannot_be_retried() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/v", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.lease_job("A", 180)?.expect("leasable");
+        assert!(!repo.retry_job(id, Some("https://example.gr/other"))?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.lease_owner.as_deref(), Some("A"));
+        assert_eq!(job.url, "https://example.gr/v");
+
+        assert!(repo.finish(id, "A", JobStatus::Completed, None, None, Some("x.mxf"))?);
+        assert!(!repo.retry_job(id, None)?);
+        assert_eq!(repo.get_job(id)?.unwrap().status, JobStatus::Completed);
         Ok(())
     }
 

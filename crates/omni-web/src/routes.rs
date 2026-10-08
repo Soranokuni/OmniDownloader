@@ -586,10 +586,13 @@ pub async fn api_override_job(
     if !is_submittable_url(&payload.url) {
         return Err(ApiError::bad_request("Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://."));
     }
-    state
+    let retried = state
         .repo
         .retry_job(job_id, Some(payload.url.trim()))
         .map_err(internal_error("Could not update the job."))?;
+    if !retried {
+        return Err(not_retryable());
+    }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: URL overridden"));
     state.broadcast_event("job_updated");
@@ -718,15 +721,27 @@ pub async fn api_queue_offer(
     Ok(Json(serde_json::json!({ "status": "ok", "job_id": result.job_id(), "index_str": index })))
 }
 
+/// A running or delivered job is not retried (P7.13).
+fn not_retryable() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "NOT_RETRYABLE",
+        "Αυτό το βίντεο κατεβαίνει αυτή τη στιγμή ή έχει ήδη παραδοθεί. Για νέο αρχείο από παραδομένο βίντεο, πατήστε «Νέα λήψη».",
+    )
+}
+
 pub async fn api_retry_job(
     RequireMcr(principal): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
     State(state): State<AppState>,
 ) -> JsonResult {
-    state
+    let retried = state
         .repo
         .retry_job(job_id, None)
         .map_err(internal_error("Could not retry the job."))?;
+    if !retried {
+        return Err(not_retryable());
+    }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
     state.broadcast_event("job_updated");

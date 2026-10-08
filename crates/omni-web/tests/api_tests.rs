@@ -211,6 +211,22 @@ async fn jobs_api_full_lifecycle() -> Result<()> {
         JobStatus::Pending
     );
 
+    // 4b. A running job is not retried or overridden
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    for (path, body) in [
+        ("retry", None),
+        ("override", Some(json!({"url": "https://www.youtube.com/watch?v=other"}))),
+    ] {
+        let (status, json) = app
+            .send("POST", &format!("/api/jobs/{}/{}", job_id, path), &app.mcr_token, body)
+            .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}");
+        assert_eq!(json["error"]["code"], "NOT_RETRYABLE", "{path}");
+        let row = app.repo.get_job(job_id)?.unwrap();
+        assert_eq!(row.status, JobStatus::Running);
+        assert_eq!(row.lease_owner.as_deref(), Some("test-worker"));
+    }
+
     // 5. Discard
     let (status, _) = app
         .send(
