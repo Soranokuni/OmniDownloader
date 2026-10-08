@@ -202,3 +202,113 @@ async fn a_video_renamed_while_it_downloads_is_delivered_under_the_new_name() {
     assert!(r.root.join("watchfolder").join("1_DIMITRIOU_LIMANICHANION.mxf").exists(), "delivered under the new name");
     assert!(!r.root.join("watchfolder").join("1_DIMITRIOU_LIMANI.mxf").exists());
 }
+
+/// What a worker that lost its lease must leave behind: nothing on air, no
+/// half-built files, no workspace.
+fn assert_nothing_delivered(r: &Rig) {
+    let left: Vec<_> = std::fs::read_dir(r.root.join("watchfolder"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "the watchfolder holds {left:?}");
+}
+
+fn job_dir(r: &Rig, id: i64) -> PathBuf {
+    r.root.join("temp").join("jobs").join(id.to_string())
+}
+
+#[tokio::test]
+async fn a_discarded_job_is_never_delivered() {
+    // P1.14: MCR removed the job while it was running; set_stage said so
+    // and the engine ignored it, so the file still went to air.
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping lost-lease test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let r = rig(ffmpeg.clone(), ffprobe, bmx);
+    let source = r.root.join("attachments").join("gone").join("source.mp4");
+    make_source(&ffmpeg, &source).await;
+    let id = queue_attachment(&r, Some(&source));
+    let job = r.repo.lease_job("test:1:A", 180).unwrap().expect("leasable");
+    r.repo.delete_job(id).unwrap();
+
+    let err = r.engine.process_job(job, "test:1:A").await.expect_err("a discarded job must not complete");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("LEASE_EXPIRED"), "{chain}");
+    assert_nothing_delivered(&r);
+    assert!(!job_dir(&r, id).exists(), "the discarded job's workspace was left behind");
+}
+
+#[tokio::test]
+async fn a_job_another_worker_took_is_not_delivered_by_the_first() {
+    // P1.14: the reaper requeued the job and worker B leased it; A, still
+    // encoding, must not deliver a second copy of B's job.
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping lost-lease test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let r = rig(ffmpeg.clone(), ffprobe, bmx);
+    let source = r.root.join("attachments").join("taken").join("source.mp4");
+    make_source(&ffmpeg, &source).await;
+    let id = queue_attachment(&r, Some(&source));
+    // A's lease is already expired when it is taken.
+    let job = r.repo.lease_job("test:1:A", -60).unwrap().expect("leasable");
+    assert_eq!(r.repo.reap_expired_leases().unwrap(), (1, 0));
+    let b = r.repo.lease_job("test:1:B", 180).unwrap().expect("requeued job is leasable");
+    assert_eq!(b.id, id);
+    // B is working in the shared workspace.
+    std::fs::create_dir_all(job_dir(&r, id)).unwrap();
+    std::fs::write(job_dir(&r, id).join("marker"), b"B").unwrap();
+
+    let err = r.engine.process_job(job, "test:1:A").await.expect_err("the first worker no longer owns the job");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("LEASE_EXPIRED"), "{chain}");
+    assert_nothing_delivered(&r);
+    assert!(job_dir(&r, id).join("marker").exists(), "A removed the workspace B is using");
+    let row = r.repo.get_job(id).unwrap().unwrap();
+    assert_eq!(row.status, JobStatus::Running);
+    assert_eq!(row.lease_owner.as_deref(), Some("test:1:B"));
+}
+
+/// Run the engine as A on a task, delete the job the moment it reaches
+/// `stage`, and expect it to stop without delivering.
+async fn discard_at(stage: omni_core::models::JobStage, tag: &str) {
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping lost-lease test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let r = rig(ffmpeg.clone(), ffprobe, bmx);
+    let source = r.root.join("attachments").join(tag).join("source.mp4");
+    make_source(&ffmpeg, &source).await;
+    let id = queue_attachment(&r, Some(&source));
+    let job = r.repo.lease_job("test:1:A", 180).unwrap().expect("leasable");
+
+    let engine = r.engine.clone();
+    let run = tokio::spawn(async move { engine.process_job(job, "test:1:A").await });
+    let started = std::time::Instant::now();
+    loop {
+        let seen = r.repo.get_job(id).unwrap().map(|j| j.stage);
+        if seen == Some(stage) {
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 60, "the job never reached {stage:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    r.repo.delete_job(id).unwrap();
+
+    let err = run.await.unwrap().expect_err("a job discarded mid-run must not complete");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("LEASE_EXPIRED"), "{chain}");
+    assert_nothing_delivered(&r);
+    assert!(!job_dir(&r, id).exists(), "the discarded job's workspace was left behind");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_discarded_during_transcode_is_not_delivered() {
+    discard_at(omni_core::models::JobStage::Transcode, "during-transcode").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_discarded_during_verify_is_not_delivered() {
+    discard_at(omni_core::models::JobStage::Verify, "during-verify").await;
+}
