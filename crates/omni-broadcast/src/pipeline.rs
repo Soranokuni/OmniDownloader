@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
@@ -39,6 +39,16 @@ pub fn room_for(duration_secs: f64, temp: &std::path::Path, watchfolder: &std::p
 /// 50 Mbps 1080i encode keeps about six cores busy; two fill the reference
 /// MCR machine (12 threads).
 pub const DEFAULT_ENCODER_SLOTS: usize = 2;
+
+/// The worker no longer holds the job's lease (discarded, requeued, or taken
+/// by another worker). Carried inside the pipeline's error so the worker
+/// can recognise it by type, not by text.
+#[derive(Debug, thiserror::Error)]
+#[error("job #{job_id} is no longer ours at {}", .stage.as_str())]
+pub struct LeaseLost {
+    pub job_id: i64,
+    pub stage: JobStage,
+}
 
 #[derive(Clone)]
 pub struct BroadcastEngine {
@@ -127,6 +137,34 @@ impl BroadcastEngine {
 
     pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
         self.process_job_with_context(job, owner, None, None, None).await
+    }
+
+    /// Move the job to `stage`, or stop for good if this worker no longer
+    /// holds it (P1.14). A job MCR discarded, or one the reaper requeued and
+    /// another worker took, must not reach the watchfolder from here. Writes
+    /// no event and no audit row: the job is not ours to write to.
+    async fn enter_stage(&self, job_id: i64, owner: &str, stage: JobStage, job_temp: &Path) -> Result<()> {
+        match self.repo.set_stage(job_id, owner, stage) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.lost(job_id, stage, job_temp).await),
+            Err(e) => {
+                warn!("Job #{job_id}: could not record stage {}: {e:#}", stage.as_str());
+                Ok(())
+            }
+        }
+    }
+
+    /// The error for a job that is no longer ours. Its workspace is removed
+    /// only when the row is gone (discarded): otherwise another worker may
+    /// hold the very same `temp/jobs/{id}` and be reading its source.
+    async fn lost(&self, job_id: i64, stage: JobStage, job_temp: &Path) -> anyhow::Error {
+        warn!("Job #{job_id}: no longer ours at {}; stopping without delivering", stage.as_str());
+        match self.repo.get_job(job_id) {
+            Ok(None) => WatchfolderDelivery::cleanup_job_temp_files(job_temp).await,
+            Ok(Some(_)) => {}
+            Err(e) => warn!("Job #{job_id}: could not tell whether the job still exists, leaving its workspace: {e:#}"),
+        }
+        anyhow::Error::new(LeaseLost { job_id, stage }).context(ErrorCode::LeaseExpired.as_str())
     }
 
     /// Run the pipeline for a job the caller holds the lease on.
@@ -239,7 +277,11 @@ impl BroadcastEngine {
         let slug = job.slug.clone();
 
         // 2. Transcode stage (Sony XDCAM HD422 PAL 1080i50)
-        let _ = self.repo.set_stage(job_id, owner, JobStage::Transcode);
+        if let Err(e) = self.enter_stage(job_id, owner, JobStage::Transcode, &job_temp).await {
+            // Not ours any more: the next download must not wait on this slot.
+            self.release_download_slot(job_id);
+            return Err(e);
+        }
 
         // The source is on disk: let the next download start, then wait for
         // an encoder (plan P1.13). Held until the encode ends; rewrap and
@@ -258,6 +300,12 @@ impl BroadcastEngine {
                 self.encoder_slots.clone().acquire_owned().await.context("encoder slots closed")?
             }
         };
+        // Discarded or taken while it waited for an encoder: do not burn
+        // minutes of encode on it.
+        if !self.repo.owns_lease(job_id, owner).unwrap_or(true) {
+            drop(encoder);
+            return Err(self.lost(job_id, JobStage::Transcode, &job_temp).await);
+        }
         let _ = self.repo.update_job_progress(job_id, 0.0, "Transcoding", "--:--");
 
         let transcoder = Transcoder::new(&self.ffmpeg_path, &self.ffprobe_path);
@@ -301,7 +349,7 @@ impl BroadcastEngine {
         };
 
         // 3. Rewrap stage (SMPTE RDD9 OP1a MXF)
-        let _ = self.repo.set_stage(job_id, owner, JobStage::Rewrap);
+        self.enter_stage(job_id, owner, JobStage::Rewrap, &job_temp).await?;
         // A rename by MCR up to now names the file (P7.12). Read after the
         // stage is REWRAP, which is when a rename starts being refused, so
         // one either lands here or is turned down; never half-applied.
@@ -334,7 +382,7 @@ impl BroadcastEngine {
         // instead of eight mono ones, a transcode truncated by a source that
         // ended early. A failed report is never delivered: a job in review is a
         // minor annoyance, a wrong file in the running order is not.
-        let _ = self.repo.set_stage(job_id, owner, JobStage::Verify);
+        self.enter_stage(job_id, owner, JobStage::Verify, &job_temp).await?;
         let report = match crate::verify::verify_mxf_with_clip(&self.ffprobe_path, &final_temp_mxf, duration, Some(&slug))
             .await {
             Ok(report) => report,
@@ -376,7 +424,7 @@ impl BroadcastEngine {
         );
 
         // 5. Atomic Delivery to Dalet Watchfolder
-        let _ = self.repo.set_stage(job_id, owner, JobStage::Deliver);
+        self.enter_stage(job_id, owner, JobStage::Deliver, &job_temp).await?;
         let delivered = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
             Ok(dest) => dest,
             Err(e) => {

@@ -1232,7 +1232,10 @@ async fn run_job(
         return Ok(());
     }
 
-    repo.set_stage(job_id, owner, JobStage::Download)?;
+    if !repo.set_stage(job_id, owner, JobStage::Download)? {
+        warn!("Job #{job_id}: no longer ours; stopping without delivering");
+        return Ok(());
+    }
 
     // A word typed onto the end of the link that the parser did not know
     // ("…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", plan P3.10): used only when the site says
@@ -1324,6 +1327,11 @@ async fn run_job(
             .await
     };
 
+    if lost_lease(&process_result) {
+        warn!("Job #{job_id}: no longer ours; nothing more to do");
+        return Ok(());
+    }
+
     // yt-dlp could not resolve the page. For a news portal that is expected:
     // the video is behind an embedded player, so sniff the actual stream and
     // retry with the session context (referer/UA/cookies) it needs to avoid 403.
@@ -1335,7 +1343,10 @@ async fn run_job(
     };
     if sniff && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
         info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
-        repo.set_stage(job_id, owner, JobStage::Extract)?;
+        if !repo.set_stage(job_id, owner, JobStage::Extract)? {
+            warn!("Job #{job_id}: no longer ours; not sniffing");
+            return Ok(());
+        }
         repo.record_event(
             job_id,
             "INFO",
@@ -1363,7 +1374,10 @@ async fn run_job(
                         let mut retry_job = job.clone();
                         omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams);
                         retry_job.url = primary;
-                        repo.set_stage(job_id, owner, JobStage::Download)?;
+                        if !repo.set_stage(job_id, owner, JobStage::Download)? {
+                            warn!("Job #{job_id}: no longer ours; not downloading the sniffed stream");
+                            return Ok(());
+                        }
                         process_result = engine
                             .process_job_with_context(
                                 retry_job,
@@ -1402,6 +1416,11 @@ async fn run_job(
                 }
             }
         }
+    }
+
+    if lost_lease(&process_result) {
+        warn!("Job #{job_id}: no longer ours; nothing more to do");
+        return Ok(());
     }
 
     match process_result {
@@ -1506,6 +1525,13 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
         }
         _ => previous,
     }
+}
+
+/// Whether the engine stopped because this worker no longer holds the job
+/// (P1.14). Nothing more may be written for it: `finish` and `requeue_after`
+/// would refuse, but the events and sniffing would not.
+fn lost_lease(result: &anyhow::Result<()>) -> bool {
+    matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
 }
 
 /// Recover the error code the pipeline attached to a failure.
@@ -2046,6 +2072,20 @@ async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, ke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's lost-lease error is recognised by type; a failure that
+    /// merely quotes the code in its text (a URL ending in it) is not.
+    #[test]
+    fn a_lost_lease_is_recognised_by_type_not_by_text() {
+        let lost = Err(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 7, stage: JobStage::Rewrap })
+            .context(ErrorCode::LeaseExpired.as_str()));
+        assert!(lost_lease(&lost));
+
+        let quoting: anyhow::Result<()> = Err(anyhow::anyhow!("ERROR: unable to download https://example.gr/LEASE_EXPIRED")
+            .context("LEASE_EXPIRED"));
+        assert!(!lost_lease(&quoting));
+        assert!(!lost_lease(&Ok(())));
+    }
 
     /// neakriti.gr article without a video (2026-10-05): the card said
     /// UNSUPPORTED_URL, "try a direct video link".

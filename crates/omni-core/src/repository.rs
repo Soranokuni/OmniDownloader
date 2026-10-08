@@ -549,6 +549,20 @@ impl Repository {
         Ok(changed == 1)
     }
 
+    /// Whether `owner` still holds the lease on a RUNNING job. Read-only: a
+    /// check before long work, where `set_stage` would write a stage event.
+    pub fn owns_lease(&self, job_id: i64, owner: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let held: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM queue WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+                params![job_id, owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(held.is_some())
+    }
+
     /// Move a leased job to the next stage and reset the stage clock.
     pub fn set_stage(&self, job_id: i64, owner: &str, stage: JobStage) -> Result<bool> {
         let conn = self.pool.get()?;
@@ -2513,6 +2527,20 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn owns_lease_is_true_only_for_the_running_owner() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/v", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        assert!(!repo.owns_lease(id, "A")?, "a pending job is nobody's");
+        repo.lease_job("A", 180)?.expect("leasable");
+        assert!(repo.owns_lease(id, "A")?);
+        assert!(!repo.owns_lease(id, "B")?);
+        repo.delete_job(id)?;
+        assert!(!repo.owns_lease(id, "A")?, "a deleted row is nobody's");
+        Ok(())
+    }
 
     #[test]
     fn journalist_aliases_round_trip_and_survive_a_resave() -> Result<()> {
