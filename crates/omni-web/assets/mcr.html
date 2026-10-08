@@ -21,7 +21,9 @@
     <div class="topbar-status">
       <span class="status-item"><span id="mail-dot" class="dot"></span><span id="mail-status">Email: —</span></span>
       <span class="status-item"><span id="llm-dot" class="dot"></span><span id="llm-status">LLM: —</span></span>
+      <span class="status-item" id="queue-status">Ουρά: —</span>
       <span class="status-item" id="storage-status">Watchfolder: —</span>
+      <span class="status-item" id="temp-status">Temp: —</span>
       <a class="btn" href="/admin">Διαχείριση</a>
       <button class="btn" type="button" id="logout-btn">Αποσύνδεση</button>
     </div>
@@ -93,6 +95,22 @@
       Αυτά τα βίντεο δεν παραδόθηκαν αυτόματα. Κάθε κάρτα λέει γιατί και τι να κάνετε.
       Το <b>Δοκιμή ξανά</b> είναι ασφαλές: δεν αγγίζει τίποτα που έχει ήδη παραδοθεί.
     </p>
+    <div class="card">
+      <div class="section-head">
+        <div class="row">
+          <label for="review-journalist" style="margin:0">Δημοσιογράφος</label>
+          <select id="review-journalist" style="width:auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
+        </div>
+        <input type="search" id="review-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" style="width:320px">
+      </div>
+      <div class="section-head" style="margin-top:10px">
+        <button class="btn" type="button" id="hide-old-review">Απόκρυψη παλαιότερων από 3 ημέρες</button>
+        <label id="review-hidden-label" class="row" style="margin:0;gap:6px" hidden>
+          <input type="checkbox" id="review-show-hidden" style="width:auto">
+          <span id="review-hidden-text">Εμφάνιση κρυμμένων</span>
+        </label>
+      </div>
+    </div>
     <div id="review-cards" class="stack">
       <div class="card center">Φόρτωση…</div>
     </div>
@@ -241,6 +259,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=33"></script>
+<script type="module" src="/static/mcr.js?v=34"></script>
 </body>
 </html>

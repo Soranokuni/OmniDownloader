@@ -188,6 +188,16 @@ async function loadStatusOnce() {
   const llm = checks.llm || { state: 'ok' };
   setStatus('llm', `LLM: ${label(llm)}`, DOT[llm.state] || '', llm.detail || '');
 
+  const queue = data.queue;
+  document.getElementById('queue-status').textContent = queue
+    ? `Ουρά: ${queue.pending} σε αναμονή · ${queue.running} σε εξέλιξη`
+    : 'Ουρά: —';
+  const tempFree = data.disk?.temp?.free_gb;
+  document.getElementById('temp-status').textContent =
+    tempFree === undefined || tempFree === null
+      ? 'Temp: άγνωστο'
+      : `Temp: ${tempFree.toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`;
+
   const free = data.disk?.watchfolder?.free_gb;
   const storage = document.getElementById('storage-status');
   storage.textContent =
@@ -245,7 +255,7 @@ function setStatus(prefix, text, dotClass, title) {
 /** Page state per list. */
 const pages = {
   live: { page: 1, perPage: 15 },
-  review: { page: 1, perPage: 10 },
+  review: { page: 1, perPage: 20 },
   completed: { page: 1, perPage: 25 },
 };
 
@@ -265,7 +275,10 @@ function showCounts(counts) {
   };
   set('queue-count', counts.active);
   set('review-count', counts.review);
-  set('completed-count', counts.completed);
+  // The Completed badge is today's deliveries; the total is in the tooltip.
+  set('completed-count', counts.completed_today);
+  document.getElementById('completed-count').title = `Σήμερα · σύνολο ${counts.completed || 0}`;
+  showHiddenCount(counts.review_hidden || 0);
   const clear = document.getElementById('clear-finished');
   clear.disabled = !counts.finished;
   clear.textContent = counts.finished
@@ -491,10 +504,85 @@ document.getElementById('clear-finished').addEventListener('click', async (event
  * Needs attention
  * ------------------------------------------------------------------ */
 
+/* The review tab's own filters, tidy-up and day headings (P7.21). */
+const reviewJournalist = document.getElementById('review-journalist');
+const reviewSearch = document.getElementById('review-search');
+const reviewShowHidden = document.getElementById('review-show-hidden');
+const restartReview = () => { pages.review.page = 1; loadReview(); };
+reviewJournalist.addEventListener('change', restartReview);
+reviewShowHidden.addEventListener('change', restartReview);
+let reviewSearchTimer = null;
+reviewSearch.addEventListener('input', () => {
+  clearTimeout(reviewSearchTimer);
+  reviewSearchTimer = setTimeout(restartReview, 300);
+});
+
+function showHiddenCount(n) {
+  const label = document.getElementById('review-hidden-label');
+  // Keep the box visible while it is ticked, so it can be unticked.
+  label.hidden = !n && !reviewShowHidden.checked;
+  document.getElementById('review-hidden-text').textContent = `Εμφάνιση κρυμμένων (${n})`;
+}
+
+const HIDE_OLD_HOURS = 72;
+document.getElementById('hide-old-review').addEventListener('click', async () => {
+  let hidden;
+  try {
+    // Count first so the question can say how many.
+    const cutoff = Date.now() - HIDE_OLD_HOURS * 3600 * 1000;
+    const data = await api('/api/jobs?view=review&page=1&per_page=100');
+    const jobs = data.jobs || [];
+    hidden = jobs.filter((j) => j.updated_at && Date.parse(j.updated_at) < cutoff).length;
+    if (data.total > jobs.length) hidden = null; // more than one page: the exact number is unknown
+  } catch (e) { toast(e.message, 'bad'); return; }
+  if (hidden === 0) { toast('Δεν υπάρχει τίποτα παλαιότερο από 3 ημέρες.', 'ok'); return; }
+  const how = hidden === null ? 'Τα παλαιότερα βίντεο' : hidden === 1 ? 'Το 1 βίντεο' : `Τα ${hidden} βίντεο`;
+  if (!confirm(
+    `${how} που περιμένουν πάνω από 3 ημέρες θα κρυφτούν από τη λίστα.\n\n` +
+    'Δεν σβήνεται τίποτα· εμφανίζονται ξανά με «Εμφάνιση κρυμμένων».',
+  )) return;
+  try {
+    const r = await api('/api/jobs/review/hide-old', { method: 'POST', body: { hours: HIDE_OLD_HOURS } });
+    toast(`${r.hidden} βίντεο κρύφτηκαν από τη λίστα.`, 'ok');
+    pages.review.page = 1;
+    refresh();
+  } catch (e) { toast(e.message, 'bad'); }
+});
+
+/* Cards in order, with a small heading before the first of each local day of
+ * `updated_at` (same look as the Email tab's day headers). */
+function dayHeading(at) {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return null;
+  const now = new Date();
+  const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  if (sameDay(d, now)) return 'Σήμερα';
+  if (sameDay(d, new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) return 'Χθες';
+  const long = d.toLocaleDateString('el-GR', { weekday: 'long', day: 'numeric', month: 'long' });
+  return long.charAt(0).toLocaleUpperCase('el-GR') + long.slice(1);
+}
+
+function withDayHeadings(jobs, card) {
+  const out = [];
+  let day;
+  for (const job of jobs) {
+    const label = job.updated_at ? dayHeading(job.updated_at) : null;
+    if (label && label !== day) out.push(el('div', { class: 'ib-day' }, label));
+    day = label;
+    out.push(card(job));
+  }
+  return out;
+}
+
 async function loadReview() {
   let data;
   try {
-    data = await fetchPage('review');
+    const extra = {};
+    const q = reviewSearch.value.trim();
+    if (q) extra.q = q;
+    if (reviewJournalist.value) extra.journalist = reviewJournalist.value;
+    if (reviewShowHidden.checked) extra.hidden = '1';
+    data = await fetchPage('review', extra);
   } catch (e) { failed(e); return; }
   showCounts(data.counts);
   const jobs = data.jobs || [];
@@ -505,9 +593,11 @@ async function loadReview() {
     historyState.delete(id); historyBox.delete(id); historyOpen.delete(id); historyTech.delete(id);
   }
   if (jobs.length === 0) {
-    render('review-cards', el('div', { class: 'card center' }, 'Δεν υπάρχει κάτι για έλεγχο.'));
+    const filtered = reviewSearch.value.trim() || reviewJournalist.value;
+    render('review-cards', el('div', { class: 'card center' },
+      filtered ? 'Κανένα βίντεο δεν ταιριάζει με την αναζήτηση.' : 'Δεν υπάρχει κάτι για έλεγχο.'));
   } else {
-    render('review-cards', jobs.map(reviewCard));
+    render('review-cards', withDayHeadings(jobs, reviewCard));
     for (const id of historyOpen) restoreHistoryScroll(id);
   }
   pager('review-pager', pages.review, data.total || 0, loadReview);
@@ -620,7 +710,10 @@ function reviewCard(job) {
           mailLink(job),
         ),
       ),
-      statusBadge(job),
+      el('div', { class: 'row tight' },
+        job.cleared_at ? el('span', { class: 'badge', title: 'Κρύφτηκε από τη λίστα· δεν σβήστηκε' }, 'κρυμμένο') : null,
+        statusBadge(job),
+      ),
     ),
     el('div', { class: 'reason' },
       el('strong', { style: 'display:block' }, job.hint
@@ -697,6 +790,10 @@ async function loadFilters() {
   } catch { /* the lists show codes and the filter stays at "all" */ }
   const surnames = journalists.map((x) => x.surname).filter(Boolean).sort();
   render(filterSelect,
+    el('option', { value: '' }, 'Όλοι οι δημοσιογράφοι'),
+    surnames.map((name) => el('option', { value: name }, name)),
+  );
+  render(reviewJournalist,
     el('option', { value: '' }, 'Όλοι οι δημοσιογράφοι'),
     surnames.map((name) => el('option', { value: name }, name)),
   );
