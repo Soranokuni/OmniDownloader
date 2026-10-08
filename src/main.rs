@@ -1104,7 +1104,7 @@ async fn run_daemon(
 
             let eng = engine_worker.clone();
             let rep = repo_worker.clone();
-            let busy_guard = busy_worker.guard(job.id);
+            let busy_guard = busy_worker.guard(job.id, &owner);
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
@@ -1112,6 +1112,9 @@ async fn run_daemon(
                 let _gate_pass = gate_pass;
                 // Until this task is done with the job, MCR cannot queue it
                 // again (a cancelled job stops only at its next stage).
+                // Its token is the job run's: MCR's cancel and a lost lease
+                // both fire it, and it kills the running tool (plan P1.15).
+                let cancel = busy_guard.token();
                 let _busy = busy_guard;
                 let job_id = job.id;
                 let (job_slot, download_slot) = permit;
@@ -1121,7 +1124,6 @@ async fn run_daemon(
                 // have lost the job -- the reaper requeued it, or an operator
                 // cancelled it -- and must stop rather than deliver a file for a
                 // job somebody else now owns.
-                let cancel = CancellationToken::new();
                 let heartbeat = {
                     let rep = rep.clone();
                     let owner = owner.clone();
@@ -1148,7 +1150,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone()).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -1258,6 +1260,7 @@ async fn run_job(
     engine: &Arc<BroadcastEngine>,
     owner: &str,
     job: omni_core::models::Job,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let job_id = job.id;
     let orig_url = job.url.clone();
@@ -1348,6 +1351,10 @@ async fn run_job(
         }
     }
 
+    if cancel.is_cancelled() {
+        warn!("Job #{job_id}: cancelled; not scanning the page");
+        return Ok(());
+    }
     if is_web && page_referer.is_none() && !omni_broadcast::downloader::is_video_platform(&orig_url) {
         let scan = engine.page_videos(&orig_url).await;
         known_unsupported = scan.unsupported;
@@ -1384,7 +1391,7 @@ async fn run_job(
             .context(ErrorCode::UnsupportedUrl.as_str()))
     } else {
         engine
-            .process_job_with_context(job.clone(), owner, page_referer.as_deref(), None, None)
+            .process_job_cancellable(job.clone(), owner, page_referer.as_deref(), None, None, Some(cancel.clone()))
             .await
     };
 
@@ -1415,6 +1422,9 @@ async fn run_job(
             "Direct download failed; sniffing the page for a stream",
         )?;
 
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         match StreamSniffer::extract_media_bundle(&orig_url, 25).await {
             Ok(bundle) => {
                 // An article's embedded posts are not all videos: the first
@@ -1422,7 +1432,10 @@ async fn run_job(
                 // video, and sent the job to review while its two real
                 // videos were delivered as siblings (P3.13). Ask yt-dlp
                 // about each post first; keep the ones it cannot rule out.
-                let streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams).await;
+                let streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams, &cancel).await;
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
                 let primary = if streams.contains(&bundle.primary_stream) {
                     Some(bundle.primary_stream.clone())
                 } else {
@@ -1444,12 +1457,13 @@ async fn run_job(
                             return Ok(());
                         }
                         process_result = engine
-                            .process_job_with_context(
+                            .process_job_cancellable(
                                 retry_job,
                                 owner,
                                 Some(&bundle.referer),
                                 Some(&bundle.user_agent),
                                 bundle.cookies.as_deref(),
+                                Some(cancel.clone()),
                             )
                             .await;
                     }
@@ -1554,7 +1568,13 @@ async fn run_job(
 /// order (P3.13). YouTube is not asked (it has no photo posts) and raw
 /// streams cannot be; a post that cannot be checked (network, login) stays.
 /// About a second per post with the folder build of yt-dlp.
-async fn without_videoless_posts(repo: &Repository, engine: &BroadcastEngine, job_id: i64, streams: &[String]) -> Vec<String> {
+async fn without_videoless_posts(
+    repo: &Repository,
+    engine: &BroadcastEngine,
+    job_id: i64,
+    streams: &[String],
+    cancel: &CancellationToken,
+) -> Vec<String> {
     use omni_broadcast::downloader::{is_video_platform, is_youtube};
     let mut kept = Vec::with_capacity(streams.len());
     let mut seen = std::collections::HashSet::new();
@@ -1565,7 +1585,16 @@ async fn without_videoless_posts(repo: &Repository, engine: &BroadcastEngine, jo
             continue;
         }
         let ask = i < 12 && is_video_platform(url) && !is_youtube(url);
-        if ask && engine.post_has_video(url).await == Some(false) {
+        let has_video = if ask {
+            // Dropping the future kills yt-dlp (run_capture sets kill_on_drop).
+            tokio::select! {
+                r = engine.post_has_video(url) => r,
+                _ = cancel.cancelled() => break,
+            }
+        } else {
+            None
+        };
+        if ask && has_video == Some(false) {
             info!("Job #{job_id}: {url} has no video; not a candidate");
             let _ = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Embedded post without a video, skipped: {url}"));
             continue;

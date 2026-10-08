@@ -785,6 +785,33 @@ async fn a_video_that_is_delivering_is_too_late_to_cancel() -> Result<()> {
 }
 
 #[tokio::test]
+async fn cancel_and_discard_fire_the_running_workers_token() -> Result<()> {
+    let app = App::new()?;
+    for (n, discard) in [(1, false), (2, true)] {
+        let id = app
+            .repo
+            .enqueue(
+                &omni_core::models::NewJob::new(&format!("https://example.gr/kill{n}"), &format!("{n}_NIKOLAOU_KILL"), "NIKOLAOU"),
+                omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+            )?
+            .job_id();
+        app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+        let guard = app.busy.guard(id, "test-worker");
+        let token = guard.token();
+        assert!(!token.is_cancelled());
+
+        let (status, json) = if discard {
+            app.send("POST", &format!("/api/jobs/{id}/discard"), &app.mcr_token, None).await?
+        } else {
+            app.send("POST", &format!("/api/jobs/{id}/cancel"), &app.mcr_token, None).await?
+        };
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(token.is_cancelled(), "the worker's tool would run on (discard={discard})");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_job_whose_worker_is_still_stopping_is_not_queued_again() -> Result<()> {
     let app = App::new()?;
     let id = app
@@ -796,7 +823,7 @@ async fn a_job_whose_worker_is_still_stopping_is_not_queued_again() -> Result<()
         .job_id();
     app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
     assert!(app.repo.cancel_job(id)? == omni_core::repository::CancelOutcome::Cancelled);
-    app.busy.insert(id);
+    let busy_guard = app.busy.guard(id, "test-worker");
 
     for (uri, body) in [
         (format!("/api/jobs/{id}/retry"), None),
@@ -810,7 +837,7 @@ async fn a_job_whose_worker_is_still_stopping_is_not_queued_again() -> Result<()
     let row = app.repo.get_job(id)?.unwrap();
     assert_eq!(row.status, JobStatus::Cancelled, "the row must not be touched");
 
-    app.busy.remove(id);
+    drop(busy_guard);
     let (status, json) = app.send("POST", &format!("/api/jobs/{id}/retry"), &app.mcr_token, None).await?;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
