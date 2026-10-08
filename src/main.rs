@@ -1447,7 +1447,7 @@ async fn run_job(
             let code = classify_pipeline_error(&e);
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
-            let message = format!("{e}");
+            let message = readable_cause(&e);
 
             // The full context chain, which carries each stage's stderr tail,
             // into the job's own timeline (plan P6.1). `error_message` is the
@@ -1532,6 +1532,93 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
 /// would refuse, but the events and sniffing would not.
 fn lost_lease(result: &anyhow::Result<()>) -> bool {
     matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
+}
+
+/// The one readable line for a failure's `error_message` (P7.15): the root
+/// cause, without the code strings the pipeline wraps around it.
+fn readable_cause(e: &anyhow::Error) -> String {
+    const CAP: usize = 300;
+    const TAIL: &str = ". stderr tail: ";
+    let outer = format!("{e}");
+    let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+    let Some(ri) = chain.iter().rposition(|s| ErrorCode::from_code(s).is_none()) else { return outer };
+    let root = &chain[ri];
+
+    let strip = |mut text: &str| -> String {
+        loop {
+            let before = text;
+            if let Some(rest) = text.strip_prefix("ERROR:") {
+                text = rest.trim_start();
+            }
+            for code in ErrorCode::ALL {
+                if let Some(rest) = text.strip_prefix(code.as_str()).and_then(|r| r.strip_prefix(':')) {
+                    text = rest.trim_start();
+                }
+            }
+            if text == before {
+                return text.trim().to_string();
+            }
+        }
+    };
+
+    let text = if let Some((header, tail)) = root.split_once(TAIL) {
+        // A tool that failed (omni_core::process): keep "exited / timed out",
+        // add the tail's FIRST line that names an error. FFmpeg 7+ follows
+        // the cause ("Error while opening encoder - maybe incorrect
+        // parameters…") with generic thread-teardown lines that also say
+        // "error"; those name nothing (seen with the installed FFmpeg 9).
+        const GENERIC: [&str; 5] = [
+            "Conversion failed!",
+            "Task finished with error code",
+            "Terminating thread with return code",
+            "Error sending frames to consumers",
+            "Nothing was written into output file",
+        ];
+        let header = strip(header);
+        let hit = tail
+            .lines()
+            .map(|l| without_log_prefixes(l.trim()))
+            .find(|l| l.to_ascii_lowercase().contains("error") && !GENERIC.iter().any(|g| l.contains(g)));
+        match hit {
+            Some(l) => format!("{header}: {}", strip(l)),
+            None => header,
+        }
+    } else {
+        // A stderr tail: the ERROR line if there is one, else the last line with text.
+        let lines: Vec<&str> = root.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let line = lines.iter().rev().find(|l| l.contains("ERROR")).or(lines.last()).copied().unwrap_or("");
+        let line = strip(line);
+        // A bare OS or serde error says little alone; keep what was being done.
+        // The OS error goes first: a parent quoting two long paths
+        // ("Failed copying … to …") would otherwise push it past the cap.
+        let parent = ri.checked_sub(1).map(|i| chain[i].as_str());
+        match parent {
+            Some(p) if lines.len() <= 1 && ErrorCode::from_code(p).is_none() && !p.trim().is_empty() && !line.is_empty() => {
+                format!("{line} ({})", p.trim())
+            }
+            _ => line,
+        }
+    };
+    if text.is_empty() {
+        return outer;
+    }
+    if text.chars().count() > CAP {
+        let cut: String = text.chars().take(CAP).collect();
+        return format!("{}…", cut.trim_end());
+    }
+    text
+}
+
+/// "[vost#0:0/mpeg2video @ 000001] [enc:mpeg2video @ 000002] Error …" ->
+/// "Error …": FFmpeg's per-component prefixes carry only addresses.
+fn without_log_prefixes(mut line: &str) -> &str {
+    while line.starts_with('[') {
+        match line.find("] ") {
+            Some(end) => line = line[end + 2..].trim_start(),
+            None => break,
+        }
+    }
+    line
 }
 
 /// Recover the error code the pipeline attached to a failure.
@@ -2072,6 +2159,102 @@ async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, ke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Job #20 (2026-10-08): the card said PIPELINE_FAILED; the reason was only
+    /// in the timeline.
+    #[test]
+    fn readable_cause_is_the_root_of_the_chain() {
+        let e = anyhow::anyhow!("ERROR: [twitter] 2106778297484939750: No video could be found in this tweet")
+            .context("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&e), "[twitter] 2106778297484939750: No video could be found in this tweet");
+    }
+
+    #[test]
+    fn readable_cause_prefers_the_error_line_of_a_stderr_tail() {
+        let e = anyhow::anyhow!("WARNING: something minor\nERROR: [generic] Unable to download webpage: HTTP Error 404\n\n")
+            .context("PAGE_NOT_FOUND");
+        assert_eq!(readable_cause(&e), "[generic] Unable to download webpage: HTTP Error 404");
+        let plain = anyhow::anyhow!("first\nlast line\n\n").context("NETWORK");
+        assert_eq!(readable_cause(&plain), "last line");
+    }
+
+    #[test]
+    fn readable_cause_of_a_bare_code_is_the_code() {
+        let e = anyhow::anyhow!("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&e), "PIPELINE_FAILED");
+        let repeated = anyhow::anyhow!("PIPELINE_FAILED: PIPELINE_FAILED: boom").context("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&repeated), "boom");
+    }
+
+    #[test]
+    fn readable_cause_keeps_the_header_of_a_tool_failure() {
+        let ff = anyhow::anyhow!(
+            "ffmpeg exited with code Some(1). stderr tail: frame=0 fps=0.0\n[mpeg2video @ 000001] Error initializing output stream\nError while opening encoder for output stream #0:0 - maybe incorrect parameters\nConversion failed!\n"
+        )
+        .context("PIPELINE_FAILED");
+        let s = readable_cause(&ff);
+        assert!(s.starts_with("ffmpeg exited with code Some(1)"), "{s}");
+        assert!(s.ends_with(": Error initializing output stream"), "the first error line, without its [… @ addr] prefix: {s}");
+        assert!(!s.contains("Conversion failed"), "{s}");
+
+        // The tail the installed FFmpeg 9 writes for an encoder that will not
+        // open (VBV buffer too small): the cause comes first, then lines
+        // that also say "error" but name nothing.
+        let ff9 = anyhow::anyhow!(concat!(
+            "ffmpeg exited with code Some(1). stderr tail: ",
+            "[mpeg2video @ 0000029b555468c0] VBV buffer too small for bitrate\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] [enc:mpeg2video @ 0000029b4afd5540] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n",
+            "[vf#0:0 @ 0000029b55549840] Error sending frames to consumers: Invalid argument\n",
+            "[vf#0:0 @ 0000029b55549840] Task finished with error code: -22 (Invalid argument)\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] [enc:mpeg2video @ 0000029b4afd5540] Could not open encoder before EOF\n",
+            "[vf#0:0 @ 0000029b55549840] Terminating thread with return code -22 (Invalid argument)\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] Task finished with error code: -22 (Invalid argument)\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] Terminating thread with return code -22 (Invalid argument)\n",
+            "[out#0/null @ 0000029b55544780] Nothing was written into output file, because at least one of its streams received no packets.\n",
+            "frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:00.02\n",
+            "Conversion failed!\n",
+        ))
+        .context("TRANSCODE_FAILED");
+        assert_eq!(
+            readable_cause(&ff9),
+            "ffmpeg exited with code Some(1): Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height."
+        );
+
+        let timeout = anyhow::anyhow!("ffmpeg timed out after 3600s; process tree killed. stderr tail: frame=10\nspeed=0.1x\n")
+            .context("TRANSCODE_TIMEOUT");
+        assert_eq!(readable_cause(&timeout), "ffmpeg timed out after 3600s; process tree killed");
+
+        let ytdlp = anyhow::anyhow!("yt-dlp exited with code Some(1). stderr tail: WARNING: x\nERROR: [twitter] 1: No video could be found\n")
+            .context("PIPELINE_FAILED");
+        let s = readable_cause(&ytdlp);
+        assert!(s.starts_with("yt-dlp exited with code Some(1)"), "{s}");
+        assert!(s.ends_with("[twitter] 1: No video could be found"), "{s}");
+    }
+
+    #[test]
+    fn readable_cause_keeps_the_parent_of_a_bare_os_error() {
+        let e = anyhow::anyhow!("The network path was not found. (os error 53)")
+            .context("Failed creating the watchfolder")
+            .context("DELIVERY_FAILED");
+        let s = readable_cause(&e);
+        assert!(s.contains("Failed creating the watchfolder") && s.contains("os error 53"), "{s}");
+        // Two long quoted paths in the parent must not push the OS error
+        // itself past the cap.
+        let long = format!("Failed copying \"{}\" to \"{}\"", "C:\\OmniIngest\\temp\\jobs\\42\\x".repeat(6), "\\\\dalet\\watch\\y".repeat(8));
+        let e = anyhow::anyhow!("Access is denied. (os error 5)").context(long).context("DELIVERY_FAILED");
+        assert!(readable_cause(&e).starts_with("Access is denied. (os error 5)"));
+        // A code above the root is not a parent worth quoting.
+        let coded = anyhow::anyhow!("boom").context("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&coded), "boom");
+    }
+
+    #[test]
+    fn readable_cause_is_capped_on_a_char_boundary() {
+        let e = anyhow::anyhow!("Σφάλμα λήψης βίντεο ".repeat(50)).context("PIPELINE_FAILED");
+        let s = readable_cause(&e);
+        assert!(s.chars().count() <= 301, "{}", s.chars().count());
+        assert!(s.ends_with('…'));
+    }
 
     /// The engine's lost-lease error is recognised by type; a failure that
     /// merely quotes the code in its text (a URL ending in it) is not.

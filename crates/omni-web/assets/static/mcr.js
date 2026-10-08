@@ -19,9 +19,9 @@ import {
   stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
   redownloadJob as deskRedownload, queueOffer as deskQueueOffer,
-  canRename, renameJob as deskRename,
-} from '/static/desk.js?v=2';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=6';
+  canRename, renameJob as deskRename, timelineNode,
+} from '/static/desk.js?v=3';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=8';
 import { initNotify, watchStatus, CHECK_INFO } from '/static/notify.js?v=6';
 
 let journalists = [];
@@ -408,12 +408,103 @@ async function loadReview() {
   } catch (e) { failed(e); return; }
   showCounts(data.counts);
   const jobs = data.jobs || [];
+  // Forget the history of jobs that left the page; keep the rest.
+  const here = new Set(jobs.map((j) => j.id));
+  for (const id of [...historyState.keys(), ...historyBox.keys(), ...historyOpen, ...historyTech]) {
+    if (here.has(id)) continue;
+    historyState.delete(id); historyBox.delete(id); historyOpen.delete(id); historyTech.delete(id);
+  }
   if (jobs.length === 0) {
     render('review-cards', el('div', { class: 'card center' }, 'Δεν υπάρχει κάτι για έλεγχο.'));
   } else {
     render('review-cards', jobs.map(reviewCard));
+    for (const id of historyOpen) restoreHistoryScroll(id);
   }
   pager('review-pager', pages.review, data.total || 0, loadReview);
+}
+
+/* A review card's history (P7.15). The cards are rebuilt every 5 s, so what is
+ * open and what was fetched lives here, by job id. The events are fetched
+ * again only when the job has changed since (`updated_at`). */
+const historyOpen = new Set();
+const historyTech = new Set();
+const historyState = new Map(); // id -> { at, events, failed, loading }
+const historyBox = new Map();   // id -> the panel currently on screen
+
+/** A detached list cannot scroll, and the rebuilt card is put on the page
+ *  only after paintHistory (render): loadReview calls this again once it is
+ *  attached. Not requestAnimationFrame, which never runs in a hidden tab. */
+function restoreHistoryScroll(id) {
+  const st = historyState.get(id);
+  const log = st?.node?.querySelector('.tech-log');
+  if (log && st.scroll && log.isConnected) log.scrollTop = st.scroll;
+}
+
+function paintHistory(id) {
+  const box = historyBox.get(id);
+  const st = historyState.get(id);
+  if (!box || !st) return;
+  if (st.events) {
+    // The built node is kept, so the 5 s rebuild of the cards re-attaches the
+    // same list (and its scroll position) until new events arrive.
+    // Every fetch stores a new array, so identity says "new events" even when
+    // the newest 80 end with the same message as last time.
+    if (!st.node || st.nodeEvents !== st.events) {
+      st.node = timelineNode(st.events, historyTech.has(id), (open) => {
+        if (open) historyTech.add(id); else historyTech.delete(id);
+      });
+      st.nodeEvents = st.events;
+      st.scroll = 0;
+      const log = st.node.querySelector('.tech-log');
+      if (log) log.addEventListener('scroll', () => { st.scroll = log.scrollTop; });
+    }
+    box.replaceChildren(st.node);
+    restoreHistoryScroll(id);
+  } else if (st.failed) {
+    box.replaceChildren(el('p', { class: 'note' }, 'Δεν φορτώθηκε το ιστορικό. ',
+      el('button', { class: 'btn', type: 'button', onClick: () => loadHistory(id, st.at) }, 'Ξανά')));
+  } else {
+    box.replaceChildren(el('p', { class: 'note' }, 'Φόρτωση…'));
+  }
+}
+
+async function loadHistory(id, at) {
+  const prev = historyState.get(id);
+  const st = { at, events: prev ? prev.events : null, node: prev ? prev.node : null, nodeSig: prev ? prev.nodeSig : '', scroll: prev ? prev.scroll : 0, failed: false, loading: true };
+  historyState.set(id, st);
+  paintHistory(id);
+  try {
+    const r = await api(`/api/jobs/${id}`);
+    st.events = r.events || [];
+  } catch {
+    // A failed re-fetch must not blank a history that already loaded.
+    if (!st.events) st.failed = true;
+  }
+  st.loading = false;
+  paintHistory(id);
+}
+
+function historyPanel(job) {
+  const box = el('div', { class: 'jc-history-panel' });
+  box.hidden = !historyOpen.has(job.id);
+  historyBox.set(job.id, box);
+  const toggle = el('button', {
+    class: 'btn', type: 'button', 'aria-expanded': String(historyOpen.has(job.id)),
+    onClick: () => {
+      const open = !historyOpen.has(job.id);
+      if (open) historyOpen.add(job.id); else historyOpen.delete(job.id);
+      toggle.setAttribute('aria-expanded', String(open));
+      box.hidden = !open;
+      const st = historyState.get(job.id);
+      if (open && (!st || (st.at !== job.updated_at && !st.loading))) loadHistory(job.id, job.updated_at);
+    },
+  }, 'Ιστορικό');
+  if (historyOpen.has(job.id)) {
+    const st = historyState.get(job.id);
+    if (!st || (st.at !== job.updated_at && !st.loading)) loadHistory(job.id, job.updated_at);
+    else paintHistory(job.id);
+  }
+  return [toggle, box];
 }
 
 function reviewCard(job) {
@@ -425,6 +516,7 @@ function reviewCard(job) {
   });
   const href = safeHref(job.url);
   const locker = job.status === 'MANUAL_DOWNLOAD';
+  const history = historyPanel(job);
 
   return el('div', { class: 'card attention stack' },
     el('div', { class: 'job-head', style: 'border-bottom:1px solid var(--line);padding-bottom:12px' },
@@ -446,13 +538,22 @@ function reviewCard(job) {
           ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet.'
           : 'Το βίντεο δεν ελήφθη αυτόματα.')),
       job.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${job.error_code}`) : null,
+      job.error_message && job.error_message !== job.error_code
+        ? el('p', {
+          class: 'note mono',
+          title: job.error_message,
+          style: 'margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere',
+        }, `Αιτία: ${job.error_message}`)
+        : null,
     ),
     el('div', { class: 'row' },
       href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
       locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά'),
       canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, 'Μετονομασία…') : null,
       el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
+      history[0],
     ),
+    history[1],
     locker ? null : el('div', {},
       el('label', { for: `override-${job.id}` },
         'Ή επικολλήστε άλλον σύνδεσμο για το ίδιο βίντεο (την ίδια την ανάρτηση, ή απευθείας σύνδεσμο .mp4 / .m3u8):'),
