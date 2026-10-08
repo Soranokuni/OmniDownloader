@@ -139,6 +139,8 @@ pub mod checks {
     pub const SELFCHECK: &str = "selfcheck";
     /// Deno, which yt-dlp needs for YouTube (plan P6.8).
     pub const DENO: &str = "deno";
+    /// The first-run Admin / Admin account still logs in.
+    pub const ACCOUNTS: &str = "accounts";
 }
 
 impl Default for HealthState {
@@ -179,6 +181,14 @@ impl HealthState {
                 }
             }
             guard.insert(name.to_string(), check);
+        }
+    }
+
+    /// Forget a check that no longer applies (the first-run account, once
+    /// replaced).
+    pub fn remove(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.checks.write() {
+            guard.remove(name);
         }
     }
 

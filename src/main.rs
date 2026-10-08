@@ -652,6 +652,17 @@ async fn run_daemon(
 
     info!("Initializing SQLite database at: {:?}", db_path);
     let repo = Repository::new(&db_path)?;
+    // A brand-new installation starts with Admin / Admin (owner's decision,
+    // 2026-10-08). First, before anything writes to the audit log, which
+    // is how a used database is told apart from a new one.
+    match repo.ensure_default_admin() {
+        Ok(true) => warn!(
+            "New installation: log in as Admin / Admin at http://127.0.0.1:{}/admin, create your own administrator and deactivate Admin.",
+            config.web_port
+        ),
+        Ok(false) => {}
+        Err(e) => warn!("Could not create the first-run administrator: {e:#}"),
+    }
 
     // Sessions that expired while the daemon was down are dead rows; clearing
     // them at start-up keeps the table from growing without bound on a machine
@@ -732,6 +743,7 @@ async fn run_daemon(
     // URL, once per job. It never blocks start-up: refusing to come up is the
     // one outcome an operator cannot diagnose from the MCR desk.
     omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
+    omni_core::selftest::check_default_admin(&repo, &health);
 
     // Tools that start are not tools that make the file: an FFmpeg 9 build
     // answered `-version` and then rejected an output option, so every job

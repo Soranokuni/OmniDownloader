@@ -76,6 +76,7 @@ const CHECK_NAME = {
   queue: 'Ουρά',
   selfcheck: 'Αυτοέλεγχος',
   deno: 'YouTube (Deno)',
+  accounts: 'Λογαριασμοί',
 };
 
 async function loadStatus() {

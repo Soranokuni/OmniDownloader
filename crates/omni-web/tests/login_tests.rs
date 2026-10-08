@@ -473,3 +473,20 @@ fn state_logs(dir: &TempDir) -> Result<Vec<String>> {
         .map(|l| l.message)
         .collect())
 }
+
+#[tokio::test]
+async fn a_new_installation_can_be_entered_as_admin_admin_from_the_network() -> Result<()> {
+    // Owner's decision (2026-10-08): a brand-new installation starts with
+    // Admin / Admin, typed as a user name, not an email address.
+    let dir = TempDir::new()?;
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    assert!(repo.ensure_default_admin()?);
+    let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));
+    let app = App { router: WebServer::build_router(state), repo, _dir: dir };
+
+    let (status, cookie) = login(&app, "10.0.0.7:5555", "Admin", "Admin").await?;
+    assert_eq!(status, StatusCode::OK, "from a desk on the newsroom network");
+    assert!(cookie.is_some());
+    assert_eq!(login(&app, "10.0.0.7:5556", "Admin", "admin").await?.0, StatusCode::UNAUTHORIZED, "the password is exact");
+    Ok(())
+}

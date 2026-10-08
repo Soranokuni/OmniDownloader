@@ -340,6 +340,7 @@ pub async fn api_change_password(
     // panel sends the operator back to the login screen afterwards.
     match state.repo.update_user_password(user.id, &payload.new_password) {
         Ok(()) => {
+            omni_core::selftest::check_default_admin(&state.repo, &state.health);
             let mut response =
                 Json(serde_json::json!({"status": "ok", "reauth_required": true})).into_response();
             response
@@ -1212,6 +1213,7 @@ pub async fn api_admin_set_user_active(
             admin.email
         ),
     );
+    omni_core::selftest::check_default_admin(&state.repo, &state.health);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1231,6 +1233,7 @@ pub async fn api_admin_update_password(
         "ADMIN",
         &format!("Password for user #{user_id} reset by {}", admin.email),
     );
+    omni_core::selftest::check_default_admin(&state.repo, &state.health);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
