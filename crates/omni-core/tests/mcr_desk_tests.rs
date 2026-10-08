@@ -109,3 +109,80 @@ fn search_and_filters_narrow_a_list() {
     assert!(find(JobsFilter { search: "%".into(), ..Default::default() }).is_empty());
     assert_eq!(find(JobsFilter { group: "-".into(), ..Default::default() }).len(), 2);
 }
+
+#[test]
+fn cancelling_keeps_the_row_and_takes_the_lease_from_a_running_worker() {
+    use omni_core::models::JobStage;
+    use omni_core::repository::CancelOutcome;
+    let (_d, repo) = repo();
+
+    // Waiting: cancelled, row and lease state as specified.
+    // Waiting in back-off (not_before set), so the assertion below proves the clear.
+    let waiting = job(&repo, 1, JobStatus::Pending);
+    repo.lease_job("host:1:0", 120).unwrap().expect("lease");
+    assert!(repo.requeue_after(waiting, "host:1:0", chrono::Duration::minutes(5), "E_TEST", "later").unwrap());
+    assert!(repo.get_job(waiting).unwrap().unwrap().not_before.is_some());
+    assert_eq!(repo.cancel_job(waiting).unwrap(), CancelOutcome::Cancelled);
+    let row = repo.get_job(waiting).unwrap().expect("the row is kept");
+    assert_eq!(row.status, JobStatus::Cancelled);
+    assert!(row.lease_owner.is_none() && row.not_before.is_none() && row.completed_at.is_some());
+    assert_eq!(repo.cancel_job(waiting).unwrap(), CancelOutcome::NotCancellable, "twice");
+
+    // Running in DOWNLOAD: the worker loses everything it needs.
+    let running = job(&repo, 2, JobStatus::Pending);
+    let leased = repo.lease_job("host:1:0", 120).unwrap().expect("lease");
+    assert_eq!(leased.id, running);
+    assert!(repo.set_stage(running, "host:1:0", JobStage::Download).unwrap());
+    assert_eq!(repo.cancel_job(running).unwrap(), CancelOutcome::Cancelled);
+    assert!(!repo.owns_lease(running, "host:1:0").unwrap());
+    assert!(!repo.set_stage(running, "host:1:0", JobStage::Probe).unwrap());
+    assert!(!repo.finish(running, "host:1:0", JobStatus::Completed, None, None, None).unwrap());
+    let row = repo.get_job(running).unwrap().unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled);
+    assert_eq!(row.stage, JobStage::Download, "the stage where it stopped is kept");
+
+    // A cancelled job can be queued again.
+    assert!(repo.retry_job(running, None).unwrap());
+    assert_eq!(repo.get_job(running).unwrap().unwrap().status, JobStatus::Pending);
+}
+
+#[test]
+fn a_job_that_is_delivering_or_settled_is_not_cancelled() {
+    use omni_core::models::JobStage;
+    use omni_core::repository::CancelOutcome;
+    let (_d, repo) = repo();
+
+    let delivering = job(&repo, 1, JobStatus::Pending);
+    repo.lease_job("host:1:0", 120).unwrap().expect("lease");
+    assert!(repo.set_stage(delivering, "host:1:0", JobStage::Deliver).unwrap());
+    assert_eq!(repo.cancel_job(delivering).unwrap(), CancelOutcome::TooLate);
+    let row = repo.get_job(delivering).unwrap().unwrap();
+    assert_eq!((row.status, row.stage), (JobStatus::Running, JobStage::Deliver));
+    assert!(repo.owns_lease(delivering, "host:1:0").unwrap(), "the worker keeps its lease");
+    // Past delivery the file is in Dalet already: a CANCELLED row would lie.
+    assert!(repo.set_stage(delivering, "host:1:0", JobStage::Archive).unwrap());
+    assert_eq!(repo.cancel_job(delivering).unwrap(), CancelOutcome::TooLate);
+
+    let review = job(&repo, 2, JobStatus::RequiresReview);
+    let done = job(&repo, 3, JobStatus::Completed);
+    assert_eq!(repo.cancel_job(review).unwrap(), CancelOutcome::NotCancellable);
+    assert_eq!(repo.cancel_job(done).unwrap(), CancelOutcome::NotCancellable);
+    assert_eq!(repo.cancel_job(99_999).unwrap(), CancelOutcome::NotCancellable);
+    assert_eq!(repo.get_job(done).unwrap().unwrap().status, JobStatus::Completed);
+}
+
+#[test]
+fn the_delivered_file_is_recorded_by_the_lease_holder_without_a_status() {
+    let (_d, repo) = repo();
+    let id = job(&repo, 1, JobStatus::Pending);
+    repo.lease_job("host:1:0", 120).unwrap().expect("lease");
+    assert!(!repo.set_delivered_file(id, "someone-else", "W:/x.mxf", 12.5).unwrap());
+    assert!(repo.set_delivered_file(id, "host:1:0", "W:/x.mxf", 12.5).unwrap());
+    let row = repo.get_job(id).unwrap().unwrap();
+    assert_eq!((row.status, row.file_path.as_deref(), row.duration_secs), (JobStatus::Running, Some("W:/x.mxf"), 12.5));
+
+    // After a cancel the row is not touched.
+    assert_eq!(repo.cancel_job(id).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    assert!(!repo.set_delivered_file(id, "host:1:0", "W:/y.mxf", 1.0).unwrap());
+    assert_eq!(repo.get_job(id).unwrap().unwrap().file_path.as_deref(), Some("W:/x.mxf"));
+}

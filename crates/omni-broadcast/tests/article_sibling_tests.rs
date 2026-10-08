@@ -88,3 +88,28 @@ fn a_single_video_article_is_left_exactly_as_it_was() {
     assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
     assert!(repo.get_job(job.id).unwrap().unwrap().candidates_json.is_none());
 }
+
+#[test]
+fn a_cancelled_article_job_queues_no_siblings() {
+    // P7.20: MCR cancelled the job while its page was being resolved. The
+    // other videos of the article must not be queued for air.
+    let (_dir, repo, mut job) = leased_article_job();
+    assert_eq!(repo.cancel_job(job.id).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    let all = vec![X1.to_string(), X2.to_string(), RAW.to_string()];
+
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all);
+
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1, "siblings were queued for a cancelled job: {jobs:?}");
+    assert!(repo.get_job(job.id).unwrap().unwrap().candidates_json.is_none(), "offers were stored too");
+}
+
+#[test]
+fn a_job_another_worker_holds_queues_no_siblings() {
+    let (_dir, repo, mut job) = leased_article_job();
+    let all = vec![X1.to_string(), X2.to_string()];
+
+    queue_article_siblings(&repo, "host:1:OTHER", &mut job, X1, &all);
+
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
+}

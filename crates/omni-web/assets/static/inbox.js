@@ -19,8 +19,8 @@
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
-  waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=7';
+  waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
+} from '/static/desk.js?v=8';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -893,12 +893,16 @@ function moreNode(j, sel) {
     }
   } else if (sel) {
     const done = j.status === 'COMPLETED' || j.status === 'COMPLETED_MANUAL';
+    const live = j.status === 'PENDING' || j.status === 'RUNNING';
     box.append(el('div', { class: 'jc-actions' },
       openLink,
       canRename(j) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(j, afterAction) }, 'Μετονομασία…') : null,
+      j.status === 'CANCELLED' ? el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, 'Δοκιμή ξανά') : null,
       done
         ? el('button', { class: 'btn', type: 'button', onClick: () => redownloadJob(j, afterAction) }, 'Νέα λήψη')
-        : el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));
+        : live
+          ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => cancelJob(j, afterAction) }, 'Ακύρωση')
+          : el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));
   }
   if (sel) box.append(historyNode(j.id));
   return box;

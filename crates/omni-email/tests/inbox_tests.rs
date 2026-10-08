@@ -232,3 +232,24 @@ fn a_mail_is_settled_only_when_none_of_its_videos_waits_or_runs() {
     assert!(mixed.settled && !mixed.ok, "settled, but one video needs MCR: {mixed:?}");
     assert_eq!((mixed.delivered, mixed.total), (1, 2));
 }
+
+#[test]
+fn a_cancelled_video_is_an_operator_decision_not_a_failure() {
+    // P7.20: MCR cancels one of two videos; the other is delivered. The mail
+    // is settled and ok. A video in review beside a cancelled one is not ok.
+    let (_d, repo) = repo();
+    mail(&repo, "<cx@x>", "ΚΑΙΡΟΣ", 30, &[("https://youtu.be/c1", JobStatus::Completed), ("https://youtu.be/c2", JobStatus::Cancelled)]);
+    mail(&repo, "<cy@x>", "ΣΕΙΣΜΟΣ", 20, &[("https://youtu.be/y1", JobStatus::Cancelled), ("https://youtu.be/y2", JobStatus::RequiresReview)]);
+
+    let entries = list(&repo);
+    let state = |k: &str| entries.iter().find(|e| e.key == k).unwrap().state;
+    assert_eq!(state("<cx@x>"), EntryState::Done);
+    assert_eq!(state("<cy@x>"), EntryState::Attention);
+
+    let s = inbox::settlements(&entries, Utc::now() - Duration::hours(48));
+    let cx = s.iter().find(|x| x.id == "mail:<cx@x>").unwrap();
+    assert!(cx.settled && cx.ok, "{cx:?}");
+    assert_eq!((cx.delivered, cx.total), (1, 2));
+    let cy = s.iter().find(|x| x.id == "mail:<cy@x>").unwrap();
+    assert!(cy.settled && !cy.ok, "{cy:?}");
+}

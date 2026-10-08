@@ -312,3 +312,40 @@ async fn a_job_discarded_during_transcode_is_not_delivered() {
 async fn a_job_discarded_during_verify_is_not_delivered() {
     discard_at(omni_core::models::JobStage::Verify, "during-verify").await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_cancelled_during_transcode_is_not_delivered() {
+    // P7.20: MCR cancels instead of deleting. The worker stops as for a
+    // discard, but the row, its history and the workspace stay.
+    let (Some(ffmpeg), Some(ffprobe), Some(bmx)) = (bin("ffmpeg"), bin("ffprobe"), bin("bmxtranswrap")) else {
+        eprintln!("WARNING: skipping lost-lease test -- ffmpeg/ffprobe/bmxtranswrap not in bin/");
+        return;
+    };
+    let r = rig(ffmpeg.clone(), ffprobe, bmx);
+    let source = r.root.join("attachments").join("cancel").join("source.mp4");
+    make_source(&ffmpeg, &source).await;
+    let id = queue_attachment(&r, Some(&source));
+    let job = r.repo.lease_job("test:1:A", 180).unwrap().expect("leasable");
+
+    let engine = r.engine.clone();
+    let run = tokio::spawn(async move { engine.process_job(job, "test:1:A").await });
+    let started = std::time::Instant::now();
+    loop {
+        let seen = r.repo.get_job(id).unwrap().map(|j| j.stage);
+        if seen == Some(omni_core::models::JobStage::Transcode) {
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 60, "the job never reached TRANSCODE");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(r.repo.cancel_job(id).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+
+    let err = run.await.unwrap().expect_err("a job cancelled mid-run must not complete");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("LEASE_EXPIRED"), "{chain}");
+    assert_nothing_delivered(&r);
+    let row = r.repo.get_job(id).unwrap().expect("the cancelled row is kept");
+    assert_eq!(row.status, JobStatus::Cancelled);
+    assert!(!r.repo.get_job_events(id, 100).unwrap().is_empty(), "the history was lost");
+    assert!(job_dir(&r, id).exists(), "the workspace of an existing row is left in place");
+}

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 
-use omni_core::models::{Job, JobStage, JobStatus};
+use omni_core::models::{Job, JobStage};
 use omni_core::repository::Repository;
 
 use crate::delivery::WatchfolderDelivery;
@@ -147,6 +147,10 @@ impl BroadcastEngine {
         match self.repo.set_stage(job_id, owner, stage) {
             Ok(true) => Ok(()),
             Ok(false) => Err(self.lost(job_id, stage, job_temp).await),
+            // At Deliver an unknown lease state must not let a file go to air
+            // for a job MCR may just have cancelled: fail, and let the worker's
+            // normal retry path run.
+            Err(e) if stage == JobStage::Deliver => Err(e.context(ErrorCode::DeliveryFailed.as_str())),
             Err(e) => {
                 warn!("Job #{job_id}: could not record stage {}: {e:#}", stage.as_str());
                 Ok(())
@@ -454,10 +458,15 @@ impl BroadcastEngine {
             );
         }
 
-        // 6. Mark Completed
+        // 6. Record the file. The status is not set here: the worker that
+        // holds the lease finishes the job as Completed with this file_path.
         let dest_str = delivered.path.to_string_lossy().to_string();
         let _ = self.repo.update_job_progress(job_id, 100.0, "Completed", "00:00");
-        let _ = self.repo.update_job_status(job_id, JobStatus::Completed, None, Some(&dest_str), Some(duration));
+        match self.repo.set_delivered_file(job_id, owner, &dest_str, duration) {
+            Ok(true) => {}
+            Ok(false) => warn!("Job #{job_id}: lease lost after delivery; the file {dest_str} is in the watchfolder"),
+            Err(e) => warn!("Job #{job_id}: could not record the delivered file {dest_str}: {e:#}"),
+        }
         let _ = self.repo.log_audit(
             "SUCCESS",
             "INGEST",
