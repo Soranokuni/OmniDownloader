@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::auth::hash_password;
+use crate::auth::{hash_password, verify_password};
 use crate::migrations;
 use crate::models::{
     AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob,
@@ -23,6 +23,12 @@ use crate::timestamps;
 /// A day covers the realistic case (the same story forwarded again during one
 /// news cycle) without blocking a genuine re-ingest the next day.
 pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
+
+/// The first-run administrator of a new installation (see
+/// [`Repository::ensure_default_admin`]). Logins are matched lowercased, so
+/// "Admin" and "admin" both work.
+pub const DEFAULT_ADMIN_LOGIN: &str = "admin";
+pub const DEFAULT_ADMIN_PASSWORD: &str = "Admin";
 
 #[derive(Clone)]
 pub struct Repository {
@@ -1253,6 +1259,41 @@ impl Repository {
         } else {
             Ok(None)
         }
+    }
+
+    /// Create the first-run administrator, `Admin` / `Admin` (owner's
+    /// decision, 2026-10-08: a fresh installation holds nothing yet, and the
+    /// person installing it replaces the account from the panel).
+    ///
+    /// Only on a database that has never had a user *or* an audit entry: a
+    /// brand-new installation, once. An installation whose users were all
+    /// removed has an audit trail of it, so the account never comes back on
+    /// its own. Returns whether it was created.
+    pub fn ensure_default_admin(&self) -> Result<bool> {
+        let (users, audit): (i64, i64) = {
+            let conn = self.pool.get()?;
+            let users = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+            let audit = conn.query_row("SELECT COUNT(*) FROM audit_logs", [], |r| r.get(0))?;
+            (users, audit)
+        };
+        if users > 0 || audit > 0 {
+            return Ok(false);
+        }
+        self.create_user(DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD, UserRole::Admin, "First-run administrator", None)?;
+        self.log_audit(
+            "WARN",
+            "AUTH",
+            "First-run administrator Admin / Admin created for a new installation: create your own administrator and deactivate it",
+        )?;
+        Ok(true)
+    }
+
+    /// Whether the first-run `Admin` / `Admin` account still logs in.
+    pub fn default_admin_still_works(&self) -> bool {
+        matches!(
+            self.get_user_by_email(DEFAULT_ADMIN_LOGIN),
+            Ok(Some(u)) if u.is_active && verify_password(DEFAULT_ADMIN_PASSWORD, &u.password_hash)
+        )
     }
 
     /// Whether any active administrator exists.

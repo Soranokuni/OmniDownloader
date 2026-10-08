@@ -260,10 +260,12 @@ pub async fn install(o: InstallOptions) -> Result<()> {
         println!("  Previous version kept as {}.", target_exe.with_extension("exe.prev").display());
     } else {
         println!();
-        println!("  Next, on THIS computer:");
-        println!("   1. Open {scheme}://127.0.0.1:{}/setup and create the first administrator.", config.web_port);
-        println!("   2. In Admin, set the mailbox (Microsoft Graph) and, if wanted, the LLM key.");
-        println!("   3. In Admin → Security, add the newsroom network so the MCR desks can open the panel.");
+        println!("  Next:");
+        println!("   1. Open {scheme}://{host}:{}/admin and log in as  Admin / Admin.", config.web_port);
+        println!("   2. Users: create your own administrator, log in as it, and deactivate Admin.");
+        println!("      (Until then every desk shows a reminder: anyone on the network can log in as Admin.)");
+        println!("   3. Set the mailbox (Microsoft Graph) and, if wanted, the LLM key.");
+        println!("   4. Security: add the newsroom network so the MCR desks can open the panel.");
     }
     Ok(())
 }
