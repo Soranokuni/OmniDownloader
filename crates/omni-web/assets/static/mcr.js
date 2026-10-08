@@ -18,10 +18,10 @@ import {
 import {
   stageLine, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard,
-  redownloadJob as deskRedownload, queueOffer as deskQueueOffer,
+  redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=3';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=8';
+} from '/static/desk.js?v=4';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=9';
 import { initNotify, watchStatus, CHECK_INFO } from '/static/notify.js?v=6';
 
 let journalists = [];
@@ -535,7 +535,7 @@ function reviewCard(job) {
     el('div', { class: 'reason' },
       el('strong', { style: 'display:block' }, job.hint
         || (locker
-          ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet.'
+          ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet, και πατήστε «Το έβαλα στο Dalet».'
           : 'Το βίντεο δεν ελήφθη αυτόματα.')),
       job.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${job.error_code}`) : null,
       job.error_message && job.error_message !== job.error_code
@@ -549,6 +549,7 @@ function reviewCard(job) {
     el('div', { class: 'row' },
       href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
       locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά'),
+      el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(job) }, 'Το έβαλα στο Dalet'),
       canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, 'Μετονομασία…') : null,
       el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
       history[0],
@@ -573,6 +574,7 @@ const retryJob = (job) => deskRetry(job, refresh);
 const overrideJob = (job, url) => deskOverride(job, url, refresh);
 const discardJob = (job) => deskDiscard(job, refresh);
 const renameJob = (job) => deskRename(job, refresh);
+const markDoneJob = (job) => deskMarkDone(job, refresh);
 
 /* ------------------------------------------------------------------ *
  * Completed
@@ -643,7 +645,11 @@ function completedRow(job) {
   const href = safeHref(job.url);
   return el('tr', {},
     el('td', {},
-      el('div', { class: 'strong' }, deliveredName(job), limitNote(job)),
+      el('div', { class: 'strong' }, deliveredName(job), limitNote(job),
+        // No file was made here: the name is the slug, not a file in the watchfolder (P7.16).
+        job.status === 'COMPLETED_MANUAL'
+          ? el('span', { class: 'badge', style: 'margin-left:8px', title: 'Το βίντεο μπήκε στο Dalet από το MCR, όχι από εδώ' }, 'χειροκίνητα')
+          : null),
       el('div', { class: 'note mono', title: job.url, style: 'max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, job.url),
       mailLink(job),
     ),

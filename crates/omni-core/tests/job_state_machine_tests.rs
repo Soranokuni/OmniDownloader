@@ -507,3 +507,59 @@ fn a_job_can_be_renamed_until_its_file_is_being_made() {
     assert!(repo.rename_job_keyword(id, "AFTER").unwrap().is_none(), "delivered files are never renamed");
     assert!(repo.rename_job_keyword(99_999, "GONE").unwrap().is_none());
 }
+
+// ------------------------------------------------------- marked by hand --
+
+#[test]
+fn a_job_can_be_marked_done_only_from_review_states() {
+    let (_d, repo) = repo();
+    let owner = "hostA:100:0";
+
+    // The three states that wait for a person.
+    for (n, status) in [JobStatus::RequiresReview, JobStatus::ManualDownload, JobStatus::Failed]
+        .into_iter()
+        .enumerate()
+    {
+        let url = format!("https://example.gr/review-{n}");
+        let id = queue(&repo, &url, &format!("{n}_NIKOLAOU_R"), "NIKOLAOU").job_id();
+        repo.lease_job(owner, 120).unwrap().unwrap();
+        assert!(repo
+            .finish(id, owner, status, Some("E_TEST"), Some("why"), None)
+            .unwrap());
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, status);
+
+        assert!(repo.mark_completed_manually(id).unwrap(), "{status:?}");
+        let job = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::CompletedManual);
+        assert!(job.completed_at.is_some());
+        assert!(job.delivered_at.is_some(), "the Email tab's «Παραδόθηκε …» time");
+        assert_eq!(job.stage, JobStage::Done);
+        assert_eq!(job.error_code.as_deref(), Some("E_TEST"));
+        assert!(job.file_path.is_none());
+
+        // Marked once; a second press changes nothing.
+        assert!(!repo.mark_completed_manually(id).unwrap());
+
+        // Dedup treats it as delivered.
+        let again = queue(&repo, &url, &format!("9{n}_NIKOLAOU_R"), "NIKOLAOU");
+        assert_eq!(again, Enqueued::DuplicateRecent { existing_id: id });
+    }
+
+    // Everything else is refused and left alone.
+    let pending = queue(&repo, "https://example.gr/pending", "7_NIKOLAOU_P", "NIKOLAOU").job_id();
+    assert!(!repo.mark_completed_manually(pending).unwrap());
+    assert_eq!(repo.get_job(pending).unwrap().unwrap().status, JobStatus::Pending);
+
+    repo.lease_job(owner, 120).unwrap().unwrap();
+    assert!(!repo.mark_completed_manually(pending).unwrap());
+    let running = repo.get_job(pending).unwrap().unwrap();
+    assert_eq!(running.status, JobStatus::Running);
+    assert_eq!(running.lease_owner.as_deref(), Some(owner));
+
+    repo.finish(pending, owner, JobStatus::Completed, None, None, Some("out.mxf"))
+        .unwrap();
+    assert!(!repo.mark_completed_manually(pending).unwrap());
+    let done = repo.get_job(pending).unwrap().unwrap();
+    assert_eq!(done.status, JobStatus::Completed);
+    assert_eq!(done.file_path.as_deref(), Some("out.mxf"));
+}

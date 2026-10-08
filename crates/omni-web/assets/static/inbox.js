@@ -19,8 +19,8 @@
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=5';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
-  pager, retryJob, overrideJob, discardJob, redownloadJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=3';
+  pager, retryJob, overrideJob, discardJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
+} from '/static/desk.js?v=4';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -856,7 +856,7 @@ function moreNode(j, sel) {
     const locker = j.status === 'MANUAL_DOWNLOAD';
     box.append(el('div', { class: `jc-hint ${j.status === 'FAILED' ? 'bad' : ''}`.trim() },
       el('strong', {}, j.hint || (locker
-        ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet.'
+        ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet, και πατήστε «Το έβαλα στο Dalet».'
         : 'Το βίντεο δεν παραδόθηκε αυτόματα.')),
       j.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${j.error_code}`) : null));
     // What fixes it is always there; opening and removing it, once the
@@ -873,6 +873,7 @@ function moreNode(j, sel) {
           if (overrideOpen.has(j.id)) openRoot()?.querySelector(`.jcard[data-job="${j.id}"] input`)?.focus();
         },
       }, 'Άλλος σύνδεσμος…'),
+      el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(j, afterAction) }, 'Το έβαλα στο Dalet'),
       sel || locker ? openLink : null,
       sel && canRename(j) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(j, afterAction) }, 'Μετονομασία…') : null,
       sel || locker ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση') : null));

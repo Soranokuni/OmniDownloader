@@ -1104,6 +1104,26 @@ impl Repository {
         Ok(n > 0)
     }
 
+    /// MCR put the video into Dalet by hand (plan P7.16). Only a job that is
+    /// waiting for a person can be marked; `false` otherwise. The error code
+    /// and message stay as the history of why it was done by hand, and
+    /// `file_path` stays empty: no file was made here.
+    pub fn mark_completed_manually(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
+                lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, delivered_at = ?, updated_at = ?
+            WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')
+            "#,
+            params![now, now, now, id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn delete_job(&self, id: i64) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM queue WHERE id = ?", params![id])?;
@@ -1115,7 +1135,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let threshold = Utc::now() - Duration::days(older_than_days);
         let count = conn.execute(
-            "DELETE FROM queue WHERE status = 'COMPLETED' AND updated_at < ?",
+            "DELETE FROM queue WHERE status IN ('COMPLETED','COMPLETED_MANUAL') AND updated_at < ?",
             params![threshold.to_rfc3339()],
         )?;
         self.log_audit("INFO", "ADMIN", &format!("Purged {} completed jobs older than {} days", count, older_than_days))?;
@@ -2593,6 +2613,22 @@ mod tests {
             let expected = if allowed { JobStatus::Pending } else { status };
             assert_eq!(repo.get_job(id)?.unwrap().status, expected, "{}", status.as_str());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_purge_removes_videos_marked_done_by_hand_too() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/old", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.update_job_status(id, JobStatus::RequiresReview, None, None, None)?;
+        assert!(repo.mark_completed_manually(id)?);
+        repo.pool.get()?.execute(
+            "UPDATE queue SET updated_at = '2020-01-01T00:00:00.000Z' WHERE id = ?",
+            params![id],
+        )?;
+        assert_eq!(repo.purge_completed_jobs(30)?, 1);
+        assert!(repo.get_job(id)?.is_none());
         Ok(())
     }
 
