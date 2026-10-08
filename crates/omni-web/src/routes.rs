@@ -1609,10 +1609,10 @@ pub async fn api_system_status(
             .unwrap_or(serde_json::Value::Null)
     };
 
-    let queue = state
-        .repo
-        .queue_summary()
-        .unwrap_or_default();
+    // `null` when the count failed, never zeros: the desk alerts on a rise in
+    // the review count, and zeros followed by the real count would announce
+    // the whole backlog as new (P7.14).
+    let queue = state.repo.queue_summary().ok();
 
     let checks = state.health.all();
 

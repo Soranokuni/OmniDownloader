@@ -84,6 +84,136 @@ function jingle(ok) {
   return true;
 }
 
+/** Three short low notes, A4 A4 E4: unlike either jingle, and not a celebration. */
+function alarm() {
+  if (!soundOn() || !ctx || ctx.state !== 'running') return false;
+  const t = ctx.currentTime + 0.03;
+  [[440, 0], [440, 0.2], [329.63, 0.4]].forEach(([f, d]) => note(f, t + d, 0.3, 0.24));
+  return true;
+}
+
+/** Check name -> what the desk calls it and what MCR should do. */
+export const CHECK_INFO = {
+  mail: {
+    name: 'Email (εισερχόμενα)',
+    action: 'Τα νέα email δεν διαβάζονται· θέματα που στέλνονται τώρα δεν θα εμφανιστούν. Ενημερώστε τον διαχειριστή.',
+  },
+  encoder: {
+    name: 'Κωδικοποιητής',
+    action: 'Τα βίντεο δεν μετατρέπονται σε μορφή εκπομπής. Ενημερώστε τον διαχειριστή· χρειάζεται επανεκκίνηση της υπηρεσίας.',
+  },
+  tools: {
+    name: 'Εργαλεία',
+    action: 'Λείπει ή χάλασε εργαλείο λήψης/μετατροπής. Ενημερώστε τον διαχειριστή.',
+  },
+  watchfolder: {
+    name: 'Watchfolder',
+    action: 'Δεν γράφεται ο φάκελος του Dalet· τα έτοιμα βίντεο δεν παραδίδονται. Ελέγξτε τη σύνδεση με τον server του Dalet και ενημερώστε τον διαχειριστή.',
+  },
+  disk: {
+    name: 'Δίσκος',
+    action: 'Ο δίσκος γεμίζει· κάτω από 5 GB ελεύθερα οι λήψεις σταματούν. Ενημερώστε τον διαχειριστή.',
+  },
+  browser: {
+    name: 'Πρόγραμμα περιήγησης',
+    action: 'Ο ενσωματωμένος browser δεν ξεκινά· βίντεο μέσα σε άρθρα ειδησεογραφικών σελίδων μπορεί να αποτύχουν.',
+  },
+  selfcheck: {
+    name: 'Αυτοέλεγχος',
+    action: 'Κάποιοι δοκιμαστικοί σύνδεσμοι δεν κατεβαίνουν· ίσως ένας ιστότοπος άλλαξε. Ενημερώστε τον διαχειριστή αν επιμένει.',
+  },
+  deno: {
+    name: 'YouTube (Deno)',
+    action: 'Τα βίντεο από YouTube μπορεί να αποτυγχάνουν. Ενημερώστε τον διαχειριστή.',
+  },
+  queue: {
+    name: 'Ουρά',
+    action: 'Βίντεο περιμένουν ή τρέχουν ασυνήθιστα πολύ. Ελέγξτε την καρτέλα «Σε εξέλιξη».',
+  },
+  accounts: { name: 'Λογαριασμοί', action: '' },
+};
+
+const SEVERITY = { ok: 0, degraded: 1, down: 2 };
+const SILENT_CHECKS = ['llm', 'accounts'];
+
+function sev(check) {
+  return check ? (SEVERITY[check.state] ?? 0) : 0;
+}
+
+function needCount(q) {
+  return (q.review || 0) + (q.manual || 0) + (q.failed || 0);
+}
+
+/**
+ * Pure: what changed between two /api/system/status payloads. `prev` null
+ * (first load) reports nothing, so what was already there is not alarmed.
+ */
+export function diffStatus(prev, next) {
+  const out = { needsPerson: 0, wentBad: [], recovered: [] };
+  if (!prev || !next) return out;
+  // The server sends `queue: null` when it could not count; comparing with
+  // that would announce the whole backlog as new on the next good answer.
+  if (prev.queue && next.queue) {
+    out.needsPerson = Math.max(0, needCount(next.queue) - needCount(prev.queue));
+  }
+  const before = prev.checks || {};
+  for (const [name, check] of Object.entries(next.checks || {})) {
+    if (SILENT_CHECKS.includes(name)) continue;
+    const was = sev(before[name]);
+    const now = sev(check);
+    if (now > was) out.wentBad.push({ name, state: check.state, detail: check.detail });
+    else if (now === 0 && was > 0) out.recovered.push(name);
+  }
+  return out;
+}
+
+let lastStatus = null;
+// The review alert and the settled-mail announcement often report the same
+// failed video a few seconds apart, in either order: whichever comes second
+// within this window keeps its toast but makes no sound and no title count.
+const SAME_NEWS_MS = 15000;
+let lastBadNews = 0;
+let unseenBad = false;
+let onOpenReview = () => {};
+
+function plainNotification(title, tag) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    const n = new Notification(title, { tag, silent: true });
+    n.onclick = () => {
+      window.focus();
+      onOpenReview();
+      n.close();
+    };
+  } catch { /* some browsers allow Notification only from a service worker */ }
+}
+
+/** Called with every successful status payload: sounds and says what got worse. */
+export function watchStatus(data) {
+  const diff = diffStatus(lastStatus, data);
+  lastStatus = data;
+  if (diff.needsPerson > 0) {
+    const n = diff.needsPerson;
+    const text = n === 1 ? '1 βίντεο χρειάζεται έλεγχο' : `${n} βίντεο χρειάζονται έλεγχο`;
+    const covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
+    lastBadNews = Date.now();
+    if (!covered) jingle(false);
+    toast(text, 'bad');
+    plainNotification(text, 'omni-review');
+    if (!covered) count(n, true);
+  }
+  if (diff.wentBad.length) alarm();
+  for (const bad of diff.wentBad) {
+    const info = CHECK_INFO[bad.name];
+    const text = `Πρόβλημα: ${info ? info.name : bad.name}${info?.action ? ` — ${info.action}` : ''}`;
+    toast(text, 'bad');
+    plainNotification(text, `omni-health-${bad.name}`);
+  }
+  for (const name of diff.recovered) {
+    toast(`Αποκαταστάθηκε: ${CHECK_INFO[name]?.name || name}`, 'ok');
+  }
+}
+
 function describe(s) {
   return s.ok
     ? `${s.delivered}/${s.total} βίντεο παραδόθηκαν`
@@ -108,21 +238,33 @@ function systemNotification(done) {
   } catch { /* some browsers allow Notification only from a service worker */ }
 }
 
-function markTitle() {
+/** Count news for the title of a hidden tab; nothing while MCR is looking. */
+function count(n, bad) {
   if (!document.hidden) return;
-  document.title = `✔ (${unseen}) ${BASE_TITLE}`;
+  unseen += n;
+  unseenBad = unseenBad || bad;
+  markTitle();
+}
+
+function markTitle() {
+  if (!document.hidden || unseen === 0) return;
+  document.title = `${unseenBad ? '⚠' : '✔'} (${unseen}) ${BASE_TITLE}`;
 }
 
 function announce(done) {
   const allOk = done.every((s) => s.ok);
-  jingle(allOk);
+  let covered = false;
+  if (!allOk) {
+    covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
+    lastBadNews = Date.now();
+  }
+  if (!covered) jingle(allOk);
   for (const s of done.slice(0, 3)) {
     toast(`${s.ok ? '✔' : '⚠'} Email «${s.subject || '(χωρίς θέμα)'}»: ${describe(s)}`, s.ok ? 'ok' : 'bad');
   }
   if (done.length > 3) toast(`Και ${done.length - 3} ακόμη email ολοκληρώθηκαν`, 'ok');
   systemNotification(done);
-  unseen += done.length;
-  markTitle();
+  if (!covered) count(done.length, !allOk);
 }
 
 async function poll() {
@@ -155,8 +297,9 @@ function paintButton() {
  * Start watching. `host` gets the sound toggle; `open(id)` shows an entry
  * (`mail:<Message-ID>` or `manual:<job id>`) when a notification is clicked.
  */
-export function initNotify(host, open) {
+export function initNotify(host, open, openReview) {
   onOpen = open || onOpen;
+  onOpenReview = openReview || onOpenReview;
   if (host) {
     button = el('button', {
       class: 'btn',
@@ -192,6 +335,7 @@ export function initNotify(host, open) {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       unseen = 0;
+      unseenBad = false;
       document.title = BASE_TITLE;
     }
   });
