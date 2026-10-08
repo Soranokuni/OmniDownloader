@@ -16,11 +16,11 @@
  * half-typed link is never lost.
  */
 
-import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=5';
+import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
   pager, retryJob, overrideJob, discardJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=4';
+} from '/static/desk.js?v=5';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -50,7 +50,12 @@ const timelines = new Map();
 /** Job ids whose technical details are unfolded. */
 const techOpen = new Set();
 
-let hooks = { onCounts: () => {}, refresh: () => {}, groupName: (c) => c };
+let hooks = {
+  onCounts: () => {},
+  refresh: () => {},
+  groupName: (c) => c,
+  onLoadError: (e) => { if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad'); },
+};
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const smooth = () => (reducedMotion.matches ? 'auto' : 'smooth');
@@ -251,7 +256,7 @@ async function loadOnce() {
     if (focus) params.set('focus', focus);
     data = await api(`/api/mails?${params}`);
   } catch (e) {
-    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    hooks.onLoadError(e);
     return;
   }
   windowDays = data.window_days || windowDays;

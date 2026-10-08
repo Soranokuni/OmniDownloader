@@ -30,28 +30,32 @@
 
 <main>
   <!-- Filled by the status poll when a subsystem check is not OK. -->
+  <!-- Shown by the status poll when the service stops answering. -->
+  <div id="offline-banner" role="alert" hidden></div>
   <div id="health-banner" hidden></div>
 
-  <div class="tabs" role="tablist">
-    <button class="tab" type="button" role="tab" data-tab="email" aria-selected="true">
+  <div class="tabs">
+  <div role="tablist" style="display:flex;gap:4px;flex-wrap:wrap">
+    <button class="tab" type="button" role="tab" id="tabbtn-email" data-tab="email" aria-controls="tab-email" aria-selected="true" tabindex="0">
       Email <span id="email-count" class="badge info" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" data-tab="queue" aria-selected="false">
+    <button class="tab" type="button" role="tab" id="tabbtn-queue" data-tab="queue" aria-controls="tab-queue" aria-selected="false" tabindex="-1">
       Σε εξέλιξη <span id="queue-count" class="badge info" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" data-tab="review" aria-selected="false">
+    <button class="tab" type="button" role="tab" id="tabbtn-review" data-tab="review" aria-controls="tab-review" aria-selected="false" tabindex="-1">
       Χρειάζονται έλεγχο <span id="review-count" class="badge warn" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" data-tab="completed" aria-selected="false">
+    <button class="tab" type="button" role="tab" id="tabbtn-completed" data-tab="completed" aria-controls="tab-completed" aria-selected="false" tabindex="-1">
       Ολοκληρωμένα <span id="completed-count" class="badge" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" data-tab="journalists" aria-selected="false">Δημοσιογράφοι</button>
-    <button class="tab" type="button" role="tab" data-tab="manual" aria-selected="false">Προσθήκη συνδέσμου</button>
+    <button class="tab" type="button" role="tab" id="tabbtn-journalists" data-tab="journalists" aria-controls="tab-journalists" aria-selected="false" tabindex="-1">Δημοσιογράφοι</button>
+    <button class="tab" type="button" role="tab" id="tabbtn-manual" data-tab="manual" aria-controls="tab-manual" aria-selected="false" tabindex="-1">Προσθήκη συνδέσμου</button>
+  </div>
     <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Προδιαγραφές εκπομπής</button>
   </div>
 
   <!-- Every mail and every link added by hand, each with its videos (plan P7.10) -->
-  <section id="tab-email" class="stack">
+  <section id="tab-email" class="stack" role="tabpanel" aria-labelledby="tabbtn-email">
     <div class="ib-toolbar">
       <div class="ib-filters" id="inbox-filters" role="group" aria-label="Φίλτρο"></div>
       <input type="search" id="inbox-search" placeholder="Αναζήτηση θέματος, αποστολέα, δημοσιογράφου ή συνδέσμου…" aria-label="Αναζήτηση">
@@ -67,7 +71,7 @@
   </section>
 
   <!-- Live queue -->
-  <section id="tab-queue" class="stack" hidden>
+  <section id="tab-queue" class="stack" role="tabpanel" aria-labelledby="tabbtn-queue" hidden>
     <div class="section-head">
       <p class="note" style="margin:0">
         Πρώτα όσα βίντεο περιμένουν ή μετατρέπονται, μετά όσα έχουν ήδη παραδοθεί.
@@ -84,7 +88,7 @@
   </section>
 
   <!-- Needs attention -->
-  <section id="tab-review" class="stack" hidden>
+  <section id="tab-review" class="stack" role="tabpanel" aria-labelledby="tabbtn-review" hidden>
     <p class="note" style="margin:0">
       Αυτά τα βίντεο δεν παραδόθηκαν αυτόματα. Κάθε κάρτα λέει γιατί και τι να κάνετε.
       Το <b>Δοκιμή ξανά</b> είναι ασφαλές: δεν αγγίζει τίποτα που έχει ήδη παραδοθεί.
@@ -96,7 +100,7 @@
   </section>
 
   <!-- Completed -->
-  <section id="tab-completed" class="stack" hidden>
+  <section id="tab-completed" class="stack" role="tabpanel" aria-labelledby="tabbtn-completed" hidden>
     <div class="card">
       <div class="section-head">
         <div class="row">
@@ -131,7 +135,7 @@
   </section>
 
   <!-- Journalists -->
-  <section id="tab-journalists" class="stack" hidden>
+  <section id="tab-journalists" class="stack" role="tabpanel" aria-labelledby="tabbtn-journalists" hidden>
     <div class="card">
       <h2 class="card-title">Προσθήκη ή αλλαγή δημοσιογράφου</h2>
       <form id="journalist-form" class="stack">
@@ -171,7 +175,7 @@
   </section>
 
   <!-- Add a link -->
-  <section id="tab-manual" class="stack" hidden>
+  <section id="tab-manual" class="stack" role="tabpanel" aria-labelledby="tabbtn-manual" hidden>
     <div class="card" style="max-width:680px;margin:0 auto">
       <h2 class="card-title">Χειροκίνητη προσθήκη συνδέσμου</h2>
       <p class="note" style="margin-bottom:12px">
@@ -237,6 +241,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=27"></script>
+<script type="module" src="/static/mcr.js?v=30"></script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 /* First-run configuration (plan P2.4, P2.5). */
 
-import { api, toast } from '/static/app.js?v=5';
+import { api, toast } from '/static/app.js?v=6';
 
 const errorLine = document.getElementById('error');
 const submitButton = document.getElementById('submit-btn');

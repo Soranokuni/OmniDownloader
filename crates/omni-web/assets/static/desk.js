@@ -6,7 +6,7 @@
  * Nothing here builds HTML from a string: see app.js.
  */
 
-import { api, el, render, toast } from '/static/app.js?v=5';
+import { api, el, render, toast } from '/static/app.js?v=6';
 
 /** What a job is doing, for a person. */
 export const STAGE_TEXT = {
