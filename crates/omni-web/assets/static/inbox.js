@@ -18,9 +18,9 @@
 
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=5';
 import {
-  STAGE_TEXT, STAGE_ORDER, tone, needsAttention, limitNote, fileName, deliveredName,
+  STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
   pager, retryJob, overrideJob, discardJob, redownloadJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=2';
+} from '/static/desk.js?v=3';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -139,12 +139,6 @@ function dayLabel(at) {
   if (same(d, today)) return 'Σήμερα';
   if (same(d, yesterday)) return `Χθες · ${long}`;
   return long;
-}
-
-function clock(at) {
-  const d = at ? new Date(at) : null;
-  if (!d || Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 /** `portal.gr/kosmos/…`: enough of a link to recognise it. */
@@ -951,56 +945,32 @@ async function queueLink(l, button) {
  * A video's history, in words, with the raw lines underneath
  * ------------------------------------------------------------------ */
 
-function eventText(ev) {
-  const m = String(ev.message || '');
-  let x;
-  if (/^Queued as /.test(m)) return 'Μπήκε στην ουρά';
-  if ((x = /^Stage (\w+)$/.exec(m))) return STAGE_TEXT[x[1]] || x[1];
-  if (/^Finished as COMPLETED_MANUAL/.test(m)) return 'Παραδόθηκε χειροκίνητα';
-  if (/^Finished as COMPLETED/.test(m)) return 'Παραδόθηκε στο Dalet';
-  if (/^Finished as MANUAL_DOWNLOAD/.test(m)) return 'Σταμάτησε: χρειάζεται χειροκίνητη λήψη';
-  if (/^Finished as /.test(m)) return 'Σταμάτησε: χρειάζεται έλεγχο';
-  if ((x = /retrying in (\d+) s/.exec(m))) return `Πρόβλημα· νέα προσπάθεια σε ${x[1]} δευτ.`;
-  if (/^Download again requested/.test(m)) return 'Νέα λήψη από το MCR';
-  if ((x = /^Renamed to (\S+)/.exec(m))) return `Έγινε ${x[1]}: το άρθρο έχει κι άλλα βίντεο`;
-  if (/^Queued by .* from the email/.test(m)) return 'Προστέθηκε από το MCR μέσα από το email';
-  if ((x = /^Offered video queued by MCR as (\S+)/.exec(m))) return `Το MCR πρόσθεσε το προτεινόμενο ${x[1]}`;
-  if (/more video\(s\) in this article offered to MCR/.test(m)) return 'Βρέθηκαν κι άλλα βίντεο στο άρθρο· προτείνονται';
-  if (/^The page holds \d+ videos/.test(m)) return 'Η σελίδα έχει πολλά βίντεο· αυτή η εργασία παίρνει το πρώτο';
-  if (/^Direct download failed; sniffing/.test(m)) return 'Ψάχνει το βίντεο μέσα στη σελίδα';
-  if (/^Sniffed stream:/.test(m)) return 'Βρέθηκε το βίντεο στη σελίδα';
-  if (/^Sniffer found no stream/.test(m)) return 'Δεν βρέθηκε βίντεο στη σελίδα';
-  if (ev.level === 'ERROR' && /[Ͱ-Ͽ]/.test(m)) return m;
-  return null;
-}
-
-function eventClass(ev) {
-  if (/^Finished as COMPLETED/.test(ev.message || '')) return 'ok';
-  if (ev.level === 'ERROR') return 'bad';
-  if (ev.level === 'WARN') return 'warn';
-  return /^Stage /.test(ev.message || '') ? 'run' : '';
-}
+/* A history that could not be fetched: stays in `timelines` (so the card does
+ * not ask again on every repaint) until «Ξανά» is pressed. */
+const TIMELINE_FAILED = [];
 
 function historyNode(jobId) {
   const events = timelines.get(jobId);
+  if (events === TIMELINE_FAILED) {
+    return el('p', { class: 'note jc-history' }, 'Δεν φορτώθηκε το ιστορικό. ',
+      el('button', {
+        class: 'btn', type: 'button',
+        onClick: () => { timelines.delete(jobId); loadTimeline(jobId); repaintJob(jobId, true); },
+      }, 'Ξανά'));
+  }
   if (!events) return el('p', { class: 'note jc-history' }, 'Φόρτωση ιστορικού…');
-  const told = events.map((ev) => [ev, eventText(ev)]).filter(([, t]) => t);
-  const details = el('details', { class: 'tech' },
-    el('summary', {}, `Τεχνικές λεπτομέρειες (${events.length})`),
-    el('ul', { class: 'tech-log mono' }, events.map((ev) => el('li', {}, `${clock(ev.at)}  ${ev.level}  ${ev.stage || ''}  ${ev.message}`))));
-  if (techOpen.has(jobId)) details.open = true;
-  details.addEventListener('toggle', () => { if (details.open) techOpen.add(jobId); else techOpen.delete(jobId); });
-  return el('div', { class: 'jc-history' },
-    told.length ? el('ul', { class: 'timeline' }, told.map(([ev, t]) => el('li', { class: eventClass(ev) }, el('time', {}, clock(ev.at)), t))) : null,
-    details);
+  return timelineNode(events, techOpen.has(jobId), (open) => { if (open) techOpen.add(jobId); else techOpen.delete(jobId); });
 }
 
 async function loadTimeline(jobId) {
   try {
     const r = await api(`/api/jobs/${jobId}`);
     timelines.set(jobId, r.events || []);
-    if (selected && selected.job === jobId) repaintJob(jobId, true);
-  } catch { /* the card still shows its state */ }
+  } catch {
+    // A failed re-fetch must not blank a history that already loaded.
+    if (!timelines.has(jobId)) timelines.set(jobId, TIMELINE_FAILED);
+  }
+  if (selected && selected.job === jobId) repaintJob(jobId, true);
 }
 
 /* ------------------------------------------------------------------ *

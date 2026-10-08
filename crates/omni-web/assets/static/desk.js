@@ -190,3 +190,63 @@ export async function queueOffer(jobId, offer, after) {
     after();
   } catch (e) { toast(e.message, 'bad'); }
 }
+
+/* ------------------------------------------------------------------ *
+ * A video's history, in words, with the raw lines underneath (P7.15).
+ * Shared by the Email tab's job card and the review card.
+ * ------------------------------------------------------------------ */
+
+/** `14:05`, or a dash when there is no usable time. */
+export function clock(at) {
+  const d = at ? new Date(at) : null;
+  if (!d || Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+/** One event in Greek, or null when it is only for engineers. */
+export function eventText(ev) {
+  const m = String(ev.message || '');
+  let x;
+  if (/^Queued as /.test(m)) return 'Μπήκε στην ουρά';
+  if ((x = /^Stage (\w+)$/.exec(m))) return STAGE_TEXT[x[1]] || x[1];
+  if (/^Finished as COMPLETED_MANUAL/.test(m)) return 'Παραδόθηκε χειροκίνητα';
+  if (/^Finished as COMPLETED/.test(m)) return 'Παραδόθηκε στο Dalet';
+  if (/^Finished as MANUAL_DOWNLOAD/.test(m)) return 'Σταμάτησε: χρειάζεται χειροκίνητη λήψη';
+  if (/^Finished as /.test(m)) return 'Σταμάτησε: χρειάζεται έλεγχο';
+  if ((x = /retrying in (\d+) s/.exec(m))) return `Πρόβλημα· νέα προσπάθεια σε ${x[1]} δευτ.`;
+  if (/^Download again requested/.test(m)) return 'Νέα λήψη από το MCR';
+  if ((x = /^Renamed to (\S+)/.exec(m))) return `Έγινε ${x[1]}: το άρθρο έχει κι άλλα βίντεο`;
+  if (/^Queued by .* from the email/.test(m)) return 'Προστέθηκε από το MCR μέσα από το email';
+  if ((x = /^Offered video queued by MCR as (\S+)/.exec(m))) return `Το MCR πρόσθεσε το προτεινόμενο ${x[1]}`;
+  if (/more video\(s\) in this article offered to MCR/.test(m)) return 'Βρέθηκαν κι άλλα βίντεο στο άρθρο· προτείνονται';
+  if (/^The page holds \d+ videos/.test(m)) return 'Η σελίδα έχει πολλά βίντεο· αυτή η εργασία παίρνει το πρώτο';
+  if (/^Direct download failed; sniffing/.test(m)) return 'Ψάχνει το βίντεο μέσα στη σελίδα';
+  if (/^Sniffed stream:/.test(m)) return 'Βρέθηκε το βίντεο στη σελίδα';
+  if (/^Sniffer found no stream/.test(m)) return 'Δεν βρέθηκε βίντεο στη σελίδα';
+  if (ev.level === 'ERROR' && /[Ͱ-Ͽ]/.test(m)) return m;
+  return null;
+}
+
+export function eventClass(ev) {
+  if (/^Finished as COMPLETED/.test(ev.message || '')) return 'ok';
+  if (ev.level === 'ERROR') return 'bad';
+  if (ev.level === 'WARN') return 'warn';
+  return /^Stage /.test(ev.message || '') ? 'run' : '';
+}
+
+/**
+ * The timeline list plus the raw lines under «Τεχνικές λεπτομέρειες».
+ * `techIsOpen` says whether the raw lines start open; `onTechToggle(open)` is
+ * told when the person opens or closes them, so a re-render keeps the choice.
+ */
+export function timelineNode(events, techIsOpen, onTechToggle) {
+  const told = events.map((ev) => [ev, eventText(ev)]).filter(([, t]) => t);
+  const details = el('details', { class: 'tech' },
+    el('summary', {}, `Τεχνικές λεπτομέρειες (${events.length})`),
+    el('ul', { class: 'tech-log mono' }, events.map((ev) => el('li', {}, `${clock(ev.at)}  ${ev.level}  ${ev.stage || ''}  ${ev.message}`))));
+  if (techIsOpen) details.open = true;
+  details.addEventListener('toggle', () => onTechToggle(details.open));
+  return el('div', { class: 'jc-history' },
+    told.length ? el('ul', { class: 'timeline' }, told.map(([ev, t]) => el('li', { class: eventClass(ev) }, el('time', {}, clock(ev.at)), t))) : null,
+    details);
+}
