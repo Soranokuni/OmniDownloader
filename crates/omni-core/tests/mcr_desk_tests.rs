@@ -186,3 +186,124 @@ fn the_delivered_file_is_recorded_by_the_lease_holder_without_a_status() {
     assert!(!repo.set_delivered_file(id, "host:1:0", "W:/y.mxf", 1.0).unwrap());
     assert_eq!(repo.get_job(id).unwrap().unwrap().file_path.as_deref(), Some("W:/x.mxf"));
 }
+
+/// Test-only: move a job's timestamp column to `hours` ago.
+fn age(dir: &tempfile::TempDir, id: i64, column: &str, hours: i64) {
+    let conn = rusqlite::Connection::open(dir.path().join("omni.db")).unwrap();
+    let t = omni_core::timestamps::format(chrono::Utc::now() - chrono::Duration::hours(hours));
+    conn.execute(&format!("UPDATE queue SET {column} = ? WHERE id = ?"), rusqlite::params![t, id]).unwrap();
+}
+
+fn review_ids(repo: &Repository, f: &JobsFilter) -> Vec<i64> {
+    repo.list_jobs_page(JobsView::Review, f, 1, 20).unwrap().jobs.into_iter().map(|j| j.id).collect()
+}
+
+#[test]
+fn the_review_view_can_be_searched_and_filtered_by_journalist() {
+    let (_d, repo) = repo();
+    let mine = job(&repo, 1, JobStatus::RequiresReview);
+    let other = repo
+        .enqueue(&NewJob::new("https://example.gr/seismos", "2_NIKOLAOU_SEISMOS", "NIKOLAOU"), DEFAULT_DEDUP_WINDOW_HOURS)
+        .unwrap()
+        .job_id();
+    repo.lease_job("host:1:0", 120).unwrap().unwrap();
+    repo.finish(other, "host:1:0", JobStatus::RequiresReview, None, None, None).unwrap();
+
+    assert_eq!(review_ids(&repo, &JobsFilter { search: "seism".into(), ..Default::default() }), vec![other]);
+    assert_eq!(review_ids(&repo, &JobsFilter { journalist: "papadaki".into(), ..Default::default() }), vec![mine]);
+    assert!(review_ids(&repo, &JobsFilter { search: "seism".into(), journalist: "PAPADAKI".into(), ..Default::default() }).is_empty());
+}
+
+#[test]
+fn old_review_jobs_can_be_hidden_and_shown_again_and_nothing_is_deleted() {
+    let (d, repo) = repo();
+    let old = job(&repo, 1, JobStatus::RequiresReview);
+    let fresh = job(&repo, 2, JobStatus::Failed);
+    let done = job(&repo, 3, JobStatus::Completed);
+    age(&d, old, "updated_at", 100);
+    age(&d, done, "updated_at", 100);
+
+    assert_eq!(repo.hide_old_review(72).unwrap(), 1, "only the old review row");
+    assert_eq!(review_ids(&repo, &JobsFilter::default()), vec![fresh]);
+    assert_eq!(review_ids(&repo, &JobsFilter { include_hidden: true, ..Default::default() }), vec![fresh, old]);
+    assert!(repo.get_job(old).unwrap().unwrap().cleared_at.is_some());
+    assert!(repo.get_job(done).unwrap().unwrap().cleared_at.is_none(), "delivered jobs are not touched");
+
+    let c = repo.job_counts().unwrap();
+    assert_eq!((c.review, c.review_hidden), (1, 1));
+    assert_eq!(repo.hide_old_review(72).unwrap(), 0, "twice");
+}
+
+#[test]
+fn a_hidden_job_that_is_retried_or_marked_done_is_no_longer_hidden() {
+    let (d, repo) = repo();
+    let a = job(&repo, 1, JobStatus::RequiresReview);
+    let b = job(&repo, 2, JobStatus::RequiresReview);
+    age(&d, a, "updated_at", 100);
+    age(&d, b, "updated_at", 100);
+    assert_eq!(repo.hide_old_review(72).unwrap(), 2);
+
+    assert!(repo.retry_job(a, None).unwrap());
+    assert!(repo.get_job(a).unwrap().unwrap().cleared_at.is_none());
+    assert!(repo.mark_completed_manually(b).unwrap());
+    assert!(repo.get_job(b).unwrap().unwrap().cleared_at.is_none());
+    // The marked job shows on the live queue like any other delivery.
+    assert!(ids(&repo, JobsView::Live, 1, 20).0.contains(&b));
+    assert_eq!(repo.job_counts().unwrap().review_hidden, 0);
+}
+
+#[test]
+fn the_completed_badge_counts_only_todays_deliveries() {
+    let (d, repo) = repo();
+    let today = job(&repo, 1, JobStatus::Completed);
+    let yesterday = job(&repo, 2, JobStatus::Completed);
+    age(&d, yesterday, "completed_at", 36);
+    let _ = today;
+
+    let c = repo.job_counts().unwrap();
+    assert_eq!((c.completed, c.completed_today), (2, 1));
+}
+
+#[test]
+fn the_queue_summary_does_not_count_a_cancelled_video_as_running() {
+    let (_d, repo) = repo();
+    let to_run = job(&repo, 1, JobStatus::Pending);
+    let cancelled = job(&repo, 2, JobStatus::Pending);
+    job(&repo, 3, JobStatus::Pending);
+    assert_eq!(repo.cancel_job(cancelled).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    // The oldest ready job is leased: now running.
+    assert_eq!(repo.lease_job("host:1:0", 120).unwrap().unwrap().id, to_run);
+
+    let s = repo.queue_summary().unwrap();
+    assert_eq!((s.pending, s.running, s.cancelled, s.total), (1, 1, 1, 3));
+}
+
+#[test]
+fn a_hidden_attachment_job_is_shown_again_once_its_file_is_attached() {
+    let (_d, repo) = repo();
+    let id = job(&repo, 1, JobStatus::ManualDownload);
+    assert_eq!(repo.hide_old_review(0).unwrap(), 1);
+    assert!(repo.attach_source(id, "W:/temp/a.mp4").unwrap());
+    assert!(repo.get_job(id).unwrap().unwrap().cleared_at.is_none());
+}
+
+#[test]
+fn today_starts_at_the_boundary_given_not_at_utc_midnight() {
+    let (d, repo) = repo();
+    let before = job(&repo, 1, JobStatus::Completed);
+    let after = job(&repo, 2, JobStatus::Completed);
+    let boundary = chrono::Utc::now() - chrono::Duration::hours(5);
+    let set = |id: i64, at: chrono::DateTime<chrono::Utc>| {
+        let conn = rusqlite::Connection::open(d.path().join("omni.db")).unwrap();
+        conn.execute(
+            "UPDATE queue SET completed_at = ? WHERE id = ?",
+            rusqlite::params![omni_core::timestamps::format(at), id],
+        )
+        .unwrap();
+    };
+    set(before, boundary - chrono::Duration::minutes(1));
+    set(after, boundary + chrono::Duration::minutes(1));
+    assert_eq!(repo.job_counts_since(boundary).unwrap().completed_today, 1);
+    assert_eq!(repo.job_counts_since(boundary - chrono::Duration::minutes(2)).unwrap().completed_today, 2);
+    assert_eq!(repo.job_counts_since(boundary + chrono::Duration::minutes(2)).unwrap().completed_today, 0);
+}

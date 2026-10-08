@@ -373,6 +373,8 @@ pub struct JobsQuery {
     per_page: Option<i64>,
     q: Option<String>,
     group: Option<String>,
+    /// `1`: the review view also lists the jobs MCR hid (plan P7.21).
+    hidden: Option<u8>,
 }
 
 /// A job as the MCR desk shows it: the row, plus what its error code means
@@ -395,6 +397,7 @@ pub async fn api_get_jobs(
             search: query.q.clone().unwrap_or_default(),
             journalist: query.journalist.clone().unwrap_or_default(),
             group: query.group.clone().unwrap_or_default(),
+            include_hidden: query.hidden == Some(1),
         };
         let page = state
             .repo
@@ -781,6 +784,28 @@ pub async fn api_clear_finished(RequireMcr(principal): RequireMcr, State(state):
     audit_action(&state, &principal, &format!("Cleared {cleared} finished job(s) from the live queue"));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok", "cleared": cleared })))
+}
+
+#[derive(Deserialize)]
+pub struct HideOldBody {
+    hours: Option<i64>,
+}
+
+/// Tidy the review tab: hide what has waited longer than `hours` (default 72).
+/// Nothing is deleted.
+pub async fn api_hide_old_review(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    body: Option<Json<HideOldBody>>,
+) -> JsonResult {
+    let hours = body.and_then(|b| b.0.hours).unwrap_or(72).clamp(0, 24 * 365);
+    let hidden = state
+        .repo
+        .hide_old_review(hours)
+        .map_err(internal_error("Could not tidy the review list."))?;
+    audit_action(&state, &principal, &format!("Hid {hidden} review job(s) older than {hours} h"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "hidden": hidden })))
 }
 
 /// Download and convert a delivered job again from its link: the file was

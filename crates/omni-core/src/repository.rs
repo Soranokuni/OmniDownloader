@@ -30,6 +30,17 @@ pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 pub const DEFAULT_ADMIN_LOGIN: &str = "admin";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "Admin";
 
+/// The start of today in the server's local time, as UTC.
+fn local_midnight_utc() -> chrono::DateTime<Utc> {
+    use chrono::{Local, TimeZone};
+    let midnight = Local::now().date_naive().and_hms_opt(0, 0, 0);
+    midnight
+        .and_then(|m| Local.from_local_datetime(&m).earliest())
+        .map(|d| d.with_timezone(&Utc))
+        // A midnight that does not exist locally: fall back to 24 h ago.
+        .unwrap_or_else(|| Utc::now() - Duration::hours(24))
+}
+
 /// What [`Repository::cancel_job`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelOutcome {
@@ -970,8 +981,11 @@ impl Repository {
                 "MANUAL_DOWNLOAD" => summary.manual += count,
                 "COMPLETED" | "COMPLETED_MANUAL" => summary.completed += count,
                 "FAILED" => summary.failed += count,
-                // Everything else is a stage of "currently being worked on".
-                _ => summary.running += count,
+                "RUNNING" => summary.running += count,
+                "CANCELLED" => summary.cancelled += count,
+                // An unknown status is only part of the total: it must not
+                // pose as work in progress.
+                _ => {}
             }
             summary.total += count;
         }
@@ -1052,7 +1066,11 @@ impl Repository {
                  COALESCE(completed_at, updated_at) DESC, id DESC",
             ),
             JobsView::Review => (
-                "status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')",
+                if filter.include_hidden {
+                    "status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')"
+                } else {
+                    "status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NULL"
+                },
                 "updated_at DESC, id DESC",
             ),
             JobsView::Completed => (
@@ -1107,25 +1125,50 @@ impl Repository {
 
     /// Tab badge counts for the MCR desk, in one query.
     pub fn job_counts(&self) -> Result<crate::models::JobCounts> {
+        // "Today" is the station's day, not UTC's: local midnight, stored as UTC.
+        self.job_counts_since(local_midnight_utc())
+    }
+
+    /// `job_counts` with the start of "today" given (UTC), so a test can pin it.
+    pub fn job_counts_since(&self, day_start_utc: chrono::DateTime<Utc>) -> Result<crate::models::JobCounts> {
+        let today_start = timestamps::format(day_start_utc);
         let conn = self.pool.get()?;
         Ok(conn.query_row(
             r#"
             SELECT
               COALESCE(SUM(status IN ('PENDING','RUNNING')), 0),
               COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL), 0),
-              COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')), 0),
-              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL')), 0)
+              COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NULL), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL')), 0),
+              COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NOT NULL), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND completed_at >= ?), 0)
             FROM queue
             "#,
-            [],
+            params![today_start],
             |r| {
                 Ok(crate::models::JobCounts {
                     active: r.get(0)?,
                     finished: r.get(1)?,
                     review: r.get(2)?,
                     completed: r.get(3)?,
+                    review_hidden: r.get(4)?,
+                    completed_today: r.get(5)?,
                 })
             },
+        )?)
+    }
+
+    /// Tidy the review tab (plan P7.21): review-status jobs untouched for
+    /// `older_than_hours` leave the list and its badge. Nothing is deleted;
+    /// «Εμφάνιση κρυμμένων» brings them back. Returns how many were hidden.
+    pub fn hide_old_review(&self, older_than_hours: i64) -> Result<usize> {
+        let cutoff = timestamps::format(Utc::now() - Duration::hours(older_than_hours.max(0)));
+        let conn = self.pool.get()?;
+        Ok(conn.execute(
+            "UPDATE queue SET cleared_at = ?
+             WHERE status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')
+               AND cleared_at IS NULL AND updated_at < ?",
+            params![timestamps::now_string(), cutoff],
         )?)
     }
 
@@ -1163,7 +1206,8 @@ impl Repository {
 
     /// MCR's «Δοκιμή ξανά» / «Χρήση αυτού του συνδέσμου»: the job starts a
     /// clean new run, like a fresh queue entry (attempts, error, back-off and
-    /// lease all reset). Refused (`false`) for a running or delivered job:
+    /// lease all reset). `cleared_at` is reset too (P7.21): a job tidied away
+    /// from the review tab that comes back to life behaves normally. Refused (`false`) for a running or delivered job:
     /// a worker still holds the lease of the first, and the second has its
     /// own action, `redownload_job`.
     pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<bool> {
@@ -1174,7 +1218,7 @@ impl Repository {
             SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
-                completed_at = NULL, url = COALESCE(?, url),
+                completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
                 url_normalized = COALESCE(?, url_normalized), updated_at = ?
             WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED')
             "#,
@@ -1198,7 +1242,7 @@ impl Repository {
             UPDATE queue
             SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
-                completed_at = ?, delivered_at = ?, updated_at = ?
+                completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL
             WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')
             "#,
             params![now, now, now, id],
@@ -1328,6 +1372,7 @@ impl Repository {
             parent_job_id: row.get("parent_job_id").ok().flatten(),
             delivered_at: timestamps::parse_opt(row.get("delivered_at").ok().flatten()),
             completed_at: timestamps::parse_opt(row.get("completed_at").ok().flatten()),
+            cleared_at: timestamps::parse_opt(row.get("cleared_at").ok().flatten()),
 
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
@@ -2231,7 +2276,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let n = conn.execute(
-            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?
+            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?, cleared_at = NULL
              WHERE id = ? AND status = 'MANUAL_DOWNLOAD'",
             params![source_path, now, id],
         )?;

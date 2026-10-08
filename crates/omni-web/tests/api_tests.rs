@@ -816,3 +816,40 @@ async fn a_job_whose_worker_is_still_stopping_is_not_queued_again() -> Result<()
     assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
     Ok(())
 }
+
+#[tokio::test]
+async fn mcr_can_hide_old_review_videos_and_show_them_again() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/old", "1_NIKOLAOU_OLD", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    app.repo.finish(id, "test-worker", JobStatus::RequiresReview, Some("E_TEST"), Some("why"), None)?;
+
+    // The default (72 h) leaves a fresh job alone.
+    let (status, json) = app.send("POST", "/api/jobs/review/hide-old", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["hidden"], 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, json) = app
+        .send("POST", "/api/jobs/review/hide-old", &app.mcr_token, Some(json!({ "hours": 0 })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["hidden"], 1);
+
+    let (_, page) = app.send("GET", "/api/jobs?view=review", &app.mcr_token, None).await?;
+    assert_eq!(page["total"], 0, "{page}");
+    assert_eq!(page["counts"]["review"], 0);
+    assert_eq!(page["counts"]["review_hidden"], 1);
+    assert!(page["counts"]["completed_today"].as_i64().is_some(), "{page}");
+
+    let (_, page) = app.send("GET", "/api/jobs?view=review&hidden=1", &app.mcr_token, None).await?;
+    assert_eq!(page["total"], 1, "{page}");
+    assert!(page["jobs"][0]["cleared_at"].is_string(), "the card can say it is hidden: {page}");
+    Ok(())
+}

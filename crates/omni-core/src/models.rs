@@ -210,6 +210,10 @@ pub struct Job {
     pub parent_job_id: Option<i64>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// When the desk took the job off a list (plan P7.1 live queue, P7.21
+    /// review tab). `None`: shown.
+    #[serde(default)]
+    pub cleared_at: Option<DateTime<Utc>>,
 
     /// Stored timestamp, `None` when the row predates real timestamps or the
     /// value is unreadable. Never substituted with "now" (defect D-11): the MCR
@@ -298,6 +302,8 @@ pub struct JobsFilter {
     pub journalist: String,
     /// A group code, or "-" for jobs without a group.
     pub group: String,
+    /// Review view only: also list the jobs the desk tidied away (P7.21).
+    pub include_hidden: bool,
 }
 
 /// One page of a job list.
@@ -316,8 +322,14 @@ pub struct JobCounts {
     pub active: i64,
     /// Delivered and still shown on the live queue.
     pub finished: i64,
+    /// Waiting for a person and not tidied away.
     pub review: i64,
+    /// Every delivery ever.
     pub completed: i64,
+    /// Review-status jobs the desk hid (P7.21); not in `review`.
+    pub review_hidden: i64,
+    /// Delivered since local midnight on the server (P7.21).
+    pub completed_today: i64,
 }
 
 /// What the `queue` health check looks at (plan P7.19).
@@ -336,8 +348,10 @@ pub struct QueueWatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueSummary {
     pub pending: i64,
-    /// Anything currently being worked on, whatever stage it is in.
+    /// Jobs a worker holds, whatever stage they are in.
     pub running: i64,
+    /// Cancelled by MCR; neither waiting nor working.
+    pub cancelled: i64,
     pub review: i64,
     pub manual: i64,
     pub completed: i64,

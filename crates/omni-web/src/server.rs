@@ -53,6 +53,7 @@ impl WebServer {
             .route("/api/jobs/:id/mark-done", post(api_mark_done_job))
             .route("/api/jobs/:id/cancel", post(api_cancel_job))
             .route("/api/jobs/clear-finished", post(api_clear_finished))
+            .route("/api/jobs/review/hide-old", post(api_hide_old_review))
             .route("/api/jobs/:id/offers/queue", post(api_queue_offer))
             .route("/api/jobs/:id/discard", post(api_discard_job))
             .route(
