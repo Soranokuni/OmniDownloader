@@ -19,6 +19,7 @@ use omni_core::models::{JobStage, JobStatus};
 use omni_core::repository::Repository;
 use omni_core::secrets::SecretStore;
 use omni_core::health::HealthState;
+use omni_core::site_health::{SiteOutcome, SiteState};
 use omni_core::logging::{LogGuard, Redactions};
 use omni_core::update_gate::UpdateGate;
 use omni_email::watcher::EmailWatcher;
@@ -787,6 +788,7 @@ async fn run_daemon(
     // The self-check's last results, and a browser launch in the background:
     // a broken browser is reported now, not when the first article fails.
     selfcheck::refresh_health(&repo, &health);
+    omni_core::site_health::refresh_health(&repo, &health);
     {
         let health = health.clone();
         tokio::spawn(async move {
@@ -1110,6 +1112,7 @@ async fn run_daemon(
             let rep = repo_worker.clone();
             let busy_guard = busy_worker.guard(job.id, &owner);
             let evidence_dir = worker_temp.join("evidence");
+            let job_health = worker_health.clone();
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
@@ -1155,7 +1158,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, worker_repair_mode).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, worker_repair_mode, &job_health).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -1268,6 +1271,7 @@ async fn run_job(
     cancel: CancellationToken,
     evidence_dir: &std::path::Path,
     repair_mode: RepairMode,
+    health: &HealthState,
 ) -> Result<()> {
     let job_id = job.id;
     let orig_url = job.url.clone();
@@ -1526,7 +1530,7 @@ async fn run_job(
                 .get_job(job_id)?
                 .and_then(|j| j.file_path)
                 .filter(|p| !p.is_empty());
-            repo.finish(
+            let done = repo.finish(
                 job_id,
                 owner,
                 JobStatus::Completed,
@@ -1534,6 +1538,13 @@ async fn run_job(
                 None,
                 delivered.as_deref(),
             )?;
+            if done && !cancel.is_cancelled() {
+                // An article's sibling job holds a sniffed stream or post,
+                // not a page of the site: it says nothing about the site.
+                if job.parent_job_id.is_none() {
+                    note_site_outcome(repo, health, job_id, &orig_url, SiteOutcome::Success);
+                }
+            }
             Ok(())
         }
         Err(e) => {
@@ -1604,7 +1615,7 @@ async fn run_job(
                         save_page_evidence(repo, evidence_dir, job_id, snap).await;
                     }
                 }
-                repo.finish(
+                let done = repo.finish(
                     job_id,
                     owner,
                     status,
@@ -1612,9 +1623,58 @@ async fn run_job(
                     Some(&message),
                     None,
                 )?;
+                // Site health (P10.3): only a finished job, and only the
+                // codes that say something about the site, not this page.
+                if done
+                    && !cancel.is_cancelled()
+                    && job.parent_job_id.is_none()
+                    && omni_core::site_health::counts_against_site(code.as_str())
+                {
+                    note_site_outcome(
+                        repo,
+                        health,
+                        job_id,
+                        &orig_url,
+                        SiteOutcome::SiteFailure(code.as_str().to_string()),
+                    );
+                }
             }
             Ok(())
         }
+    }
+}
+
+/// Fold a finished job into its site's health (plan P10.3). Bookkeeping only:
+/// a database error is a warning and never changes the job's outcome.
+fn note_site_outcome(
+    repo: &Repository,
+    health: &HealthState,
+    job_id: i64,
+    url: &str,
+    outcome: SiteOutcome,
+) {
+    let is_platform = omni_broadcast::downloader::is_video_platform(url);
+    let Some(domain) = omni_core::site_health::site_for_job(url, is_platform) else {
+        return;
+    };
+    match repo.record_site_outcome(&domain, outcome) {
+        Ok((before, after)) => {
+            if before != after {
+                let line = match (after, repo.get_site(&domain)) {
+                    (SiteState::Healthy, _) => format!("Site {domain} is healthy again"),
+                    (state, Ok(Some(row))) => format!(
+                        "Site {domain} is now {} ({} failures in a row)",
+                        state.as_str(),
+                        row.consecutive_fail
+                    ),
+                    (state, _) => format!("Site {domain} is now {}", state.as_str()),
+                };
+                info!("Job #{job_id}: {line}");
+                let _ = repo.record_event(job_id, "INFO", None, &line);
+            }
+            omni_core::site_health::refresh_health(repo, health);
+        }
+        Err(e) => warn!("Job #{job_id}: site health for {domain} not recorded: {e:#}"),
     }
 }
 
@@ -2370,6 +2430,15 @@ async fn run_one_task(
         "retention" => {
             // Login records first: the table grows with every failed attempt
             // and nothing else prunes it.
+            match repo.purge_idle_sites(90) {
+                Ok(n) if n > 0 => {
+                    info!("Retention: removed {n} idle site record(s)");
+                    // A purged degraded site must leave the banner too.
+                    omni_core::site_health::refresh_health(repo, &ctx.health);
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Retention: site records not purged: {e:#}"),
+            }
             match repo.purge_login_attempts(90) {
                 Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),
                 Ok(_) => {}
@@ -2901,6 +2970,20 @@ mod tests {
 
     /// The code a page's evidence gives a failed job (P10.2): a "no video"
     /// verdict needs the second look; a weak page keeps what it had.
+    #[test]
+    fn only_four_codes_count_against_a_site() {
+        let counting: Vec<&str> = ErrorCode::ALL
+            .iter()
+            .map(|c| c.as_str())
+            .filter(|c| omni_core::site_health::counts_against_site(c))
+            .collect();
+        assert_eq!(
+            counting,
+            ["UNSUPPORTED_URL", "HTTP_403", "NO_STREAM_FOUND", "VIDEO_UNRESOLVED"],
+            "a new ErrorCode must be a conscious choice here"
+        );
+    }
+
     #[test]
     fn evidence_names_the_exact_failure() {
         let orig = ErrorCode::NoStreamFound;

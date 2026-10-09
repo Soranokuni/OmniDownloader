@@ -141,6 +141,8 @@ pub mod checks {
     pub const DENO: &str = "deno";
     /// The first-run Admin / Admin account still logs in.
     pub const ACCOUNTS: &str = "accounts";
+    /// News sites that stopped giving video (plan P10.3).
+    pub const SITES: &str = "sites";
 }
 
 impl Default for HealthState {

@@ -15,6 +15,7 @@ use crate::models::{
     ProcessedMail, QueueSummary, QueueWatch, User,
     UserRole,
 };
+use crate::site_health::{self, SiteOutcome, SiteRow, SiteState};
 use crate::taxonomy::{Group, ImportReport, Person, Taxonomy};
 use crate::timestamps;
 
@@ -1865,6 +1866,101 @@ impl Repository {
         Ok(n)
     }
 
+    /// Fold one outcome into a site's row (plan P10.3). Read-modify-write in
+    /// one immediate transaction so two workers finishing at once both count.
+    /// Returns the state before and after.
+    pub fn record_site_outcome(
+        &self,
+        domain: &str,
+        outcome: SiteOutcome,
+    ) -> Result<(SiteState, SiteState)> {
+        let domain = domain.trim().to_lowercase();
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row = read_site(&tx, &domain)?.unwrap_or_else(|| SiteRow::new(&domain));
+        let before = row.state;
+        let now = Utc::now();
+        let row = site_health::apply(row, outcome, now);
+        let after = row.state;
+        tx.execute(
+            r#"
+            INSERT INTO site_stats (domain, recent, consecutive_fail, last_ok_at, last_fail_at,
+                                    last_code, state, state_since, llm_breaker_until, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                recent = excluded.recent,
+                consecutive_fail = excluded.consecutive_fail,
+                last_ok_at = excluded.last_ok_at,
+                last_fail_at = excluded.last_fail_at,
+                last_code = excluded.last_code,
+                state = excluded.state,
+                state_since = excluded.state_since,
+                llm_breaker_until = excluded.llm_breaker_until,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                row.domain,
+                row.recent,
+                row.consecutive_fail,
+                row.last_ok_at.map(timestamps::format),
+                row.last_fail_at.map(timestamps::format),
+                row.last_code,
+                row.state.as_str(),
+                row.state_since.map(timestamps::format),
+                row.llm_breaker_until.map(timestamps::format),
+                timestamps::format(now),
+            ],
+        )?;
+        tx.commit()?;
+        Ok((before, after))
+    }
+
+    pub fn get_site(&self, domain: &str) -> Result<Option<SiteRow>> {
+        let conn = self.pool.get()?;
+        read_site(&conn, &domain.trim().to_lowercase())
+    }
+
+    /// Sites that are degraded or broken, oldest trouble first.
+    pub fn list_sites_not_healthy(&self) -> Result<Vec<SiteRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT domain, recent, consecutive_fail, last_ok_at, last_fail_at, last_code,
+                    state, state_since, llm_breaker_until
+             FROM site_stats WHERE state <> 'healthy' ORDER BY state_since ASC, domain ASC",
+        )?;
+        let rows = stmt
+            .query_map([], site_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Set a site's state from outside the outcome stream (canaries).
+    /// Returns false when the site has no row.
+    pub fn set_site_state(&self, domain: &str, state: SiteState) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            "UPDATE site_stats
+             SET state = ?, state_since = CASE WHEN state <> ? THEN ? ELSE state_since END, updated_at = ?
+             WHERE domain = ?",
+            params![state.as_str(), state.as_str(), now, now, domain.trim().to_lowercase()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Delete rows whose last success and last failure are both older than
+    /// `days` (or never happened). Retention.
+    pub fn purge_idle_sites(&self, days: i64) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(Utc::now() - Duration::days(days));
+        let n = conn.execute(
+            "DELETE FROM site_stats
+             WHERE (last_ok_at IS NULL OR last_ok_at < ?) AND (last_fail_at IS NULL OR last_fail_at < ?)",
+            params![cutoff, cutoff],
+        )?;
+        Ok(n)
+    }
+
     /// Create a session with an arbitrary lifetime.
     ///
     /// `expires_at` is stored in the same RFC3339 format the expiry query
@@ -2775,6 +2871,57 @@ mod tests {
     }
 
     #[test]
+    fn site_stats_record_list_set_and_purge() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        assert!(repo.get_site("news.example")?.is_none());
+        assert!(repo.list_sites_not_healthy()?.is_empty());
+
+        for _ in 0..6 {
+            let (b, a) = repo.record_site_outcome("news.example", SiteOutcome::Success)?;
+            assert_eq!((b, a), (SiteState::Healthy, SiteState::Healthy));
+        }
+        let fail = || SiteOutcome::SiteFailure("NO_STREAM_FOUND".into());
+        repo.record_site_outcome("news.example", fail())?;
+        repo.record_site_outcome("news.example", fail())?;
+        let (b, a) = repo.record_site_outcome("news.example", fail())?;
+        assert_eq!((b, a), (SiteState::Healthy, SiteState::Degraded));
+
+        let row = repo.get_site("news.example")?.expect("row");
+        assert_eq!(row.consecutive_fail, 3);
+        assert_eq!(row.recent, "111111000");
+        assert_eq!(row.last_code.as_deref(), Some("NO_STREAM_FOUND"));
+        assert!(row.last_ok_at.is_some() && row.last_fail_at.is_some() && row.state_since.is_some());
+        let bad = repo.list_sites_not_healthy()?;
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].domain, "news.example");
+
+        // A canary can call it broken; a failure leaves it broken.
+        assert!(repo.set_site_state("news.example", SiteState::Broken)?);
+        assert!(!repo.set_site_state("nobody.example", SiteState::Broken)?);
+        let (b, a) = repo.record_site_outcome("news.example", fail())?;
+        assert_eq!((b, a), (SiteState::Broken, SiteState::Broken));
+        let (_, a) = repo.record_site_outcome("news.example", SiteOutcome::Success)?;
+        assert_eq!(a, SiteState::Healthy);
+        assert!(repo.list_sites_not_healthy()?.is_empty());
+
+        // Purge: a recently active row stays, an idle one goes.
+        repo.record_site_outcome("idle.example", SiteOutcome::Success)?;
+        {
+            let conn = repo.pool.get()?;
+            let old = timestamps::format(Utc::now() - Duration::days(120));
+            conn.execute(
+                "UPDATE site_stats SET last_ok_at = ?, last_fail_at = NULL WHERE domain = 'idle.example'",
+                params![old],
+            )?;
+        }
+        assert_eq!(repo.purge_idle_sites(90)?, 1);
+        assert!(repo.get_site("idle.example")?.is_none());
+        assert!(repo.get_site("news.example")?.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn owns_lease_is_true_only_for_the_running_owner() -> Result<()> {
         let temp_db = NamedTempFile::new()?;
         let repo = Repository::new(temp_db.path())?;
@@ -3102,6 +3249,35 @@ fn upsert_group(conn: &rusqlite::Connection, g: &Group) -> Result<()> {
         params![g.code, g.name, g.kind, serde_json::to_string(&g.keywords)?, g.description, timestamps::now_string()],
     )?;
     Ok(())
+}
+
+fn site_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SiteRow> {
+    let ts = |i: usize| -> rusqlite::Result<Option<chrono::DateTime<Utc>>> {
+        Ok(timestamps::parse_opt(r.get::<_, Option<String>>(i)?))
+    };
+    Ok(SiteRow {
+        domain: r.get(0)?,
+        recent: r.get(1)?,
+        consecutive_fail: r.get(2)?,
+        last_ok_at: ts(3)?,
+        last_fail_at: ts(4)?,
+        last_code: r.get(5)?,
+        state: SiteState::parse(&r.get::<_, String>(6)?),
+        state_since: ts(7)?,
+        llm_breaker_until: ts(8)?,
+    })
+}
+
+fn read_site(conn: &rusqlite::Connection, domain: &str) -> Result<Option<SiteRow>> {
+    Ok(conn
+        .query_row(
+            "SELECT domain, recent, consecutive_fail, last_ok_at, last_fail_at, last_code,
+                    state, state_since, llm_breaker_until
+             FROM site_stats WHERE domain = ?",
+            params![domain],
+            site_from_row,
+        )
+        .optional()?)
 }
 
 /// Replace one journalist's memberships with `codes`, in order.
