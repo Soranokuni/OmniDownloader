@@ -447,6 +447,25 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        16,
+        // Per news site: has it started failing (P10.3)? `recent` is the last
+        // 20 outcomes as '1'/'0'; `llm_breaker_until` is for a later item.
+        r#"
+        CREATE TABLE IF NOT EXISTS site_stats (
+            domain            TEXT PRIMARY KEY,
+            recent            TEXT NOT NULL DEFAULT '',
+            consecutive_fail  INTEGER NOT NULL DEFAULT 0,
+            last_ok_at        TEXT,
+            last_fail_at      TEXT,
+            last_code         TEXT,
+            state             TEXT NOT NULL DEFAULT 'healthy',
+            state_since       TEXT,
+            llm_breaker_until TEXT,
+            updated_at        TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -626,6 +645,26 @@ mod tests {
             assert!(columns.iter().any(|x| x == c), "job_evidence.{c} missing: {columns:?}");
         }
         assert!(target_version() >= 15);
+    }
+
+    #[test]
+    fn migration_16_creates_site_stats() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('site_stats')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in [
+            "domain", "recent", "consecutive_fail", "last_ok_at", "last_fail_at", "last_code",
+            "state", "state_since", "llm_breaker_until", "updated_at",
+        ] {
+            assert!(columns.iter().any(|x| x == c), "site_stats.{c} missing: {columns:?}");
+        }
+        assert!(target_version() >= 16);
     }
 
     #[test]

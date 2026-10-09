@@ -1733,10 +1733,26 @@ pub async fn api_system_status(
 
     let checks = state.health.all();
 
+    // Sites that stopped giving video (P10.3); `null` when the query failed.
+    let sites = state.repo.list_sites_not_healthy().ok().map(|rows| {
+        rows.into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "domain": r.domain,
+                    "state": r.state.as_str(),
+                    "consecutive_fail": r.consecutive_fail,
+                    "state_since": r.state_since,
+                    "last_code": r.last_code,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
     Json(serde_json::json!({
         "status": state.health.overall().as_str(),
         "checks": checks,
         "queue": queue,
+        "sites": sites,
         "disk": {
             "watchfolder": disk_of(&watchfolder),
             "temp": disk_of(&temp_path),

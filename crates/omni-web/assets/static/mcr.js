@@ -22,7 +22,7 @@ import {
   canRename, renameJob as deskRename, timelineNode,
 } from '/static/desk.js?v=8';
 import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=14';
-import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=8';
+import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=9';
 
 let journalists = [];
 

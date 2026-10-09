@@ -131,10 +131,14 @@ export const CHECK_INFO = {
     action: 'Βίντεο περιμένουν ή τρέχουν ασυνήθιστα πολύ. Ελέγξτε την καρτέλα «Σε εξέλιξη».',
   },
   accounts: { name: 'Λογαριασμοί', action: '' },
+  sites: {
+    name: 'Ιστότοποι',
+    action: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο· οι εργασίες από αυτόν ίσως χρειαστούν χειροκίνητη λήψη.',
+  },
 };
 
 const SEVERITY = { ok: 0, degraded: 1, down: 2 };
-const SILENT_CHECKS = ['llm', 'accounts'];
+const SILENT_CHECKS = ['llm', 'accounts', 'sites'];
 
 function sev(check) {
   return check ? (SEVERITY[check.state] ?? 0) : 0;
