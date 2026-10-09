@@ -24,6 +24,16 @@ use crate::timestamps;
 /// news cycle) without blocking a genuine re-ingest the next day.
 pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 
+/// One page-evidence file of a failed job (plan P10.1).
+#[derive(Debug, Clone)]
+pub struct EvidenceRow {
+    pub job_id: i64,
+    pub path: String,
+    pub bytes: i64,
+    /// `None` when the stored text does not parse; never shown as "now".
+    pub created_at: Option<chrono::DateTime<Utc>>,
+}
+
 /// The first-run administrator of a new installation (see
 /// [`Repository::ensure_default_admin`]). Logins are matched lowercased, so
 /// "Admin" and "admin" both work.
@@ -2696,12 +2706,73 @@ impl Repository {
         }
         Ok(list)
     }
+
+    // ---- page evidence (P10.1) ----
+
+    /// Note that the evidence file of a failed job was written.
+    pub fn record_evidence(&self, job_id: i64, path: &str, bytes: i64) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO job_evidence (job_id, path, bytes, created_at) VALUES (?, ?, ?, ?)",
+            params![job_id, path, bytes, timestamps::now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every evidence row, oldest first.
+    pub fn list_evidence(&self) -> Result<Vec<EvidenceRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, path, bytes, created_at FROM job_evidence ORDER BY created_at ASC, job_id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(EvidenceRow {
+                job_id: r.get(0)?,
+                path: r.get(1)?,
+                bytes: r.get(2)?,
+                created_at: timestamps::parse_opt(r.get(3).ok()),
+            })
+        })?;
+        let mut list = Vec::new();
+        for row in rows {
+            list.push(row?);
+        }
+        Ok(list)
+    }
+
+    pub fn delete_evidence(&self, job_id: i64) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM job_evidence WHERE job_id = ?", params![job_id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn evidence_rows_are_recorded_listed_oldest_first_and_deleted() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        assert!(repo.list_evidence()?.is_empty());
+        repo.record_evidence(7, "temp/evidence/7.json", 1000)?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        repo.record_evidence(3, "temp/evidence/3.json", 2000)?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        repo.record_evidence(7, "temp/evidence/7.json", 1500)?; // replaces, newest now
+
+        let rows = repo.list_evidence()?;
+        assert_eq!(rows.iter().map(|r| r.job_id).collect::<Vec<_>>(), vec![3, 7]);
+        assert_eq!(rows[1].bytes, 1500);
+        assert!(rows.iter().all(|r| r.created_at.is_some()));
+
+        repo.delete_evidence(3)?;
+        assert_eq!(repo.list_evidence()?.len(), 1);
+        repo.delete_evidence(3)?; // already gone: not an error
+        Ok(())
+    }
 
     #[test]
     fn owns_lease_is_true_only_for_the_running_owner() -> Result<()> {
