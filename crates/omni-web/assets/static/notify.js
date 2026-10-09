@@ -145,7 +145,7 @@ function sev(check) {
 }
 
 function needCount(q) {
-  return (q.review || 0) + (q.manual || 0) + (q.failed || 0);
+  return (q.review || 0) + (q.manual || 0) + (q.failed || 0) + (q.approval || 0);
 }
 
 /**

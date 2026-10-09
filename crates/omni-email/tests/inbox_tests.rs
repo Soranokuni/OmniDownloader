@@ -96,6 +96,26 @@ fn each_mail_is_one_entry_with_the_state_of_its_videos() {
 }
 
 #[test]
+fn a_held_video_gives_the_mail_its_own_state_that_still_needs_attention() {
+    let (_d, repo) = repo();
+    mail(&repo, "<held@x>", "ΚΑΙΡΟΣ", 30, &[("https://youtu.be/h1", JobStatus::AwaitingApproval)]);
+    // A failure beside a held video is the louder state.
+    mail(&repo, "<both@x>", "ΣΕΙΣΜΟΣ", 20, &[("https://youtu.be/h2", JobStatus::AwaitingApproval), ("https://youtu.be/h3", JobStatus::Failed)]);
+    // A video still downloading does not hide a held one.
+    mail(&repo, "<mix@x>", "ΠΥΡΚΑΓΙΑ", 10, &[("https://youtu.be/h4", JobStatus::AwaitingApproval), ("https://youtu.be/h5", JobStatus::Pending)]);
+
+    let entries = list(&repo);
+    let state = |k: &str| entries.iter().find(|e| e.key == k).unwrap().state;
+    assert_eq!(state("<held@x>"), EntryState::Approval);
+    assert_eq!(state("<both@x>"), EntryState::Attention);
+    assert_eq!(state("<mix@x>"), EntryState::Approval);
+
+    let page = inbox::page(entries, InboxFilter::Attention, "", 1, 20);
+    assert_eq!(page.total, 3, "held videos are under «needs attention»");
+    assert_eq!(page.counts.attention, 3);
+}
+
+#[test]
 fn a_link_added_by_hand_is_an_entry_with_its_article_videos() {
     let (_d, repo) = repo();
     let root = repo

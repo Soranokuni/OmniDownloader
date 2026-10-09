@@ -321,3 +321,25 @@ fn a_job_with_a_waiting_or_approved_hold_cannot_be_renamed() -> Result<()> {
     assert_eq!(repo.get_job(id)?.unwrap().slug, "2_ANNA_TEST");
     Ok(())
 }
+
+#[test]
+fn lease_job_by_id_takes_only_that_pending_job() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let other = queue(&repo, 1); // older and first in line
+    let mine = queue(&repo, 2);
+
+    assert!(repo.lease_job_by_id(mine, "dev", 60)?);
+    assert_eq!(repo.get_job(mine)?.unwrap().status, JobStatus::Running);
+    assert_eq!(repo.get_job(mine)?.unwrap().lease_owner.as_deref(), Some("dev"));
+    assert_eq!(repo.get_job(other)?.unwrap().status, JobStatus::Pending, "another pending job is never taken");
+
+    // Already running: not leasable again. A missing id: false.
+    assert!(!repo.lease_job_by_id(mine, "dev2", 60)?);
+    assert!(!repo.lease_job_by_id(9999, "dev", 60)?);
+    // Not pending at all (cancelled): false, and still cancelled.
+    repo.cancel_job(other)?;
+    assert!(!repo.lease_job_by_id(other, "dev", 60)?);
+    assert_eq!(repo.get_job(other)?.unwrap().status, JobStatus::Cancelled);
+    Ok(())
+}

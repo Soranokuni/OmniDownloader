@@ -20,7 +20,7 @@ import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/s
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=8';
+} from '/static/desk.js?v=10';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -90,6 +90,7 @@ function shortStatus(j) {
     case 'MANUAL_DOWNLOAD': return 'χειροκίνητη λήψη';
     case 'FAILED': return 'απέτυχε';
     case 'CANCELLED': return 'ακυρώθηκε';
+    case 'AWAITING_APPROVAL': return 'για έγκριση';
     default: return 'χρειάζεται έλεγχο';
   }
 }
@@ -107,6 +108,7 @@ function railBadge(j) {
     MANUAL_DOWNLOAD: ['warn', 'Χειροκίνητα'],
     FAILED: ['bad', 'Απέτυχε'],
     CANCELLED: ['', 'Ακυρώθηκε'],
+    AWAITING_APPROVAL: ['warn', 'Για έγκριση'],
   }[j.status] || ['warn', 'Έλεγχος'];
   return el('span', { class: `badge ${cls}`.trim() }, text);
 }
@@ -118,12 +120,13 @@ function summary(e) {
   if (!js.length) {
     return [e.outcome === 'PHOTOS_ONLY' ? 'Μόνο φωτογραφίες· τίποτα για λήψη' : 'Δεν βρέθηκε βίντεο'];
   }
-  const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0 };
+  const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0, approval: 0 };
   for (const j of js) c[tone(j)] += 1;
   const head = el('b', {}, js.length === 1 ? '1 βίντεο' : `${js.length} βίντεο`);
   if (c.ok === js.length) return [head, js.length === 1 ? ' · παραδόθηκε' : ' · όλα παραδόθηκαν'];
   const parts = [];
   if (c.bad) parts.push(c.bad === 1 ? '1 απέτυχε' : `${c.bad} απέτυχαν`);
+  if (c.approval) parts.push(`${c.approval} για έγκριση`);
   if (c.warn) parts.push(c.warn === 1 ? '1 θέλει έλεγχο' : `${c.warn} θέλουν έλεγχο`);
   if (c.run) {
     const r = js.find((j) => j.status === 'RUNNING');
@@ -829,6 +832,16 @@ function subLine(j) {
       break;
     case 'CANCELLED':
       left = ['Ακυρώθηκε'];
+      break;
+    case 'AWAITING_APPROVAL':
+      // To the review tab, with this video's card in view (mcr.js listens).
+      left = [el('button', {
+        class: 'badge warn', type: 'button', title: 'Άνοιγμα στην καρτέλα «Χρειάζονται έλεγχο»',
+        onClick: (ev) => {
+          ev.stopPropagation();
+          window.dispatchEvent(new CustomEvent('desk:approval', { detail: { id: j.id } }));
+        },
+      }, 'Για έγκριση')];
       break;
     default:
       left = [el('span', { class: 'st' }, 'Δεν κατέβηκε αυτόματα')];
