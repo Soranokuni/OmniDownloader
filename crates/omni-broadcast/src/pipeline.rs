@@ -12,6 +12,7 @@ use omni_core::repository::{HeldOutput, Repository};
 use crate::delivery::WatchfolderDelivery;
 use crate::downloader::{DownloadError, DownloadOpts, Downloader};
 use crate::errors::ErrorCode;
+use crate::preview::{self, PreviewEncoder};
 use crate::rewrapper::Rewrapper;
 use crate::transcoder::Transcoder;
 
@@ -92,6 +93,8 @@ pub struct BroadcastEngine {
     encoder_slots: Arc<Semaphore>,
     /// The download slot each job holds until it reaches the encoder.
     download_slots: Arc<Mutex<HashMap<i64, OwnedSemaphorePermit>>>,
+    /// The H.264 encoder previews use, found on first use (P10.6).
+    preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
 }
 
 impl BroadcastEngine {
@@ -118,6 +121,16 @@ impl BroadcastEngine {
         self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&job_id)
     }
 
+    /// The encoder held-video previews use; asked of ffmpeg once, then kept.
+    pub async fn preview_encoder(&self) -> PreviewEncoder {
+        // A failed question is not remembered: the next hold asks again.
+        let found = self
+            .preview_encoder
+            .get_or_try_init(|| async { preview::discover(&self.ffmpeg_path).await.ok_or(()) })
+            .await;
+        found.copied().unwrap_or(PreviewEncoder::None)
+    }
+
     pub fn new(
         repo: Repository,
         ytdl_path: PathBuf,
@@ -137,6 +150,7 @@ impl BroadcastEngine {
             watchfolder_dir,
             encoder_slots: Arc::new(Semaphore::new(DEFAULT_ENCODER_SLOTS)),
             download_slots: Arc::new(Mutex::new(HashMap::new())),
+            preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -529,7 +543,7 @@ impl BroadcastEngine {
         // 4b. Held for MCR: the file stays here, bound to its SHA-256, and
         // nothing reaches the watchfolder until it is approved (P10.5).
         if let DeliveryMode::Hold { hold_hours, held_max_bytes } = delivery {
-            self.hold_final(job_id, owner, &final_temp_mxf, &slug, duration, hold_hours, held_max_bytes, &job_temp)
+            self.hold_final(job_id, owner, &final_temp_mxf, &slug, duration, hold_hours, held_max_bytes, &job_temp, cancel.as_ref())
                 .await?;
             return Ok(RunOutcome::Held);
         }
@@ -613,6 +627,7 @@ impl BroadcastEngine {
         hold_hours: i64,
         held_max_bytes: u64,
         job_temp: &Path,
+        cancel: Option<&CancellationToken>,
     ) -> Result<()> {
         if !self.repo.owns_lease(job_id, owner).unwrap_or(false) {
             return Err(self.lost(job_id, JobStage::Verify, job_temp).await);
@@ -704,6 +719,22 @@ impl BroadcastEngine {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
                 return Err(e.context("Could not record the held video").context(ErrorCode::PipelineFailed.as_str()));
             }
+        }
+
+        // A look at exactly the held file for MCR; best effort, never fails the hold.
+        let token = cancel.cloned().unwrap_or_default();
+        let encoder = self.preview_encoder().await;
+        let made = preview::make(&self.ffmpeg_path, &held_path, &dir, encoder, duration, &token).await;
+        if !made.has_preview() {
+            let why = made.why.as_deref().unwrap_or("άγνωστος λόγος");
+            let _ = self.repo.record_event(
+                job_id,
+                "WARN",
+                Some(JobStage::Verify),
+                &format!("Δεν έγινε προεπισκόπηση: {why}"),
+            );
+        } else {
+            let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Verify), "Προεπισκόπηση έτοιμη");
         }
 
         WatchfolderDelivery::cleanup_job_temp_files(job_temp).await;

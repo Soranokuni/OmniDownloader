@@ -756,11 +756,14 @@ async fn run_daemon(
     match omni_broadcast::selftest::encoder_self_test(&st_ffmpeg, &st_ffprobe, &st_bmx, &temp_path).await {
         Ok(report) => {
             encoder_ok.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Which H.264 encoder MCR's preview of a held video will use (P10.6).
+            let preview_encoder = broadcast_engine.preview_encoder().await;
             health.set(
                 omni_core::health::checks::ENCODER,
                 omni_core::health::Check::ok(format!(
-                    "test clip transcoded, rewrapped and verified in {:.1} s",
-                    report.elapsed.as_secs_f64()
+                    "test clip transcoded, rewrapped and verified in {:.1} s; preview: {}",
+                    report.elapsed.as_secs_f64(),
+                    preview_encoder.label()
                 )),
             );
         }
