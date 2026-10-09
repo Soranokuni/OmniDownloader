@@ -299,6 +299,17 @@ const MATRIX: &[Row] = &[
         "/api/jobs/1/retry",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),    // MCR desk (plan P7.1): download a delivered job again; clear the live list.
+    // A video held for approval (P10.5): MCR decides, nobody else.
+    (
+        "POST",
+        "/api/jobs/1/approve",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/reject",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
     (
         "POST",
         "/api/jobs/1/redownload",
@@ -937,6 +948,44 @@ async fn w07_state_changing_requests_need_the_panel_marker_and_a_same_origin() -
     // GET is never blocked by the guard.
     let status = h.request("GET", "/api/jobs", Mcr).await;
     assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+/// Approving or rejecting a held video (P10.5) is a state-changing POST: the
+/// panel marker is required like on every other one.
+#[tokio::test]
+async fn approving_or_rejecting_a_held_video_needs_the_csrf_marker() -> Result<()> {
+    let h = Harness::new(true)?;
+    for uri in ["/api/jobs/1/approve", "/api/jobs/1/reject"] {
+        let send = |headers: &[(&str, &str)]| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("cookie", format!("omni_session={}", h.tokens.mcr))
+                .header("content-type", "application/json");
+            for (k, v) in headers {
+                builder = builder.header(*k, *v);
+            }
+            let req = builder.body(Body::from(r#"{"sha256":"x","reason":"other"}"#)).unwrap();
+            let router = h.router.clone().layer(MockConnectInfo(OUTSIDER.parse::<SocketAddr>().unwrap()));
+            async move { router.oneshot(req).await.unwrap().status() }
+        };
+        assert_eq!(
+            send(&[("host", "mcr.local"), ("origin", "https://evil.example")]).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: a cross-site post must be refused"
+        );
+        assert_eq!(
+            send(&[("host", "mcr.local"), ("origin", "http://mcr.local")]).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: no panel marker"
+        );
+        assert_ne!(
+            send(&[("x-omni-request", "1"), ("host", "mcr.local"), ("origin", "http://mcr.local")]).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: the panel's own request must get through the guard"
+        );
+    }
     Ok(())
 }
 

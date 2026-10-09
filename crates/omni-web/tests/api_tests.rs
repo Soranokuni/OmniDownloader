@@ -70,7 +70,8 @@ impl App {
         let admin_token = omni_core::auth::generate_session_token();
         repo.create_session(admin_id, &admin_token, 1)?;
 
-        let state = AppState::new(repo.clone(), config, dir.path().join("config.json"));
+        let state = AppState::new(repo.clone(), config, dir.path().join("config.json"))
+            .with_temp_dir(dir.path().join("temp"));
         let busy = state.busy_jobs.clone();
         let router = WebServer::build_router(state);
 
@@ -901,5 +902,124 @@ async fn the_self_check_panel_lists_the_site_canaries() -> Result<()> {
     assert!(rows[0]["last_checked_at"].is_string());
     // The existing fields are still there.
     assert!(json["links"].is_array());
+    Ok(())
+}
+
+// ---- videos held for approval (P10.5) ----
+
+const HELD_SHA: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+/// A job held for approval, with a file in its held directory.
+fn held_job(app: &App, n: u32) -> Result<i64> {
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new(&format!("https://example.gr/h{n}"), &format!("{n}_NIKOLAOU_HELD"), "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("clip.mxf"), b"abc")?;
+    assert!(app.repo.hold_output(
+        id,
+        "test-worker",
+        &dir.join("clip.mxf").to_string_lossy(),
+        3,
+        HELD_SHA,
+        Some(2.0),
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    )?);
+    assert!(app.repo.finish(id, "test-worker", JobStatus::AwaitingApproval, None, None, None)?);
+    Ok(id)
+}
+
+#[tokio::test]
+async fn the_desk_sees_the_held_file_and_approves_exactly_that_sha() -> Result<()> {
+    let app = App::new()?;
+    let id = held_job(&app, 1)?;
+
+    let (status, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let held = &json["job"]["held"];
+    assert_eq!(held["sha256"], HELD_SHA, "{json}");
+    assert_eq!(held["bytes"], 3);
+    assert!(held["expires_at"].is_string() && held["created_at"].is_string(), "{held}");
+
+    // The wrong file, and a malformed hash, change nothing.
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": "0".repeat(64) })))
+        .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"]["code"], "NOT_HELD");
+    let (status, _) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": "xyz" })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA.to_uppercase() })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
+    assert!(app.repo.approved_held(id)?.is_some());
+
+    // Once decided, the job JSON carries no held block and a second approval is a 409.
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert!(json["job"]["held"].is_null(), "{json}");
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA })))
+        .await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NOT_HELD")), "{json}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejecting_sends_the_job_to_review_and_deletes_the_held_file() -> Result<()> {
+    let app = App::new()?;
+    let id = held_job(&app, 1)?;
+    let held_dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    assert!(held_dir.exists());
+
+    // An unknown reason and an over-long note are refused before anything changes.
+    let (status, _) = app
+        .send("POST", &format!("/api/jobs/{id}/reject"), &app.mcr_token, Some(json!({ "reason": "because" })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{id}/reject"),
+            &app.mcr_token,
+            Some(json!({ "reason": "other", "note": "x".repeat(301) })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+    assert!(held_dir.exists());
+
+    let (status, json) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{id}/reject"),
+            &app.mcr_token,
+            Some(json!({ "reason": "wrong_video", "note": "άλλο θέμα" })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let job = app.repo.get_job(id)?.unwrap();
+    assert_eq!(job.status, JobStatus::RequiresReview);
+    assert_eq!(job.error_code.as_deref(), Some("REJECTED_BY_MCR"));
+    assert!(job.error_message.as_deref().unwrap().contains("άλλο θέμα"));
+    assert!(!held_dir.exists(), "the held directory must be removed");
+    assert_eq!(app.repo.get_held(id)?.unwrap().reason.as_deref(), Some("wrong_video"));
+
+    // A job that is not held: 409 NOT_HELD, nothing touched.
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/reject"), &app.mcr_token, Some(json!({ "reason": "other" })))
+        .await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NOT_HELD")), "{json}");
     Ok(())
 }

@@ -28,6 +28,9 @@ pub enum JobStatus {
     Cancelled,
     /// The operator dropped the file into Dalet themselves.
     CompletedManual,
+    /// The video is made and checked but held back; MCR approves or rejects
+    /// it (P10.5). Never leased, never delivered until approved.
+    AwaitingApproval,
 }
 
 impl JobStatus {
@@ -41,6 +44,7 @@ impl JobStatus {
             Self::ManualDownload => "MANUAL_DOWNLOAD",
             Self::Cancelled => "CANCELLED",
             Self::CompletedManual => "COMPLETED_MANUAL",
+            Self::AwaitingApproval => "AWAITING_APPROVAL",
         }
     }
 
@@ -60,6 +64,7 @@ impl JobStatus {
             "MANUAL_DOWNLOAD" => Self::ManualDownload,
             "CANCELLED" => Self::Cancelled,
             "COMPLETED_MANUAL" => Self::CompletedManual,
+            "AWAITING_APPROVAL" => Self::AwaitingApproval,
             // Legacy states from before the state machine; migration 2 rewrites
             // the rows, but a downgrade or an external tool could still write one.
             "EXTRACTING" | "DOWNLOADING" | "TRANSCODING" | "REWRAPPING" => Self::Running,
@@ -68,6 +73,8 @@ impl JobStatus {
     }
 
     /// Nothing further will happen to this job without an operator acting.
+    /// A held job is not terminal: its file is still in `temp/held` and the
+    /// approval, rejection or expiry sweep decides what becomes of it.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -354,6 +361,8 @@ pub struct QueueSummary {
     pub cancelled: i64,
     pub review: i64,
     pub manual: i64,
+    /// Made and checked, held for MCR's approval (P10.5).
+    pub approval: i64,
     pub completed: i64,
     pub failed: i64,
     pub total: i64,

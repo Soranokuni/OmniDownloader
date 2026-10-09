@@ -62,11 +62,19 @@ pub enum ErrorCode {
     NoVideoOnPage,
     /// The page has a video we could not get. A human takes it from here.
     VideoUnresolved,
+    /// MCR looked at a video found automatically and turned it down (P10.5).
+    RejectedByMcr,
+    /// A held video was not approved in time and its file was deleted.
+    ApprovalExpired,
+    /// The file that waited for approval is not the one that was approved.
+    HeldFileChanged,
+    /// The automatic repair ran out of time or attempts.
+    RepairExhausted,
 }
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 27] = [
+    pub const ALL: [ErrorCode; 31] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
@@ -94,6 +102,10 @@ impl ErrorCode {
         Self::DrmProtected,
         Self::NoVideoOnPage,
         Self::VideoUnresolved,
+        Self::RejectedByMcr,
+        Self::ApprovalExpired,
+        Self::HeldFileChanged,
+        Self::RepairExhausted,
     ];
 
     /// The code stored on a job, back as a code.
@@ -130,6 +142,10 @@ impl ErrorCode {
             Self::DrmProtected => "DRM_PROTECTED",
             Self::NoVideoOnPage => "NO_VIDEO_ON_PAGE",
             Self::VideoUnresolved => "VIDEO_UNRESOLVED",
+            Self::RejectedByMcr => "REJECTED_BY_MCR",
+            Self::ApprovalExpired => "APPROVAL_EXPIRED",
+            Self::HeldFileChanged => "HELD_FILE_CHANGED",
+            Self::RepairExhausted => "REPAIR_EXHAUSTED",
         }
     }
 
@@ -200,6 +216,10 @@ impl ErrorCode {
             Self::DrmProtected => "Το βίντεο έχει προστασία αντιγραφής (DRM) και δεν μπορεί να κατέβει. Ζητήστε το αρχείο από την πηγή ή βάλτε το στο Dalet με άλλο τρόπο και πατήστε «Το έβαλα στο Dalet».",
             Self::NoVideoOnPage => "Η σελίδα δεν έχει βίντεο (ελέγχθηκε δύο φορές). Αν εννοούσαν άλλον σύνδεσμο, επικολλήστε τον στο «Χρήση αυτού του συνδέσμου»· αλλιώς πατήστε «Αφαίρεση».",
             Self::VideoUnresolved => "Η σελίδα έχει βίντεο αλλά δεν κατέβηκε αυτόματα. Ανοίξτε τον σύνδεσμο και κατεβάστε το χειροκίνητα, ή δοκιμάστε ξανά αργότερα.",
+            Self::RejectedByMcr => "Το MCR απέρριψε το βίντεο που βρέθηκε αυτόματα. Κατεβάστε το σωστό χειροκίνητα ή δώστε άλλον σύνδεσμο.",
+            Self::ApprovalExpired => "Κανείς δεν ενέκρινε το βίντεο μέσα σε 24 ώρες και το αρχείο σβήστηκε. Πατήστε «Δοκιμή ξανά» αν το χρειάζεστε ακόμα.",
+            Self::HeldFileChanged => "Το αρχείο που περίμενε έγκριση άλλαξε ή χάθηκε και ΔΕΝ παραδόθηκε. Πατήστε «Δοκιμή ξανά».",
+            Self::RepairExhausted => "Η αυτόματη επισκευή δεν βρήκε το βίντεο μέσα στον χρόνο της. Ανοίξτε τον σύνδεσμο και κατεβάστε το χειροκίνητα.",
         }
     }
 
@@ -550,6 +570,10 @@ mod tests {
             ErrorCode::DrmProtected,
             ErrorCode::NoVideoOnPage,
             ErrorCode::VideoUnresolved,
+            ErrorCode::RejectedByMcr,
+            ErrorCode::ApprovalExpired,
+            ErrorCode::HeldFileChanged,
+            ErrorCode::RepairExhausted,
         ] {
             let hint = code.hint_el();
             assert!(hint.len() > 20, "{code} has no useful hint");
@@ -579,9 +603,28 @@ mod tests {
             assert!(!c.should_try_sniffer());
             assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
         }
-        assert_eq!(ErrorCode::ALL.len(), 27);
+        assert_eq!(ErrorCode::ALL.len(), 31);
         let unique: std::collections::HashSet<_> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(unique.len(), 27);
+        assert_eq!(unique.len(), 31);
+    }
+
+    #[test]
+    fn the_approval_codes_are_terminal_stable_and_greek() {
+        let cases = [
+            (ErrorCode::RejectedByMcr, "REJECTED_BY_MCR"),
+            (ErrorCode::ApprovalExpired, "APPROVAL_EXPIRED"),
+            (ErrorCode::HeldFileChanged, "HELD_FILE_CHANGED"),
+            (ErrorCode::RepairExhausted, "REPAIR_EXHAUSTED"),
+        ];
+        for (c, text) in cases {
+            assert_eq!(c.as_str(), text);
+            assert_eq!(ErrorCode::from_code(text), Some(c));
+            assert!(!c.is_retryable(), "{c} must not be retried");
+            assert!(!c.should_try_sniffer());
+            assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
+            assert!(c.hint_el().chars().any(|ch| ('\u{0370}'..='\u{03FF}').contains(&ch)), "{c}");
+        }
+        assert!(ErrorCode::LowDisk.is_retryable(), "a refused hold is retried like a full disk");
     }
 
     /// The MCR desk shows a stored code's Greek hint (plan P7.1); every code

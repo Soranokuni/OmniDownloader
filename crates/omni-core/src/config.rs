@@ -461,6 +461,21 @@ pub struct RepairConfig {
     /// Total size of the evidence folder; the oldest go first above it.
     #[serde(default = "default_evidence_max_mb")]
     pub evidence_max_mb: u64,
+    /// A video held for approval is dropped after this many hours (P10.5).
+    #[serde(default = "default_hold_hours")]
+    pub hold_hours: i64,
+    /// All videos waiting for approval together may not exceed this; a new
+    /// hold over it fails with LOW_DISK and is retried.
+    #[serde(default = "default_held_max_gb")]
+    pub held_max_gb: u64,
+}
+
+fn default_hold_hours() -> i64 {
+    24
+}
+
+fn default_held_max_gb() -> u64 {
+    20
 }
 
 fn default_evidence_days() -> i64 {
@@ -473,7 +488,13 @@ fn default_evidence_max_mb() -> u64 {
 
 impl Default for RepairConfig {
     fn default() -> Self {
-        Self { mode: RepairMode::Off, evidence_days: default_evidence_days(), evidence_max_mb: default_evidence_max_mb() }
+        Self {
+            mode: RepairMode::Off,
+            evidence_days: default_evidence_days(),
+            evidence_max_mb: default_evidence_max_mb(),
+            hold_hours: default_hold_hours(),
+            held_max_gb: default_held_max_gb(),
+        }
     }
 }
 
@@ -905,6 +926,8 @@ mod tests {
         assert_eq!(old.repair.mode, RepairMode::Off);
         assert_eq!(old.repair.evidence_days, 14);
         assert_eq!(old.repair.evidence_max_mb, 200);
+        assert_eq!(old.repair.hold_hours, 24);
+        assert_eq!(old.repair.held_max_gb, 20);
         let set: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"shadow","evidence_days":3}}"#).unwrap();
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);

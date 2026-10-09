@@ -487,6 +487,28 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_site_canaries_domain ON site_canaries(domain);
         "#,
     ),
+    (
+        18,
+        // A finished video held back from the watchfolder until MCR approves
+        // it (P10.5), bound to its SHA-256. `decision`: NULL (waiting) |
+        // approved | rejected | expired | superseded | delivered.
+        r#"
+        CREATE TABLE IF NOT EXISTS held_outputs (
+            job_id     INTEGER PRIMARY KEY,
+            path       TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            sha256     TEXT NOT NULL,
+            duration   REAL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            decision   TEXT,
+            decided_by TEXT,
+            decided_at TEXT,
+            reason     TEXT,
+            delivered_path TEXT
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -719,6 +741,26 @@ mod tests {
             "url must be unique"
         );
         assert!(target_version() >= 17);
+    }
+
+    #[test]
+    fn migration_18_creates_held_outputs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('held_outputs')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in [
+            "job_id", "path", "bytes", "sha256", "duration", "created_at", "expires_at",
+            "decision", "decided_by", "decided_at", "reason", "delivered_path",
+        ] {
+            assert!(columns.iter().any(|x| x == c), "held_outputs.{c} missing: {columns:?}");
+        }
+        assert!(target_version() >= 18);
     }
 
     #[test]

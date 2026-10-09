@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use omni_core::models::{Job, JobStage};
-use omni_core::repository::Repository;
+use omni_core::repository::{HeldOutput, Repository};
 
 use crate::delivery::WatchfolderDelivery;
 use crate::downloader::{DownloadError, DownloadOpts, Downloader};
@@ -49,6 +49,27 @@ pub const DEFAULT_ENCODER_SLOTS: usize = 2;
 pub struct LeaseLost {
     pub job_id: i64,
     pub stage: JobStage,
+}
+
+/// What a finished, verified video does next (plan P10.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryMode {
+    /// Into the watchfolder, as always.
+    Deliver,
+    /// Keep the file under `temp/held/{id}` for MCR to approve; the
+    /// watchfolder is never touched. `held_max_bytes` caps everything held
+    /// at once.
+    Hold { hold_hours: i64, held_max_bytes: u64 },
+}
+
+/// How a run that returned `Ok` ended (P10.5). The worker parks or
+/// completes the job from this, not from what the database says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// The file is in the watchfolder.
+    Delivered,
+    /// The file is held for MCR; nothing was delivered.
+    Held,
 }
 
 fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
@@ -218,6 +239,25 @@ impl BroadcastEngine {
         cookies: Option<&str>,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
+        self.process_job_mode(job, owner, referer, user_agent, cookies, cancel, DeliveryMode::Deliver)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::process_job_cancellable`] with what to do with the finished
+    /// file (P10.5). `Hold` stops after the compliance gate, keeps the file
+    /// and returns `Ok`; the worker then parks the job as AWAITING_APPROVAL
+    /// (it, not the engine, sets the status).
+    pub async fn process_job_mode(
+        &self,
+        job: Job,
+        owner: &str,
+        referer: Option<&str>,
+        user_agent: Option<&str>,
+        cookies: Option<&str>,
+        cancel: Option<CancellationToken>,
+        delivery: DeliveryMode,
+    ) -> Result<RunOutcome> {
         let job_id = job.id;
         let slug = job.slug.clone();
         let url = job.url.clone();
@@ -252,7 +292,7 @@ impl BroadcastEngine {
                 Some(JobStage::Download),
                 "Source is the file attached to the email; nothing to download",
             );
-            return self.finish_from_source(job, owner, source, job_temp, cancel).await;
+            return self.finish_from_source(job, owner, source, job_temp, cancel, delivery).await;
         }
 
         // 1. Download stage
@@ -307,7 +347,7 @@ impl BroadcastEngine {
             }
         };
 
-        self.finish_from_source(job, owner, downloaded_file, job_temp, cancel).await
+        self.finish_from_source(job, owner, downloaded_file, job_temp, cancel, delivery).await
     }
 
     /// Stages 2–6, from a source file on disk to the watchfolder.
@@ -318,7 +358,8 @@ impl BroadcastEngine {
         downloaded_file: PathBuf,
         job_temp: PathBuf,
         cancel: Option<CancellationToken>,
-    ) -> Result<()> {
+        delivery: DeliveryMode,
+    ) -> Result<RunOutcome> {
         let job_id = job.id;
         let slug = job.slug.clone();
 
@@ -485,6 +526,14 @@ impl BroadcastEngine {
             &report.summary(),
         );
 
+        // 4b. Held for MCR: the file stays here, bound to its SHA-256, and
+        // nothing reaches the watchfolder until it is approved (P10.5).
+        if let DeliveryMode::Hold { hold_hours, held_max_bytes } = delivery {
+            self.hold_final(job_id, owner, &final_temp_mxf, &slug, duration, hold_hours, held_max_bytes, &job_temp)
+                .await?;
+            return Ok(RunOutcome::Held);
+        }
+
         // 5. Atomic Delivery to Dalet Watchfolder
         self.enter_stage(job_id, owner, JobStage::Deliver, &job_temp).await?;
         let delivered = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
@@ -532,6 +581,298 @@ impl BroadcastEngine {
         );
 
         info!("Job #{} ({}) broadcast ingest successfully finished!", job_id, slug);
+        Ok(RunOutcome::Delivered)
+    }
+
+    /// The encoder slots (for tests and diagnostics): a deliver-only job
+    /// must never wait on them.
+    pub fn encoder_slots(&self) -> Arc<Semaphore> {
+        self.encoder_slots.clone()
+    }
+
+    /// Remove job `job_id`'s held directory (best effort; the sweep retries).
+    pub fn discard_held_dir(&self, job_id: i64) {
+        omni_core::held::remove_held_dir(&self.temp_dir, job_id);
+    }
+
+    /// `temp/held/{id}` for this engine's temp directory.
+    fn held_dir(&self, job_id: i64) -> PathBuf {
+        omni_core::held::held_dir(&self.temp_dir, job_id)
+    }
+
+    /// The `Hold` end of the pipeline: the verified file leaves the job's
+    /// workspace for `temp/held/{id}/{slug}.mxf`, its SHA-256 is recorded,
+    /// and the job's workspace is removed. Never touches the watchfolder.
+    async fn hold_final(
+        &self,
+        job_id: i64,
+        owner: &str,
+        final_mxf: &Path,
+        slug: &str,
+        duration: f64,
+        hold_hours: i64,
+        held_max_bytes: u64,
+        job_temp: &Path,
+    ) -> Result<()> {
+        if !self.repo.owns_lease(job_id, owner).unwrap_or(false) {
+            return Err(self.lost(job_id, JobStage::Verify, job_temp).await);
+        }
+        let bytes = tokio::fs::metadata(final_mxf)
+            .await
+            .with_context(|| format!("Could not read the size of the file to hold: {final_mxf:?}"))
+            .context(ErrorCode::PipelineFailed.as_str())?
+            .len();
+        let in_use = self
+            .repo
+            .held_bytes_in_use(job_id)
+            .context("Could not read what is already held for approval")
+            .context(ErrorCode::PipelineFailed.as_str())?;
+        if in_use.saturating_add(bytes) > held_max_bytes {
+            let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            let why = format!(
+                "Not enough room to hold the video for approval: {:.1} GB already held, this one is {:.1} GB, the limit is {:.1} GB",
+                gb(in_use),
+                gb(bytes),
+                gb(held_max_bytes)
+            );
+            warn!("Job #{job_id}: {why}");
+            let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Verify), &why);
+            WatchfolderDelivery::cleanup_job_temp_files(job_temp).await;
+            return Err(anyhow::anyhow!("{}: {why}", ErrorCode::LowDisk.as_str()).context(ErrorCode::LowDisk.as_str()));
+        }
+
+        // A fresh directory: an older hold of this job (retried since) goes.
+        let dir = self.held_dir(job_id);
+        if dir.exists() {
+            tokio::fs::remove_dir_all(&dir)
+                .await
+                .with_context(|| format!("Could not clear the old held directory {dir:?}"))
+                .context(ErrorCode::PipelineFailed.as_str())?;
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("Could not create the held directory {dir:?}"))
+            .context(ErrorCode::PipelineFailed.as_str())?;
+        let held_path = dir.join(format!("{slug}.mxf"));
+        if tokio::fs::rename(final_mxf, &held_path).await.is_err() {
+            // Another volume: copy, then remove the original.
+            let copied = tokio::fs::copy(final_mxf, &held_path).await;
+            if let Err(e) = copied {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Could not move the video to {held_path:?}"))
+                    .context(ErrorCode::PipelineFailed.as_str()));
+            }
+            let _ = tokio::fs::remove_file(final_mxf).await;
+        }
+
+        let hash_path = held_path.clone();
+        let hashed = tokio::task::spawn_blocking(move || omni_core::held::sha256_file(&hash_path)).await;
+        let sha256 = match hashed {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(anyhow::Error::new(e)
+                    .context("Could not fingerprint the held video")
+                    .context(ErrorCode::PipelineFailed.as_str()));
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(anyhow::Error::new(e)
+                    .context("Could not fingerprint the held video")
+                    .context(ErrorCode::PipelineFailed.as_str()));
+            }
+        };
+
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(hold_hours.max(1));
+        let recorded = self.repo.hold_output(
+            job_id,
+            owner,
+            &held_path.to_string_lossy(),
+            bytes as i64,
+            &sha256,
+            Some(duration),
+            expires_at,
+        );
+        match recorded {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(self.lost(job_id, JobStage::Verify, job_temp).await);
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+                return Err(e.context("Could not record the held video").context(ErrorCode::PipelineFailed.as_str()));
+            }
+        }
+
+        WatchfolderDelivery::cleanup_job_temp_files(job_temp).await;
+        let _ = self.repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Verify),
+            "Το βίντεο περιμένει έγκριση από το MCR",
+        );
+        info!("Job #{job_id} ({slug}) is held for approval ({bytes} bytes, sha256 {sha256})");
         Ok(())
+    }
+
+    /// Deliver the held file MCR approved, and nothing else (P10.5). The
+    /// file passes the compliance gate again; then, at the last moment, it
+    /// is opened so that nobody can change or delete it, hashed through that
+    /// very handle against the SHA-256 recorded when it was held, and copied
+    /// by the same [`WatchfolderDelivery::deliver`] as any other video while
+    /// the handle is still open. Takes no download slot and no encoder slot:
+    /// nothing is downloaded or encoded.
+    ///
+    /// The file's path in the watchfolder is recorded on the job and on the
+    /// held row together right after the copy; a run that finds both equal
+    /// (a crash before the worker finished the job) copies nothing again.
+    /// The held row stays `approved` and the held directory stays: the
+    /// worker holding the lease finishes the job and the row together
+    /// (`Repository::finish_held_delivery`) and then calls
+    /// [`Self::discard_held_dir`]. The engine sets no terminal status.
+    pub async fn deliver_held(
+        &self,
+        job: &Job,
+        owner: &str,
+        held: &HeldOutput,
+        cancel: Option<CancellationToken>,
+    ) -> Result<()> {
+        let job_id = job.id;
+        let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
+        // A deliver-only job has no use for the slot it was leased under.
+        self.release_download_slot(job_id);
+
+        // Delivered by an earlier run of this approval, then the worker died.
+        if let (Some(done), Some(at)) = (held.delivered_path.as_deref(), job.file_path.as_deref()) {
+            if !done.is_empty() && done == at {
+                info!("Job #{job_id}: the approved video is already at {at}; nothing to copy");
+                let _ = self.repo.record_event(
+                    job_id,
+                    "INFO",
+                    Some(JobStage::Deliver),
+                    &format!("Already in the watchfolder at {at}; not copied again"),
+                );
+                return Ok(());
+            }
+        }
+
+        self.enter_stage(job_id, owner, JobStage::Verify, &job_temp).await?;
+        let path = PathBuf::from(&held.path);
+        // The file is the one recorded for this job, in its own directory.
+        let slug = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if path.starts_with(self.held_dir(job_id)) => stem.to_string(),
+            _ => return Err(self.held_changed(job_id, &format!("the held path {path:?} is not in this job's held directory"))),
+        };
+        // Gone or a different size: no need to run the checks below.
+        match tokio::fs::metadata(&path).await {
+            Ok(m) if m.is_file() && m.len() as i64 == held.bytes => {}
+            Ok(_) => return Err(self.held_changed(job_id, "its size is not the one that was approved")),
+            Err(e) => return Err(self.held_changed(job_id, &format!("it cannot be read: {e}"))),
+        }
+        if is_cancelled(&cancel) {
+            return Err(self.lost(job_id, JobStage::Verify, &job_temp).await);
+        }
+
+        let duration = held.duration.unwrap_or(0.0);
+        let report = match crate::verify::verify_mxf_with_clip(&self.ffprobe_path, &path, duration, Some(&slug)).await {
+            Ok(report) => report,
+            Err(e) => {
+                let err_msg = format!("Compliance check could not run: {e}");
+                error!("Job #{job_id}: {err_msg}");
+                let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Verify), &err_msg);
+                return Err(e.context("COMPLIANCE_FAILED"));
+            }
+        };
+        if let Ok(json) = serde_json::to_string(&report) {
+            let _ = self.repo.set_compliance_report(job_id, &json);
+        }
+        if !report.pass {
+            let summary = report.summary();
+            error!("Job #{job_id}: {summary}");
+            let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Verify), &summary);
+            let _ = self.repo.log_audit(
+                "ERROR",
+                "COMPLIANCE",
+                &format!("Job #{job_id} ({slug}) failed the compliance gate before delivery: {summary}"),
+            );
+            return Err(anyhow::anyhow!("COMPLIANCE_FAILED: {summary}"));
+        }
+        let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Verify), &report.summary());
+
+        self.enter_stage(job_id, owner, JobStage::Deliver, &job_temp).await?;
+
+        // Hash right before the copy, through a handle nobody can write to
+        // or delete from, and keep it open until the copy is done.
+        let lock_path = path.clone();
+        let hashed = tokio::task::spawn_blocking(move || {
+            let file = omni_core::held::open_locked(&lock_path)?;
+            let sha = omni_core::held::sha256_reader(&file)?;
+            // Hashing moved the position; the handle only guards the file.
+            Ok::<_, std::io::Error>((sha, file))
+        })
+        .await;
+        let (sha, guard) = match hashed {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(self.held_changed(job_id, &format!("it cannot be read: {e}"))),
+            Err(e) => return Err(anyhow::Error::new(e).context(ErrorCode::PipelineFailed.as_str())),
+        };
+        if !sha.eq_ignore_ascii_case(&held.sha256) {
+            return Err(self.held_changed(job_id, "its SHA-256 is not the one that was approved"));
+        }
+
+        let delivered = match WatchfolderDelivery::deliver(&path, &self.watchfolder_dir, &slug).await {
+            Ok(dest) => dest,
+            Err(e) => {
+                drop(guard);
+                let err_msg = format!("Watchfolder delivery failed: {e:#}");
+                error!("Job #{job_id}: {err_msg}");
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
+                let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{job_id} ({slug}): {err_msg}"));
+                return Err(e);
+            }
+        };
+        drop(guard);
+        if delivered.suffixed {
+            let _ = self.repo.record_event(
+                job_id,
+                "WARN",
+                Some(JobStage::Deliver),
+                &format!("Slug collision: delivered as {} because {slug}.mxf already existed", delivered.filename),
+            );
+        }
+
+        let dest_str = delivered.path.to_string_lossy().to_string();
+        let _ = self.repo.update_job_progress(job_id, 100.0, "Completed", "00:00");
+        match self.repo.record_held_delivery(job_id, owner, &dest_str, duration) {
+            Ok(true) => {}
+            Ok(false) => {
+                // On air but not ours to record. The row stays approved and
+                // the held file stays; nothing is marked delivered.
+                warn!("Job #{job_id}: lease lost after delivery; the file {dest_str} is in the watchfolder");
+                return Err(self.lost(job_id, JobStage::Deliver, &job_temp).await);
+            }
+            Err(e) => {
+                warn!("Job #{job_id}: could not record the delivered file {dest_str}: {e:#}");
+                return Err(e.context("Could not record the delivery").context(ErrorCode::PipelineFailed.as_str()));
+            }
+        }
+        let _ = self.repo.log_audit(
+            "SUCCESS",
+            "INGEST",
+            &format!("Job #{job_id} ({slug}) approved by MCR and ready in watchfolder at {dest_str:?}"),
+        );
+        info!("Job #{job_id} ({slug}) delivered after approval");
+        Ok(())
+    }
+
+    /// The held file is not what was approved: stop, deliver nothing.
+    fn held_changed(&self, job_id: i64, why: &str) -> anyhow::Error {
+        let err_msg = format!("The video that waited for approval changed or is gone, and was not delivered: {why}");
+        error!("Job #{job_id}: {err_msg}");
+        let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Verify), &err_msg);
+        let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{job_id}: {err_msg}"));
+        anyhow::anyhow!("{}: {err_msg}", ErrorCode::HeldFileChanged.as_str()).context(ErrorCode::HeldFileChanged.as_str())
     }
 }
