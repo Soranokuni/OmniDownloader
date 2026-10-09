@@ -1961,6 +1961,108 @@ impl Repository {
         Ok(n)
     }
 
+    /// Clear a site's run of failures after a canary passed (plan P10.4).
+    pub fn reset_site_failures(&self, domain: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE site_stats SET consecutive_fail = 0, updated_at = ? WHERE domain = ?",
+            params![timestamps::now_string(), domain.trim().to_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// Page links of jobs that completed on their own in the last `days`:
+    /// the pool the canaries are drawn from (plan P10.4). Not hand-finished
+    /// jobs, not an article's sibling videos, not attachments.
+    pub fn completed_pages_since(&self, days: i64) -> Result<Vec<crate::models::CompletedPage>> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(Utc::now() - Duration::days(days));
+        let mut stmt = conn.prepare(
+            "SELECT id, url, COALESCE(completed_at, updated_at) FROM queue
+             WHERE status = 'COMPLETED' AND parent_job_id IS NULL
+               AND (url LIKE 'http://%' OR url LIKE 'https://%')
+               AND COALESCE(completed_at, updated_at) >= ?
+             ORDER BY COALESCE(completed_at, updated_at) DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![cutoff], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (job_id, url, at) = r?;
+            if let Some(finished_at) = timestamps::parse(&at) {
+                out.push(crate::models::CompletedPage { job_id, url, finished_at });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every canary, newest first.
+    pub fn list_canaries(&self) -> Result<Vec<crate::models::SiteCanary>> {
+        let conn = self.pool.get()?;
+        read_canaries(&conn, None)
+    }
+
+    /// The canaries of one site, newest first.
+    pub fn list_canaries_for(&self, domain: &str) -> Result<Vec<crate::models::SiteCanary>> {
+        let conn = self.pool.get()?;
+        read_canaries(&conn, Some(&domain.trim().to_lowercase()))
+    }
+
+    /// Domains that have at least one canary.
+    pub fn canary_domains(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT domain FROM site_canaries ORDER BY domain")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Add a canary; a link already in the pool is left as it is.
+    pub fn add_canary(
+        &self,
+        domain: &str,
+        url: &str,
+        job_id: Option<i64>,
+        added_at: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO site_canaries (domain, url, job_id, added_at) VALUES (?, ?, ?, ?)",
+            params![domain.trim().to_lowercase(), url, job_id, timestamps::format(added_at)],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn delete_canary(&self, id: i64) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM site_canaries WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    /// The canary's page answered 404/410: the article was taken down. The
+    /// row stays, marked, so the link is not added again.
+    pub fn mark_canary_gone(&self, id: i64) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE site_canaries SET last_checked_at = ?, last_ok = 0, last_detail = ? WHERE id = ?",
+            params![timestamps::now_string(), crate::models::CANARY_GONE, id],
+        )?;
+        Ok(())
+    }
+
+    /// Store a canary check. A pass clears the failure count; a failure adds one.
+    pub fn record_canary_result(&self, id: i64, ok: bool, detail: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE site_canaries
+             SET last_checked_at = ?, last_ok = ?, last_detail = ?,
+                 fail_count = CASE WHEN ? THEN 0 ELSE fail_count + 1 END
+             WHERE id = ?",
+            params![timestamps::now_string(), ok as i64, detail, ok, id],
+        )?;
+        Ok(())
+    }
+
     /// Create a session with an arbitrary lifetime.
     ///
     /// `expires_at` is stored in the same RFC3339 format the expiry query
@@ -2922,6 +3024,66 @@ mod tests {
     }
 
     #[test]
+    fn canary_pool_sources_and_crud() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let mk = |url: &str, slug: &str, status: &str, parent: Option<i64>| -> Result<i64> {
+            let id = repo.enqueue(&NewJob::new(url, slug, "ANNA"), 0)?.job_id();
+            let conn = repo.pool.get()?;
+            conn.execute(
+                "UPDATE queue SET status = ?, parent_job_id = ?, completed_at = ? WHERE id = ?",
+                params![status, parent, timestamps::now_string(), id],
+            )?;
+            Ok(id)
+        };
+        let good = mk("https://news.example/a", "1_A_X", "COMPLETED", None)?;
+        mk("https://news.example/b", "2_A_X", "COMPLETED_MANUAL", None)?;
+        mk("https://news.example/c", "3_A_X", "COMPLETED", Some(good))?;
+        mk("C:\\attachments\\clip.mp4", "4_A_X", "COMPLETED", None)?;
+        mk("https://news.example/e", "5_A_X", "REQUIRES_REVIEW", None)?;
+        let old = mk("https://news.example/old", "6_A_X", "COMPLETED", None)?;
+        {
+            let conn = repo.pool.get()?;
+            conn.execute(
+                "UPDATE queue SET completed_at = ? WHERE id = ?",
+                params![timestamps::format(Utc::now() - Duration::days(40)), old],
+            )?;
+        }
+        let pages = repo.completed_pages_since(30)?;
+        assert_eq!(pages.len(), 1, "{pages:?}");
+        assert_eq!((pages[0].job_id, pages[0].url.as_str()), (good, "https://news.example/a"));
+
+        let t0 = Utc::now() - Duration::hours(5);
+        assert!(repo.add_canary("News.Example", "https://news.example/a", Some(good), t0)?);
+        assert!(!repo.add_canary("news.example", "https://news.example/a", Some(good), t0)?, "a link is added once");
+        repo.add_canary("news.example", "https://news.example/z", None, t0 + Duration::hours(1))?;
+        repo.add_canary("other.example", "https://other.example/1", None, t0)?;
+        assert_eq!(repo.canary_domains()?, vec!["news.example", "other.example"]);
+        let mine = repo.list_canaries_for("news.example")?;
+        assert_eq!(mine.iter().map(|c| c.url.as_str()).collect::<Vec<_>>(), vec!["https://news.example/z", "https://news.example/a"]);
+        assert!(mine[0].last_ok.is_none() && mine[0].last_checked_at.is_none());
+
+        repo.record_canary_result(mine[0].id, false, "no video")?;
+        repo.record_canary_result(mine[0].id, false, "no video")?;
+        let c = &repo.list_canaries_for("news.example")?[0];
+        assert_eq!((c.last_ok, c.fail_count, c.last_detail.as_deref()), (Some(false), 2, Some("no video")));
+        assert!(c.last_checked_at.is_some());
+        repo.record_canary_result(mine[0].id, true, "found it")?;
+        let c = &repo.list_canaries_for("news.example")?[0];
+        assert_eq!((c.last_ok, c.fail_count), (Some(true), 0));
+
+        repo.delete_canary(mine[0].id)?;
+        assert_eq!(repo.list_canaries()?.len(), 2);
+
+        // A pass also clears the site's run of failures.
+        repo.record_site_outcome("news.example", SiteOutcome::SiteFailure("NO_STREAM_FOUND".into()))?;
+        assert_eq!(repo.get_site("news.example")?.unwrap().consecutive_fail, 1);
+        repo.reset_site_failures("news.example")?;
+        assert_eq!(repo.get_site("news.example")?.unwrap().consecutive_fail, 0);
+        Ok(())
+    }
+
+    #[test]
     fn owns_lease_is_true_only_for_the_running_owner() -> Result<()> {
         let temp_db = NamedTempFile::new()?;
         let repo = Repository::new(temp_db.path())?;
@@ -3266,6 +3428,29 @@ fn site_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SiteRow> {
         state_since: ts(7)?,
         llm_breaker_until: ts(8)?,
     })
+}
+
+fn read_canaries(conn: &rusqlite::Connection, domain: Option<&str>) -> Result<Vec<crate::models::SiteCanary>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain, url, job_id, added_at, last_checked_at, last_ok, last_detail, fail_count
+         FROM site_canaries WHERE (?1 IS NULL OR domain = ?1) ORDER BY added_at DESC, id DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![domain], |r| {
+            Ok(crate::models::SiteCanary {
+                id: r.get(0)?,
+                domain: r.get(1)?,
+                url: r.get(2)?,
+                job_id: r.get(3)?,
+                added_at: timestamps::parse_opt(r.get(4)?),
+                last_checked_at: timestamps::parse_opt(r.get(5)?),
+                last_ok: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                last_detail: r.get(7)?,
+                fail_count: r.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn read_site(conn: &rusqlite::Connection, domain: &str) -> Result<Option<SiteRow>> {

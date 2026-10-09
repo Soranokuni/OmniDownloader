@@ -1543,9 +1543,26 @@ pub async fn api_admin_selfcheck(RequireAdmin(_): RequireAdmin, State(state): St
         .repo
         .list_selfcheck_links()
         .map_err(internal_error("Could not read the self-check links."))?;
+    // The recent known-good articles per news site (plan P10.4).
+    let canaries: Vec<serde_json::Value> = state
+        .repo
+        .list_canaries()
+        .map_err(internal_error("Could not read the site canaries."))?
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "domain": c.domain,
+                "url": c.url,
+                "last_ok": c.last_ok,
+                "last_checked_at": c.last_checked_at,
+                "last_detail": c.last_detail,
+            })
+        })
+        .collect();
     let checks = state.health.all();
     Ok(Json(serde_json::json!({
         "links": links,
+        "canaries": canaries,
         "summary": checks.get(omni_core::health::checks::SELFCHECK),
         "browser": checks.get(omni_core::health::checks::BROWSER),
     })))
