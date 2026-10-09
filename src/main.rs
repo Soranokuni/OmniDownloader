@@ -10,8 +10,9 @@ use tracing::{error, info, warn};
 use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
 use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
+use omni_browser::evidence::{Evidence, EvidenceClass};
 use omni_browser::sniffer::StreamSniffer;
-use omni_core::config::AppConfig;
+use omni_core::config::{AppConfig, RepairMode};
 use omni_core::paths::AppPaths;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStage, JobStatus};
@@ -1024,6 +1025,7 @@ async fn run_daemon(
     let worker_health = health.clone();
     let worker_watchfolder = watchfolder_path.clone();
     let worker_temp = temp_path.clone();
+    let worker_repair_mode = config.repair.mode;
 
     tokio::spawn(async move {
         info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
@@ -1153,7 +1155,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, worker_repair_mode).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -1265,6 +1267,7 @@ async fn run_job(
     job: omni_core::models::Job,
     cancel: CancellationToken,
     evidence_dir: &std::path::Path,
+    repair_mode: RepairMode,
 ) -> Result<()> {
     let job_id = job.id;
     let orig_url = job.url.clone();
@@ -1339,6 +1342,8 @@ async fn run_job(
     // attempt that would only say so again (one more yt-dlp start and page
     // fetch, several seconds) and go straight to the sniffer.
     let mut known_unsupported = false;
+    // How many videos yt-dlp's page scan named (P10.2).
+    let mut scanned_videos = 0usize;
 
     // A portal whose video one API request names (plan P3.8): no yt-dlp
     // page scan, no browser. A failed request just takes the usual way.
@@ -1363,6 +1368,7 @@ async fn run_job(
         let scan = engine.page_videos(&orig_url).await;
         known_unsupported = scan.unsupported;
         let videos = scan.videos;
+        scanned_videos = videos.len();
         if videos.len() > 1 {
             info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
             repo.record_event(
@@ -1411,6 +1417,7 @@ async fn run_job(
     // its page also plays other posts' videos.
     // What the browser saw, kept for a job that ends without a video (P10.1).
     let mut snapshot: Option<omni_browser::PageSnapshot> = None;
+    let mut sniffed_streams: Vec<String> = Vec::new();
     let sniff = match &process_result {
         Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
         Ok(()) => false,
@@ -1444,6 +1451,9 @@ async fn run_job(
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
+                // Only what is left after the photo-only posts are dropped
+                // says the page has a video.
+                sniffed_streams = streams.clone();
                 let primary = if streams.contains(&bundle.primary_stream) {
                     Some(bundle.primary_stream.clone())
                 } else {
@@ -1531,10 +1541,10 @@ async fn run_job(
             // (plan P1.9). Retrying a deleted video burns worker slots and
             // delays telling the journalist their link is dead; retrying a
             // dropped connection usually just works.
-            let code = classify_pipeline_error(&e);
+            let mut code = classify_pipeline_error(&e);
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
-            let message = readable_cause(&e);
+            let mut message = readable_cause(&e);
 
             // The full context chain, which carries each stage's stderr tail,
             // into the job's own timeline (plan P6.1). `error_message` is the
@@ -1557,11 +1567,37 @@ async fn run_job(
                     ErrorCode::ManualDownload => JobStatus::ManualDownload,
                     _ => JobStatus::RequiresReview,
                 };
-                repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                // A page that gave no video: what did it show (P10.2)? May
+                // name a more exact code, and may look at the page again.
+                let original = code;
+                if is_web
+                    && matches!(code, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
+                    && !omni_broadcast::downloader::is_video_platform(&orig_url)
+                {
+                    let page = FailedPage {
+                        url: &orig_url,
+                        mode: repair_mode,
+                        snapshot: snapshot.take(),
+                        sniffed_streams: &sniffed_streams,
+                        original: code,
+                        named_by_site: site_named_video(page_referer.is_some(), scanned_videos),
+                    };
+                    let (exact, line, seen) = assess_failed_page(repo, owner, job_id, &cancel, page).await;
+                    code = exact;
+                    if let Some(line) = line {
+                        message = line;
+                    }
+                    snapshot = seen;
+                }
+                // Nothing more is written for a job that is no longer ours.
+                if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
+                    repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                }
                 // Only the job's owner writes evidence: a job MCR cancelled
                 // or the reaper gave away has no business leaving a file.
                 if let Some(snap) = &snapshot {
-                    if matches!(code, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
+                    if (matches!(original, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
+                        || matches!(code, ErrorCode::DrmProtected | ErrorCode::NoVideoOnPage | ErrorCode::VideoUnresolved))
                         && !cancel.is_cancelled()
                         && still_ours(repo, job_id, owner)
                     {
@@ -1580,6 +1616,130 @@ async fn run_job(
             Ok(())
         }
     }
+}
+
+/// Whether to open the page again with the diagnostic recorders: only when
+/// repair is on, for a page (not a platform post), and when the passive look
+/// proved nothing (no snapshot at all, weak or none).
+fn should_diagnose(mode: RepairMode, passive: Option<EvidenceClass>, is_platform: bool) -> bool {
+    mode != RepairMode::Off
+        && !is_platform
+        && passive.map_or(true, |c| matches!(c, EvidenceClass::Weak | EvidenceClass::None))
+}
+
+/// The code and the one-line reason (Greek, for the MCR card) a page's
+/// evidence gives a job that failed with `original`. `None` for the line
+/// keeps the existing cause text. A "no video" verdict needs the diagnostic
+/// run; without it the original code stands, as it does for a weak page.
+fn evidence_code(original: ErrorCode, ev: &Evidence) -> (ErrorCode, Option<String>) {
+    match ev.class {
+        EvidenceClass::Protected => {
+            let system = ev.signals.iter().find_map(|s| s.strip_prefix("eme:")).unwrap_or("DRM");
+            (ErrorCode::DrmProtected, Some(format!("Το βίντεο έχει DRM ({system})")))
+        }
+        EvidenceClass::LoginWall => (ErrorCode::LoginRequired, None),
+        EvidenceClass::GeoBlocked => (ErrorCode::GeoBlocked, None),
+        EvidenceClass::Strong => (
+            ErrorCode::VideoUnresolved,
+            Some(format!("Βρέθηκε βίντεο στη σελίδα ({}) αλλά δεν κατέβηκε", ev.signals.join(", "))),
+        ),
+        EvidenceClass::None if ev.diagnosed => {
+            (ErrorCode::NoVideoOnPage, Some("Δεν βρέθηκε βίντεο ούτε στον δεύτερο έλεγχο".to_string()))
+        }
+        EvidenceClass::None | EvidenceClass::Weak => (original, None),
+    }
+}
+
+/// What a failed web job's page left behind, for [`assess_failed_page`].
+struct FailedPage<'a> {
+    url: &'a str,
+    mode: RepairMode,
+    snapshot: Option<omni_browser::PageSnapshot>,
+    sniffed_streams: &'a [String],
+    original: ErrorCode,
+    /// The site's API or yt-dlp's page scan named a video for this job.
+    named_by_site: bool,
+}
+
+/// The site or yt-dlp's page scan named a video for this job: the API
+/// resolved it (a referer is kept), or the scan found at least one.
+fn site_named_video(api_or_sibling: bool, scanned_videos: usize) -> bool {
+    api_or_sibling || scanned_videos >= 1
+}
+
+/// The passive verdict with "the site itself named a video" added as a strong
+/// signal: such a job is never reported as a page without video.
+fn with_site_hint(passive: Option<Evidence>, named_by_site: bool) -> Option<Evidence> {
+    if !named_by_site {
+        return passive;
+    }
+    let hint = Evidence { class: EvidenceClass::Strong, signals: vec!["named-by-site".into()], diagnosed: false };
+    Some(match passive {
+        Some(p) => omni_browser::evidence::combine(&hint, &p),
+        None => hint,
+    })
+}
+
+/// Judge a web page that ended without a video from what the browser saw, run
+/// the diagnostic second look when that is allowed and needed, and note the
+/// verdict on the job. Returns the code to finish with, a replacement cause
+/// line, and the snapshot to keep as evidence (the diagnostic one when there
+/// is one). Never fails: whatever goes wrong leaves today's outcome.
+async fn assess_failed_page(
+    repo: &Repository,
+    owner: &str,
+    job_id: i64,
+    cancel: &CancellationToken,
+    page: FailedPage<'_>,
+) -> (ErrorCode, Option<String>, Option<omni_browser::PageSnapshot>) {
+    let FailedPage { url, mode, snapshot, sniffed_streams, original, named_by_site } = page;
+    let is_ad = |u: &str| StreamSniffer::is_ad_or_tracking(u);
+    let mut snapshot = snapshot;
+    let passive = with_site_hint(
+        snapshot.as_ref().map(|snap| omni_browser::evidence::classify(snap, sniffed_streams, None, is_ad)),
+        named_by_site,
+    );
+    let mut verdict = passive.clone();
+
+    if should_diagnose(mode, passive.as_ref().map(|e| e.class), false)
+        && !cancel.is_cancelled()
+        && still_ours(repo, job_id, owner)
+    {
+        info!("Job #{job_id}: the page showed no video; looking at it once more with the diagnostic run");
+        // Dropping the run closes its browser.
+        let ran = tokio::select! {
+            r = StreamSniffer::diagnose(url, 30) => Some(r),
+            _ = cancel.cancelled() => None,
+        };
+        let Some((diag_snap, diag)) = ran else {
+            return (original, None, snapshot);
+        };
+        if cancel.is_cancelled() || !still_ours(repo, job_id, owner) {
+            return (original, None, snapshot);
+        }
+        let looked = omni_browser::evidence::classify(&diag_snap, sniffed_streams, Some(&diag), is_ad);
+        verdict = Some(match &passive {
+            Some(p) => omni_browser::evidence::combine(p, &looked),
+            None => looked,
+        });
+        // A run that was blocked or cut short leaves the first look as the evidence.
+        if diag.complete || snapshot.is_none() {
+            snapshot = Some(diag_snap);
+        }
+    }
+
+    let Some(ev) = verdict else {
+        return (original, None, snapshot);
+    };
+    if cancel.is_cancelled() || !still_ours(repo, job_id, owner) {
+        return (original, None, snapshot);
+    }
+    let line = format!("Evidence: {} — {}", ev.class.as_str(), ev.signals.join(", "));
+    if let Err(e) = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &line) {
+        warn!("Job #{job_id}: could not note the page evidence verdict: {e:#}");
+    }
+    let (code, message) = evidence_code(original, &ev);
+    (code, message, snapshot)
 }
 
 /// Largest evidence file written for one job.
@@ -2733,5 +2893,124 @@ mod tests {
         let e = anyhow::Error::from(omni_broadcast::downloader::DownloadError { code, message: line.into() })
             .context(code.as_str());
         assert_eq!(classify_pipeline_error(&e), ErrorCode::PrivateOrRemoved);
+    }
+
+    fn verdict(class: EvidenceClass, signals: &[&str], diagnosed: bool) -> Evidence {
+        Evidence { class, signals: signals.iter().map(|s| s.to_string()).collect(), diagnosed }
+    }
+
+    /// The code a page's evidence gives a failed job (P10.2): a "no video"
+    /// verdict needs the second look; a weak page keeps what it had.
+    #[test]
+    fn evidence_names_the_exact_failure() {
+        let orig = ErrorCode::NoStreamFound;
+        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::None, &[], false));
+        assert_eq!((c, m), (orig, None), "not diagnosed: no claim that the page has no video");
+        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::None, &[], true));
+        assert_eq!(c, ErrorCode::NoVideoOnPage);
+        assert_eq!(m.as_deref(), Some("Δεν βρέθηκε βίντεο ούτε στον δεύτερο έλεγχο"));
+        assert_eq!(evidence_code(ErrorCode::Http403, &verdict(EvidenceClass::Weak, &["player-container"], true)), (ErrorCode::Http403, None));
+        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::Strong, &["og:video", "embed:jwplayer"], false));
+        assert_eq!(c, ErrorCode::VideoUnresolved);
+        assert_eq!(m.as_deref(), Some("Βρέθηκε βίντεο στη σελίδα (og:video, embed:jwplayer) αλλά δεν κατέβηκε"));
+        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::Protected, &["eme:com.widevine.alpha", "mse:video/mp4"], true));
+        assert_eq!(c, ErrorCode::DrmProtected);
+        assert_eq!(m.as_deref(), Some("Το βίντεο έχει DRM (com.widevine.alpha)"));
+        assert_eq!(evidence_code(orig, &verdict(EvidenceClass::LoginWall, &["http-401 cdn.example"], true)), (ErrorCode::LoginRequired, None));
+        assert_eq!(evidence_code(orig, &verdict(EvidenceClass::GeoBlocked, &["http-451 cdn.example"], false)), (ErrorCode::GeoBlocked, None));
+        // every result is a final code: nothing here sends a job round again
+        for class in [EvidenceClass::Protected, EvidenceClass::LoginWall, EvidenceClass::GeoBlocked, EvidenceClass::Strong] {
+            let (c, _) = evidence_code(ErrorCode::UnsupportedUrl, &verdict(class, &[], true));
+            assert!(!c.is_retryable(), "{c}");
+        }
+    }
+
+    #[test]
+    fn the_second_look_needs_repair_on_a_page_and_nothing_proven() {
+        use EvidenceClass as C;
+        for passive in [None, Some(C::Weak), Some(C::None)] {
+            assert!(!should_diagnose(RepairMode::Off, passive, false), "off never diagnoses");
+            assert!(should_diagnose(RepairMode::Shadow, passive, false));
+            assert!(should_diagnose(RepairMode::Hold, passive, false));
+            assert!(!should_diagnose(RepairMode::Hold, passive, true), "a platform post is never re-sniffed");
+        }
+        for passive in [C::Protected, C::LoginWall, C::GeoBlocked, C::Strong] {
+            assert!(!should_diagnose(RepairMode::Hold, Some(passive), false), "{passive:?} is already decided");
+        }
+    }
+
+    /// A job the site itself named a video for can never be "no video on the
+    /// page", and needs no second look.
+    #[test]
+    fn one_scanned_video_counts_as_named_by_the_site() {
+        assert!(!site_named_video(false, 0));
+        assert!(site_named_video(false, 1), "a single video is enough, not only several");
+        assert!(site_named_video(false, 3));
+        assert!(site_named_video(true, 0));
+    }
+
+    #[test]
+    fn a_video_the_site_named_is_never_reported_missing() {
+        assert!(with_site_hint(None, false).is_none());
+        let named = with_site_hint(None, true).unwrap();
+        assert_eq!(named.class, EvidenceClass::Strong);
+        assert_eq!(named.signals, vec!["named-by-site"]);
+        assert_eq!(evidence_code(ErrorCode::NoStreamFound, &named).0, ErrorCode::VideoUnresolved);
+        assert!(!should_diagnose(RepairMode::Hold, Some(named.class), false));
+        // over a weak or empty look it wins; over a refusal it does not
+        let weak = verdict(EvidenceClass::Weak, &["player-container"], false);
+        let both = with_site_hint(Some(weak), true).unwrap();
+        assert_eq!(both.class, EvidenceClass::Strong);
+        assert!(both.signals.contains(&"player-container".to_string()));
+        let drm = with_site_hint(Some(verdict(EvidenceClass::Protected, &["drm:setkeys"], false)), true).unwrap();
+        assert_eq!(drm.class, EvidenceClass::Protected);
+    }
+
+    /// A job MCR cancelled while the page was judged gets no verdict event and
+    /// keeps today's code; the same page for a job still ours gets both.
+    #[tokio::test]
+    async fn a_cancelled_job_gets_no_evidence_verdict() {
+        let db = std::env::temp_dir().join(format!("omni_p102_cancel_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let repo = Repository::new(&db).unwrap();
+        let id = repo
+            .enqueue(&omni_core::models::NewJob::new("https://news.example/a", "slug-a", "Test Person"), 24)
+            .unwrap()
+            .job_id();
+        let job = repo.lease_job("w1", 60).unwrap().expect("leased");
+        assert_eq!(job.id, id);
+        let page = || {
+            let mut snap = omni_browser::PageSnapshot::new("https://news.example/a");
+            snap.meta = vec![("og:video".into(), "https://cdn.example/v.mp4".into())];
+            FailedPage {
+                url: "https://news.example/a",
+                mode: RepairMode::Off,
+                snapshot: Some(snap),
+                sniffed_streams: &[],
+                original: ErrorCode::NoStreamFound,
+                named_by_site: false,
+            }
+        };
+        let notes = |repo: &Repository| {
+            repo.get_job_events(id, 50).unwrap().iter().filter(|e| e.message.starts_with("Evidence:")).count()
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (code, line, _) = assess_failed_page(&repo, "w1", id, &cancel, page()).await;
+        assert_eq!((code, line), (ErrorCode::NoStreamFound, None));
+        assert_eq!(notes(&repo), 0, "no verdict for a cancelled job");
+
+        let live = CancellationToken::new();
+        let (code, line, _) = assess_failed_page(&repo, "w1", id, &live, page()).await;
+        assert_eq!(code, ErrorCode::VideoUnresolved);
+        assert!(line.is_some());
+        assert_eq!(notes(&repo), 1);
+
+        let (code, _, _) = assess_failed_page(&repo, "someone-else", id, &live, page()).await;
+        assert_eq!(code, ErrorCode::NoStreamFound, "a lost lease gets no verdict either");
+        assert_eq!(notes(&repo), 1);
+        drop(repo);
+        let _ = std::fs::remove_file(&db);
     }
 }

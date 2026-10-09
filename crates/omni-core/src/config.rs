@@ -440,10 +440,10 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RepairMode {
-    /// No capture decisions beyond today's behaviour.
+    /// No diagnostic re-sniff and no repair ladder; a failed job's reason may still be more exact.
     #[default]
     Off,
-    /// Decide and log, change nothing.
+    /// The diagnostic re-sniff runs and failure reasons are exact; the repair ladder only records what it would have used and changes nothing.
     Shadow,
     /// Hold the job for MCR when the decision says so.
     Hold,

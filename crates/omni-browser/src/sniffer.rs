@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{
-    EventRequestWillBeSent, EventResponseReceived, SetBlockedUrLsParams,
+    EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, RequestId, ResourceType, SetBlockedUrLsParams,
 };
+use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,8 +18,44 @@ use tracing::{info, warn};
 use crate::adblock::UnifiedAdBlocker;
 use crate::agent::BrowserError;
 use crate::browser::HeadlessBrowserManager;
-use crate::evidence::{NetworkEntry, NetworkLog, PageSnapshot, PAGE_FACTS_JS};
+use crate::evidence::{vast_candidate, vast_media_files, Diagnostic, NetworkEntry, NetworkLog, PageSnapshot, DIAG_JS, PAGE_FACTS_JS};
 use crate::glomex;
+
+/// Click a cookie-consent button, if the page shows one. Fixed text.
+const COOKIE_BYPASS_JS: &str = r#"
+            (() => {
+                const selectors = [
+                    '#didomi-notice-agree-button',
+                    '.didomi-components-button--color',
+                    '.fc-cta-consent',
+                    '#onetrust-accept-btn-handler',
+                    '#onetrust-reject-all-handler',
+                    '.ot-sdk-button',
+                    'button[id*="accept"]',
+                    'button[class*="accept"]',
+                    'button[id*="agree"]',
+                    'button[class*="agree"]',
+                    'button[aria-label*="accept"]',
+                    'button[aria-label*="agree"]',
+                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        try { el.click(); return sel; } catch (e) {}
+                    }
+                }
+                // Search buttons by Greek or English text
+                const buttons = Array.from(document.querySelectorAll('button, a'));
+                for (const b of buttons) {
+                    const txt = (b.textContent || '').trim().toUpperCase();
+                    if (txt.includes('ΣΥΜΦΩΝΩ') || txt.includes('ΑΠΟΔΟΧΗ') || txt.includes('ACCEPT') || txt.includes('AGREE')) {
+                        try { b.click(); return 'button-text:' + txt; } catch (e) {}
+                    }
+                }
+                return null;
+            })()
+        "#;
 
 /// Media session metadata and extracted video streams.
 /// Captures browser context (cookies, user-agent, referer) to forward to downstream
@@ -36,6 +74,30 @@ pub struct DiscoveredMedia {
 pub struct Sniffed {
     pub media: Result<DiscoveredMedia>,
     pub snapshot: PageSnapshot,
+}
+
+/// Shared between the diagnostic run's listeners and its caller, so a run
+/// cut short by its budget still hands back what it saw.
+#[derive(Default)]
+struct DiagState {
+    net_log: std::sync::Mutex<NetworkLog>,
+    diag: std::sync::Mutex<Diagnostic>,
+    xml: std::sync::Mutex<Vec<RequestId>>,
+    facts: std::sync::Mutex<DiagFacts>,
+    main_doc: std::sync::Mutex<MainDoc>,
+}
+
+/// The page's own document: the first document request, and how it was answered.
+#[derive(Default)]
+struct MainDoc {
+    frame_id: Option<chromiumoxide::cdp::browser_protocol::page::FrameId>,
+    status: Option<i64>,
+}
+
+#[derive(Default)]
+struct DiagFacts {
+    facts: Option<Value>,
+    final_url: Option<String>,
 }
 
 /// StreamSniffer uses headless Chrome via CDP to navigate complex news websites,
@@ -147,6 +209,213 @@ impl StreamSniffer {
         result
     }
 
+    /// A second, instrumented look at a page the normal sniff got nothing
+    /// from (plan P10.2): the page is opened with recorders for Media Source
+    /// and DRM requests in place before its own scripts run, every player is
+    /// scrolled into view and started muted, and what the page then shows is
+    /// read. Never used by the normal sniff; the page is only observed.
+    ///
+    /// Bounded by `budget_secs`; on a timeout or a launch failure it returns
+    /// what it has (possibly nothing) rather than an error.
+    pub async fn diagnose(target_url: &str, budget_secs: u64) -> (PageSnapshot, Diagnostic) {
+        Self::diagnose_with(HeadlessBrowserManager::launch().await, target_url, budget_secs).await
+    }
+
+    /// `diagnose` on an already attempted launch (a failed one is a run that
+    /// saw nothing, never a clean page).
+    async fn diagnose_with(
+        launched: Result<crate::browser::BrowserSession>,
+        target_url: &str,
+        budget_secs: u64,
+    ) -> (PageSnapshot, Diagnostic) {
+        let host = reqwest::Url::parse(target_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+        let mut snapshot = PageSnapshot::new(target_url);
+        let mut session = match launched {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("StreamSniffer: diagnostic run for {host} could not start the browser: {e:#}");
+                return (snapshot, Diagnostic::default());
+            }
+        };
+        let state = Arc::new(DiagState::default());
+        let run = Self::diagnose_page(&session.browser, target_url, &state);
+        if tokio::time::timeout(Duration::from_secs(budget_secs), run).await.is_err() {
+            warn!("StreamSniffer: diagnostic run for {host} hit its {budget_secs} s budget");
+        }
+        session.shutdown().await;
+
+        if let Ok(log) = state.net_log.lock() {
+            snapshot.network = log.entries();
+        }
+        if let Ok(mut f) = state.facts.lock() {
+            snapshot.final_url = f.final_url.take();
+            if let Some(v) = f.facts.take() {
+                snapshot.apply_page_facts(&v);
+            }
+        }
+        let mut diag = state.diag.lock().map(|d| d.clone()).unwrap_or_default();
+        let main_ok = state.main_doc.lock().is_ok_and(|m| m.status.is_some_and(|s| (200..300).contains(&s)));
+        // A page that ended up somewhere else (a login, a consent wall) was
+        // not the one asked for.
+        diag.complete = crate::evidence::run_was_complete(main_ok, &snapshot, target_url);
+        (snapshot, diag)
+    }
+
+    async fn diagnose_page(browser: &Browser, target_url: &str, state: &Arc<DiagState>) {
+        let page = match browser.new_page("about:blank").await {
+            Ok(p) => p,
+            Err(e) => return warn!("StreamSniffer: diagnostic run could not open a page: {e}"),
+        };
+        if let Ok(params) = SetBlockedUrLsParams::builder().urls(UnifiedAdBlocker::global().generate_cdp_blocked_patterns()).build() {
+            let _ = page.execute(params).await;
+        }
+
+        if let Ok(mut events) = page.event_listener::<EventRequestWillBeSent>().await {
+            let st = state.clone();
+            tokio::spawn(async move {
+                while let Some(event) = events.next().await {
+                    if let Ok(mut log) = st.net_log.lock() {
+                        log.on_request(
+                            event.request_id.inner(),
+                            NetworkEntry {
+                                url: event.request.url.clone(),
+                                method: Some(event.request.method.clone()),
+                                status: None,
+                                mime: None,
+                                resource_type: event.r#type.as_ref().map(|t| format!("{:?}", t)),
+                                frame_id: event.frame_id.as_ref().map(|f| f.inner().clone()),
+                            },
+                        );
+                    }
+                }
+            });
+        }
+        if let Ok(mut events) = page.event_listener::<EventResponseReceived>().await {
+            let st = state.clone();
+            tokio::spawn(async move {
+                while let Some(event) = events.next().await {
+                    let mime = event.response.mime_type.clone();
+                    if let Ok(mut log) = st.net_log.lock() {
+                        log.on_response(
+                            event.request_id.inner(),
+                            event.response.status,
+                            Some(mime.clone()),
+                            Some(format!("{:?}", event.r#type)),
+                        );
+                    }
+                    // The first document answered in the page's main frame.
+                    if matches!(event.r#type, ResourceType::Document) {
+                        if let Ok(mut m) = st.main_doc.lock() {
+                            let ours = m.frame_id.is_none() || m.frame_id.as_ref() == event.frame_id.as_ref();
+                            if m.status.is_none() && ours {
+                                m.status = Some(event.response.status);
+                            }
+                        }
+                    }
+                    if vast_candidate(&mime, &format!("{:?}", event.r#type)) {
+                        if let Ok(mut x) = st.xml.lock() {
+                            if x.len() < 16 {
+                                x.push(event.request_id.clone());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        if let Ok(mut events) = page.event_listener::<EventConsoleApiCalled>().await {
+            let st = state.clone();
+            tokio::spawn(async move {
+                while let Some(event) = events.next().await {
+                    let first = event.args.first().and_then(|a| a.value.as_ref()).and_then(Value::as_str);
+                    if first != Some("__omni_diag") {
+                        continue;
+                    }
+                    if let Some(rec) = event.args.get(1).and_then(|a| a.value.as_ref()).and_then(Value::as_str) {
+                        if let Ok(mut d) = st.diag.lock() {
+                            d.record(rec);
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Err(e) = page.execute(AddScriptToEvaluateOnNewDocumentParams::new(DIAG_JS)).await {
+            warn!("StreamSniffer: diagnostic recorders could not be installed: {e}");
+        }
+
+        let main_frame = page.mainframe().await.ok().flatten();
+        if let Ok(mut m) = state.main_doc.lock() {
+            m.frame_id = main_frame;
+        }
+
+        let started = std::time::Instant::now();
+        let settle = Duration::from_secs(15);
+        // The load may never finish on a page with a live player; the wait
+        // below is what bounds it.
+        let _ = tokio::time::timeout(settle, page.goto(target_url)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = page.evaluate(COOKIE_BYPASS_JS).await;
+
+        let scroll_js = r#"
+            (async () => {
+                try {
+                    const els = Array.from(document.querySelectorAll('video, iframe, [class*=player]')).slice(0, 15);
+                    for (const el of els) {
+                        try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                        await new Promise(r => setTimeout(r, 300));
+                    }
+                    return els.length;
+                } catch (e) { return 0; }
+            })()
+        "#;
+        let _ = page.evaluate(scroll_js).await;
+        let play_js = r#"
+            (() => {
+                for (const v of Array.from(document.querySelectorAll('video'))) {
+                    try {
+                        v.muted = true;
+                        const p = v.play();
+                        if (p && p.catch) p.catch(() => {});
+                    } catch (e) {}
+                }
+            })()
+        "#;
+        let _ = page.evaluate(play_js).await;
+
+        if let Some(rest) = settle.checked_sub(started.elapsed()) {
+            tokio::time::sleep(rest).await;
+        }
+
+        if let Ok(Ok(eval)) = tokio::time::timeout(Duration::from_secs(3), page.evaluate(PAGE_FACTS_JS)).await {
+            if let Ok(mut f) = state.facts.lock() {
+                f.facts = eval.value().cloned();
+            }
+        }
+        let final_url = page.url().await.ok().flatten();
+        if let Ok(mut f) = state.facts.lock() {
+            f.final_url = final_url;
+        }
+
+        // Ad servers' VAST replies name the ad's own media files, which must
+        // not be mistaken for the page's video. Best effort.
+        let ids: Vec<_> = state.xml.lock().map(|x| x.clone()).unwrap_or_default();
+        for id in ids {
+            let body = tokio::time::timeout(Duration::from_secs(2), page.execute(GetResponseBodyParams::new(id))).await;
+            if let Ok(Ok(resp)) = body {
+                if !resp.result.base64_encoded && resp.result.body.len() <= 65536 {
+                    let files = vast_media_files(&resp.result.body);
+                    if let Ok(mut d) = state.diag.lock() {
+                        for f in files {
+                            if d.ad_media.len() < 64 && !d.ad_media.contains(&f) {
+                                d.ad_media.push(f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn sniff(browser: &Browser, target_url: &str, timeout_secs: u64) -> Sniffed {
         let mut snapshot = PageSnapshot::new(target_url);
         let media = Self::sniff_page(browser, target_url, timeout_secs, &mut snapshot).await;
@@ -244,40 +513,7 @@ impl StreamSniffer {
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // 4. Bypass Cookie Consent (OneTrust, Didomi, Quantcast, Google Funding Choices, Greek portals)
-        let cookie_bypass_js = r#"
-            (() => {
-                const selectors = [
-                    '#didomi-notice-agree-button',
-                    '.didomi-components-button--color',
-                    '.fc-cta-consent',
-                    '#onetrust-accept-btn-handler',
-                    '#onetrust-reject-all-handler',
-                    '.ot-sdk-button',
-                    'button[id*="accept"]',
-                    'button[class*="accept"]',
-                    'button[id*="agree"]',
-                    'button[class*="agree"]',
-                    'button[aria-label*="accept"]',
-                    'button[aria-label*="agree"]',
-                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll'
-                ];
-                for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        try { el.click(); return sel; } catch (e) {}
-                    }
-                }
-                // Search buttons by Greek or English text
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                for (const b of buttons) {
-                    const txt = (b.textContent || '').trim().toUpperCase();
-                    if (txt.includes('ΣΥΜΦΩΝΩ') || txt.includes('ΑΠΟΔΟΧΗ') || txt.includes('ACCEPT') || txt.includes('AGREE')) {
-                        try { b.click(); return 'button-text:' + txt; } catch (e) {}
-                    }
-                }
-                return null;
-            })()
-        "#;
+        let cookie_bypass_js = COOKIE_BYPASS_JS;
         let _ = page.evaluate(cookie_bypass_js).await;
 
         // 5. Programmatic Lazy-Scroll (Operational Protocol from PDF Benchmark)
@@ -721,6 +957,15 @@ fn final_candidates(mut list: Vec<(u32, String)>) -> Vec<(u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_diagnostic_run_that_could_not_launch_is_incomplete() {
+        let (snap, diag) = StreamSniffer::diagnose_with(Err(anyhow!("no browser here")), "https://news.example/a", 5).await;
+        assert!(!diag.complete, "a run that saw nothing must not read as a clean page");
+        assert!(snap.network.is_empty() && snap.html.is_none());
+        let e = crate::evidence::classify(&snap, &[], Some(&diag), |_| false);
+        assert!(!e.diagnosed);
+    }
 
     /// The blocker is process-wide and no longer self-initializes from a
     /// CWD-relative path (plan P0.1). Point it at a scratch directory; with no

@@ -56,11 +56,17 @@ pub enum ErrorCode {
     ManualDownload,
     /// Anything unclassified. Always goes to a human.
     PipelineFailed,
+    /// The page's video is copy-protected (EME/DRM); no download can get it.
+    DrmProtected,
+    /// Looked at twice, with a diagnostic pass: the page has no video.
+    NoVideoOnPage,
+    /// The page has a video we could not get. A human takes it from here.
+    VideoUnresolved,
 }
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 24] = [
+    pub const ALL: [ErrorCode; 27] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
@@ -85,6 +91,9 @@ impl ErrorCode {
         Self::LeaseExpired,
         Self::ManualDownload,
         Self::PipelineFailed,
+        Self::DrmProtected,
+        Self::NoVideoOnPage,
+        Self::VideoUnresolved,
     ];
 
     /// The code stored on a job, back as a code.
@@ -118,6 +127,9 @@ impl ErrorCode {
             Self::LeaseExpired => "LEASE_EXPIRED",
             Self::ManualDownload => "MANUAL_DOWNLOAD",
             Self::PipelineFailed => "PIPELINE_FAILED",
+            Self::DrmProtected => "DRM_PROTECTED",
+            Self::NoVideoOnPage => "NO_VIDEO_ON_PAGE",
+            Self::VideoUnresolved => "VIDEO_UNRESOLVED",
         }
     }
 
@@ -185,6 +197,9 @@ impl ErrorCode {
             Self::LeaseExpired => "Η εργασία διακόπηκε και δεν ολοκληρώθηκε μετά από επανειλημμένες προσπάθειες.",
             Self::ManualDownload => "Σύνδεσμος μεταφοράς αρχείων (WeTransfer κ.λπ.). Κατεβάστε το αρχείο από τον σύνδεσμο, βάλτε το στο Dalet και πατήστε «Το έβαλα στο Dalet».",
             Self::PipelineFailed => "Απρόβλεπτο σφάλμα. Δείτε την «Αιτία» και το «Ιστορικό» σε αυτή την κάρτα, και δοκιμάστε ξανά ή δώστε άλλον σύνδεσμο.",
+            Self::DrmProtected => "Το βίντεο έχει προστασία αντιγραφής (DRM) και δεν μπορεί να κατέβει. Ζητήστε το αρχείο από την πηγή ή βάλτε το στο Dalet με άλλο τρόπο και πατήστε «Το έβαλα στο Dalet».",
+            Self::NoVideoOnPage => "Η σελίδα δεν έχει βίντεο (ελέγχθηκε δύο φορές). Αν εννοούσαν άλλον σύνδεσμο, επικολλήστε τον στο «Χρήση αυτού του συνδέσμου»· αλλιώς πατήστε «Αφαίρεση».",
+            Self::VideoUnresolved => "Η σελίδα έχει βίντεο αλλά δεν κατέβηκε αυτόματα. Ανοίξτε τον σύνδεσμο και κατεβάστε το χειροκίνητα, ή δοκιμάστε ξανά αργότερα.",
         }
     }
 
@@ -532,6 +547,9 @@ mod tests {
             ErrorCode::LeaseExpired,
             ErrorCode::ManualDownload,
             ErrorCode::PipelineFailed,
+            ErrorCode::DrmProtected,
+            ErrorCode::NoVideoOnPage,
+            ErrorCode::VideoUnresolved,
         ] {
             let hint = code.hint_el();
             assert!(hint.len() > 20, "{code} has no useful hint");
@@ -549,6 +567,21 @@ mod tests {
         assert_eq!(ErrorCode::ComplianceFailed.as_str(), "COMPLIANCE_FAILED");
         assert_eq!(ErrorCode::NoStreamFound.as_str(), "NO_STREAM_FOUND");
         assert_eq!(ErrorCode::ManualDownload.as_str(), "MANUAL_DOWNLOAD");
+        assert_eq!(ErrorCode::DrmProtected.as_str(), "DRM_PROTECTED");
+        assert_eq!(ErrorCode::NoVideoOnPage.as_str(), "NO_VIDEO_ON_PAGE");
+        assert_eq!(ErrorCode::VideoUnresolved.as_str(), "VIDEO_UNRESOLVED");
+    }
+
+    #[test]
+    fn the_page_evidence_codes_are_terminal_and_listed_once() {
+        for c in [ErrorCode::DrmProtected, ErrorCode::NoVideoOnPage, ErrorCode::VideoUnresolved] {
+            assert!(!c.is_retryable(), "{c} must not be retried");
+            assert!(!c.should_try_sniffer());
+            assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
+        }
+        assert_eq!(ErrorCode::ALL.len(), 27);
+        let unique: std::collections::HashSet<_> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(unique.len(), 27);
     }
 
     /// The MCR desk shows a stored code's Greek hint (plan P7.1); every code
