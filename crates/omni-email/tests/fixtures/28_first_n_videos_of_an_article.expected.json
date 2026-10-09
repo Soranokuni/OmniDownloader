@@ -1,0 +1,50 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "subject",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "1",
+          "keyword": "ITHOPOIOSKOLLISE",
+          "marker": false,
+          "max_videos": 2,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.iefimerida.gr/zoi/fixture-ithopoios-podilato"
+        }
+      ],
+      "keyword": "ITHOPOIOSKOLLISE",
+      "title": "Ηθοποιός κόλλησε στην κίνηση και νοίκιασε ηλεκτρικό ποδήλατο"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "PROTAGKOL",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture2802"
+        }
+      ],
+      "keyword": "PROTAGKOL",
+      "title": "Τα 2 πρώτα γκολ της ομάδας στο ντέρμπι"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "MARKER_WITHOUT_URL",
+      "detail": "1"
+    }
+  ]
+}

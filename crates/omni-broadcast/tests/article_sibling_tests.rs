@@ -17,6 +17,7 @@ fn leased_article_job() -> (tempfile::TempDir, Repository, omni_core::models::Jo
     j.keyword = "SEISMOS".into();
     j.priority = 3;
     j.email_message_id = Some("<m1@example.gr>".into());
+    j.group_code = Some("NEWS".into());
     repo.enqueue(&j, DEFAULT_DEDUP_WINDOW_HOURS).unwrap();
     let job = repo.lease_job("host:1:1", 180).unwrap().unwrap();
     (dir, repo, job)
@@ -46,6 +47,10 @@ fn platform_videos_become_sibling_jobs_and_raw_streams_are_offered() {
         vec![(X2, "1B_MCR_SEISMOS", JobStatus::Pending), (X3, "1C_MCR_SEISMOS", JobStatus::Pending)]
     );
     assert!(siblings.iter().all(|j| j.priority == 3 && j.email_message_id.as_deref() == Some("<m1@example.gr>")));
+    // The MCR mail view files them under the article's link (plan P7.6),
+    // and they carry the article's group label.
+    assert!(siblings.iter().all(|j| j.parent_job_id == Some(job.id)), "{siblings:?}");
+    assert!(siblings.iter().all(|j| j.group_code.as_deref() == Some("NEWS")), "{siblings:?}");
 
     // The raw stream is offered, with the next index in the sequence.
     let offered: Vec<Offered> = serde_json::from_str(row.candidates_json.as_deref().unwrap()).unwrap();
@@ -82,4 +87,29 @@ fn a_single_video_article_is_left_exactly_as_it_was() {
     assert_eq!(job.slug, "1_MCR_SEISMOS");
     assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
     assert!(repo.get_job(job.id).unwrap().unwrap().candidates_json.is_none());
+}
+
+#[test]
+fn a_cancelled_article_job_queues_no_siblings() {
+    // P7.20: MCR cancelled the job while its page was being resolved. The
+    // other videos of the article must not be queued for air.
+    let (_dir, repo, mut job) = leased_article_job();
+    assert_eq!(repo.cancel_job(job.id).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    let all = vec![X1.to_string(), X2.to_string(), RAW.to_string()];
+
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all);
+
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1, "siblings were queued for a cancelled job: {jobs:?}");
+    assert!(repo.get_job(job.id).unwrap().unwrap().candidates_json.is_none(), "offers were stored too");
+}
+
+#[test]
+fn a_job_another_worker_holds_queues_no_siblings() {
+    let (_dir, repo, mut job) = leased_article_job();
+    let all = vec![X1.to_string(), X2.to_string()];
+
+    queue_article_siblings(&repo, "host:1:OTHER", &mut job, X1, &all);
+
+    assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
 }

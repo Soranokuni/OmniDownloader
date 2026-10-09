@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — Systems Administration</title>
-<link rel="stylesheet" href="/static/app.css?v=2">
+<link rel="stylesheet" href="/static/app.css?v=8">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -80,6 +80,39 @@
   </div>
 
   <div class="stack" style="grid-column:span 2">
+    <section class="card stack" id="selfcheck">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Self-check</h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="selfcheck-refresh">Refresh</button>
+          <button class="btn btn-primary" type="button" id="selfcheck-run">Run the check now</button>
+        </div>
+      </div>
+      <p class="note">
+        Every morning at 05:15 the system checks that it can still find a video at each
+        link below, without downloading it, and that the browser it uses for news
+        articles works. When a link stops working, it shows here in red with the date it
+        started. A new yt-dlp is kept only if every link that worked before still works.
+        If one stops working, the previous yt-dlp is put back automatically.
+      </p>
+      <div id="selfcheck-summary" class="stack"></div>
+      <div class="card flush">
+        <table>
+          <thead><tr><th>Link</th><th>Status</th><th>Last checked</th><th>What it found</th><th class="right"></th></tr></thead>
+          <tbody id="selfcheck-body"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <form id="selfcheck-form" class="row">
+        <input type="text" id="selfcheck-label" placeholder="Name, e.g. Instagram reel" style="width:220px" required>
+        <input type="url" id="selfcheck-url" class="grow" placeholder="https://… a link that has a video" required>
+        <button class="btn" type="submit">Add link</button>
+      </form>
+      <p class="note">
+        Use links that will stay online (an official account's video, not a breaking-news
+        post that may be deleted). Keep at least one per kind of link the newsroom sends.
+      </p>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
@@ -88,10 +121,241 @@
       <div class="card flush">
         <table>
           <thead>
-            <tr><th>Email</th><th>Name</th><th>Role</th><th>Journalist</th><th class="right">Actions</th></tr>
+            <tr><th>Email</th><th>Name</th><th>Role</th><th>Journalist</th><th>Status</th><th class="right">Actions</th></tr>
           </thead>
           <tbody id="users-body">
-            <tr><td colspan="5" class="empty">Loading users…</td></tr>
+            <tr><td colspan="6" class="empty">Loading users…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head" style="margin-bottom:12px">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Recent mail</h2>
+        <button class="btn" type="button" id="mail-refresh">Refresh</button>
+      </div>
+      <p class="note" style="margin-bottom:10px">
+        What the daemon made of each mail. <b>Reprocess</b> reads a mail again on
+        the next poll (after a parser fix, or a journalist added to the roster);
+        jobs it already has are not queued twice.
+      </p>
+      <div class="card flush" style="max-height:360px;overflow:auto">
+        <table>
+          <thead><tr><th>Handled</th><th>Subject</th><th>From</th><th>Outcome</th><th class="num">Jobs</th><th class="right"></th></tr></thead>
+          <tbody id="mail-body">
+            <tr><td colspan="6" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card stack" id="llm">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">LLM assist</h2>
+        <span id="llm-in-use" class="note mono"></span>
+      </div>
+      <p class="note">
+        The parser decides every job. The model is asked only where the parser is
+        unsure (a journalist, a keyword, a group), and what it answers is checked
+        before use. Any OpenAI-compatible server works, on this machine or online.
+      </p>
+      <div class="grid-2">
+        <div>
+          <label for="llm-mode">Mode</label>
+          <select id="llm-mode">
+            <option value="assist">Assist (ask where the parser is unsure)</option>
+            <option value="off">Off (parser only)</option>
+          </select>
+        </div>
+        <div>
+          <label for="llm-provider">Provider</label>
+          <select id="llm-provider"></select>
+        </div>
+      </div>
+      <div>
+        <label for="llm-base">Base URL</label>
+        <input type="text" id="llm-base" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:1234/v1">
+      </div>
+      <p id="llm-online" class="note warn" hidden>
+        Online provider: each assist call sends the subject, part of the mail
+        body, the roster surnames and the group names to this company. Email
+        addresses and phone numbers are replaced with placeholders first, and
+        the sender's address is never sent.
+      </p>
+      <div class="grid-2">
+        <div>
+          <label for="llm-auth">API key is sent as</label>
+          <select id="llm-auth">
+            <option value="none">No key (local server)</option>
+            <option value="bearer">Authorization: Bearer (most providers)</option>
+            <option value="api_key_header">api-key header (Azure OpenAI)</option>
+          </select>
+        </div>
+        <div>
+          <label for="llm-key">API key</label>
+          <input type="password" id="llm-key" autocomplete="off">
+          <label class="row tight" style="margin:4px 0 0 0">
+            <input type="checkbox" id="llm-clear-key" style="width:auto">
+            <span class="note">Remove the stored key</span>
+          </label>
+        </div>
+      </div>
+      <div>
+        <label for="llm-model">Model</label>
+        <div class="row">
+          <input type="text" id="llm-model" class="grow" list="llm-models" spellcheck="false" autocomplete="off" placeholder="google/gemma-4-e4b">
+          <datalist id="llm-models"></datalist>
+          <button class="btn" type="button" id="llm-load-models">Load models</button>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div>
+          <label for="llm-timeout">Timeout per call (seconds, 5–300)</label>
+          <input type="number" id="llm-timeout" min="5" max="300" value="30">
+        </div>
+        <div>
+          <label for="llm-tokens">Answer token limit (50–8000)</label>
+          <input type="number" id="llm-tokens" min="50" max="8000" value="400">
+        </div>
+      </div>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="llm-no-thinking" style="width:auto" checked>
+        <span>Disable thinking (reasoning models answer in seconds instead of minutes)</span>
+      </label>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="llm-polish" style="width:auto">
+        <span>Let the LLM write every keyword (otherwise only where the parser cannot make one); one model call per mail</span>
+      </label>
+      <div class="row">
+        <button class="btn" type="button" id="llm-test">Test</button>
+        <button class="btn btn-primary" type="button" id="llm-save">Save and apply</button>
+      </div>
+      <p id="llm-result" class="note" style="white-space:pre-line"></p>
+    </section>
+
+    <section class="card stack" id="taxonomy">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Newsroom taxonomy</h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="taxonomy-export">Export taxonomy.json</button>
+          <button class="btn" type="button" id="taxonomy-import-btn">Import…</button>
+          <input type="file" id="taxonomy-file" accept="application/json,.json" hidden>
+        </div>
+      </div>
+      <p class="note">
+        Groups are the news desk, each show and each desk. A mail's group is
+        decided from its subject, from "για …" in the body, or from the
+        journalist's first group; the LLM chooses from this list only when
+        none of those decide. The group is a label on the job: it never
+        changes the file name or where the file is delivered.
+      </p>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="taxonomy-replace" style="width:auto">
+        <span>On import, also remove groups and people the file does not list</span>
+      </label>
+      <p id="taxonomy-result" class="note" style="white-space:pre-line"></p>
+
+      <h3 class="card-title" style="font-size:0.95rem">Groups</h3>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr><th>Code</th><th>Name</th><th>Kind</th><th>Keywords</th><th>Description</th><th class="right">Actions</th></tr>
+          </thead>
+          <tbody id="groups-body">
+            <tr><td colspan="6" class="empty">Loading groups…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <form id="group-form" class="stack">
+        <div class="grid-2">
+          <div>
+            <label for="g-code">Code (A–Z, 0–9, _)</label>
+            <input type="text" id="g-code" required maxlength="20" placeholder="NEWS" autocomplete="off">
+          </div>
+          <div>
+            <label for="g-name">Name</label>
+            <input type="text" id="g-name" required placeholder="Κεντρικό Δελτίο Ειδήσεων">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="g-kind">Kind</label>
+            <select id="g-kind">
+              <option value="news">News</option>
+              <option value="show" selected>Show</option>
+              <option value="desk">Desk</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+          <div>
+            <label for="g-keywords">Keywords that name it (comma-separated)</label>
+            <input type="text" id="g-keywords" placeholder="ΔΕΛΤΙΟ, ΚΕΝΤΡΙΚΟ ΔΕΛΤΙΟ">
+          </div>
+        </div>
+        <div>
+          <label for="g-description">Description (for people and the LLM)</label>
+          <textarea id="g-description" rows="2" maxlength="500"></textarea>
+        </div>
+        <button class="btn btn-primary" type="submit">Save group</button>
+      </form>
+
+      <h3 class="card-title" style="font-size:0.95rem">People</h3>
+      <div class="card flush" style="max-height:420px;overflow:auto">
+        <table>
+          <thead>
+            <tr><th>Surname (slug)</th><th>Name</th><th>Addresses</th><th>Other names</th><th>Groups</th><th class="num">Prio</th><th class="right"></th></tr>
+          </thead>
+          <tbody id="people-body">
+            <tr><td colspan="7" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <form id="person-form" class="stack">
+        <div class="grid-2">
+          <div>
+            <label for="pf-surname">Surname as it appears in file names (Latin)</label>
+            <input type="text" id="pf-surname" required maxlength="40" placeholder="PAPADAKI" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="pf-name">Full name</label>
+            <input type="text" id="pf-name" required placeholder="Μαρία Παπαδάκη">
+          </div>
+        </div>
+        <div>
+          <label for="pf-emails">Addresses they send from (comma-separated)</label>
+          <input type="text" id="pf-emails" placeholder="m.papadaki@station.gr, papadaki@radio.gr" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="pf-aliases">Other names the mail may use: Greek surname, first name, nickname (comma-separated)</label>
+          <input type="text" id="pf-aliases" placeholder="ΠΑΠΑΔΑΚΗ, ΜΑΡΙΑ, ΜΑΙΡΗ">
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="pf-groups">Groups, default first (comma-separated codes)</label>
+            <input type="text" id="pf-groups" placeholder="NEWS" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="pf-priority">Queue priority (-100…100)</label>
+            <input type="number" id="pf-priority" value="0" min="-100" max="100">
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit">Save person</button>
+          <button class="btn" type="button" id="pf-clear">New person</button>
+        </div>
+      </form>
+
+      <h3 class="card-title" style="font-size:0.95rem">Backups</h3>
+      <div class="row" style="justify-content:space-between">
+        <p class="note" style="margin:0">A backup is taken automatically before every import, restore and delete; the newest 30 are kept in data\backups\taxonomy.</p>
+        <button class="btn" type="button" id="taxonomy-backup-now">Back up now</button>
+      </div>
+      <div class="card flush" style="max-height:260px;overflow:auto">
+        <table>
+          <thead><tr><th>Backup</th><th class="num">Groups</th><th class="num">People</th><th class="right"></th></tr></thead>
+          <tbody id="backups-body">
+            <tr><td colspan="4" class="empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -130,30 +394,17 @@
     </section>
 
     <section class="card">
-      <h2 class="card-title">Connection tests</h2>
-      <div class="grid-2">
+      <h2 class="card-title">Mailbox test</h2>
+      <div>
         <div>
-          <label for="test-llm-endpoint">LLM endpoint</label>
-          <input type="text" id="test-llm-endpoint" placeholder="http://localhost:11434/v1">
-          <label for="test-llm-model" style="margin-top:8px">Model</label>
-          <input type="text" id="test-llm-model" placeholder="gemma3:4b">
-          <button class="btn btn-block" type="button" id="test-llm-btn" style="margin-top:10px">Test LLM</button>
-        </div>
-        <div>
-          <label for="test-mail-server">IMAP server</label>
-          <input type="text" id="test-mail-server" placeholder="outlook.office365.com">
-          <div class="grid-2" style="margin-top:8px">
-            <div>
-              <label for="test-mail-port">Port</label>
-              <input type="number" id="test-mail-port" value="993">
-            </div>
-            <div>
-              <label for="test-mail-user">Mailbox</label>
-              <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
-            </div>
-          </div>
-          <label for="test-mail-pass" style="margin-top:8px">Password</label>
-          <input type="password" id="test-mail-pass" autocomplete="off">
+          <label for="test-mail-tenant">Directory (tenant) ID</label>
+          <input type="text" id="test-mail-tenant" autocomplete="off" spellcheck="false">
+          <label for="test-mail-client" style="margin-top:8px">Application (client) ID</label>
+          <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
+          <label for="test-mail-user" style="margin-top:8px">Mailbox</label>
+          <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
+          <label for="test-mail-secret" style="margin-top:8px">Client secret (blank: test the stored one)</label>
+          <input type="password" id="test-mail-secret" autocomplete="off">
           <button class="btn btn-block" type="button" id="test-mail-btn" style="margin-top:10px">Test mailbox</button>
         </div>
       </div>
@@ -201,6 +452,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=2"></script>
+<script type="module" src="/static/admin.js?v=11"></script>
 </body>
 </html>

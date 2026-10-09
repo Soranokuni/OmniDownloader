@@ -8,13 +8,14 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::auth::hash_password;
+use crate::auth::{hash_password, verify_password};
 use crate::migrations;
 use crate::models::{
     AuditLog, Enqueued, Job, JobEvent, JobStage, JobStatus, Journalist, LoginAttempt, NewJob,
-    ProcessedMail, QueueSummary, User,
+    ProcessedMail, QueueSummary, QueueWatch, User,
     UserRole,
 };
+use crate::taxonomy::{Group, ImportReport, Person, Taxonomy};
 use crate::timestamps;
 
 /// Default window for treating a re-sent link as already delivered.
@@ -22,6 +23,33 @@ use crate::timestamps;
 /// A day covers the realistic case (the same story forwarded again during one
 /// news cycle) without blocking a genuine re-ingest the next day.
 pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
+
+/// The first-run administrator of a new installation (see
+/// [`Repository::ensure_default_admin`]). Logins are matched lowercased, so
+/// "Admin" and "admin" both work.
+pub const DEFAULT_ADMIN_LOGIN: &str = "admin";
+pub const DEFAULT_ADMIN_PASSWORD: &str = "Admin";
+
+/// The start of today in the server's local time, as UTC.
+fn local_midnight_utc() -> chrono::DateTime<Utc> {
+    use chrono::{Local, TimeZone};
+    let midnight = Local::now().date_naive().and_hms_opt(0, 0, 0);
+    midnight
+        .and_then(|m| Local.from_local_datetime(&m).earliest())
+        .map(|d| d.with_timezone(&Utc))
+        // A midnight that does not exist locally: fall back to 24 h ago.
+        .unwrap_or_else(|| Utc::now() - Duration::hours(24))
+}
+
+/// What [`Repository::cancel_job`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled,
+    /// The job is already delivering; the file cannot be stopped.
+    TooLate,
+    /// Not waiting or running (or no such job).
+    NotCancellable,
+}
 
 #[derive(Clone)]
 pub struct Repository {
@@ -83,6 +111,7 @@ impl Repository {
         }
 
         self.seed_journalists_from_file(&conn)?;
+        self.seed_taxonomy_from_file(&conn)?;
 
         Ok(())
     }
@@ -204,6 +233,9 @@ impl Repository {
             email_source: email_source.map(str::to_string),
             email_message_id: None,
             extraction_method: None,
+            group_code: None,
+            max_videos: None,
+            parent_job_id: None,
         };
         Ok(self.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id())
     }
@@ -293,8 +325,9 @@ impl Repository {
             INSERT INTO queue (
                 url, url_normalized, slug, journalist, keyword, index_str, priority,
                 status, stage, submitted_by_user_id, notes, email_source,
-                email_message_id, extraction_method, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?)
+                email_message_id, extraction_method, group_code, max_videos, parent_job_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 job.url,
@@ -310,6 +343,9 @@ impl Repository {
                 job.email_source,
                 job.email_message_id,
                 job.extraction_method,
+                job.group_code,
+                job.max_videos.filter(|n| *n > 0),
+                job.parent_job_id,
                 now,
                 now
             ],
@@ -474,7 +510,7 @@ impl Repository {
                 SELECT id FROM queue
                 WHERE status = 'PENDING'
                   AND (not_before IS NULL OR not_before <= ?)
-                ORDER BY priority DESC, created_at ASC
+                ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1
                 "#,
                 params![now],
@@ -518,6 +554,63 @@ impl Repository {
         self.get_job(id)
     }
 
+    /// 1-based place in the queue of every PENDING job `lease_job` could take
+    /// now, in its order. Jobs in back-off have no place (plan P7.19).
+    pub fn pending_positions(&self) -> Result<std::collections::HashMap<i64, i64>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id FROM queue
+            WHERE status = 'PENDING'
+              AND (not_before IS NULL OR not_before <= ?)
+            ORDER BY priority DESC, created_at ASC, id ASC
+            "#,
+        )?;
+        let ids = stmt
+            .query_map(params![timestamps::now_string()], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids.into_iter().zip(1..).collect())
+    }
+
+    /// Waiting and running figures for the `queue` health check (plan P7.19).
+    pub fn queue_watch(&self, now: chrono::DateTime<Utc>) -> Result<QueueWatch> {
+        let conn = self.pool.get()?;
+        let now_s = timestamps::format(now);
+        let (waiting, oldest): (i64, Option<String>) = conn.query_row(
+            r#"
+            SELECT COUNT(*), MIN(updated_at) FROM queue
+            WHERE status = 'PENDING' AND (not_before IS NULL OR not_before <= ?)
+            "#,
+            params![now_s],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM queue WHERE status = 'RUNNING'",
+            [],
+            |r| r.get(0),
+        )?;
+        let step: Option<(i64, String, Option<String>)> = conn
+            .query_row(
+                r#"
+                SELECT id, stage, stage_started_at FROM queue
+                WHERE status = 'RUNNING' AND stage_started_at IS NOT NULL
+                ORDER BY stage_started_at ASC LIMIT 1
+                "#,
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let secs = |raw: Option<String>| {
+            timestamps::parse_opt(raw).map(|t| (now - t).num_seconds().max(0))
+        };
+        Ok(QueueWatch {
+            waiting,
+            running,
+            oldest_ready_wait_secs: secs(oldest),
+            longest_step: step.and_then(|(id, stage, at)| secs(at).map(|s| (id, stage, s))),
+        })
+    }
+
     /// Extend the lease. Called every ~30 s by the worker that holds it.
     ///
     /// Returns `false` when the job is no longer ours -- the reaper requeued it,
@@ -532,6 +625,20 @@ impl Repository {
             params![expires, timestamps::now_string(), job_id, owner],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Whether `owner` still holds the lease on a RUNNING job. Read-only: a
+    /// check before long work, where `set_stage` would write a stage event.
+    pub fn owns_lease(&self, job_id: i64, owner: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let held: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM queue WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+                params![job_id, owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(held.is_some())
     }
 
     /// Move a leased job to the next stage and reset the stage clock.
@@ -569,6 +676,44 @@ impl Repository {
                 params![job_id, now, format!("Renamed to {slug}: the article has more videos")],
             )?;
         }
+        Ok(changed == 1)
+    }
+
+    /// MCR gives a job a better keyword (P7.12): `{index}_{JOURNALIST}_{KEYWORD}`
+    /// becomes its slug, the file name it is delivered under. Only while the
+    /// file is not being made yet: waiting, needing review, or running up to
+    /// the transcode (the worker reads the slug again when it starts the
+    /// rewrap, which names the clip). One statement, so a job that moves on
+    /// meanwhile is refused rather than half-renamed. `(old, new)` slug, or
+    /// `None` when it is too late (or the job is gone).
+    pub fn rename_job_keyword(&self, job_id: i64, keyword: &str) -> Result<Option<(String, String)>> {
+        let Some(job) = self.get_job(job_id)? else {
+            return Ok(None);
+        };
+        let slug = format!("{}_{}_{}", job.index_str, job.journalist, keyword);
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            // A waiting job keeps its updated_at: it is the start of its wait (plan P7.19).
+            "UPDATE queue SET keyword = ?, slug = ?,
+                    updated_at = CASE WHEN status = 'PENDING' THEN updated_at ELSE ? END
+             WHERE id = ?
+               AND (status IN ('PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED')
+                    OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))",
+            params![keyword, slug, timestamps::now_string(), job_id],
+        )?;
+        Ok((changed == 1).then_some((job.slug, slug)))
+    }
+
+    /// Correct a running job's address (a word the sender glued to it,
+    /// plan P3.12), dedup key included, so the desk opens and dedups the
+    /// address that works. Only the worker holding the lease may do it.
+    pub fn set_leased_job_url(&self, job_id: i64, owner: &str, url: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE queue SET url = ?, url_normalized = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![url, crate::urlnorm::normalize(url), timestamps::now_string(), job_id, owner],
+        )?;
         Ok(changed == 1)
     }
 
@@ -626,6 +771,28 @@ impl Repository {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// The newest `limit` lines of the job's timeline, oldest first: a job
+    /// retried many times keeps its latest story, not its first.
+    pub fn recent_job_events(&self, job_id: i64, limit: usize) -> Result<Vec<JobEvent>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, job_id, at, stage, level, message FROM (
+                 SELECT * FROM job_events WHERE job_id = ? ORDER BY id DESC LIMIT ?
+             ) ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id, limit as i64], |row| {
+            Ok(JobEvent {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                at: timestamps::parse_opt(row.get(2).ok()),
+                stage: row.get(3)?,
+                level: row.get(4)?,
+                message: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Requeue jobs whose lease expired (plan P1.1).
@@ -748,6 +915,19 @@ impl Repository {
         Ok(())
     }
 
+    /// Record the delivered file and its duration on a job, without touching
+    /// its status: the worker holding the lease decides the terminal status
+    /// (`finish`). Only the lease holder may write it.
+    pub fn set_delivered_file(&self, id: i64, owner: &str, file_path: &str, duration: f64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![file_path, duration, timestamps::now_string(), id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn update_job_progress(&self, id: i64, progress: f64, speed: &str, eta: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
@@ -801,8 +981,11 @@ impl Repository {
                 "MANUAL_DOWNLOAD" => summary.manual += count,
                 "COMPLETED" | "COMPLETED_MANUAL" => summary.completed += count,
                 "FAILED" => summary.failed += count,
-                // Everything else is a stage of "currently being worked on".
-                _ => summary.running += count,
+                "RUNNING" => summary.running += count,
+                "CANCELLED" => summary.cancelled += count,
+                // An unknown status is only part of the total: it must not
+                // pose as work in progress.
+                _ => {}
             }
             summary.total += count;
         }
@@ -859,31 +1042,242 @@ impl Repository {
         Ok(list)
     }
 
-    pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<()> {
-        let conn = self.pool.get()?;
-        if let Some(url) = new_url {
-            conn.execute(
-                r#"
-                UPDATE queue
-                SET url = ?, status = 'PENDING', progress = 0.0, speed = '0 Mbps', eta = '--:--',
-                    error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                WHERE id = ?
-                "#,
-                params![url, id],
-            )?;
-        } else {
-            conn.execute(
-                r#"
-                UPDATE queue
-                SET status = 'PENDING', progress = 0.0, speed = '0 Mbps', eta = '--:--',
-                    error_message = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                WHERE id = ?
-                "#,
-                params![id],
-            )?;
+    /// One page of an MCR desk list (plan P7.1). The WHERE clauses are
+    /// fixed text chosen by `view`; every value is a bound parameter.
+    pub fn list_jobs_page(
+        &self,
+        view: crate::models::JobsView,
+        filter: &crate::models::JobsFilter,
+        page: i64,
+        per_page: i64,
+    ) -> Result<crate::models::JobPage> {
+        use crate::models::JobsView;
+        let per_page = per_page.clamp(5, 100);
+        let page = page.max(1);
+
+        let (scope, order) = match view {
+            JobsView::Live => (
+                "(status IN ('PENDING','RUNNING') OR (status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL))",
+                // Working first, then waiting in the order they will run,
+                // then delivered, newest first.
+                "CASE WHEN status = 'RUNNING' THEN 0 WHEN status = 'PENDING' THEN 1 ELSE 2 END, \
+                 CASE WHEN status IN ('RUNNING','PENDING') THEN -priority ELSE 0 END, \
+                 CASE WHEN status IN ('RUNNING','PENDING') THEN created_at END ASC, \
+                 COALESCE(completed_at, updated_at) DESC, id DESC",
+            ),
+            JobsView::Review => (
+                if filter.include_hidden {
+                    "status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')"
+                } else {
+                    "status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NULL"
+                },
+                "updated_at DESC, id DESC",
+            ),
+            JobsView::Completed => (
+                "status IN ('COMPLETED','COMPLETED_MANUAL')",
+                "COALESCE(completed_at, updated_at) DESC, id DESC",
+            ),
+        };
+
+        let mut clauses = vec![scope.to_string()];
+        let mut values: Vec<String> = Vec::new();
+        let search = filter.search.trim();
+        if !search.is_empty() {
+            let like = format!(
+                "%{}%",
+                search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            clauses.push(
+                "(slug LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\' OR keyword LIKE ? ESCAPE '\\' OR journalist LIKE ? ESCAPE '\\')"
+                    .into(),
+            );
+            values.extend(std::iter::repeat(like).take(4));
         }
-        self.log_audit("INFO", "QUEUE", &format!("Retried Job #{}", id))?;
-        Ok(())
+        if !filter.journalist.trim().is_empty() {
+            clauses.push("journalist = ?".into());
+            values.push(filter.journalist.trim().to_uppercase());
+        }
+        match filter.group.trim() {
+            "" => {}
+            "-" => clauses.push("group_code IS NULL".into()),
+            code => {
+                clauses.push("group_code = ?".into());
+                values.push(code.to_string());
+            }
+        }
+        let where_sql = clauses.join(" AND ");
+
+        let conn = self.pool.get()?;
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM queue WHERE {where_sql}"),
+            rusqlite::params_from_iter(values.iter()),
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM queue WHERE {where_sql} ORDER BY {order} LIMIT {per_page} OFFSET {}",
+            (page - 1) * per_page
+        ))?;
+        let jobs = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), Self::map_job_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(crate::models::JobPage { jobs, total, page, per_page })
+    }
+
+    /// Tab badge counts for the MCR desk, in one query.
+    pub fn job_counts(&self) -> Result<crate::models::JobCounts> {
+        // "Today" is the station's day, not UTC's: local midnight, stored as UTC.
+        self.job_counts_since(local_midnight_utc())
+    }
+
+    /// `job_counts` with the start of "today" given (UTC), so a test can pin it.
+    pub fn job_counts_since(&self, day_start_utc: chrono::DateTime<Utc>) -> Result<crate::models::JobCounts> {
+        let today_start = timestamps::format(day_start_utc);
+        let conn = self.pool.get()?;
+        Ok(conn.query_row(
+            r#"
+            SELECT
+              COALESCE(SUM(status IN ('PENDING','RUNNING')), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL), 0),
+              COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NULL), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL')), 0),
+              COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NOT NULL), 0),
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND completed_at >= ?), 0)
+            FROM queue
+            "#,
+            params![today_start],
+            |r| {
+                Ok(crate::models::JobCounts {
+                    active: r.get(0)?,
+                    finished: r.get(1)?,
+                    review: r.get(2)?,
+                    completed: r.get(3)?,
+                    review_hidden: r.get(4)?,
+                    completed_today: r.get(5)?,
+                })
+            },
+        )?)
+    }
+
+    /// Tidy the review tab (plan P7.21): review-status jobs untouched for
+    /// `older_than_hours` leave the list and its badge. Nothing is deleted;
+    /// «Εμφάνιση κρυμμένων» brings them back. Returns how many were hidden.
+    pub fn hide_old_review(&self, older_than_hours: i64) -> Result<usize> {
+        let cutoff = timestamps::format(Utc::now() - Duration::hours(older_than_hours.max(0)));
+        let conn = self.pool.get()?;
+        Ok(conn.execute(
+            "UPDATE queue SET cleared_at = ?
+             WHERE status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')
+               AND cleared_at IS NULL AND updated_at < ?",
+            params![timestamps::now_string(), cutoff],
+        )?)
+    }
+
+    /// Take delivered jobs off the live queue. They are not deleted: the
+    /// Completed list still has them. Returns how many were cleared.
+    pub fn clear_finished_jobs(&self) -> Result<usize> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute(
+            "UPDATE queue SET cleared_at = ? WHERE status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL",
+            params![timestamps::now_string()],
+        )?)
+    }
+
+    /// Run a delivered job again from its link (plan P7.1): the file was
+    /// deleted, or the wrong video came out. Everything about the last run
+    /// is reset; the new file is delivered next to the old one if that is
+    /// still there (`_2`), never over it. `false` if the job is not a
+    /// delivered one.
+    pub fn redownload_job(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
+                file_path = NULL, delivered_at = NULL, completed_at = NULL, cleared_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND status IN ('COMPLETED','COMPLETED_MANUAL')
+            "#,
+            params![timestamps::now_string(), id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// MCR's «Δοκιμή ξανά» / «Χρήση αυτού του συνδέσμου»: the job starts a
+    /// clean new run, like a fresh queue entry (attempts, error, back-off and
+    /// lease all reset). `cleared_at` is reset too (P7.21): a job tidied away
+    /// from the review tab that comes back to life behaves normally. Refused (`false`) for a running or delivered job:
+    /// a worker still holds the lease of the first, and the second has its
+    /// own action, `redownload_job`.
+    pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
+                completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
+                url_normalized = COALESCE(?, url_normalized), updated_at = ?
+            WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED')
+            "#,
+            params![new_url, new_url.map(crate::urlnorm::normalize), timestamps::now_string(), id],
+        )?;
+        if n > 0 {
+            self.log_audit("INFO", "QUEUE", &format!("Retried Job #{}", id))?;
+        }
+        Ok(n > 0)
+    }
+
+    /// MCR put the video into Dalet by hand (plan P7.16). Only a job that is
+    /// waiting for a person can be marked; `false` otherwise. The error code
+    /// and message stay as the history of why it was done by hand, and
+    /// `file_path` stays empty: no file was made here.
+    pub fn mark_completed_manually(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
+                lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL
+            WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')
+            "#,
+            params![now, now, now, id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// MCR cancels a video that waits or downloads (plan P7.20). The row and
+    /// its history stay as CANCELLED; the lease is taken away, so a worker
+    /// still running the job stops before its next stage (P1.14). Once the
+    /// job is in DELIVER the file is on its way to the watchfolder and the
+    /// cancel is refused.
+    pub fn cancel_job(&self, id: i64) -> Result<CancelOutcome> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, updated_at = ?
+            WHERE id = ? AND (status = 'PENDING' OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
+            "#,
+            params![now, now, id],
+        )?;
+        if n > 0 {
+            self.log_audit("WARN", "QUEUE", &format!("Cancelled Job #{}", id))?;
+            return Ok(CancelOutcome::Cancelled);
+        }
+        let row: Option<(String, String)> = conn
+            .query_row("SELECT status, stage FROM queue WHERE id = ?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(match row {
+            Some((status, stage)) if status == "RUNNING" && matches!(stage.as_str(), "DELIVER" | "ARCHIVE" | "DONE") => CancelOutcome::TooLate,
+            _ => CancelOutcome::NotCancellable,
+        })
     }
 
     pub fn delete_job(&self, id: i64) -> Result<()> {
@@ -897,7 +1291,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let threshold = Utc::now() - Duration::days(older_than_days);
         let count = conn.execute(
-            "DELETE FROM queue WHERE status = 'COMPLETED' AND updated_at < ?",
+            "DELETE FROM queue WHERE status IN ('COMPLETED','COMPLETED_MANUAL') AND updated_at < ?",
             params![threshold.to_rfc3339()],
         )?;
         self.log_audit("INFO", "ADMIN", &format!("Purged {} completed jobs older than {} days", count, older_than_days))?;
@@ -973,8 +1367,12 @@ impl Repository {
             extraction_method: row.get("extraction_method").ok().flatten(),
             stage_timings_json: row.get("stage_timings_json").ok().flatten(),
             email_message_id: row.get("email_message_id").ok().flatten(),
+            group_code: row.get("group_code").ok().flatten(),
+            max_videos: row.get("max_videos").ok().flatten(),
+            parent_job_id: row.get("parent_job_id").ok().flatten(),
             delivered_at: timestamps::parse_opt(row.get("delivered_at").ok().flatten()),
             completed_at: timestamps::parse_opt(row.get("completed_at").ok().flatten()),
+            cleared_at: timestamps::parse_opt(row.get("cleared_at").ok().flatten()),
 
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
@@ -1050,6 +1448,41 @@ impl Repository {
         } else {
             Ok(None)
         }
+    }
+
+    /// Create the first-run administrator, `Admin` / `Admin` (owner's
+    /// decision, 2026-10-08: a fresh installation holds nothing yet, and the
+    /// person installing it replaces the account from the panel).
+    ///
+    /// Only on a database that has never had a user *or* an audit entry: a
+    /// brand-new installation, once. An installation whose users were all
+    /// removed has an audit trail of it, so the account never comes back on
+    /// its own. Returns whether it was created.
+    pub fn ensure_default_admin(&self) -> Result<bool> {
+        let (users, audit): (i64, i64) = {
+            let conn = self.pool.get()?;
+            let users = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+            let audit = conn.query_row("SELECT COUNT(*) FROM audit_logs", [], |r| r.get(0))?;
+            (users, audit)
+        };
+        if users > 0 || audit > 0 {
+            return Ok(false);
+        }
+        self.create_user(DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD, UserRole::Admin, "First-run administrator", None)?;
+        self.log_audit(
+            "WARN",
+            "AUTH",
+            "First-run administrator Admin / Admin created for a new installation: create your own administrator and deactivate it",
+        )?;
+        Ok(true)
+    }
+
+    /// Whether the first-run `Admin` / `Admin` account still logs in.
+    pub fn default_admin_still_works(&self) -> bool {
+        matches!(
+            self.get_user_by_email(DEFAULT_ADMIN_LOGIN),
+            Ok(Some(u)) if u.is_active && verify_password(DEFAULT_ADMIN_PASSWORD, &u.password_hash)
+        )
     }
 
     /// Whether any active administrator exists.
@@ -1474,19 +1907,33 @@ impl Repository {
 
     pub fn list_journalists(&self) -> Result<Vec<Journalist>> {
         let conn = self.pool.get()?;
+        let mut memberships: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT jg.journalist_id, g.code FROM journalist_groups jg JOIN groups g ON g.id = jg.group_id
+                 ORDER BY jg.journalist_id, jg.position, g.code",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, code) = row?;
+                memberships.entry(id).or_default().push(code);
+            }
+        }
         let mut stmt = conn.prepare("SELECT * FROM journalists ORDER BY surname ASC")?;
         let rows = stmt.query_map([], |row| {
             let emails_raw: String = row.get("emails")?;
             let emails: Vec<String> = serde_json::from_str(&emails_raw).unwrap_or_default();
             let aliases_raw: String = row.get("aliases")?;
             let aliases: Vec<String> = serde_json::from_str(&aliases_raw).unwrap_or_default();
+            let id: i64 = row.get("id")?;
             Ok(Journalist {
-                id: row.get("id")?,
+                id,
                 surname: row.get("surname")?,
                 full_name: row.get("full_name")?,
                 emails,
                 default_priority: row.get("default_priority")?,
                 aliases,
+                groups: memberships.get(&id).cloned().unwrap_or_default(),
                 created_at: timestamps::parse_opt(row.get("created_at").ok()),
             })
         })?;
@@ -1539,6 +1986,272 @@ impl Repository {
         Ok(())
     }
 
+    // ==========================================
+    // Taxonomy: groups and membership (plan P4.17)
+    // ==========================================
+
+    /// The directory the database lives in (`data/`), for files that belong
+    /// with it: taxonomy backups, the seed files.
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        self.db_path.as_deref().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+    }
+
+    /// Write the current taxonomy to `data/backups/taxonomy/` (plan P4.27)
+    /// and keep the newest [`TAXONOMY_BACKUPS_KEPT`]. `reason` is a short
+    /// word in the file name: "manual", "before-import", "before-restore",
+    /// "before-delete".
+    pub fn backup_taxonomy(&self, reason: &str) -> Result<TaxonomyBackup> {
+        let dir = self
+            .data_dir()
+            .ok_or_else(|| anyhow::anyhow!("no data directory for backups"))?
+            .join("backups")
+            .join("taxonomy");
+        std::fs::create_dir_all(&dir)?;
+        let reason: String = reason
+            .chars()
+            .filter(|c| c.is_ascii_lowercase() || *c == '-')
+            .take(20)
+            .collect();
+        // Milliseconds: two backups in one second (an import right after a
+        // manual one) must not overwrite each other.
+        let stamp = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let name = format!("taxonomy-{stamp}-{}.json", if reason.is_empty() { "manual" } else { &reason });
+        let t = self.export_taxonomy()?;
+        let body = serde_json::to_string_pretty(&t)? + "\n";
+        let tmp = dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, &body)?;
+        std::fs::rename(&tmp, dir.join(&name))?;
+        let mut all = self.list_taxonomy_backups()?;
+        while all.len() > TAXONOMY_BACKUPS_KEPT {
+            if let Some(oldest) = all.pop() {
+                let _ = std::fs::remove_file(dir.join(&oldest.name));
+            }
+        }
+        Ok(TaxonomyBackup {
+            name,
+            bytes: body.len() as u64,
+            groups: t.groups.len(),
+            people: t.people.len(),
+        })
+    }
+
+    /// Taxonomy backups, newest first.
+    pub fn list_taxonomy_backups(&self) -> Result<Vec<TaxonomyBackup>> {
+        let Some(dir) = self.data_dir().map(|d| d.join("backups").join("taxonomy")) else {
+            return Ok(Vec::new());
+        };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !valid_backup_name(&name) {
+                continue;
+            }
+            let raw = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let (groups, people) = serde_json::from_str::<Taxonomy>(&raw)
+                .map(|t| (t.groups.len(), t.people.len()))
+                .unwrap_or((0, 0));
+            out.push(TaxonomyBackup {
+                bytes: raw.len() as u64,
+                name,
+                groups,
+                people,
+            });
+        }
+        out.sort_by(|a, b| b.name.cmp(&a.name));
+        Ok(out)
+    }
+
+    /// One backup's contents. The name is checked, so no other file can be read.
+    pub fn read_taxonomy_backup(&self, name: &str) -> Result<Taxonomy> {
+        if !valid_backup_name(name) {
+            anyhow::bail!("not a taxonomy backup name: {name}");
+        }
+        let dir = self.data_dir().ok_or_else(|| anyhow::anyhow!("no data directory"))?;
+        let raw = std::fs::read_to_string(dir.join("backups").join("taxonomy").join(name))
+            .with_context(|| format!("no backup {name}"))?;
+        Ok(serde_json::from_str(&raw).with_context(|| format!("backup {name} is not a taxonomy file"))?)
+    }
+
+    /// Put a backup back exactly: groups and people it does not list are
+    /// removed. The state before is backed up first.
+    pub fn restore_taxonomy_backup(&self, name: &str) -> Result<ImportReport> {
+        let t = self.read_taxonomy_backup(name)?;
+        self.backup_taxonomy("before-restore")?;
+        self.import_taxonomy(&t, true)
+    }
+
+    pub fn list_groups(&self) -> Result<Vec<Group>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT code, name, kind, keywords, description FROM groups ORDER BY code")?;
+        let rows = stmt.query_map([], |r| {
+            let keywords: String = r.get(3)?;
+            Ok(Group {
+                code: r.get(0)?,
+                name: r.get(1)?,
+                kind: r.get(2)?,
+                keywords: serde_json::from_str(&keywords).unwrap_or_default(),
+                description: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Insert or update one group by code. The group is normalised and
+    /// validated first; an invalid one is an error naming the problem.
+    pub fn save_group(&self, group: &Group) -> Result<Group> {
+        let g = group.normalized();
+        g.validate().map_err(anyhow::Error::msg)?;
+        let conn = self.pool.get()?;
+        upsert_group(&conn, &g)?;
+        Ok(g)
+    }
+
+    /// Delete a group; its memberships go with it (foreign-key cascade).
+    /// Jobs keep the label they were given.
+    pub fn delete_group(&self, code: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("DELETE FROM groups WHERE code = ?", params![code.trim().to_uppercase()])? == 1)
+    }
+
+    /// Replace a journalist's groups; the first becomes the default. Every
+    /// code must exist.
+    pub fn set_journalist_groups(&self, surname: &str, codes: &[String]) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        replace_memberships(&tx, &surname.trim().to_uppercase(), codes)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The whole taxonomy, for taxonomy.json.
+    pub fn export_taxonomy(&self) -> Result<Taxonomy> {
+        let people = self
+            .list_journalists()?
+            .into_iter()
+            .filter(|j| j.surname != "MCR")
+            .map(|j| Person {
+                surname: j.surname,
+                full_name: j.full_name,
+                emails: j.emails,
+                aliases: j.aliases,
+                default_priority: j.default_priority,
+                groups: j.groups,
+            })
+            .collect();
+        Ok(Taxonomy {
+            version: crate::taxonomy::TAXONOMY_VERSION,
+            groups: self.list_groups()?,
+            people,
+        })
+    }
+
+    /// Import taxonomy.json in one transaction: all of it or none of it.
+    ///
+    /// Groups and people in the file are inserted or updated. With
+    /// `replace`, groups and people *not* in the file are deleted too (MCR
+    /// always stays). A person's groups are replaced by the file's list.
+    /// Invalid input is refused with every problem listed.
+    pub fn import_taxonomy(&self, input: &Taxonomy, replace: bool) -> Result<ImportReport> {
+        let known: Vec<String> = if replace {
+            Vec::new()
+        } else {
+            self.list_groups()?.into_iter().map(|g| g.code).collect()
+        };
+        let t = input.checked(&known).map_err(|errors| anyhow::anyhow!("taxonomy refused:\n- {}", errors.join("\n- ")))?;
+        if t.people.iter().any(|p| p.surname == "MCR") {
+            anyhow::bail!("taxonomy refused:\n- MCR is built in and cannot be imported");
+        }
+
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let mut report = ImportReport::default();
+        for g in &t.groups {
+            upsert_group(&tx, g)?;
+            report.groups_saved += 1;
+        }
+        for p in &t.people {
+            tx.execute(
+                r#"
+                INSERT INTO journalists (surname, full_name, emails, default_priority, aliases)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(surname) DO UPDATE SET
+                    full_name = excluded.full_name,
+                    emails = excluded.emails,
+                    default_priority = excluded.default_priority,
+                    aliases = excluded.aliases
+                "#,
+                params![
+                    p.surname,
+                    p.full_name,
+                    serde_json::to_string(&p.emails)?,
+                    p.default_priority,
+                    serde_json::to_string(&p.aliases)?
+                ],
+            )?;
+            replace_memberships(&tx, &p.surname, &p.groups)?;
+            report.people_saved += 1;
+        }
+        if replace {
+            let keep_groups: Vec<&str> = t.groups.iter().map(|g| g.code.as_str()).collect();
+            for code in self.list_groups_in(&tx)? {
+                if !keep_groups.contains(&code.as_str()) {
+                    tx.execute("DELETE FROM groups WHERE code = ?", params![code])?;
+                    report.groups_removed += 1;
+                }
+            }
+            let keep_people: Vec<&str> = t.people.iter().map(|p| p.surname.as_str()).collect();
+            let surnames: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT surname FROM journalists WHERE surname <> 'MCR'")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for s in surnames {
+                if !keep_people.contains(&s.as_str()) {
+                    tx.execute("DELETE FROM journalists WHERE surname = ?", params![s])?;
+                    report.people_removed += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    fn list_groups_in(&self, conn: &rusqlite::Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT code FROM groups")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// First start with a `data/taxonomy.json` and no groups yet: import it
+    /// (merge). A bad file is logged and skipped; the daemon still starts.
+    fn seed_taxonomy_from_file(&self, conn: &rusqlite::Connection) -> Result<()> {
+        let groups: i64 = conn.query_row("SELECT COUNT(*) FROM groups", [], |r| r.get(0))?;
+        if groups > 0 {
+            return Ok(());
+        }
+        let Some(path) = self.db_path.as_deref().and_then(|p| p.parent()).map(|d| d.join("taxonomy.json")) else {
+            return Ok(());
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let parsed: Taxonomy = match serde_json::from_str(&raw) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Ignoring {:?}: not a taxonomy file ({e})", path);
+                return Ok(());
+            }
+        };
+        match self.import_taxonomy(&parsed, false) {
+            Ok(r) => info!("Seeded {} groups and {} people from {:?}", r.groups_saved, r.people_saved, path),
+            Err(e) => warn!("Ignoring {:?}: {e:#}", path),
+        }
+        Ok(())
+    }
+
     pub fn find_journalist_by_email(&self, email: &str) -> Result<Option<String>> {
         let clean_email = email.trim().to_lowercase();
         let journalists = self.list_journalists()?;
@@ -1563,7 +2276,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let n = conn.execute(
-            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?
+            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?, cleared_at = NULL
              WHERE id = ? AND status = 'MANUAL_DOWNLOAD'",
             params![source_path, now, id],
         )?;
@@ -1586,35 +2299,229 @@ impl Repository {
             .query_row(
                 "SELECT * FROM processed_mail WHERE internet_message_id = ?",
                 params![internet_message_id],
-                |row| {
-                    Ok(ProcessedMail {
-                        internet_message_id: row.get("internet_message_id")?,
-                        source_id: row.get("source_id")?,
-                        processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
-                        outcome: row.get("outcome")?,
-                        from_address: row.get("from_address")?,
-                        subject: row.get("subject")?,
-                        jobs_json: row.get("jobs_json")?,
-                    })
-                },
+                Self::map_processed_mail,
             )
             .optional()?)
     }
 
+    fn map_processed_mail(row: &rusqlite::Row) -> rusqlite::Result<ProcessedMail> {
+        let list = |col: &str| -> Vec<String> {
+            row.get::<_, Option<String>>(col)
+                .ok()
+                .flatten()
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default()
+        };
+        Ok(ProcessedMail {
+            internet_message_id: row.get("internet_message_id")?,
+            source_id: row.get("source_id")?,
+            processed_at: timestamps::parse_opt(row.get("processed_at").ok()),
+            outcome: row.get("outcome")?,
+            from_address: row.get("from_address")?,
+            subject: row.get("subject")?,
+            jobs_json: row.get("jobs_json")?,
+            received_at: timestamps::parse_opt(row.get("received_at").ok().flatten()),
+            from_name: row.get("from_name").ok().flatten(),
+            to: list("to_addrs"),
+            cc: list("cc_addrs"),
+            body_text: row.get("body_text").ok().flatten(),
+            attachments_json: row.get("attachments_json").ok().flatten(),
+            parse_json: row.get("parse_json").ok().flatten(),
+        })
+    }
+
     /// Record (or update) what a message produced. Called only after its
     /// jobs are in the queue, so a row here means "nothing left to do".
-    pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
+    /// Where the last poll of `mailbox` got to (plan P4.8). `None` before the
+    /// first poll that saw a message.
+    pub fn get_mail_checkpoint(&self, mailbox: &str) -> Result<Option<chrono::DateTime<Utc>>> {
+        let conn = self.pool.get()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT modified_since FROM mail_checkpoints WHERE mailbox = ?",
+                params![mailbox],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(timestamps::parse_opt(raw))
+    }
+
+    pub fn set_mail_checkpoint(&self, mailbox: &str, modified_since: chrono::DateTime<Utc>) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
             r#"
-            INSERT INTO processed_mail
-                (internet_message_id, source_id, processed_at, outcome, from_address, subject, jobs_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO mail_checkpoints (mailbox, modified_since, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(mailbox) DO UPDATE SET
+                modified_since = excluded.modified_since,
+                updated_at     = excluded.updated_at
+            "#,
+            params![mailbox, timestamps::format(modified_since), timestamps::now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The newest handled mail first, for the admin panel and `mail-history`.
+    // ------------------------------------------------------------------
+    // Self-check links (plan P6.7)
+    // ------------------------------------------------------------------
+
+    pub fn list_selfcheck_links(&self) -> Result<Vec<crate::models::SelfcheckLink>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM selfcheck_links ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::SelfcheckLink {
+                id: row.get("id")?,
+                label: row.get("label")?,
+                url: row.get("url")?,
+                last_checked_at: timestamps::parse_opt(row.get("last_checked_at").ok()),
+                last_ok: row.get::<_, Option<i64>>("last_ok")?.map(|v| v != 0),
+                last_detail: row.get("last_detail")?,
+                last_ok_at: timestamps::parse_opt(row.get("last_ok_at").ok()),
+                failing_since: timestamps::parse_opt(row.get("failing_since").ok()),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Add a link to the self-check. A link already there is an error, so an
+    /// operator is told rather than seeing nothing happen.
+    pub fn add_selfcheck_link(&self, label: &str, url: &str) -> Result<i64> {
+        let conn = self.pool.get()?;
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM selfcheck_links WHERE url = ?", params![url], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if exists {
+            anyhow::bail!("That link is already in the self-check.");
+        }
+        conn.execute("INSERT INTO selfcheck_links (label, url) VALUES (?, ?)", params![label, url])?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn delete_selfcheck_link(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("DELETE FROM selfcheck_links WHERE id = ?", params![id])? > 0)
+    }
+
+    /// Store one link's result. Returns the previous `last_ok`, so the caller
+    /// can tell a link that just broke (or just recovered) from one that has
+    /// been failing for a week.
+    pub fn record_selfcheck_result(&self, id: i64, ok: bool, detail: &str) -> Result<Option<bool>> {
+        let conn = self.pool.get()?;
+        let previous: Option<Option<i64>> = conn
+            .query_row("SELECT last_ok FROM selfcheck_links WHERE id = ?", params![id], |r| r.get(0))
+            .optional()?;
+        let now = timestamps::now_string();
+        conn.execute(
+            r#"
+            UPDATE selfcheck_links
+            SET last_checked_at = ?1,
+                last_ok = ?2,
+                last_detail = ?3,
+                last_ok_at = CASE WHEN ?2 = 1 THEN ?1 ELSE last_ok_at END,
+                failing_since = CASE
+                    WHEN ?2 = 1 THEN NULL
+                    WHEN failing_since IS NULL THEN ?1
+                    ELSE failing_since END
+            WHERE id = ?4
+            "#,
+            params![now, ok as i64, detail, id],
+        )?;
+        Ok(previous.flatten().map(|v| v != 0))
+    }
+
+    pub fn list_processed_mail(&self, limit: i64) -> Result<Vec<ProcessedMail>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM processed_mail ORDER BY processed_at DESC LIMIT ?")?;
+        let rows = stmt.query_map(params![limit.clamp(1, 1000)], Self::map_processed_mail)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Ask the watcher to read a handled mail again (plan P4.25). Returns
+    /// the mail's record, or an error when there is none or it has no
+    /// provider id to fetch it by.
+    pub fn request_mail_reprocess(&self, internet_message_id: &str, requested_by: &str) -> Result<ProcessedMail> {
+        let m = self
+            .get_processed_mail(internet_message_id)?
+            .ok_or_else(|| anyhow::anyhow!("no handled mail with Message-ID {internet_message_id}"))?;
+        let source = m
+            .source_id
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("the mail's mailbox id was not recorded; it cannot be fetched again"))?;
+        let conn = self.pool.get()?;
+        conn.execute(
+            r#"
+            INSERT INTO mail_reprocess (internet_message_id, source_id, requested_at, requested_by)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(internet_message_id) DO UPDATE SET
-                source_id    = excluded.source_id,
-                processed_at = excluded.processed_at,
-                outcome      = excluded.outcome,
-                jobs_json    = excluded.jobs_json
+                requested_at = excluded.requested_at,
+                requested_by = excluded.requested_by,
+                attempts = 0
+            "#,
+            params![m.internet_message_id, source, timestamps::now_string(), requested_by],
+        )?;
+        Ok(m)
+    }
+
+    /// Pending reprocess requests, oldest first: (Message-ID, provider id, attempts).
+    pub fn pending_mail_reprocess(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.pool.get()?;
+        let mut stmt =
+            conn.prepare("SELECT internet_message_id, source_id, attempts FROM mail_reprocess ORDER BY requested_at")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn note_mail_reprocess_failure(&self, internet_message_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE mail_reprocess SET attempts = attempts + 1 WHERE internet_message_id = ?",
+            params![internet_message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_mail_reprocess(&self, internet_message_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM mail_reprocess WHERE internet_message_id = ?", params![internet_message_id])?;
+        Ok(())
+    }
+
+    /// Forget that a mail was handled, so it is parsed as new. Only the
+    /// reprocess path calls this; its jobs are untouched.
+    pub fn forget_processed_mail(&self, internet_message_id: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("DELETE FROM processed_mail WHERE internet_message_id = ?", params![internet_message_id])?;
+        Ok(())
+    }
+
+    /// Record what a mail produced, and (plan P7.6) what it said.
+    ///
+    /// On a second record of the same mail the content columns are replaced
+    /// only by a value: a FAILED record, which knows only the headers, must
+    /// not erase a text an earlier attempt stored.
+    pub fn record_processed_mail(&self, m: &ProcessedMail) -> Result<()> {
+        let conn = self.pool.get()?;
+        let list = |v: &Vec<String>| (!v.is_empty()).then(|| serde_json::to_string(v).unwrap_or_default());
+        conn.execute(
+            r#"
+            INSERT INTO processed_mail
+                (internet_message_id, source_id, processed_at, outcome, from_address, subject, jobs_json,
+                 received_at, from_name, to_addrs, cc_addrs, body_text, attachments_json, parse_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(internet_message_id) DO UPDATE SET
+                source_id        = excluded.source_id,
+                processed_at     = excluded.processed_at,
+                outcome          = excluded.outcome,
+                jobs_json        = excluded.jobs_json,
+                received_at      = COALESCE(excluded.received_at, received_at),
+                from_name        = COALESCE(excluded.from_name, from_name),
+                to_addrs         = COALESCE(excluded.to_addrs, to_addrs),
+                cc_addrs         = COALESCE(excluded.cc_addrs, cc_addrs),
+                body_text        = COALESCE(excluded.body_text, body_text),
+                attachments_json = COALESCE(excluded.attachments_json, attachments_json),
+                parse_json       = COALESCE(excluded.parse_json, parse_json)
             "#,
             params![
                 m.internet_message_id,
@@ -1623,10 +2530,139 @@ impl Repository {
                 m.outcome,
                 m.from_address,
                 m.subject,
-                m.jobs_json
+                m.jobs_json,
+                m.received_at.map(timestamps::format),
+                m.from_name.as_deref().filter(|s| !s.trim().is_empty()),
+                list(&m.to),
+                list(&m.cc),
+                m.body_text,
+                m.attachments_json,
+                m.parse_json,
             ],
         )?;
         Ok(())
+    }
+
+    // ==========================================
+    // MCR mail view (plan P7.7)
+    // ==========================================
+
+    /// Every mail received (or, for mail from before plan P7.6, handled)
+    /// since `since`, with the start of its text.
+    pub fn inbox_mail_rows(&self, since: chrono::DateTime<Utc>) -> Result<Vec<crate::models::InboxMailRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT internet_message_id, received_at, processed_at, outcome, from_address, from_name, subject,
+                    substr(body_text, 1, 4000) AS body_head, attachments_json, parse_json, jobs_json
+             FROM processed_mail
+             WHERE COALESCE(received_at, processed_at) >= ?",
+        )?;
+        let rows = stmt.query_map(params![timestamps::format(since)], |r| {
+            Ok(crate::models::InboxMailRow {
+                internet_message_id: r.get("internet_message_id")?,
+                received_at: timestamps::parse_opt(r.get("received_at").ok().flatten()),
+                processed_at: timestamps::parse_opt(r.get("processed_at").ok().flatten()),
+                outcome: r.get("outcome")?,
+                from_address: r.get("from_address")?,
+                from_name: r.get("from_name").ok().flatten(),
+                subject: r.get("subject")?,
+                body_head: r.get("body_head").ok().flatten(),
+                attachments_json: r.get("attachments_json").ok().flatten(),
+                parse_json: r.get("parse_json").ok().flatten(),
+                jobs_json: r.get("jobs_json")?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The jobs created since `since`, and the ones in `extra_ids` whenever
+    /// they were created (an older job a mail's duplicate link points at).
+    pub fn inbox_job_rows(&self, since: chrono::DateTime<Utc>, extra_ids: &[i64]) -> Result<Vec<crate::models::InboxJobRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, url, slug, journalist, index_str, status, stage, progress, email_message_id,
+                    parent_job_id, submitted_by_user_id, group_code, created_at
+             FROM queue
+             WHERE created_at >= ? OR id IN (SELECT value FROM json_each(?))",
+        )?;
+        let extra = serde_json::to_string(extra_ids)?;
+        let rows = stmt.query_map(params![timestamps::format(since), extra], |r| {
+            Ok(crate::models::InboxJobRow {
+                id: r.get("id")?,
+                url: r.get("url")?,
+                slug: r.get("slug")?,
+                journalist: r.get("journalist")?,
+                index_str: r.get("index_str")?,
+                status: r.get("status")?,
+                stage: r.get::<_, Option<String>>("stage")?.unwrap_or_else(|| "QUEUED".into()),
+                progress: r.get::<_, Option<f64>>("progress")?.unwrap_or(0.0),
+                email_message_id: r.get("email_message_id")?,
+                parent_job_id: r.get("parent_job_id")?,
+                submitted_by_user_id: r.get("submitted_by_user_id")?,
+                group_code: r.get("group_code")?,
+                created_at: timestamps::parse_opt(r.get("created_at").ok().flatten()),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A mail's own jobs (its Message-ID, article siblings included) and the
+    /// jobs in `also` (those its duplicate links point at), oldest first.
+    pub fn jobs_for_mail(&self, internet_message_id: &str, also: &[i64]) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM queue
+             WHERE email_message_id = ? OR id IN (SELECT value FROM json_each(?))
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![internet_message_id, serde_json::to_string(also)?], Self::map_job_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A job added by hand and the videos found in its article.
+    pub fn jobs_with_children(&self, id: i64) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT * FROM queue WHERE id = ? OR parent_job_id = ? ORDER BY id")?;
+        let rows = stmt.query_map(params![id, id], Self::map_job_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Add one entry to a handled mail's `jobs_json`: a link MCR queued from
+    /// the mail's text (plan P7.8), so the view files the job under it.
+    /// `false` when the mail is not there.
+    pub fn append_mail_job(&self, internet_message_id: &str, entry: &serde_json::Value) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE processed_mail SET jobs_json = json_insert(COALESCE(jobs_json, '[]'), '$[#]', json(?))
+             WHERE internet_message_id = ?",
+            params![entry.to_string(), internet_message_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The subjects of the mails `keys` (plan P7.11): a video on the desk
+    /// says which mail it came from.
+    pub fn mail_subjects(&self, keys: &[String]) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT internet_message_id, COALESCE(subject, '') FROM processed_mail
+             WHERE internet_message_id IN (SELECT value FROM json_each(?))",
+        )?;
+        let rows = stmt.query_map(params![serde_json::to_string(keys)?], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forget the text of mail handled more than `older_than_days` ago
+    /// (plan P7.6). The row stays: sender, subject and the jobs it produced
+    /// are the record of what came in. Returns how many texts were cleared.
+    pub fn purge_mail_text(&self, older_than_days: i64) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(Utc::now() - Duration::days(older_than_days.max(1)));
+        Ok(conn.execute(
+            "UPDATE processed_mail SET body_text = NULL
+             WHERE body_text IS NOT NULL AND COALESCE(received_at, processed_at) < ?",
+            params![cutoff],
+        )?)
     }
 
     // ==========================================
@@ -1666,6 +2702,209 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn owns_lease_is_true_only_for_the_running_owner() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/v", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        assert!(!repo.owns_lease(id, "A")?, "a pending job is nobody's");
+        repo.lease_job("A", 180)?.expect("leasable");
+        assert!(repo.owns_lease(id, "A")?);
+        assert!(!repo.owns_lease(id, "B")?);
+        repo.delete_job(id)?;
+        assert!(!repo.owns_lease(id, "A")?, "a deleted row is nobody's");
+        Ok(())
+    }
+
+    #[test]
+    fn pending_positions_follow_lease_order_and_skip_backoff() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let mut ids = Vec::new();
+        for n in 0..4 {
+            let job = NewJob::new(format!("https://example.gr/p{n}"), format!("{n}_ANNA_TEST"), "ANNA");
+            ids.push(repo.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id());
+        }
+        {
+            let conn = repo.pool.get()?;
+            // ids[0] oldest, ids[1] newer, ids[2] high priority but newest, ids[3] in back-off.
+            for (i, id) in ids.iter().enumerate() {
+                conn.execute(
+                    "UPDATE queue SET created_at = ? WHERE id = ?",
+                    params![format!("2030-01-01T00:00:0{i}.000Z"), id],
+                )?;
+            }
+            conn.execute("UPDATE queue SET priority = 9 WHERE id = ?", params![ids[2]])?;
+            conn.execute(
+                "UPDATE queue SET not_before = '2999-01-01T00:00:00.000Z' WHERE id = ?",
+                params![ids[3]],
+            )?;
+        }
+        let pos = repo.pending_positions()?;
+        assert_eq!(pos.get(&ids[2]), Some(&1), "priority first");
+        assert_eq!(pos.get(&ids[0]), Some(&2));
+        assert_eq!(pos.get(&ids[1]), Some(&3));
+        assert_eq!(pos.get(&ids[3]), None, "back-off has no place");
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_a_waiting_job_does_not_restart_its_wait() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/r", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        {
+            let conn = repo.pool.get()?;
+            conn.execute("UPDATE queue SET updated_at = '2030-01-01T00:00:00.000Z' WHERE id = ?", params![id])?;
+        }
+        assert!(repo.rename_job_keyword(id, "NEWWORD")?.is_some());
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.keyword, "NEWWORD");
+        assert_eq!(timestamps::format(job.updated_at.unwrap()), "2030-01-01T00:00:00.000Z");
+        Ok(())
+    }
+
+    #[test]
+    fn queue_watch_reports_oldest_wait_and_longest_step() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let now = Utc::now();
+        assert_eq!(repo.queue_watch(now)?, QueueWatch::default());
+
+        let a = repo.enqueue(&NewJob::new("https://example.gr/a", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let b = repo.enqueue(&NewJob::new("https://example.gr/b", "2_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let c = repo.enqueue(&NewJob::new("https://example.gr/c", "3_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let d = repo.enqueue(&NewJob::new("https://example.gr/d", "4_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let leased = repo.lease_job("A", 180)?.expect("leasable");
+        {
+            let conn = repo.pool.get()?;
+            let ago = |m: i64| timestamps::format(now - Duration::minutes(m));
+            // Leased job is the one with the highest priority, oldest created_at: a.
+            assert_eq!(leased.id, a);
+            conn.execute("UPDATE queue SET stage = 'DOWNLOAD', stage_started_at = ? WHERE id = ?", params![ago(35), a])?;
+            conn.execute("UPDATE queue SET updated_at = ? WHERE id = ?", params![ago(42), b])?;
+            conn.execute("UPDATE queue SET updated_at = ? WHERE id = ?", params![ago(10), c])?;
+            // In back-off and very old: must not count as waiting.
+            conn.execute(
+                "UPDATE queue SET updated_at = ?, not_before = '2999-01-01T00:00:00.000Z' WHERE id = ?",
+                params![ago(500), d],
+            )?;
+        }
+        let w = repo.queue_watch(now)?;
+        assert_eq!(w.waiting, 2);
+        assert_eq!(w.running, 1);
+        assert_eq!(w.oldest_ready_wait_secs, Some(42 * 60));
+        assert_eq!(w.longest_step, Some((a, "DOWNLOAD".to_string(), 35 * 60)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_retried_job_starts_a_clean_run() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/v", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.lease_job("A", 180)?.expect("leasable");
+        assert!(repo.finish(id, "A", JobStatus::RequiresReview, Some("E_TEST"), Some("boom"), None)?);
+        {
+            let conn = repo.pool.get()?;
+            conn.execute(
+                "UPDATE queue SET attempts = max_attempts, not_before = '2999-01-01T00:00:00.000Z' WHERE id = ?",
+                params![id],
+            )?;
+        }
+        let before = repo.get_job(id)?.unwrap();
+        assert!(before.attempts > 0 && before.error_code.is_some() && before.not_before.is_some());
+
+        assert!(repo.retry_job(id, None)?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.stage, JobStage::Queued);
+        assert_eq!(job.attempts, 0);
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.not_before, None);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.lease_expires_at, None);
+        assert_eq!(job.stage_started_at, None);
+        assert_eq!(job.completed_at, None);
+        assert!(repo.lease_job("B", 180)?.is_some(), "a cleared not_before lets it lease at once");
+        Ok(())
+    }
+
+    #[test]
+    fn retry_is_allowed_exactly_for_the_waiting_and_stopped_statuses() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let cases = [
+            (JobStatus::Pending, true),
+            (JobStatus::RequiresReview, true),
+            (JobStatus::ManualDownload, true),
+            (JobStatus::Failed, true),
+            (JobStatus::Cancelled, true),
+            (JobStatus::Completed, false),
+            (JobStatus::CompletedManual, false),
+        ];
+        for (n, (status, allowed)) in cases.into_iter().enumerate() {
+            let url = format!("https://example.gr/v{n}");
+            let id = repo.enqueue(&NewJob::new(&url, &format!("{n}_ANNA_TEST"), "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+            repo.update_job_status(id, status, None, None, None)?;
+            assert_eq!(repo.retry_job(id, None)?, allowed, "{}", status.as_str());
+            let expected = if allowed { JobStatus::Pending } else { status };
+            assert_eq!(repo.get_job(id)?.unwrap().status, expected, "{}", status.as_str());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_purge_removes_videos_marked_done_by_hand_too() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/old", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.update_job_status(id, JobStatus::RequiresReview, None, None, None)?;
+        assert!(repo.mark_completed_manually(id)?);
+        repo.pool.get()?.execute(
+            "UPDATE queue SET updated_at = '2020-01-01T00:00:00.000Z' WHERE id = ?",
+            params![id],
+        )?;
+        assert_eq!(repo.purge_completed_jobs(30)?, 1);
+        assert!(repo.get_job(id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn an_override_moves_the_dedup_key_with_the_link() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/dead", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.update_job_status(id, JobStatus::RequiresReview, None, None, None)?;
+        assert!(repo.retry_job(id, Some("https://example.gr/works"))?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.url, "https://example.gr/works");
+        assert_eq!(job.url_normalized.as_deref(), Some(crate::urlnorm::normalize("https://example.gr/works").as_str()));
+        // A plain retry keeps the link and its key.
+        repo.update_job_status(id, JobStatus::Failed, None, None, None)?;
+        assert!(repo.retry_job(id, None)?);
+        assert_eq!(repo.get_job(id)?.unwrap().url_normalized, job.url_normalized);
+        Ok(())
+    }
+
+    #[test]
+    fn a_running_or_delivered_job_cannot_be_retried() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.enqueue(&NewJob::new("https://example.gr/v", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        repo.lease_job("A", 180)?.expect("leasable");
+        assert!(!repo.retry_job(id, Some("https://example.gr/other"))?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.lease_owner.as_deref(), Some("A"));
+        assert_eq!(job.url, "https://example.gr/v");
+
+        assert!(repo.finish(id, "A", JobStatus::Completed, None, None, Some("x.mxf"))?);
+        assert!(!repo.retry_job(id, None)?);
+        assert_eq!(repo.get_job(id)?.unwrap().status, JobStatus::Completed);
+        Ok(())
+    }
 
     #[test]
     fn journalist_aliases_round_trip_and_survive_a_resave() -> Result<()> {
@@ -1756,3 +2995,61 @@ mod tests {
 }
 
 
+
+/// How many taxonomy backups are kept (plan P4.27).
+pub const TAXONOMY_BACKUPS_KEPT: usize = 30;
+
+/// One file in `data/backups/taxonomy/`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TaxonomyBackup {
+    pub name: String,
+    pub bytes: u64,
+    pub groups: usize,
+    pub people: usize,
+}
+
+/// `taxonomy-20260930T134501123Z-before-import.json`, and nothing else: no
+/// separators, so a name from a request can never leave the directory.
+fn valid_backup_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("taxonomy-").and_then(|r| r.strip_suffix(".json")) else {
+        return false;
+    };
+    rest.len() <= 60 && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn upsert_group(conn: &rusqlite::Connection, g: &Group) -> Result<()> {
+    conn.execute(
+        r#"
+        INSERT INTO groups (code, name, kind, keywords, description, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            name = excluded.name,
+            kind = excluded.kind,
+            keywords = excluded.keywords,
+            description = excluded.description
+        "#,
+        params![g.code, g.name, g.kind, serde_json::to_string(&g.keywords)?, g.description, timestamps::now_string()],
+    )?;
+    Ok(())
+}
+
+/// Replace one journalist's memberships with `codes`, in order.
+fn replace_memberships(conn: &rusqlite::Connection, surname: &str, codes: &[String]) -> Result<()> {
+    let jid: i64 = conn
+        .query_row("SELECT id FROM journalists WHERE surname = ?", params![surname], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("no journalist named {surname}"))?;
+    conn.execute("DELETE FROM journalist_groups WHERE journalist_id = ?", params![jid])?;
+    for (pos, code) in codes.iter().enumerate() {
+        let code = code.trim().to_uppercase();
+        let gid: i64 = conn
+            .query_row("SELECT id FROM groups WHERE code = ?", params![code], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no group {code}"))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO journalist_groups (journalist_id, group_id, position) VALUES (?, ?, ?)",
+            params![jid, gid, pos as i64],
+        )?;
+    }
+    Ok(())
+}

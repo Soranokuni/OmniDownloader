@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to config.json and edit. Secrets never belong in this file: the mailbox password and any API secret live in the encrypted store (data/secrets.bin), set with `omni-ingest secrets set mail.password` or from the admin panel.",
+  "_comment": "Copy to config.json and edit. Secrets never belong in this file: the Graph client secret and any API secret live in the encrypted store (data/secrets.bin), set with `omni-ingest secrets set graph.client_secret` or from the admin panel.",
 
   "database_path": "data/omni.db",
   "watchfolder_path": "watchfolder",
@@ -33,27 +33,27 @@
   "max_concurrent_downloads": 2,
   "max_concurrent_transcodes": 2,
 
-  "email_provider": "Outlook",
-  "imap_server": "outlook.office365.com",
-  "imap_port": 993,
-  "email_address": "",
   "email_poll_interval_secs": 30,
 
   "graph": {
-    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, Graph is used and the IMAP fields above are ignored. See README, 'Office 365 mailbox'.",
+    "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, the mailbox is polled; otherwise email ingest is off. The app needs Mail.Read only; write_access (with Mail.ReadWrite) also marks and files mail under the two folders. See README, 'Office 365 mailbox'.",
     "tenant_id": "",
     "client_id": "",
     "mailbox": "ingest@example.gr",
+    "write_access": false,
     "processed_folder": "Omni/Processed",
     "failed_folder": "Omni/Failed"
   },
 
-  "ollama_endpoint": "http://localhost:11434/v1",
-  "ollama_model": "gemma3:4b",
+  "ollama_endpoint": "http://127.0.0.1:1234/v1",
+  "ollama_model": "google/gemma-4-e4b",
 
   "llm": {
     "_comment": "The deterministic parser decides every job. In \"assist\" mode the model is asked only when the parser cannot name the journalist of a routed mail or make a keyword from a title, and what it proposes is checked against the roster and ^[A-Z0-9]{2,20}$. \"off\" never calls it. With the model down the jobs are identical.",
     "mode": "assist",
+    "provider": "lmstudio",
+    "auth": "none",
+    "disable_thinking": true,
     "timeout_secs": 30,
     "max_tokens": 400,
     "keyword_polish": false

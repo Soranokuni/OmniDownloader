@@ -1,3 +1,5 @@
+pub mod install;
+
 use anyhow::{Context, Result};
 use inquire::{Confirm, CustomType, Password, Text};
 use omni_core::config::AppConfig;
@@ -155,6 +157,97 @@ pub enum SecretSubcommand {
     List,
 }
 
+/// Account recovery from the machine itself (`omni-ingest admin …`).
+///
+/// Whoever can run this can already read the database file, so it adds no
+/// new access; it only saves them from editing SQL by hand when the one
+/// administrator's password (or address) is forgotten.
+pub enum AdminSubcommand {
+    /// List every account: address, role, active. No password data.
+    ListUsers,
+    /// Set a new password for one account and end all its sessions.
+    ResetPassword { email: String },
+    /// Deactivate (sign out, refuse sign-in) or reactivate an account. The
+    /// last active administrator is never deactivated.
+    SetActive { email: String, active: bool },
+}
+
+pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<()> {
+    match cmd {
+        AdminSubcommand::ListUsers => {
+            let users = repo.list_users()?;
+            if users.is_empty() {
+                println!("\nNo accounts. Open /setup on this machine, or run `omni-ingest setup`.");
+                return Ok(());
+            }
+            println!("\n{:<40} {:<10} {}", "Sign-in address", "Role", "Active");
+            for u in users {
+                println!("{:<40} {:<10} {}", u.email, u.role.as_str(), if u.is_active { "yes" } else { "NO" });
+            }
+        }
+        AdminSubcommand::SetActive { email, active } => {
+            let users = repo.list_users()?;
+            let wanted = email.trim().to_lowercase();
+            let Some(user) = users.iter().find(|u| u.email.trim().to_lowercase() == wanted) else {
+                anyhow::bail!("No account signs in as `{}`. See `omni-ingest admin list-users`.", email.trim());
+            };
+            if !active
+                && user.role == UserRole::Admin
+                && !users.iter().any(|u| u.id != user.id && u.is_active && u.role == UserRole::Admin)
+            {
+                anyhow::bail!("{} is the last active administrator; create or reactivate another first.", user.email);
+            }
+            repo.set_user_active_status(user.id, active)?;
+            if !active {
+                repo.delete_sessions_for_user(user.id)?;
+            }
+            let _ = repo.log_audit(
+                "WARN",
+                "ADMIN",
+                &format!("Account {} {} from the command line", user.email, if active { "reactivated" } else { "deactivated" }),
+            );
+            println!("✓ {} {}.", user.email, if active { "reactivated" } else { "deactivated and signed out" });
+        }
+        AdminSubcommand::ResetPassword { email } => {
+            let wanted = email.trim().to_lowercase();
+            let Some(user) = repo.list_users()?.into_iter().find(|u| u.email.trim().to_lowercase() == wanted) else {
+                let known: Vec<String> = repo.list_users()?.into_iter().map(|u| u.email).collect();
+                anyhow::bail!(
+                    "No account signs in as `{}`. Accounts: {}",
+                    email.trim(),
+                    if known.is_empty() { "none".to_string() } else { known.join(", ") }
+                );
+            };
+            // Piped for scripts, masked and confirmed otherwise; never an
+            // argument, which would sit in the shell history.
+            let password = match read_piped_secret()? {
+                Some(piped) => piped,
+                None => Password::new(&format!("New password for {}:", user.email))
+                    .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                    .with_custom_confirmation_message("Type it again:")
+                    .with_help_message("At least 12 characters")
+                    .prompt()?,
+            };
+            omni_core::auth::validate_password(&password).map_err(anyhow::Error::msg)?;
+            repo.update_user_password(user.id, &password)?;
+            let _ = repo.log_audit(
+                "WARN",
+                "ADMIN",
+                &format!("Password for {} reset from the command line", user.email),
+            );
+            println!("✓ Password for {} changed; every session of that account was ended.", user.email);
+            if !user.is_active {
+                println!("! This account is deactivated and still cannot sign in; reactivate it from another admin account.");
+            }
+            println!(
+                "  If sign-in was refused as too many attempts, wait up to an hour or restart the daemon: \
+                 the attempt counter is in memory."
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Result<()> {
     match cmd {
         SecretSubcommand::List => {
@@ -166,7 +259,7 @@ pub fn handle_secrets_command(store: &SecretStore, cmd: SecretSubcommand) -> Res
         }
         SecretSubcommand::Set { key } => {
             ensure_known_key(&key)?;
-            // Piped stdin (`... | omni-ingest secrets set mail.password`) for a
+            // Piped stdin (`... | omni-ingest secrets set graph.client_secret`) for a
             // scripted install; an interactive masked prompt otherwise. Either
             // way the value never appears as a command-line argument, where it
             // would be visible in the process list and the shell history.
@@ -255,39 +348,41 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
         .with_help_message("Directory for transient downloads and intermediate transcodes")
         .prompt()?;
 
-    // 4. Email Ingest
-    let enable_email = Confirm::new("Enable Outlook / IMAP email monitoring watchdog?")
-        .with_default(!config.email_address.is_empty())
+    // 4. Email Ingest: the Office 365 mailbox through Microsoft Graph (P4.7).
+    let enable_email = Confirm::new("Enable email ingest from the Office 365 mailbox (Microsoft Graph)?")
+        .with_default(!config.graph.mailbox.trim().is_empty())
         .prompt()?;
 
     if enable_email {
-        config.imap_server = Text::new("IMAP Host:")
-            .with_default(&config.imap_server)
+        config.graph.tenant_id = Text::new("Directory (tenant) ID:")
+            .with_default(&config.graph.tenant_id)
+            .with_help_message("From the app registration's Overview page in Entra ID")
             .prompt()?;
 
-        config.imap_port = CustomType::<u16>::new("IMAP Port:")
-            .with_default(config.imap_port)
+        config.graph.client_id = Text::new("Application (client) ID:")
+            .with_default(&config.graph.client_id)
             .prompt()?;
 
-        config.email_address = Text::new("Email Address / Username:")
-            .with_default(&config.email_address)
+        config.graph.mailbox = Text::new("Ingest mailbox address:")
+            .with_default(&config.graph.mailbox)
             .prompt()?;
 
-        let pw = Password::new("Email Password / App Password:")
+        let secret = Password::new("Client secret value:")
             .without_confirmation()
-            .with_help_message("Leave empty to keep existing password")
+            .with_display_mode(inquire::PasswordDisplayMode::Masked)
+            .with_help_message("Leave empty to keep the stored secret")
             .prompt()?;
 
-        if !pw.is_empty() {
-            // Into the encrypted store, not config.json (plan P2.6, W-06).
-            // `config.email_password` is the runtime copy the mail watcher
-            // reads; `save_to_file` cannot serialise it.
+        if !secret.is_empty() {
+            // Into the encrypted store, never config.json (plan P2.6).
+            // `config.graph.client_secret` is the runtime copy; `save_to_file`
+            // cannot serialise it.
             let store = SecretStore::new(config.resolve_path("data/secrets.bin"));
             store
-                .set(secret_keys::MAIL_PASSWORD, &pw)
-                .context("Failed storing the mailbox password")?;
-            config.email_password = pw;
-            println!("  Mailbox password stored encrypted in data/secrets.bin.");
+                .set(secret_keys::GRAPH_CLIENT_SECRET, &secret)
+                .context("Failed storing the Graph client secret")?;
+            config.graph.client_secret = secret;
+            println!("  Client secret stored encrypted in data/secrets.bin.");
         }
 
         config.email_poll_interval_secs = CustomType::<u64>::new("Email Polling Interval (seconds):")

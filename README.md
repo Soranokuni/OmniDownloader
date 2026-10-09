@@ -244,9 +244,27 @@ copy config.example.json config.json
 # or use the wizard
 .\target\release\omni-ingest.exe setup
 
+# what the daemon made of each mail; read one again on its next poll
+.\target\release\omni-ingest.exe mail-history
+.\target\release\omni-ingest.exe mail-reprocess --subject "VIRAL"
+
+# locked out? list the accounts, or set a new password (prompted, not an argument)
+.\target\release\omni-ingest.exe admin list-users
+.\target\release\omni-ingest.exe admin reset-password admin@station.gr
+.\target\release\omni-ingest.exe admin deactivate old-admin@station.gr
+
 # credentials never go in config.json
-.\target\release\omni-ingest.exe secrets set mail.password
+.\target\release\omni-ingest.exe secrets set graph.client_secret
 .\target\release\omni-ingest.exe secrets list
+
+# what the parser would do with the last 10 mails (read-only: nothing is
+# queued, nothing in the mailbox changes); or with saved .eml files
+.\target\release\omni-ingest.exe mail-preview --last 10
+.\target\release\omni-ingest.exe mail-preview --eml .\sample.eml
+
+# queue saved .eml files as if they had arrived (the running daemon downloads
+# them; a file handled before is skipped; no mailbox is touched)
+.\target\release\omni-ingest.exe mail-ingest --eml .\sample.eml
 
 # sniff a single URL through the headless browser
 .\target\release\omni-ingest.exe browser-test "https://example.com/video/..."
@@ -258,6 +276,14 @@ copy config.example.json config.json
 
 Panels: `/mcr` (operators), `/admin`, `/user`, `/login` on port 8080 by default.
 
+The MCR desk opens on **Email**: every mail (and every link added by hand), newest
+first, each with a bar of its videos' states. Opened, a mail shows its text with
+every link tagged by the file it became and coloured by how that file is doing,
+and its videos beside it; pointing at one lights up the other. A link the parser
+left out shows why, and can be queued from there. The text is kept for
+`mail_text_retention_days` (30) and then cleared; `/mcr#queue`, `#review` and
+`#completed` open the other lists directly.
+
 If the watchfolder is a network share, install the service under a domain
 account. LocalSystem authenticates to SMB as the computer account, which most
 file servers refuse — and the failure appears only at delivery, after a correct
@@ -265,14 +291,16 @@ file has already been produced.
 
 ## Office 365 mailbox (Microsoft Graph)
 
-Exchange Online no longer accepts basic-auth IMAP, so an Office 365 ingest
-mailbox is read through Microsoft Graph with an app registration. IMAP remains
-for on-premises servers.
+Exchange Online no longer accepts basic-auth IMAP, so the ingest mailbox is
+read through Microsoft Graph with an app registration. Graph is the only mail
+source; IMAP support has been removed.
 
 1. **Entra ID → App registrations → New registration.** Single tenant, no
    redirect URI. Note the *Application (client) ID* and *Directory (tenant) ID*.
 2. **API permissions → Add → Microsoft Graph → Application permissions:**
-   `Mail.ReadWrite` and `Mail.Send`. Grant admin consent.
+   `Mail.Read`. Grant admin consent. That is all the daemon needs: it never
+   writes to the mailbox unless you also grant `Mail.ReadWrite` and set
+   `graph.write_access` (see below).
 3. **Certificates & secrets → New client secret.** Copy the value once.
 4. **Limit the app to the ingest mailbox.** Without this, application
    permissions reach every mailbox in the tenant. In Exchange Online
@@ -294,10 +322,60 @@ for on-premises servers.
    .\target\release\omni-ingest.exe secrets set graph.client_secret
    ```
 
-Processed mail is marked read and moved to `Omni/Processed`. Mail that could
-not be processed is moved to `Omni/Failed` and left **unread**, so a person
-sees it. Both folders are created on first use. A message is never processed
-twice: the daemon remembers every Message-ID it has handled.
+   Or use `/setup` in the browser, which stores the secret the same way, then
+   **Test mailbox** on `/admin`.
+
+   For a console or development run you can instead set `OMNI_GRAPH_TENANT_ID`,
+   `OMNI_GRAPH_CLIENT_ID`, `OMNI_GRAPH_MAILBOX` and `OMNI_GRAPH_CLIENT_SECRET`
+   (see `.env.example`); a set variable wins over config.json and the store
+   and is never written to either. Do not use them for the service: a
+   service's environment is stored in plaintext in the registry.
+
+**How mail is picked up.** Each poll lists the Inbox messages changed since the
+last poll (with a 15-minute overlap) and processes those whose Message-ID the
+database has not seen. Read state does not matter: someone opening the ingest
+mailbox in Outlook hides nothing, and a message is never processed twice. A
+mail moved into the Inbox later (rescued from Junk) is picked up, provided it
+was received no more than 72 hours before the last poll. On the very first
+poll the daemon looks back 24 hours.
+
+With `Mail.Read` alone the mailbox is left exactly as it is. A mail that could
+not be processed after three attempts is recorded as failed and appears in the
+admin log (`Gave up on email ...`), not in the mailbox.
+
+**Optional: mark and file mail in the mailbox.** Grant `Mail.ReadWrite`
+instead and set `"write_access": true` under `graph`: processed mail is then
+marked read and moved to `Omni/Processed`, and mail that could not be
+processed is moved to `Omni/Failed` and left **unread**. Both folders are
+created on first use.
+
+## LLM assist (optional)
+
+The deterministic parser decides every job; the LLM is asked only where it
+is unsure (a journalist, a keyword, a group) and its answers are checked
+before use. With the LLM off, down or slow, the jobs are the same.
+
+Set it on **Admin → LLM assist**: pick a provider preset (LM Studio,
+Ollama, GenieX, llama.cpp/vLLM, OpenAI, Azure OpenAI, Google Gemini,
+Anthropic, OpenRouter, Mistral, Groq, or any OpenAI-compatible server),
+**Load models**, **Test**, then **Save and apply**; no restart. Keys are
+stored encrypted (`llm.api_key`) and a stored key is only ever sent to the
+base URL it was saved with.
+
+- **Local** (this machine or the station network): the prompt is sent as is.
+- **Online**: https is required, and email addresses and phone numbers in
+  the mail are replaced with placeholders; the sender's address is never
+  sent. Subject, part of the body, roster surnames and group names are.
+- The built-in prompt reads who the material is for ("για τον Γιώργο",
+  "ΓΙΑ ΕΥΗ", nicknames and cases, matched against full names and aliases)
+  and writes story keywords (place, person, event; never VIDEO, VIRAL or the
+  journalist's name). **Let the LLM write every keyword** asks it for all
+  sections, one call per mail. A recipient named in a mail but missing from
+  the roster appears as `JOURNALIST_SUGGESTED: <name>` in the job notes and
+  the audit log; the roster is never changed automatically.
+- Leave **Disable thinking** on for reasoning models (Gemma 4, Qwen 3.5):
+  with thinking, Gemma 4 E4B took 63 s per mail on a Snapdragon X Elite
+  instead of 8–29 s, or used its whole token budget and answered nothing.
 
 ## Configuration and data that stay out of git
 

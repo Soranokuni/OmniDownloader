@@ -35,6 +35,12 @@ pub struct AppState {
     /// plain-HTTP deployment means the browser never sends it back, which
     /// presents to operators as "login does nothing".
     pub tls_enabled: bool,
+    /// The LLM assist in use, shared with the mail watcher: saving LLM
+    /// settings in the admin panel swaps it without a restart (plan P4.22).
+    pub llm: omni_email::assist::LiveAssist,
+    /// Jobs a worker is still busy with; a retry waits until it has stopped
+    /// (plan P7.20). Shared with the worker pool by the daemon.
+    pub busy_jobs: omni_core::busy::BusyJobs,
 }
 
 impl AppState {
@@ -45,6 +51,7 @@ impl AppState {
             config.security.login_rate_limit_per_account_hour,
         );
         let tls_enabled = config.tls.is_enabled();
+        let llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
         // Tests and callers that do not configure secrets get a store rooted
         // beside the config; the daemon replaces it with the real one.
         let default_store = omni_core::secrets::SecretStore::new(
@@ -63,6 +70,8 @@ impl AppState {
             secrets: Arc::new(default_store),
             health: omni_core::health::HealthState::new(),
             tls_enabled,
+            llm,
+            busy_jobs: omni_core::busy::BusyJobs::new(),
         }
     }
 
@@ -70,6 +79,18 @@ impl AppState {
     /// subsystems observed rather than a second, private copy.
     pub fn with_health(mut self, health: omni_core::health::HealthState) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Share the worker pool's busy-job set.
+    pub fn with_busy_jobs(mut self, busy: omni_core::busy::BusyJobs) -> Self {
+        self.busy_jobs = busy;
+        self
+    }
+
+    /// Share the daemon's live LLM assist with the admin panel.
+    pub fn with_llm(mut self, llm: omni_email::assist::LiveAssist) -> Self {
+        self.llm = llm;
         self
     }
 

@@ -30,6 +30,11 @@
 *.bak.json
 .env
 .env.*
+*.env
+!/.env.example
+# Local overrides of any config, in any directory.
+config.local.*
+*.local.json
 *.pem
 *.key
 *.pfx
@@ -37,6 +42,12 @@
 # DPAPI secret store and any database copy, wherever it lands (a trial run
 # puts both next to its own config).
 secrets.bin
+*.keystore
+*.jks
+*.kdbx
+# OAuth token caches (MSAL, azure-identity), should a tool ever write one.
+*token_cache*
+*.msalcache*
 *.db
 *.db-shm
 *.db-wal
@@ -71,6 +82,9 @@ desktop.ini
 
 # ---- Real newsroom roster: staff names and work addresses ----
 journalists.seed.json
+# The taxonomy export holds the same names and addresses; only the invented
+# example is tracked.
+taxonomy.json
 
 # ---- Internal working notes and agent instructions ----
 #

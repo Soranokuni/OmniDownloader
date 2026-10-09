@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="el">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniDownloader — MCR Handler Portal</title>
-<link rel="stylesheet" href="/static/app.css?v=2">
+<title>OmniDownloader — MCR</title>
+<link rel="stylesheet" href="/static/app.css?v=8">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -15,173 +15,250 @@
       <div class="brand-mark">O</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p>Master Control Room · Ingest</p>
+        <p>Master Control Room · Λήψη βίντεο</p>
       </div>
     </div>
     <div class="topbar-status">
-      <span class="status-item"><span id="mail-dot" class="dot"></span><span id="mail-status">Mail: —</span></span>
+      <span class="status-item"><span id="mail-dot" class="dot"></span><span id="mail-status">Email: —</span></span>
       <span class="status-item"><span id="llm-dot" class="dot"></span><span id="llm-status">LLM: —</span></span>
+      <span class="status-item" id="queue-status">Ουρά: —</span>
       <span class="status-item" id="storage-status">Watchfolder: —</span>
-      <a class="btn" href="/admin">Administration</a>
-      <button class="btn" type="button" id="logout-btn">Sign out</button>
+      <span class="status-item" id="temp-status">Temp: —</span>
+      <a class="btn" href="/admin">Διαχείριση</a>
+      <button class="btn" type="button" id="logout-btn">Αποσύνδεση</button>
     </div>
   </div>
 </header>
 
 <main>
   <!-- Filled by the status poll when a subsystem check is not OK. -->
+  <!-- Shown by the status poll when the service stops answering. -->
+  <div id="offline-banner" role="alert" hidden></div>
   <div id="health-banner" hidden></div>
 
-  <div class="tabs" role="tablist">
-    <button class="tab" type="button" role="tab" data-tab="queue" aria-selected="true">Live Queue</button>
-    <button class="tab" type="button" role="tab" data-tab="review" aria-selected="false">
-      Action Required <span id="review-count" class="badge warn" hidden>0</span>
+  <div class="tabs">
+  <div role="tablist" style="display:flex;gap:4px;flex-wrap:wrap">
+    <button class="tab" type="button" role="tab" id="tabbtn-email" data-tab="email" aria-controls="tab-email" aria-selected="true" tabindex="0">
+      Email <span id="email-count" class="badge info" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" data-tab="archive" aria-selected="false">Broadcast Archive</button>
-    <button class="tab" type="button" role="tab" data-tab="journalists" aria-selected="false">Journalists</button>
-    <button class="tab" type="button" role="tab" data-tab="manual" aria-selected="false">Quick Queue</button>
-    <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Mezzanine Specs</button>
+    <button class="tab" type="button" role="tab" id="tabbtn-queue" data-tab="queue" aria-controls="tab-queue" aria-selected="false" tabindex="-1">
+      Σε εξέλιξη <span id="queue-count" class="badge info" hidden>0</span>
+    </button>
+    <button class="tab" type="button" role="tab" id="tabbtn-review" data-tab="review" aria-controls="tab-review" aria-selected="false" tabindex="-1">
+      Χρειάζονται έλεγχο <span id="review-count" class="badge warn" hidden>0</span>
+    </button>
+    <button class="tab" type="button" role="tab" id="tabbtn-completed" data-tab="completed" aria-controls="tab-completed" aria-selected="false" tabindex="-1">
+      Ολοκληρωμένα <span id="completed-count" class="badge" hidden>0</span>
+    </button>
+    <button class="tab" type="button" role="tab" id="tabbtn-journalists" data-tab="journalists" aria-controls="tab-journalists" aria-selected="false" tabindex="-1">Δημοσιογράφοι</button>
+    <button class="tab" type="button" role="tab" id="tabbtn-manual" data-tab="manual" aria-controls="tab-manual" aria-selected="false" tabindex="-1">Προσθήκη συνδέσμου</button>
+  </div>
+    <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Προδιαγραφές εκπομπής</button>
   </div>
 
+  <!-- Every mail and every link added by hand, each with its videos (plan P7.10) -->
+  <section id="tab-email" class="stack" role="tabpanel" aria-labelledby="tabbtn-email">
+    <div class="ib-toolbar">
+      <div class="ib-filters" id="inbox-filters" role="group" aria-label="Φίλτρο"></div>
+      <input type="search" id="inbox-search" placeholder="Αναζήτηση θέματος, αποστολέα, δημοσιογράφου ή συνδέσμου…" aria-label="Αναζήτηση">
+    </div>
+    <p class="note" style="margin:0">
+      Κάθε email που ήρθε, με τα βίντεο που βγήκαν από αυτό. Ανοίξτε ένα για να δείτε το κείμενό του:
+      κάθε σύνδεσμος έχει δίπλα τον αριθμό του αρχείου που έγινε και το χρώμα της κατάστασής του.
+    </p>
+    <div id="inbox-list" class="ib-list">
+      <div class="card center">Φόρτωση…</div>
+    </div>
+    <div id="inbox-pager"></div>
+  </section>
+
   <!-- Live queue -->
-  <section id="tab-queue" class="stack">
+  <section id="tab-queue" class="stack" role="tabpanel" aria-labelledby="tabbtn-queue" hidden>
+    <div class="section-head">
+      <p class="note" style="margin:0">
+        Πρώτα όσα βίντεο περιμένουν ή μετατρέπονται, μετά όσα έχουν ήδη παραδοθεί.
+        Τα παραδοθέντα μένουν και στα <b>Ολοκληρωμένα</b>.
+      </p>
+      <button class="btn" type="button" id="clear-finished" disabled>Αφαίρεση παραδοθέντων από τη λίστα</button>
+    </div>
     <!-- Other videos found in submitted articles, for MCR to queue (empty when none) -->
     <div id="article-offers" class="stack"></div>
     <div id="queue-cards" class="stack">
-      <div class="card center">Loading live queue…</div>
+      <div class="card center">Φόρτωση…</div>
     </div>
+    <div id="queue-pager"></div>
   </section>
 
-  <!-- Action required -->
-  <section id="tab-review" class="stack" hidden>
-    <div id="review-cards" class="stack">
-      <div class="card center">No items require operator review.</div>
-    </div>
-  </section>
-
-  <!-- Archive -->
-  <section id="tab-archive" class="stack" hidden>
+  <!-- Needs attention -->
+  <section id="tab-review" class="stack" role="tabpanel" aria-labelledby="tabbtn-review" hidden>
+    <p class="note" style="margin:0">
+      Αυτά τα βίντεο δεν παραδόθηκαν αυτόματα. Κάθε κάρτα λέει γιατί και τι να κάνετε.
+      Το <b>Δοκιμή ξανά</b> είναι ασφαλές: δεν αγγίζει τίποτα που έχει ήδη παραδοθεί.
+    </p>
     <div class="card">
       <div class="section-head">
         <div class="row">
-          <label for="journalist-filter" style="margin:0">Journalist</label>
-          <select id="journalist-filter" style="width:auto"><option value="">All journalists</option></select>
+          <label for="review-journalist" style="margin:0">Δημοσιογράφος</label>
+          <select id="review-journalist" style="width:auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
         </div>
-        <input type="text" id="archive-search" placeholder="Search slug, keyword or URL…" style="width:280px">
+        <input type="search" id="review-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" style="width:320px">
+      </div>
+      <div class="section-head" style="margin-top:10px">
+        <button class="btn" type="button" id="hide-old-review">Απόκρυψη παλαιότερων από 3 ημέρες</button>
+        <label id="review-hidden-label" class="row" style="margin:0;gap:6px" hidden>
+          <input type="checkbox" id="review-show-hidden" style="width:auto">
+          <span id="review-hidden-text">Εμφάνιση κρυμμένων</span>
+        </label>
       </div>
     </div>
+    <div id="review-cards" class="stack">
+      <div class="card center">Φόρτωση…</div>
+    </div>
+    <div id="review-pager"></div>
+  </section>
+
+  <!-- Completed -->
+  <section id="tab-completed" class="stack" role="tabpanel" aria-labelledby="tabbtn-completed" hidden>
+    <div class="card">
+      <div class="section-head">
+        <div class="row">
+          <label for="journalist-filter" style="margin:0">Δημοσιογράφος</label>
+          <select id="journalist-filter" style="width:auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
+          <label for="group-filter" style="margin:0 0 0 12px">Ομάδα</label>
+          <select id="group-filter" style="width:auto"><option value="">Όλες οι ομάδες</option></select>
+        </div>
+        <input type="search" id="completed-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" style="width:320px">
+      </div>
+      <p class="note" style="margin:10px 0 0">
+        Όλα τα βίντεο που παραδόθηκαν, τα νεότερα πρώτα. Αν ένα αρχείο σβήστηκε ή βγήκε λάθος,
+        πατήστε <b>Νέα λήψη</b>: το βίντεο κατεβαίνει ξανά από τον σύνδεσμό του και παραδίδεται
+        πάλι, δίπλα στο παλιό αρχείο αν υπάρχει ακόμη, ποτέ πάνω του.
+      </p>
+    </div>
+    <div id="completed-offers" class="stack"></div>
     <div class="card flush">
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>Broadcast slug</th><th>Journalist</th><th>Status</th>
-            <th>Duration</th><th>Media format</th><th>Updated</th>
+            <th>Αρχείο</th><th>Δημοσιογράφος</th><th>Ομάδα</th><th>Παράδοση</th>
+            <th>Διάρκεια</th><th class="right"></th>
           </tr>
         </thead>
-        <tbody id="archive-body">
-          <tr><td colspan="7" class="empty">Loading archive…</td></tr>
+        <tbody id="completed-body">
+          <tr><td colspan="6" class="empty">Φόρτωση…</td></tr>
         </tbody>
       </table>
     </div>
+    <div id="completed-pager"></div>
   </section>
 
   <!-- Journalists -->
-  <section id="tab-journalists" class="stack" hidden>
+  <section id="tab-journalists" class="stack" role="tabpanel" aria-labelledby="tabbtn-journalists" hidden>
     <div class="card">
-      <h2 class="card-title">Add or update a journalist</h2>
+      <h2 class="card-title">Προσθήκη ή αλλαγή δημοσιογράφου</h2>
       <form id="journalist-form" class="stack">
         <div class="grid-2">
           <div>
-            <label for="j-surname">Surname (used in the filename)</label>
+            <label for="j-surname">Επώνυμο με λατινικά (μπαίνει στο όνομα του αρχείου)</label>
             <input type="text" id="j-surname" required placeholder="PAPADAKI">
           </div>
           <div>
-            <label for="j-fullname">Full name</label>
-            <input type="text" id="j-fullname" placeholder="Anna Papadaki">
+            <label for="j-fullname">Ονοματεπώνυμο</label>
+            <input type="text" id="j-fullname" placeholder="Άννα Παπαδάκη">
           </div>
         </div>
         <div class="grid-2">
           <div>
-            <label for="j-emails">Addresses (comma separated)</label>
+            <label for="j-emails">Διευθύνσεις email (χωρισμένες με κόμμα)</label>
             <input type="text" id="j-emails" placeholder="a.papadaki@station.gr, anna@station.gr">
           </div>
           <div>
-            <label for="j-priority">Default priority</label>
+            <label for="j-priority">Προτεραιότητα (0 = κανονική)</label>
             <input type="number" id="j-priority" value="0" min="-100" max="100">
           </div>
         </div>
-        <button class="btn btn-primary" type="submit">Save journalist</button>
+        <button class="btn btn-primary" type="submit">Αποθήκευση δημοσιογράφου</button>
       </form>
     </div>
     <div class="card flush">
       <table>
         <thead>
-          <tr><th>Surname</th><th>Full name</th><th>Addresses</th><th>Priority</th><th class="right">Actions</th></tr>
+          <tr><th>Επώνυμο</th><th>Ονοματεπώνυμο</th><th>Διευθύνσεις</th><th>Προτεραιότητα</th><th class="right"></th></tr>
         </thead>
         <tbody id="journalists-body">
-          <tr><td colspan="5" class="empty">Loading journalists…</td></tr>
+          <tr><td colspan="5" class="empty">Φόρτωση…</td></tr>
         </tbody>
       </table>
     </div>
   </section>
 
-  <!-- Quick queue -->
-  <section id="tab-manual" class="stack" hidden>
+  <!-- Add a link -->
+  <section id="tab-manual" class="stack" role="tabpanel" aria-labelledby="tabbtn-manual" hidden>
     <div class="card" style="max-width:680px;margin:0 auto">
-      <h2 class="card-title">Manual broadcast ingest</h2>
+      <h2 class="card-title">Χειροκίνητη προσθήκη συνδέσμου</h2>
+      <p class="note" style="margin-bottom:12px">
+        Για βίντεο που δεν ήρθε με email. Επικολλήστε τον σύνδεσμο του βίντεο ή του άρθρου
+        που το περιέχει. Το αρχείο ονομάζεται <span class="mono">ΑΡΙΘΜΟΣ_ΔΗΜΟΣΙΟΓΡΑΦΟΣ_ΛΕΞΗ.mxf</span>.
+      </p>
       <form id="manual-form" class="stack">
         <div>
-          <label for="m-url">Media or page URL</label>
+          <label for="m-url">Σύνδεσμος του βίντεο ή του άρθρου</label>
           <input type="url" id="m-url" required placeholder="https://…">
         </div>
         <div class="grid-2">
           <div>
-            <label for="m-journalist">Journalist surname</label>
-            <input type="text" id="m-journalist" required placeholder="PAPADAKI or MCR" value="MCR">
+            <label for="m-journalist">Επώνυμο δημοσιογράφου</label>
+            <input type="text" id="m-journalist" required placeholder="PAPADAKI" list="m-journalists">
+            <datalist id="m-journalists"></datalist>
           </div>
           <div>
-            <label for="m-keyword">Keyword</label>
-            <input type="text" id="m-keyword" required placeholder="KNICKS">
+            <label for="m-keyword">Λέξη-κλειδί (το θέμα, με λατινικά ή ελληνικά)</label>
+            <input type="text" id="m-keyword" required placeholder="SEISMOS">
           </div>
         </div>
         <div class="grid-2">
           <div>
-            <label for="m-index">Section number / index</label>
+            <label for="m-index">Αριθμός θέματος</label>
             <input type="text" id="m-index" value="1" required>
           </div>
-          <div class="checkbox-row" style="align-self:end;padding-bottom:9px">
-            <input type="checkbox" id="m-priority">
-            <label for="m-priority">High priority</label>
+          <div>
+            <label for="m-max">Από άρθρο: μόνο τα πρώτα … βίντεο (κενό = όλα)</label>
+            <input type="number" id="m-max" min="1" max="20" placeholder="όλα">
           </div>
         </div>
-        <button class="btn btn-primary btn-block" type="submit">Queue for ingest</button>
+        <div class="checkbox-row">
+          <input type="checkbox" id="m-priority">
+          <label for="m-priority">Επείγον (μπαίνει πριν από τα άλλα)</label>
+        </div>
+        <p class="note" id="m-preview" style="margin:0"></p>
+        <button class="btn btn-primary btn-block" type="submit">Προσθήκη στην ουρά</button>
       </form>
     </div>
   </section>
 </main>
 
-<!-- Mezzanine specifications -->
+<!-- Broadcast format -->
 <div class="modal" id="specs-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="specs-title">
     <div class="section-head" style="border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px">
       <h2 id="specs-title" style="margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.07em">
-        Mezzanine broadcast specification
+        Προδιαγραφές κάθε αρχείου που παραδίδεται
       </h2>
-      <button class="btn btn-icon" type="button" id="specs-close" aria-label="Close">✕</button>
+      <button class="btn btn-icon" type="button" id="specs-close" aria-label="Κλείσιμο">✕</button>
     </div>
-    <div class="spec-row"><span>Video codec</span><span>MPEG-2 (Sony XDCAM HD422)</span></div>
-    <div class="spec-row"><span>Bitrate</span><span>50 Mbps CBR</span></div>
-    <div class="spec-row"><span>Resolution</span><span>1920×1080, 16:9</span></div>
-    <div class="spec-row"><span>Frame rate / scan</span><span>25 fps, 1080i50, top field first</span></div>
-    <div class="spec-row"><span>Chroma</span><span>4:2:2 (yuv422p)</span></div>
-    <div class="spec-row"><span>Audio layout</span><span>EBU R48 — 8 discrete mono tracks</span></div>
-    <div class="spec-row"><span>Audio codec</span><span>PCM 24-bit @ 48 kHz</span></div>
-    <div class="spec-row"><span>Channel mapping</span><span>1 Left, 2 Right, 3–8 silence</span></div>
-    <div class="spec-row"><span>Wrapper</span><span>SMPTE RDD9 OP1a (bmxtranswrap)</span></div>
-    <button class="btn btn-block" type="button" id="specs-close-2" style="margin-top:14px">Close</button>
+    <div class="spec-row"><span>Κωδικοποίηση βίντεο</span><span>MPEG-2 (Sony XDCAM HD422)</span></div>
+    <div class="spec-row"><span>Ρυθμός δεδομένων</span><span>50 Mbps CBR</span></div>
+    <div class="spec-row"><span>Ανάλυση</span><span>1920×1080, 16:9</span></div>
+    <div class="spec-row"><span>Καρέ / σάρωση</span><span>25 fps, 1080i50, πρώτο το πάνω πεδίο</span></div>
+    <div class="spec-row"><span>Χρωματική δειγματοληψία</span><span>4:2:2 (yuv422p)</span></div>
+    <div class="spec-row"><span>Διάταξη ήχου</span><span>EBU R48 — 8 ανεξάρτητα μονοφωνικά κανάλια</span></div>
+    <div class="spec-row"><span>Κωδικοποίηση ήχου</span><span>PCM 24-bit @ 48 kHz</span></div>
+    <div class="spec-row"><span>Αντιστοίχιση καναλιών</span><span>1 Αριστερό, 2 Δεξί, 3–8 σιωπή</span></div>
+    <div class="spec-row"><span>Περιτύλιγμα</span><span>SMPTE RDD9 OP1a (bmxtranswrap)</span></div>
+    <button class="btn btn-block" type="button" id="specs-close-2" style="margin-top:14px">Κλείσιμο</button>
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=2"></script>
+<script type="module" src="/static/mcr.js?v=34"></script>
 </body>
 </html>

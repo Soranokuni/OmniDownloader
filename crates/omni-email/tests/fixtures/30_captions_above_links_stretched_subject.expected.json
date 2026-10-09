@@ -1,0 +1,46 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1A",
+          "keyword": "DIAGONISMOSYPNOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture3001?si=AbCdEfGh"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "DIAGONISMOSPARKARISM",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://x.com/someone/status/3002"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1C",
+          "keyword": "GAMILIADEXIOSI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://x.com/other/status/3003"
+        }
+      ],
+      "keyword": "DIAGONISMOSYPNOU",
+      "title": "Διαγωνισμος υπνου"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

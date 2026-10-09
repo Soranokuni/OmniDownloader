@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="el">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniDownloader — Journalist Ingest Portal</title>
-<link rel="stylesheet" href="/static/app.css?v=2">
+<title>OmniDownloader — Αποστολή βίντεο</title>
+<link rel="stylesheet" href="/static/app.css?v=8">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -15,13 +15,13 @@
       <div class="brand-mark">O</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p>Newsroom Ingest Desk</p>
+        <p>Αποστολή βίντεο στο MCR</p>
       </div>
     </div>
     <div class="topbar-status">
-      <span id="user-display" class="status-item">Signed in</span>
-      <button class="btn" type="button" id="password-btn">Change password</button>
-      <button class="btn" type="button" id="logout-btn">Sign out</button>
+      <span id="user-display" class="status-item">Συνδεδεμένος</span>
+      <button class="btn" type="button" id="password-btn">Αλλαγή κωδικού</button>
+      <button class="btn" type="button" id="logout-btn">Αποσύνδεση</button>
     </div>
   </div>
 </header>
@@ -29,42 +29,42 @@
 <main class="stack">
 
   <section class="card">
-    <h2 class="card-title">Submit a video for ingest</h2>
+    <h2 class="card-title">Αποστολή βίντεο</h2>
     <form id="submit-form" class="stack">
       <div>
-        <label for="url">Video link or article URL</label>
+        <label for="url">Σύνδεσμος του βίντεο ή του άρθρου</label>
         <input type="url" id="url" required
-               placeholder="https://www.youtube.com/watch?v=… or a news portal article">
+               placeholder="https://www.youtube.com/watch?v=… ή άρθρο ειδησεογραφικού site">
       </div>
       <div class="grid-2">
         <div>
-          <label for="keyword">Topic / distinctive keyword</label>
-          <input type="text" id="keyword" required placeholder="KNICKS, PROTEST, …">
+          <label for="keyword">Λέξη-κλειδί του θέματος</label>
+          <input type="text" id="keyword" required placeholder="ΣΕΙΣΜΟΣ, ΚΙΝΗΤΟΠΟΙΗΣΗ, …">
         </div>
         <div>
-          <label for="index">Section number in your rundown</label>
+          <label for="index">Αριθμός θέματος στο δελτίο</label>
           <input type="text" id="index" value="1" required>
         </div>
       </div>
       <div>
-        <label for="notes">Notes for MCR (optional)</label>
-        <input type="text" id="notes" placeholder="e.g. only the second half of the clip">
+        <label for="notes">Σημείωση για το MCR (προαιρετικά)</label>
+        <input type="text" id="notes" placeholder="π.χ. μόνο το δεύτερο μισό του βίντεο">
       </div>
       <div class="checkbox-row">
         <input type="checkbox" id="priority">
-        <label for="priority">Urgent — put ahead of the queue</label>
+        <label for="priority">Επείγον (μπαίνει πριν από τα άλλα)</label>
       </div>
-      <button class="btn btn-primary btn-block" type="submit">Send to ingest</button>
+      <button class="btn btn-primary btn-block" type="submit">Αποστολή</button>
     </form>
   </section>
 
   <section class="stack">
     <div class="section-head">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">My submissions</h2>
-      <button class="btn" type="button" id="refresh-btn">Refresh</button>
+      <h2 class="card-title" style="border:none;margin:0;padding:0">Οι αποστολές μου</h2>
+      <button class="btn" type="button" id="refresh-btn">Ανανέωση</button>
     </div>
     <div id="my-jobs" class="stack">
-      <div class="card center">Loading your submissions…</div>
+      <div class="card center">Φόρτωση…</div>
     </div>
   </section>
 
@@ -72,25 +72,25 @@
 
 <div class="modal" id="password-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="pw-title">
-    <h2 id="pw-title" class="card-title">Change your password</h2>
+    <h2 id="pw-title" class="card-title">Αλλαγή κωδικού</h2>
     <form id="password-form" class="stack">
       <div>
-        <label for="pw-current">Current password</label>
+        <label for="pw-current">Τρέχων κωδικός</label>
         <input type="password" id="pw-current" required autocomplete="current-password">
       </div>
       <div>
-        <label for="pw-new">New password (at least 12 characters)</label>
+        <label for="pw-new">Νέος κωδικός (τουλάχιστον 12 χαρακτήρες)</label>
         <input type="password" id="pw-new" required minlength="12" autocomplete="new-password">
       </div>
-      <p class="note">Changing your password signs you out on every device.</p>
+      <p class="note">Με την αλλαγή του κωδικού αποσυνδέεστε από όλες τις συσκευές.</p>
       <div class="row">
-        <button class="btn btn-primary grow" type="submit">Change password</button>
-        <button class="btn" type="button" id="pw-cancel">Cancel</button>
+        <button class="btn btn-primary grow" type="submit">Αλλαγή κωδικού</button>
+        <button class="btn" type="button" id="pw-cancel">Άκυρο</button>
       </div>
     </form>
   </div>
 </div>
 
-<script type="module" src="/static/user.js?v=2"></script>
+<script type="module" src="/static/user.js?v=5"></script>
 </body>
 </html>

@@ -465,3 +465,101 @@ fn leasing_holds_only_briefly_under_contention() {
         start.elapsed()
     );
 }
+
+#[test]
+fn only_the_lease_holder_corrects_a_jobs_link_and_dedup_follows_it() {
+    // P3.12: a job queued as "…/arthro/-ΒΙΝΤΕΟ" is corrected while it runs;
+    // the desk then opens, and dedups, the address that works.
+    let (_d, repo) = repo();
+    let id = queue(&repo, "https://www.example.gr/kosmos/arthro/-ΒΙΝΤΕΟ", "1_MCR_ARTHRO", "MCR").job_id();
+    let job = repo.lease_job("hostA:1:1", 120).unwrap().expect("a job");
+    assert_eq!(job.id, id);
+
+    assert!(!repo.set_leased_job_url(id, "hostA:1:2", "https://www.example.gr/kosmos/arthro/").unwrap(), "not the lease holder");
+    assert!(repo.set_leased_job_url(id, "hostA:1:1", "https://www.example.gr/kosmos/arthro/").unwrap());
+    assert_eq!(repo.get_job(id).unwrap().unwrap().url, "https://www.example.gr/kosmos/arthro/");
+    assert_eq!(
+        queue(&repo, "https://www.example.gr/kosmos/arthro/", "2_MCR_ARTHRO", "MCR"),
+        Enqueued::DuplicateActive { existing_id: id },
+        "the corrected address is the one dedup knows"
+    );
+}
+
+#[test]
+fn a_job_can_be_renamed_until_its_file_is_being_made() {
+    // P7.12: MCR fixes an uncertain keyword before delivery, never after
+    // the rewrap has named the clip.
+    let (_d, repo) = repo();
+    let id = queue(&repo, "https://example.gr/rename", "1_MCR_TREILER", "MCR").job_id();
+    let (old, new) = repo.rename_job_keyword(id, "DUNE").unwrap().expect("a waiting job");
+    assert_eq!((old.as_str(), new.as_str()), ("1_MCR_TREILER", "1_MCR_DUNE"));
+    let job = repo.get_job(id).unwrap().unwrap();
+    assert_eq!((job.slug.as_str(), job.keyword.as_str()), ("1_MCR_DUNE", "DUNE"));
+
+    repo.lease_job("hostA:1:1", 120).unwrap().expect("leased");
+    repo.set_stage(id, "hostA:1:1", JobStage::Transcode).unwrap();
+    assert!(repo.rename_job_keyword(id, "DUNEPART").unwrap().is_some(), "still before the rewrap");
+    repo.set_stage(id, "hostA:1:1", JobStage::Rewrap).unwrap();
+    assert!(repo.rename_job_keyword(id, "LATE").unwrap().is_none(), "the clip is being named");
+    assert_eq!(repo.get_job(id).unwrap().unwrap().slug, "1_MCR_DUNEPART");
+
+    repo.finish(id, "hostA:1:1", JobStatus::Completed, None, None, Some("x.mxf")).unwrap();
+    assert!(repo.rename_job_keyword(id, "AFTER").unwrap().is_none(), "delivered files are never renamed");
+    assert!(repo.rename_job_keyword(99_999, "GONE").unwrap().is_none());
+}
+
+// ------------------------------------------------------- marked by hand --
+
+#[test]
+fn a_job_can_be_marked_done_only_from_review_states() {
+    let (_d, repo) = repo();
+    let owner = "hostA:100:0";
+
+    // The three states that wait for a person.
+    for (n, status) in [JobStatus::RequiresReview, JobStatus::ManualDownload, JobStatus::Failed]
+        .into_iter()
+        .enumerate()
+    {
+        let url = format!("https://example.gr/review-{n}");
+        let id = queue(&repo, &url, &format!("{n}_NIKOLAOU_R"), "NIKOLAOU").job_id();
+        repo.lease_job(owner, 120).unwrap().unwrap();
+        assert!(repo
+            .finish(id, owner, status, Some("E_TEST"), Some("why"), None)
+            .unwrap());
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, status);
+
+        assert!(repo.mark_completed_manually(id).unwrap(), "{status:?}");
+        let job = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::CompletedManual);
+        assert!(job.completed_at.is_some());
+        assert!(job.delivered_at.is_some(), "the Email tab's «Παραδόθηκε …» time");
+        assert_eq!(job.stage, JobStage::Done);
+        assert_eq!(job.error_code.as_deref(), Some("E_TEST"));
+        assert!(job.file_path.is_none());
+
+        // Marked once; a second press changes nothing.
+        assert!(!repo.mark_completed_manually(id).unwrap());
+
+        // Dedup treats it as delivered.
+        let again = queue(&repo, &url, &format!("9{n}_NIKOLAOU_R"), "NIKOLAOU");
+        assert_eq!(again, Enqueued::DuplicateRecent { existing_id: id });
+    }
+
+    // Everything else is refused and left alone.
+    let pending = queue(&repo, "https://example.gr/pending", "7_NIKOLAOU_P", "NIKOLAOU").job_id();
+    assert!(!repo.mark_completed_manually(pending).unwrap());
+    assert_eq!(repo.get_job(pending).unwrap().unwrap().status, JobStatus::Pending);
+
+    repo.lease_job(owner, 120).unwrap().unwrap();
+    assert!(!repo.mark_completed_manually(pending).unwrap());
+    let running = repo.get_job(pending).unwrap().unwrap();
+    assert_eq!(running.status, JobStatus::Running);
+    assert_eq!(running.lease_owner.as_deref(), Some(owner));
+
+    repo.finish(pending, owner, JobStatus::Completed, None, None, Some("out.mxf"))
+        .unwrap();
+    assert!(!repo.mark_completed_manually(pending).unwrap());
+    let done = repo.get_job(pending).unwrap().unwrap();
+    assert_eq!(done.status, JobStatus::Completed);
+    assert_eq!(done.file_path.as_deref(), Some("out.mxf"));
+}

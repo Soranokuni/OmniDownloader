@@ -5,8 +5,6 @@ edition = "2021"
 
 [dependencies]
 omni-core = { path = "../omni-core" }
-imap = { version = "3.0.0-alpha.15", default-features = false, features = ["native-tls"] }
-native-tls = "0.2"
 mailparse = "0.15"
 encoding_rs = "0.8"
 reqwest = { version = "0.12", features = ["json", "stream"] }

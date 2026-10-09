@@ -1,9 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{EventRequestWillBeSent, SetBlockedUrLsParams};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use tracing::{info, warn};
 use crate::adblock::UnifiedAdBlocker;
 use crate::agent::BrowserError;
 use crate::browser::HeadlessBrowserManager;
+use crate::glomex;
 
 /// Media session metadata and extracted video streams.
 /// Captures browser context (cookies, user-agent, referer) to forward to downstream
@@ -84,6 +86,36 @@ impl StreamSniffer {
     pub async fn extract_video_stream(target_url: &str, timeout_secs: u64) -> Result<String> {
         let media = Self::extract_media_bundle(target_url, timeout_secs).await?;
         Ok(media.primary_stream)
+    }
+
+    /// Launch the browser and find the video on a built-in test page (an X
+    /// post as portals embed it; nothing is fetched from the network).
+    /// Returns the browser's own version string ("Chrome/141.0.7390.55").
+    ///
+    /// This is the daily "does the browser still work?" check (plan P6.7):
+    /// a Chrome/Edge update that the browser library no longer understands
+    /// otherwise shows up as news-article jobs failing one by one.
+    pub async fn self_test() -> Result<String> {
+        const PAGE: &str = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Cmeta%20charset%3Dutf-8%3E\
+            %3Ch1%3EOmniDownloader%20self-test%3C%2Fh1%3E%3Cblockquote%20class%3D%22twitter-tweet%22%3E\
+            %3Ca%20href%3D%22https%3A%2F%2Fx.com%2FSelfTest%2Fstatus%2F1900000000000000042%22%3Epost%3C%2Fa%3E\
+            %3C%2Fblockquote%3E";
+        const EXPECTED: &str = "https://x.com/SelfTest/status/1900000000000000042";
+
+        let mut session = HeadlessBrowserManager::launch().await?;
+        let version = session
+            .browser
+            .version()
+            .await
+            .map(|v| v.product.replace("HeadlessChrome", "Chrome"))
+            .unwrap_or_else(|_| "unknown version".into());
+        let result = Self::sniff(&session.browser, PAGE, 10).await;
+        session.shutdown().await;
+        let media = result.context("the browser could not read its test page")?;
+        if !media.all_streams.iter().any(|u| u == EXPECTED) {
+            anyhow::bail!("the browser opened its test page but did not find the video on it");
+        }
+        Ok(version)
     }
 
     /// Full media extraction pipeline returning primary stream, all discovered streams,
@@ -293,19 +325,28 @@ impl StreamSniffer {
                 }
 
                 // 6. YouTube embeds (standard iframes, WP Rocket lazyload, ProtoThema custom plugins, explicit article links)
+                // Only a real YouTube address yields an id: the old pattern took
+                // any 11 characters after a "/", and read "ServiceLogi" out of a
+                // sign-in link (2026-10-06).
+                const ytId = (value) => {
+                    const m = String(value || '').match(
+                        /(?:youtube(?:-nocookie)?\.com\/(?:embed\/|shorts\/|live\/|v\/|watch\?(?:[^#]*&)?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})(?![a-zA-Z0-9_-])/i
+                    );
+                    return m ? m[1] : null;
+                };
                 const ytNodes = Array.from(document.querySelectorAll(
                     'iframe[src*="youtube.com"], iframe[src*="youtube-nocookie.com"], iframe[src*="youtu.be"],' +
                     'iframe[data-src*="youtube.com"], iframe[data-lazy-src*="youtube.com"],' +
-                    '.rll-youtube-player, [data-plugin-youtube], [data-id]'
+                    '.rll-youtube-player, [data-plugin-youtube]'
                 ));
                 for (const y of ytNodes) {
-                    const src = getSrc(y) || y.getAttribute('data-id') || '';
-                    const m = src.match(/(?:embed\/|v=|\/)([a-zA-Z0-9_-]{11})/);
-                    if (m) {
-                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + m[1] });
-                    }
+                    let id = ytId(getSrc(y));
+                    // WP Rocket's lazy player carries the bare id.
+                    const dataId = y.getAttribute('data-id') || '';
+                    if (!id && y.classList.contains('rll-youtube-player') && /^[a-zA-Z0-9_-]{11}$/.test(dataId)) id = dataId;
+                    if (id) found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
                     const pluginAttr = y.getAttribute('data-plugin-youtube') || '';
-                    const pm = pluginAttr.match(/"ID":\s*"([^"]+)"/);
+                    const pm = pluginAttr.match(/"ID":\s*"([a-zA-Z0-9_-]{11})"/);
                     if (pm) {
                         found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + pm[1] });
                     }
@@ -313,9 +354,9 @@ impl StreamSniffer {
 
                 const ytLinks = Array.from(document.querySelectorAll('a[href*="youtube.com/watch"], a[href*="youtu.be/"]'));
                 for (const a of ytLinks) {
-                    const m = (a.href || '').match(/(?:v=|\/)([a-zA-Z0-9_-]{11})/);
-                    if (m) {
-                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + m[1] });
+                    const id = ytId(a.href);
+                    if (id) {
+                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
                         break;
                     }
                 }
@@ -358,6 +399,39 @@ impl StreamSniffer {
                     if (t.getAttribute('cite')) found.push({ type: 'tiktok', url: t.getAttribute('cite') });
                 }
 
+                // 10b. Instagram posts: the official blockquote, or the
+                // embed iframe once it has loaded.
+                const igCanon = (u) => {
+                    const m = (u || '').match(/instagram\.com\/(p|reels?|tv)\/([A-Za-z0-9_-]+)/i);
+                    if (!m) return null;
+                    const kind = m[1].toLowerCase() === 'p' ? 'p' : (m[1].toLowerCase() === 'tv' ? 'tv' : 'reel');
+                    return `https://www.instagram.com/${kind}/${m[2]}/`;
+                };
+                const igNodes = Array.from(document.querySelectorAll(
+                    'blockquote.instagram-media, [data-instgrm-permalink], iframe[src*="instagram.com/"], iframe[data-src*="instagram.com/"]'
+                ));
+                for (const n of igNodes) {
+                    const u = igCanon(n.getAttribute('data-instgrm-permalink') || getSrc(n) || (n.querySelector('a') || {}).href);
+                    if (u) found.push({ type: 'instagram', url: u });
+                }
+
+                // 10c. Streamable players.
+                for (const f of Array.from(document.querySelectorAll('iframe[src*="streamable.com"], iframe[data-src*="streamable.com"], iframe[data-lazy-src*="streamable.com"]'))) {
+                    const m = getSrc(f).match(/streamable\.com\/(?:e|o|s)\/([A-Za-z0-9]+)/i);
+                    if (m) found.push({ type: 'streamable', url: 'https://streamable.com/' + m[1] });
+                }
+
+                // 10d. A portal's own oEmbed proxy (iefimerida.gr:
+                // <iframe data-src="/oembed?url=https%3A%2F%2Fwww.instagram.com%2Freel%2F…">),
+                // lazy, so the post inside never loads in a headless visit.
+                for (const f of Array.from(document.querySelectorAll('iframe[src*="oembed"], iframe[data-src*="oembed"], iframe[data-lazy-src*="oembed"]'))) {
+                    let inner = null;
+                    try { inner = new URL(getSrc(f), location.href).searchParams.get('url'); } catch (e) {}
+                    if (!inner || !/^https?:\/\//i.test(inner)) continue;
+                    const ig = igCanon(inner);
+                    found.push({ type: 'oembed', url: ig || inner.replace(/[?&]utm_[^&#]*/g, '') });
+                }
+
                 // 11. Direct HTML5 <video> and <source> elements (In.gr, Star.gr, ERT)
                 const videoElements = Array.from(document.querySelectorAll('video, video source, source'));
                 for (const el of videoElements) {
@@ -381,40 +455,15 @@ impl StreamSniffer {
             })()
         "#;
 
+        // Where the page really is (after redirects): what a contextual glomex
+        // player is matched against.
+        let page_url = page.url().await.ok().flatten().unwrap_or_else(|| target_url.to_string());
+        let mut handled: HashSet<String> = HashSet::new();
         match page.evaluate(dom_embed_js).await {
             Ok(eval) => {
-                if let Some(val) = eval.value() {
-                    if let Some(arr) = val.as_array() {
-                        info!("StreamSniffer: DOM embed inspection found {} raw elements", arr.len());
-                        for item in arr {
-                            if let Some(obj) = item.as_object() {
-                                if let Some(url_val) = obj.get("url").and_then(Value::as_str) {
-                                    let embed_type = obj
-                                        .get("type")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("embed");
-                                    let score = if embed_type == "script_hls" || embed_type == "ert_hls" {
-                                        100
-                                    } else if embed_type == "video_src" || embed_type == "source_src" {
-                                        Self::score_stream_url(url_val)
-                                    } else {
-                                        95 // Embedded platform URL (Twitter, Glomex, JWPlayer, YouTube, Dailymotion, TikTok, Brightcove, Vimeo)
-                                    };
-
-                                    if score > 0 {
-                                        info!(
-                                            "StreamSniffer: Identified DOM embedded media [{}] (score: {}): {}",
-                                            embed_type, score, url_val
-                                        );
-                                        let mut list = candidates.lock().await;
-                                        if !list.iter().any(|(_, u)| u == url_val) {
-                                            list.push((score, url_val.to_string()));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if let Some(arr) = eval.value().and_then(Value::as_array) {
+                    info!("StreamSniffer: DOM embed inspection found {} raw elements", arr.len());
+                    Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
                 }
             }
             Err(e) => {
@@ -459,37 +508,8 @@ impl StreamSniffer {
             if last_dom_poll.elapsed() >= Duration::from_millis(1500) {
                 last_dom_poll = std::time::Instant::now();
                 if let Ok(eval) = page.evaluate(dom_embed_js).await {
-                    if let Some(val) = eval.value() {
-                        if let Some(arr) = val.as_array() {
-                            for item in arr {
-                                if let Some(obj) = item.as_object() {
-                                    if let Some(url_val) = obj.get("url").and_then(Value::as_str) {
-                                        let embed_type = obj
-                                            .get("type")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("embed");
-                                        let score = if embed_type == "script_hls" || embed_type == "ert_hls" {
-                                            100
-                                        } else if embed_type == "video_src" || embed_type == "source_src" {
-                                            Self::score_stream_url(url_val)
-                                        } else {
-                                            95
-                                        };
-
-                                        if score > 0 {
-                                            let mut list = candidates.lock().await;
-                                            if !list.iter().any(|(_, u)| u == url_val) {
-                                                info!(
-                                                    "StreamSniffer: Identified DOM embedded media [{}] (score: {}): {}",
-                                                    embed_type, score, url_val
-                                                );
-                                                list.push((score, url_val.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(arr) = eval.value().and_then(Value::as_array) {
+                        Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
                     }
                 }
             }
@@ -524,9 +544,7 @@ impl StreamSniffer {
         });
 
         // 10. Compile all streams and primary stream
-        let list = candidates.lock().await;
-        let mut sorted_candidates = list.clone();
-        sorted_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let sorted_candidates = final_candidates(candidates.lock().await.clone());
 
         if let Some((score, best_url)) = sorted_candidates.first() {
             info!(
@@ -549,6 +567,72 @@ impl StreamSniffer {
             Err(BrowserError::NoStreamFound(target_url.to_string()).into())
         }
     }
+
+    /// One DOM inspection's findings into the candidate list. `handled` holds
+    /// the URLs already looked at, so a glomex player is resolved once, not on
+    /// every re-poll.
+    async fn add_dom_items(
+        items: &[Value],
+        candidates: &Mutex<Vec<(u32, String)>>,
+        handled: &mut HashSet<String>,
+        page_url: &str,
+    ) {
+        for obj in items.iter().filter_map(Value::as_object) {
+            let Some(raw) = obj.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            if !handled.insert(raw.to_string()) {
+                continue;
+            }
+            let embed_type = obj.get("type").and_then(Value::as_str).unwrap_or("embed");
+
+            let (score, url) = if let Some(embed) = glomex::parse_embed(raw) {
+                match glomex::resolve(&embed, page_url).await {
+                    Ok(glomex::Resolved::Embed(u)) => (95, u),
+                    Ok(glomex::Resolved::Empty) => {
+                        info!("StreamSniffer: glomex player {raw} has no video for this page; ignored");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("StreamSniffer: could not ask glomex which video {raw} plays: {e:#}");
+                        continue;
+                    }
+                }
+            } else if embed_type == "script_hls" || embed_type == "ert_hls" {
+                (100, raw.to_string())
+            } else if embed_type == "video_src" || embed_type == "source_src" {
+                (Self::score_stream_url(raw), raw.to_string())
+            } else {
+                // Embedded platform URL (Twitter, JWPlayer, YouTube, Dailymotion, TikTok, Brightcove, Vimeo)
+                (95, raw.to_string())
+            };
+
+            if score > 0 {
+                let mut list = candidates.lock().await;
+                if !list.iter().any(|(_, u)| *u == url) {
+                    info!("StreamSniffer: Identified DOM embedded media [{embed_type}] (score: {score}): {url}");
+                    list.push((score, url));
+                }
+            }
+        }
+    }
+}
+
+/// The candidates, best first, without the network copy of a glomex clip
+/// that is also found as its player: the player URL gives yt-dlp the clip's
+/// best rendition and its title, and the copy would be offered to MCR as a
+/// second video.
+fn final_candidates(mut list: Vec<(u32, String)>) -> Vec<(u32, String)> {
+    let embedded: HashSet<String> = list
+        .iter()
+        .filter_map(|(_, u)| glomex::parse_embed(u))
+        .map(|e| e.playlist_id)
+        .collect();
+    list.retain(|(_, u)| glomex::clip_id_of_stream(u).map_or(true, |clip| !embedded.contains(&clip)));
+    // Stable: among equal scores the one found first stays first.
+    list.sort_by(|a, b| b.0.cmp(&a.0));
+    list
+
 }
 
 #[cfg(test)]
@@ -635,5 +719,19 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// neakriti.gr, 2026-10-05: the network saw the stream of the clip a
+    /// contextual player played, and the same clip was found as its player.
+    /// One video, not two, and the player URL is the one downloaded.
+    #[test]
+    fn a_glomex_clip_seen_as_player_and_as_stream_is_one_candidate() {
+        let player = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=eexbs17mbtfi1y9&playlistId=v-dlso19wczcdl";
+        let stream = "https://video-cdn-jwt-new.mes.glomex.cloud/v2/77a350/v-dlso19wczcdl/eyJ0.eyJl.-wps/stream.mp4";
+        let other = "https://video-cdn-jwt-new.mes.glomex.cloud/v2/77a350/v-another/eyJ0.eyJl.-wps/stream.mp4";
+        let tiktok = "https://www.tiktok.com/@someone/video/7690626350159318305";
+        let out = final_candidates(vec![(80, stream.into()), (95, player.into()), (80, other.into()), (95, tiktok.into())]);
+        let urls: Vec<&str> = out.iter().map(|(_, u)| u.as_str()).collect();
+        assert_eq!(urls, vec![player, tiktok, other]);
     }
 }

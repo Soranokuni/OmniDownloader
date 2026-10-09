@@ -30,6 +30,7 @@ struct App {
     mcr_token: String,
     user_token: String,
     admin_token: String,
+    busy: omni_core::busy::BusyJobs,
     _dir: TempDir,
 }
 
@@ -70,6 +71,7 @@ impl App {
         repo.create_session(admin_id, &admin_token, 1)?;
 
         let state = AppState::new(repo.clone(), config, dir.path().join("config.json"));
+        let busy = state.busy_jobs.clone();
         let router = WebServer::build_router(state);
 
         Ok(Self {
@@ -78,6 +80,7 @@ impl App {
             mcr_token,
             user_token,
             admin_token,
+            busy,
             _dir: dir,
         })
     }
@@ -211,6 +214,22 @@ async fn jobs_api_full_lifecycle() -> Result<()> {
         JobStatus::Pending
     );
 
+    // 4b. A running job is not retried or overridden
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    for (path, body) in [
+        ("retry", None),
+        ("override", Some(json!({"url": "https://www.youtube.com/watch?v=other"}))),
+    ] {
+        let (status, json) = app
+            .send("POST", &format!("/api/jobs/{}/{}", job_id, path), &app.mcr_token, body)
+            .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}");
+        assert_eq!(json["error"]["code"], "NOT_RETRYABLE", "{path}");
+        let row = app.repo.get_job(job_id)?.unwrap();
+        assert_eq!(row.status, JobStatus::Running);
+        assert_eq!(row.lease_owner.as_deref(), Some("test-worker"));
+    }
+
     // 5. Discard
     let (status, _) = app
         .send(
@@ -315,7 +334,7 @@ async fn html_pages_render_for_the_roles_that_may_see_them() -> Result<()> {
 
     for (uri, token, needle) in [
         ("/mcr", &app.mcr_token, "MCR"),
-        ("/user", &app.user_token, "Ingest"),
+        ("/user", &app.user_token, "Οι αποστολές μου"),
         ("/admin", &app.admin_token, "Administration"),
     ] {
         let res = app
@@ -420,6 +439,7 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     let queued = app.repo.get_job(new_id)?.unwrap();
     assert_eq!((queued.url.as_str(), queued.slug.as_str()), (raw, "1D_MCR_SEISMOS"));
     assert_eq!(queued.status, JobStatus::Pending);
+    assert_eq!(queued.parent_job_id, Some(id), "the mail view files it under its article (plan P7.6)");
 
     // Twice: refused, and the offer remembers the job it became.
     let (status, body) = app.send("POST", &uri, &app.mcr_token, Some(json!({ "url": raw }))).await?;
@@ -430,5 +450,433 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     // A reporter cannot use it.
     let (status, _) = app.send("POST", &uri, &app.user_token, Some(json!({ "url": raw }))).await?;
     assert!(status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED, "{status}");
+    Ok(())
+}
+// ==========================================
+// MCR mail view (plan P7.8)
+// ==========================================
+
+/// A Message-ID in a query string.
+fn q(key: &str) -> String {
+    key.replace('%', "%25").replace('<', "%3C").replace('>', "%3E").replace('@', "%40").replace('+', "%2B")
+}
+
+/// A handled mail from GEORGIOU whose first link became a job; returns the job id.
+fn seed_mail(app: &App, key: &str, body: &str, job_url: &str) -> Result<i64> {
+    let mut new = omni_core::models::NewJob::new(job_url, "1_GEORGIOU_SEISMOS", "GEORGIOU");
+    new.keyword = "SEISMOS".into();
+    new.email_message_id = Some(key.into());
+    let result = app.repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)?;
+    app.repo.record_processed_mail(&omni_core::models::ProcessedMail {
+        internet_message_id: key.into(),
+        source_id: Some("AAMk-graph-id".into()),
+        outcome: "JOBS".into(),
+        from_address: Some("e.georgiou@example.gr".into()),
+        from_name: Some("Ελένη Γεωργίου".into()),
+        subject: Some("ΘΕΜΑΤΑ ΕΛΕΝΗΣ".into()),
+        jobs_json: json!([{ "index_str": "1", "slug": "1_GEORGIOU_SEISMOS", "url": job_url, "status": "PENDING", "result": result }])
+            .to_string(),
+        received_at: Some(chrono::Utc::now()),
+        body_text: Some(body.into()),
+        parse_json: Some(
+            json!({ "journalist": "GEORGIOU", "how": "sender", "outcome": "JOBS",
+                    "sections": [{ "index_str": "1", "keyword": "SEISMOS" }] })
+            .to_string(),
+        ),
+        ..Default::default()
+    })?;
+    Ok(result.job_id())
+}
+
+#[tokio::test]
+async fn the_mail_view_lists_a_mail_and_shows_its_text_links_and_jobs() -> Result<()> {
+    let app = App::new()?;
+    let body = "1. ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=api00000001\nΔείτε και https://www.portal-news.example/";
+    let id = seed_mail(&app, "<m1@example.gr>", body, "https://www.youtube.com/watch?v=api00000001")?;
+
+    let (status, list) = app.send("GET", "/api/mails", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["entries"][0]["key"], "<m1@example.gr>");
+    assert_eq!(list["entries"][0]["state"], "active");
+    assert_eq!(list["entries"][0]["jobs"][0]["id"], id);
+    assert_eq!(list["counts"]["all"], 1);
+    assert!(list["job_counts"]["active"].as_i64().is_some());
+
+    let uri = format!("/api/mails/view?key={}", q("<m1@example.gr>"));
+    let (status, view) = app.send("GET", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["from_name"], "Ελένη Γεωργίου");
+    assert_eq!(view["how"], "από τη διεύθυνση του αποστολέα");
+    assert_eq!(view["links"][0]["jobs"], json!([id]));
+    assert_eq!(view["links"][1]["skip"]["can_queue"], true);
+    assert_eq!(view["jobs"][0]["id"], id);
+    assert_eq!(view["jobs"][0]["place"]["link"], "l1");
+    assert_eq!(view["next_index"], "2");
+    assert_eq!(view["text"][0]["role"], "read");
+
+    // The live refresh carries what changes, not the text.
+    let (_, part) = app.send("GET", &format!("{uri}&parts=jobs"), &app.mcr_token, None).await?;
+    assert!(part.get("text").is_none() && part["jobs"][0]["id"] == id, "{part}");
+
+    let (status, _) = app.send("GET", "/api/mails/view?key=%3Cnope%40x%3E", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// The mail's text reaches the panel as JSON strings, never as markup.
+#[tokio::test]
+async fn a_hostile_mail_text_is_returned_as_data() -> Result<()> {
+    let app = App::new()?;
+    let body = "<img src=x onerror=alert(1)>\nhttps://www.youtube.com/watch?v=xss00000002\n</div><script>alert(2)</script>";
+    seed_mail(&app, "<x1@example.gr>", body, "https://www.youtube.com/watch?v=xss00000002")?;
+    let res = app
+        .router
+        .clone()
+        .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/mails/view?key={}", q("<x1@example.gr>")))
+                .header("cookie", format!("omni_session={}", app.mcr_token))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.headers()["content-type"], "application/json");
+    let view: Value = serde_json::from_slice(&res.into_body().collect().await?.to_bytes())?;
+    assert_eq!(view["text"][0]["lines"][0][0]["t"], "<img src=x onerror=alert(1)>");
+    assert_eq!(view["text"][0]["lines"][2][0]["t"], "</div><script>alert(2)</script>");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skipped_link_can_be_queued_from_its_mail_once() -> Result<()> {
+    let app = App::new()?;
+    let body = "1. ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=api00000003\nΔείτε και https://www.portal-news.example/\nΦωτο: https://www.example.gr/photo.jpg";
+    seed_mail(&app, "<m3@example.gr>", body, "https://www.youtube.com/watch?v=api00000003")?;
+    let send = |url: &str| json!({ "key": "<m3@example.gr>", "url": url });
+
+    // Not in this mail: refused.
+    let (status, _) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://evil.example/x")))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A photo: refused.
+    let (status, _) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://www.example.gr/photo.jpg")))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://www.portal-news.example/")))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["slug"], "2_GEORGIOU_SEISMOS", "next number, the mail's journalist, the story next to it");
+    let job = app.repo.get_job(body["job_id"].as_i64().unwrap())?.unwrap();
+    assert_eq!(job.email_message_id.as_deref(), Some("<m3@example.gr>"));
+    assert_eq!(job.status, JobStatus::Pending);
+
+    // Filed under its link in the view; a second click is refused.
+    let (_, view) = app
+        .send("GET", &format!("/api/mails/view?key={}", q("<m3@example.gr>")), &app.mcr_token, None)
+        .await?;
+    assert_eq!(view["links"][1]["jobs"], json!([job.id]), "{view}");
+    let (status, _) = app
+        .send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send("https://www.portal-news.example/")))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_a_mail_the_watcher_gave_up_on_can_be_read_again_from_the_desk() -> Result<()> {
+    let app = App::new()?;
+    seed_mail(&app, "<ok@example.gr>", "x https://youtu.be/okokokok", "https://youtu.be/okokokok")?;
+    app.repo.record_processed_mail(&omni_core::models::ProcessedMail {
+        internet_message_id: "<failed@example.gr>".into(),
+        source_id: Some("AAMk-failed".into()),
+        outcome: "FAILED".into(),
+        subject: Some("Πλάνα λιμάνι".into()),
+        ..Default::default()
+    })?;
+    let ask = |key: &str| json!({ "key": key });
+
+    let (status, _) = app.send("POST", "/api/mails/reprocess", &app.mcr_token, Some(ask("<ok@example.gr>"))).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a handled mail stays with the administrator");
+    let (status, _) = app.send("POST", "/api/mails/reprocess", &app.mcr_token, Some(ask("<nope@example.gr>"))).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) =
+        app.send("POST", "/api/mails/reprocess", &app.mcr_token, Some(ask("<failed@example.gr>"))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pending: Vec<String> = app.repo.pending_mail_reprocess()?.into_iter().map(|(k, _, _)| k).collect();
+    assert_eq!(pending, vec!["<failed@example.gr>"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_link_added_by_hand_is_an_entry_of_its_own_with_a_timeline() -> Result<()> {
+    let app = App::new()?;
+    let (status, created) = app
+        .send(
+            "POST",
+            "/api/jobs",
+            &app.mcr_token,
+            Some(json!({ "url": "https://www.ertnews.gr/video/kairos/", "journalist": "MCR", "keyword": "KAIROS" })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["job_id"].as_i64().unwrap();
+
+    let (_, list) = app.send("GET", "/api/mails", &app.mcr_token, None).await?;
+    assert_eq!(list["entries"][0]["kind"], "manual");
+    assert_eq!(list["entries"][0]["key"], id.to_string());
+    assert_eq!(list["entries"][0]["added_by_name"], "MCR Desk");
+
+    let (status, view) =
+        app.send("GET", &format!("/api/mails/view?kind=manual&key={id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["links"][0]["jobs"], json!([id]));
+    assert_eq!(view["jobs"][0]["place"]["shared"], false);
+
+    let (status, detail) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail["events"][0]["message"].as_str().unwrap_or("").starts_with("Queued as"), "{detail}");
+    Ok(())
+}
+
+/// Plan P7.11: a video on the desk says which mail it came from, and the
+/// mail list can be asked for the page that holds that mail.
+#[tokio::test]
+async fn a_video_on_the_desk_names_its_mail_and_the_list_finds_it() -> Result<()> {
+    let app = App::new()?;
+    let id = seed_mail(&app, "<m9@example.gr>", "1. Α\nhttps://youtu.be/m9m9m9m9", "https://youtu.be/m9m9m9m9")?;
+    let (status, page) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    let job = page["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap();
+    assert_eq!(job["mail_subject"], "ΘΕΜΑΤΑ ΕΛΕΝΗΣ");
+    assert_eq!(job["email_message_id"], "<m9@example.gr>");
+
+    let (status, list) = app
+        .send("GET", &format!("/api/mails?per_page=5&focus=mail%3A{}", q("<m9@example.gr>")), &app.mcr_token, None)
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["page"], 1);
+    assert_eq!(list["entries"][0]["key"], "<m9@example.gr>");
+    Ok(())
+}
+
+/// Plan P7.19: a waiting video says its place; one in back-off has none.
+#[tokio::test]
+async fn waiting_videos_get_a_queue_position_and_back_off_ones_do_not() -> Result<()> {
+    let app = App::new()?;
+    let new = |n: u32| omni_core::models::NewJob::new(format!("https://example.gr/q{n}"), format!("{n}_ANNA_QUEUE"), "ANNA");
+    let backoff = app.repo.enqueue(&new(1), 24)?.job_id();
+    app.repo.lease_job("W", 180)?.expect("leasable");
+    assert!(app.repo.requeue_after(backoff, "W", chrono::Duration::minutes(5), "E_TEST", "later")?);
+    let first = app.repo.enqueue(&new(2), 24)?.job_id();
+    let second = app.repo.enqueue(&new(3), 24)?.job_id();
+
+    let (status, page) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    let find = |id: i64| page["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone();
+    assert_eq!(find(first)["queue_position"], 1);
+    assert_eq!(find(second)["queue_position"], 2);
+    assert!(find(backoff).get("queue_position").is_none(), "{}", find(backoff));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_mail_view_gives_a_queue_position_to_ready_videos_only() -> Result<()> {
+    let app = App::new()?;
+    let ready = seed_mail(&app, "<m19@example.gr>", "1. Α\nhttps://example.gr/q19a", "https://example.gr/q19a")?;
+    let mut other = omni_core::models::NewJob::new("https://example.gr/q19b", "2_GEORGIOU_SEISMOS", "GEORGIOU");
+    other.email_message_id = Some("<m19@example.gr>".into());
+    let waiting = app.repo.enqueue(&other, 24)?.job_id();
+    // Lease the second one by hand so it can go into back-off.
+    app.repo.lease_job("W", 180)?; // takes `ready`
+    app.repo.lease_job("W2", 180)?; // takes `waiting`
+    assert!(app.repo.requeue_after(waiting, "W2", chrono::Duration::minutes(5), "E_TEST", "later")?);
+    assert!(app.repo.requeue_after(ready, "W", chrono::Duration::seconds(-1), "E_TEST", "later")?);
+
+    let uri = format!("/api/mails/view?key={}", q("<m19@example.gr>"));
+    let (status, view) = app.send("GET", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let find = |id: i64| view["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone();
+    assert_eq!(find(ready)["queue_position"], 1, "{view}");
+    assert!(find(waiting).get("queue_position").is_none(), "{view}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcr_can_mark_a_review_video_as_put_into_dalet_once() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/locker", "1_NIKOLAOU_LOCKER", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+
+    // A running job is refused.
+    let uri = format!("/api/jobs/{id}/mark-done");
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "NOT_MARKABLE");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Running);
+
+    app.repo
+        .finish(id, "test-worker", JobStatus::RequiresReview, Some("E_TEST"), Some("why"), None)?;
+    let (status, _) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::CompletedManual);
+    let events = app.repo.get_job_events(id, 100)?;
+    assert!(
+        events.iter().any(|e| e.message.starts_with("Finished as COMPLETED_MANUAL: put into Dalet by hand")),
+        "no event recorded"
+    );
+
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "NOT_MARKABLE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcr_cancels_a_waiting_video_and_it_stays_in_the_list() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/cancel", "1_NIKOLAOU_CANCEL", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    let uri = format!("/api/jobs/{id}/cancel");
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Cancelled);
+    let events = app.repo.get_job_events(id, 100)?;
+    assert!(events.iter().any(|e| e.level == "WARN" && e.message.starts_with("Cancelled by")), "no event");
+
+    let (status, json) = app.send("POST", &uri, &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "NOT_CANCELLABLE");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_video_that_is_delivering_is_too_late_to_cancel() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/late", "1_NIKOLAOU_LATE", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    assert!(app.repo.set_stage(id, "test-worker", omni_core::models::JobStage::Deliver)?);
+
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/cancel"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["error"]["code"], "TOO_LATE");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_and_discard_fire_the_running_workers_token() -> Result<()> {
+    let app = App::new()?;
+    for (n, discard) in [(1, false), (2, true)] {
+        let id = app
+            .repo
+            .enqueue(
+                &omni_core::models::NewJob::new(&format!("https://example.gr/kill{n}"), &format!("{n}_NIKOLAOU_KILL"), "NIKOLAOU"),
+                omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+            )?
+            .job_id();
+        app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+        let guard = app.busy.guard(id, "test-worker");
+        let token = guard.token();
+        assert!(!token.is_cancelled());
+
+        let (status, json) = if discard {
+            app.send("POST", &format!("/api/jobs/{id}/discard"), &app.mcr_token, None).await?
+        } else {
+            app.send("POST", &format!("/api/jobs/{id}/cancel"), &app.mcr_token, None).await?
+        };
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(token.is_cancelled(), "the worker's tool would run on (discard={discard})");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_whose_worker_is_still_stopping_is_not_queued_again() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/stop", "1_NIKOLAOU_STOP", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    assert!(app.repo.cancel_job(id)? == omni_core::repository::CancelOutcome::Cancelled);
+    let busy_guard = app.busy.guard(id, "test-worker");
+
+    for (uri, body) in [
+        (format!("/api/jobs/{id}/retry"), None),
+        (format!("/api/jobs/{id}/override"), Some(serde_json::json!({ "url": "https://example.gr/other" }))),
+        (format!("/api/jobs/{id}/redownload"), None),
+    ] {
+        let (status, json) = app.send("POST", &uri, &app.mcr_token, body).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {json}");
+        assert_eq!(json["error"]["code"], "STILL_STOPPING", "{uri}");
+    }
+    let row = app.repo.get_job(id)?.unwrap();
+    assert_eq!(row.status, JobStatus::Cancelled, "the row must not be touched");
+
+    drop(busy_guard);
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/retry"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcr_can_hide_old_review_videos_and_show_them_again() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/old", "1_NIKOLAOU_OLD", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    app.repo.finish(id, "test-worker", JobStatus::RequiresReview, Some("E_TEST"), Some("why"), None)?;
+
+    // The default (72 h) leaves a fresh job alone.
+    let (status, json) = app.send("POST", "/api/jobs/review/hide-old", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["hidden"], 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (status, json) = app
+        .send("POST", "/api/jobs/review/hide-old", &app.mcr_token, Some(json!({ "hours": 0 })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["hidden"], 1);
+
+    let (_, page) = app.send("GET", "/api/jobs?view=review", &app.mcr_token, None).await?;
+    assert_eq!(page["total"], 0, "{page}");
+    assert_eq!(page["counts"]["review"], 0);
+    assert_eq!(page["counts"]["review_hidden"], 1);
+    assert!(page["counts"]["completed_today"].as_i64().is_some(), "{page}");
+
+    let (_, page) = app.send("GET", "/api/jobs?view=review&hidden=1", &app.mcr_token, None).await?;
+    assert_eq!(page["total"], 1, "{page}");
+    assert!(page["jobs"][0]["cleared_at"].is_string(), "the card can say it is hidden: {page}");
     Ok(())
 }

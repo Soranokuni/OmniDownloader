@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="el">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniDownloader — Sign in</title>
-<link rel="stylesheet" href="/static/app.css?v=2">
+<title>OmniDownloader — Σύνδεση</title>
+<link rel="stylesheet" href="/static/app.css?v=8">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -14,31 +14,31 @@
     <div class="auth-head">
       <div class="brand-mark">O</div>
       <h1>OmniDownloader</h1>
-      <p>Broadcast ingest — newsroom sign in</p>
+      <p>Λήψη βίντεο για εκπομπή — σύνδεση</p>
     </div>
 
     <div class="card">
       <form id="login-form" class="stack">
         <div>
-          <label for="email">Work email</label>
-          <input type="email" id="email" required autocomplete="username" autofocus>
+          <label for="email">Email εργασίας ή όνομα χρήστη</label>
+          <input type="text" id="email" required autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>
         </div>
         <div>
-          <label for="password">Password</label>
+          <label for="password">Κωδικός</label>
           <input type="password" id="password" required autocomplete="current-password">
         </div>
-        <button class="btn btn-primary btn-block" type="submit" id="submit-btn">Sign in</button>
+        <button class="btn btn-primary btn-block" type="submit" id="submit-btn">Σύνδεση</button>
         <p id="error" class="note bad" role="alert"></p>
       </form>
     </div>
 
     <p id="setup-hint" class="note" style="text-align:center;margin-top:14px" hidden>
-      No administrator account exists yet. Open
-      <strong>/setup</strong> in a browser on the ingest machine itself to create one.
+      Δεν υπάρχει ακόμη λογαριασμός διαχειριστή. Ανοίξτε τη σελίδα
+      <strong>/setup</strong> σε πρόγραμμα περιήγησης στον ίδιο τον υπολογιστή λήψης για να δημιουργήσετε έναν.
     </p>
   </div>
 </div>
 
-<script type="module" src="/static/login.js?v=2"></script>
+<script type="module" src="/static/login.js?v=5"></script>
 </body>
 </html>

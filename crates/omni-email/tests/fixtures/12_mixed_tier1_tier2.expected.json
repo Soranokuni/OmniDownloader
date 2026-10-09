@@ -1,8 +1,5 @@
 {
-  "ignored_urls": [
-    "https://www.protothema.gr/greece/article/1500000/purkagia-lasithi/",
-    "https://www.newsit.gr/ellada/fotia-sto-lasithi/4000000/"
-  ],
+  "ignored_urls": [],
   "journalist": {
     "how": "sender",
     "surname": "GEORGIOU"
@@ -13,8 +10,26 @@
       "index_str": "1",
       "jobs": [
         {
+          "confidence": 0.8,
+          "index_str": "1A",
+          "keyword": "PYRKAGIALASITHI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.protothema.gr/greece/article/1500000/purkagia-lasithi/"
+        },
+        {
+          "confidence": 0.8,
+          "index_str": "1B",
+          "keyword": "PYRKAGIALASITHI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.newsit.gr/ellada/fotia-sto-lasithi/4000000/"
+        },
+        {
           "confidence": 0.95,
-          "index_str": "1",
+          "index_str": "1C",
           "keyword": "PYRKAGIALASITHI",
           "marker": false,
           "status": "PENDING",

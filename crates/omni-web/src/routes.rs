@@ -6,6 +6,7 @@ use axum::Json;
 use chrono::Duration as ChronoDuration;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -163,7 +164,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         let mut response = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
-            "Too many failed sign-in attempts. Try again shortly.",
+            "Πάρα πολλές αποτυχημένες προσπάθειες σύνδεσης. Δοκιμάστε ξανά σε λίγο.",
         )
         .into_response();
         response.headers_mut().insert(
@@ -191,7 +192,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         }
         Err(e) => {
             tracing::error!(error = ?e, "Login lookup failed");
-            return ApiError::internal("Sign-in is temporarily unavailable.").into_response();
+            return ApiError::internal("Η σύνδεση δεν είναι διαθέσιμη αυτή τη στιγμή.").into_response();
         }
     };
 
@@ -265,7 +266,7 @@ fn invalid_credentials() -> Response {
     ApiError::new(
         StatusCode::UNAUTHORIZED,
         "INVALID_CREDENTIALS",
-        "Invalid email or password.",
+        "Λάθος email ή κωδικός.",
     )
     .into_response()
 }
@@ -339,6 +340,7 @@ pub async fn api_change_password(
     // panel sends the operator back to the login screen afterwards.
     match state.repo.update_user_password(user.id, &payload.new_password) {
         Ok(()) => {
+            omni_core::selftest::check_default_admin(&state.repo, &state.health);
             let mut response =
                 Json(serde_json::json!({"status": "ok", "reauth_required": true})).into_response();
             response
@@ -353,20 +355,8 @@ pub async fn api_change_password(
     }
 }
 
-/// Minimum password policy.
-///
-/// Length only. Composition rules ("one digit, one symbol") push operators
-/// towards `Password1!` and towards writing it on the desk; a 12-character
-/// floor is the part that actually helps.
-pub fn validate_password(password: &str) -> Result<(), String> {
-    if password.chars().count() < 12 {
-        return Err("Password must be at least 12 characters.".to_string());
-    }
-    if password.chars().count() > 256 {
-        return Err("Password must be at most 256 characters.".to_string());
-    }
-    Ok(())
-}
+/// Minimum password policy: one rule for the panels and the CLI.
+pub use omni_core::auth::validate_password;
 
 // ==========================================
 // Jobs API
@@ -376,6 +366,25 @@ pub fn validate_password(password: &str) -> Result<(), String> {
 pub struct JobsQuery {
     my: Option<bool>,
     journalist: Option<String>,
+    /// `live`, `review` or `completed`: one page of an MCR desk list
+    /// (plan P7.1). Without it, the old unpaged list.
+    view: Option<omni_core::models::JobsView>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+    q: Option<String>,
+    group: Option<String>,
+    /// `1`: the review view also lists the jobs MCR hid (plan P7.21).
+    hidden: Option<u8>,
+}
+
+/// A job as the MCR desk shows it: the row, plus what its error code means
+/// and what to do about it, in the operators' language.
+fn job_for_desk(job: &omni_core::models::Job) -> serde_json::Value {
+    let mut v = serde_json::to_value(job).unwrap_or_default();
+    if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
+        v["hint"] = serde_json::Value::String(code.hint_el().to_string());
+    }
+    v
 }
 
 pub async fn api_get_jobs(
@@ -383,6 +392,49 @@ pub async fn api_get_jobs(
     Query(query): Query<JobsQuery>,
     State(state): State<AppState>,
 ) -> JsonResult {
+    if let Some(view) = query.view {
+        let filter = omni_core::models::JobsFilter {
+            search: query.q.clone().unwrap_or_default(),
+            journalist: query.journalist.clone().unwrap_or_default(),
+            group: query.group.clone().unwrap_or_default(),
+            include_hidden: query.hidden == Some(1),
+        };
+        let page = state
+            .repo
+            .list_jobs_page(view, &filter, query.page.unwrap_or(1), query.per_page.unwrap_or(20))
+            .map_err(internal_error("Could not read the job queue."))?;
+        let counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+        // Which mail each came from, so the desk can open it (plan P7.11).
+        let keys: Vec<String> = page.jobs.iter().filter_map(|j| j.email_message_id.clone()).collect();
+        let subjects = state.repo.mail_subjects(&keys).unwrap_or_default();
+        // Place in the queue, for waiting jobs on the live view (plan P7.19).
+        let positions = if view == omni_core::models::JobsView::Live {
+            state.repo.pending_positions().unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        let jobs: Vec<serde_json::Value> = page
+            .jobs
+            .iter()
+            .map(|j| {
+                let mut v = job_for_desk(j);
+                if let Some(pos) = positions.get(&j.id) {
+                    v["queue_position"] = serde_json::json!(pos);
+                }
+                if let Some(subject) = j.email_message_id.as_ref().and_then(|k| subjects.get(k)) {
+                    v["mail_subject"] = serde_json::Value::String(subject.clone());
+                }
+                v
+            })
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "jobs": jobs,
+            "total": page.total,
+            "page": page.page,
+            "per_page": page.per_page,
+            "counts": counts,
+        })));
+    }
     let jobs = if query.my == Some(true) {
         let Some(user) = principal.user() else {
             return Err(ApiError::unauthorized());
@@ -421,7 +473,12 @@ pub async fn api_get_job(
         .get_job(job_id)
         .map_err(internal_error("Could not read the job."))?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(serde_json::json!({ "job": job })))
+    // The timeline the mail view shows for a selected video (plan P7.8).
+    let events = state
+        .repo
+        .recent_job_events(job_id, 80)
+        .map_err(internal_error("Could not read the job."))?;
+    Ok(Json(serde_json::json!({ "job": job_for_desk(&job), "events": events })))
 }
 
 #[derive(Deserialize)]
@@ -432,6 +489,8 @@ pub struct CreateJobPayload {
     priority: Option<i32>,
     journalist: Option<String>,
     index_str: Option<String>,
+    /// Only the first N videos of the article (plan P4.33).
+    max_videos: Option<i64>,
 }
 
 pub async fn api_create_job(
@@ -442,7 +501,7 @@ pub async fn api_create_job(
     let url = payload.url.trim();
     if !is_submittable_url(url) {
         return Err(ApiError::bad_request(
-            "Enter an http:// or https:// link.",
+            "Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://.",
         ));
     }
 
@@ -463,24 +522,22 @@ pub async fn api_create_job(
     let priority = payload.priority.unwrap_or(0).clamp(-100, 100);
     let submitted_by = auth_user.map(|u| u.id);
 
+    let mut new = omni_core::models::NewJob::new(url, slug.clone(), journalist.clone());
+    new.keyword = keyword.clone();
+    new.index_str = index_str.clone();
+    new.priority = priority;
+    new.status = JobStatus::Pending;
+    new.submitted_by_user_id = submitted_by;
+    new.notes = payload.notes.clone();
+    new.max_videos = payload.max_videos.filter(|n| (1..=20).contains(n));
     let job_id = state
         .repo
-        .add_job(
-            url,
-            &slug,
-            &journalist,
-            &keyword,
-            &index_str,
-            priority,
-            JobStatus::Pending,
-            submitted_by,
-            payload.notes.as_deref(),
-            None,
-        )
+        .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
         .map_err(|e| {
             tracing::error!(error = ?e, "Enqueue failed");
-            ApiError::bad_request("Could not queue that link.")
-        })?;
+            ApiError::bad_request("Ο σύνδεσμος δεν μπήκε στην ουρά.")
+        })?
+        .job_id();
 
     state.broadcast_event("job_created");
     Ok(Json(
@@ -507,7 +564,10 @@ fn is_submittable_url(url: &str) -> bool {
 /// separately) but because a slug is a filename and a filename with a quote,
 /// a slash or a NUL in it is a delivery failure at best.
 fn sanitize_token(raw: &str, fallback: &str) -> String {
-    let cleaned: String = raw
+    // Greek typed in the form ("Σεισμός") becomes the house Latin form
+    // (ELOT 743, as the email parser makes keywords), not a row of dashes.
+    let latin = omni_core::translit::translit(raw.trim());
+    let cleaned: String = latin
         .trim()
         .to_uppercase()
         .chars()
@@ -529,6 +589,19 @@ pub struct OverridePayload {
     url: String,
 }
 
+/// A worker that was cancelled is still stopping: the job must not start again
+/// in the same workspace yet (plan P7.20).
+fn refuse_while_stopping(state: &AppState, job_id: i64) -> Result<(), ApiError> {
+    if state.busy_jobs.contains(job_id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "STILL_STOPPING",
+            "Η προηγούμενη επεξεργασία αυτού του βίντεο σταματά ακόμη· δοκιμάστε ξανά σε λίγα δευτερόλεπτα.",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn api_override_job(
     RequireMcr(principal): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
@@ -536,16 +609,68 @@ pub async fn api_override_job(
     Json(payload): Json<OverridePayload>,
 ) -> JsonResult {
     if !is_submittable_url(&payload.url) {
-        return Err(ApiError::bad_request("Enter an http:// or https:// link."));
+        return Err(ApiError::bad_request("Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://."));
     }
-    state
+    refuse_while_stopping(&state, job_id)?;
+    let retried = state
         .repo
         .retry_job(job_id, Some(payload.url.trim()))
         .map_err(internal_error("Could not update the job."))?;
+    if !retried {
+        return Err(not_retryable());
+    }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: URL overridden"));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+pub struct RenamePayload {
+    keyword: String,
+}
+
+/// MCR renames a video before it is made (P7.12): the keyword part of the
+/// file name, typed in Greek or Latin, kept in the house form (ELOT 743,
+/// letters and digits, at most 20).
+pub async fn api_rename_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<RenamePayload>,
+) -> JsonResult {
+    let keyword = house_keyword(&payload.keyword)
+        .ok_or_else(|| ApiError::bad_request("Γράψτε μια λέξη-κλειδί με τουλάχιστον 2 γράμματα ή ψηφία."))?;
+    let renamed = state
+        .repo
+        .rename_job_keyword(job_id, &keyword)
+        .map_err(internal_error("Could not rename the job."))?;
+    let Some((old, new)) = renamed else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "TOO_LATE",
+            "Το αρχείο αυτού του βίντεο δημιουργείται ή έχει ήδη παραδοθεί· το όνομά του δεν αλλάζει πια.",
+        ));
+    };
+    let who = principal.audit_label();
+    let _ = state
+        .repo
+        .record_event(job_id, "INFO", None, &format!("Renamed by {who}: {old} → {new}"));
+    audit_action(&state, &principal, &format!("Job #{job_id}: renamed {old} → {new}"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "slug": new, "keyword": keyword })))
+}
+
+/// A keyword as typed by a person: transliterated, letters and digits only,
+/// upper case, at most 20; `None` under 2 characters.
+fn house_keyword(raw: &str) -> Option<String> {
+    let k: String = omni_core::translit::translit(raw.trim())
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(20)
+        .collect();
+    (k.len() >= 2).then_some(k)
 }
 
 #[derive(Deserialize)]
@@ -578,10 +703,10 @@ pub async fn api_queue_offer(
         .and_then(|j| serde_json::from_str(j).ok())
         .unwrap_or_default();
     let Some(offer) = offers.iter_mut().find(|o| o.url == payload.url.trim()) else {
-        return Err(ApiError::bad_request("That video is not among this job's offers."));
+        return Err(ApiError::bad_request("Αυτό το βίντεο δεν είναι ανάμεσα στα προτεινόμενα αυτής της εργασίας."));
     };
     if let Some(existing) = offer.queued_job_id {
-        return Err(ApiError::bad_request(format!("Already queued as job #{existing}.")));
+        return Err(ApiError::bad_request(format!("Έχει ήδη μπει στην ουρά ως εργασία #{existing}.")));
     }
 
     let mut new = omni_core::models::NewJob::new(
@@ -596,6 +721,8 @@ pub async fn api_queue_offer(
     new.email_message_id = job.email_message_id.clone();
     new.submitted_by_user_id = principal.user().map(|u| u.id).or(job.submitted_by_user_id);
     new.extraction_method = Some("sniffer".into());
+    new.group_code = job.group_code.clone();
+    new.parent_job_id = Some(job_id);
     new.notes = Some(format!("Offered from the article of job #{job_id}: {}", job.url));
     let result = state
         .repo
@@ -620,17 +747,157 @@ pub async fn api_queue_offer(
     Ok(Json(serde_json::json!({ "status": "ok", "job_id": result.job_id(), "index_str": index })))
 }
 
+/// A running or delivered job is not retried (P7.13).
+fn not_retryable() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "NOT_RETRYABLE",
+        "Αυτό το βίντεο κατεβαίνει αυτή τη στιγμή ή έχει ήδη παραδοθεί. Για νέο αρχείο από παραδομένο βίντεο, πατήστε «Νέα λήψη».",
+    )
+}
+
 pub async fn api_retry_job(
     RequireMcr(principal): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
     State(state): State<AppState>,
 ) -> JsonResult {
-    state
+    refuse_while_stopping(&state, job_id)?;
+    let retried = state
         .repo
         .retry_job(job_id, None)
         .map_err(internal_error("Could not retry the job."))?;
+    if !retried {
+        return Err(not_retryable());
+    }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// Take every delivered job off the live queue. Nothing is deleted.
+pub async fn api_clear_finished(RequireMcr(principal): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let cleared = state
+        .repo
+        .clear_finished_jobs()
+        .map_err(internal_error("Could not clear the finished jobs."))?;
+    audit_action(&state, &principal, &format!("Cleared {cleared} finished job(s) from the live queue"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "cleared": cleared })))
+}
+
+#[derive(Deserialize)]
+pub struct HideOldBody {
+    hours: Option<i64>,
+}
+
+/// Tidy the review tab: hide what has waited longer than `hours` (default 72).
+/// Nothing is deleted.
+pub async fn api_hide_old_review(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    body: Option<Json<HideOldBody>>,
+) -> JsonResult {
+    let hours = body.and_then(|b| b.0.hours).unwrap_or(72).clamp(0, 24 * 365);
+    let hidden = state
+        .repo
+        .hide_old_review(hours)
+        .map_err(internal_error("Could not tidy the review list."))?;
+    audit_action(&state, &principal, &format!("Hid {hidden} review job(s) older than {hours} h"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "hidden": hidden })))
+}
+
+/// Download and convert a delivered job again from its link: the file was
+/// deleted, or something went wrong with it.
+pub async fn api_redownload_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    refuse_while_stopping(&state, job_id)?;
+    let done = state
+        .repo
+        .redownload_job(job_id)
+        .map_err(internal_error("Could not queue the job again."))?;
+    if !done {
+        return Err(ApiError::bad_request(
+            "Νέα λήψη γίνεται μόνο για βίντεο που έχει παραδοθεί. Για ένα που χρειάζεται έλεγχο, πατήστε «Δοκιμή ξανά».",
+        ));
+    }
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Download again requested by {}", principal.audit_label()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: download again"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// MCR put the video into Dalet by hand: the job is recorded as done.
+pub async fn api_mark_done_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let done = state
+        .repo
+        .mark_completed_manually(job_id)
+        .map_err(internal_error("Could not mark the job as done."))?;
+    if !done {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "NOT_MARKABLE",
+            "Μόνο ένα βίντεο που περιμένει έλεγχο μπορεί να σημειωθεί ως παραδομένο χειροκίνητα.",
+        ));
+    }
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Finished as COMPLETED_MANUAL: put into Dalet by hand by {}", principal.audit_label()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: marked as put into Dalet by hand"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// MCR cancels a video that waits or downloads: the row and its history stay.
+pub async fn api_cancel_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    use omni_core::repository::CancelOutcome;
+    let outcome = state
+        .repo
+        .cancel_job(job_id)
+        .map_err(internal_error("Could not cancel the job."))?;
+    match outcome {
+        CancelOutcome::Cancelled => {}
+        CancelOutcome::TooLate => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "TOO_LATE",
+                "Το αρχείο παραδίδεται αυτή τη στιγμή στο Dalet· δεν ακυρώνεται πια.",
+            ));
+        }
+        CancelOutcome::NotCancellable => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "NOT_CANCELLABLE",
+                "Ακυρώνεται μόνο βίντεο που περιμένει ή κατεβαίνει.",
+            ));
+        }
+    }
+    // Stop the running tool now, not at the worker's next stage (P1.15).
+    state.busy_jobs.cancel(job_id);
+    let _ = state
+        .repo
+        .record_event(job_id, "WARN", None, &format!("Cancelled by {}", principal.audit_label()));
+    audit_action(&state, &principal, &format!("Job #{job_id}: cancelled"));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -644,6 +911,7 @@ pub async fn api_discard_job(
         .repo
         .delete_job(job_id)
         .map_err(internal_error("Could not discard the job."))?;
+    state.busy_jobs.cancel(job_id);
 
     audit_action(&state, &principal, &format!("Job #{job_id}: discarded"));
     state.broadcast_event("job_deleted");
@@ -695,10 +963,10 @@ pub async fn api_save_journalist(
 ) -> JsonResult {
     let surname = sanitize_token(&payload.surname, "");
     if surname.is_empty() {
-        return Err(ApiError::bad_request("Surname is required."));
+        return Err(ApiError::bad_request("Το επώνυμο είναι υποχρεωτικό."));
     }
     if payload.emails.len() > 20 {
-        return Err(ApiError::bad_request("At most 20 addresses per journalist."));
+        return Err(ApiError::bad_request("Έως 20 διευθύνσεις ανά δημοσιογράφο."));
     }
     if let Some(aliases) = &payload.aliases {
         if aliases.len() > 30 || aliases.iter().any(|a| a.chars().count() > 40) {
@@ -738,10 +1006,230 @@ pub async fn api_delete_journalist(
     }
     state
         .repo
-        .delete_journalist(&surname)
+        .backup_taxonomy("before-delete")
+        .and_then(|_| state.repo.delete_journalist(&surname))
         .map_err(internal_error("Could not delete the journalist."))?;
     audit_action(&state, &principal, &format!("Journalist {surname} deleted"));
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
+// Taxonomy: groups and membership (plan P4.20)
+// ==========================================
+
+/// The groups, for the MCR label and filter and the admin editor. Group
+/// names and descriptions are newsroom vocabulary, not personal data.
+pub async fn api_get_groups(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let groups = state
+        .repo
+        .list_groups()
+        .map_err(internal_error("Could not read the groups."))?;
+    Ok(Json(serde_json::json!({ "groups": groups })))
+}
+
+/// Create or update one group. Admin: groups shape what the LLM is told.
+pub async fn api_save_group(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(group): Json<omni_core::taxonomy::Group>,
+) -> JsonResult {
+    let group = group.normalized();
+    group.validate().map_err(ApiError::bad_request)?;
+    let saved = state
+        .repo
+        .save_group(&group)
+        .map_err(internal_error("Could not save the group."))?;
+    let _ = state
+        .repo
+        .log_audit("INFO", "ADMIN", &format!("Group {} saved by {}", saved.code, admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok", "group": saved })))
+}
+
+pub async fn api_delete_group(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(code): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let removed = state
+        .repo
+        .backup_taxonomy("before-delete")
+        .and_then(|_| state.repo.delete_group(&code))
+        .map_err(internal_error("Could not delete the group."))?;
+    if !removed {
+        return Err(ApiError::bad_request("No such group."));
+    }
+    let _ = state
+        .repo
+        .log_audit("WARN", "ADMIN", &format!("Group {} deleted by {}", code.to_uppercase(), admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+pub struct JournalistGroupsPayload {
+    /// Group codes, the default first.
+    groups: Vec<String>,
+}
+
+pub async fn api_set_journalist_groups(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(surname): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<JournalistGroupsPayload>,
+) -> JsonResult {
+    if payload.groups.len() > 20 {
+        return Err(ApiError::bad_request("At most 20 groups per person."));
+    }
+    let known: Vec<String> = state
+        .repo
+        .list_groups()
+        .map_err(internal_error("Could not read the groups."))?
+        .into_iter()
+        .map(|g| g.code)
+        .collect();
+    let codes: Vec<String> = payload.groups.iter().map(|g| g.trim().to_uppercase()).filter(|g| !g.is_empty()).collect();
+    if let Some(unknown) = codes.iter().find(|c| !known.contains(c)) {
+        return Err(ApiError::bad_request(format!("No group {unknown}.")));
+    }
+    let surname = surname.trim().to_uppercase();
+    if !state
+        .repo
+        .list_journalists()
+        .map_err(internal_error("Could not read the roster."))?
+        .iter()
+        .any(|j| j.surname == surname)
+    {
+        return Err(ApiError::bad_request("No such journalist."));
+    }
+    state
+        .repo
+        .set_journalist_groups(&surname, &codes)
+        .map_err(internal_error("Could not save the groups."))?;
+    let _ = state.repo.log_audit(
+        "INFO",
+        "ADMIN",
+        &format!("Groups of {surname} set to [{}] by {}", codes.join(", "), admin.email),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// Taxonomy backups, newest first (plan P4.27).
+pub async fn api_admin_taxonomy_backups(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let backups = state
+        .repo
+        .list_taxonomy_backups()
+        .map_err(internal_error("Could not list the backups."))?;
+    Ok(Json(serde_json::json!({
+        "backups": backups,
+        "kept": omni_core::repository::TAXONOMY_BACKUPS_KEPT,
+    })))
+}
+
+pub async fn api_admin_taxonomy_backup_now(RequireAdmin(admin): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let b = state
+        .repo
+        .backup_taxonomy("manual")
+        .map_err(internal_error("Could not write the backup."))?;
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("Taxonomy backed up by {}: {}", admin.email, b.name));
+    Ok(Json(serde_json::json!({ "status": "ok", "backup": b })))
+}
+
+/// One backup, for download.
+pub async fn api_admin_taxonomy_backup_get(
+    RequireAdmin(_): RequireAdmin,
+    AxumPath(name): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let t = state
+        .repo
+        .read_taxonomy_backup(&name)
+        .map_err(|_| ApiError::bad_request("No such backup."))?;
+    Ok(Json(serde_json::json!(t)))
+}
+
+pub async fn api_admin_taxonomy_backup_restore(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(name): AxumPath<String>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    if state.repo.read_taxonomy_backup(&name).is_err() {
+        return Err(ApiError::bad_request("No such backup."));
+    }
+    let report = state
+        .repo
+        .restore_taxonomy_backup(&name)
+        .map_err(internal_error("Could not restore the backup."))?;
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("Taxonomy restored from {name} by {} (the state before was backed up)", admin.email),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok", "report": report })))
+}
+
+/// taxonomy.json, for download. Admin only: it lists staff and addresses.
+pub async fn api_admin_export_taxonomy(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let t = state
+        .repo
+        .export_taxonomy()
+        .map_err(internal_error("Could not export the taxonomy."))?;
+    Ok(Json(serde_json::json!(t)))
+}
+
+#[derive(Deserialize)]
+pub struct ImportTaxonomyPayload {
+    taxonomy: omni_core::taxonomy::Taxonomy,
+    /// Also delete groups and people the file does not list.
+    #[serde(default)]
+    replace: bool,
+}
+
+pub async fn api_admin_import_taxonomy(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<ImportTaxonomyPayload>,
+) -> JsonResult {
+    // Check first, so a mistake in the file comes back as a list the admin
+    // can fix, not as "internal error".
+    let known: Vec<String> = if payload.replace {
+        Vec::new()
+    } else {
+        state
+            .repo
+            .list_groups()
+            .map_err(internal_error("Could not read the groups."))?
+            .into_iter()
+            .map(|g| g.code)
+            .collect()
+    };
+    if let Err(problems) = payload.taxonomy.checked(&known) {
+        return Err(ApiError::bad_request(format!("The file was not imported:\n- {}", problems.join("\n- "))));
+    }
+    if payload.taxonomy.people.iter().any(|p| p.surname.trim().eq_ignore_ascii_case("MCR")) {
+        return Err(ApiError::bad_request("The file was not imported: MCR is built in."));
+    }
+    // What was there before, so an import can be undone from the panel.
+    state
+        .repo
+        .backup_taxonomy("before-import")
+        .map_err(internal_error("Could not back up the taxonomy before importing; nothing was imported."))?;
+    let report = state
+        .repo
+        .import_taxonomy(&payload.taxonomy, payload.replace)
+        .map_err(internal_error("Could not import the taxonomy."))?;
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!(
+            "Taxonomy imported{} by {}: {} groups and {} people saved, {} groups and {} people removed",
+            if payload.replace { " (replace)" } else { "" },
+            admin.email,
+            report.groups_saved,
+            report.people_saved,
+            report.groups_removed,
+            report.people_removed
+        ),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok", "report": report })))
 }
 
 // ==========================================
@@ -809,6 +1297,58 @@ pub struct UpdatePasswordPayload {
     password: String,
 }
 
+#[derive(Deserialize)]
+pub struct UserActivePayload {
+    active: bool,
+}
+
+/// Deactivate or reactivate an account (plan P2.4). A deactivated account
+/// cannot sign in and its sessions end at once. The last active
+/// administrator, and your own account, cannot be deactivated here: nobody
+/// could administer the station afterwards.
+pub async fn api_admin_set_user_active(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(user_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<UserActivePayload>,
+) -> JsonResult {
+    let users = state.repo.list_users().map_err(internal_error("Could not read the accounts."))?;
+    let Some(target) = users.iter().find(|u| u.id == user_id) else {
+        return Err(ApiError::bad_request("No such account."));
+    };
+    if !payload.active {
+        if target.email.eq_ignore_ascii_case(&admin.email) {
+            return Err(ApiError::bad_request("You cannot deactivate your own account."));
+        }
+        let other_admins = users
+            .iter()
+            .filter(|u| u.id != user_id && u.is_active && u.role == UserRole::Admin)
+            .count();
+        if target.role == UserRole::Admin && other_admins == 0 {
+            return Err(ApiError::bad_request("This is the last active administrator."));
+        }
+    }
+    state
+        .repo
+        .set_user_active_status(user_id, payload.active)
+        .map_err(internal_error("Could not change the account."))?;
+    if !payload.active {
+        let _ = state.repo.delete_sessions_for_user(user_id);
+    }
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!(
+            "Account {} {} by {}",
+            target.email,
+            if payload.active { "reactivated" } else { "deactivated" },
+            admin.email
+        ),
+    );
+    omni_core::selftest::check_default_admin(&state.repo, &state.health);
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
 pub async fn api_admin_update_password(
     RequireAdmin(admin): RequireAdmin,
     AxumPath(user_id): AxumPath<i64>,
@@ -825,6 +1365,7 @@ pub async fn api_admin_update_password(
         "ADMIN",
         &format!("Password for user #{user_id} reset by {}", admin.email),
     );
+    omni_core::selftest::check_default_admin(&state.repo, &state.health);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -993,6 +1534,67 @@ pub async fn api_admin_run_task(
 }
 
 // ==========================================
+// Self-check (plan P6.7)
+// ==========================================
+
+/// The self-check links with their last results, and the browser's state.
+pub async fn api_admin_selfcheck(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let links = state
+        .repo
+        .list_selfcheck_links()
+        .map_err(internal_error("Could not read the self-check links."))?;
+    let checks = state.health.all();
+    Ok(Json(serde_json::json!({
+        "links": links,
+        "summary": checks.get(omni_core::health::checks::SELFCHECK),
+        "browser": checks.get(omni_core::health::checks::BROWSER),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct SelfcheckLinkPayload {
+    label: String,
+    url: String,
+}
+
+pub async fn api_admin_selfcheck_add(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<SelfcheckLinkPayload>,
+) -> JsonResult {
+    let url = payload.url.trim();
+    let label: String = payload.label.trim().chars().take(80).collect();
+    if !is_submittable_url(url) {
+        return Err(ApiError::bad_request("Enter an http:// or https:// link."));
+    }
+    if label.is_empty() {
+        return Err(ApiError::bad_request("Give the link a name, such as \"Instagram reel\"."));
+    }
+    let id = state
+        .repo
+        .add_selfcheck_link(&label, url)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("{} added self-check link {label}: {url}", admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok", "id": id })))
+}
+
+pub async fn api_admin_selfcheck_delete(
+    RequireAdmin(admin): RequireAdmin,
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let removed = state
+        .repo
+        .delete_selfcheck_link(id)
+        .map_err(internal_error("Could not remove the link."))?;
+    if !removed {
+        return Err(ApiError::not_found());
+    }
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("{} removed self-check link #{id}", admin.email));
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
 // Secrets API (plan P2.6)
 // ==========================================
 
@@ -1047,10 +1649,6 @@ pub async fn api_secrets_set(
 
     // Mail uses its secret from the running config, so reflect the change
     // without a restart.
-    if payload.key == omni_core::secrets::keys::MAIL_PASSWORD {
-        let mut cfg = state.config.write().await;
-        cfg.email_password = payload.value.trim().to_string();
-    }
     if payload.key == omni_core::secrets::keys::GRAPH_CLIENT_SECRET {
         let mut cfg = state.config.write().await;
         cfg.graph.client_secret = payload.value.trim().to_string();
@@ -1128,10 +1726,10 @@ pub async fn api_system_status(
             .unwrap_or(serde_json::Value::Null)
     };
 
-    let queue = state
-        .repo
-        .queue_summary()
-        .unwrap_or_default();
+    // `null` when the count failed, never zeros: the desk alerts on a rise in
+    // the review count, and zeros followed by the real count would announce
+    // the whole backlog as new (P7.14).
+    let queue = state.repo.queue_summary().ok();
 
     let checks = state.health.all();
 
@@ -1186,68 +1784,663 @@ pub async fn api_system_logs(
     Ok(Json(serde_json::json!({ "logs": logs })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 pub struct TestEmailPayload {
-    server: String,
-    port: u16,
-    email: String,
-    pass: String,
+    tenant_id: String,
+    client_id: String,
+    mailbox: String,
+    /// Blank: test with the stored secret, which is then only ever paired
+    /// with the stored tenant and client id, never with typed-in ones.
+    client_secret: String,
 }
 
-/// Test the mailbox credentials.
+/// Test the Graph mailbox (plan P4.7): sign in and read the inbox.
 ///
 /// Admin-only: unauthenticated, this was a credential oracle — point it at the
 /// station's mailbox and the response distinguishes a right password from a
 /// wrong one, for free, from anywhere on the LAN.
 pub async fn api_test_email(
     RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
     Json(payload): Json<TestEmailPayload>,
 ) -> JsonResult {
-    let res: Result<anyhow::Result<()>, tokio::task::JoinError> =
-        tokio::task::spawn_blocking(move || {
-            omni_email::watcher::EmailWatcher::test_connection(
-                &payload.server,
-                payload.port,
-                &payload.email,
-                &payload.pass,
-            )
-        })
-        .await;
-
-    match res {
-        Ok(Ok(_)) => Ok(Json(serde_json::json!({"status": "ok"}))),
-        Ok(Err(e)) => Err(ApiError::bad_request(e.to_string())),
-        Err(join_err) => {
-            tracing::error!(error = ?join_err, "Mail test task failed");
-            Err(ApiError::internal("Mail test could not be run."))
-        }
+    let saved = state.config.read().await.graph.clone();
+    let pick = |typed: &str, saved: &str| {
+        let typed = typed.trim();
+        if typed.is_empty() { saved.to_string() } else { typed.to_string() }
+    };
+    let mut cfg = saved.clone();
+    cfg.mailbox = pick(&payload.mailbox, &saved.mailbox);
+    if !payload.client_secret.trim().is_empty() {
+        cfg.tenant_id = pick(&payload.tenant_id, &saved.tenant_id);
+        cfg.client_id = pick(&payload.client_id, &saved.client_id);
+        cfg.client_secret = payload.client_secret.trim().to_string();
     }
+    match omni_email::graph::GraphMailSource::new(cfg).test_access().await {
+        Ok(detail) => Ok(Json(serde_json::json!({ "status": "ok", "detail": detail }))),
+        Err(e) => Err(ApiError::bad_request(e.to_string())),
+    }
+}
+
+// ==========================================
+// MCR mail view (plan P7.8)
+// ==========================================
+
+#[derive(Deserialize)]
+pub struct MailsQuery {
+    #[serde(default)]
+    filter: omni_email::inbox::InboxFilter,
+    q: Option<String>,
+    page: Option<usize>,
+    per_page: Option<usize>,
+    /// `mail:<Message-ID>` or `manual:<id>`: return the page that holds it.
+    focus: Option<String>,
+}
+
+/// One page of the mail view's list: handled mail and links added by hand,
+/// newest first, within the days the mail text is kept.
+/// The Email tab's entries received since `since`.
+fn inbox_entries(state: &AppState, since: chrono::DateTime<chrono::Utc>) -> Result<Vec<omni_email::inbox::Entry>, ApiError> {
+    let mails = state.repo.inbox_mail_rows(since).map_err(internal_error("Could not read the mail list."))?;
+    let extra = omni_email::inbox::referenced_job_ids(&mails);
+    // A day of slack for jobs: a mail's received time is the server's clock.
+    let jobs = state
+        .repo
+        .inbox_job_rows(since - chrono::Duration::days(1), &extra)
+        .map_err(internal_error("Could not read the mail list."))?;
+    Ok(omni_email::inbox::entries(mails, jobs, since))
+}
+
+/// Recent emails (and links added by hand) with whether all their videos
+/// have ended (plan P5.4). The desk polls this on every tab and chimes for
+/// an entry that turned settled. Two days back: what is still in play.
+pub async fn api_get_mail_settlements(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let since = chrono::Utc::now() - chrono::Duration::days(2);
+    let entries = inbox_entries(&state, since)?;
+    Ok(Json(serde_json::json!({ "entries": omni_email::inbox::settlements(&entries, since) })))
+}
+
+pub async fn api_get_mails(
+    RequireMcr(_): RequireMcr,
+    Query(query): Query<MailsQuery>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let days = state.config.read().await.mail_text_retention_days.clamp(1, 3650);
+    let since = chrono::Utc::now() - chrono::Duration::days(days);
+    let entries = inbox_entries(&state, since)?;
+    let page = omni_email::inbox::page_with_focus(
+        entries,
+        query.filter,
+        query.q.as_deref().unwrap_or(""),
+        query.page.unwrap_or(1),
+        query.per_page.unwrap_or(20),
+        query.focus.as_deref(),
+    );
+
+    // Who added a link by hand, by name.
+    let names: HashMap<i64, String> = if page.entries.iter().any(|e| e.added_by.is_some()) {
+        state
+            .repo
+            .list_users()
+            .map_err(internal_error("Could not read the mail list."))?
+            .into_iter()
+            .map(|u| (u.id, u.full_name))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let entries: Vec<serde_json::Value> = page
+        .entries
+        .iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(e).unwrap_or_default();
+            if let Some(name) = e.added_by.and_then(|id| names.get(&id)) {
+                v["added_by_name"] = serde_json::Value::String(name.clone());
+            }
+            v
+        })
+        .collect();
+    let job_counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+    Ok(Json(serde_json::json!({
+        "entries": entries,
+        "total": page.total,
+        "page": page.page,
+        "per_page": page.per_page,
+        "counts": page.counts,
+        "job_counts": job_counts,
+        "window_days": days,
+    })))
 }
 
 #[derive(Deserialize)]
-pub struct TestLlmPayload {
-    endpoint: String,
-    model: String,
+pub struct MailViewQuery {
+    /// `mail` (default) or `manual`.
+    kind: Option<String>,
+    key: String,
+    /// `jobs`: only what changes while the mail is open, for the live refresh.
+    parts: Option<String>,
 }
 
-pub async fn api_test_llm(
-    RequireAdmin(_): RequireAdmin,
-    Json(payload): Json<TestLlmPayload>,
-) -> JsonResult {
-    let client = omni_email::llm::LlmClient::new(&payload.endpoint, &payload.model);
-    if client.ping().await {
-        Ok(Json(serde_json::json!({"status": "ok"})))
-    } else {
-        Err(ApiError::bad_request("LLM endpoint unreachable"))
+/// A link added by hand, shaped as a mail whose text is the link, so the
+/// desk shows it the way it shows mail.
+fn manual_entry_as_mail(root: &omni_core::models::Job) -> omni_core::models::ProcessedMail {
+    omni_core::models::ProcessedMail {
+        internet_message_id: String::new(),
+        outcome: "JOBS".into(),
+        subject: Some(root.url.clone()),
+        jobs_json: serde_json::json!([{
+            "index_str": root.index_str,
+            "slug": root.slug,
+            "url": root.url,
+            "status": root.status.as_str(),
+            "result": { "outcome": "created", "id": root.id },
+        }])
+        .to_string(),
+        received_at: root.created_at,
+        body_text: Some(root.url.clone()),
+        ..Default::default()
     }
+}
+
+/// The mail (or manual entry) `key` and its jobs.
+fn load_mail(
+    state: &AppState,
+    kind: Option<&str>,
+    key: &str,
+) -> Result<(omni_core::models::ProcessedMail, Vec<omni_core::models::Job>), ApiError> {
+    if kind == Some("manual") {
+        let id: i64 = key.trim().parse().map_err(|_| ApiError::not_found())?;
+        let jobs = state.repo.jobs_with_children(id).map_err(internal_error("Could not read the job."))?;
+        let root = jobs
+            .iter()
+            .find(|j| j.id == id && j.email_message_id.is_none())
+            .ok_or_else(ApiError::not_found)?;
+        return Ok((manual_entry_as_mail(root), jobs));
+    }
+    let mail = state
+        .repo
+        .get_processed_mail(key)
+        .map_err(internal_error("Could not read the mail."))?
+        .ok_or_else(ApiError::not_found)?;
+    let pointed_at: Vec<i64> = serde_json::from_str::<Vec<omni_email::watcher::QueuedFromMail>>(&mail.jobs_json)
+        .unwrap_or_default()
+        .iter()
+        .map(|q| q.result.job_id())
+        .collect();
+    let jobs = state
+        .repo
+        .jobs_for_mail(&mail.internet_message_id, &pointed_at)
+        .map_err(internal_error("Could not read the mail's jobs."))?;
+    Ok((mail, jobs))
+}
+
+/// The videos an article offered MCR and nobody has queued yet, per job.
+fn open_offers(jobs: &[omni_core::models::Job]) -> Vec<serde_json::Value> {
+    jobs.iter()
+        .flat_map(|j| {
+            j.candidates_json
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<Vec<omni_broadcast::article::Offered>>(c).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|o| o.queued_job_id.is_none())
+                .map(move |o| serde_json::json!({ "job_id": j.id, "url": o.url, "index_str": o.index_str }))
+        })
+        .collect()
+}
+
+pub async fn api_get_mail_view(
+    RequireMcr(_): RequireMcr,
+    Query(query): Query<MailViewQuery>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let cfg = state.config.read().await.parser.clone();
+    let (mail, jobs) = load_mail(&state, query.kind.as_deref(), &query.key)?;
+    let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
+
+    let by_id: HashMap<i64, &omni_core::models::Job> = jobs.iter().map(|j| (j.id, j)).collect();
+    // The Email tab's cards say the place in the queue too (plan P7.19).
+    let positions = state.repo.pending_positions().unwrap_or_default();
+    let desk_jobs: Vec<serde_json::Value> = view
+        .jobs
+        .iter()
+        .filter_map(|p| {
+            by_id.get(&p.job_id).map(|j| {
+                let mut v = job_for_desk(j);
+                if let Some(pos) = positions.get(&j.id) {
+                    v["queue_position"] = serde_json::json!(pos);
+                }
+                v["place"] = serde_json::json!({ "link": p.link, "parent": p.parent, "shared": p.shared });
+                v
+            })
+        })
+        .collect();
+    let links: Vec<serde_json::Value> = view
+        .links
+        .iter()
+        .map(|l| serde_json::json!({ "id": l.id, "url": l.url, "role": l.role, "jobs": l.jobs, "skip": l.skip }))
+        .collect();
+
+    if query.parts.as_deref() == Some("jobs") {
+        return Ok(Json(serde_json::json!({
+            "jobs": desk_jobs,
+            "links": links,
+            "attachments": view.attachments,
+            "offers": open_offers(&jobs),
+            "next_index": view.next_index,
+        })));
+    }
+
+    let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
+    Ok(Json(serde_json::json!({
+        "kind": if query.kind.as_deref() == Some("manual") { "manual" } else { "mail" },
+        "key": query.key,
+        "subject": mail.subject,
+        "from_name": mail.from_name,
+        "from_address": mail.from_address,
+        "to": mail.to,
+        "cc": mail.cc,
+        "received_at": mail.received_at,
+        "processed_at": mail.processed_at,
+        "outcome": mail.outcome,
+        "journalist": summary.as_ref().map(|s| s.journalist.clone()).or_else(|| jobs.first().map(|j| j.journalist.clone())),
+        "how": summary.as_ref().map(|s| omni_email::mail_view::how_el(s.how)),
+        "group_code": summary.as_ref().and_then(|s| s.group.as_ref().map(|g| g.code.clone())),
+        "urgent": summary.as_ref().is_some_and(|s| s.urgent),
+        "notes": view.notes,
+        "text": view.text,
+        "links": links,
+        "attachments": view.attachments,
+        "jobs": desk_jobs,
+        "offers": open_offers(&jobs),
+        "next_index": view.next_index,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct QueueLinkPayload {
+    key: String,
+    url: String,
+}
+
+/// Queue a link from a mail's text that became no job: «Λήψη και αυτού».
+///
+/// Only a link that is in that mail's stored text, is not already a job,
+/// and is not a photo or a document. It is named as the mail's own links
+/// are (journalist, the next number, the neighbouring story's keyword) and
+/// recorded with the mail, so the desk files the job under that link.
+pub async fn api_mail_queue_link(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    Json(payload): Json<QueueLinkPayload>,
+) -> JsonResult {
+    let cfg = state.config.read().await.parser.clone();
+    let (mail, jobs) = load_mail(&state, None, &payload.key)?;
+    let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
+    let wanted = payload.url.trim();
+    let Some(link) = view.links.iter().find(|l| l.url == wanted) else {
+        return Err(ApiError::bad_request("Αυτός ο σύνδεσμος δεν υπάρχει στο κείμενο αυτού του email."));
+    };
+    match &link.skip {
+        None => return Err(ApiError::bad_request("Αυτός ο σύνδεσμος έχει ήδη μπει στην ουρά.")),
+        Some(s) if !s.can_queue => {
+            return Err(ApiError::bad_request("Φωτογραφίες και έγγραφα δεν κατεβαίνουν ως βίντεο."))
+        }
+        Some(_) => {}
+    }
+    if !is_submittable_url(&link.url) {
+        return Err(ApiError::bad_request("Επικολλήστε έναν σύνδεσμο που αρχίζει με http:// ή https://."));
+    }
+    let (journalist, keyword, index) = omni_email::mail_view::naming_for_link(&mail, &view, &jobs, &link.id)
+        .ok_or_else(|| ApiError::bad_request("Αυτός ο σύνδεσμος δεν υπάρχει στο κείμενο αυτού του email."))?;
+    let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
+    let subject = mail.subject.clone().unwrap_or_default();
+    let slug = format!("{index}_{journalist}_{keyword}");
+
+    let locker = omni_email::parser::classify(&link.url, &cfg) == omni_email::parser::Tier::Locker;
+    let mut new = omni_core::models::NewJob::new(link.url.clone(), slug.clone(), journalist.clone());
+    new.keyword = keyword;
+    new.index_str = index.clone();
+    new.status = if locker { JobStatus::ManualDownload } else { JobStatus::Pending };
+    new.extraction_method = locker.then(|| "locker".to_string());
+    new.email_message_id = Some(mail.internet_message_id.clone());
+    new.email_source = mail.from_address.clone();
+    new.group_code = summary
+        .as_ref()
+        .and_then(|s| s.group.as_ref().map(|g| g.code.clone()))
+        .or_else(|| jobs.iter().find_map(|j| j.group_code.clone()));
+    new.priority = if summary.as_ref().is_some_and(|s| s.urgent) {
+        omni_email::watcher::URGENT_PRIORITY_BOOST
+    } else {
+        0
+    };
+    new.submitted_by_user_id = principal.user().map(|u| u.id);
+    new.notes = Some(format!("Queued by MCR from the email: {subject}"));
+    let result = state
+        .repo
+        .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+        .map_err(internal_error("Could not queue that link."))?;
+    state
+        .repo
+        .append_mail_job(
+            &mail.internet_message_id,
+            &serde_json::json!({
+                "index_str": index,
+                "slug": slug,
+                "url": link.url,
+                "status": new.status.as_str(),
+                "result": result,
+            }),
+        )
+        .map_err(internal_error("Could not record the link with its email."))?;
+    let job_id = result.job_id();
+    if result.is_new() {
+        let _ = state.repo.record_event(
+            job_id,
+            "INFO",
+            None,
+            &format!("Queued by {} from the email '{subject}'", principal.audit_label()),
+        );
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: queued from the email '{subject}'"));
+    state.broadcast_event("job_created");
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "job_id": job_id,
+        "slug": slug,
+        "index_str": index,
+        "duplicate": !result.is_new(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MailKeyPayload {
+    key: String,
+}
+
+/// Read again a mail the watcher gave up on. Only that: a handled mail read
+/// again after a day could queue its delivered links a second time, so that
+/// stays with the administrator (plan P4.25).
+pub async fn api_mail_reprocess(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    Json(payload): Json<MailKeyPayload>,
+) -> JsonResult {
+    let mail = state
+        .repo
+        .get_processed_mail(payload.key.trim())
+        .map_err(internal_error("Could not read the mail."))?
+        .ok_or_else(ApiError::not_found)?;
+    if mail.outcome != "FAILED" {
+        return Err(ApiError::bad_request(
+            "Ξανά διαβάζεται μόνο ένα email που το σύστημα δεν μπόρεσε να διαβάσει.",
+        ));
+    }
+    state
+        .repo
+        .request_mail_reprocess(&mail.internet_message_id, &principal.audit_label())
+        .map_err(|_| ApiError::bad_request("Αυτό το email δεν μπορεί να διαβαστεί ξανά από το γραμματοκιβώτιο."))?;
+    audit_action(
+        &state,
+        &principal,
+        &format!("Reprocess of the email '{}' requested", mail.subject.unwrap_or_default()),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
+// Handled mail and reprocess (plan P4.25)
+// ==========================================
+
+pub async fn api_admin_mail_history(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let rows = state.repo.list_processed_mail(100).map_err(internal_error("Could not read the mail history."))?;
+    let pending: Vec<String> = state
+        .repo
+        .pending_mail_reprocess()
+        .map_err(internal_error("Could not read the mail history."))?
+        .into_iter()
+        .map(|(k, _, _)| k)
+        .collect();
+    let mails: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|m| {
+            let jobs = serde_json::from_str::<Vec<serde_json::Value>>(&m.jobs_json).map(|v| v.len()).unwrap_or(0);
+            serde_json::json!({
+                "internet_message_id": m.internet_message_id,
+                "subject": m.subject,
+                "from_address": m.from_address,
+                "outcome": m.outcome,
+                "processed_at": m.processed_at,
+                "jobs": jobs,
+                "reprocess_pending": pending.contains(&m.internet_message_id),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "mails": mails })))
+}
+
+#[derive(Deserialize)]
+pub struct ReprocessPayload {
+    internet_message_id: String,
+}
+
+pub async fn api_admin_mail_reprocess(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<ReprocessPayload>,
+) -> JsonResult {
+    let m = state
+        .repo
+        .request_mail_reprocess(payload.internet_message_id.trim(), &admin.email)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let _ = state.repo.log_audit(
+        "INFO",
+        "EMAIL",
+        &format!("Reprocess of '{}' requested by {}", m.subject.unwrap_or_default(), admin.email),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+// ==========================================
+// LLM settings (plan P4.22)
+// ==========================================
+
+/// The LLM card of the admin panel: what is being saved, tested or asked
+/// for its model list. Nothing here is applied until it is saved.
+#[derive(Deserialize)]
+pub struct LlmSettingsPayload {
+    #[serde(default)]
+    mode: omni_core::config::LlmMode,
+    #[serde(default)]
+    provider: String,
+    base_url: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    auth: omni_core::config::LlmAuth,
+    /// Blank: keep the stored key, which is then only ever sent to the
+    /// stored base URL, never to a typed-in one.
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    clear_key: bool,
+    #[serde(default = "default_llm_timeout_payload")]
+    timeout_secs: u64,
+    #[serde(default = "default_llm_tokens_payload")]
+    max_tokens: u32,
+    #[serde(default = "default_true_payload")]
+    disable_thinking: bool,
+    /// The LLM writes every section's keyword, not only those the parser
+    /// could not make.
+    #[serde(default)]
+    keyword_polish: bool,
+}
+
+fn default_llm_timeout_payload() -> u64 {
+    30
+}
+fn default_llm_tokens_payload() -> u32 {
+    400
+}
+fn default_true_payload() -> bool {
+    true
+}
+
+fn same_base(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'))
+}
+
+/// Endpoint, model and LLM config for `p`, on top of the saved config.
+fn llm_settings(
+    p: &LlmSettingsPayload,
+    saved: &omni_core::config::AppConfig,
+) -> Result<(String, String, omni_core::config::LlmConfig), ApiError> {
+    let base = p.base_url.trim().to_string();
+    omni_email::llm::check_base_url(&base).map_err(ApiError::bad_request)?;
+    let key = if !p.api_key.trim().is_empty() {
+        p.api_key.trim().to_string()
+    } else if p.clear_key {
+        String::new()
+    } else if same_base(&base, &saved.ollama_endpoint) {
+        saved.llm.api_key.clone()
+    } else {
+        String::new()
+    };
+    let cfg = omni_core::config::LlmConfig {
+        mode: p.mode,
+        timeout_secs: p.timeout_secs.clamp(5, 300),
+        max_tokens: p.max_tokens.clamp(50, 8000),
+        keyword_polish: p.keyword_polish,
+        provider: {
+            let v = p.provider.trim().to_lowercase();
+            if v.is_empty() { "custom".into() } else { v.chars().take(30).collect() }
+        },
+        auth: p.auth,
+        disable_thinking: p.disable_thinking,
+        api_key: key,
+    };
+    Ok((base, p.model.trim().chars().take(200).collect(), cfg))
+}
+
+pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let cfg = state.config.read().await;
+    Ok(Json(serde_json::json!({
+        "mode": cfg.llm.mode,
+        "provider": cfg.llm.provider,
+        "base_url": cfg.ollama_endpoint,
+        "model": cfg.ollama_model,
+        "auth": cfg.llm.auth,
+        "timeout_secs": cfg.llm.timeout_secs,
+        "max_tokens": cfg.llm.max_tokens,
+        "disable_thinking": cfg.llm.disable_thinking,
+        "keyword_polish": cfg.llm.keyword_polish,
+        "key_set": !cfg.llm.api_key.is_empty(),
+        "online": !omni_email::llm::is_local_endpoint(&cfg.ollama_endpoint),
+        "in_use": state.llm.current().describe(),
+    })))
+}
+
+/// Save and apply: the watcher uses the new settings from its next mail.
+pub async fn api_admin_save_llm(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<LlmSettingsPayload>,
+) -> JsonResult {
+    let mut cfg = state.config.write().await;
+    let (base, model, llm) = llm_settings(&payload, &cfg)?;
+    if llm.mode != omni_core::config::LlmMode::Off && model.is_empty() {
+        return Err(ApiError::bad_request("Choose a model (Load models lists what the server offers)."));
+    }
+    // The key first: if it cannot be stored, nothing changes.
+    let key_key = omni_core::secrets::keys::LLM_API_KEY;
+    if !payload.api_key.trim().is_empty() {
+        state.secrets.set(key_key, payload.api_key.trim()).map_err(internal_error("Could not store the API key."))?;
+    } else if payload.clear_key {
+        state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
+    } else if !same_base(&base, &cfg.ollama_endpoint) && !cfg.llm.api_key.is_empty() {
+        // A new provider does not inherit the old one's key.
+        state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
+    }
+    cfg.ollama_endpoint = base;
+    cfg.ollama_model = model;
+    cfg.llm = llm;
+    cfg.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
+    let assist = omni_email::assist::Assist::from_config(&cfg);
+    let described = assist.describe();
+    state.llm.replace(assist);
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("LLM settings changed by {}: {:?}, {described}", admin.email, cfg.llm.mode),
+    );
+    Ok(Json(serde_json::json!({ "status": "ok", "in_use": described })))
+}
+
+/// A real, small JSON request with the unsaved settings, timed.
+pub async fn api_admin_test_llm(
+    RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<LlmSettingsPayload>,
+) -> JsonResult {
+    let saved = state.config.read().await.clone();
+    let (base, model, llm) = llm_settings(&payload, &saved)?;
+    if model.is_empty() {
+        return Err(ApiError::bad_request("Choose a model first."));
+    }
+    let max_tokens = llm.max_tokens;
+    let client = omni_email::llm::LlmClient::from_settings(&base, &model, &llm);
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "word": { "type": "string" } },
+        "required": ["word"],
+        "additionalProperties": false
+    });
+    let started = std::time::Instant::now();
+    let answer = client
+        .chat_json(
+            "Answer with one JSON object and nothing else: {\"word\": string}.",
+            "Transliterate the Greek word ΛΙΜΑΝΙ to uppercase Latin letters.",
+            &schema,
+            max_tokens,
+        )
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "seconds": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        "answer": answer,
+        "online": client.is_online(),
+    })))
+}
+
+/// What models the server offers, with the unsaved settings.
+pub async fn api_admin_llm_models(
+    RequireAdmin(_): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<LlmSettingsPayload>,
+) -> JsonResult {
+    let saved = state.config.read().await.clone();
+    let (base, model, llm) = llm_settings(&payload, &saved)?;
+    let models = omni_email::llm::LlmClient::from_settings(&base, &model, &llm)
+        .list_models()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(serde_json::json!({ "models": models })))
 }
 
 #[derive(Deserialize)]
 pub struct SetupPayload {
-    email_provider: String,
-    imap_server: String,
-    email_address: String,
-    email_password: String,
+    /// The Graph mailbox (plan P4.7). All blank: no email ingest.
+    #[serde(default)]
+    graph_tenant_id: String,
+    #[serde(default)]
+    graph_client_id: String,
+    #[serde(default)]
+    graph_mailbox: String,
+    /// Blank keeps the stored secret.
+    #[serde(default)]
+    graph_client_secret: String,
     ollama_endpoint: String,
     ollama_model: String,
     watchfolder_path: String,
@@ -1319,21 +2512,22 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
 
     {
         let mut cfg = state.config.write().await;
-        cfg.email_provider = payload.email_provider;
-        cfg.imap_server = payload.imap_server;
-        cfg.email_address = payload.email_address;
-        if !payload.email_password.is_empty() {
+        cfg.graph.tenant_id = payload.graph_tenant_id.trim().to_string();
+        cfg.graph.client_id = payload.graph_client_id.trim().to_string();
+        cfg.graph.mailbox = payload.graph_mailbox.trim().to_string();
+        let secret = payload.graph_client_secret.trim();
+        if !secret.is_empty() {
             // Into the encrypted store, never into config.json (plan P2.6).
             // The runtime copy is what the mail watcher reads.
             if let Err(e) = state
                 .secrets
-                .set(omni_core::secrets::keys::MAIL_PASSWORD, &payload.email_password)
+                .set(omni_core::secrets::keys::GRAPH_CLIENT_SECRET, secret)
             {
-                tracing::error!(error = ?e, "Storing the mailbox password failed");
-                return ApiError::internal("Could not store the mailbox password.")
+                tracing::error!(error = ?e, "Storing the Graph client secret failed");
+                return ApiError::internal("Could not store the Graph client secret.")
                     .into_response();
             }
-            cfg.email_password = payload.email_password;
+            cfg.graph.client_secret = secret.to_string();
         }
         cfg.ollama_endpoint = payload.ollama_endpoint;
         cfg.ollama_model = payload.ollama_model;
@@ -1342,6 +2536,7 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
             tracing::error!(error = ?e, "Saving config failed");
             return ApiError::internal("Could not save the configuration.").into_response();
         }
+        state.llm.replace(omni_email::assist::Assist::from_config(&cfg));
     }
     let _ = state
         .repo
@@ -1352,10 +2547,28 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
 
 /// Whether the first-run page should still be offered in the UI.
 /// Public, because the login page links to it and must know.
-pub async fn api_setup_state(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+///
+/// To whoever may use the page (an admin, or loopback before the first admin)
+/// it also returns the current mailbox settings, so a reopened page does not
+/// blank them. Never a secret: only whether one is set.
+pub async fn api_setup_state(State(state): State<AppState>, req: Request) -> Json<serde_json::Value> {
+    let (parts, _) = req.into_parts();
+    let mut out = serde_json::json!({
         "needs_admin": !state.repo.has_active_admin().unwrap_or(true)
-    }))
+    });
+    if setup_window_open(&parts, &state).await {
+        let cfg = state.config.read().await;
+        out["graph"] = serde_json::json!({
+            "tenant_id": cfg.graph.tenant_id,
+            "client_id": cfg.graph.client_id,
+            "mailbox": cfg.graph.mailbox,
+            "secret_set": !cfg.graph.client_secret.is_empty(),
+        });
+        out["watchfolder_path"] = serde_json::json!(cfg.watchfolder_path);
+        out["ollama_endpoint"] = serde_json::json!(cfg.ollama_endpoint);
+        out["ollama_model"] = serde_json::json!(cfg.ollama_model);
+    }
+    Json(out)
 }
 
 // ==========================================
@@ -1396,6 +2609,8 @@ mod tests {
         assert_eq!(sanitize_token("../../etc", "MCR"), "ETC");
         assert_eq!(sanitize_token("a\"b", "MCR"), "A-B");
         assert_eq!(sanitize_token("", "MCR"), "MCR");
+        assert_eq!(sanitize_token("Σεισμός", "ASSET"), "SEISMOS");
+        assert_eq!(sanitize_token("Παπαδάκη", "MCR"), "PAPADAKI");
         assert_eq!(sanitize_token("---", "MCR"), "MCR");
         assert_eq!(sanitize_token(&"X".repeat(200), "MCR").len(), 40);
     }

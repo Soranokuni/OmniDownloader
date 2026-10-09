@@ -16,8 +16,9 @@ mod windows_impl {
     use std::time::Duration;
     use windows_service::define_windows_service;
     use windows_service::service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-        ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
+        ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
+        ServiceStatus, ServiceType,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
@@ -153,6 +154,26 @@ mod windows_impl {
 
         let _ = service.set_description(SERVICE_DESCRIPTION);
 
+        // Start after the boot rush (network shares and DNS up), and come
+        // back by itself after a crash: 1 min, 1 min, 5 min, the count reset
+        // after a day without one. An unattended MCR machine has nobody to
+        // press "start" at 3 a.m. (plan P9).
+        if let Err(e) = service.set_delayed_auto_start(true) {
+            info!("Delayed auto-start not set ({e}); the service still starts with Windows");
+        }
+        let restart = |secs| ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(secs) };
+        let actions = ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart(60), restart(60), restart(300)]),
+        };
+        if let Err(e) = service.update_failure_actions(actions) {
+            info!("Restart-on-failure not set ({e})");
+        }
+        // Also when the process exits with an error rather than crashing.
+        let _ = service.set_failure_actions_on_non_crash_failures(true);
+
         // Register the Event Log source while we still have the administrator
         // rights that creating a service required. A failure here is not fatal
         // — the service will run and log to files either way — but it does mean
@@ -216,6 +237,40 @@ mod windows_impl {
         service.stop().context("Failed stopping service")?;
         info!("Successfully triggered stop for Windows Service: {}", SERVICE_NAME);
         Ok(())
+    }
+
+    /// Whether this process may create services: run as administrator.
+    pub fn can_install() -> bool {
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE).is_ok()
+    }
+
+    /// The executable the installed service runs, if it is installed.
+    pub fn installed_exe() -> Option<std::path::PathBuf> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+        let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
+        Some(service.query_config().ok()?.executable_path)
+    }
+
+    /// Stop the service if it runs, and wait until it has (up to `timeout`):
+    /// the executable cannot be replaced while the process holds it.
+    pub fn stop_and_wait(timeout: Duration) -> Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .context("Failed opening Service Manager")?;
+        let service = manager
+            .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+            .context("Failed opening service")?;
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        let _ = service.stop();
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        anyhow::bail!("{SERVICE_NAME} did not stop within {} s", timeout.as_secs())
     }
 
     pub fn status() -> Result<String> {
@@ -345,6 +400,34 @@ pub fn query_service_status() -> Result<String> {
     return windows_impl::status();
     #[cfg(not(windows))]
     return non_windows_impl::status();
+}
+
+/// Whether this process may install services (it runs as administrator).
+pub fn can_install_services() -> bool {
+    #[cfg(windows)]
+    return windows_impl::can_install();
+    #[cfg(not(windows))]
+    return false;
+}
+
+/// The executable the installed service points at; `None` when the
+/// service is not installed.
+pub fn installed_service_exe() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    return windows_impl::installed_exe();
+    #[cfg(not(windows))]
+    return None;
+}
+
+/// Stop the service and wait until it has stopped (no-op when stopped).
+pub fn stop_service_and_wait(timeout: std::time::Duration) -> Result<()> {
+    #[cfg(windows)]
+    return windows_impl::stop_and_wait(timeout);
+    #[cfg(not(windows))]
+    {
+        let _ = timeout;
+        return non_windows_impl::stop();
+    }
 }
 
 

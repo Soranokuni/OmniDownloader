@@ -96,7 +96,7 @@ export function icon(name, extraClass = '') {
  * ------------------------------------------------------------------ */
 
 /** Cache-busting stamp, replaced per release; also on the sprite URL. */
-export const BUILD = '2';
+export const BUILD = '3';
 
 /**
  * The single API entry point.
@@ -123,15 +123,7 @@ export async function api(path, options = {}) {
   try {
     response = await fetch(path, init);
   } catch (networkError) {
-    throw new ApiError('NETWORK', 'The ingest daemon is not responding.');
-  }
-
-  if (response.status === 401) {
-    // The session ended (idle timeout, or an admin ended it). Send the
-    // operator to the login screen rather than leaving a panel that silently
-    // stops updating.
-    if (!location.pathname.startsWith('/login')) location.href = '/login';
-    throw new ApiError('UNAUTHENTICATED', 'Session expired.');
+    throw new ApiError('NETWORK', 'Η υπηρεσία λήψης δεν απαντά. Ελέγξτε ότι τρέχει και ξαναδοκιμάστε.');
   }
 
   let payload = null;
@@ -140,17 +132,40 @@ export async function api(path, options = {}) {
     try { payload = JSON.parse(text); } catch { payload = null; }
   }
 
+  if (response.status === 401) {
+    // On a panel: the session ended (idle timeout, or an admin ended it), so
+    // go to the login screen rather than leave a panel that silently stops
+    // updating. On the login screen itself a 401 is the answer to a failed
+    // sign-in, and the server's own message ("wrong email or password") is
+    // the one to show: "Session expired." there sent people looking for a
+    // session problem when the address was wrong.
+    const onLogin = location.pathname.startsWith('/login');
+    if (!onLogin) location.href = '/login';
+    const serverMessage = payload && payload.error && payload.error.message;
+    throw new ApiError('UNAUTHENTICATED', onLogin && serverMessage ? serverMessage : 'Η σύνδεση έληξε. Συνδεθείτε ξανά.');
+  }
+
   if (!response.ok) {
     const err = payload && payload.error ? payload.error : {};
-    throw new ApiError(err.code || String(response.status), err.message || 'Request failed.');
+    let message = err.message || 'Το αίτημα απέτυχε.';
+    // The server's internal errors are English; on a Greek page say it in Greek.
+    if (document.documentElement.lang === 'el') {
+      if (err.code === 'INTERNAL') {
+        message = 'Σφάλμα στον διακομιστή. Δοκιμάστε ξανά· αν επαναλαμβάνεται, ενημερώστε τον διαχειριστή.';
+      } else if (err.code === 'NOT_FOUND') {
+        message = 'Δεν βρέθηκε· ίσως αφαιρέθηκε στο μεταξύ.';
+      }
+    }
+    throw new ApiError(err.code || String(response.status), message, response.status);
   }
   return payload;
 }
 
 export class ApiError extends Error {
-  constructor(code, message) {
+  constructor(code, message, status = 0) {
     super(message);
     this.code = code;
+    this.status = status;
   }
 }
 
@@ -206,14 +221,17 @@ export function live(onUpdate, intervalMs = 5000) {
 export function fmtTime(value) {
   if (!value) return '—';
   const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString();
+  // Greek date and 24-hour time, whatever the browser's own language is.
+  return Number.isNaN(d.getTime())
+    ? '—'
+    : d.toLocaleString('el-GR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
 export function fmtDuration(seconds) {
   if (!seconds || seconds <= 0) return '—';
+  // "4:25", "0:47": minutes and seconds, as on a clip's timecode.
   const s = Math.round(seconds);
-  const m = Math.floor(s / 60);
-  return m > 0 ? `${m}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
 /** Map a job status to a badge colour class. */

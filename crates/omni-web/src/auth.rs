@@ -276,7 +276,7 @@ impl ApiError {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "UNAUTHENTICATED",
-            "Sign in to continue.",
+            "Συνδεθείτε για να συνεχίσετε.",
         )
     }
 

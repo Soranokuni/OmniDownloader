@@ -3,7 +3,10 @@
 //! OAuth2 client credentials against the station tenant, then plain REST.
 //! Fully async on reqwest — no blocking client, no `spawn_blocking` (E-05).
 //!
-//! What the mailbox looks like from outside:
+//! The station's app holds `Mail.Read` only (plan P4.8), so by default the
+//! mailbox is never written: nothing is marked read or moved, and the
+//! database alone records what was handled. With `graph.write_access` (and
+//! `Mail.ReadWrite`) the mailbox also shows it:
 //! * processed mail is marked read and moved to `Omni/Processed`;
 //! * mail that could not be processed is moved to `Omni/Failed` and left
 //!   **unread**, so a human sees it (E-02);
@@ -24,7 +27,16 @@ use tracing::{info, warn};
 use omni_core::config::GraphConfig;
 
 use crate::mail::{AttachmentMeta, InboundMail};
-use crate::source::{MailHealth, MailOutcome, MailSource};
+use crate::source::{MailGone, MailHeader, MailHealth, MailOutcome, MailSource};
+
+/// Headers per listing page. Graph allows up to 1000 for messages; a small
+/// page keeps each response quick, and `$select` keeps each entry tiny.
+const LIST_PAGE: usize = 100;
+
+/// What a full fetch selects. The listing selects [`HEADER_FIELDS`] only.
+const MESSAGE_FIELDS: &str =
+    "id,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,lastModifiedDateTime,body,hasAttachments";
+const HEADER_FIELDS: &str = "id,internetMessageId,subject,from,receivedDateTime,lastModifiedDateTime";
 
 pub const LOGIN_BASE: &str = "https://login.microsoftonline.com";
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com";
@@ -46,6 +58,26 @@ impl std::fmt::Display for RetryAfter {
 }
 
 impl std::error::Error for RetryAfter {}
+
+/// Graph answered with an error status. `message` is Graph's own
+/// `error.message`, which names the problem and carries no credential.
+#[derive(Debug, Clone)]
+pub struct GraphError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Graph returned {}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+fn graph_status(e: &anyhow::Error) -> Option<StatusCode> {
+    e.chain().find_map(|c| c.downcast_ref::<GraphError>()).map(|g| g.status)
+}
 
 struct Token {
     value: String,
@@ -87,6 +119,8 @@ fn default_expires_in() -> u64 {
 #[derive(Deserialize)]
 struct GList<T> {
     value: Vec<T>,
+    #[serde(default, rename = "@odata.nextLink")]
+    next_link: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -130,6 +164,8 @@ struct GMessage {
     cc_recipients: Vec<GRecipient>,
     #[serde(default)]
     received_date_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_modified_date_time: Option<DateTime<Utc>>,
     #[serde(default)]
     body: Option<GBody>,
     #[serde(default)]
@@ -271,24 +307,17 @@ impl GraphMailSource {
                     .ok()
                     .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(String::from))
                     .unwrap_or(body);
-                bail!("Graph returned {status}: {}", msg.chars().take(200).collect::<String>());
+                return Err(anyhow::Error::new(GraphError {
+                    status,
+                    message: msg.chars().take(200).collect(),
+                }));
             }
             return Ok(resp);
         }
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: Url, prefer_text: bool) -> Result<T> {
-        let resp = self
-            .send(|c| {
-                let r = c.get(url.clone());
-                if prefer_text {
-                    // Graph converts HTML bodies to text (defect E-06).
-                    r.header("Prefer", "outlook.body-content-type=\"text\"")
-                } else {
-                    r
-                }
-            })
-            .await?;
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
+        let resp = self.send(|c| c.get(url.clone())).await?;
         resp.json().await.context("unreadable Graph response")
     }
 
@@ -312,7 +341,7 @@ impl GraphMailSource {
                 .query_pairs_mut()
                 .append_pair("$filter", &format!("displayName eq '{}'", name.replace('\'', "''")))
                 .append_pair("$select", "id,displayName");
-            let found: GList<GFolder> = self.get_json(filtered, false).await?;
+            let found: GList<GFolder> = self.get_json(filtered).await?;
             let id = match found.value.into_iter().find(|f| f.display_name.eq_ignore_ascii_case(name)) {
                 Some(f) => f.id,
                 None => {
@@ -336,7 +365,7 @@ impl GraphMailSource {
     async fn attachments(&self, message_id: &str) -> Result<Vec<AttachmentMeta>> {
         let mut url = self.url(&["messages", message_id, "attachments"])?;
         url.query_pairs_mut().append_pair("$select", "id,name,contentType,size,isInline");
-        let list: GList<GAttachment> = self.get_json(url, false).await?;
+        let list: GList<GAttachment> = self.get_json(url).await?;
         Ok(list
             .value
             .into_iter()
@@ -375,6 +404,48 @@ impl GraphMailSource {
     }
 }
 
+impl GraphMailSource {
+    /// A `@odata.nextLink` is followed only on the Graph host we were given:
+    /// the bearer token goes with it.
+    fn same_origin(&self, link: &str) -> Result<Url> {
+        let url = Url::parse(link).context("unreadable @odata.nextLink")?;
+        let base = Url::parse(&self.graph_base).context("bad Graph base URL")?;
+        if url.origin() != base.origin() {
+            bail!("Graph paging link points at another host ({}); not followed", url.origin().ascii_serialization());
+        }
+        Ok(url)
+    }
+
+    /// The admin panel's "Test mailbox" (plan P4.7): sign in, then read the
+    /// inbox folder and one message id. Reading the folder alone would not
+    /// prove the app may read messages. Each failure says what to fix.
+    pub async fn test_access(&self) -> Result<String> {
+        if !self.is_configured() {
+            bail!("Fill in tenant id, client id, mailbox and the client secret first.");
+        }
+        self.token(true).await?;
+        let explain = |e: anyhow::Error| match graph_status(&e) {
+            Some(StatusCode::FORBIDDEN) | Some(StatusCode::UNAUTHORIZED) => anyhow!(
+                "Signed in, but the app may not read {}: grant Mail.Read (application) with admin                  consent, and check the application access policy covers this mailbox.",
+                self.cfg.mailbox
+            ),
+            Some(StatusCode::NOT_FOUND) => anyhow!("Signed in, but there is no mailbox {} in this tenant.", self.cfg.mailbox),
+            _ => e,
+        };
+        let mut inbox_url = self.url(&["mailFolders", "Inbox"])?;
+        inbox_url.query_pairs_mut().append_pair("$select", "id,displayName,unreadItemCount");
+        let inbox: GFolder = self.get_json(inbox_url).await.map_err(explain)?;
+        let mut one = self.url(&["mailFolders", "Inbox", "messages"])?;
+        one.query_pairs_mut().append_pair("$top", "1").append_pair("$select", "id");
+        let _: GList<serde_json::Value> = self.get_json(one).await.map_err(explain)?;
+        Ok(format!(
+            "Signed in; the Inbox of {} is readable ({} unread).",
+            self.cfg.mailbox,
+            inbox.unread_item_count.unwrap_or(0)
+        ))
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -396,40 +467,85 @@ impl MailSource for GraphMailSource {
         self.cfg.is_configured()
     }
 
-    async fn fetch_unprocessed(&self, limit: usize) -> Result<Vec<InboundMail>> {
+    fn checkpoint_key(&self) -> String {
+        format!("graph:{}", self.cfg.mailbox.trim().to_lowercase())
+    }
+
+    async fn list_changed(&self, since: DateTime<Utc>, max: usize) -> Result<Vec<MailHeader>> {
         let mut url = self.url(&["mailFolders", "Inbox", "messages"])?;
         url.query_pairs_mut()
-            // Graph refuses $orderby on a property absent from $filter
-            // ("InefficientFilter"), hence the always-true date clause.
-            .append_pair("$filter", "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false")
-            .append_pair("$orderby", "receivedDateTime asc")
-            .append_pair("$top", &limit.clamp(1, 50).to_string())
+            // Not `isRead`: with Mail.Read nothing can be marked read, and a
+            // person opening the mailbox in Outlook would hide mail from us.
+            // lastModifiedDateTime also moves when a mail is moved *into*
+            // the inbox (rescued from Junk), which receivedDateTime does not.
+            // Graph wants the $orderby property in $filter, and it is.
             .append_pair(
-                "$select",
-                "id,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments",
-            );
-        let list: GList<GMessage> = self.get_json(url, true).await?;
-        let mut out = Vec::with_capacity(list.value.len());
-        for m in list.value {
-            let attachments = if m.has_attachments {
-                match self.attachments(&m.id).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        // Better to skip the message this poll than to parse it
-                        // without the video it carries.
-                        warn!("Graph: attachments of {} unreadable, retrying next poll: {e:#}", m.id);
-                        continue;
-                    }
-                }
-            } else {
-                Vec::new()
+                "$filter",
+                &format!("lastModifiedDateTime ge {}", since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            )
+            .append_pair("$orderby", "lastModifiedDateTime asc")
+            .append_pair("$top", &LIST_PAGE.min(max.max(1)).to_string())
+            .append_pair("$select", HEADER_FIELDS);
+        let mut out = Vec::new();
+        let mut next = Some(url);
+        while let Some(page_url) = next.take() {
+            let page: GList<GMessage> = self.get_json(page_url).await?;
+            for m in page.value {
+                // Graph always sends it; a message without one cannot be
+                // placed against the checkpoint, so it is not listed.
+                let Some(modified_at) = m.last_modified_date_time else {
+                    warn!("Graph: message {} has no lastModifiedDateTime; skipped", m.id);
+                    continue;
+                };
+                out.push(MailHeader {
+                    internet_message_id: m.internet_message_id.unwrap_or_default(),
+                    subject: m.subject.unwrap_or_default(),
+                    from_address: m.from.unwrap_or_default().email_address.address.trim().to_lowercase(),
+                    received_at: m.received_date_time,
+                    modified_at,
+                    id: m.id,
+                });
+            }
+            if out.len() >= max {
+                out.truncate(max);
+                break;
+            }
+            next = match page.next_link {
+                Some(link) => Some(self.same_origin(&link)?),
+                None => None,
             };
-            out.push(self.to_inbound(m, attachments));
         }
         Ok(out)
     }
 
+    async fn fetch_mail(&self, id: &str) -> Result<InboundMail> {
+        let mut url = self.url(&["messages", id])?;
+        url.query_pairs_mut().append_pair("$select", MESSAGE_FIELDS);
+        // The HTML as sent, not Graph's text rendering: our own converter
+        // keeps the address behind a hyperlinked word and is what the
+        // golden fixtures test (plan P4.10).
+        let m: GMessage = match self.get_json(url).await {
+            Ok(m) => m,
+            Err(e) if graph_status(&e) == Some(StatusCode::NOT_FOUND) => {
+                return Err(anyhow::Error::new(MailGone(id.to_string())));
+            }
+            Err(e) => return Err(e),
+        };
+        let attachments = if m.has_attachments {
+            // An error here fails the fetch: better to retry the message next
+            // poll than to parse it without the video it carries.
+            self.attachments(&m.id).await.context("attachments unreadable")?
+        } else {
+            Vec::new()
+        };
+        Ok(self.to_inbound(m, attachments))
+    }
+
     async fn mark_processed(&self, mail_id: &str, outcome: MailOutcome) -> Result<()> {
+        if !self.cfg.write_access {
+            // Mail.Read only: the database is the record (plan P4.8).
+            return Ok(());
+        }
         let folder = match outcome {
             MailOutcome::Processed => {
                 // Read first: if the move fails, a read message is already
@@ -494,7 +610,7 @@ impl MailSource for GraphMailSource {
         let probe = async {
             let mut url = self.url(&["mailFolders", "Inbox"])?;
             url.query_pairs_mut().append_pair("$select", "id,displayName,unreadItemCount");
-            let inbox: GFolder = self.get_json(url, false).await?;
+            let inbox: GFolder = self.get_json(url).await?;
             Ok::<_, anyhow::Error>(inbox.unread_item_count.unwrap_or(0))
         };
         match probe.await {

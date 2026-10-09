@@ -24,6 +24,8 @@ use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
+mod selfcheck;
+
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
 #[command(author = "Alex Fountas <afountas@cretetv.gr>")]
@@ -53,11 +55,46 @@ enum Commands {
     RunService,
     /// Run the interactive CLI setup wizard
     Setup,
+    /// Install (or upgrade) from this release folder: copy to the install
+    /// directory, register and start the Windows service, check it answers
+    Install {
+        /// Install directory
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Dalet watchfolder (asked on a new installation when not given)
+        #[arg(long)]
+        watchfolder: Option<String>,
+        /// Web panel port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Run the service as this account (a domain account for a network
+        /// watchfolder); LocalSystem when not given
+        #[arg(long)]
+        account: Option<String>,
+        /// Ask nothing; take the defaults
+        #[arg(long)]
+        yes: bool,
+        /// Leave the Windows firewall alone
+        #[arg(long)]
+        no_firewall: bool,
+        /// Bring the configuration, database, secrets and seeds of an older
+        /// installation (or a dev checkout) on this PC into the new one
+        #[arg(long)]
+        import: Option<std::path::PathBuf>,
+    },
+    /// Remove the Windows service and its firewall rule; files stay
+    Uninstall {
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
     /// Manage the Windows Service (install, uninstall, start, stop, status)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Check the browser and every self-check link now, and print the
+    /// results (the same check that runs every morning; nothing is downloaded)
+    Selfcheck,
     /// Test headless browser stream sniffing on a target URL
     BrowserTest {
         /// URL to navigate and extract video stream from
@@ -68,11 +105,66 @@ enum Commands {
         #[command(subcommand)]
         action: AdblockAction,
     },
+    /// Show what the parser would do with recent mail, without queueing
+    /// anything or touching the mailbox (read-only)
+    MailPreview {
+        /// How many of the most recently changed Inbox messages to show
+        #[arg(long, default_value_t = 10)]
+        last: usize,
+        /// Look this many hours back
+        #[arg(long, default_value_t = 72)]
+        hours: i64,
+        /// Parse these .eml files instead of reading the mailbox
+        #[arg(long)]
+        eml: Vec<std::path::PathBuf>,
+        /// Also ask the LLM assist, as the daemon would
+        #[arg(long)]
+        llm: bool,
+    },
+    /// Queue saved .eml files as if they had arrived in the mailbox: parsed,
+    /// queued, attachments saved, the mail kept for the MCR mail view. A file
+    /// already handled is skipped. The running daemon downloads the jobs.
+    MailIngest {
+        /// The .eml files
+        #[arg(long, required = true)]
+        eml: Vec<std::path::PathBuf>,
+    },
+    /// The mail the daemon has handled, newest first
+    MailHistory {
+        #[arg(long, default_value_t = 20)]
+        last: i64,
+    },
+    /// Have the running daemon read a handled mail again on its next poll;
+    /// name it by Message-ID or by a part of its subject
+    MailReprocess {
+        #[arg(long)]
+        message_id: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+    },
+    /// Account recovery on this machine: list accounts, reset a password
+    Admin {
+        #[command(subcommand)]
+        action: AdminAction,
+    },
     /// Manage credentials in the encrypted secret store
     Secrets {
         #[command(subcommand)]
         action: SecretAction,
     },
+}
+
+#[derive(Subcommand)]
+enum AdminAction {
+    /// List every account's sign-in address, role and whether it is active
+    ListUsers,
+    /// Set a new password for an account (prompted, never on the command
+    /// line) and end all of its sessions
+    ResetPassword { email: String },
+    /// Sign an account out and refuse its sign-in until reactivated
+    Deactivate { email: String },
+    /// Let a deactivated account sign in again
+    Activate { email: String },
 }
 
 #[derive(Subcommand)]
@@ -138,15 +230,150 @@ fn init_logging(cli: &Cli, paths: &AppPaths) -> Result<Option<LogGuard>> {
     // Seed the redaction set from the secret store before the first line is
     // written, so nothing can be logged in the window before it is populated.
     let store = SecretStore::new(paths.resolve("data/secrets.bin"));
-    let redactions = Redactions::new(store.all_values());
+    let mut values = store.all_values();
+    // A secret supplied through the environment (plan P4.9) is redacted too.
+    values.extend(
+        omni_core::config::env_vars::SECRETS
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+    );
+    let redactions = Redactions::new(values);
 
     let guard = omni_core::logging::init(&paths.logs, &config.log, console, redactions)?;
     Ok(Some(guard))
 }
 
+/// `omni-ingest mail-preview` (plan P4.16): parse recent mail, or .eml
+/// files, and print what would be queued. Reads the mailbox, the roster and
+/// `processed_mail`; writes nothing, marks nothing.
+async fn mail_preview(
+    paths: &AppPaths,
+    last: usize,
+    hours: i64,
+    eml: Vec<std::path::PathBuf>,
+    llm: bool,
+) -> Result<()> {
+    use omni_email::source::MailSource;
+
+    let mut config = AppConfig::load_from_file(&paths.config)
+        .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+    config.adopt_secrets(&SecretStore::new(paths.resolve("data/secrets.bin")))?;
+    config.apply_env_overrides(|name| std::env::var(name).ok());
+    let repo = Repository::new(paths.resolve(&config.database_path))?;
+    let roster = repo.list_journalists()?;
+    let groups = repo.list_groups()?;
+    if roster.is_empty() {
+        println!("! The journalist roster is empty: every mail will resolve to MCR.");
+    }
+
+    let mails: Vec<omni_email::InboundMail> = if !eml.is_empty() {
+        let mut v = Vec::new();
+        for path in &eml {
+            let raw = std::fs::read(path).with_context(|| format!("Cannot read {path:?}"))?;
+            v.push(omni_email::InboundMail::from_rfc822(&path.display().to_string(), &raw)?);
+        }
+        v
+    } else {
+        let source = omni_email::graph::GraphMailSource::new(config.graph.clone());
+        if !source.is_configured() {
+            anyhow::bail!("The Graph mailbox is not configured (tenant id, client id, mailbox, client secret).");
+        }
+        let since = chrono::Utc::now() - chrono::Duration::hours(hours.max(1));
+        let mut headers = source.list_changed(since, 5000).await?;
+        headers.sort_by_key(|h| std::cmp::Reverse(h.modified_at));
+        headers.truncate(last.max(1));
+        println!(
+            "{} message(s) changed in the last {hours} h in {}; showing the newest {}.",
+            headers.len(),
+            config.graph.mailbox,
+            headers.len()
+        );
+        let mut v = Vec::new();
+        for h in headers {
+            match source.fetch_mail(&h.id).await {
+                Ok(m) => v.push(m),
+                Err(e) => println!("! '{}': could not be read: {e:#}", h.subject),
+            }
+        }
+        v
+    };
+
+    let assist = llm.then(|| {
+        omni_email::assist::Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
+    });
+    for mail in &mails {
+        let parsed = omni_email::assist::interpret(mail, &roster, &groups, &config.parser, assist.as_ref()).await;
+        let seen = repo
+            .get_processed_mail(&omni_email::watcher::mail_key(mail))?
+            .map(|p| p.outcome);
+        print!("{}", omni_email::preview::render(mail, &parsed, seen.as_deref()));
+    }
+    println!("
+Nothing was queued and the mailbox was not changed.");
+    Ok(())
+}
+
+/// `omni-ingest mail-ingest --eml …` (plan P7.9): saved mail through the
+/// watcher's own path into the configured database. Reads no mailbox.
+async fn mail_ingest(paths: &AppPaths, files: &[std::path::PathBuf]) -> Result<()> {
+    use omni_email::watcher::Ingested;
+
+    let mut config = AppConfig::load_from_file(&paths.config)
+        .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+    config.adopt_secrets(&SecretStore::new(paths.resolve("data/secrets.bin")))?;
+    let repo = Repository::new(paths.resolve(&config.database_path))?;
+    let source = std::sync::Arc::new(omni_email::eml::EmlSource::from_files(files)?);
+    let watcher = omni_email::EmailWatcher::with_source(config, repo.clone(), source.clone());
+
+    for id in source.ids() {
+        let mail = omni_email::source::MailSource::fetch_mail(source.as_ref(), &id).await?;
+        let key = omni_email::watcher::mail_key(&mail);
+        match watcher.ingest(&mail).await {
+            Ok(Ingested::AlreadyHandled) => println!("{id}: already handled ({key}); skipped"),
+            Ok(Ingested::Processed) => {
+                let row = repo.get_processed_mail(&key)?;
+                let queued: Vec<omni_email::watcher::QueuedFromMail> = row
+                    .as_ref()
+                    .and_then(|r| serde_json::from_str(&r.jobs_json).ok())
+                    .unwrap_or_default();
+                println!(
+                    "{id}: {} — {} job(s){}",
+                    row.map(|r| r.outcome).unwrap_or_default(),
+                    queued.len(),
+                    queued.iter().map(|q| format!("\n    {}  {}", q.slug, q.url)).collect::<String>()
+                );
+            }
+            Err(e) => println!("{id}: not queued: {e:#}"),
+        }
+    }
+    println!("\nThe running daemon downloads what was queued; the MCR desk shows it under Email.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // The installer runs from a release folder, which is not an install:
+    // nothing is created or logged next to it (plan P9).
+    match &cli.command {
+        Some(Commands::Install { dir, watchfolder, port, account, yes, no_firewall, import }) => {
+            return omni_cli::install::install(omni_cli::install::InstallOptions {
+                dir: dir.clone(),
+                watchfolder: watchfolder.clone(),
+                port: *port,
+                account: account.clone(),
+                yes: *yes,
+                no_firewall: *no_firewall,
+                import: import.clone(),
+            })
+            .await;
+        }
+        Some(Commands::Uninstall { dir }) => return omni_cli::install::uninstall(dir.clone()).await,
+        _ => {}
+    }
 
     // Anchor every relative path to the install directory exactly once, before
     // anything can accidentally resolve one against the CWD (plan P0.1).
@@ -189,6 +416,7 @@ async fn main() -> Result<()> {
         Some(Commands::Setup) => {
             omni_cli::run_setup_wizard(Some(&cli.config))?;
         }
+        Some(Commands::Install { .. } | Commands::Uninstall { .. }) => unreachable!("handled before paths"),
         Some(Commands::Service { action }) => {
             let sub = match action {
                 ServiceAction::Install { account } => {
@@ -209,6 +437,34 @@ async fn main() -> Result<()> {
                 ServiceAction::Status => omni_cli::ServiceSubcommand::Status,
             };
             omni_cli::handle_service_command(sub)?;
+        }
+        Some(Commands::Selfcheck) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let health = HealthState::new();
+            let ytdl = DependencyManager::new(&paths.bin).ytdl_live();
+            let deps = DependencyManager::new(&paths.bin);
+            if !ensure_deno(&deps, &health, config.ytdl_auto_update_nightly).await {
+                println!("  ✗ Deno: {}", health.get(omni_core::health::checks::DENO).and_then(|c| c.detail).unwrap_or_default());
+            } else {
+                println!("  ✓ Deno {} (for YouTube)", deps.deno_version().unwrap_or_default());
+            }
+            println!("Checking the browser…");
+            selfcheck::check_browser(&health).await;
+            if let Some(c) = health.get(omni_core::health::checks::BROWSER) {
+                println!("  {} {}", if c.state == omni_core::health::Health::Ok { "✓" } else { "✗" }, c.detail.unwrap_or_default());
+            }
+            let links = repo.list_selfcheck_links()?;
+            println!("Checking {} link(s); each takes a few seconds…", links.len());
+            let mut failing = 0;
+            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, &links).await {
+                if !outcome.ok {
+                    failing += 1;
+                }
+                println!("  {} {:<32} {}", if outcome.ok { "✓" } else { "✗" }, link.label, outcome.detail);
+            }
+            println!("{} of {} links work.", links.len() - failing, links.len());
         }
         Some(Commands::BrowserTest { url }) => {
             println!("Testing stream sniffer on URL: {}", url);
@@ -234,6 +490,80 @@ async fn main() -> Result<()> {
                     eprintln!("\n✗ Stream sniffing failed: {}", e);
                 }
             }
+        }
+        Some(Commands::MailPreview { last, hours, eml, llm }) => {
+            mail_preview(&paths, last, hours, eml, llm).await?;
+        }
+        Some(Commands::MailIngest { eml }) => {
+            mail_ingest(&paths, &eml).await?;
+        }
+        Some(Commands::MailHistory { last }) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let rows = repo.list_processed_mail(last)?;
+            if rows.is_empty() {
+                println!("\nNo mail handled yet.");
+            }
+            let pending: Vec<String> = repo.pending_mail_reprocess()?.into_iter().map(|(k, _, _)| k).collect();
+            for m in rows {
+                let jobs = serde_json::from_str::<Vec<serde_json::Value>>(&m.jobs_json).map(|v| v.len()).unwrap_or(0);
+                println!(
+                    "{}  {:<12} {:>2} job(s)  {}{}\n    {}",
+                    m.processed_at.map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default(),
+                    m.outcome,
+                    jobs,
+                    m.subject.unwrap_or_default(),
+                    if pending.contains(&m.internet_message_id) { "   [reprocess pending]" } else { "" },
+                    m.internet_message_id
+                );
+            }
+        }
+        Some(Commands::MailReprocess { message_id, subject }) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let key = match (message_id, subject) {
+                (Some(id), _) => id.trim().to_string(),
+                (None, Some(part)) => {
+                    let wanted = part.trim().to_lowercase();
+                    let hits: Vec<_> = repo
+                        .list_processed_mail(500)?
+                        .into_iter()
+                        .filter(|m| m.subject.as_deref().unwrap_or("").to_lowercase().contains(&wanted))
+                        .collect();
+                    match hits.len() {
+                        0 => anyhow::bail!("No handled mail has `{}` in its subject. See `omni-ingest mail-history`.", part.trim()),
+                        1 => hits[0].internet_message_id.clone(),
+                        n => {
+                            println!("{n} handled mails match; name one with --message-id:");
+                            for m in hits {
+                                println!("  {}  {}", m.internet_message_id, m.subject.unwrap_or_default());
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+                (None, None) => anyhow::bail!("Name the mail: --message-id <id> or --subject <part of it>."),
+            };
+            let m = repo.request_mail_reprocess(&key, "command line")?;
+            let _ = repo.log_audit("INFO", "EMAIL", &format!("Reprocess of '{}' requested from the command line", m.subject.clone().unwrap_or_default()));
+            println!(
+                "✓ '{}' will be read again on the daemon's next poll (it must be running). Jobs it already has are not queued twice.",
+                m.subject.unwrap_or_default()
+            );
+        }
+        Some(Commands::Admin { action }) => {
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let repo = Repository::new(paths.resolve(&config.database_path))?;
+            let sub = match action {
+                AdminAction::ListUsers => omni_cli::AdminSubcommand::ListUsers,
+                AdminAction::ResetPassword { email } => omni_cli::AdminSubcommand::ResetPassword { email },
+                AdminAction::Deactivate { email } => omni_cli::AdminSubcommand::SetActive { email, active: false },
+                AdminAction::Activate { email } => omni_cli::AdminSubcommand::SetActive { email, active: true },
+            };
+            omni_cli::handle_admin_command(&repo, sub)?;
         }
         Some(Commands::Secrets { action }) => {
             let store = SecretStore::new(paths.resolve("data/secrets.bin"));
@@ -301,6 +631,12 @@ async fn run_daemon(
             .context("Failed rewriting config.json without the plaintext secret")?;
         info!("Rewrote {:?} without the plaintext mailbox password", config_path);
     }
+    // Console / development runs may take the Graph settings from the
+    // environment (plan P4.9). Names only in the log, never values.
+    let from_env = config.apply_env_overrides(|name| std::env::var(name).ok());
+    if !from_env.is_empty() {
+        info!("Graph settings taken from the environment: {}", from_env.join(", "));
+    }
     let config = config;
 
     // Every one of these is absolute: relative entries resolve against the
@@ -316,6 +652,17 @@ async fn run_daemon(
 
     info!("Initializing SQLite database at: {:?}", db_path);
     let repo = Repository::new(&db_path)?;
+    // A brand-new installation starts with Admin / Admin (owner's decision,
+    // 2026-10-08). First, before anything writes to the audit log, which
+    // is how a used database is told apart from a new one.
+    match repo.ensure_default_admin() {
+        Ok(true) => warn!(
+            "New installation: log in as Admin / Admin at http://127.0.0.1:{}/admin, create your own administrator and deactivate Admin.",
+            config.web_port
+        ),
+        Ok(false) => {}
+        Err(e) => warn!("Could not create the first-run administrator: {e:#}"),
+    }
 
     // Sessions that expired while the daemon was down are dead rows; clearing
     // them at start-up keeps the table from growing without bound on a machine
@@ -335,6 +682,9 @@ async fn run_daemon(
 
     // Dependency manager and tool paths
     let dep_mgr = DependencyManager::new(&bin_dir);
+    if config.ytdl_path.is_none() {
+        ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
+    }
     let ffmpeg_path = config
         .ffmpeg_path
         .as_ref()
@@ -375,7 +725,8 @@ async fn run_daemon(
         bmxtranswrap_path,
         temp_path.clone(),
         watchfolder_path.clone(),
-    ));
+    )
+    .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8)));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -392,6 +743,7 @@ async fn run_daemon(
     // URL, once per job. It never blocks start-up: refusing to come up is the
     // one outcome an operator cannot diagnose from the MCR desk.
     omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
+    omni_core::selftest::check_default_admin(&repo, &health);
 
     // Tools that start are not tools that make the file: an FFmpeg 9 build
     // answered `-version` and then rejected an output option, so every job
@@ -419,6 +771,28 @@ async fn run_daemon(
         }
     }
 
+    // Deno for YouTube (plan P6.8): reported now, and fetched in the
+    // background when it is missing, so a fresh install or a deleted
+    // bin/deno.exe repairs itself instead of failing YouTube jobs.
+    {
+        let health = health.clone();
+        let bin_dir = bin_dir.clone();
+        let auto = config.ytdl_auto_update_nightly;
+        tokio::spawn(async move {
+            ensure_deno(&DependencyManager::new(&bin_dir), &health, auto).await;
+        });
+    }
+
+    // The self-check's last results, and a browser launch in the background:
+    // a broken browser is reported now, not when the first article fails.
+    selfcheck::refresh_health(&repo, &health);
+    {
+        let health = health.clone();
+        tokio::spawn(async move {
+            selfcheck::check_browser(&health).await;
+        });
+    }
+
     match health.overall() {
         omni_core::health::Health::Ok => info!("Start-up self-test passed"),
         verdict => {
@@ -439,9 +813,16 @@ async fn run_daemon(
     }
 
     // 1. Start Embedded Web Server
+    // One LLM assist for the watcher, the admin panel and the health check;
+    // the panel swaps it when the settings are saved (plan P4.22).
+    let live_llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
+    // Jobs a worker is still busy with: a retry from MCR waits for them.
+    let busy_jobs = omni_core::busy::BusyJobs::new();
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_secret_store(secret_store.clone())
-        .with_health(health.clone());
+        .with_health(health.clone())
+        .with_llm(live_llm.clone())
+        .with_busy_jobs(busy_jobs.clone());
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();
@@ -453,19 +834,20 @@ async fn run_daemon(
     });
 
     // 2. Start Email Monitoring Watchdog
-    // Graph (Office 365) when configured, else IMAP; see EmailWatcher::new.
-    if config.graph.is_configured() || !config.email_address.is_empty() {
+    // The Office 365 mailbox through Microsoft Graph; see EmailWatcher::new.
+    if config.graph.is_configured() {
         let email_watcher = Arc::new(
             EmailWatcher::new(config.clone(), repo.clone())
                 .with_attachments_dir(temp_path.join("attachments"))
-                .with_health(health.clone()),
+                .with_health(health.clone())
+                .with_live_assist(live_llm.clone()),
         );
         let email_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             email_watcher.start_polling_loop(email_rx).await;
         });
     } else {
-        info!("Email monitoring disabled (neither a Graph mailbox nor an IMAP address is configured).");
+        info!("Email monitoring disabled (the Graph mailbox is not configured: tenant id, client id, mailbox and client secret).");
         health.set(
             omni_core::health::checks::MAIL,
             omni_core::health::Check::disabled("Mailbox"),
@@ -480,22 +862,26 @@ async fn run_daemon(
     // of that constraint, and the status must not imply otherwise.
     {
         let llm_health = health.clone();
-        let endpoint = config.ollama_endpoint.clone();
-        let model = config.ollama_model.clone();
+        let live = live_llm.clone();
         let mut llm_rx = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let client = omni_email::llm::LlmClient::new(&endpoint, &model);
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = llm_rx.recv() => break,
                     _ = tick.tick() => {
-                        let check = if client.ping().await {
-                            omni_core::health::Check::ok(format!("{model} at {endpoint}"))
+                        // The current settings each time: the panel may
+                        // have changed them since the last tick.
+                        let assist = live.current();
+                        let check = if assist.mode() == omni_core::config::LlmMode::Off {
+                            omni_core::health::Check::disabled("LLM assist")
+                        } else if assist.client().ping().await {
+                            omni_core::health::Check::ok(assist.describe())
                         } else {
                             omni_core::health::Check::degraded(format!(
-                                "{endpoint} unreachable; parsing continues without it"
+                                "{} unreachable or key refused; parsing continues without it",
+                                assist.describe()
                             ))
                         };
                         llm_health.set_if_changed(omni_core::health::checks::LLM, check);
@@ -526,6 +912,8 @@ async fn run_daemon(
             adblock_enabled: config.adblock_auto_update_nightly,
             gate: update_gate.clone(),
             retention_days: config.retention_days.max(1),
+            mail_text_retention_days: config.mail_text_retention_days.max(1),
+            health: health.clone(),
         };
 
         tokio::spawn(async move {
@@ -574,6 +962,7 @@ async fn run_daemon(
     // 6. Lease reaper: requeue jobs whose owner died without releasing them.
     {
         let repo_reaper = repo.clone();
+        let queue_health = health.clone();
         let mut reaper_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(LEASE_REAP_INTERVAL);
@@ -588,6 +977,18 @@ async fn run_daemon(
                             ),
                             Err(e) => error!("Lease reaper failed: {e:?}"),
                         }
+                        match repo_reaper.queue_watch(chrono::Utc::now()) {
+                            Ok(w) => {
+                                let was_degraded = queue_health
+                                    .get(omni_core::health::checks::QUEUE)
+                                    .is_some_and(|c| c.state == omni_core::health::Health::Degraded);
+                                queue_health.set_if_changed(
+                                    omni_core::health::checks::QUEUE,
+                                    queue_check(&w, was_degraded),
+                                );
+                            }
+                            Err(e) => warn!("Queue check could not read the queue: {e:?}"),
+                        }
                     }
                 }
             }
@@ -601,17 +1002,29 @@ async fn run_daemon(
     // and twenty pending jobs, eighteen sat in DOWNLOADING with nobody working
     // on them -- and the MCR panel showed eighteen phantom downloads while the
     // operator waited for files that were not being made.
+    //
+    // Two limits (plan P1.13): `max_concurrent_downloads` jobs fetching
+    // their source, and the engine's encoder slots. A job hands its download
+    // slot back once its source is on disk, so the next download starts
+    // while it waits for an encoder. Jobs in flight are capped at downloads
+    // + encoders, so downloads run ahead of the encoders by a bounded amount.
     let max_concurrency = config.max_concurrent_downloads.clamp(1, 10);
+    let max_encoders = config.max_concurrent_transcodes.clamp(1, 8);
     let semaphore = Arc::new(Semaphore::new(max_concurrency));
+    let in_flight = Arc::new(Semaphore::new(max_concurrency + max_encoders));
     let mut worker_rx = shutdown_tx.subscribe();
     let repo_worker = repo.clone();
+    let busy_worker = busy_jobs.clone();
     let engine_worker = broadcast_engine.clone();
     let worker_hostname = hostname.clone();
     let worker_gate = update_gate.clone();
     let worker_encoder_ok = encoder_ok.clone();
+    let worker_health = health.clone();
+    let worker_watchfolder = watchfolder_path.clone();
+    let worker_temp = temp_path.clone();
 
     tokio::spawn(async move {
-        info!("Queue worker pool active (concurrency: {max_concurrency})");
+        info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
         let mut worker_seq: u64 = 0;
 
         loop {
@@ -621,7 +1034,11 @@ async fn run_daemon(
                     info!("Worker pool shutting down.");
                     break;
                 }
-                p = semaphore.clone().acquire_owned() => match p {
+                p = async {
+                    let job_slot = in_flight.clone().acquire_owned().await?;
+                    let download_slot = semaphore.clone().acquire_owned().await?;
+                    Ok::<_, tokio::sync::AcquireError>((job_slot, download_slot))
+                } => match p {
                     Ok(p) => p,
                     Err(_) => break,
                 },
@@ -637,6 +1054,17 @@ async fn run_daemon(
                 tokio::select! {
                     _ = worker_rx.recv() => break,
                     _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                }
+            }
+
+            // Under STOP_DISK_GB free, no new job starts (plan P1.4): the
+            // `disk` check goes red and the queue waits until there is room
+            // again, rather than every job failing in turn mid-encode.
+            if !omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp) {
+                drop(permit);
+                tokio::select! {
+                    _ = worker_rx.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
                 }
             }
 
@@ -676,18 +1104,26 @@ async fn run_daemon(
 
             let eng = engine_worker.clone();
             let rep = repo_worker.clone();
+            let busy_guard = busy_worker.guard(job.id, &owner);
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
                 // it is what tells a waiting updater the downloader is idle.
                 let _gate_pass = gate_pass;
+                // Until this task is done with the job, MCR cannot queue it
+                // again (a cancelled job stops only at its next stage).
+                // Its token is the job run's: MCR's cancel and a lost lease
+                // both fire it, and it kills the running tool (plan P1.15).
+                let cancel = busy_guard.token();
+                let _busy = busy_guard;
                 let job_id = job.id;
+                let (job_slot, download_slot) = permit;
+                eng.hold_download_slot(job_id, download_slot);
 
                 // Keep the lease alive while we work. If it stops succeeding we
                 // have lost the job -- the reaper requeued it, or an operator
                 // cancelled it -- and must stop rather than deliver a file for a
                 // job somebody else now owns.
-                let cancel = CancellationToken::new();
                 let heartbeat = {
                     let rep = rep.clone();
                     let owner = owner.clone();
@@ -714,7 +1150,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone()).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -733,7 +1169,9 @@ async fn run_daemon(
                     );
                 }
 
-                drop(permit);
+                // A job that ended before reaching the encoder still holds it.
+                eng.release_download_slot(job_id);
+                drop(job_slot);
             });
         }
     });
@@ -771,6 +1209,32 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const LEASE_SECS: i64 = 180;
 const LEASE_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// A ready video waiting, or one step running, longer than this is a warning.
+const QUEUE_SLOW_SECS: i64 = 30 * 60;
+
+/// Once degraded, the check recovers only when both measures are under this,
+/// so a backlog hovering near 30 min does not alarm on every edge.
+const QUEUE_RECOVER_SECS: i64 = 25 * 60;
+
+/// The `queue` health check (plan P7.19). Never `down`: a slow queue is a warning.
+fn queue_check(w: &omni_core::models::QueueWatch, was_degraded: bool) -> omni_core::health::Check {
+    use omni_core::health::Check;
+    let limit = if was_degraded { QUEUE_RECOVER_SECS } else { QUEUE_SLOW_SECS };
+    let counts = format!("{} waiting, {} running", w.waiting, w.running);
+    let mut problems = Vec::new();
+    if let Some(secs) = w.oldest_ready_wait_secs.filter(|s| *s > limit) {
+        problems.push(format!("a video has waited {} min", secs / 60));
+    }
+    if let Some((id, stage, secs)) = w.longest_step.as_ref().filter(|(_, _, s)| *s > limit) {
+        problems.push(format!("job #{id} has been in {stage} for {} min", secs / 60));
+    }
+    if problems.is_empty() {
+        Check::ok(counts)
+    } else {
+        Check::degraded(format!("{}; {counts}", problems.join("; ")))
+    }
+}
+
 /// Host component of a lease owner string.
 ///
 /// Recovery only requeues jobs whose owner starts with this host, so two
@@ -779,6 +1243,12 @@ fn hostname_for_lease() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+/// Whether this worker still holds the job. A failed check counts as lost:
+/// better to stop than to queue or deliver for a job MCR may have cancelled.
+fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
+    repo.owns_lease(job_id, owner).unwrap_or(false)
 }
 
 /// Run one leased job through the pipeline.
@@ -790,6 +1260,7 @@ async fn run_job(
     engine: &Arc<BroadcastEngine>,
     owner: &str,
     job: omni_core::models::Job,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let job_id = job.id;
     let orig_url = job.url.clone();
@@ -817,8 +1288,117 @@ async fn run_job(
         return Ok(());
     }
 
-    repo.set_stage(job_id, owner, JobStage::Download)?;
-    let mut process_result = engine.process_job(job.clone(), owner).await;
+    if !repo.set_stage(job_id, owner, JobStage::Download)? {
+        warn!("Job #{job_id}: no longer ours; stopping without delivering");
+        return Ok(());
+    }
+
+    // A word typed onto the end of the link that the parser did not know
+    // ("…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", plan P3.10): used only when the site says
+    // the address as given does not exist and confirms the one without it.
+    //
+    // First the words the parser knows (P3.12): a job queued before P3.9
+    // still carries "…-ΒΙΝΤΕΟ", and some sites (amna.gr) answer 200 for the
+    // decorated address, so a 404 never says so. The same rule as the
+    // parser: no guess, no request.
+    let mut job = job;
+    let orig_url = if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
+        let known = omni_email::parser::without_annotation(&orig_url);
+        let (fixed, why) = if known != orig_url {
+            (Some(known.to_string()), "the word the sender glued to it removed")
+        } else {
+            (omni_browser::pages::repair_dead_link(&orig_url).await, "it does not exist as sent (404); the site has it without the ending the sender added")
+        };
+        match fixed {
+            Some(fixed) => {
+                info!("Job #{job_id}: {orig_url} -> {fixed}");
+                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed}"))?;
+                if let Err(e) = repo.set_leased_job_url(job_id, owner, &fixed) {
+                    warn!("Job #{job_id}: could not store the corrected link: {e:#}");
+                }
+                job.url = fixed.clone();
+                fixed
+            }
+            None => orig_url,
+        }
+    } else {
+        orig_url
+    };
+
+    // A news page yt-dlp reads as several videos (an article with four
+    // Streamable embeds): this job takes the first, the others become
+    // sibling jobs or offers, as when the sniffer finds them. Before, all
+    // were downloaded into this job and one was delivered.
+    let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
+    let mut page_referer: Option<String> = None;
+    // yt-dlp already said it cannot read this page: skip the download
+    // attempt that would only say so again (one more yt-dlp start and page
+    // fetch, several seconds) and go straight to the sniffer.
+    let mut known_unsupported = false;
+
+    // A portal whose video one API request names (plan P3.8): no yt-dlp
+    // page scan, no browser. A failed request just takes the usual way.
+    if is_web {
+        match omni_browser::pages::resolve(&orig_url).await {
+            Ok(Some(video)) => {
+                info!("Job #{job_id}: the page's own API names {video}");
+                repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Video named by the site's API: {video}"))?;
+                job.url = video;
+                page_referer = Some(orig_url.clone());
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Job #{job_id}: site API lookup failed, trying the usual way: {e:#}"),
+        }
+    }
+
+    if cancel.is_cancelled() {
+        warn!("Job #{job_id}: cancelled; not scanning the page");
+        return Ok(());
+    }
+    if is_web && page_referer.is_none() && !omni_broadcast::downloader::is_video_platform(&orig_url) {
+        let scan = engine.page_videos(&orig_url).await;
+        known_unsupported = scan.unsupported;
+        let videos = scan.videos;
+        if videos.len() > 1 {
+            info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
+            repo.record_event(
+                job_id,
+                "INFO",
+                Some(JobStage::Extract),
+                &format!("The page holds {} videos; this job downloads the first: {}", videos.len(), videos[0]),
+            )?;
+            if !still_ours(repo, job_id, owner) {
+                warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+                return Ok(());
+            }
+            omni_broadcast::article::queue_article_siblings(repo, owner, &mut job, &videos[0], &videos);
+            job.url = videos[0].clone();
+            page_referer = Some(orig_url.clone());
+        }
+    }
+    if !still_ours(repo, job_id, owner) {
+        warn!("Job #{job_id}: no longer ours; not downloading");
+        return Ok(());
+    }
+    let mut process_result = if known_unsupported {
+        repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Extract),
+            "yt-dlp has no extractor for this page; going straight to the browser",
+        )?;
+        Err(anyhow::anyhow!("{}: yt-dlp has no extractor for the page", ErrorCode::UnsupportedUrl.as_str())
+            .context(ErrorCode::UnsupportedUrl.as_str()))
+    } else {
+        engine
+            .process_job_cancellable(job.clone(), owner, page_referer.as_deref(), None, None, Some(cancel.clone()))
+            .await
+    };
+
+    if lost_lease(&process_result) {
+        warn!("Job #{job_id}: no longer ours; nothing more to do");
+        return Ok(());
+    }
 
     // yt-dlp could not resolve the page. For a news portal that is expected:
     // the video is behind an embedded player, so sniff the actual stream and
@@ -831,7 +1411,10 @@ async fn run_job(
     };
     if sniff && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
         info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
-        repo.set_stage(job_id, owner, JobStage::Extract)?;
+        if !repo.set_stage(job_id, owner, JobStage::Extract)? {
+            warn!("Job #{job_id}: no longer ours; not sniffing");
+            return Ok(());
+        }
         repo.record_event(
             job_id,
             "INFO",
@@ -839,28 +1422,65 @@ async fn run_job(
             "Direct download failed; sniffing the page for a stream",
         )?;
 
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         match StreamSniffer::extract_media_bundle(&orig_url, 25).await {
             Ok(bundle) => {
-                info!("Job #{job_id}: sniffer found {}", bundle.primary_stream);
-                repo.record_event(
-                    job_id,
-                    "INFO",
-                    Some(JobStage::Extract),
-                    &format!("Sniffed stream: {}", bundle.primary_stream),
-                )?;
-                let mut retry_job = job.clone();
-                omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &bundle.primary_stream, &bundle.all_streams);
-                retry_job.url = bundle.primary_stream;
-                repo.set_stage(job_id, owner, JobStage::Download)?;
-                process_result = engine
-                    .process_job_with_context(
-                        retry_job,
-                        owner,
-                        Some(&bundle.referer),
-                        Some(&bundle.user_agent),
-                        bundle.cookies.as_deref(),
-                    )
-                    .await;
+                // An article's embedded posts are not all videos: the first
+                // X post in a news247 article was a photo, became the job's
+                // video, and sent the job to review while its two real
+                // videos were delivered as siblings (P3.13). Ask yt-dlp
+                // about each post first; keep the ones it cannot rule out.
+                let streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams, &cancel).await;
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                let primary = if streams.contains(&bundle.primary_stream) {
+                    Some(bundle.primary_stream.clone())
+                } else {
+                    streams.first().cloned()
+                };
+                match primary {
+                    Some(primary) => {
+                        info!("Job #{job_id}: sniffer found {primary}");
+                        repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Sniffed stream: {primary}"))?;
+                        let mut retry_job = job.clone();
+                        if !still_ours(repo, job_id, owner) {
+                            warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+                            return Ok(());
+                        }
+                        omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams);
+                        retry_job.url = primary;
+                        if !repo.set_stage(job_id, owner, JobStage::Download)? {
+                            warn!("Job #{job_id}: no longer ours; not downloading the sniffed stream");
+                            return Ok(());
+                        }
+                        process_result = engine
+                            .process_job_cancellable(
+                                retry_job,
+                                owner,
+                                Some(&bundle.referer),
+                                Some(&bundle.user_agent),
+                                bundle.cookies.as_deref(),
+                                Some(cancel.clone()),
+                            )
+                            .await;
+                    }
+                    None => {
+                        repo.record_event(
+                            job_id,
+                            "ERROR",
+                            Some(JobStage::Extract),
+                            "The page's embedded posts have no video (photos or text only)",
+                        )?;
+                        process_result = Err(anyhow::anyhow!(
+                            "{}: the page's embedded posts have no video",
+                            ErrorCode::NoStreamFound.as_str()
+                        )
+                        .context(ErrorCode::NoStreamFound.as_str()));
+                    }
+                }
             }
             Err(sniff_err) => {
                 warn!("Job #{job_id}: sniffer found nothing: {sniff_err}");
@@ -870,8 +1490,16 @@ async fn run_job(
                     Some(JobStage::Extract),
                     &format!("Sniffer found no stream: {sniff_err}"),
                 )?;
+                if let Err(previous) = std::mem::replace(&mut process_result, Ok(())) {
+                    process_result = Err(after_failed_sniff(previous, sniff_err));
+                }
             }
         }
+    }
+
+    if lost_lease(&process_result) {
+        warn!("Job #{job_id}: no longer ours; nothing more to do");
+        return Ok(());
     }
 
     match process_result {
@@ -898,7 +1526,7 @@ async fn run_job(
             let code = classify_pipeline_error(&e);
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
-            let message = format!("{e}");
+            let message = readable_cause(&e);
 
             // The full context chain, which carries each stage's stderr tail,
             // into the job's own timeline (plan P6.1). `error_message` is the
@@ -936,6 +1564,157 @@ async fn run_job(
     }
 }
 
+/// `streams` without the social posts yt-dlp says have no video, in page
+/// order (P3.13). YouTube is not asked (it has no photo posts) and raw
+/// streams cannot be; a post that cannot be checked (network, login) stays.
+/// About a second per post with the folder build of yt-dlp.
+async fn without_videoless_posts(
+    repo: &Repository,
+    engine: &BroadcastEngine,
+    job_id: i64,
+    streams: &[String],
+    cancel: &CancellationToken,
+) -> Vec<String> {
+    use omni_broadcast::downloader::{is_video_platform, is_youtube};
+    let mut kept = Vec::with_capacity(streams.len());
+    let mut seen = std::collections::HashSet::new();
+    for (i, url) in streams.iter().enumerate() {
+        // One post under two addresses (".../visegrad24/status/N" and
+        // ".../i/status/N") is asked about, and kept, once.
+        if !seen.insert(omni_core::urlnorm::normalize(url)) {
+            continue;
+        }
+        let ask = i < 12 && is_video_platform(url) && !is_youtube(url);
+        let has_video = if ask {
+            // Dropping the future kills yt-dlp (run_capture sets kill_on_drop).
+            tokio::select! {
+                r = engine.post_has_video(url) => r,
+                _ = cancel.cancelled() => break,
+            }
+        } else {
+            None
+        };
+        if ask && has_video == Some(false) {
+            info!("Job #{job_id}: {url} has no video; not a candidate");
+            let _ = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Embedded post without a video, skipped: {url}"));
+            continue;
+        }
+        kept.push(url.clone());
+    }
+    kept
+}
+
+/// The job's failure once the sniffer has also come back empty-handed.
+///
+/// A page the browser opened and found no video on is reported as that
+/// (NO_STREAM_FOUND): yt-dlp's "Unsupported URL" for a news article only
+/// means it has no extractor for the portal, which is why the sniffer ran,
+/// and told MCR to "try a direct video link" for an article that has none.
+/// A browser that never got that far leaves yt-dlp's failure standing.
+fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyhow::Error {
+    match sniff_err.downcast_ref::<omni_browser::BrowserError>() {
+        Some(omni_browser::BrowserError::NoStreamFound(_)) => {
+            anyhow::anyhow!("{}: no video found in the page", ErrorCode::NoStreamFound.as_str())
+                .context(ErrorCode::NoStreamFound.as_str())
+        }
+        _ => previous,
+    }
+}
+
+/// Whether the engine stopped because this worker no longer holds the job
+/// (P1.14). Nothing more may be written for it: `finish` and `requeue_after`
+/// would refuse, but the events and sniffing would not.
+fn lost_lease(result: &anyhow::Result<()>) -> bool {
+    matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
+}
+
+/// The one readable line for a failure's `error_message` (P7.15): the root
+/// cause, without the code strings the pipeline wraps around it.
+fn readable_cause(e: &anyhow::Error) -> String {
+    const CAP: usize = 300;
+    const TAIL: &str = ". stderr tail: ";
+    let outer = format!("{e}");
+    let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+    let Some(ri) = chain.iter().rposition(|s| ErrorCode::from_code(s).is_none()) else { return outer };
+    let root = &chain[ri];
+
+    let strip = |mut text: &str| -> String {
+        loop {
+            let before = text;
+            if let Some(rest) = text.strip_prefix("ERROR:") {
+                text = rest.trim_start();
+            }
+            for code in ErrorCode::ALL {
+                if let Some(rest) = text.strip_prefix(code.as_str()).and_then(|r| r.strip_prefix(':')) {
+                    text = rest.trim_start();
+                }
+            }
+            if text == before {
+                return text.trim().to_string();
+            }
+        }
+    };
+
+    let text = if let Some((header, tail)) = root.split_once(TAIL) {
+        // A tool that failed (omni_core::process): keep "exited / timed out",
+        // add the tail's FIRST line that names an error. FFmpeg 7+ follows
+        // the cause ("Error while opening encoder - maybe incorrect
+        // parameters…") with generic thread-teardown lines that also say
+        // "error"; those name nothing (seen with the installed FFmpeg 9).
+        const GENERIC: [&str; 5] = [
+            "Conversion failed!",
+            "Task finished with error code",
+            "Terminating thread with return code",
+            "Error sending frames to consumers",
+            "Nothing was written into output file",
+        ];
+        let header = strip(header);
+        let hit = tail
+            .lines()
+            .map(|l| without_log_prefixes(l.trim()))
+            .find(|l| l.to_ascii_lowercase().contains("error") && !GENERIC.iter().any(|g| l.contains(g)));
+        match hit {
+            Some(l) => format!("{header}: {}", strip(l)),
+            None => header,
+        }
+    } else {
+        // A stderr tail: the ERROR line if there is one, else the last line with text.
+        let lines: Vec<&str> = root.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let line = lines.iter().rev().find(|l| l.contains("ERROR")).or(lines.last()).copied().unwrap_or("");
+        let line = strip(line);
+        // A bare OS or serde error says little alone; keep what was being done.
+        // The OS error goes first: a parent quoting two long paths
+        // ("Failed copying … to …") would otherwise push it past the cap.
+        let parent = ri.checked_sub(1).map(|i| chain[i].as_str());
+        match parent {
+            Some(p) if lines.len() <= 1 && ErrorCode::from_code(p).is_none() && !p.trim().is_empty() && !line.is_empty() => {
+                format!("{line} ({})", p.trim())
+            }
+            _ => line,
+        }
+    };
+    if text.is_empty() {
+        return outer;
+    }
+    if text.chars().count() > CAP {
+        let cut: String = text.chars().take(CAP).collect();
+        return format!("{}…", cut.trim_end());
+    }
+    text
+}
+
+/// "[vost#0:0/mpeg2video @ 000001] [enc:mpeg2video @ 000002] Error …" ->
+/// "Error …": FFmpeg's per-component prefixes carry only addresses.
+fn without_log_prefixes(mut line: &str) -> &str {
+    while line.starts_with('[') {
+        match line.find("] ") {
+            Some(end) => line = line[end + 2..].trim_start(),
+            None => break,
+        }
+    }
+    line
+}
+
 /// Recover the error code the pipeline attached to a failure.
 ///
 /// The pipeline wraps failures with `.context(code.as_str())`, so the code is in
@@ -950,6 +1729,7 @@ fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
         ErrorCode::LoginRequired,
         ErrorCode::GeoBlocked,
         ErrorCode::PrivateOrRemoved,
+        ErrorCode::PageNotFound,
         ErrorCode::LiveStream,
         ErrorCode::Http403,
         ErrorCode::UnsupportedUrl,
@@ -995,6 +1775,23 @@ async fn nightly_ytdl_update(
         }
     };
 
+    // A build the self-check already rolled back is not tried again every
+    // night; the next release is.
+    let rejected_marker = dep_mgr.get_bin_dir().join("yt-dlp.exe.rejected");
+    let rejected = std::fs::read_to_string(&rejected_marker).unwrap_or_default();
+    if rejected.trim() == staged.sha256 {
+        dep_mgr.discard_staged_ytdl();
+        info!("yt-dlp update skipped: this build was rolled back before");
+        return TaskOutcome::Skipped;
+    }
+    // Live and also the release: nothing to do. (The download is still made,
+    // to know; it is a few seconds at 03:00.)
+    if dep_mgr.ytdl_live_sha256().as_deref() == Some(staged.sha256.as_str()) {
+        dep_mgr.discard_staged_ytdl();
+        info!("yt-dlp is already the latest release");
+        return TaskOutcome::Ok;
+    }
+
     // Up to ten minutes for in-flight downloads. Longer than any sane clip and
     // shorter than the gap to the next bulletin.
     if !gate.pause_and_drain(Duration::from_secs(600)).await {
@@ -1011,28 +1808,226 @@ async fn nightly_ytdl_update(
     }
 
     let outcome = dep_mgr.apply_staged_ytdl();
-    // Resume before reporting, so a logging failure cannot leave the queue
-    // paused.
-    gate.resume();
+    let installed = match outcome {
+        Ok(path) => path,
+        Err(e) => {
+            gate.resume();
+            warn!("Nightly yt-dlp update failed to install: {e:#}");
+            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+            return TaskOutcome::Failed;
+        }
+    };
 
-    match outcome {
-        Ok(path) => {
-            info!("Nightly yt-dlp updated to {:?}", path);
+    // Is the new build at least as good as the old one (plan P6.7)? The
+    // links that worked before the update are checked again, with downloads
+    // still paused. A link the new build fails and the old one passes means
+    // the release broke it: the old build goes back and this one is marked
+    // rejected. A link both fail is the site, not the update.
+    let verdict = verify_ytdl_update(dep_mgr, &installed, repo).await;
+    gate.resume();
+    match verdict {
+        UpdateVerdict::Kept { checked } => {
+            info!("Nightly yt-dlp updated to {:?} ({checked} self-check link(s) still work)", installed);
             let _ = repo.log_audit(
                 "INFO",
                 "SYSTEM",
                 &format!(
-                    "yt-dlp updated ({} channel, sha256 {}); previous build kept for rollback",
+                    "yt-dlp updated ({} channel, sha256 {}); {checked} self-check link(s) still work; previous build kept for rollback",
                     channel,
                     &staged.sha256[..16]
                 ),
             );
             TaskOutcome::Ok
         }
-        Err(e) => {
-            warn!("Nightly yt-dlp update failed to install: {e:#}");
-            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+        UpdateVerdict::RolledBack { broken } => {
+            let _ = std::fs::write(&rejected_marker, &staged.sha256);
+            warn!("yt-dlp update rolled back: it broke {}", broken.join(", "));
+            let _ = repo.log_audit(
+                "ERROR",
+                "SYSTEM",
+                &format!(
+                    "yt-dlp update rolled back automatically: the new build could not get {} while the previous one could. The previous build is in use; the next release will be tried.",
+                    broken.join(", ")
+                ),
+            );
             TaskOutcome::Failed
+        }
+    }
+}
+
+/// Report Deno's state, and install it when it is missing and automatic
+/// updates are on. Returns whether a working Deno is in place.
+async fn ensure_deno(dep_mgr: &DependencyManager, health: &HealthState, auto: bool) -> bool {
+    use omni_core::health::{checks, Check};
+    if let Some(v) = dep_mgr.deno_version() {
+        health.set(checks::DENO, Check::ok(format!("Deno {v}")));
+        return true;
+    }
+    if !auto {
+        health.set(
+            checks::DENO,
+            Check::degraded(
+                "deno.exe is missing from bin/: YouTube downloads fail. Automatic updates are off; put deno.exe in bin/ or turn them on",
+            ),
+        );
+        return false;
+    }
+    health.set(checks::DENO, Check::degraded("deno.exe is missing: downloading it now; YouTube downloads may fail until it is in place"));
+    match dep_mgr.install_deno().await {
+        Ok(v) => {
+            info!("Deno {v} installed for yt-dlp's YouTube support");
+            health.set(checks::DENO, Check::ok(format!("Deno {v}")));
+            true
+        }
+        Err(e) => {
+            warn!("Deno could not be installed: {e:#}");
+            health.set(
+                checks::DENO,
+                Check::degraded(format!("deno.exe is missing and could not be downloaded ({e:#}): YouTube downloads fail; it is tried again tonight")),
+            );
+            false
+        }
+    }
+}
+
+/// The nightly Deno step (plan P6.8): install it if missing; take a newer
+/// release only if every self-check link that worked still works, else put
+/// the previous one back.
+async fn nightly_deno_update(
+    dep_mgr: &DependencyManager,
+    gate: &UpdateGate,
+    repo: &Repository,
+    health: &HealthState,
+) -> omni_core::scheduler::TaskOutcome {
+    use omni_core::scheduler::TaskOutcome;
+    let Some(installed) = dep_mgr.deno_version() else {
+        return if ensure_deno(dep_mgr, health, true).await { TaskOutcome::Ok } else { TaskOutcome::Failed };
+    };
+    let latest = match dep_mgr.latest_deno_tag().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Deno update check failed: {e:#}");
+            return TaskOutcome::Skipped;
+        }
+    };
+    if latest.trim_start_matches('v') == installed {
+        return TaskOutcome::Ok;
+    }
+    if !gate.pause_and_drain(Duration::from_secs(600)).await {
+        gate.resume();
+        return TaskOutcome::Skipped;
+    }
+    let result = dep_mgr.install_deno().await;
+    let outcome = match result {
+        Err(e) => {
+            warn!("Deno update not installed: {e:#}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
+            TaskOutcome::Failed
+        }
+        Ok(new_version) => {
+            let worked: Vec<omni_core::models::SelfcheckLink> = repo
+                .list_selfcheck_links()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|l| l.last_ok == Some(true))
+                .collect();
+            let ytdl = dep_mgr.ytdl_live();
+            let broken: Vec<String> = selfcheck::check_and_record(repo, &ytdl, &worked)
+                .await
+                .into_iter()
+                .filter(|(_, o)| !o.ok)
+                .map(|(l, _)| l.label)
+                .collect();
+            if broken.is_empty() {
+                let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                TaskOutcome::Ok
+            } else {
+                let _ = dep_mgr.rollback_deno();
+                let _ = repo.log_audit(
+                    "ERROR",
+                    "SYSTEM",
+                    &format!("Deno {new_version} rolled back to {installed}: {} stopped working with it", broken.join(", ")),
+                );
+                TaskOutcome::Failed
+            }
+        }
+    };
+    gate.resume();
+    if let Some(v) = dep_mgr.deno_version() {
+        health.set(omni_core::health::checks::DENO, omni_core::health::Check::ok(format!("Deno {v}")));
+    }
+    outcome
+}
+
+enum UpdateVerdict {
+    Kept { checked: usize },
+    RolledBack { broken: Vec<String> },
+}
+
+async fn verify_ytdl_update(dep_mgr: &DependencyManager, live: &std::path::Path, repo: &Repository) -> UpdateVerdict {
+    let worked: Vec<omni_core::models::SelfcheckLink> = repo
+        .list_selfcheck_links()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l.last_ok == Some(true))
+        .collect();
+    let results = selfcheck::check_and_record(repo, live, &worked).await;
+    let failed: Vec<omni_core::models::SelfcheckLink> =
+        results.into_iter().filter(|(_, o)| !o.ok).map(|(l, _)| l).collect();
+    if failed.is_empty() {
+        return UpdateVerdict::Kept { checked: worked.len() };
+    }
+
+    if let Err(e) = dep_mgr.rollback_ytdl() {
+        warn!("yt-dlp verification: could not put the previous build back to compare: {e:#}");
+        return UpdateVerdict::Kept { checked: worked.len() };
+    }
+    let with_old = selfcheck::check_and_record(repo, live, &failed).await;
+    let broken: Vec<String> = with_old.iter().filter(|(_, o)| o.ok).map(|(l, _)| l.label.clone()).collect();
+    if broken.is_empty() {
+        // Both builds fail those links: the sites changed or the network is
+        // down. The newer build is the better bet for a fix; put it back.
+        if let Err(e) = dep_mgr.rollback_ytdl() {
+            warn!("yt-dlp verification: could not reinstate the new build: {e:#}");
+        }
+        // Record what the build that stays in place sees.
+        selfcheck::check_and_record(repo, live, &failed).await;
+        return UpdateVerdict::Kept { checked: worked.len() };
+    }
+    UpdateVerdict::RolledBack { broken }
+}
+
+/// Replace a one-file yt-dlp with the folder build of the *same release*
+/// (plan P2.10): same extractors, ~3-17 s less per yt-dlp start. A newer
+/// release still only arrives through the nightly update and its
+/// self-check. Any failure leaves the one-file exe in use.
+async fn ensure_ytdl_folder_build(dep_mgr: &DependencyManager, channel: &str, auto: bool) {
+    if !auto || dep_mgr.ytdl_is_folder_build() || !dep_mgr.ytdl_legacy().is_file() {
+        return;
+    }
+    let legacy = dep_mgr.ytdl_legacy();
+    let version = match omni_core::process::run_capture(&legacy, ["--version"], Duration::from_secs(60)).await {
+        Ok(o) if o.success => o.stdout.lines().next().unwrap_or("").trim().to_string(),
+        _ => String::new(),
+    };
+    if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        warn!("yt-dlp folder build not installed: could not read the version of {legacy:?}");
+        return;
+    }
+    info!("Installing the folder build of yt-dlp {version} (starts in ~1 s instead of 4-18 s)");
+    let staged = tokio::time::timeout(Duration::from_secs(120), dep_mgr.stage_ytdl_release(channel, Some(&version))).await;
+    match staged {
+        Ok(Ok(_)) => match dep_mgr.apply_staged_ytdl() {
+            Ok(p) => info!("yt-dlp {version} now runs from {p:?}; {legacy:?} is kept as the fallback"),
+            Err(e) => {
+                dep_mgr.discard_staged_ytdl();
+                warn!("yt-dlp folder build not installed: {e:#}");
+            }
+        },
+        Ok(Err(e)) => warn!("yt-dlp folder build not installed: {e:#}"),
+        Err(_) => {
+            dep_mgr.discard_staged_ytdl();
+            warn!("yt-dlp folder build not installed: download took over 2 minutes");
         }
     }
 }
@@ -1046,6 +2041,8 @@ struct MaintenanceContext {
     adblock_enabled: bool,
     gate: UpdateGate,
     retention_days: i64,
+    mail_text_retention_days: i64,
+    health: HealthState,
 }
 
 /// Run whatever is due, recording the outcome of each (plan P6.6).
@@ -1126,7 +2123,24 @@ async fn run_one_task(
                 return Ok(TaskOutcome::Skipped);
             }
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
-            Ok(nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await)
+            let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
+            let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health).await;
+            selfcheck::refresh_health(repo, &ctx.health);
+            // The worse of the two is what the maintenance panel shows.
+            Ok(match (ytdl, deno) {
+                (TaskOutcome::Failed, _) | (_, TaskOutcome::Failed) => TaskOutcome::Failed,
+                (TaskOutcome::Ok, _) | (_, TaskOutcome::Ok) => TaskOutcome::Ok,
+                _ => TaskOutcome::Skipped,
+            })
+        }
+
+        "selfcheck" => {
+            let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
+            let failing = selfcheck::run(repo, &ytdl, &ctx.health).await?;
+            if failing > 0 {
+                anyhow::bail!("{failing} self-check link(s) not working; see Administration → Self-check");
+            }
+            Ok(TaskOutcome::Ok)
         }
 
         "adblock_update" => {
@@ -1149,6 +2163,15 @@ async fn run_one_task(
                 Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("Retention: login records not purged: {e:#}"),
+            }
+
+            // The text of handled mail (plan P7.6): the MCR mail view needs it
+            // for a few weeks, nobody needs it for ever. Sender, subject and
+            // jobs stay with the row.
+            match repo.purge_mail_text(ctx.mail_text_retention_days) {
+                Ok(n) if n > 0 => info!("Retention: cleared the text of {n} handled mail(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: mail text not cleared: {e:#}"),
             }
 
             // Orphaned per-job workspaces. The start-up sweep only runs at
@@ -1225,4 +2248,197 @@ async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, ke
         }
     }
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_core::health::Health;
+    use omni_core::models::QueueWatch;
+
+    #[test]
+    fn queue_check_is_ok_until_something_is_slow_and_never_down() {
+        let ok = queue_check(&QueueWatch {
+            waiting: 2,
+            running: 1,
+            oldest_ready_wait_secs: Some(QUEUE_SLOW_SECS),
+            longest_step: Some((3, "DOWNLOAD".into(), 60)),
+        }, false);
+        assert_eq!(ok.state, Health::Ok);
+        assert_eq!(ok.detail.as_deref(), Some("2 waiting, 1 running"));
+
+        let wait = queue_check(&QueueWatch {
+            waiting: 1,
+            running: 0,
+            oldest_ready_wait_secs: Some(42 * 60 + 5),
+            longest_step: None,
+        }, false);
+        assert_eq!(wait.state, Health::Degraded);
+        assert!(wait.detail.unwrap().contains("a video has waited 42 min"));
+
+        let step = queue_check(&QueueWatch {
+            waiting: 0,
+            running: 1,
+            oldest_ready_wait_secs: None,
+            longest_step: Some((17, "DOWNLOAD".into(), 35 * 60)),
+        }, false);
+        assert_eq!(step.state, Health::Degraded);
+        assert!(step.detail.unwrap().contains("job #17 has been in DOWNLOAD for 35 min"));
+
+        let both = queue_check(&QueueWatch {
+            waiting: 1,
+            running: 1,
+            oldest_ready_wait_secs: Some(42 * 60),
+            longest_step: Some((17, "DOWNLOAD".into(), 35 * 60)),
+        }, false);
+        assert_eq!(both.state, Health::Degraded);
+        let d = both.detail.unwrap();
+        assert!(d.contains("a video has waited 42 min") && d.contains("job #17 has been in DOWNLOAD for 35 min"));
+
+        // Hysteresis: 27 min stays degraded once degraded, is ok when not; 24 min recovers.
+        let near = |mins: i64, was: bool| queue_check(&QueueWatch {
+            waiting: 1,
+            running: 1,
+            oldest_ready_wait_secs: Some(mins * 60),
+            longest_step: Some((5, "DOWNLOAD".into(), mins * 60)),
+        }, was);
+        assert_eq!(near(27, true).state, Health::Degraded);
+        assert_eq!(near(27, false).state, Health::Ok);
+        assert_eq!(near(24, true).state, Health::Ok);
+    }
+
+    /// Job #20 (2026-10-08): the card said PIPELINE_FAILED; the reason was only
+    /// in the timeline.
+    #[test]
+    fn readable_cause_is_the_root_of_the_chain() {
+        let e = anyhow::anyhow!("ERROR: [twitter] 2106778297484939750: No video could be found in this tweet")
+            .context("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&e), "[twitter] 2106778297484939750: No video could be found in this tweet");
+    }
+
+    #[test]
+    fn readable_cause_prefers_the_error_line_of_a_stderr_tail() {
+        let e = anyhow::anyhow!("WARNING: something minor\nERROR: [generic] Unable to download webpage: HTTP Error 404\n\n")
+            .context("PAGE_NOT_FOUND");
+        assert_eq!(readable_cause(&e), "[generic] Unable to download webpage: HTTP Error 404");
+        let plain = anyhow::anyhow!("first\nlast line\n\n").context("NETWORK");
+        assert_eq!(readable_cause(&plain), "last line");
+    }
+
+    #[test]
+    fn readable_cause_of_a_bare_code_is_the_code() {
+        let e = anyhow::anyhow!("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&e), "PIPELINE_FAILED");
+        let repeated = anyhow::anyhow!("PIPELINE_FAILED: PIPELINE_FAILED: boom").context("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&repeated), "boom");
+    }
+
+    #[test]
+    fn readable_cause_keeps_the_header_of_a_tool_failure() {
+        let ff = anyhow::anyhow!(
+            "ffmpeg exited with code Some(1). stderr tail: frame=0 fps=0.0\n[mpeg2video @ 000001] Error initializing output stream\nError while opening encoder for output stream #0:0 - maybe incorrect parameters\nConversion failed!\n"
+        )
+        .context("PIPELINE_FAILED");
+        let s = readable_cause(&ff);
+        assert!(s.starts_with("ffmpeg exited with code Some(1)"), "{s}");
+        assert!(s.ends_with(": Error initializing output stream"), "the first error line, without its [… @ addr] prefix: {s}");
+        assert!(!s.contains("Conversion failed"), "{s}");
+
+        // The tail the installed FFmpeg 9 writes for an encoder that will not
+        // open (VBV buffer too small): the cause comes first, then lines
+        // that also say "error" but name nothing.
+        let ff9 = anyhow::anyhow!(concat!(
+            "ffmpeg exited with code Some(1). stderr tail: ",
+            "[mpeg2video @ 0000029b555468c0] VBV buffer too small for bitrate\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] [enc:mpeg2video @ 0000029b4afd5540] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n",
+            "[vf#0:0 @ 0000029b55549840] Error sending frames to consumers: Invalid argument\n",
+            "[vf#0:0 @ 0000029b55549840] Task finished with error code: -22 (Invalid argument)\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] [enc:mpeg2video @ 0000029b4afd5540] Could not open encoder before EOF\n",
+            "[vf#0:0 @ 0000029b55549840] Terminating thread with return code -22 (Invalid argument)\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] Task finished with error code: -22 (Invalid argument)\n",
+            "[vost#0:0/mpeg2video @ 0000029b55546680] Terminating thread with return code -22 (Invalid argument)\n",
+            "[out#0/null @ 0000029b55544780] Nothing was written into output file, because at least one of its streams received no packets.\n",
+            "frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:00.02\n",
+            "Conversion failed!\n",
+        ))
+        .context("TRANSCODE_FAILED");
+        assert_eq!(
+            readable_cause(&ff9),
+            "ffmpeg exited with code Some(1): Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height."
+        );
+
+        let timeout = anyhow::anyhow!("ffmpeg timed out after 3600s; process tree killed. stderr tail: frame=10\nspeed=0.1x\n")
+            .context("TRANSCODE_TIMEOUT");
+        assert_eq!(readable_cause(&timeout), "ffmpeg timed out after 3600s; process tree killed");
+
+        let ytdlp = anyhow::anyhow!("yt-dlp exited with code Some(1). stderr tail: WARNING: x\nERROR: [twitter] 1: No video could be found\n")
+            .context("PIPELINE_FAILED");
+        let s = readable_cause(&ytdlp);
+        assert!(s.starts_with("yt-dlp exited with code Some(1)"), "{s}");
+        assert!(s.ends_with("[twitter] 1: No video could be found"), "{s}");
+    }
+
+    #[test]
+    fn readable_cause_keeps_the_parent_of_a_bare_os_error() {
+        let e = anyhow::anyhow!("The network path was not found. (os error 53)")
+            .context("Failed creating the watchfolder")
+            .context("DELIVERY_FAILED");
+        let s = readable_cause(&e);
+        assert!(s.contains("Failed creating the watchfolder") && s.contains("os error 53"), "{s}");
+        // Two long quoted paths in the parent must not push the OS error
+        // itself past the cap.
+        let long = format!("Failed copying \"{}\" to \"{}\"", "C:\\OmniIngest\\temp\\jobs\\42\\x".repeat(6), "\\\\dalet\\watch\\y".repeat(8));
+        let e = anyhow::anyhow!("Access is denied. (os error 5)").context(long).context("DELIVERY_FAILED");
+        assert!(readable_cause(&e).starts_with("Access is denied. (os error 5)"));
+        // A code above the root is not a parent worth quoting.
+        let coded = anyhow::anyhow!("boom").context("PIPELINE_FAILED");
+        assert_eq!(readable_cause(&coded), "boom");
+    }
+
+    #[test]
+    fn readable_cause_is_capped_on_a_char_boundary() {
+        let e = anyhow::anyhow!("Σφάλμα λήψης βίντεο ".repeat(50)).context("PIPELINE_FAILED");
+        let s = readable_cause(&e);
+        assert!(s.chars().count() <= 301, "{}", s.chars().count());
+        assert!(s.ends_with('…'));
+    }
+
+    /// The engine's lost-lease error is recognised by type; a failure that
+    /// merely quotes the code in its text (a URL ending in it) is not.
+    #[test]
+    fn a_lost_lease_is_recognised_by_type_not_by_text() {
+        let lost = Err(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 7, stage: JobStage::Rewrap })
+            .context(ErrorCode::LeaseExpired.as_str()));
+        assert!(lost_lease(&lost));
+
+        let quoting: anyhow::Result<()> = Err(anyhow::anyhow!("ERROR: unable to download https://example.gr/LEASE_EXPIRED")
+            .context("LEASE_EXPIRED"));
+        assert!(!lost_lease(&quoting));
+        assert!(!lost_lease(&Ok(())));
+    }
+
+    /// neakriti.gr article without a video (2026-10-05): the card said
+    /// UNSUPPORTED_URL, "try a direct video link".
+    #[test]
+    fn a_page_without_a_video_is_reported_as_no_stream_not_unsupported() {
+        let yt_dlp = || anyhow::anyhow!("ERROR: Unsupported URL: https://www.neakriti.gr/x").context(ErrorCode::UnsupportedUrl.as_str());
+
+        let empty = anyhow::Error::from(omni_browser::BrowserError::NoStreamFound("https://www.neakriti.gr/x".into()));
+        assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), empty)), ErrorCode::NoStreamFound);
+
+        let no_browser = anyhow::Error::from(omni_browser::BrowserError::LaunchFailed("no Chrome".into()));
+        assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), no_browser)), ErrorCode::UnsupportedUrl);
+    }
+
+    /// A mistyped YouTube id (2026-10-07): the card said «Απρόβλεπτο
+    /// σφάλμα». The downloader's code must come back out of the chain the
+    /// pipeline wraps around it.
+    #[test]
+    fn an_unavailable_video_keeps_its_code_through_the_pipeline() {
+        let line = "ERROR: [youtube] zzzzzzzzzz0: This video is unavailable";
+        let code = omni_broadcast::errors::classify_download_error(line);
+        let e = anyhow::Error::from(omni_broadcast::downloader::DownloadError { code, message: line.into() })
+            .context(code.as_str());
+        assert_eq!(classify_pipeline_error(&e), ErrorCode::PrivateOrRemoved);
+    }
 }

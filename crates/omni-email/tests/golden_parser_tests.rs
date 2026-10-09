@@ -28,10 +28,12 @@ fn roster() -> Vec<Journalist> {
         emails: emails.iter().map(|s| s.to_string()).collect(),
         default_priority: 0,
         aliases: aliases.iter().map(|s| s.to_string()).collect(),
+        groups: vec![],
         created_at: None,
     };
     vec![
-        j("MCR", "Master Control Room", &[], &[]),
+        // The desk addresses: they pass mail on (fixture 26).
+        j("MCR", "Master Control Room", &["master@example.gr", "flow@example.gr"], &[]),
         j("PAPADAKI", "Anna Papadaki", &["a.papadaki@example.gr"], &["ΠΑΠΑΔΑΚΗ", "ΑΝΝΑ"]),
         j("NIKOLAOU", "Giorgos Nikolaou", &["g.nikolaou@example.gr"], &["ΝΙΚΟΛΑΟΥ", "ΓΙΩΡΓΟΣ"]),
         j("GEORGIOU", "Eleni Georgiou", &["e.georgiou@example.gr"], &["ΓΕΩΡΓΙΟΥ", "ΕΛΕΝΗ"]),

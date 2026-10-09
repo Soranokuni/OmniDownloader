@@ -12,7 +12,7 @@
         {
           "confidence": 0.95,
           "index_str": "1A",
-          "keyword": "KALYTERAEVDOMADAS",
+          "keyword": "GKOLEVDOMADAS",
           "marker": false,
           "status": "PENDING",
           "tier": "tier1",
@@ -21,7 +21,7 @@
         {
           "confidence": 0.95,
           "index_str": "1B",
-          "keyword": "KALYTERAEVDOMADAS",
+          "keyword": "ILIOVASILEMAELAFONIS",
           "marker": false,
           "status": "PENDING",
           "tier": "tier1",
@@ -57,7 +57,7 @@
         {
           "confidence": 0.95,
           "index_str": "1F",
-          "keyword": "KALYTERAEVDOMADAS",
+          "keyword": "CHOROSSITEIA",
           "marker": false,
           "status": "PENDING",
           "tier": "tier1",

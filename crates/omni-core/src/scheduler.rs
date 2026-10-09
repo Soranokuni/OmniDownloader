@@ -164,8 +164,16 @@ pub fn default_tasks() -> Vec<TaskSpec> {
         },
         TaskSpec {
             name: "retention",
-            description: "Delete expired archive copies, orphaned temp files and old login records",
+            description: "Delete expired archive copies, orphaned temp files, old login records and the text of old mail",
             cadence: Cadence::DailyAt { hour: 4, minute: 0 },
+            jitter: Duration::ZERO,
+        },
+        TaskSpec {
+            name: "selfcheck",
+            description: "Check that the browser works and that a video can still be found at each self-check link",
+            // After the yt-dlp update (03:00-03:20) and the blocklists, so it
+            // checks what the newsroom will use that day.
+            cadence: Cadence::DailyAt { hour: 5, minute: 15 },
             jitter: Duration::ZERO,
         },
         TaskSpec {
