@@ -26,6 +26,7 @@ use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
+mod canary;
 mod selfcheck;
 
 #[derive(Parser)]
@@ -895,6 +896,15 @@ async fn run_daemon(
     }
 
 
+    // Site canaries (plan P10.4): shared by the nightly check and the
+    // workers' daytime trigger, so only one runs at a time.
+    let canary_env = Arc::new(canary::CanaryEnv::new(
+        repo.clone(),
+        health.clone(),
+        bin_dir.clone(),
+        config.ytdl_channel.clone(),
+    ));
+
     // 3. Maintenance scheduler (plan P6.6).
     //
     // Replaces `if now.format("%H") == "03"` inside an hourly tick, which could
@@ -917,6 +927,7 @@ async fn run_daemon(
             retention_days: config.retention_days.max(1),
             mail_text_retention_days: config.mail_text_retention_days.max(1),
             health: health.clone(),
+            canary: canary_env.clone(),
             evidence_days: config.repair.evidence_days.max(1),
             evidence_max_bytes: config.repair.evidence_max_mb.saturating_mul(1024 * 1024),
         };
@@ -1028,6 +1039,7 @@ async fn run_daemon(
     let worker_watchfolder = watchfolder_path.clone();
     let worker_temp = temp_path.clone();
     let worker_repair_mode = config.repair.mode;
+    let worker_canary = canary_env.clone();
 
     tokio::spawn(async move {
         info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
@@ -1113,6 +1125,7 @@ async fn run_daemon(
             let busy_guard = busy_worker.guard(job.id, &owner);
             let evidence_dir = worker_temp.join("evidence");
             let job_health = worker_health.clone();
+            let job_canary = worker_canary.clone();
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
@@ -1158,7 +1171,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, worker_repair_mode, &job_health).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, worker_repair_mode, &job_health, &job_canary).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -1272,6 +1285,7 @@ async fn run_job(
     evidence_dir: &std::path::Path,
     repair_mode: RepairMode,
     health: &HealthState,
+    canary: &Arc<canary::CanaryEnv>,
 ) -> Result<()> {
     let job_id = job.id;
     let orig_url = job.url.clone();
@@ -1630,13 +1644,20 @@ async fn run_job(
                     && job.parent_job_id.is_none()
                     && omni_core::site_health::counts_against_site(code.as_str())
                 {
-                    note_site_outcome(
+                    let noted = note_site_outcome(
                         repo,
                         health,
                         job_id,
                         &orig_url,
                         SiteOutcome::SiteFailure(code.as_str().to_string()),
                     );
+                    // A site that just started failing: look at its recent
+                    // articles in the background (P10.4). Never awaited here.
+                    if let Some((domain, before, after)) = noted {
+                        if canary::should_trigger(repair_mode, before, after) {
+                            canary.trigger(&domain);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -1652,11 +1673,9 @@ fn note_site_outcome(
     job_id: i64,
     url: &str,
     outcome: SiteOutcome,
-) {
+) -> Option<(String, SiteState, SiteState)> {
     let is_platform = omni_broadcast::downloader::is_video_platform(url);
-    let Some(domain) = omni_core::site_health::site_for_job(url, is_platform) else {
-        return;
-    };
+    let domain = omni_core::site_health::site_for_job(url, is_platform)?;
     match repo.record_site_outcome(&domain, outcome) {
         Ok((before, after)) => {
             if before != after {
@@ -1673,8 +1692,12 @@ fn note_site_outcome(
                 let _ = repo.record_event(job_id, "INFO", None, &line);
             }
             omni_core::site_health::refresh_health(repo, health);
+            Some((domain, before, after))
         }
-        Err(e) => warn!("Job #{job_id}: site health for {domain} not recorded: {e:#}"),
+        Err(e) => {
+            warn!("Job #{job_id}: site health for {domain} not recorded: {e:#}");
+            None
+        }
     }
 }
 
@@ -2314,6 +2337,7 @@ struct MaintenanceContext {
     evidence_days: i64,
     evidence_max_bytes: u64,
     health: HealthState,
+    canary: Arc<canary::CanaryEnv>,
 }
 
 /// Run whatever is due, recording the outcome of each (plan P6.6).
@@ -2394,8 +2418,13 @@ async fn run_one_task(
                 return Ok(TaskOutcome::Skipped);
             }
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
-            let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
-            let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health).await;
+            // No canary run (its yt-dlp starts without a gate pass) overlaps the swap.
+            let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
+                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
+                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health).await;
+                (ytdl, deno)
+            })
+            .await;
             selfcheck::refresh_health(repo, &ctx.health);
             // The worse of the two is what the maintenance panel shows.
             Ok(match (ytdl, deno) {
@@ -2408,6 +2437,9 @@ async fn run_one_task(
         "selfcheck" => {
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
             let failing = selfcheck::run(repo, &ytdl, &ctx.health).await?;
+            // Then the recent articles of each frequent site (P10.4). Always
+            // on; a site's verdict never changes this task's outcome.
+            canary::nightly(&ctx.canary).await;
             if failing > 0 {
                 anyhow::bail!("{failing} self-check link(s) not working; see Administration → Self-check");
             }
@@ -2430,6 +2462,13 @@ async fn run_one_task(
         "retention" => {
             // Login records first: the table grows with every failed attempt
             // and nothing else prunes it.
+            match canary::sync_pool(repo) {
+                Ok((added, removed)) if added + removed > 0 => {
+                    info!("Retention: site canaries +{added} -{removed}")
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Retention: site canaries not refreshed: {e:#}"),
+            }
             match repo.purge_idle_sites(90) {
                 Ok(n) if n > 0 => {
                     info!("Retention: removed {n} idle site record(s)");

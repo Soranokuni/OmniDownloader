@@ -123,6 +123,18 @@ pub async fn repair_dead_link(url: &str) -> Option<String> {
     None
 }
 
+/// The HTTP status a plain GET of `url` ends on (redirects followed), or
+/// `None` when no answer came. Used to tell a removed article (404/410) from
+/// a site that changed (plan P10.4).
+pub async fn page_status(url: &str) -> Option<u16> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent(PAGE_CHECK_UA)
+        .build()
+        .ok()?;
+    client.get(url).send().await.ok().map(|r| r.status().as_u16())
+}
+
 /// A desktop browser's identity: some portals answer a bare HTTP client
 /// with 403 whatever the address.
 const PAGE_CHECK_UA: &str =

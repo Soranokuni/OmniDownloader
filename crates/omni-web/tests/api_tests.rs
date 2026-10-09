@@ -880,3 +880,26 @@ async fn mcr_can_hide_old_review_videos_and_show_them_again() -> Result<()> {
     assert!(page["jobs"][0]["cleared_at"].is_string(), "the card can say it is hidden: {page}");
     Ok(())
 }
+
+#[tokio::test]
+async fn the_self_check_panel_lists_the_site_canaries() -> Result<()> {
+    let app = App::new()?;
+    let (status, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["canaries"], json!([]));
+
+    app.repo.add_canary("news.example", "https://news.example/a", None, chrono::Utc::now())?;
+    let id = app.repo.list_canaries()?[0].id;
+    app.repo.record_canary_result(id, false, "no video found on the page")?;
+    let (_, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    let rows = json["canaries"].as_array().expect("canaries array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["domain"], "news.example");
+    assert_eq!(rows[0]["url"], "https://news.example/a");
+    assert_eq!(rows[0]["last_ok"], false);
+    assert_eq!(rows[0]["last_detail"], "no video found on the page");
+    assert!(rows[0]["last_checked_at"].is_string());
+    // The existing fields are still there.
+    assert!(json["links"].is_array());
+    Ok(())
+}

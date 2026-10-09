@@ -466,6 +466,27 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        17,
+        // Recent known-good article links per frequent news site, re-checked
+        // each night and when a site starts failing (P10.4). Not
+        // `selfcheck_links`: that list also decides whether a yt-dlp update
+        // is kept. `added_at` is when the job that proved the link finished.
+        r#"
+        CREATE TABLE IF NOT EXISTS site_canaries (
+            id              INTEGER PRIMARY KEY,
+            domain          TEXT NOT NULL,
+            url             TEXT NOT NULL UNIQUE,
+            job_id          INTEGER,
+            added_at        TEXT NOT NULL,
+            last_checked_at TEXT,
+            last_ok         INTEGER,
+            last_detail     TEXT,
+            fail_count      INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_site_canaries_domain ON site_canaries(domain);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -665,6 +686,39 @@ mod tests {
             assert!(columns.iter().any(|x| x == c), "site_stats.{c} missing: {columns:?}");
         }
         assert!(target_version() >= 16);
+    }
+
+    #[test]
+    fn migration_17_creates_site_canaries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('site_canaries')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in [
+            "id", "domain", "url", "job_id", "added_at", "last_checked_at", "last_ok",
+            "last_detail", "fail_count",
+        ] {
+            assert!(columns.iter().any(|x| x == c), "site_canaries.{c} missing: {columns:?}");
+        }
+        conn.execute(
+            "INSERT INTO site_canaries (domain, url, added_at) VALUES ('a.example', 'https://a.example/1', 'x')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO site_canaries (domain, url, added_at) VALUES ('a.example', 'https://a.example/1', 'x')",
+                [],
+            )
+            .is_err(),
+            "url must be unique"
+        );
+        assert!(target_version() >= 17);
     }
 
     #[test]
