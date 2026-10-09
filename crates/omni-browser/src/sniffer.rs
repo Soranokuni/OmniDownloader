@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::browser::Browser;
-use chromiumoxide::cdp::browser_protocol::network::{EventRequestWillBeSent, SetBlockedUrLsParams};
+use chromiumoxide::cdp::browser_protocol::network::{
+    EventRequestWillBeSent, EventResponseReceived, SetBlockedUrLsParams,
+};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,6 +16,7 @@ use tracing::{info, warn};
 use crate::adblock::UnifiedAdBlocker;
 use crate::agent::BrowserError;
 use crate::browser::HeadlessBrowserManager;
+use crate::evidence::{NetworkEntry, NetworkLog, PageSnapshot, PAGE_FACTS_JS};
 use crate::glomex;
 
 /// Media session metadata and extracted video streams.
@@ -26,6 +29,13 @@ pub struct DiscoveredMedia {
     pub user_agent: String,
     pub referer: String,
     pub cookies: Option<String>,
+}
+
+/// A sniff's outcome together with what the browser saw (plan P10.1). The
+/// snapshot's page facts are only read when no stream was found.
+pub struct Sniffed {
+    pub media: Result<DiscoveredMedia>,
+    pub snapshot: PageSnapshot,
 }
 
 /// StreamSniffer uses headless Chrome via CDP to navigate complex news websites,
@@ -109,7 +119,7 @@ impl StreamSniffer {
             .await
             .map(|v| v.product.replace("HeadlessChrome", "Chrome"))
             .unwrap_or_else(|_| "unknown version".into());
-        let result = Self::sniff(&session.browser, PAGE, 10).await;
+        let result = Self::sniff(&session.browser, PAGE, 10).await.media;
         session.shutdown().await;
         let media = result.context("the browser could not read its test page")?;
         if !media.all_streams.iter().any(|u| u == EXPECTED) {
@@ -121,15 +131,34 @@ impl StreamSniffer {
     /// Full media extraction pipeline returning primary stream, all discovered streams,
     /// active cookies, User-Agent, and Referer.
     pub async fn extract_media_bundle(target_url: &str, timeout_secs: u64) -> Result<DiscoveredMedia> {
+        Self::extract_with_evidence(target_url, timeout_secs).await.media
+    }
+
+    /// The same extraction, also returning what the browser saw.
+    pub async fn extract_with_evidence(target_url: &str, timeout_secs: u64) -> Sniffed {
         info!("StreamSniffer: Starting browser extraction for {}", target_url);
 
-        let mut session = HeadlessBrowserManager::launch().await?;
+        let mut session = match HeadlessBrowserManager::launch().await {
+            Ok(s) => s,
+            Err(e) => return Sniffed { media: Err(e), snapshot: PageSnapshot::new(target_url) },
+        };
         let result = Self::sniff(&session.browser, target_url, timeout_secs).await;
         session.shutdown().await;
         result
     }
 
-    async fn sniff(browser: &Browser, target_url: &str, timeout_secs: u64) -> Result<DiscoveredMedia> {
+    async fn sniff(browser: &Browser, target_url: &str, timeout_secs: u64) -> Sniffed {
+        let mut snapshot = PageSnapshot::new(target_url);
+        let media = Self::sniff_page(browser, target_url, timeout_secs, &mut snapshot).await;
+        Sniffed { media, snapshot }
+    }
+
+    async fn sniff_page(
+        browser: &Browser,
+        target_url: &str,
+        timeout_secs: u64,
+        snapshot: &mut PageSnapshot,
+    ) -> Result<DiscoveredMedia> {
         let page = browser
             .new_page(target_url)
             .await
@@ -154,10 +183,46 @@ impl StreamSniffer {
             .await
             .map_err(|e| anyhow!("Failed registering network request listener: {}", e))?;
 
+        // Passive record of what the page requested and got back (P10.1).
+        let net_log = Arc::new(std::sync::Mutex::new(NetworkLog::default()));
+        let net_log_req = net_log.clone();
+        let stop_flag_resp = stop_flag.clone();
+        if let Ok(mut response_events) = page.event_listener::<EventResponseReceived>().await {
+            let net_log_resp = net_log.clone();
+            tokio::spawn(async move {
+                while let Some(event) = response_events.next().await {
+                    if stop_flag_resp.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok(mut log) = net_log_resp.lock() {
+                        log.on_response(
+                            event.request_id.inner(),
+                            event.response.status,
+                            Some(event.response.mime_type.clone()),
+                            Some(format!("{:?}", event.r#type)),
+                        );
+                    }
+                }
+            });
+        }
+
         tokio::spawn(async move {
             while let Some(event) = request_events.next().await {
                 if stop_flag_clone.load(Ordering::Relaxed) {
                     break;
+                }
+                if let Ok(mut log) = net_log_req.lock() {
+                    log.on_request(
+                        event.request_id.inner(),
+                        NetworkEntry {
+                            url: event.request.url.clone(),
+                            method: Some(event.request.method.clone()),
+                            status: None,
+                            mime: None,
+                            resource_type: event.r#type.as_ref().map(|t| format!("{:?}", t)),
+                            frame_id: event.frame_id.as_ref().map(|f| f.inner().clone()),
+                        },
+                    );
                 }
                 let req_url = event.request.url.clone();
                 let score = Self::score_stream_url(&req_url);
@@ -546,6 +611,13 @@ impl StreamSniffer {
         // 10. Compile all streams and primary stream
         let sorted_candidates = final_candidates(candidates.lock().await.clone());
 
+        // What the browser saw goes in whether or not a stream was found: a
+        // found stream can still fail downstream (HTTP 403).
+        if let Ok(log) = net_log.lock() {
+            snapshot.network = log.entries();
+        }
+        snapshot.final_url = Some(page_url.clone());
+
         if let Some((score, best_url)) = sorted_candidates.first() {
             info!(
                 "StreamSniffer: Discovered {} media streams total. Selected primary (score: {}): {}",
@@ -564,6 +636,17 @@ impl StreamSniffer {
                 cookies,
             })
         } else {
+            // Nothing found: one read-only look at the page for the facts (1 s at most).
+            // Never changes the outcome.
+            match tokio::time::timeout(Duration::from_secs(1), page.evaluate(PAGE_FACTS_JS)).await {
+                Ok(Ok(eval)) => {
+                    if let Some(v) = eval.value() {
+                        snapshot.apply_page_facts(v);
+                    }
+                }
+                Ok(Err(e)) => warn!("StreamSniffer: page facts could not be read: {}", e),
+                Err(_) => warn!("StreamSniffer: page facts read timed out"),
+            }
             Err(BrowserError::NoStreamFound(target_url.to_string()).into())
         }
     }

@@ -914,6 +914,8 @@ async fn run_daemon(
             retention_days: config.retention_days.max(1),
             mail_text_retention_days: config.mail_text_retention_days.max(1),
             health: health.clone(),
+            evidence_days: config.repair.evidence_days.max(1),
+            evidence_max_bytes: config.repair.evidence_max_mb.saturating_mul(1024 * 1024),
         };
 
         tokio::spawn(async move {
@@ -1105,6 +1107,7 @@ async fn run_daemon(
             let eng = engine_worker.clone();
             let rep = repo_worker.clone();
             let busy_guard = busy_worker.guard(job.id, &owner);
+            let evidence_dir = worker_temp.join("evidence");
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
@@ -1150,7 +1153,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone()).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -1261,6 +1264,7 @@ async fn run_job(
     owner: &str,
     job: omni_core::models::Job,
     cancel: CancellationToken,
+    evidence_dir: &std::path::Path,
 ) -> Result<()> {
     let job_id = job.id;
     let orig_url = job.url.clone();
@@ -1405,6 +1409,8 @@ async fn run_job(
     // retry with the session context (referer/UA/cookies) it needs to avoid 403.
     // A platform post is sniffed only where that can help (`should_sniff`):
     // its page also plays other posts' videos.
+    // What the browser saw, kept for a job that ends without a video (P10.1).
+    let mut snapshot: Option<omni_browser::PageSnapshot> = None;
     let sniff = match &process_result {
         Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
         Ok(()) => false,
@@ -1425,7 +1431,9 @@ async fn run_job(
         if cancel.is_cancelled() {
             return Ok(());
         }
-        match StreamSniffer::extract_media_bundle(&orig_url, 25).await {
+        let sniffed = StreamSniffer::extract_with_evidence(&orig_url, 25).await;
+        snapshot = Some(sniffed.snapshot);
+        match sniffed.media {
             Ok(bundle) => {
                 // An article's embedded posts are not all videos: the first
                 // X post in a news247 article was a photo, became the job's
@@ -1550,6 +1558,16 @@ async fn run_job(
                     _ => JobStatus::RequiresReview,
                 };
                 repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                // Only the job's owner writes evidence: a job MCR cancelled
+                // or the reaper gave away has no business leaving a file.
+                if let Some(snap) = &snapshot {
+                    if matches!(code, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
+                        && !cancel.is_cancelled()
+                        && still_ours(repo, job_id, owner)
+                    {
+                        save_page_evidence(repo, evidence_dir, job_id, snap).await;
+                    }
+                }
                 repo.finish(
                     job_id,
                     owner,
@@ -1561,6 +1579,37 @@ async fn run_job(
             }
             Ok(())
         }
+    }
+}
+
+/// Largest evidence file written for one job.
+const EVIDENCE_MAX_BYTES: usize = 512 * 1024;
+
+/// Write the page evidence of a failed job to `{dir}/{job_id}.json` and note
+/// it in the database. A failure here is a warning only: it never changes the
+/// job's outcome.
+async fn save_page_evidence(
+    repo: &Repository,
+    dir: &std::path::Path,
+    job_id: i64,
+    snapshot: &omni_browser::PageSnapshot,
+) {
+    let path = dir.join(format!("{job_id}.json"));
+    let json = snapshot.to_capped_json(EVIDENCE_MAX_BYTES);
+    let bytes = json.len() as i64;
+    let (dir, file) = (dir.to_path_buf(), path.clone());
+    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&file, json)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return warn!("Job #{job_id}: page evidence not written: {e}"),
+        Err(e) => return warn!("Job #{job_id}: page evidence not written: {e}"),
+    }
+    if let Err(e) = repo.record_evidence(job_id, &path.to_string_lossy(), bytes) {
+        warn!("Job #{job_id}: page evidence not recorded: {e:#}");
     }
 }
 
@@ -2042,6 +2091,8 @@ struct MaintenanceContext {
     gate: UpdateGate,
     retention_days: i64,
     mail_text_retention_days: i64,
+    evidence_days: i64,
+    evidence_max_bytes: u64,
     health: HealthState,
 }
 
@@ -2188,6 +2239,7 @@ async fn run_one_task(
             if removed > 0 {
                 info!("Retention: removed {removed} saved email attachment(s)");
             }
+            sweep_evidence(repo, &ctx.temp_path.join("evidence"), ctx.evidence_days, ctx.evidence_max_bytes);
             Ok(TaskOutcome::Ok)
         }
 
@@ -2250,11 +2302,252 @@ async fn sweep_orphan_job_dirs(repo: &Repository, jobs_dir: &std::path::Path, ke
     removed
 }
 
+/// Which evidence rows retention deletes (P10.1): older than `keep_days`, or
+/// whose job is gone; then the oldest until the rest fit `max_bytes`. A
+/// RUNNING job's row is never chosen. `rows` come oldest first.
+fn evidence_to_delete(
+    rows: &[omni_core::repository::EvidenceRow],
+    now: chrono::DateTime<chrono::Utc>,
+    keep_days: i64,
+    max_bytes: u64,
+    is_running: impl Fn(i64) -> bool,
+    job_exists: impl Fn(i64) -> bool,
+) -> Vec<i64> {
+    let cutoff = now - chrono::Duration::days(keep_days.max(1));
+    let mut chosen = vec![false; rows.len()];
+    for (i, r) in rows.iter().enumerate() {
+        if is_running(r.job_id) {
+            continue;
+        }
+        chosen[i] = !job_exists(r.job_id) || r.created_at.is_some_and(|t| t < cutoff);
+    }
+    let mut total: u64 = rows
+        .iter()
+        .zip(&chosen)
+        .filter(|(_, c)| !**c)
+        .map(|(r, _)| r.bytes.max(0) as u64)
+        .sum();
+    for (i, r) in rows.iter().enumerate() {
+        if total <= max_bytes {
+            break;
+        }
+        if chosen[i] || is_running(r.job_id) {
+            continue;
+        }
+        chosen[i] = true;
+        total -= r.bytes.max(0) as u64;
+    }
+    rows.iter().zip(chosen).filter(|(_, c)| *c).map(|(r, _)| r.job_id).collect()
+}
+
+/// What retention knows about a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobLookup {
+    Missing,
+    Running,
+    Present,
+}
+
+/// Retention for `temp/evidence`: rows chosen by [`evidence_to_delete`], and
+/// `{id}.json` files that have no row. Each file is matched by its whole name,
+/// never by prefix.
+fn sweep_evidence(repo: &Repository, dir: &std::path::Path, keep_days: i64, max_bytes: u64) {
+    let rows = match repo.list_evidence() {
+        Ok(r) => r,
+        Err(e) => return warn!("Retention: evidence list not read: {e:#}"),
+    };
+    // A failed lookup keeps the evidence: treated as a running job.
+    let lookup = |id: i64| match repo.get_job(id) {
+        Ok(None) => JobLookup::Missing,
+        Ok(Some(j)) if j.status == JobStatus::Running => JobLookup::Running,
+        Ok(Some(_)) => JobLookup::Present,
+        Err(_) => JobLookup::Running,
+    };
+    let (removed, stray) = sweep_evidence_with(
+        &rows,
+        dir,
+        chrono::Utc::now(),
+        keep_days,
+        max_bytes,
+        &lookup,
+        &|id| repo.delete_evidence(id).is_ok(),
+    );
+    if removed > 0 || stray > 0 {
+        info!("Retention: removed {removed} evidence file(s) and {stray} without a record");
+    }
+}
+
+/// The sweep itself, with the job lookup and the row delete injected.
+/// Returns (files with a row removed, stray files removed).
+fn sweep_evidence_with(
+    rows: &[omni_core::repository::EvidenceRow],
+    dir: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+    keep_days: i64,
+    max_bytes: u64,
+    lookup: &dyn Fn(i64) -> JobLookup,
+    delete_row: &dyn Fn(i64) -> bool,
+) -> (usize, usize) {
+    let doomed = evidence_to_delete(
+        rows,
+        now,
+        keep_days,
+        max_bytes,
+        |id| lookup(id) == JobLookup::Running,
+        |id| lookup(id) != JobLookup::Missing,
+    );
+    let mut removed = 0;
+    for id in &doomed {
+        let Some(row) = rows.iter().find(|r| r.job_id == *id) else { continue };
+        match std::fs::remove_file(&row.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!("Retention: evidence file of job #{id} not removed: {e}");
+                continue;
+            }
+        }
+        if delete_row(*id) {
+            removed += 1;
+        }
+    }
+    // Files whose row is gone (a crash between the write and the insert).
+    // Not a running job's, and not one so fresh its row may be about to appear.
+    let known: std::collections::HashSet<i64> = rows.iter().map(|r| r.job_id).collect();
+    let mut stray = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(id) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if !path.is_file() || known.contains(&id) || lookup(id) == JobLookup::Running {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= Duration::from_secs(3600));
+            if old_enough && std::fs::remove_file(&path).is_ok() {
+                stray += 1;
+            }
+        }
+    }
+    (removed, stray)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use omni_core::health::Health;
     use omni_core::models::QueueWatch;
+
+    fn ev_row(job_id: i64, mb: i64, age_days: i64, now: chrono::DateTime<chrono::Utc>) -> omni_core::repository::EvidenceRow {
+        omni_core::repository::EvidenceRow {
+            job_id,
+            path: format!("temp/evidence/{job_id}.json"),
+            bytes: mb * 1024 * 1024,
+            created_at: Some(now - chrono::Duration::days(age_days)),
+        }
+    }
+
+    #[test]
+    fn evidence_over_the_size_cap_goes_oldest_first() {
+        let now = chrono::Utc::now();
+        // 30 files of 10 MB = 300 MB, oldest first, all recent.
+        let rows: Vec<_> = (1..=30).map(|i| ev_row(i, 10, 30 - i.min(29) / 3, now)).collect();
+        let max = 200 * 1024 * 1024;
+        let gone = evidence_to_delete(&rows, now, 60, max, |_| false, |_| true);
+        let kept: i64 = rows.iter().filter(|r| !gone.contains(&r.job_id)).map(|r| r.bytes).sum();
+        assert!(kept as u64 <= max, "kept {kept}");
+        assert_eq!(gone, (1..=10).collect::<Vec<_>>(), "the ten oldest, in order");
+    }
+
+    #[test]
+    fn the_evidence_sweep_touches_only_whole_id_json_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "omni-evidence-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+        let write = |name: &str, aged: bool| {
+            let p = dir.join(name);
+            std::fs::write(&p, "{}").unwrap();
+            if aged {
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+            }
+        };
+        write("7.json", true); // stray, job gone
+        write("17.json", true); // has a row, old
+        write("abc.json", true);
+        write("7.json.bak", true);
+        write("8.json", true); // stray, but its job is running
+        write("9.json", false); // stray, but written a minute ago
+        write("10.json", true); // stray, job exists but is not running
+
+        let now = chrono::Utc::now();
+        let mut row = ev_row(17, 1, 20, now);
+        row.path = dir.join("17.json").to_string_lossy().into_owned();
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let lookup = |id: i64| match id {
+            8 => JobLookup::Running,
+            7 => JobLookup::Missing,
+            _ => JobLookup::Present,
+        };
+        let (removed, stray) = sweep_evidence_with(
+            &[row],
+            &dir,
+            now,
+            14,
+            200 * 1024 * 1024,
+            &lookup,
+            &|id| {
+                deleted.borrow_mut().push(id);
+                true
+            },
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(left, vec!["7.json.bak", "8.json", "9.json", "abc.json"]);
+        assert_eq!((removed, stray), (1, 2), "17 by its row; 7 and 10 as strays");
+        assert_eq!(*deleted.borrow(), vec![17]);
+    }
+
+    #[test]
+    fn evidence_of_a_running_job_is_never_chosen() {
+        let now = chrono::Utc::now();
+        let rows = vec![ev_row(1, 150, 40, now), ev_row(2, 100, 1, now)];
+        // Job 1 is oldest, past the age limit, and over the cap, but running.
+        let gone = evidence_to_delete(&rows, now, 14, 200 * 1024 * 1024, |id| id == 1, |_| true);
+        assert!(!gone.contains(&1));
+        assert_eq!(gone, vec![2], "the size cap falls on the next oldest instead");
+        let gone = evidence_to_delete(&rows, now, 14, 200 * 1024 * 1024, |id| id == 1, |id| id != 1);
+        assert!(!gone.contains(&1), "running wins over a missing job");
+    }
+
+    #[test]
+    fn evidence_of_a_vanished_job_or_past_the_age_limit_is_chosen() {
+        let now = chrono::Utc::now();
+        let rows = vec![ev_row(1, 1, 1, now), ev_row(2, 1, 20, now), ev_row(3, 1, 2, now)];
+        let gone = evidence_to_delete(&rows, now, 14, 200 * 1024 * 1024, |_| false, |id| id != 3);
+        assert_eq!(gone, vec![2, 3]);
+        let none = evidence_to_delete(&rows, now, 14, 200 * 1024 * 1024, |_| false, |_| true);
+        assert_eq!(none, vec![2], "only the 20-day-old file is past 14 days");
+    }
 
     #[test]
     fn queue_check_is_ok_until_something_is_slow_and_never_down() {

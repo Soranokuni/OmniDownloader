@@ -436,6 +436,47 @@ impl Default for LlmConfig {
     }
 }
 
+/// What the daemon does with the page evidence of a failed job (plan P10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RepairMode {
+    /// No capture decisions beyond today's behaviour.
+    #[default]
+    Off,
+    /// Decide and log, change nothing.
+    Shadow,
+    /// Hold the job for MCR when the decision says so.
+    Hold,
+}
+
+/// Page evidence and repair (`repair` in config.json). Old files without the
+/// section load with these defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairConfig {
+    #[serde(default)]
+    pub mode: RepairMode,
+    /// Evidence files older than this are deleted by the retention task.
+    #[serde(default = "default_evidence_days")]
+    pub evidence_days: i64,
+    /// Total size of the evidence folder; the oldest go first above it.
+    #[serde(default = "default_evidence_max_mb")]
+    pub evidence_max_mb: u64,
+}
+
+fn default_evidence_days() -> i64 {
+    14
+}
+
+fn default_evidence_max_mb() -> u64 {
+    200
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self { mode: RepairMode::Off, evidence_days: default_evidence_days(), evidence_max_mb: default_evidence_max_mb() }
+    }
+}
+
 /// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
@@ -588,6 +629,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub llm: LlmConfig,
 
+    /// Page evidence of failed jobs and the repair mode (plan P10.1).
+    #[serde(default)]
+    pub repair: RepairConfig,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -682,6 +727,7 @@ impl Default for AppConfig {
             ollama_endpoint: default_ollama_endpoint(),
             ollama_model: default_ollama_model(),
             llm: LlmConfig::default(),
+            repair: RepairConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -852,6 +898,18 @@ mod tests {
     use super::*;
     use crate::secrets::{keys, SecretStore};
     use tempfile::TempDir;
+
+    #[test]
+    fn repair_section_defaults_and_parses() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.repair.mode, RepairMode::Off);
+        assert_eq!(old.repair.evidence_days, 14);
+        assert_eq!(old.repair.evidence_max_mb, 200);
+        let set: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"shadow","evidence_days":3}}"#).unwrap();
+        assert_eq!(set.repair.mode, RepairMode::Shadow);
+        assert_eq!(set.repair.evidence_days, 3);
+        assert_eq!(set.repair.evidence_max_mb, 200);
+    }
 
     #[test]
     fn secrets_never_reach_config_json() {

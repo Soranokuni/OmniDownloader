@@ -434,6 +434,19 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
             ('Link with "-ΒΙΝΤΕΟ" glued on by the sender', 'https://www.news247.gr/kosmos/rosia-apo-agnosti-pnevmonia-o-thanatos-tis-erevnitrias-ti-leei-gia-tin-panoli-o-pou/-ΒΙΝΤΕΟ');
         "#,
     ),
+    (
+        15,
+        // Page evidence of failed news-page jobs (P10.1): one capped JSON
+        // file per job under temp/evidence; the row is what retention walks.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_evidence (
+            job_id     INTEGER PRIMARY KEY,
+            path       TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -596,6 +609,23 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(applied as usize, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn migration_15_creates_job_evidence() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('job_evidence')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in ["job_id", "path", "bytes", "created_at"] {
+            assert!(columns.iter().any(|x| x == c), "job_evidence.{c} missing: {columns:?}");
+        }
+        assert!(target_version() >= 15);
     }
 
     #[test]

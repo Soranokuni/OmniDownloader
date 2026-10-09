@@ -59,6 +59,13 @@
     "keyword_polish": false
   },
 
+  "repair": {
+    "_comment": "Page evidence of failed news-page jobs, kept under temp/evidence. mode: off, shadow or hold.",
+    "mode": "off",
+    "evidence_days": 14,
+    "evidence_max_mb": 200
+  },
+
   "ytdl_channel": "stable",
   "ytdl_auto_update_nightly": true,
 
