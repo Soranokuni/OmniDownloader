@@ -80,6 +80,12 @@ impl AppPaths {
         self.temp.join("jobs").join(job_id.to_string())
     }
 
+    /// Where a finished video waits for MCR's approval (P10.5): one
+    /// directory per job, removed as a whole, never matched by prefix.
+    pub fn held(&self, job_id: i64) -> PathBuf {
+        self.temp.join("held").join(job_id.to_string())
+    }
+
     /// Create every directory the daemon writes to.
     ///
     /// Called once at start-up so a missing `logs/` does not surface later as a

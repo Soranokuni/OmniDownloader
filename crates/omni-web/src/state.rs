@@ -41,6 +41,10 @@ pub struct AppState {
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
+    /// The daemon's temp directory, where `held/{id}` keeps a video waiting
+    /// for approval (P10.5). `None` in tests that have none: a rejection then
+    /// leaves the directory to the sweep.
+    pub temp_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -72,7 +76,14 @@ impl AppState {
             tls_enabled,
             llm,
             busy_jobs: omni_core::busy::BusyJobs::new(),
+            temp_dir: None,
         }
+    }
+
+    /// Where held videos live, so a rejection can remove its file now.
+    pub fn with_temp_dir(mut self, temp_dir: PathBuf) -> Self {
+        self.temp_dir = Some(temp_dir);
+        self
     }
 
     /// Share the daemon's health state, so the endpoints report what the

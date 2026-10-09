@@ -826,7 +826,8 @@ async fn run_daemon(
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
         .with_llm(live_llm.clone())
-        .with_busy_jobs(busy_jobs.clone());
+        .with_busy_jobs(busy_jobs.clone())
+        .with_temp_dir(temp_path.clone());
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();
@@ -979,6 +980,7 @@ async fn run_daemon(
     {
         let repo_reaper = repo.clone();
         let queue_health = health.clone();
+        let reaper_temp = temp_path.clone();
         let mut reaper_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(LEASE_REAP_INTERVAL);
@@ -992,6 +994,21 @@ async fn run_daemon(
                                 "Lease reaper: {requeued} job(s) requeued, {review} sent to review"
                             ),
                             Err(e) => error!("Lease reaper failed: {e:?}"),
+                        }
+                        // Videos held for approval (P10.5): expire, supersede, tidy.
+                        let (sweep_repo, sweep_temp) = (repo_reaper.clone(), reaper_temp.clone());
+                        match tokio::task::spawn_blocking(move || {
+                            omni_core::held::sweep(&sweep_repo, &sweep_temp, chrono::Utc::now())
+                        })
+                        .await
+                        {
+                            Ok(Ok(r)) if r.is_empty() => {}
+                            Ok(Ok(r)) => info!(
+                                "Held-video sweep: {} expired, {} superseded, {} forgotten, {} stray folder(s) removed",
+                                r.expired.len(), r.superseded.len(), r.forgotten.len(), r.dirs_removed
+                            ),
+                            Ok(Err(e)) => warn!("Held-video sweep failed: {e:?}"),
+                            Err(e) => warn!("Held-video sweep did not finish: {e:?}"),
                         }
                         match repo_reaper.queue_watch(chrono::Utc::now()) {
                             Ok(w) => {
@@ -1047,14 +1064,17 @@ async fn run_daemon(
 
         loop {
             // Capacity first. This await is where an idle daemon sits.
-            let permit = tokio::select! {
+            let mut permit = tokio::select! {
                 _ = worker_rx.recv() => {
                     info!("Worker pool shutting down.");
                     break;
                 }
                 p = async {
                     let job_slot = in_flight.clone().acquire_owned().await?;
-                    let download_slot = semaphore.clone().acquire_owned().await?;
+                    // A download slot only if one is free right now: an
+                    // approved held video is delivered without downloading
+                    // and must not queue behind other people's downloads.
+                    let download_slot = semaphore.clone().try_acquire_owned().ok();
                     Ok::<_, tokio::sync::AcquireError>((job_slot, download_slot))
                 } => match p {
                     Ok(p) => p,
@@ -1100,7 +1120,27 @@ async fn run_daemon(
 
             let owner = format!("{worker_hostname}:{}:{worker_seq}", std::process::id());
 
-            let job = match repo_worker.lease_job(&owner, LEASE_SECS) {
+            let leased = if permit.1.is_some() {
+                repo_worker.lease_job(&owner, LEASE_SECS)
+            } else {
+                // Every download slot is busy: an approved held video can
+                // still start; anything else waits briefly for a slot.
+                match repo_worker.lease_approved_held_job(&owner, LEASE_SECS) {
+                    Ok(None) => match tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned()).await {
+                        Ok(Ok(slot)) => {
+                            permit.1 = Some(slot);
+                            repo_worker.lease_job(&owner, LEASE_SECS)
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            drop(permit);
+                            continue;
+                        }
+                    },
+                    other => other,
+                }
+            };
+            let job = match leased {
                 Ok(Some(job)) => job,
                 Ok(None) => {
                     // Nothing ready. Release the permit and idle with jitter so
@@ -1139,7 +1179,9 @@ async fn run_daemon(
                 let _busy = busy_guard;
                 let job_id = job.id;
                 let (job_slot, download_slot) = permit;
-                eng.hold_download_slot(job_id, download_slot);
+                if let Some(download_slot) = download_slot {
+                    eng.hold_download_slot(job_id, download_slot);
+                }
 
                 // Keep the lease alive while we work. If it stops succeeding we
                 // have lost the job -- the reaper requeued it, or an operator
@@ -1272,6 +1314,63 @@ fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
     repo.owns_lease(job_id, owner).unwrap_or(false)
 }
 
+/// The run holding the lease parks the job for MCR's approval (P10.5): not
+/// terminal, no lease, never leased again until approved. `false` when the
+/// job is no longer this worker's.
+fn finish_held(repo: &Repository, job_id: i64, owner: &str) -> Result<bool> {
+    repo.finish(job_id, owner, JobStatus::AwaitingApproval, None, None, None)
+}
+
+/// An approved held video: deliver exactly that file (P10.5). No download,
+/// no encode, no site-health or evidence bookkeeping. The terminal status is
+/// set here, by the worker holding the lease, as for every other job.
+async fn run_approved_delivery(
+    repo: &Repository,
+    engine: &Arc<BroadcastEngine>,
+    owner: &str,
+    job: &omni_core::models::Job,
+    held: &omni_core::repository::HeldOutput,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let job_id = job.id;
+    let result = engine.deliver_held(job, owner, held, Some(cancel.clone())).await;
+    if lost_lease(&result) {
+        warn!("Job #{job_id}: no longer ours; nothing more to do");
+        return Ok(());
+    }
+    match result {
+        Ok(()) => {
+            // The job and the held row finish together; a lost lease marks
+            // nothing and keeps the held file.
+            if repo.finish_held_delivery(job_id, owner)? {
+                engine.discard_held_dir(job_id);
+            } else {
+                warn!("Job #{job_id}: no longer ours after delivering the approved video; the held file is kept");
+            }
+        }
+        Err(e) => {
+            let code = classify_pipeline_error(&e);
+            let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
+            let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
+            let message = readable_cause(&e);
+            let diagnostic: String = format!("{e:#}").chars().take(8192).collect();
+            let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
+            if code.is_retryable() && attempts < max_attempts {
+                // The approval stands: the next lease delivers the same file.
+                let backoff = code.backoff(attempts);
+                info!("Job #{job_id}: {code} delivering the approved video, retrying in {} s", backoff.num_seconds());
+                repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
+            } else {
+                if still_ours(repo, job_id, owner) {
+                    repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                }
+                repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run one leased job through the pipeline.
 ///
 /// Extracted from the worker loop so the lease, the heartbeat and the permit are
@@ -1311,6 +1410,12 @@ async fn run_job(
             None,
         )?;
         return Ok(());
+    }
+
+    // MCR approved the video this job held back: deliver that file, and do
+    // nothing of what follows (no download, no page scan, no sniffing).
+    if let Some(held) = repo.approved_held(job_id)? {
+        return run_approved_delivery(repo, engine, owner, &job, &held, &cancel).await;
     }
 
     if !repo.set_stage(job_id, owner, JobStage::Download)? {
@@ -1419,7 +1524,15 @@ async fn run_job(
             .context(ErrorCode::UnsupportedUrl.as_str()))
     } else {
         engine
-            .process_job_cancellable(job.clone(), owner, page_referer.as_deref(), None, None, Some(cancel.clone()))
+            .process_job_mode(
+                job.clone(),
+                owner,
+                page_referer.as_deref(),
+                None,
+                None,
+                Some(cancel.clone()),
+                omni_broadcast::pipeline::DeliveryMode::Deliver,
+            )
             .await
     };
 
@@ -1438,7 +1551,7 @@ async fn run_job(
     let mut sniffed_streams: Vec<String> = Vec::new();
     let sniff = match &process_result {
         Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
-        Ok(()) => false,
+        Ok(_) => false,
     };
     if sniff && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
         info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
@@ -1493,13 +1606,14 @@ async fn run_job(
                             return Ok(());
                         }
                         process_result = engine
-                            .process_job_cancellable(
+                            .process_job_mode(
                                 retry_job,
                                 owner,
                                 Some(&bundle.referer),
                                 Some(&bundle.user_agent),
                                 bundle.cookies.as_deref(),
                                 Some(cancel.clone()),
+                                omni_broadcast::pipeline::DeliveryMode::Deliver,
                             )
                             .await;
                     }
@@ -1526,7 +1640,7 @@ async fn run_job(
                     Some(JobStage::Extract),
                     &format!("Sniffer found no stream: {sniff_err}"),
                 )?;
-                if let Err(previous) = std::mem::replace(&mut process_result, Ok(())) {
+                if let Err(previous) = std::mem::replace(&mut process_result, Ok(omni_broadcast::pipeline::RunOutcome::Delivered)) {
                     process_result = Err(after_failed_sniff(previous, sniff_err));
                 }
             }
@@ -1539,7 +1653,12 @@ async fn run_job(
     }
 
     match process_result {
-        Ok(()) => {
+        Ok(omni_broadcast::pipeline::RunOutcome::Held) => {
+            // Made and checked, but held for MCR (P10.5): nothing was delivered.
+            finish_held(repo, job_id, owner)?;
+            Ok(())
+        }
+        Ok(omni_broadcast::pipeline::RunOutcome::Delivered) => {
             let delivered = repo
                 .get_job(job_id)?
                 .and_then(|j| j.file_path)
@@ -1916,7 +2035,7 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
 /// Whether the engine stopped because this worker no longer holds the job
 /// (P1.14). Nothing more may be written for it: `finish` and `requeue_after`
 /// would refuse, but the events and sniffing would not.
-fn lost_lease(result: &anyhow::Result<()>) -> bool {
+fn lost_lease<T>(result: &anyhow::Result<T>) -> bool {
     matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
 }
 
@@ -2016,6 +2135,7 @@ fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
     let text = format!("{e:#}");
     for code in [
         ErrorCode::ManualDownload,
+        ErrorCode::HeldFileChanged,
         ErrorCode::ComplianceFailed,
         ErrorCode::ProbeFailed,
         ErrorCode::LoginRequired,
@@ -2717,6 +2837,57 @@ mod tests {
     use omni_core::health::Health;
     use omni_core::models::QueueWatch;
 
+    /// A scratch database that removes itself.
+    struct ScratchDb(std::path::PathBuf);
+    impl ScratchDb {
+        fn new() -> (Self, Repository) {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("omni-main-test-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::new(dir.join("omni.db")).unwrap();
+            (Self(dir), repo)
+        }
+    }
+    impl Drop for ScratchDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// P10.5: the worker holding the lease parks a held job; only it can.
+    #[test]
+    fn finish_held_parks_the_job_for_its_owner_and_nobody_else() {
+        let (_db, repo) = ScratchDb::new();
+        let id = repo
+            .enqueue(
+                &omni_core::models::NewJob::new("https://example.gr/h", "1_ANNA_HELD", "ANNA"),
+                omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+            )
+            .unwrap()
+            .job_id();
+        repo.lease_job("w1", 180).unwrap().expect("leased");
+
+        assert!(!finish_held(&repo, id, "w2").unwrap(), "another worker must not park the job");
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Running);
+
+        assert!(finish_held(&repo, id, "w1").unwrap());
+        let job = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::AwaitingApproval);
+        assert_eq!(job.lease_owner, None);
+        assert!(!finish_held(&repo, id, "w1").unwrap(), "the lease is gone once parked");
+        assert!(repo.lease_job("w3", 180).unwrap().is_none(), "a parked job is not leased");
+    }
+
+    /// P10.5: a changed held file is a terminal, named failure, never "unexpected".
+    #[test]
+    fn a_changed_held_file_classifies_as_its_own_terminal_code() {
+        let e = anyhow::anyhow!("{}: the video changed", ErrorCode::HeldFileChanged.as_str())
+            .context(ErrorCode::HeldFileChanged.as_str());
+        let code = classify_pipeline_error(&e);
+        assert_eq!(code, ErrorCode::HeldFileChanged);
+        assert!(!code.is_retryable(), "a file that is not the approved one is never retried into delivery");
+    }
+
     fn ev_row(job_id: i64, mb: i64, age_days: i64, now: chrono::DateTime<chrono::Utc>) -> omni_core::repository::EvidenceRow {
         omni_core::repository::EvidenceRow {
             job_id,
@@ -2968,7 +3139,7 @@ mod tests {
     /// merely quotes the code in its text (a URL ending in it) is not.
     #[test]
     fn a_lost_lease_is_recognised_by_type_not_by_text() {
-        let lost = Err(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 7, stage: JobStage::Rewrap })
+        let lost: anyhow::Result<()> = Err(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 7, stage: JobStage::Rewrap })
             .context(ErrorCode::LeaseExpired.as_str()));
         assert!(lost_lease(&lost));
 

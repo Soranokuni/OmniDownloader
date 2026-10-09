@@ -387,6 +387,25 @@ fn job_for_desk(job: &omni_core::models::Job) -> serde_json::Value {
     v
 }
 
+/// What the desk needs to approve a held video: the file's SHA-256 (sent
+/// back with the approval), its size and its deadline. `null` unless a video
+/// is waiting for this job (P10.5).
+fn held_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+    if job.status != JobStatus::AwaitingApproval {
+        return serde_json::Value::Null;
+    }
+    match state.repo.waiting_held(job.id) {
+        Ok(Some(h)) => serde_json::json!({
+            "sha256": h.sha256,
+            "bytes": h.bytes,
+            "duration": h.duration,
+            "created_at": h.created_at.map(omni_core::timestamps::format),
+            "expires_at": h.expires_at.map(omni_core::timestamps::format),
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
 pub async fn api_get_jobs(
     RequireMcr(principal): RequireMcr,
     Query(query): Query<JobsQuery>,
@@ -418,6 +437,7 @@ pub async fn api_get_jobs(
             .iter()
             .map(|j| {
                 let mut v = job_for_desk(j);
+                v["held"] = held_for_desk(&state, j);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -478,7 +498,9 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
-    Ok(Json(serde_json::json!({ "job": job_for_desk(&job), "events": events })))
+    let mut desk_job = job_for_desk(&job);
+    desk_job["held"] = held_for_desk(&state, &job);
+    Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
 }
 
 #[derive(Deserialize)]
@@ -771,6 +793,99 @@ pub async fn api_retry_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// The video is not waiting for a decision (P10.5): never held, decided
+/// already, a different file than the one named, or expired.
+fn not_held() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "NOT_HELD",
+        "Αυτό το βίντεο δεν περιμένει έγκριση: αποφασίστηκε ήδη, έληξε, ή το αρχείο άλλαξε. Ανανεώστε τη λίστα.",
+    )
+}
+
+#[derive(Deserialize)]
+pub struct ApprovePayload {
+    /// The SHA-256 the desk was shown: the approval is for exactly that file.
+    sha256: String,
+}
+
+/// MCR approves the video a job held back; the job goes back to the queue
+/// and the worker that takes it delivers exactly the file with this SHA-256.
+pub async fn api_approve_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<ApprovePayload>,
+) -> JsonResult {
+    let sha = payload.sha256.trim().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("Λάθος αποτύπωμα αρχείου (SHA-256)."));
+    }
+    let approved = state
+        .repo
+        .approve_held(job_id, &sha, &principal.audit_label())
+        .map_err(internal_error("Could not approve the video."))?;
+    if !approved {
+        return Err(not_held());
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: held video approved (sha256 {sha})"));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+pub struct RejectPayload {
+    reason: String,
+    note: Option<String>,
+}
+
+/// The job's message for a rejection: what MCR said, in the desk's language.
+fn rejection_message(reason: &str, note: Option<&str>) -> Option<String> {
+    let base = match reason {
+        "wrong_video" => "Το MCR απέρριψε το βίντεο: δεν είναι το σωστό.",
+        "not_usable" => "Το MCR απέρριψε το βίντεο: δεν είναι αξιοποιήσιμο.",
+        "other" => "Το MCR απέρριψε το βίντεο.",
+        _ => return None,
+    };
+    let note: String = note
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let note = note.trim();
+    Some(if note.is_empty() { base.to_string() } else { format!("{base} Σημείωση: {note}") })
+}
+
+/// MCR rejects the video a job held back: the job goes to review, the file
+/// is deleted.
+pub async fn api_reject_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<RejectPayload>,
+) -> JsonResult {
+    if payload.note.as_deref().is_some_and(|n| n.chars().count() > 300) {
+        return Err(ApiError::bad_request("Η σημείωση μπορεί να έχει έως 300 χαρακτήρες."));
+    }
+    let Some(message) = rejection_message(&payload.reason, payload.note.as_deref()) else {
+        return Err(ApiError::bad_request("Άγνωστος λόγος απόρριψης."));
+    };
+    let rejected = state
+        .repo
+        .reject_held(job_id, &payload.reason, &message, &principal.audit_label())
+        .map_err(internal_error("Could not reject the video."))?;
+    if !rejected {
+        return Err(not_held());
+    }
+    // The file goes now; if that fails the sweep tries again.
+    if let Some(temp) = state.temp_dir.clone() {
+        let _ = tokio::task::spawn_blocking(move || omni_core::held::remove_held_dir(&temp, job_id)).await;
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected ({})", payload.reason));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -2041,6 +2156,7 @@ pub async fn api_get_mail_view(
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
                 let mut v = job_for_desk(j);
+                v["held"] = held_for_desk(&state, j);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }

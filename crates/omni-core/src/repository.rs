@@ -35,6 +35,30 @@ pub struct EvidenceRow {
     pub created_at: Option<chrono::DateTime<Utc>>,
 }
 
+/// A finished video held back until MCR approves it (plan P10.5).
+#[derive(Debug, Clone)]
+pub struct HeldOutput {
+    pub job_id: i64,
+    pub path: String,
+    pub bytes: i64,
+    /// Lower-case hex SHA-256 of the file as held; approval names it and
+    /// delivery re-checks it.
+    pub sha256: String,
+    pub duration: Option<f64>,
+    /// `None` when the stored text does not parse; never shown as "now".
+    pub created_at: Option<chrono::DateTime<Utc>>,
+    pub expires_at: Option<chrono::DateTime<Utc>>,
+    /// `None` while waiting, then approved | rejected | expired | superseded | delivered.
+    pub decision: Option<String>,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<chrono::DateTime<Utc>>,
+    pub reason: Option<String>,
+    /// Where the approved file was copied in the watchfolder; set together
+    /// with the job's `file_path` right after the copy, so a restart can tell
+    /// that THIS file was delivered.
+    pub delivered_path: Option<String>,
+}
+
 /// The first-run administrator of a new installation (see
 /// [`Repository::ensure_default_admin`]). Logins are matched lowercased, so
 /// "Admin" and "admin" both work.
@@ -404,7 +428,7 @@ impl Repository {
                 error_message = ?,
                 file_path = COALESCE(?, file_path),
                 progress = CASE WHEN ? = 'COMPLETED' THEN 100.0 ELSE progress END,
-                completed_at = ?,
+                completed_at = CASE WHEN ? = 'AWAITING_APPROVAL' THEN completed_at ELSE ? END,
                 delivered_at = CASE WHEN ? THEN ? ELSE delivered_at END,
                 updated_at = ?
             WHERE id = ? AND lease_owner = ?
@@ -416,6 +440,7 @@ impl Repository {
                 error_message,
                 file_path,
                 status.as_str(),
+                status.as_str(),
                 now,
                 delivered,
                 now,
@@ -425,7 +450,7 @@ impl Repository {
             ],
         )?;
         if changed == 1 {
-            let level = if status == JobStatus::Completed { "INFO" } else { "ERROR" };
+            let level = if matches!(status, JobStatus::Completed | JobStatus::AwaitingApproval) { "INFO" } else { "ERROR" };
             self.record_event(
                 job_id,
                 level,
@@ -511,19 +536,42 @@ impl Repository {
     /// Runs in one IMMEDIATE transaction so two workers cannot select the same
     /// row before either updates it.
     pub fn lease_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
+        self.lease_next(owner, lease_secs, false)
+    }
+
+    /// [`Self::lease_job`] limited to jobs MCR approved a held video for
+    /// (P10.5). Delivering such a job downloads and encodes nothing, so the
+    /// worker loop may take one when every download slot is busy.
+    pub fn lease_approved_held_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
+        self.lease_next(owner, lease_secs, true)
+    }
+
+    fn lease_next(&self, owner: &str, lease_secs: i64, approved_held_only: bool) -> Result<Option<Job>> {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let now = timestamps::now_string();
-        let id: Option<i64> = tx
-            .query_row(
-                r#"
+        let select = if approved_held_only {
+            r#"
+                SELECT id FROM queue
+                WHERE status = 'PENDING'
+                  AND (not_before IS NULL OR not_before <= ?)
+                  AND id IN (SELECT job_id FROM held_outputs WHERE decision = 'approved')
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT 1
+                "#
+        } else {
+            r#"
                 SELECT id FROM queue
                 WHERE status = 'PENDING'
                   AND (not_before IS NULL OR not_before <= ?)
                 ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1
-                "#,
+                "#
+        };
+        let id: Option<i64> = tx
+            .query_row(
+                select,
                 params![now],
                 |r| r.get(0),
             )
@@ -709,7 +757,9 @@ impl Repository {
                     updated_at = CASE WHEN status = 'PENDING' THEN updated_at ELSE ? END
              WHERE id = ?
                AND (status IN ('PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED')
-                    OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))",
+                    OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))
+               AND NOT EXISTS (SELECT 1 FROM held_outputs h
+                               WHERE h.job_id = queue.id AND (h.decision IS NULL OR h.decision = 'approved'))",
             params![keyword, slug, timestamps::now_string(), job_id],
         )?;
         Ok((changed == 1).then_some((job.slug, slug)))
@@ -990,6 +1040,7 @@ impl Repository {
                 "PENDING" => summary.pending += count,
                 "REQUIRES_REVIEW" => summary.review += count,
                 "MANUAL_DOWNLOAD" => summary.manual += count,
+                "AWAITING_APPROVAL" => summary.approval += count,
                 "COMPLETED" | "COMPLETED_MANUAL" => summary.completed += count,
                 "FAILED" => summary.failed += count,
                 "RUNNING" => summary.running += count,
@@ -1222,8 +1273,9 @@ impl Repository {
     /// a worker still holds the lease of the first, and the second has its
     /// own action, `redownload_job`.
     pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<bool> {
-        let conn = self.pool.get()?;
-        let n = conn.execute(
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
@@ -1231,10 +1283,21 @@ impl Repository {
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
                 url_normalized = COALESCE(?, url_normalized), updated_at = ?
-            WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED')
+            WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED','AWAITING_APPROVAL')
             "#,
             params![new_url, new_url.map(crate::urlnorm::normalize), timestamps::now_string(), id],
         )?;
+        if n > 0 {
+            // A new run, possibly of another link: a file held (or approved
+            // but not yet delivered) for the old run must not be delivered
+            // for it (P10.5).
+            tx.execute(
+                "UPDATE held_outputs SET decision = 'superseded', decided_at = ?
+                 WHERE job_id = ? AND (decision IS NULL OR decision = 'approved')",
+                params![timestamps::now_string(), id],
+            )?;
+        }
+        tx.commit()?;
         if n > 0 {
             self.log_audit("INFO", "QUEUE", &format!("Retried Job #{}", id))?;
         }
@@ -1254,7 +1317,7 @@ impl Repository {
             SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL
-            WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED')
+            WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','AWAITING_APPROVAL')
             "#,
             params![now, now, now, id],
         )?;
@@ -1274,7 +1337,7 @@ impl Repository {
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 completed_at = ?, updated_at = ?
-            WHERE id = ? AND (status = 'PENDING' OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
+            WHERE id = ? AND (status IN ('PENDING','AWAITING_APPROVAL') OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
             "#,
             params![now, now, id],
         )?;
@@ -2942,6 +3005,353 @@ impl Repository {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM job_evidence WHERE job_id = ?", params![job_id])?;
         Ok(())
+    }
+}
+
+/// What the held-output sweep does with one row (P10.5), decided from the
+/// row, its job and the clock alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldSweep {
+    Keep,
+    /// Past its time, still waiting: the job goes to review.
+    Expire,
+    /// MCR (or a retry) moved the job on: the held file is no longer wanted.
+    Supersede,
+    /// The job is gone: the row goes too.
+    Forget,
+}
+
+/// The sweep's decision for a held row. `job` is `None` when the job no
+/// longer exists. A waiting row whose expiry does not parse is expired
+/// rather than kept for ever.
+pub fn held_sweep_action(
+    decision: Option<&str>,
+    job: Option<JobStatus>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> HeldSweep {
+    let Some(job) = job else { return HeldSweep::Forget };
+    match decision {
+        None => match job {
+            JobStatus::AwaitingApproval if expires_at.map_or(true, |t| t < now) => HeldSweep::Expire,
+            // Running: the hold is being written right now.
+            JobStatus::AwaitingApproval | JobStatus::Running => HeldSweep::Keep,
+            _ => HeldSweep::Supersede,
+        },
+        Some("approved") => match job {
+            JobStatus::Pending | JobStatus::Running => HeldSweep::Keep,
+            _ => HeldSweep::Supersede,
+        },
+        Some(_) => HeldSweep::Keep,
+    }
+}
+
+// ---- videos held for approval (P10.5) ----
+impl Repository {
+    fn held_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HeldOutput> {
+        Ok(HeldOutput {
+            job_id: r.get("job_id")?,
+            path: r.get("path")?,
+            bytes: r.get("bytes")?,
+            sha256: r.get("sha256")?,
+            duration: r.get("duration")?,
+            created_at: timestamps::parse_opt(r.get("created_at")?),
+            expires_at: timestamps::parse_opt(r.get("expires_at")?),
+            decision: r.get("decision")?,
+            decided_by: r.get("decided_by")?,
+            decided_at: timestamps::parse_opt(r.get("decided_at")?),
+            reason: r.get("reason")?,
+            delivered_path: r.get("delivered_path")?,
+        })
+    }
+
+    /// Record the held file of a job this worker still leases. `false` when
+    /// the lease is gone: nothing is written. Replaces an older row of the
+    /// same job (a retried job holds again).
+    pub fn hold_output(
+        &self,
+        job_id: i64,
+        owner: &str,
+        path: &str,
+        bytes: i64,
+        sha256: &str,
+        duration: Option<f64>,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ours: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM queue WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+                params![job_id, owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if ours.is_none() {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO held_outputs
+               (job_id, path, bytes, sha256, duration, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![job_id, path, bytes, sha256, duration, timestamps::now_string(), timestamps::format(expires_at)],
+        )?;
+        // Nothing of this run was delivered, whatever an earlier run left:
+        // a stale file_path must never pass for a delivery.
+        tx.execute(
+            "UPDATE queue SET file_path = NULL, delivered_at = NULL WHERE id = ?",
+            params![job_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The held row of a job, whatever its decision.
+    pub fn get_held(&self, job_id: i64) -> Result<Option<HeldOutput>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row("SELECT * FROM held_outputs WHERE job_id = ?", params![job_id], Self::held_from_row)
+            .optional()?)
+    }
+
+    /// The held row while nobody has decided on it.
+    pub fn waiting_held(&self, job_id: i64) -> Result<Option<HeldOutput>> {
+        Ok(self.get_held(job_id)?.filter(|h| h.decision.is_none()))
+    }
+
+    /// The held row once MCR approved it and it is not yet delivered.
+    pub fn approved_held(&self, job_id: i64) -> Result<Option<HeldOutput>> {
+        Ok(self.get_held(job_id)?.filter(|h| h.decision.as_deref() == Some("approved")))
+    }
+
+    /// Bytes held for approval or approved-and-not-yet-delivered, other than
+    /// job `except`'s own (which a new hold replaces).
+    pub fn held_bytes_in_use(&self, except: i64) -> Result<u64> {
+        let conn = self.pool.get()?;
+        let n: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM held_outputs
+             WHERE job_id != ? AND (decision IS NULL OR decision = 'approved')",
+            params![except],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// Right after the approved file was copied: the job's `file_path` and
+    /// the row's `delivered_path` are written together, owner-checked. A
+    /// restart that finds both equal knows this file was delivered and
+    /// copies nothing again. `false` when the lease is gone (nothing written).
+    pub fn record_held_delivery(&self, job_id: i64, owner: &str, path: &str, duration: f64) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![path, duration, timestamps::now_string(), job_id, owner],
+        )?;
+        if n != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE held_outputs SET delivered_path = ? WHERE job_id = ? AND decision = 'approved'",
+            params![path, job_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The end of an approved delivery, in one transaction: the job is
+    /// COMPLETED with the file the copy recorded, and the held row is
+    /// `delivered`. Refused (`false`, nothing written) when the lease is gone
+    /// or the job's `file_path` is not the one this approved file was
+    /// delivered to.
+    pub fn finish_held_delivery(&self, job_id: i64, owner: &str) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = timestamps::now_string();
+        let n = tx.execute(
+            r#"
+            UPDATE queue
+            SET status = 'COMPLETED', stage = 'DONE', lease_owner = NULL, lease_expires_at = NULL,
+                error_code = NULL, error_message = NULL, progress = 100.0,
+                completed_at = ?, delivered_at = ?, updated_at = ?
+            WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'
+              AND file_path IS NOT NULL AND file_path != ''
+              AND file_path = (SELECT delivered_path FROM held_outputs
+                               WHERE job_id = queue.id AND decision = 'approved')
+            "#,
+            params![now, now, now, job_id, owner],
+        )?;
+        if n != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE held_outputs SET decision = 'delivered', decided_at = ? WHERE job_id = ? AND decision = 'approved'",
+            params![now, job_id],
+        )?;
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'INFO', 'Finished as COMPLETED')",
+            params![job_id, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Set the decision of an approved row (`delivered`, once its file is in
+    /// the watchfolder). `false` when the row was not approved.
+    pub fn mark_held(&self, job_id: i64, decision: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE held_outputs SET decision = ?, decided_at = ?
+             WHERE job_id = ? AND decision = 'approved'",
+            params![decision, timestamps::now_string(), job_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// MCR approves the held file with this SHA-256: the job goes back to
+    /// PENDING and the worker that leases it delivers exactly that file.
+    /// One transaction; `false` (nothing changed) when the job is not
+    /// waiting, the file is not the one named, or it was decided already.
+    pub fn approve_held(&self, job_id: i64, sha256: &str, by: &str) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = timestamps::now_string();
+        let held = tx.execute(
+            "UPDATE held_outputs SET decision = 'approved', decided_by = ?, decided_at = ?
+             WHERE job_id = ? AND decision IS NULL AND sha256 = ?",
+            params![by, now, job_id, sha256],
+        )?;
+        let queued = tx.execute(
+            r#"
+            UPDATE queue
+            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
+                completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND status = 'AWAITING_APPROVAL'
+            "#,
+            params![now, job_id],
+        )?;
+        if held != 1 || queued != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'INFO', ?)",
+            params![job_id, now, format!("Approved by {by}; delivering the held file")],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// MCR rejects the held file: the job goes to review with
+    /// REJECTED_BY_MCR and `message`. One transaction; `false` when the job
+    /// is not waiting.
+    pub fn reject_held(&self, job_id: i64, reason: &str, message: &str, by: &str) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = timestamps::now_string();
+        let held = tx.execute(
+            "UPDATE held_outputs SET decision = 'rejected', decided_by = ?, decided_at = ?, reason = ?
+             WHERE job_id = ? AND decision IS NULL",
+            params![by, now, reason, job_id],
+        )?;
+        let queued = tx.execute(
+            r#"
+            UPDATE queue
+            SET status = 'REQUIRES_REVIEW', error_code = 'REJECTED_BY_MCR', error_message = ?,
+                lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, cleared_at = NULL, updated_at = ?
+            WHERE id = ? AND status = 'AWAITING_APPROVAL'
+            "#,
+            params![message, now, now, job_id],
+        )?;
+        if held != 1 || queued != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
+            params![job_id, now, format!("Rejected by {by} ({reason}): {message}")],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A waiting hold past its time: the job goes to review with
+    /// APPROVAL_EXPIRED. `false` when it was decided in the meantime.
+    pub fn expire_held(&self, job_id: i64, now: chrono::DateTime<Utc>) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let at = timestamps::format(now);
+        let held = tx.execute(
+            "UPDATE held_outputs SET decision = 'expired', decided_at = ?
+             WHERE job_id = ? AND decision IS NULL",
+            params![at, job_id],
+        )?;
+        let queued = tx.execute(
+            r#"
+            UPDATE queue
+            SET status = 'REQUIRES_REVIEW', error_code = 'APPROVAL_EXPIRED',
+                error_message = 'Nobody approved the video in time; the held file was deleted',
+                lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, cleared_at = NULL, updated_at = ?
+            WHERE id = ? AND status = 'AWAITING_APPROVAL'
+            "#,
+            params![at, at, job_id],
+        )?;
+        if held != 1 || queued != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
+            params![job_id, at, "Nobody approved the held video in time; it was deleted"],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A held row whose job moved on without it: the condition of
+    /// [`held_sweep_action`], checked again in SQL.
+    pub fn supersede_held(&self, job_id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE held_outputs SET decision = 'superseded', decided_at = ?
+             WHERE job_id = ? AND (
+               (decision IS NULL AND COALESCE((SELECT status FROM queue WHERE id = job_id), '')
+                  NOT IN ('AWAITING_APPROVAL','RUNNING','')) OR
+               (decision = 'approved' AND COALESCE((SELECT status FROM queue WHERE id = job_id), '')
+                  NOT IN ('PENDING','RUNNING','')))",
+            params![timestamps::now_string(), job_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Drop the row of a job that no longer exists.
+    pub fn forget_held(&self, job_id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "DELETE FROM held_outputs WHERE job_id = ? AND NOT EXISTS (SELECT 1 FROM queue WHERE id = ?)",
+            params![job_id, job_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Every row that still wants its file (waiting or approved), with its
+    /// job's status (`None` when the job is gone).
+    pub fn list_live_held(&self) -> Result<Vec<(HeldOutput, Option<JobStatus>)>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT h.*, (SELECT status FROM queue WHERE id = h.job_id) AS job_status
+             FROM held_outputs h
+             WHERE h.decision IS NULL OR h.decision = 'approved'
+             ORDER BY h.job_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let status: Option<String> = r.get("job_status")?;
+            Ok((Self::held_from_row(r)?, status.as_deref().and_then(JobStatus::parse)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
