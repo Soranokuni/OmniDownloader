@@ -1,0 +1,30 @@
+{
+  "ignored_urls": [
+    "https://www.example.gr/"
+  ],
+  "journalist": {
+    "how": "subject",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "VIRAL",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/reel/fixture2301"
+        }
+      ],
+      "keyword": "VIRAL",
+      "title": "VIRAL ΓΙΑ ΕΛΕΝΗ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

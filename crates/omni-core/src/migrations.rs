@@ -273,6 +273,167 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_processed_mail_at ON processed_mail(processed_at);
         "#,
     ),
+    (
+        6,
+        // Where the last mail poll got to, per mailbox (plan P4.8).
+        //
+        // The station's Graph app has `Mail.Read` only, so nothing can be
+        // marked read or moved: "unread" says nothing about what the daemon
+        // has handled. The poll lists what changed since this point (minus an
+        // overlap) and `processed_mail` decides what is new. Losing the row
+        // costs Graph calls, never a duplicate job.
+        r#"
+        CREATE TABLE IF NOT EXISTS mail_checkpoints (
+            mailbox        TEXT PRIMARY KEY,
+            modified_since TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        7,
+        // The newsroom taxonomy (plan P4.17): groups (the news desk, each
+        // show) and who belongs to which. `position` orders a person's
+        // groups; position 0 is their default. A group is a label on the job
+        // and never changes a file name or a delivery path.
+        r#"
+        CREATE TABLE IF NOT EXISTS groups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            code        TEXT NOT NULL UNIQUE,
+            name        TEXT NOT NULL,
+            kind        TEXT NOT NULL DEFAULT 'show',
+            keywords    TEXT NOT NULL DEFAULT '[]',
+            description TEXT NOT NULL DEFAULT '',
+            created_at  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS journalist_groups (
+            journalist_id INTEGER NOT NULL REFERENCES journalists(id) ON DELETE CASCADE,
+            group_id      INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            position      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (journalist_id, group_id)
+        );
+        "#,
+    ),
+    (
+        8,
+        // The group a job was queued for (plan P4.18): a label for the
+        // panels, never used for naming or delivery. A job keeps its label
+        // if the group is later deleted.
+        r#"
+        ALTER TABLE queue ADD COLUMN group_code TEXT;
+        "#,
+    ),
+    (
+        9,
+        // Mail an operator asked to have read again (plan P4.25). The
+        // watcher fetches each by its provider id on its next poll and runs
+        // it through the parser as if new; a checkpoint rewind would not
+        // reach a mail changed long ago. `attempts` counts failed tries.
+        r#"
+        CREATE TABLE IF NOT EXISTS mail_reprocess (
+            internet_message_id TEXT PRIMARY KEY,
+            source_id    TEXT NOT NULL,
+            requested_at TEXT NOT NULL,
+            requested_by TEXT,
+            attempts     INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    ),
+    (
+        10,
+        // The nightly self-check (plan P6.7): links known to hold a video,
+        // one per route a job can take, checked without downloading. The
+        // defaults are seeded here, once, so links an operator deletes stay
+        // deleted. `last_ok` is NULL until the first check.
+        r#"
+        CREATE TABLE IF NOT EXISTS selfcheck_links (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            label           TEXT NOT NULL,
+            url             TEXT NOT NULL UNIQUE,
+            last_checked_at TEXT,
+            last_ok         INTEGER,
+            last_detail     TEXT,
+            last_ok_at      TEXT,
+            failing_since   TEXT,
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        INSERT OR IGNORE INTO selfcheck_links (label, url) VALUES
+            ('YouTube', 'https://www.youtube.com/watch?v=jNQXAC9IVRw'),
+            ('Instagram reel', 'https://www.instagram.com/reel/Dd615LBN4QM/'),
+            ('Facebook video', 'https://www.facebook.com/ingr.officialpage/videos/1245278808680006/'),
+            ('TikTok', 'https://www.tiktok.com/@glasatnabulgaria/video/7690626350159318305'),
+            ('X (Twitter) video', 'https://x.com/i/status/2100509173943288138'),
+            ('Streamable', 'https://streamable.com/531cym'),
+            ('News article, glomex player', 'https://www.neakriti.gr/life/2202679_katerina-liolioy-makari-na-me-axiosei-o-theos-na-kano-ena-i-dyo-paidia-ti-eipe-gia'),
+            ('News article, Instagram embed', 'https://www.iefimerida.gr/zoi/keit-mintleton-doyleies-spitioy-prigkipa-goyiliam'),
+            ('News article, YouTube embed', 'https://www.bovary.gr/people-and-style/glam-stars/tzoni-ntep-entyposiaki-metamorfosi-gkriza-mallia');
+        "#,
+    ),
+    (
+        11,
+        // MCR desk paging (plan P7.1): "Clear finished" takes delivered jobs
+        // off the live queue without deleting them; they stay under
+        // Completed, where they can be downloaded again.
+        r#"
+        ALTER TABLE queue ADD COLUMN cleared_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_queue_status_completed ON queue(status, completed_at);
+        "#,
+    ),
+    (
+        12,
+        // "ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ" (plan P4.33): how many of an article's
+        // videos the journalist asked for. NULL means all of them.
+        r#"
+        ALTER TABLE queue ADD COLUMN max_videos INTEGER;
+        "#,
+    ),
+    (
+        13,
+        // The MCR mail view (plan P7.6): what each mail said, so the desk can
+        // show it next to the jobs it produced. `body_text` is the readable
+        // text (never the HTML) and is cleared by the nightly retention task
+        // after `mail_text_retention_days`; the rest stays with the row.
+        //
+        // `parent_job_id`: the job whose article an article sibling (1B, 1C)
+        // or an offer MCR queued came from. Rows queued before this have it
+        // only in their notes, in the two forms the planner and the offer
+        // route write; CAST keeps the leading digits of "123: https://…".
+        r#"
+        ALTER TABLE processed_mail ADD COLUMN received_at      TEXT;
+        ALTER TABLE processed_mail ADD COLUMN from_name        TEXT;
+        ALTER TABLE processed_mail ADD COLUMN to_addrs         TEXT;
+        ALTER TABLE processed_mail ADD COLUMN cc_addrs         TEXT;
+        ALTER TABLE processed_mail ADD COLUMN body_text        TEXT;
+        ALTER TABLE processed_mail ADD COLUMN attachments_json TEXT;
+        ALTER TABLE processed_mail ADD COLUMN parse_json       TEXT;
+        CREATE INDEX IF NOT EXISTS idx_processed_mail_received ON processed_mail(received_at);
+
+        ALTER TABLE queue ADD COLUMN parent_job_id INTEGER;
+        UPDATE queue
+           SET parent_job_id = CAST(substr(notes, length('Also in the article of job #') + 1) AS INTEGER)
+         WHERE notes LIKE 'Also in the article of job #%';
+        UPDATE queue
+           SET parent_job_id = CAST(substr(notes, length('Offered from the article of job #') + 1) AS INTEGER)
+         WHERE notes LIKE 'Offered from the article of job #%';
+        UPDATE queue SET parent_job_id = NULL WHERE parent_job_id <= 0;
+        CREATE INDEX IF NOT EXISTS idx_queue_email_message ON queue(email_message_id);
+        CREATE INDEX IF NOT EXISTS idx_queue_parent        ON queue(parent_job_id);
+        "#,
+    ),
+    (
+        14,
+        // Self-check links for the routes added on 2026-10-07 (P3.8–P3.13):
+        // a news agency page whose video only its own API names, an article
+        // whose first embedded X post is photos only, and the same article
+        // with the "-ΒΙΝΤΕΟ" a sender glued on (404 as sent). Seeded once,
+        // like migration 10's: an operator's deletion sticks.
+        r#"
+        INSERT OR IGNORE INTO selfcheck_links (label, url) VALUES
+            ('News agency video page (ΑΠΕ-ΜΠΕ API)', 'https://www.amna.gr/home/videos/1028434/Proores-ekloges-stin-Ispania-stis-29-Noembriou--anakoinose-o-P-Santseth'),
+            ('News article, X embeds, first one photos only', 'https://www.news247.gr/kosmos/rosia-apo-agnosti-pnevmonia-o-thanatos-tis-erevnitrias-ti-leei-gia-tin-panoli-o-pou/'),
+            ('Link with "-ΒΙΝΤΕΟ" glued on by the sender', 'https://www.news247.gr/kosmos/rosia-apo-agnosti-pnevmonia-o-thanatos-tis-erevnitrias-ti-leei-gia-tin-panoli-o-pou/-ΒΙΝΤΕΟ');
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -400,7 +561,7 @@ mod tests {
         let v = apply(&mut conn, None).unwrap();
         assert_eq!(v, target_version());
         // The baseline tables must exist.
-        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail"] {
+        for table in ["users", "sessions", "queue", "journalists", "audit_logs", "processed_mail", "mail_checkpoints", "groups", "journalist_groups", "mail_reprocess"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
@@ -474,6 +635,54 @@ mod tests {
         apply(&mut conn, Some(&db)).unwrap();
         let after = std::fs::read_dir(tmp.path().join("backups")).unwrap().count();
         assert_eq!(after, 1, "a no-op start-up wrote another backup");
+    }
+
+    /// Article siblings and queued offers from before migration 13 learn
+    /// their parent from the notes they were written with (plan P7.6).
+    #[test]
+    fn earlier_article_siblings_get_their_parent_from_their_notes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 12) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status, notes) VALUES
+                (7,  'https://portal.gr/a', '1A_PAPADAKI_X', 'COMPLETED', 'Email: ΘΕΜΑΤΑ'),
+                (8,  'https://x.com/i/status/2', '1B_PAPADAKI_X', 'PENDING', 'Also in the article of job #7: https://portal.gr/a'),
+                (9,  'https://cdn.portal.gr/m.m3u8', '1C_PAPADAKI_X', 'PENDING', 'Offered from the article of job #7: https://portal.gr/a'),
+                (10, 'https://youtu.be/q', '2_PAPADAKI_Y', 'PENDING', NULL),
+                (11, 'https://youtu.be/r', '3_PAPADAKI_Y', 'PENDING', 'Also in the article of job #: broken');",
+        )
+        .unwrap();
+
+        apply(&mut conn, None).unwrap();
+
+        let parent = |id: i64| -> Option<i64> {
+            conn.query_row("SELECT parent_job_id FROM queue WHERE id = ?", rusqlite::params![id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(parent(8), Some(7));
+        assert_eq!(parent(9), Some(7));
+        assert_eq!(parent(7), None);
+        assert_eq!(parent(10), None);
+        assert_eq!(parent(11), None, "a note without a number must not invent parent 0");
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('processed_mail')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in ["received_at", "from_name", "to_addrs", "cc_addrs", "body_text", "attachments_json", "parse_json"] {
+            assert!(columns.iter().any(|x| x == c), "processed_mail.{c} missing: {columns:?}");
+        }
     }
 
     /// Upgrading a real v1 database: the rows survive, the UNIQUE(url)

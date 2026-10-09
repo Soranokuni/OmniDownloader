@@ -48,9 +48,10 @@ fn test_volatile_locker_intercept_and_slug_generation() {
     "#;
 
     let volatile_urls = intercept_volatile_urls(mixed_email);
-    assert_eq!(volatile_urls.len(), 3);
+    assert_eq!(volatile_urls.len(), 2);
     assert!(volatile_urls.iter().any(|u| u.contains("we.tl")));
-    assert!(volatile_urls.iter().any(|u| u.contains("amna.gr")));
+    // ΑΠΕ-ΜΠΕ is a news agency site with public video pages, not a locker.
+    assert!(!volatile_urls.iter().any(|u| u.contains("amna.gr")));
     assert!(volatile_urls.iter().any(|u| u.contains("transfernow.net")));
 
     // Test slug sanitization for manual resolver

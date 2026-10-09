@@ -29,6 +29,9 @@ pub enum ErrorCode {
     LoginRequired,
     GeoBlocked,
     PrivateOrRemoved,
+    /// The page itself does not exist (HTTP 404/410): a mistyped or decorated
+    /// link, or a deleted article. Waiting and the browser cannot help.
+    PageNotFound,
     /// A live stream, with no VOD yet.
     LiveStream,
     /// Timeouts, resets, DNS. The one class where waiting genuinely helps.
@@ -56,6 +59,39 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    /// Every code. A new variant goes here too, or `from_code` cannot read it.
+    pub const ALL: [ErrorCode; 24] = [
+        Self::UnsupportedUrl,
+        Self::Http403,
+        Self::LoginRequired,
+        Self::GeoBlocked,
+        Self::PrivateOrRemoved,
+        Self::PageNotFound,
+        Self::LiveStream,
+        Self::Network,
+        Self::NoStreamFound,
+        Self::ProbeFailed,
+        Self::TranscodeFailed,
+        Self::RewrapFailed,
+        Self::ComplianceFailed,
+        Self::DeliveryFailed,
+        Self::LowDisk,
+        Self::SourceTooLong,
+        Self::ExtractTimeout,
+        Self::DownloadTimeout,
+        Self::TranscodeTimeout,
+        Self::RewrapTimeout,
+        Self::DeliverTimeout,
+        Self::LeaseExpired,
+        Self::ManualDownload,
+        Self::PipelineFailed,
+    ];
+
+    /// The code stored on a job, back as a code.
+    pub fn from_code(code: &str) -> Option<ErrorCode> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == code.trim())
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::UnsupportedUrl => "UNSUPPORTED_URL",
@@ -63,6 +99,7 @@ impl ErrorCode {
             Self::LoginRequired => "LOGIN_REQUIRED",
             Self::GeoBlocked => "GEO_BLOCKED",
             Self::PrivateOrRemoved => "PRIVATE_OR_REMOVED",
+            Self::PageNotFound => "PAGE_NOT_FOUND",
             Self::LiveStream => "LIVE_STREAM",
             Self::Network => "NETWORK",
             Self::NoStreamFound => "NO_STREAM_FOUND",
@@ -93,6 +130,11 @@ impl ErrorCode {
         matches!(
             self,
             Self::Network
+                // A bare 403 is a CDN or platform refusing for now: YouTube
+                // turned two videos away for a few minutes on 2026-10-06
+                // that downloaded fine minutes later. Geo blocks and logins
+                // have codes of their own and are not retried.
+                | Self::Http403
                 | Self::DeliveryFailed
                 | Self::LowDisk
                 | Self::DownloadTimeout
@@ -121,27 +163,28 @@ impl ErrorCode {
     pub fn hint_el(&self) -> &'static str {
         match self {
             Self::UnsupportedUrl => "Δεν αναγνωρίζεται η σελίδα. Δοκιμάστε απευθείας σύνδεσμο βίντεο.",
-            Self::Http403 => "Η πηγή μπλοκάρει την απευθείας λήψη. Δοκιμάστε ξανά ή δώστε άλλο σύνδεσμο.",
-            Self::LoginRequired => "Απαιτείται σύνδεση. Ανεβάστε cookies για αυτόν τον ιστότοπο (Διαχείριση → Cookies).",
+            Self::Http403 => "Η πηγή αρνήθηκε τη λήψη. Έγιναν αυτόματες επαναλήψεις χωρίς επιτυχία· πατήστε «Δοκιμή ξανά» αργότερα ή δώστε άλλο σύνδεσμο.",
+            Self::LoginRequired => "Ο ιστότοπος ζητά σύνδεση (login) για αυτό το βίντεο. Επικολλήστε άλλον σύνδεσμο για το ίδιο βίντεο· αν συμβαίνει συχνά με αυτόν τον ιστότοπο, ζητήστε από τον διαχειριστή να προσθέσει cookies.",
             Self::GeoBlocked => "Το βίντεο δεν είναι διαθέσιμο από την Ελλάδα.",
             Self::PrivateOrRemoved => "Το βίντεο είναι ιδιωτικό ή έχει αφαιρεθεί. Ζητήστε άλλον σύνδεσμο.",
+            Self::PageNotFound => "Η σελίδα δεν υπάρχει (404). Ελέγξτε τον σύνδεσμο: συχνά έχει κολλήσει μια λέξη στο τέλος του (π.χ. «-ΒΙΝΤΕΟ»). Διορθώστε τον ή ζητήστε τον σωστό.",
             Self::LiveStream => "Ζωντανή μετάδοση. Περιμένετε να γίνει διαθέσιμη η εγγραφή.",
             Self::Network => "Πρόβλημα δικτύου. Γίνεται αυτόματη επανάληψη.",
-            Self::NoStreamFound => "Δεν βρέθηκε βίντεο στη σελίδα. Επικολλήστε τον σύνδεσμο ροής από το πρόγραμμα περιήγησης.",
+            Self::NoStreamFound => "Δεν βρέθηκε βίντεο στη σελίδα. Ανοίξτε τον σύνδεσμο: αν δεν έχει βίντεο, πατήστε «Αφαίρεση»· αν έχει, επικολλήστε παρακάτω τον σύνδεσμο της ανάρτησης με το βίντεο (YouTube, Instagram, Facebook…).",
             Self::ProbeFailed => "Το αρχείο που κατέβηκε δεν διαβάζεται. Πιθανώς ατελής λήψη.",
-            Self::TranscodeFailed => "Απέτυχε η μετατροπή. Δείτε το σφάλμα στις λεπτομέρειες.",
-            Self::RewrapFailed => "Απέτυχε η ενθυλάκωση σε MXF.",
+            Self::TranscodeFailed => "Απέτυχε η μετατροπή. Δείτε την «Αιτία» και το «Ιστορικό» σε αυτή την κάρτα· αν επαναλαμβάνεται, ενημερώστε τον διαχειριστή.",
+            Self::RewrapFailed => "Απέτυχε η ενθυλάκωση σε MXF. Πατήστε «Δοκιμή ξανά»· αν επαναλαμβάνεται, ενημερώστε τον διαχειριστή.",
             Self::ComplianceFailed => "Το αρχείο δεν πληροί τις προδιαγραφές εκπομπής και ΔΕΝ παραδόθηκε.",
             Self::DeliveryFailed => "Απέτυχε η παράδοση στον φάκελο του Dalet. Ελέγξτε το δίκτυο και τα δικαιώματα.",
-            Self::LowDisk => "Ανεπαρκής χώρος στον δίσκο.",
+            Self::LowDisk => "Ανεπαρκής χώρος στον δίσκο. Ενημερώστε τον διαχειριστή.",
             Self::SourceTooLong => "Το βίντεο υπερβαίνει το επιτρεπτό όριο διάρκειας.",
             Self::ExtractTimeout | Self::DownloadTimeout => "Λήξη χρόνου κατά τη λήψη.",
             Self::TranscodeTimeout => "Λήξη χρόνου κατά τη μετατροπή.",
             Self::RewrapTimeout => "Λήξη χρόνου κατά την ενθυλάκωση.",
             Self::DeliverTimeout => "Λήξη χρόνου κατά την παράδοση.",
             Self::LeaseExpired => "Η εργασία διακόπηκε και δεν ολοκληρώθηκε μετά από επανειλημμένες προσπάθειες.",
-            Self::ManualDownload => "Σύνδεσμος μεταφοράς αρχείων. Κατεβάστε το αρχείο και ανεβάστε το εδώ.",
-            Self::PipelineFailed => "Απρόβλεπτο σφάλμα. Δείτε τις λεπτομέρειες της εργασίας.",
+            Self::ManualDownload => "Σύνδεσμος μεταφοράς αρχείων (WeTransfer κ.λπ.). Κατεβάστε το αρχείο από τον σύνδεσμο, βάλτε το στο Dalet και πατήστε «Το έβαλα στο Dalet».",
+            Self::PipelineFailed => "Απρόβλεπτο σφάλμα. Δείτε την «Αιτία» και το «Ιστορικό» σε αυτή την κάρτα, και δοκιμάστε ξανά ή δώστε άλλον σύνδεσμο.",
         }
     }
 
@@ -158,7 +201,21 @@ impl ErrorCode {
     /// yt-dlp's extractor knows which video belongs to the post; the page does
     /// not. An X reply without a video of its own plays the thread parent's,
     /// and sniffing it delivered someone else's video under the reply's name.
+    ///
+    /// YouTube: never. Its page holds sign-in and recommendation links, not
+    /// a stream the browser can see, and sniffing it after a 403 on
+    /// 2026-10-06 "found" a video id read out of a `/ServiceLogin` link,
+    /// which then failed under a misleading error.
     pub fn should_sniff(&self, url: &str) -> bool {
+        // A page that does not exist has no player to find.
+        if *self == Self::PageNotFound || crate::downloader::is_youtube(url) {
+            return false;
+        }
+        // yt-dlp's extractor read the post and found no video in it; the
+        // post's page would only offer the browser someone else's.
+        if *self == Self::NoStreamFound && crate::downloader::is_video_platform(url) {
+            return false;
+        }
         !crate::downloader::is_video_platform(url) || self.should_try_sniffer()
     }
 }
@@ -189,8 +246,11 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     {
         return ErrorCode::GeoBlocked;
     }
+    // YouTube says "Video unavailable. …" for a removed video and "This video
+    // is unavailable" for an id it does not know (a mistyped link).
     if s.contains("private video")
         || s.contains("video unavailable")
+        || s.contains("this video is unavailable")
         || s.contains("has been removed")
         || s.contains("account associated with this video has been terminated")
         || s.contains("this video is no longer available")
@@ -217,6 +277,16 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     }
     if s.contains("http error 403") || s.contains("403 forbidden") {
         return ErrorCode::Http403;
+    }
+    // A post with photos, or text only: yt-dlp's extractor read the post and
+    // it has no video. Not unexpected, and not something to sniff for.
+    if s.contains("no video could be found in this tweet") || s.contains("there's no video in this post") {
+        return ErrorCode::NoStreamFound;
+    }
+    // The page, not a media segment: "Unable to download webpage: HTTP Error
+    // 404". A 404 on video data can be an expired signed URL and is not this.
+    if s.contains("unable to download webpage: http error 404") || s.contains("unable to download webpage: http error 410") {
+        return ErrorCode::PageNotFound;
     }
     if s.contains("unsupported url") || s.contains("no suitable extractor") {
         return ErrorCode::UnsupportedUrl;
@@ -288,6 +358,16 @@ mod tests {
                 ErrorCode::UnsupportedUrl,
             ),
             (
+                // Verbatim (job 82, 2026-10-07): a link with "-ΒΙΝΤΕΟ" glued on.
+                "ERROR: [generic] -ΒΙΝΤΕΟ: Unable to download webpage: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)",
+                ErrorCode::PageNotFound,
+            ),
+            (
+                // A media segment, not the page: not a dead link.
+                "ERROR: unable to download video data: HTTP Error 404: Not Found",
+                ErrorCode::PipelineFailed,
+            ),
+            (
                 "ERROR: unable to download video data: <urlopen error [Errno 110] Connection timed out>",
                 ErrorCode::Network,
             ),
@@ -302,9 +382,11 @@ mod tests {
                 ErrorCode::Network,
             ),
             (
-                // A reply that has no video: final, not a sniffer case.
+                // A reply that has no video: final (not retried), and not a
+                // sniffer case either (`should_sniff` refuses NO_STREAM_FOUND
+                // on a platform post). It used to read "unexpected error".
                 "ERROR: [twitter] 1900000000000000011: No video could be found in this tweet",
-                ErrorCode::PipelineFailed,
+                ErrorCode::NoStreamFound,
             ),
             (
                 "ERROR: [generic] Requested format is not available",
@@ -333,9 +415,27 @@ mod tests {
     }
 
     #[test]
+    fn a_mistyped_youtube_id_asks_for_another_link() {
+        // yt-dlp's other wording, for an id YouTube does not know. Verbatim
+        // from the dev instance, 2026-10-07: it fell through to
+        // PIPELINE_FAILED, and the card said «Απρόβλεπτο σφάλμα» instead of
+        // asking for another link.
+        let code = classify_download_error("ERROR: [youtube] zzzzzzzzzz0: This video is unavailable");
+        assert_eq!(code, ErrorCode::PrivateOrRemoved);
+        assert!(!code.is_retryable());
+        // Not verbatim: the same words with a geo reason stay a geo block,
+        // which is why the geo phrases are matched first.
+        assert_eq!(
+            classify_download_error("ERROR: [youtube] zzzzzzzzzz0: This video is unavailable in your country"),
+            ErrorCode::GeoBlocked
+        );
+    }
+
+    #[test]
     fn only_genuinely_transient_failures_are_retried() {
         for retryable in [
             ErrorCode::Network,
+            ErrorCode::Http403,
             ErrorCode::DeliveryFailed,
             ErrorCode::LowDisk,
             ErrorCode::DownloadTimeout,
@@ -392,9 +492,19 @@ mod tests {
         // yt-dlp said the reply has no video. Its page plays the thread
         // parent's video, and that must not be delivered under this job.
         assert!(!ErrorCode::PipelineFailed.should_sniff(reply));
+        // Now classified as such ("No video could be found in this tweet").
+        assert!(!ErrorCode::NoStreamFound.should_sniff(reply));
+        // A page that does not exist has no player either (P3.10).
+        assert!(!ErrorCode::PageNotFound.should_sniff(article));
         // Transient: retried, not sniffed.
         assert!(!ErrorCode::Network.should_sniff(reply));
         assert!(ErrorCode::Http403.should_sniff(reply));
+        // YouTube's own extractor is the only way to its video.
+        for yt in ["https://www.youtube.com/watch?v=Eksg5qHdZho&t=89s", "https://youtu.be/l0lr6MGpMu4"] {
+            for code in [ErrorCode::Http403, ErrorCode::UnsupportedUrl, ErrorCode::PipelineFailed] {
+                assert!(!code.should_sniff(yt), "{code} sniffed {yt}");
+            }
+        }
         // An article is sniffed whatever yt-dlp said.
         assert!(ErrorCode::PipelineFailed.should_sniff(article));
         assert!(ErrorCode::UnsupportedUrl.should_sniff(article));
@@ -439,5 +549,18 @@ mod tests {
         assert_eq!(ErrorCode::ComplianceFailed.as_str(), "COMPLIANCE_FAILED");
         assert_eq!(ErrorCode::NoStreamFound.as_str(), "NO_STREAM_FOUND");
         assert_eq!(ErrorCode::ManualDownload.as_str(), "MANUAL_DOWNLOAD");
+    }
+
+    /// The MCR desk shows a stored code's Greek hint (plan P7.1); every code
+    /// must read back, each once.
+    #[test]
+    fn every_stored_code_reads_back() {
+        let mut seen = std::collections::HashSet::new();
+        for c in ErrorCode::ALL {
+            assert!(seen.insert(c.as_str()), "{} listed twice", c.as_str());
+            assert_eq!(ErrorCode::from_code(c.as_str()), Some(c));
+            assert!(!c.hint_el().is_empty());
+        }
+        assert_eq!(ErrorCode::from_code("NOT_A_CODE"), None);
     }
 }

@@ -1,11 +1,16 @@
 pub mod assist;
 pub mod decontaminate;
+pub mod eml;
 pub mod graph;
-pub mod imap_source;
+pub mod groups;
+pub mod inbox;
 pub mod interceptor;
+pub mod link_titles;
 pub mod llm;
 pub mod mail;
+pub mod mail_view;
 pub mod parser;
+pub mod preview;
 pub mod source;
 pub mod watcher;
 

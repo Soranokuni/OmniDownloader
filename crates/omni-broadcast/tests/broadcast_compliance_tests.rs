@@ -217,6 +217,23 @@ fn a_progressive_source_is_doubled_to_50_before_it_is_interlaced() {
 }
 
 #[test]
+fn frames_are_scaled_at_the_lower_of_the_source_rate_and_50() {
+    // P1.12: scaling after `fps=50` scaled every 25p frame twice. Scale,
+    // pad and format are per-frame and `fps` only picks frames, so moving
+    // the scaler is invisible in the output (framemd5-identical) and halves
+    // its work for the commonest web source.
+    for fps in [23.976, 25.0, 30.0, 50.0] {
+        let (chain, _) = build_video_chain(&video(1280, 720, fps, ScanType::Progressive));
+        assert!(
+            chain.find("scale=") < chain.find("fps=50"),
+            "a {fps} fps source must be scaled before it is doubled to 50: {chain}"
+        );
+    }
+    let (chain, _) = build_video_chain(&video(1920, 1080, 60.0, ScanType::Progressive));
+    assert!(chain.find("fps=50") < chain.find("scale="), "a 60p source comes down to 50 first: {chain}");
+}
+
+#[test]
 fn an_interlaced_25_tff_source_passes_its_fields_through_untouched() {
     // This is already the target scan. Deinterlacing and re-interlacing costs a
     // generation of vertical detail, and re-weaving already-woven fields tears
@@ -313,11 +330,11 @@ fn every_branch_still_ends_at_the_full_raster_in_4_2_2() {
                 chain.contains("pad=1920:1080"),
                 "branch {branch} does not pad: {chain}"
             );
-            assert!(
-                chain.ends_with("format=yuv422p")
-                    || chain.contains("format=yuv422p,tinterlace"),
-                "branch {branch} does not reach 4:2:2: {chain}"
-            );
+            let format_at = chain.find("format=yuv422p");
+            assert!(format_at.is_some(), "branch {branch} does not reach 4:2:2: {chain}");
+            if let Some(weave_at) = chain.find("tinterlace") {
+                assert!(format_at < Some(weave_at), "branch {branch} weaves before reaching 4:2:2: {chain}");
+            }
         }
     }
 }

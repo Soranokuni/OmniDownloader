@@ -47,7 +47,13 @@ impl WebServer {
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))
             .route("/api/jobs/:id", get(api_get_job))
             .route("/api/jobs/:id/override", post(api_override_job))
+            .route("/api/jobs/:id/rename", post(api_rename_job))
             .route("/api/jobs/:id/retry", post(api_retry_job))
+            .route("/api/jobs/:id/redownload", post(api_redownload_job))
+            .route("/api/jobs/:id/mark-done", post(api_mark_done_job))
+            .route("/api/jobs/:id/cancel", post(api_cancel_job))
+            .route("/api/jobs/clear-finished", post(api_clear_finished))
+            .route("/api/jobs/review/hide-old", post(api_hide_old_review))
             .route("/api/jobs/:id/offers/queue", post(api_queue_offer))
             .route("/api/jobs/:id/discard", post(api_discard_job))
             .route(
@@ -55,8 +61,17 @@ impl WebServer {
                 get(api_get_journalists).post(api_save_journalist),
             )
             .route("/api/journalists/:surname", post(api_delete_journalist))
+            .route("/api/groups", get(api_get_groups).post(api_save_group))
+            .route("/api/groups/:code", post(api_delete_group))
+            .route("/api/journalists/:surname/groups", post(api_set_journalist_groups))
             .route("/api/system/status", get(api_system_status))
             .route("/api/events", get(api_events))
+            // The mail view (plan P7.8).
+            .route("/api/mails", get(api_get_mails))
+            .route("/api/mails/settled", get(api_get_mail_settlements))
+            .route("/api/mails/view", get(api_get_mail_view))
+            .route("/api/mails/queue-link", post(api_mail_queue_link))
+            .route("/api/mails/reprocess", post(api_mail_reprocess))
             // ---- Admin ----
             .route("/admin", get(view_admin))
             .route(
@@ -64,17 +79,35 @@ impl WebServer {
                 get(api_admin_list_users).post(api_admin_create_user),
             )
             .route("/api/admin/users/:id/password", post(api_admin_update_password))
+            .route("/api/admin/users/:id/active", post(api_admin_set_user_active))
             .route("/api/admin/purge", post(api_admin_purge))
             .route("/api/admin/vacuum", post(api_admin_vacuum))
             .route("/api/admin/dependencies", get(api_admin_dependencies))
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))
             .route("/api/admin/rollback-ytdl", post(api_admin_rollback_ytdl))
             .route("/api/admin/maintenance", get(api_admin_maintenance))
+            .route(
+                "/api/admin/taxonomy",
+                get(api_admin_export_taxonomy).post(api_admin_import_taxonomy),
+            )
+            .route(
+                "/api/admin/taxonomy/backups",
+                get(api_admin_taxonomy_backups).post(api_admin_taxonomy_backup_now),
+            )
+            .route("/api/admin/taxonomy/backups/:name", get(api_admin_taxonomy_backup_get))
+            .route("/api/admin/taxonomy/backups/:name/restore", post(api_admin_taxonomy_backup_restore))
             .route("/api/admin/maintenance/:name/run", post(api_admin_run_task))
+            .route("/api/admin/selfcheck", get(api_admin_selfcheck))
+            .route("/api/admin/selfcheck/links", post(api_admin_selfcheck_add))
+            .route("/api/admin/selfcheck/links/:id/delete", post(api_admin_selfcheck_delete))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))
-            .route("/api/system/test-llm", post(api_test_llm))
+            .route("/api/admin/llm", get(api_admin_get_llm).post(api_admin_save_llm))
+            .route("/api/admin/llm/test", post(api_admin_test_llm))
+            .route("/api/admin/llm/models", post(api_admin_llm_models))
+            .route("/api/admin/mail", get(api_admin_mail_history))
+            .route("/api/admin/mail/reprocess", post(api_admin_mail_reprocess))
             // ---- Static assets (public; they contain no data) ----
             .route("/static/*file", get(serve_static))
             .layer(axum::middleware::from_fn(csrf_guard))

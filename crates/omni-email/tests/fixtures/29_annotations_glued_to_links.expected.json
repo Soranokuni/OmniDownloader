@@ -1,0 +1,91 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.9,
+          "index_str": "1A",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.amna.gr/home/videos/2900001/Fixture-ekloges-sto-exoteriko"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture2902"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1C",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture2903"
+        },
+        {
+          "confidence": 0.8,
+          "index_str": "1D",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.news247.gr/kosmos/fixture2904-synagermos-se-ergastirio/"
+        },
+        {
+          "confidence": 0.9,
+          "index_str": "1E",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.news247.gr/kosmos/fixture2905-ti-leei-o-pou/"
+        },
+        {
+          "confidence": 0.8,
+          "index_str": "1F",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.iefimerida.gr/kosmos/fixture2906-sismos"
+        },
+        {
+          "confidence": 0.8,
+          "index_str": "1G",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.protothema.gr/world/fixture2907-to-viral-binteo/"
+        },
+        {
+          "confidence": 0.9,
+          "index_str": "1H",
+          "keyword": "YLIKODIETHNI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.star.gr/tv/fixture2908-VIDEO"
+        }
+      ],
+      "keyword": "YLIKODIETHNI",
+      "title": "ΥΛΙΚΟ ΓΙΑ ΠΛΑΝΑ ΔΙΕΘΝΗ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

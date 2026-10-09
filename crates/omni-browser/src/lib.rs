@@ -1,6 +1,8 @@
 pub mod adblock;
 pub mod agent;
 pub mod browser;
+pub mod glomex;
+pub mod pages;
 pub mod sniffer;
 
 pub use adblock::{AdBlockStats, UnifiedAdBlocker};

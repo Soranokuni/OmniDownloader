@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "code": "NEWS",
+      "name": "Κεντρικό Δελτίο Ειδήσεων",
+      "kind": "news",
+      "keywords": ["ΔΕΛΤΙΟ", "ΚΕΝΤΡΙΚΟ ΔΕΛΤΙΟ", "ΕΙΔΗΣΕΙΣ"],
+      "description": "Ρεπορτάζ και πλάνα για τα δελτία ειδήσεων της ημέρας."
+    },
+    {
+      "code": "MORNING",
+      "name": "Πρωινή εκπομπή",
+      "kind": "show",
+      "keywords": ["ΠΡΩΙΝΗ", "ΠΡΩΙΝΗ ΕΚΠΟΜΠΗ"],
+      "description": "Πρωινή ενημερωτική εκπομπή: συνεντεύξεις, θέματα πόλης, καιρός."
+    },
+    {
+      "code": "SPORTS",
+      "name": "Αθλητικό τμήμα",
+      "kind": "desk",
+      "keywords": ["ΑΘΛΗΤΙΚΑ", "ΑΘΛΗΤΙΚΟ"],
+      "description": "Αγώνες, στιγμιότυπα και δηλώσεις για το αθλητικό δελτίο."
+    }
+  ],
+  "people": [
+    {
+      "surname": "PAPADAKI",
+      "full_name": "Maria Papadaki",
+      "emails": ["m.papadaki@example.gr"],
+      "aliases": ["ΠΑΠΑΔΑΚΗ", "ΜΑΡΙΑ", "ΜΑΡΙΑΣ"],
+      "default_priority": 0,
+      "groups": ["NEWS", "MORNING"]
+    },
+    {
+      "surname": "NIKOLAOU",
+      "full_name": "Giorgos Nikolaou",
+      "emails": ["g.nikolaou@example.gr"],
+      "aliases": ["ΝΙΚΟΛΑΟΥ", "ΓΙΩΡΓΟΣ"],
+      "default_priority": 0,
+      "groups": ["SPORTS"]
+    }
+  ]
+}

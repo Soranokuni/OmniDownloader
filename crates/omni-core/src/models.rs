@@ -198,8 +198,22 @@ pub struct Job {
     /// `{"download_ms": .., "transcode_ms": ..}` for the benchmarks.
     pub stage_timings_json: Option<String>,
     pub email_message_id: Option<String>,
+    /// The group the job was queued for (plan P4.18); a label only.
+    #[serde(default)]
+    pub group_code: Option<String>,
+    /// Only the first N videos of the article (plan P4.33); `None` is all.
+    #[serde(default)]
+    pub max_videos: Option<i64>,
+    /// The job whose article this video was found in: set on article
+    /// siblings (1B, 1C) and on offers MCR queued (plan P7.6).
+    #[serde(default)]
+    pub parent_job_id: Option<i64>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// When the desk took the job off a list (plan P7.1 live queue, P7.21
+    /// review tab). `None`: shown.
+    #[serde(default)]
+    pub cleared_at: Option<DateTime<Utc>>,
 
     /// Stored timestamp, `None` when the row predates real timestamps or the
     /// value is unreadable. Never substituted with "now" (defect D-11): the MCR
@@ -261,15 +275,83 @@ pub struct Journalist {
     /// Compared accent- and case-insensitively, in ELOT 743 Latin.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Group codes this person belongs to (plan P4.17); the first is their
+    /// default group.
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Which list of the MCR desk (plan P7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobsView {
+    /// Waiting and working, then delivered ones nobody has cleared yet.
+    Live,
+    /// Needs a person: review, file-locker downloads, failures.
+    Review,
+    /// Every delivered job, cleared or not, newest first.
+    Completed,
+}
+
+/// Filters for a page of jobs; empty strings mean "any".
+#[derive(Debug, Clone, Default)]
+pub struct JobsFilter {
+    /// Matched against slug, link, keyword and journalist.
+    pub search: String,
+    pub journalist: String,
+    /// A group code, or "-" for jobs without a group.
+    pub group: String,
+    /// Review view only: also list the jobs the desk tidied away (P7.21).
+    pub include_hidden: bool,
+}
+
+/// One page of a job list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobPage {
+    pub jobs: Vec<Job>,
+    pub total: i64,
+    pub page: i64,
+    pub per_page: i64,
+}
+
+/// How many jobs each MCR tab holds, for the tab badges.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobCounts {
+    /// Waiting or being worked on.
+    pub active: i64,
+    /// Delivered and still shown on the live queue.
+    pub finished: i64,
+    /// Waiting for a person and not tidied away.
+    pub review: i64,
+    /// Every delivery ever.
+    pub completed: i64,
+    /// Review-status jobs the desk hid (P7.21); not in `review`.
+    pub review_hidden: i64,
+    /// Delivered since local midnight on the server (P7.21).
+    pub completed_today: i64,
+}
+
+/// What the `queue` health check looks at (plan P7.19).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueWatch {
+    /// PENDING jobs `lease_job` could take now (not in back-off).
+    pub waiting: i64,
+    pub running: i64,
+    /// How long the oldest ready PENDING job has waited.
+    pub oldest_ready_wait_secs: Option<i64>,
+    /// The RUNNING job with the oldest `stage_started_at`: (job id, stage, secs).
+    pub longest_step: Option<(i64, String, i64)>,
 }
 
 /// Queue depth, for the status panel (plan P6.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueSummary {
     pub pending: i64,
-    /// Anything currently being worked on, whatever stage it is in.
+    /// Jobs a worker holds, whatever stage they are in.
     pub running: i64,
+    /// Cancelled by MCR; neither waiting nor working.
+    pub cancelled: i64,
     pub review: i64,
     pub manual: i64,
     pub completed: i64,
@@ -393,7 +475,28 @@ impl Enqueued {
     }
 }
 
+/// A link the nightly self-check tries (plan P6.7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfcheckLink {
+    pub id: i64,
+    /// What it stands for, for a person: "Instagram reel".
+    pub label: String,
+    pub url: String,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    /// `None` until first checked.
+    pub last_ok: Option<bool>,
+    /// The video found, or why none was.
+    pub last_detail: Option<String>,
+    pub last_ok_at: Option<DateTime<Utc>>,
+    /// Set when it started failing; cleared when it works again.
+    pub failing_since: Option<DateTime<Utc>>,
+}
+
 /// One row of `processed_mail` (plan P4.2, defect E-07).
+///
+/// The fields after `jobs_json` are what the MCR mail view shows (plan
+/// P7.6). They are empty for mail handled before that, and `body_text` is
+/// cleared again after `mail_text_retention_days`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessedMail {
     /// RFC 5322 Message-ID, or `source:{provider id}` when a message has none.
@@ -407,6 +510,82 @@ pub struct ProcessedMail {
     pub subject: Option<String>,
     /// What the message produced, as the email crate records it.
     pub jobs_json: String,
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
+    /// The sender's display name.
+    #[serde(default)]
+    pub from_name: Option<String>,
+    #[serde(default)]
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// The readable text the parser read (the text part, or the HTML reduced
+    /// to text), before any cleanup. Never the HTML itself.
+    #[serde(default)]
+    pub body_text: Option<String>,
+    /// The attachments' metadata, as the email crate records it.
+    #[serde(default)]
+    pub attachments_json: Option<String>,
+    /// What the parser decided (journalist, group, warnings, sections), as
+    /// the email crate records it.
+    #[serde(default)]
+    pub parse_json: Option<String>,
+}
+
+impl Default for ProcessedMail {
+    fn default() -> Self {
+        Self {
+            internet_message_id: String::new(),
+            source_id: None,
+            processed_at: None,
+            outcome: String::new(),
+            from_address: None,
+            subject: None,
+            jobs_json: "[]".into(),
+            received_at: None,
+            from_name: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            body_text: None,
+            attachments_json: None,
+            parse_json: None,
+        }
+    }
+}
+
+/// One handled mail as the MCR mail view's list needs it (plan P7.7).
+#[derive(Debug, Clone, Default)]
+pub struct InboxMailRow {
+    pub internet_message_id: String,
+    pub received_at: Option<DateTime<Utc>>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub outcome: String,
+    pub from_address: Option<String>,
+    pub from_name: Option<String>,
+    pub subject: Option<String>,
+    /// The start of the stored text, for the one-line preview.
+    pub body_head: Option<String>,
+    pub attachments_json: Option<String>,
+    pub parse_json: Option<String>,
+    pub jobs_json: String,
+}
+
+/// One job as the MCR mail view's list needs it (plan P7.7).
+#[derive(Debug, Clone, Default)]
+pub struct InboxJobRow {
+    pub id: i64,
+    pub url: String,
+    pub slug: String,
+    pub journalist: String,
+    pub index_str: String,
+    pub status: String,
+    pub stage: String,
+    pub progress: f64,
+    pub email_message_id: Option<String>,
+    pub parent_job_id: Option<i64>,
+    pub submitted_by_user_id: Option<i64>,
+    pub group_code: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// A job to be queued (plan P1.1).
@@ -424,6 +603,13 @@ pub struct NewJob {
     pub email_source: Option<String>,
     pub email_message_id: Option<String>,
     pub extraction_method: Option<String>,
+    /// Group label (plan P4.18).
+    pub group_code: Option<String>,
+    /// The journalist asked for only the first N videos of the article
+    /// (plan P4.33); `None` is all of them.
+    pub max_videos: Option<i64>,
+    /// The job whose article this video was found in (plan P7.6).
+    pub parent_job_id: Option<i64>,
 }
 
 impl NewJob {
@@ -442,6 +628,9 @@ impl NewJob {
             email_source: None,
             email_message_id: None,
             extraction_method: None,
+            group_code: None,
+            max_videos: None,
+            parent_job_id: None,
         }
     }
 }

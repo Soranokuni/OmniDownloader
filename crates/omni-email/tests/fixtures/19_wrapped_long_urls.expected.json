@@ -1,0 +1,76 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "sender",
+    "surname": "DIMITRIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "PYRKAGIARETHYMNO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/watch/?v=fixture1901&ref=sharing&mibextid=fixture19sharingtoken"
+        }
+      ],
+      "keyword": "PYRKAGIARETHYMNO",
+      "title": "ΠΥΡΚΑΓΙΑ ΣΤΟ ΡΕΘΥΜΝΟ"
+    },
+    {
+      "index_str": "2",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "2",
+          "keyword": "ANAKOINOSIPERIFEREIA",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture1902abcdefghijklmnopqrstu"
+        }
+      ],
+      "keyword": "ANAKOINOSIPERIFEREIA",
+      "title": "ΑΝΑΚΟΙΝΩΣΗ ΠΕΡΙΦΕΡΕΙΑΣ"
+    },
+    {
+      "index_str": "3",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "3",
+          "keyword": "KAIROS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture1903"
+        }
+      ],
+      "keyword": "KAIROS",
+      "title": "ΚΑΙΡΟΣ"
+    },
+    {
+      "index_str": "4",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "4",
+          "keyword": "WEATHER",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://youtu.be/fixture1904"
+        }
+      ],
+      "keyword": "WEATHER",
+      "title": "Weather"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

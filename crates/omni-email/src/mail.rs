@@ -1,6 +1,6 @@
 //! The provider-neutral shape of one inbound email (plan P4.1).
 //!
-//! Graph and IMAP both reduce a message to [`InboundMail`]; the parser only
+//! Every mail source reduces a message to [`InboundMail`]; the parser only
 //! ever sees this type, which is what lets it be tested offline from `.eml`
 //! fixtures.
 
@@ -24,7 +24,7 @@ pub struct AttachmentMeta {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InboundMail {
-    /// Provider id used to mark / move / reply (Graph message id, IMAP UID).
+    /// Provider id used to mark / move / reply (the Graph message id).
     pub id: String,
     /// RFC 5322 `Message-ID`, the idempotency key (E-07). Kept with its angle
     /// brackets exactly as the header carried them.
@@ -51,7 +51,7 @@ impl InboundMail {
         self.body_html.as_deref().map(html_to_text).unwrap_or_default()
     }
 
-    /// Read a raw RFC 822 message (IMAP `RFC822` fetch, or an `.eml` file).
+    /// Read a raw RFC 822 message (an `.eml` file or a fixture).
     pub fn from_rfc822(id: &str, raw: &[u8]) -> Result<Self> {
         let parsed = parse_mail(raw).context("Failed parsing RFC822 MIME message")?;
         let headers = parsed.get_headers();
@@ -197,8 +197,57 @@ static RE_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>(.*?)</a\s*>"#).unwrap()
 });
 static RE_BREAKS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6]|table|blockquote|pre)\s*>|<(p|div|li|tr|h[1-6])\b[^>]*>").unwrap()
+    Regex::new(r"(?i)<br\s*/?>|<hr\b[^>]*>|</(p|div|li|tr|h[1-6]|table|blockquote|pre)\s*>|<(p|div|li|tr|h[1-6]|blockquote)\b[^>]*>").unwrap()
 });
+/// Table cells sit side by side: a space, or two cells' words run together.
+static RE_CELLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)</t[dh]\s*>").unwrap());
+/// Anchor text that is itself an address, often shortened by the client
+/// (`youtube.com/watch?v=ab…`): the href replaces it, or the parser would see
+/// a second, broken link.
+static RE_DISPLAY_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(https?://|www\.)?[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?[…]?$").unwrap());
+static RE_LIST_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(/?)(ol|ul|li)\b([^>]*)>").unwrap());
+static RE_OL_START: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bstart\s*=\s*["']?(\d{1,4})"#).unwrap());
+
+/// Write the numbers of `<ol>` items into the text, as a mail client shows
+/// them, honouring `start="5"`. Outlook sends a numbered story list as
+/// `<ol>`; without the numbers every item fell into one section and lost
+/// the index the journalist gave it (and the numbering restarts the plain
+/// text part shows after an interruption, "1. 2. 3. 4. … 1. 2. 3.", are not
+/// there in the HTML).
+fn number_ordered_lists(html: &str) -> String {
+    // (ordered, next number) per open list.
+    let mut stack: Vec<(bool, u32)> = Vec::new();
+    let mut out = String::with_capacity(html.len());
+    let mut last = 0;
+    for c in RE_LIST_TAGS.captures_iter(html) {
+        let m = c.get(0).unwrap();
+        out.push_str(&html[last..m.end()]);
+        last = m.end();
+        let closing = !c[1].is_empty();
+        match (c[2].to_ascii_lowercase().as_str(), closing) {
+            ("ol", false) => {
+                let start = RE_OL_START.captures(&c[3]).and_then(|s| s[1].parse().ok()).unwrap_or(1);
+                stack.push((true, start));
+            }
+            ("ul", false) => stack.push((false, 0)),
+            ("ol" | "ul", true) => {
+                stack.pop();
+            }
+            ("li", false) => {
+                if let Some((true, n)) = stack.last_mut() {
+                    out.push_str(&format!("{n}. "));
+                    *n += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
 static RE_TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").unwrap());
 static RE_ENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z]{2,8});").unwrap());
@@ -217,12 +266,17 @@ pub fn html_to_text(html: &str) -> String {
         let inner = c.get(3).map(|m| m.as_str()).unwrap_or("");
         let inner_text = decode_entities(&RE_TAGS.replace_all(inner, ""));
         let is_web = href.starts_with("http://") || href.starts_with("https://");
-        if is_web && !inner_text.contains(href.as_str()) {
-            format!("{} {}", inner_text.trim(), href)
-        } else {
+        let inner_trimmed = inner_text.trim();
+        if !is_web || inner_text.contains(href.as_str()) {
             inner_text
+        } else if RE_DISPLAY_URL.is_match(inner_trimmed) {
+            href
+        } else {
+            format!("{inner_trimmed} {href}")
         }
     });
+    let s = number_ordered_lists(&s);
+    let s = RE_CELLS.replace_all(&s, " ");
     let s = RE_BREAKS.replace_all(&s, "\n");
     let s = RE_TAGS.replace_all(&s, "");
     let s = decode_entities(&s);
@@ -271,6 +325,35 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outlook on the web, 2026-10-05: a story list in two `<ol>`s around an
+    /// unnumbered paragraph, the second continuing at 5.
+    #[test]
+    fn ordered_list_items_keep_their_numbers() {
+        let html = r#"<ol start="1" data-x="{&quot;a&quot;:1}"><li><div><a href="https://a.example/x">https://a.example/x</a> + ΕΙΚΟΝΕΣ</div></li>
+            <li><div>Τίτλος</div></li></ol><div><a href="https://b.example/y">https://b.example/y</a></div>
+            <ol start="5"><li><div>https://c.example/z + ΠΛΑΝΑ</div></li><li>έκτο<ul><li>κουκκίδα</li></ul></li></ol>"#;
+        let text = html_to_text(html);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["1.", "https://a.example/x + ΕΙΚΟΝΕΣ", "2.", "Τίτλος", "https://b.example/y", "5.", "https://c.example/z + ΠΛΑΝΑ", "6. έκτο", "κουκκίδα"],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_shortened_display_address_is_replaced_by_its_href() {
+        let html = r#"<p><a href="https://www.youtube.com/watch?v=abcdef123&amp;t=4">youtube.com/watch?v=abc…</a></p>
+            <p><a href="https://youtu.be/q1">www.youtu.be/q1</a></p>
+            <table><tr><td>ΚΕΛΙ</td><td>ΔΕΥΤΕΡΟ</td></tr></table>"#;
+        let text = html_to_text(html);
+        assert!(!text.contains("abc…"), "{text}");
+        assert_eq!(text.lines().next(), Some("https://www.youtube.com/watch?v=abcdef123&t=4"), "{text}");
+        assert!(text.contains("https://youtu.be/q1"), "{text}");
+        assert!(!text.contains("www.youtu.be"), "{text}");
+        assert!(text.contains("ΚΕΛΙ ΔΕΥΤΕΡΟ"), "{text}");
+    }
 
     #[test]
     fn html_keeps_hrefs_behind_headline_anchors() {

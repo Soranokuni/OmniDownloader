@@ -234,9 +234,101 @@ pub fn registrable_domain(raw: &str) -> Option<String> {
     }
 }
 
+/// Addresses `url` may have been before someone typed a word onto its end
+/// (plan P3.10): "…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", "…-sismos-ΤΩΡΑ", "…-NEW".
+///
+/// The parser already removes the words it knows (P3.9). These are
+/// guesses for the ones it does not, so they are never used on their
+/// own: the caller tries one only when the site says the address as
+/// given does not exist (404/410) and the guess does. The last token
+/// (after the last `-`, `_` or `/`) is a candidate for removal when it
+/// has a non-Latin letter, or is Latin capitals only: the sites this
+/// newsroom reads write their slugs in lowercase. Most likely first.
+pub fn undecorated_candidates(url: &str) -> Vec<String> {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return Vec::new();
+    };
+    let Some(path_start) = url[scheme_end..].find('/').map(|i| scheme_end + i) else {
+        return Vec::new();
+    };
+    let tail_start = url[path_start..].rfind(['-', '_', '/']).map(|i| path_start + i);
+    let Some(sep) = tail_start else {
+        return Vec::new();
+    };
+    let token = percent_decode(&url[sep + 1..]);
+    let letters: Vec<char> = token.chars().filter(|c| c.is_alphabetic()).collect();
+    let decorated = !letters.is_empty()
+        && (letters.iter().any(|c| !c.is_ascii()) || letters.iter().all(|c| c.is_ascii_uppercase()) && letters.len() >= 3);
+    if !decorated {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |c: String| {
+        let has_path = c.len() > path_start + 1 || c.contains('?');
+        if c != url && has_path && !out.contains(&c) {
+            out.push(c);
+        }
+    };
+    // "…/arthro/-WORD" and "…/arthro/WORD": back to "…/arthro/", then without the slash.
+    let before = &url[..sep];
+    if url[sep..].starts_with('/') || before.ends_with('/') {
+        let base = before.trim_end_matches('/');
+        push(format!("{base}/"));
+        push(base.to_string());
+    } else {
+        push(before.to_string());
+        push(format!("{before}/"));
+    }
+    out
+}
+
+/// `%CE%92` → `Β`; anything that does not decode stays as it was.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(b) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_word_typed_onto_a_link_gives_the_address_without_it() {
+        // P3.10: guesses, each confirmed by the site before use.
+        assert_eq!(
+            undecorated_candidates("https://www.news247.gr/kosmos/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ"),
+            vec!["https://www.news247.gr/kosmos/arthro/", "https://www.news247.gr/kosmos/arthro"]
+        );
+        assert_eq!(
+            undecorated_candidates("https://site.gr/a/sismos-krites-ΤΩΡΑ"),
+            vec!["https://site.gr/a/sismos-krites", "https://site.gr/a/sismos-krites/"]
+        );
+        assert_eq!(
+            undecorated_candidates("https://site.gr/a/sismos-%CE%A4%CE%A9%CE%A1%CE%91")[0],
+            "https://site.gr/a/sismos"
+        );
+        assert_eq!(undecorated_candidates("https://site.gr/a/sismos-NEW")[0], "https://site.gr/a/sismos");
+        // An address that looks like a site's own is not second-guessed.
+        assert!(undecorated_candidates("https://site.gr/a/sismos-sta-xania/").is_empty());
+        assert!(undecorated_candidates("https://site.gr/a/sismos-sta-xania").is_empty());
+        assert!(undecorated_candidates("https://site.gr/a/article-12345").is_empty());
+        assert!(undecorated_candidates("https://site.gr/a/clip-HD").is_empty(), "two capitals are a format, not a word");
+        assert!(undecorated_candidates("https://site.gr/ΤΩΡΑ").is_empty(), "nothing but the front page would be left");
+        assert!(undecorated_candidates("not a url").is_empty());
+    }
 
     /// Table of real shapes the newsroom receives, and what each must collapse to.
     #[test]

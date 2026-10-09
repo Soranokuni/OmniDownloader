@@ -1,0 +1,36 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.75,
+          "index_str": "1",
+          "keyword": "VIRAL",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.facebook.com/reel/fixture2501"
+        }
+      ],
+      "keyword": "VIRAL",
+      "title": "VIRAL ΓΙΑ ΕΥΗ"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_SUGGESTED",
+      "detail": "ΕΥΗ"
+    },
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

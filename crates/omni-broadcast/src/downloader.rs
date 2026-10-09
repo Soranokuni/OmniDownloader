@@ -53,6 +53,9 @@ pub struct DownloadOpts<'a> {
     pub concurrent_fragments: u32,
     pub timeout: Duration,
     pub cancel: Option<CancellationToken>,
+    /// Deno, for YouTube's JavaScript challenge (plan P6.8). `download`
+    /// fills it from `bin/` when the caller leaves it empty.
+    pub js_runtime: Option<&'a Path>,
 }
 
 impl Default for DownloadOpts<'_> {
@@ -67,6 +70,7 @@ impl Default for DownloadOpts<'_> {
             concurrent_fragments: 4,
             timeout: Duration::from_secs(1800),
             cancel: None,
+            js_runtime: None,
         }
     }
 }
@@ -86,7 +90,32 @@ const VIDEO_PLATFORMS: &[&str] = &[
     "vimeo.com",
     "dailymotion.com",
     "dai.ly",
+    "streamable.com",
 ];
+
+/// Whether `url` is on YouTube.
+pub fn is_youtube(url: &str) -> bool {
+    let host = host_of(url);
+    ["youtube.com", "youtu.be", "youtube-nocookie.com"]
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+fn host_of(url: &str) -> String {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
 
 /// Whether `url` is a page on a video platform (as opposed to a raw stream
 /// or a news portal's article).
@@ -112,13 +141,31 @@ pub fn is_video_platform(url: &str) -> bool {
 
 pub struct Downloader {
     ytdl_path: PathBuf,
+    /// `deno.exe` next to yt-dlp, when it is there.
+    deno: Option<PathBuf>,
+}
+
+/// `--js-runtimes deno:<path>`: yt-dlp only looks for Deno on PATH by
+/// itself, and the service's PATH has no bin/.
+fn js_runtime_args(deno: Option<&Path>) -> Vec<String> {
+    match deno {
+        Some(p) => vec!["--js-runtimes".into(), format!("deno:{}", p.display())],
+        None => Vec::new(),
+    }
 }
 
 impl Downloader {
     pub fn new<P: AsRef<Path>>(ytdl_path: P) -> Self {
-        Self {
-            ytdl_path: ytdl_path.as_ref().to_path_buf(),
-        }
+        let ytdl_path = ytdl_path.as_ref().to_path_buf();
+        // bin/deno.exe sits next to the legacy bin/yt-dlp.exe, and one level
+        // up from the folder build's bin/yt-dlp/yt-dlp.exe (plan P2.10).
+        let deno = ytdl_path
+            .ancestors()
+            .skip(1)
+            .take(2)
+            .map(|d| d.join("deno.exe"))
+            .find(|p| p.is_file());
+        Self { ytdl_path, deno }
     }
 
     /// Build the yt-dlp argument vector.
@@ -142,6 +189,13 @@ impl Downloader {
             // A journalist's link often carries a playlist id; ingesting the
             // whole playlist would flood the watchfolder.
             "--no-playlist".into(),
+            // --no-playlist does not stop a news page that yt-dlp's generic
+            // extractor reads as a playlist of its embeds: an iefimerida.gr
+            // article with four Streamable videos downloaded all four into
+            // one job and delivered one of them. The page's other videos are
+            // queued as their own jobs (`page_videos`).
+            "--playlist-items".into(),
+            "1".into(),
             "--retries".into(),
             "5".into(),
             "--fragment-retries".into(),
@@ -152,6 +206,13 @@ impl Downloader {
             "30".into(),
             "--concurrent-fragments".into(),
             opts.concurrent_fragments.to_string(),
+            // Never resume a `.part` left by an earlier or cancelled run: the
+            // same job may be retried with a different link (P1.15).
+            "--no-continue".into(),
+            // Nor take a complete `source.*` left in a kept workspace (a
+            // restart or reap, then an override to a new link) as "already
+            // downloaded": that would deliver the old link's video (P1.16).
+            "--force-overwrites".into(),
             "--newline".into(),
             "--no-warnings".into(),
             "--no-color".into(),
@@ -174,6 +235,7 @@ impl Downloader {
         if opts.insecure_tls {
             args.push("--no-check-certificates".into());
         }
+        args.extend(js_runtime_args(opts.js_runtime));
         // The article page's session (referer, browser UA, its cookies) is for
         // raw streams on the portal's own CDN. A video platform the sniffer
         // found embedded in the article is fetched by yt-dlp's own extractor,
@@ -218,6 +280,10 @@ impl Downloader {
         F: FnMut(DownloadProgress) + Send + 'static,
     {
         tokio::fs::create_dir_all(output_dir).await?;
+        let mut opts = opts;
+        if opts.js_runtime.is_none() {
+            opts.js_runtime = self.deno.as_deref();
+        }
         let args = Self::build_args(url, output_dir, &opts);
 
         info!("Job #{job_id}: downloading {url}");
@@ -275,6 +341,120 @@ impl Downloader {
             .await
             .ok_or_else(|| anyhow!("yt-dlp reported success but produced no file in {output_dir:?}"))
     }
+}
+
+/// The videos yt-dlp sees on a page (`--flat-playlist -J`), in page order,
+/// when it reads the page as several; empty for a single video or anything
+/// else. Only http(s) entry URLs are kept, each once.
+pub fn parse_page_videos(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    if v.get("_type").and_then(|t| t.as_str()) != Some("playlist") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for e in v.get("entries").and_then(|e| e.as_array()).into_iter().flatten() {
+        let Some(u) = e.get("url").or_else(|| e.get("webpage_url")).and_then(|u| u.as_str()) else {
+            continue;
+        };
+        if !(u.starts_with("https://") || u.starts_with("http://")) {
+            continue;
+        }
+        let u = canonical_streamable(u).unwrap_or_else(|| u.to_string());
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    }
+    out
+}
+
+/// `https://streamable.com/ID` for the player forms (`/e/ID`, `/o/ID`,
+/// `/s/ID`), the form the sniffer reports too, so one video found by both
+/// is one job.
+pub fn canonical_streamable(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = rest.strip_prefix("streamable.com/")?;
+    let mut parts = path.split(['/', '?', '#']).filter(|p| !p.is_empty());
+    let first = parts.next()?;
+    let id = if matches!(first, "e" | "o" | "s") { parts.next()? } else { first };
+    id.chars().all(|c| c.is_ascii_alphanumeric()).then(|| format!("https://streamable.com/{id}"))
+}
+
+/// What a probe of a link found: the extractor and the video id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probed {
+    pub extractor: String,
+    pub id: String,
+}
+
+/// `--print "%(extractor)s %(id)s"` output: the first non-empty line.
+pub fn parse_probe_line(stdout: &str) -> Option<Probed> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (extractor, id) = line.split_once(' ')?;
+    let id = id.trim();
+    (!extractor.is_empty() && !id.is_empty() && id != "NA").then(|| Probed { extractor: extractor.to_string(), id: id.to_string() })
+}
+
+impl Downloader {
+    /// Whether yt-dlp can still get the video at `url`, without downloading
+    /// it (`--simulate`: the page is read and the formats are chosen). The
+    /// self-check (plan P6.7) uses this. `Err` is the one-line reason.
+    pub async fn probe(&self, url: &str, timeout: Duration) -> std::result::Result<Probed, String> {
+        let mut args: Vec<String> = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "30",
+            "--print",
+            "%(extractor)s %(id)s",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
+            Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
+            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
+        }
+    }
+
+    /// The videos on a news page, when yt-dlp reads it as several (see
+    /// [`parse_page_videos`]), and whether yt-dlp said it has no extractor
+    /// for the page at all. Any other failure is no videos: the download
+    /// that follows reports it properly.
+    pub async fn page_videos(&self, url: &str, timeout: Duration) -> PageScan {
+        let mut args: Vec<String> =
+            ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()).collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => PageScan { videos: parse_page_videos(&o.stdout), unsupported: false },
+            Ok(o) if !o.timed_out => PageScan {
+                videos: Vec::new(),
+                unsupported: crate::errors::classify_download_error(&o.stderr_tail) == ErrorCode::UnsupportedUrl,
+            },
+            _ => PageScan::default(),
+        }
+    }
+}
+
+/// What `--flat-playlist -J` made of a page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageScan {
+    /// The page's videos when it holds several, in page order.
+    pub videos: Vec<String>,
+    /// yt-dlp has no extractor for the page ("Unsupported URL"): a download
+    /// attempt would only read the page again to say the same, so the
+    /// caller can go straight to the sniffer.
+    pub unsupported: bool,
 }
 
 /// `downloaded total speed eta`, with `NA` for values yt-dlp does not know yet.
@@ -373,6 +553,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_part_file_is_never_resumed() {
+        let args = args_for(&DownloadOpts::default());
+        assert!(args.iter().any(|a| a == "--no-continue"), "{args:?}");
+    }
+
+    #[test]
+    fn a_leftover_complete_file_is_never_taken_as_already_downloaded() {
+        let args = args_for(&DownloadOpts::default());
+        assert!(args.iter().any(|a| a == "--force-overwrites"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--no-overwrites" || a == "-w"), "{args:?}");
+    }
+
+    #[test]
     fn the_format_selector_never_pulls_more_than_1080() {
         // Defect D-18: the old selector downloaded 4K and then downscaled it,
         // costing minutes of a news deadline for no visible gain.
@@ -408,6 +601,60 @@ mod tests {
         ] {
             assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
         }
+    }
+
+    /// iefimerida.gr, 2026-10-05: four Streamable embeds read as a generic
+    /// playlist; one job downloaded all four.
+    #[test]
+    fn only_the_first_video_of_a_page_is_downloaded_into_a_job() {
+        let args = args_for(&DownloadOpts::default());
+        let i = args.iter().position(|a| a == "--playlist-items").expect("--playlist-items");
+        assert_eq!(args[i + 1], "1");
+    }
+
+    /// 2026-10-06: two YouTube jobs failed with HTTP 403; yt-dlp said "No
+    /// supported JavaScript runtime could be found".
+    #[test]
+    fn deno_is_handed_to_yt_dlp_when_it_is_there() {
+        let deno = PathBuf::from(r"C:\omni\bin\deno.exe");
+        let args = args_for(&DownloadOpts { js_runtime: Some(&deno), ..Default::default() });
+        let i = args.iter().position(|a| a == "--js-runtimes").expect("--js-runtimes");
+        assert_eq!(args[i + 1], r"deno:C:\omni\bin\deno.exe");
+        assert!(!args_for(&DownloadOpts::default()).iter().any(|a| a == "--js-runtimes"));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Downloader::new(dir.path().join("yt-dlp.exe")).deno.is_none());
+        std::fs::write(dir.path().join("deno.exe"), b"x").unwrap();
+        assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe")).deno, Some(dir.path().join("deno.exe")));
+        // The folder build (P2.10) is one level down: without this YouTube
+        // would lose its JavaScript runtime and 403 at random.
+        assert_eq!(
+            Downloader::new(dir.path().join("yt-dlp").join("yt-dlp.exe")).deno,
+            Some(dir.path().join("deno.exe"))
+        );
+    }
+
+    #[test]
+    fn a_probe_reads_the_extractor_and_the_id() {
+        assert_eq!(
+            parse_probe_line("\nInstagram Dd615LBN4QM\n"),
+            Some(Probed { extractor: "Instagram".into(), id: "Dd615LBN4QM".into() })
+        );
+        assert_eq!(parse_probe_line("generic NA"), None);
+        assert_eq!(parse_probe_line(""), None);
+    }
+
+    #[test]
+    fn a_page_read_as_several_videos_lists_them_in_order() {
+        let json = r#"{"_type": "playlist", "extractor": "generic", "entries": [
+            {"_type": "url", "url": "https://streamable.com/e/531cym", "ie_key": "Streamable"},
+            {"_type": "url", "url": "https://streamable.com/e/k98n7n", "ie_key": "Streamable"},
+            {"_type": "url", "url": "https://streamable.com/e/531cym", "ie_key": "Streamable"},
+            {"_type": "url", "url": "javascript:void(0)"}]}"#;
+        assert_eq!(parse_page_videos(json), vec!["https://streamable.com/531cym", "https://streamable.com/k98n7n"]);
+        assert!(parse_page_videos(r#"{"_type": "video", "id": "x", "webpage_url": "https://a/b"}"#).is_empty());
+        assert!(parse_page_videos("ERROR: Unsupported URL").is_empty());
+        assert!(is_video_platform("https://streamable.com/e/531cym"));
     }
 
     #[test]

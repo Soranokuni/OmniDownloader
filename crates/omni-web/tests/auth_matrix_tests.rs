@@ -271,6 +271,18 @@ const MATRIX: &[Row] = &[
         "/api/jobs/1",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Admin, Reached)],
     ),
+    // The file name a video is delivered under: the desk's to fix (P7.12).
+    (
+        "POST",
+        "/api/jobs/1/rename",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Denied),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     (
         "POST",
         "/api/jobs/1/override",
@@ -286,7 +298,33 @@ const MATRIX: &[Row] = &[
         "POST",
         "/api/jobs/1/retry",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
-    ),    (
+    ),    // MCR desk (plan P7.1): download a delivered job again; clear the live list.
+    (
+        "POST",
+        "/api/jobs/1/redownload",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/mark-done",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/cancel",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/clear-finished",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/review/hide-old",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
         "POST",
         "/api/jobs/1/offers/queue",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
@@ -311,6 +349,83 @@ const MATRIX: &[Row] = &[
         "/api/journalists/PAPADAKI",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),
+    // ---- Taxonomy (plan P4.20): read for the MCR label; edits are admin ----
+    (
+        "GET",
+        "/api/groups",
+        &[(Anonymous, Denied), (AllowlistedIp, Reached), (Caller::User, Denied), (Mcr, Reached), (Admin, Reached)],
+    ),
+    ("POST", "/api/groups", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/groups/NEWS", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/journalists/PAPADAKI/groups", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // taxonomy.json lists staff and their addresses.
+    ("GET", "/api/admin/taxonomy", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("GET", "/api/admin/taxonomy/backups", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/taxonomy/backups", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("GET", "/api/admin/taxonomy/backups/taxonomy-x.json", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/taxonomy/backups/taxonomy-x.json/restore", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/users/1/active", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/taxonomy", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     (
         "GET",
         "/api/system/status",
@@ -320,6 +435,52 @@ const MATRIX: &[Row] = &[
         "GET",
         "/api/events",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
+    ),
+    // MCR mail view (plan P7.8): mail text and senders are newsroom data,
+    // so the desk policy: never anonymous, never a reporter.
+    (
+        "GET",
+        "/api/mails",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    // Subjects and journalists of recent mail: the same policy (plan P5.4).
+    (
+        "GET",
+        "/api/mails/settled",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "GET",
+        "/api/mails/view",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/mails/queue-link",
+        &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/mails/reprocess",
+        &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
     ),
     // ---- Logged in ----
     (
@@ -420,6 +581,27 @@ const MATRIX: &[Row] = &[
         "/api/admin/maintenance/vacuum/run",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
     ),
+    // Self-check links (plan P6.7): admin only, like the rest of maintenance.
+    (
+        "GET",
+        "/api/admin/selfcheck",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/admin/selfcheck/links",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
+    ),
+    (
+        "POST",
+        "/api/admin/selfcheck/links/1/delete",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
+    ),
     (
         "GET",
         "/api/secrets",
@@ -452,11 +634,50 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
-    (
-        "POST",
-        "/api/system/test-llm",
-        &[(Anonymous, Denied), (Mcr, Denied), (Admin, Reached)],
-    ),
+    // ---- LLM settings (plan P4.22): the key and where mail text goes ----
+    ("GET", "/api/admin/llm", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/llm", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/llm/test", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/llm/models", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // ---- Handled mail (plan P4.25): subjects and senders; reprocess ----
+    ("GET", "/api/admin/mail", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/mail/reprocess", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // ---- First-run only. With an admin present this is a 404 for everyone
     //      who is not one, including a loopback client.
     (
@@ -512,10 +733,10 @@ async fn w01_anonymous_callers_cannot_repoint_the_watchfolder() -> Result<()> {
     let h = Harness::new(true)?;
 
     let payload = serde_json::json!({
-        "email_provider": "Outlook",
-        "imap_server": "evil.example",
-        "email_address": "attacker@evil.example",
-        "email_password": "hunter2",
+        "graph_tenant_id": "attacker-tenant",
+        "graph_client_id": "attacker-app",
+        "graph_mailbox": "attacker@evil.example",
+        "graph_client_secret": "hunter2",
         "ollama_endpoint": "http://evil.example",
         "ollama_model": "x",
         "watchfolder_path": "\\\\attacker\\share"
@@ -580,10 +801,10 @@ async fn the_first_run_window_is_loopback_only_and_closes_once_an_admin_exists()
 
     // Claim it.
     let payload = serde_json::json!({
-        "email_provider": "Outlook",
-        "imap_server": "outlook.office365.com",
-        "email_address": "ingest@station.gr",
-        "email_password": "",
+        "graph_tenant_id": "",
+        "graph_client_id": "",
+        "graph_mailbox": "ingest@station.gr",
+        "graph_client_secret": "",
         "ollama_endpoint": "http://localhost:11434/v1",
         "ollama_model": "gemma",
         "watchfolder_path": "C:/watch",

@@ -25,6 +25,21 @@ fn hasher() -> Result<Argon2<'static>> {
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
 }
 
+/// Minimum password policy, shared by the web panels and the CLI.
+///
+/// Length only. Composition rules ("one digit, one symbol") push operators
+/// towards `Password1!` and towards writing it on the desk; a 12-character
+/// floor is the part that actually helps.
+pub fn validate_password(password: &str) -> std::result::Result<(), String> {
+    if password.chars().count() < 12 {
+        return Err("Password must be at least 12 characters.".to_string());
+    }
+    if password.chars().count() > 256 {
+        return Err("Password must be at most 256 characters.".to_string());
+    }
+    Ok(())
+}
+
 pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = hasher()?

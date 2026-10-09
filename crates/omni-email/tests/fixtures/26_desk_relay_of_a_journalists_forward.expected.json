@@ -1,0 +1,42 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "forwarded",
+    "surname": "NIKOLAOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1A",
+          "keyword": "STAVRIDI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.instagram.com/reel/Fixture2601/"
+        },
+        {
+          "confidence": 0.95,
+          "index_str": "1B",
+          "keyword": "STAVRIDI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.instagram.com/reel/Fixture2602/"
+        }
+      ],
+      "keyword": "STAVRIDI",
+      "title": "Για Σταυρίδη"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_SUGGESTED",
+      "detail": "Σταυρίδη"
+    }
+  ]
+}

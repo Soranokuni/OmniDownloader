@@ -16,6 +16,8 @@ pub struct TranscodeProgress {
 pub struct Transcoder {
     ffmpeg_path: PathBuf,
     ffprobe_path: PathBuf,
+    /// Kills the running ffmpeg and its children when cancelled (plan P1.15).
+    cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 
@@ -208,6 +210,19 @@ pub fn build_video_chain(video: &crate::probe::VideoStream) -> (String, &'static
         // pairs into 25 interlaced frames. A 25p source becomes PsF: both fields
         // of each output frame come from one source frame, so there is no
         // interline twitter and the motion cadence is the source's own.
+        //
+        // Up to 50 fps the frames are scaled at the source rate, before `fps`
+        // duplicates them (P1.12): scale, pad and format are per-frame and
+        // `fps` only picks frames, so the output is bit-identical (framemd5
+        // checked) and a 25p source is scaled 25 times a second, not 50.
+        // Above 50 the rate comes down first, for the same reason.
+        ScanType::Progressive | ScanType::Unknown if video.fps > 0.0 && video.fps <= 50.05 => (
+            format!(
+                "{},fps=50,tinterlace=mode=interleave_top:flags=vlpf",
+                scale_pad(false)
+            ),
+            "progressive_to_25i",
+        ),
         ScanType::Progressive | ScanType::Unknown => (
             format!(
                 "fps=50,{},tinterlace=mode=interleave_top:flags=vlpf",
@@ -551,6 +566,20 @@ impl Transcoder {
         Self {
             ffmpeg_path: ffmpeg_path.as_ref().to_path_buf(),
             ffprobe_path: ffprobe_path.as_ref().to_path_buf(),
+            cancel: None,
+        }
+    }
+
+    /// Stop every ffmpeg run of this transcoder when `token` is cancelled.
+    pub fn with_cancel(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    fn cancellable(&self, opts: RunOpts) -> RunOpts {
+        match &self.cancel {
+            Some(t) => opts.with_cancel(t.clone()),
+            None => opts,
         }
     }
 
@@ -588,7 +617,7 @@ impl Transcoder {
         let out = omni_core::process::run(
             &self.ffmpeg_path,
             &args,
-            RunOpts::new(timeout),
+            self.cancellable(RunOpts::new(timeout)),
         )
         .await
         .ok()?;
@@ -657,9 +686,9 @@ impl Transcoder {
         // probed duration is an honest percentage, unlike scraping "time=" out
         // of the human-readable stderr.
         let total_us = (duration * 1_000_000.0).max(1.0);
-        let opts = RunOpts::new(StdDuration::from_secs_f64(
+        let opts = self.cancellable(RunOpts::new(StdDuration::from_secs_f64(
             (duration * 6.0).clamp(600.0, 10_800.0),
-        ))
+        )))
         .on_stdout_line(move |line| {
             if let Some(v) = line.strip_prefix("out_time_us=") {
                 if let Ok(us) = v.trim().parse::<f64>() {

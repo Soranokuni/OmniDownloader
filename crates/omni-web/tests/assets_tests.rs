@@ -346,3 +346,28 @@ async fn static_assets_are_served_and_cacheable() -> Result<()> {
 
     Ok(())
 }
+
+/// Regression (2026-09-30): the shared `api()` helper answered every 401
+/// with "Session expired." before reading the response, so a sign-in with an
+/// address that has no account said "Session expired." — and sent the
+/// operator looking for a session problem. On the login page the server's
+/// own message must be shown.
+#[test]
+fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
+    let assets = all_assets();
+    let app = assets.get("static/app.js").expect("app.js shipped");
+    let code: Vec<&str> = app.lines().filter(|l| !is_comment(l)).collect();
+    let body_read = code.iter().position(|l| l.contains("await response.text()")).expect("body read");
+    let unauthorized = code.iter().position(|l| l.contains("response.status === 401")).expect("401 branch");
+    assert!(body_read < unauthorized, "the 401 branch runs before the response body is read");
+    let branch = code[unauthorized..].iter().take(12).copied().collect::<Vec<_>>().join("\n");
+    assert!(branch.contains("serverMessage"), "the 401 branch ignores the server's message:\n{branch}");
+
+    // And every page imports the same app.js: two versions of one module
+    // would load twice, with two copies of its state.
+    let versions: std::collections::BTreeSet<&str> = assets
+        .values()
+        .flat_map(|s| s.match_indices("/static/app.js?v=").map(move |(i, _)| &s[i..i + 19]))
+        .collect();
+    assert_eq!(versions.len(), 1, "pages import different app.js versions: {versions:?}");
+}
