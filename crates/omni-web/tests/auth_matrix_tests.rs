@@ -186,6 +186,9 @@ enum Expect {
     /// Reached the handler. The handler may still 400 on the empty `{}` body
     /// we send — that is fine and means the policy let it through.
     Reached,
+    /// Reached the handler, which answers 404 because there is nothing to
+    /// serve for job 1 (preview files, P10.6); the policy still let it in.
+    ReachedNoFile,
     /// Turned away: 401, 403 or (for pages) a redirect to /login.
     Denied,
     /// Route is not there for this caller at all.
@@ -202,6 +205,10 @@ fn assert_outcome(route: &str, caller: Caller, expected: Expect, actual: StatusC
                 | StatusCode::FORBIDDEN
                 | StatusCode::NOT_FOUND
                 | StatusCode::TEMPORARY_REDIRECT
+        ),
+        ReachedNoFile => !matches!(
+            actual,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TEMPORARY_REDIRECT
         ),
         Denied => matches!(
             actual,
@@ -300,6 +307,21 @@ const MATRIX: &[Row] = &[
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),    // MCR desk (plan P7.1): download a delivered job again; clear the live list.
     // A video held for approval (P10.5): MCR decides, nobody else.
+    (
+        "GET",
+        "/api/jobs/1/preview/video",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
+        "GET",
+        "/api/jobs/1/preview/contact",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
+        "GET",
+        "/api/jobs/1/preview/article",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
     (
         "POST",
         "/api/jobs/1/approve",

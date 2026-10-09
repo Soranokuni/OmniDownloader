@@ -1023,3 +1023,174 @@ async fn rejecting_sends_the_job_to_review_and_deletes_the_held_file() -> Result
     assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NOT_HELD")), "{json}");
     Ok(())
 }
+
+// ---- preview of a held video (P10.6) ----
+
+impl App {
+    /// A GET with optional extra headers; the status, headers and raw body.
+    async fn get_raw(&self, uri: &str, token: &str, headers: &[(&str, &str)]) -> Result<(StatusCode, axum::http::HeaderMap, Vec<u8>)> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", format!("omni_session={token}"))
+            .header("host", "mcr.local");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let res = self
+            .router
+            .clone()
+            .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+            .oneshot(builder.body(Body::empty())?)
+            .await?;
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res.into_body().collect().await?.to_bytes().to_vec();
+        Ok((status, headers, bytes))
+    }
+}
+
+/// A held job whose directory also holds a 1000-byte "preview.mp4" and a contact sheet.
+fn held_job_with_preview(app: &App) -> Result<(i64, std::path::PathBuf)> {
+    let id = held_job(app, 1)?;
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("_preview.mp4"), &data)?;
+    std::fs::write(dir.join("_contact.jpg"), b"jpegbytes")?;
+    Ok((id, dir))
+}
+
+#[tokio::test]
+async fn the_desk_seeks_in_the_preview_with_a_range_request() -> Result<()> {
+    let app = App::new()?;
+    let (id, _dir) = held_job_with_preview(&app)?;
+
+    let (status, headers, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[("range", "bytes=0-99")]).await?;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers["content-range"], "bytes 0-99/1000");
+    assert_eq!(body.len(), 100);
+    assert_eq!(headers["content-type"], "video/mp4");
+    assert_eq!(headers["cache-control"], "no-store");
+
+    let (status, headers, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[("range", "bytes=900-")]).await?;
+    assert_eq!((status, body.len()), (StatusCode::PARTIAL_CONTENT, 100));
+    assert_eq!(headers["content-range"], "bytes 900-999/1000");
+
+    let (status, _, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!((status, body.len()), (StatusCode::OK, 1000));
+
+    let (status, headers, body) = app.get_raw(&format!("/api/jobs/{id}/preview/contact"), &app.mcr_token, &[]).await?;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, b"jpegbytes".as_slice()));
+    assert_eq!(headers["content-type"], "image/jpeg");
+
+    // No article picture yet: 404, not an empty 200.
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{id}/preview/article"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The job JSON says what is there.
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(
+        json["job"]["held"]["preview"],
+        json!({ "video": true, "audio_only": false, "contact": true, "article": false }),
+        "{json}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_audio_only_preview_is_served_as_audio() -> Result<()> {
+    let app = App::new()?;
+    let (id, dir) = held_job_with_preview(&app)?;
+    std::fs::remove_file(dir.join("_preview.mp4"))?;
+    std::fs::write(dir.join("_preview.m4a"), b"audio")?;
+    let (status, headers, _) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "audio/mp4");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["held"]["preview"]["audio_only"], true, "{json}");
+    assert_eq!(json["job"]["held"]["preview"]["video"], false, "{json}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn there_is_no_preview_without_a_live_held_row_and_the_request_picks_no_file() -> Result<()> {
+    let app = App::new()?;
+    // A job with no held row at all, though a file sits where one would be.
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/p9", "9_NIKOLAOU_NOROW", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("_preview.mp4"), b"x")?;
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let app = App::new()?;
+    // A delivered video no longer has a preview, even if its files linger.
+    let (held_id, held_dir) = held_job_with_preview(&app)?;
+    let sha = app.repo.waiting_held(held_id)?.unwrap().sha256;
+    assert!(app.repo.approve_held(held_id, &sha, "desk")?);
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{held_id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::OK, "an approved video still waits for delivery");
+    let job = app.repo.lease_job("w2", 180)?.expect("approved job is leased");
+    assert_eq!(job.id, held_id);
+    assert!(app.repo.record_held_delivery(held_id, "w2", "C:/watch/x.mxf", 2.0)?);
+    assert!(app.repo.finish_held_delivery(held_id, "w2")?);
+    assert_eq!(app.repo.get_held(held_id)?.unwrap().decision.as_deref(), Some("delivered"));
+    assert!(held_dir.join("_preview.mp4").is_file());
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{held_id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Only the three fixed names are routes: nothing in the request names a file.
+    {
+        let app2 = App::new()?;
+        let r = held_job_with_preview(&app2)?;
+        for uri in [
+            format!("/api/jobs/{}/preview/..%2F{}.mxf", r.0, "1_NIKOLAOU_HELD"),
+            format!("/api/jobs/{}/preview/_preview.mp4", r.0),
+            format!("/api/jobs/{}/preview/../preview/video/x", r.0),
+            format!("/api/jobs/{}/preview/clip.mxf", r.0),
+        ] {
+            let (status, _, body) = app2.get_raw(&uri, &app2.mcr_token, &[]).await?;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+                "{uri} -> {status}"
+            );
+            assert!(body != b"abc", "{uri} served the held MXF");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_held_row_outside_the_jobs_held_directory_serves_no_preview() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/e1", "1_NIKOLAOU_ELSEWHERE", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let elsewhere = app._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere)?;
+    std::fs::write(elsewhere.join("clip.mxf"), b"abc")?;
+    std::fs::write(elsewhere.join("_preview.mp4"), b"secret")?;
+    assert!(app.repo.hold_output(
+        id,
+        "test-worker",
+        &elsewhere.join("clip.mxf").to_string_lossy(),
+        3,
+        HELD_SHA,
+        Some(2.0),
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    )?);
+    let (status, _, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_ne!(body, b"secret");
+    Ok(())
+}

@@ -3,6 +3,7 @@ pub mod delivery;
 pub mod errors;
 pub mod downloader;
 pub mod pipeline;
+pub mod preview;
 pub mod probe;
 pub mod verify;
 pub mod rewrapper;

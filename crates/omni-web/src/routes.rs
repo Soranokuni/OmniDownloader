@@ -401,9 +401,79 @@ fn held_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::
             "duration": h.duration,
             "created_at": h.created_at.map(omni_core::timestamps::format),
             "expires_at": h.expires_at.map(omni_core::timestamps::format),
+            "preview": std::path::Path::new(&h.path).parent().map(preview_flags),
         }),
         _ => serde_json::Value::Null,
     }
+}
+
+/// Which preview files this held video has (P10.6), so the desk knows what to
+/// show; the files live next to the held MXF, under fixed names.
+fn preview_flags(dir: &std::path::Path) -> serde_json::Value {
+    use omni_broadcast::preview::{ARTICLE_FILE, AUDIO_FILE, CONTACT_FILE, VIDEO_FILE};
+    let has = |name: &str| dir.join(name).is_file();
+    serde_json::json!({
+        "video": has(VIDEO_FILE),
+        "audio_only": !has(VIDEO_FILE) && has(AUDIO_FILE),
+        "contact": has(CONTACT_FILE),
+        "article": has(ARTICLE_FILE),
+    })
+}
+
+/// The directory a job's preview files are in: the parent of the held row's
+/// file, while the video waits or is approved and not yet delivered. Never
+/// built from the request.
+fn preview_dir(state: &AppState, job_id: i64) -> Option<std::path::PathBuf> {
+    let row = state.repo.get_held(job_id).ok()??;
+    if !matches!(row.decision.as_deref(), None | Some("approved")) {
+        return None;
+    }
+    let dir = std::path::Path::new(&row.path).parent()?.to_path_buf();
+    match &state.temp_dir {
+        Some(temp) if dir != omni_core::held::held_dir(temp, job_id) => None,
+        _ => Some(dir),
+    }
+}
+
+/// Serve one fixed preview file with Range support, so the desk can seek.
+async fn serve_preview(state: &AppState, job_id: i64, names: &[(&str, &'static str)], req: Request) -> Response {
+    let Some(dir) = preview_dir(state, job_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    for (name, mime) in names {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let mut svc = tower_http::services::ServeFile::new(path);
+        return match tower::Service::call(&mut svc, req).await {
+            Ok(res) => {
+                let mut res = res.map(axum::body::Body::new);
+                let h = res.headers_mut();
+                h.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static(mime));
+                h.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+                res
+            }
+            Err(never) => match never {},
+        };
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// `GET /api/jobs/:id/preview/video`: the 540p preview (or the audio-only one).
+pub async fn api_preview_video(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    use omni_broadcast::preview::{AUDIO_FILE, VIDEO_FILE};
+    serve_preview(&state, id, &[(VIDEO_FILE, "video/mp4"), (AUDIO_FILE, "audio/mp4")], req).await
+}
+
+/// `GET /api/jobs/:id/preview/contact`: the contact sheet.
+pub async fn api_preview_contact(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    serve_preview(&state, id, &[(omni_broadcast::preview::CONTACT_FILE, "image/jpeg")], req).await
+}
+
+/// `GET /api/jobs/:id/preview/article`: the article's picture, when one was kept.
+pub async fn api_preview_article(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    serve_preview(&state, id, &[(omni_broadcast::preview::ARTICLE_FILE, "image/jpeg")], req).await
 }
 
 pub async fn api_get_jobs(
