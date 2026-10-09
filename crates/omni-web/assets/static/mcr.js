@@ -20,9 +20,10 @@ import {
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=8';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=14';
-import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=9';
+} from '/static/desk.js?v=10';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=16';
+import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=10';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=3';
 
 let journalists = [];
 
@@ -53,6 +54,10 @@ function switchTab(name) {
     if (section) section.hidden = tab !== name;
   }
   document.body.classList.toggle('desk-wide', name === 'email');
+  // A held video keeps playing behind a hidden tab otherwise.
+  if (name !== 'review') {
+    for (const m of document.querySelectorAll('#approval-section video, #approval-section audio')) m.pause();
+  }
   if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
   if (name === 'journalists') loadJournalists();
   refresh();
@@ -74,6 +79,12 @@ for (const button of document.querySelectorAll('.tab[data-tab]')) {
     document.getElementById(`tabbtn-${TABS[to]}`)?.focus();
   });
 }
+
+// The Email tab's «Για έγκριση» chip: open the review tab at that card.
+window.addEventListener('desk:approval', (ev) => {
+  switchTab('review');
+  focusApproval(ev.detail.id);
+});
 
 // A link or back/forward that changes only the hash. switchTab's replaceState
 // does not fire this, so there is no loop.
@@ -190,7 +201,7 @@ async function loadStatusOnce() {
 
   const queue = data.queue;
   document.getElementById('queue-status').textContent = queue
-    ? `Ουρά: ${queue.pending} σε αναμονή · ${queue.running} σε εξέλιξη`
+    ? `Ουρά: ${queue.pending} σε αναμονή · ${queue.running} σε εξέλιξη${queue.approval > 0 ? ` · Για έγκριση ${queue.approval}` : ''}`
     : 'Ουρά: —';
   const tempFree = data.disk?.temp?.free_gb;
   document.getElementById('temp-status').textContent =
@@ -256,6 +267,7 @@ function setStatus(prefix, text, dotClass, title) {
 const pages = {
   live: { page: 1, perPage: 15 },
   review: { page: 1, perPage: 20 },
+  approval: { page: 1, perPage: 100 },
   completed: { page: 1, perPage: 25 },
 };
 
@@ -274,7 +286,8 @@ function showCounts(counts) {
     b.textContent = String(n || 0);
   };
   set('queue-count', counts.active);
-  set('review-count', counts.review);
+  // Held videos wait for a person too, so they count on the same tab.
+  set('review-count', (counts.review || 0) + (counts.approval || 0));
   // The Completed badge is today's deliveries; the total is in the tooltip.
   set('completed-count', counts.completed_today);
   document.getElementById('completed-count').title = `Σήμερα · σύνολο ${counts.completed || 0}`;
@@ -574,7 +587,20 @@ function withDayHeadings(jobs, card) {
   return out;
 }
 
+/* The held videos (P10.7): fetched with every review refresh, but their cards
+ * are reconciled by job id (approval.js), never rebuilt. A failed fetch leaves
+ * the cards as they are. */
+async function loadApproval() {
+  try {
+    const data = await fetchPage('approval');
+    syncApproval(document.getElementById('approval-section'), data.jobs || [], {
+      mailLink, historyPanel, markDone: (job) => deskMarkDone(job, refresh), refresh,
+    });
+  } catch (e) { failed(e); }
+}
+
 async function loadReview() {
+  await loadApproval();
   let data;
   try {
     const extra = {};
@@ -587,7 +613,7 @@ async function loadReview() {
   showCounts(data.counts);
   const jobs = data.jobs || [];
   // Forget the history of jobs that left the page; keep the rest.
-  const here = new Set(jobs.map((j) => j.id));
+  const here = new Set([...jobs.map((j) => j.id), ...approvalIds()]);
   for (const id of [...historyState.keys(), ...historyBox.keys(), ...historyOpen, ...historyTech]) {
     if (here.has(id)) continue;
     historyState.delete(id); historyBox.delete(id); historyOpen.delete(id); historyTech.delete(id);

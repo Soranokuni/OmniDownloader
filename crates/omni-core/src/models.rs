@@ -297,6 +297,8 @@ pub enum JobsView {
     Live,
     /// Needs a person: review, file-locker downloads, failures.
     Review,
+    /// Videos held for MCR approval, oldest first (P10.7).
+    Approval,
     /// Every delivered job, cleared or not, newest first.
     Completed,
 }
@@ -337,6 +339,8 @@ pub struct JobCounts {
     pub review_hidden: i64,
     /// Delivered since local midnight on the server (P7.21).
     pub completed_today: i64,
+    /// Videos waiting for MCR approval (P10.7).
+    pub approval: i64,
 }
 
 /// What the `queue` health check looks at (plan P7.19).

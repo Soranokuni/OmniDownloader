@@ -936,6 +936,36 @@ fn held_job(app: &App, n: u32) -> Result<i64> {
 }
 
 #[tokio::test]
+async fn the_approval_view_lists_only_held_jobs_with_their_held_block() -> Result<()> {
+    let app = App::new()?;
+    let held = held_job(&app, 1)?;
+    // A job in review must not show up in the approval view.
+    let other = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/r1", "2_NIKOLAOU_REVIEW", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    app.repo.finish(other, "test-worker", JobStatus::RequiresReview, Some("E_TEST"), Some("why"), None)?;
+
+    let (status, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 1, "{page}");
+    assert_eq!(page["jobs"][0]["id"], held, "{page}");
+    assert_eq!(page["jobs"][0]["held"]["sha256"], HELD_SHA, "{page}");
+    assert_eq!(page["counts"]["approval"], 1, "{page}");
+    assert_eq!(page["counts"]["review"], 1, "{page}");
+
+    // The review list does not contain the held job.
+    let (_, review) = app.send("GET", "/api/jobs?view=review", &app.mcr_token, None).await?;
+    assert_eq!(review["total"], 1, "{review}");
+    assert_eq!(review["jobs"][0]["id"], other, "{review}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_desk_sees_the_held_file_and_approves_exactly_that_sha() -> Result<()> {
     let app = App::new()?;
     let id = held_job(&app, 1)?;

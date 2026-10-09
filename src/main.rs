@@ -155,6 +155,20 @@ enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// Development only (debug builds): make a real held video from a local
+    /// file, so the MCR desk's «Για έγκριση» can be seen. Use a dev config.
+    #[cfg(debug_assertions)]
+    DevHold {
+        /// The video (or audio) file to hold; it is copied, never moved
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// File name without `.mxf` (default `1_{JOURNALIST}_DEVHOLD`)
+        #[arg(long)]
+        slug: Option<String>,
+        /// Journalist surname for the job
+        #[arg(long)]
+        journalist: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -320,6 +334,105 @@ Nothing was queued and the mailbox was not changed.");
 
 /// `omni-ingest mail-ingest --eml …` (plan P7.9): saved mail through the
 /// watcher's own path into the configured database. Reads no mailbox.
+/// `dev-hold` makes jobs and files: it must never touch the live installation.
+/// Refused unless `--config` was given and neither the config nor the database
+/// is the install root's own.
+#[cfg(debug_assertions)]
+fn dev_hold_guard(paths: &AppPaths, config_given: bool, db: &std::path::Path) -> Result<()> {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        let key = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+        key(a) == key(b)
+    };
+    anyhow::ensure!(config_given, "dev-hold needs an explicit --config pointing at a throwaway dev config");
+    anyhow::ensure!(
+        !same(&paths.config, &paths.root.join("config.json")),
+        "dev-hold refuses the install's own config.json; use a dev config"
+    );
+    anyhow::ensure!(
+        !same(db, &paths.root.join("data").join("omni.db")),
+        "dev-hold refuses the install's own database (data/omni.db); use a dev config"
+    );
+    Ok(())
+}
+
+/// Debug builds only: a real held video from a local file, made the way the
+/// worker makes one (copy as an attachment source, lease, transcode, gate,
+/// hold, preview, park). Stop the daemon on that config first, so no worker
+/// leases the job (or another one) before this does.
+#[cfg(debug_assertions)]
+async fn dev_hold(
+    paths: &AppPaths,
+    file: &std::path::Path,
+    slug: Option<String>,
+    journalist: Option<String>,
+) -> Result<()> {
+    use omni_broadcast::pipeline::{DeliveryMode, RunOutcome};
+
+    anyhow::ensure!(file.is_file(), "{file:?} is not a file");
+    let config_given = std::env::args().any(|a| a == "-c" || a == "--config" || a.starts_with("--config="));
+    let config = AppConfig::load_from_file(&paths.config)
+        .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+    let db_path = paths.resolve(&config.database_path);
+    dev_hold_guard(paths, config_given, &db_path)?;
+    let repo = Repository::new(&db_path)?;
+    let temp_path = paths.resolve(&config.temp_path);
+    let watchfolder_path = paths.resolve(&config.watchfolder_path);
+    let deps = DependencyManager::new(&paths.resolve(&config.bin_dir));
+    let tool = |configured: &Option<String>, name: &str| {
+        configured
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| deps.find_binary(name))
+            .unwrap_or_else(|| PathBuf::from(format!("{name}.exe")))
+    };
+    let engine = BroadcastEngine::new(
+        repo.clone(),
+        tool(&config.ytdl_path, "yt-dlp"),
+        tool(&config.ffmpeg_path, "ffmpeg"),
+        tool(&config.ffprobe_path, "ffprobe"),
+        tool(&config.bmxtranswrap_path, "bmxtranswrap"),
+        temp_path.clone(),
+        watchfolder_path,
+    );
+
+    let journalist = journalist.unwrap_or_else(|| "DEVTEST".to_string()).to_uppercase();
+    let slug = slug.unwrap_or_else(|| format!("1_{journalist}_DEVHOLD"));
+    // Unique, so the dedup window never folds two runs into one job.
+    let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let mut new = omni_core::models::NewJob::new(format!("attachment://dev-hold/{nonce}"), slug, journalist);
+    new.keyword = "DEVHOLD".into();
+    new.status = JobStatus::ManualDownload;
+    new.extraction_method = Some("attachment".into());
+    let id = repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+
+    let dir = temp_path.join("attachments").join(id.to_string());
+    std::fs::create_dir_all(&dir)?;
+    let source = dir.join(file.file_name().context("the file has no name")?);
+    std::fs::copy(file, &source).with_context(|| format!("Could not copy {file:?} to {source:?}"))?;
+    anyhow::ensure!(repo.attach_source(id, &source.to_string_lossy())?, "job #{id} could not take its source");
+
+    let owner = format!("{}:dev-hold", hostname_for_lease());
+    // Exactly our job, never the next one in the queue. A daemon on this dev
+    // database could take it first; then it is cancelled, not left to run.
+    if !repo.lease_job_by_id(id, &owner, 3600)? {
+        let _ = repo.cancel_job(id);
+        anyhow::bail!("job #{id} could not be leased (a daemon on this dev database took it?); it was cancelled");
+    }
+    let job = repo.get_job(id)?.context("the job vanished")?;
+    let mode = DeliveryMode::Hold {
+        hold_hours: config.repair.hold_hours,
+        held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
+    };
+    match engine.process_job_mode(job, &owner, None, None, None, None, mode).await? {
+        RunOutcome::Held => {
+            anyhow::ensure!(finish_held(&repo, id, &owner)?, "job #{id} is no longer ours");
+            println!("Held job #{id}");
+        }
+        RunOutcome::Delivered => anyhow::bail!("job #{id} was delivered instead of held"),
+    }
+    Ok(())
+}
+
 async fn mail_ingest(paths: &AppPaths, files: &[std::path::PathBuf]) -> Result<()> {
     use omni_email::watcher::Ingested;
 
@@ -499,6 +612,10 @@ async fn main() -> Result<()> {
         }
         Some(Commands::MailIngest { eml }) => {
             mail_ingest(&paths, &eml).await?;
+        }
+        #[cfg(debug_assertions)]
+        Some(Commands::DevHold { file, slug, journalist }) => {
+            dev_hold(&paths, &file, slug, journalist).await?;
         }
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)
@@ -2858,6 +2975,19 @@ mod tests {
     }
 
     /// P10.5: the worker holding the lease parks a held job; only it can.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_hold_refuses_the_live_install() {
+        let paths = AppPaths::with_root("C:/omni-install", "config.json");
+        let live_db = paths.root.join("data").join("omni.db");
+        assert!(dev_hold_guard(&paths, false, &paths.root.join("dev").join("omni.db")).is_err(), "no explicit --config");
+        assert!(dev_hold_guard(&paths, true, &live_db).is_err(), "the live database");
+        assert!(dev_hold_guard(&paths, true, &paths.root.join("dev").join("omni.db")).is_err(), "config.json of the root");
+        let dev = AppPaths::with_root("C:/omni-install", "dev/config.json");
+        assert!(dev_hold_guard(&dev, true, &dev.root.join("dev").join("omni.db")).is_ok());
+        assert!(dev_hold_guard(&dev, true, std::path::Path::new("C:/OMNI-INSTALL/Data/omni.db")).is_err(), "case-insensitive on Windows paths");
+    }
+
     #[test]
     fn finish_held_parks_the_job_for_its_owner_and_nobody_else() {
         let (_db, repo) = ScratchDb::new();

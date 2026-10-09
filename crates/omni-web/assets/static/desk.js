@@ -87,6 +87,7 @@ export function statusBadge(job) {
     case 'MANUAL_DOWNLOAD': return el('span', { class: 'badge warn' }, 'Χειροκίνητη λήψη');
     case 'FAILED': return el('span', { class: 'badge bad' }, 'Απέτυχε');
     case 'CANCELLED': return el('span', { class: 'badge' }, 'Ακυρώθηκε');
+    case 'AWAITING_APPROVAL': return el('span', { class: 'badge warn' }, 'Για έγκριση');
     default: return el('span', { class: 'badge warn' }, 'Χρειάζεται έλεγχο');
   }
 }
@@ -102,6 +103,7 @@ export function tone(job) {
     case 'CANCELLED':
       return 'wait';
     case 'FAILED': return 'bad';
+    case 'AWAITING_APPROVAL': return 'approval';
     default: return 'warn';
   }
 }
@@ -287,6 +289,7 @@ export function eventText(ev) {
   if ((x = /^Stage (\w+)$/.exec(m))) return STAGE_TEXT[x[1]] || x[1];
   if (/^Finished as COMPLETED_MANUAL/.test(m)) return 'Παραδόθηκε χειροκίνητα';
   if (/^Finished as COMPLETED/.test(m)) return 'Παραδόθηκε στο Dalet';
+  if (/^Finished as AWAITING_APPROVAL/.test(m)) return 'Έτοιμο: περιμένει έγκριση από το MCR';
   if (/^Finished as MANUAL_DOWNLOAD/.test(m)) return 'Σταμάτησε: χρειάζεται χειροκίνητη λήψη';
   if (/^Finished as /.test(m)) return 'Σταμάτησε: χρειάζεται έλεγχο';
   if ((x = /retrying in (\d+) s/.exec(m))) return `Πρόβλημα· νέα προσπάθεια σε ${x[1]} δευτ.`;

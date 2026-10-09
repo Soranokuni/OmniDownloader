@@ -536,22 +536,36 @@ impl Repository {
     /// Runs in one IMMEDIATE transaction so two workers cannot select the same
     /// row before either updates it.
     pub fn lease_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
-        self.lease_next(owner, lease_secs, false)
+        self.lease_next(owner, lease_secs, false, None)
+    }
+
+    /// Lease exactly job `id`, and only while it is PENDING and ready; any
+    /// other job is left alone. For tools that made a job themselves and must
+    /// never take someone else's. `false`: nothing leased.
+    pub fn lease_job_by_id(&self, id: i64, owner: &str, lease_secs: i64) -> Result<bool> {
+        Ok(self.lease_next(owner, lease_secs, false, Some(id))?.is_some())
     }
 
     /// [`Self::lease_job`] limited to jobs MCR approved a held video for
     /// (P10.5). Delivering such a job downloads and encodes nothing, so the
     /// worker loop may take one when every download slot is busy.
     pub fn lease_approved_held_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
-        self.lease_next(owner, lease_secs, true)
+        self.lease_next(owner, lease_secs, true, None)
     }
 
-    fn lease_next(&self, owner: &str, lease_secs: i64, approved_held_only: bool) -> Result<Option<Job>> {
+    fn lease_next(&self, owner: &str, lease_secs: i64, approved_held_only: bool, only_id: Option<i64>) -> Result<Option<Job>> {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let now = timestamps::now_string();
-        let select = if approved_held_only {
+        let select = if only_id.is_some() {
+            r#"
+                SELECT id FROM queue
+                WHERE status = 'PENDING'
+                  AND (not_before IS NULL OR not_before <= ?)
+                  AND id = ?
+                "#
+        } else if approved_held_only {
             r#"
                 SELECT id FROM queue
                 WHERE status = 'PENDING'
@@ -572,7 +586,7 @@ impl Repository {
         let id: Option<i64> = tx
             .query_row(
                 select,
-                params![now],
+                rusqlite::params_from_iter(std::iter::once(rusqlite::types::Value::Text(now.clone())).chain(only_id.map(rusqlite::types::Value::Integer))),
                 |r| r.get(0),
             )
             .optional()?;
@@ -1135,6 +1149,7 @@ impl Repository {
                 },
                 "updated_at DESC, id DESC",
             ),
+            JobsView::Approval => ("status = 'AWAITING_APPROVAL'", "created_at ASC, id ASC"),
             JobsView::Completed => (
                 "status IN ('COMPLETED','COMPLETED_MANUAL')",
                 "COALESCE(completed_at, updated_at) DESC, id DESC",
@@ -1203,7 +1218,8 @@ impl Repository {
               COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NULL), 0),
               COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL')), 0),
               COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NOT NULL), 0),
-              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND completed_at >= ?), 0)
+              COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND completed_at >= ?), 0),
+              COALESCE(SUM(status = 'AWAITING_APPROVAL'), 0)
             FROM queue
             "#,
             params![today_start],
@@ -1215,6 +1231,7 @@ impl Repository {
                     completed: r.get(3)?,
                     review_hidden: r.get(4)?,
                     completed_today: r.get(5)?,
+                    approval: r.get(6)?,
                 })
             },
         )?)

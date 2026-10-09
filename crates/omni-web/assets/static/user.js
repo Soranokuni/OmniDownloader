@@ -12,6 +12,7 @@ const STATUS_TEXT = {
   COMPLETED_MANUAL: 'Παραδόθηκε',
   REQUIRES_REVIEW: 'Το εξετάζει το MCR',
   MANUAL_DOWNLOAD: 'Το κατεβάζει το MCR',
+  AWAITING_APPROVAL: 'Το βλέπει το MCR',
   FAILED: 'Απέτυχε',
   CANCELLED: 'Ακυρώθηκε',
 };
