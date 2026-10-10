@@ -240,9 +240,65 @@ pub fn unmap_v4(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// True for an address an outbound fetch must never reach: private, loopback,
+/// link-local, CGNAT, multicast, reserved, documentation and benchmarking
+/// ranges, ULA, and every IPv6 form that embeds an IPv4 address
+/// (IPv4-compatible, IPv4-mapped, SIIT, NAT64 incl. local-use, 6to4, Teredo).
+pub fn is_non_public(ip: IpAddr) -> bool {
+    const BLOCKS: &[&str] = &[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "::/96",
+        "::ffff:0:0:0/96",
+        "64:ff9b:1::/48",
+        "2001::/32",
+        "2001:db8::/32",
+        "100::/64",
+        "fec0::/10",
+        "::ffff:0:0/96",
+        "64:ff9b::/96",
+        "2002::/16",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    ];
+    BLOCKS
+        .iter()
+        .filter_map(|b| b.parse::<Cidr>().ok())
+        .any(|c| c.contains(ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_public_covers_private_and_embedded_v4_forms() {
+        for a in [
+            "10.0.0.5", "127.0.0.1", "169.254.1.1", "100.64.0.1", "172.16.0.1", "192.168.1.1", "224.0.0.1",
+            "0.0.0.0", "::1", "::", "::127.0.0.1", "::ffff:10.0.0.5", "64:ff9b::a00:1", "2002:7f00:1::1",
+            "fd00::1", "fe80::1", "ff02::1",
+            "192.0.0.8", "192.0.2.1", "198.18.0.1", "198.19.255.1", "198.51.100.7", "203.0.113.9",
+            "::ffff:0:0:1", "64:ff9b:1::1", "2001:0:4136:e378::1", "2001:db8::1", "100::1", "fec0::1",
+        ] {
+            assert!(is_non_public(a.parse().unwrap()), "{a}");
+        }
+        for a in ["93.184.216.34", "8.8.8.8", "2606:4700::1111"] {
+            assert!(!is_non_public(a.parse().unwrap()), "{a}");
+        }
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
