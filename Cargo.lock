@@ -1624,6 +1624,8 @@ name = "omni-broadcast"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "chrono",
  "omni-core",
  "regex",
@@ -1634,6 +1636,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]

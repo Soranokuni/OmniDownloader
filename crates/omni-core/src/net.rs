@@ -280,9 +280,141 @@ pub fn is_non_public(ip: IpAddr) -> bool {
         .any(|c| c.contains(ip))
 }
 
+/// True when `ip` is a public unicast address a request may go to.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    !is_non_public(ip)
+}
+
+/// Why an address may not be requested.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EgressError {
+    #[error("the name did not resolve")]
+    Unresolved,
+    #[error("the name did not resolve within the time allowed")]
+    Timeout,
+    #[error("the name resolves to a non-public address")]
+    NonPublic,
+}
+
+/// The URL half of the egress rule, shared by the recipe `Fetch` step and the
+/// repair gate: http or https, no userinfo, never `localhost` (trailing dot
+/// included) and never a private or reserved address literal. Returns the
+/// parsed URL, which the caller must use instead of the raw text (the parser
+/// and other URL readers can disagree about the host of the raw text), and the
+/// lowercase host without a trailing dot. The error is short and names the host
+/// only, never the path or query.
+pub fn parse_public_url(raw: &str) -> Result<(reqwest::Url, String), String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "url".to_string())?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("scheme".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("userinfo".to_string());
+    }
+    let shown = url.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if shown.is_empty() {
+        return Err("host missing".to_string());
+    }
+    if let Ok(ip) = shown.parse::<IpAddr>() {
+        if is_non_public(ip) {
+            return Err(format!("host {ip} is a private address"));
+        }
+        return Ok((url, ip.to_string()));
+    }
+    let d = shown.trim_end_matches('.').to_string();
+    if d == "localhost" || d.ends_with(".localhost") {
+        return Err(format!("host {d} is local"));
+    }
+    Ok((url, d))
+}
+
+/// Resolve `host` and return its addresses, failing when resolution fails, is
+/// too slow, or ANY address is not public (a name with one public and one
+/// private record is still a way in).
+pub async fn resolve_public(
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<Vec<std::net::SocketAddr>, EgressError> {
+    let found = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| EgressError::Timeout)?
+        .map_err(|_| EgressError::Unresolved)?;
+    check_addrs(found.collect())
+}
+
+/// The answer rule of [`resolve_public`]: at least one address, and EVERY one
+/// public.
+pub fn check_addrs(addrs: Vec<std::net::SocketAddr>) -> Result<Vec<std::net::SocketAddr>, EgressError> {
+    if addrs.is_empty() {
+        return Err(EgressError::Unresolved);
+    }
+    if addrs.iter().any(|a| !is_public_ip(a.ip())) {
+        return Err(EgressError::NonPublic);
+    }
+    Ok(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ip_range_edges() {
+        // (first non-public, last non-public) per block, then the public
+        // neighbours just outside.
+        for a in [
+            "0.0.0.0", "0.255.255.255", "10.0.0.0", "10.255.255.255", "100.64.0.0", "100.127.255.255",
+            "127.0.0.0", "127.255.255.255", "169.254.0.0", "169.254.255.255", "172.16.0.0", "172.31.255.255",
+            "192.168.0.0", "192.168.255.255", "224.0.0.0", "239.255.255.255", "240.0.0.0", "255.255.255.255",
+            "192.0.0.0", "192.0.0.255", "192.0.2.0", "192.0.2.255", "198.18.0.0", "198.19.255.255",
+            "198.51.100.0", "198.51.100.255", "203.0.113.0", "203.0.113.255",
+            "fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe80::", "febf:ffff::1", "ff00::", "2001:db8::", "2001:db8:ffff::1",
+        ] {
+            assert!(!is_public_ip(a.parse().unwrap()), "{a} must not be public");
+        }
+        for a in [
+            "1.0.0.0", "9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0", "126.255.255.255", "128.0.0.0",
+            "169.253.255.255", "169.255.0.0", "172.15.255.255", "172.32.0.0", "192.167.255.255", "192.169.0.0",
+            "192.0.1.0", "192.0.3.0", "198.17.255.255", "198.20.0.0", "198.51.99.255", "198.51.101.0",
+            "203.0.112.255", "203.0.114.0", "223.255.255.255", "2606:4700::1111", "2a00:1450:4001::1",
+        ] {
+            assert!(is_public_ip(a.parse().unwrap()), "{a} must be public");
+        }
+    }
+
+    #[test]
+    fn public_url_rule_rejects_local_forms() {
+        for u in [
+            "ftp://cdn.example.org/a.mp4", "http://user:pw@cdn.example.org/", "http://localhost/", "http://LOCALHOST./x",
+            "http://a.localhost/", "http://127.0.0.1/", "http://2130706433/", "http://0x7f.1/", "http://[::1]/",
+            "http://[::ffff:10.0.0.5]/", "http://10.1.2.3:8080/", "file:///C:/x", "not a url",
+        ] {
+            assert!(parse_public_url(u).is_err(), "{u}");
+        }
+        let (url, host) = parse_public_url("https://CDN.Example.org./v/a.mp4?x=1").unwrap();
+        assert_eq!(host, "cdn.example.org");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(parse_public_url("http://93.184.216.34/a").unwrap().1, "93.184.216.34");
+    }
+
+    #[test]
+    fn an_answer_is_accepted_only_when_every_address_is_public() {
+        let sa = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+        assert_eq!(check_addrs(vec![]), Err(EgressError::Unresolved));
+        let all_public = vec![sa("93.184.216.34:443"), sa("[2606:4700::1111]:443")];
+        assert_eq!(check_addrs(all_public.clone()), Ok(all_public));
+        assert_eq!(check_addrs(vec![sa("10.0.0.1:80"), sa("[fd00::1]:80")]), Err(EgressError::NonPublic));
+        assert_eq!(check_addrs(vec![sa("93.184.216.34:80"), sa("192.168.0.9:80")]), Err(EgressError::NonPublic));
+        assert_eq!(check_addrs(vec![sa("127.0.0.1:80"), sa("93.184.216.34:80")]), Err(EgressError::NonPublic));
+    }
+
+    #[tokio::test]
+    async fn resolve_public_refuses_a_loopback_answer() {
+        // `localhost` resolves to loopback without any network.
+        let r = resolve_public("localhost", 80, std::time::Duration::from_secs(5)).await;
+        assert!(matches!(r, Err(EgressError::NonPublic) | Err(EgressError::Unresolved)), "{r:?}");
+    }
 
     #[test]
     fn non_public_covers_private_and_embedded_v4_forms() {

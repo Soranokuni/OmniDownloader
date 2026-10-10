@@ -18,6 +18,7 @@ pub const MAX_PLAYER_HTML_CHARS: usize = 4096;
 pub const MAX_SCRIPTS: usize = 20;
 pub const MAX_SCRIPT_CHARS: usize = 2048;
 pub const MAX_POSTERS: usize = 20;
+pub const MAX_AD_MEDIA: usize = 64;
 pub const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 const MAX_URL_CHARS: usize = 2048;
 
@@ -78,6 +79,10 @@ pub struct PageSnapshot {
     /// `document.readyState` when the facts were read.
     #[serde(default)]
     pub ready_state: Option<String>,
+    /// Media files an ad server's VAST reply named (capped, `MAX_AD_MEDIA`),
+    /// so later checks have them from the saved snapshot alone.
+    #[serde(default)]
+    pub ad_media: Vec<String>,
     /// RFC 3339.
     pub captured_at: String,
 }
@@ -125,6 +130,16 @@ impl PageSnapshot {
             captured_at: chrono::Utc::now().to_rfc3339(),
             ..Default::default()
         }
+    }
+
+    /// Add an ad media URL under the cap; false when it was not added.
+    pub fn push_ad_media(&mut self, url: &str) -> bool {
+        let url = truncate_chars(url, MAX_URL_CHARS);
+        if self.ad_media.len() >= MAX_AD_MEDIA || self.ad_media.contains(&url) {
+            return false;
+        }
+        self.ad_media.push(url);
+        true
     }
 
     /// Add a network entry under the cap.
@@ -233,11 +248,12 @@ impl PageSnapshot {
                 s.html = None;
             }
         }
-        let steps: [fn(&mut PageSnapshot); 4] = [
+        let steps: [fn(&mut PageSnapshot); 5] = [
             |s| s.scripts.clear(),
             |s| s.players.clear(),
             |s| s.ld_json.clear(),
             |s| s.meta.clear(),
+            |s| s.ad_media.clear(),
         ];
         for step in steps {
             if size(&s) <= max_bytes {
@@ -756,6 +772,103 @@ pub fn combine(passive: &Evidence, diagnostic: &Evidence) -> Evidence {
     let mut signals: Vec<String> = win.signals.iter().chain(other.signals.iter()).filter(|s| seen.insert((*s).clone())).cloned().collect();
     signals.truncate(MAX_SIGNALS);
     Evidence { class: win.class, signals, diagnosed: diagnostic.diagnosed }
+}
+
+/// Longest and shortest video length a page statement is believed for.
+const MIN_EXPECTED_SECS: f64 = 1.0;
+const MAX_EXPECTED_SECS: f64 = 6.0 * 3600.0;
+
+/// ISO 8601 duration (`PT2M34S`, `PT1H2M3.5S`, `P0DT1H`) in seconds.
+fn parse_iso8601_duration(s: &str) -> Option<f64> {
+    let s = s.trim().to_ascii_uppercase();
+    let mut rest = s.strip_prefix('P')?;
+    let mut total = 0.0f64;
+    let mut in_time = false;
+    let mut any = false;
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('T') {
+            if in_time {
+                return None;
+            }
+            in_time = true;
+            rest = r;
+            continue;
+        }
+        let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+        let n: f64 = rest[..end].parse().ok()?;
+        let unit = rest[end..].chars().next()?;
+        let secs = match (in_time, unit) {
+            (false, 'D') => 86400.0,
+            (true, 'H') => 3600.0,
+            (true, 'M') => 60.0,
+            (true, 'S') => 1.0,
+            _ => return None,
+        };
+        total += n * secs;
+        any = true;
+        rest = &rest[end + 1..];
+    }
+    (any && total.is_finite()).then_some(total)
+}
+
+fn plausible_secs(v: f64) -> Option<f64> {
+    (v.is_finite() && v > MIN_EXPECTED_SECS && v <= MAX_EXPECTED_SECS).then_some(v)
+}
+
+fn is_video_object(v: &Value) -> bool {
+    match v.get("@type") {
+        Some(Value::String(t)) => t == "VideoObject",
+        Some(Value::Array(a)) => a.iter().any(|t| t.as_str() == Some("VideoObject")),
+        _ => false,
+    }
+}
+
+/// First VideoObject duration in a JSON-LD value, through arrays, `@graph` and
+/// nested objects (bounded depth).
+fn ld_video_duration(v: &Value, depth: usize) -> Option<f64> {
+    if depth > 6 {
+        return None;
+    }
+    match v {
+        Value::Array(a) => a.iter().find_map(|x| ld_video_duration(x, depth + 1)),
+        Value::Object(o) => {
+            if is_video_object(v) {
+                if let Some(d) = o.get("duration").and_then(Value::as_str).and_then(parse_iso8601_duration).and_then(plausible_secs) {
+                    return Some(d);
+                }
+            }
+            o.values().find_map(|x| ld_video_duration(x, depth + 1))
+        }
+        _ => None,
+    }
+}
+
+/// The length the page itself states for its video, in seconds: a JSON-LD
+/// VideoObject `duration`, then `og:video:duration` / `video:duration`
+/// (seconds), then `itemprop=duration` (ISO 8601). Values of 1 s or less, or
+/// over 6 h, are ignored as junk.
+pub fn expected_duration_secs(snap: &PageSnapshot) -> Option<f64> {
+    for raw in &snap.ld_json {
+        if let Ok(v) = serde_json::from_str::<Value>(raw) {
+            if let Some(d) = ld_video_duration(&v, 0) {
+                return Some(d);
+            }
+        }
+    }
+    fn meta<'a>(snap: &'a PageSnapshot, names: &'a [&str]) -> impl Iterator<Item = &'a str> {
+        snap.meta.iter().filter(move |(k, _)| names.iter().any(|n| k.eq_ignore_ascii_case(n))).map(|(_, v)| v.trim())
+    }
+    for v in meta(snap, &["og:video:duration", "video:duration"]) {
+        if let Some(d) = v.parse::<f64>().ok().and_then(plausible_secs) {
+            return Some(d);
+        }
+    }
+    for v in meta(snap, &["duration"]) {
+        if let Some(d) = parse_iso8601_duration(v).and_then(plausible_secs) {
+            return Some(d);
+        }
+    }
+    None
 }
 
 /// Whether a response may be an ad server's VAST reply worth reading: an XML
@@ -1420,5 +1533,71 @@ mod tests {
             d.record(&format!(r#"{{"k":"play","v":"https://a.example/{i}.mp4"}}"#));
         }
         assert_eq!(d.played_srcs.len(), 32);
+    }
+
+    fn snap_with(ld: &[&str], meta: &[(&str, &str)]) -> PageSnapshot {
+        let mut s = PageSnapshot::new("https://news.example/a");
+        s.ld_json = ld.iter().map(|x| x.to_string()).collect();
+        s.meta = meta.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        s
+    }
+
+    #[test]
+    fn expected_duration_table() {
+        let vo = |d: &str| format!(r#"{{"@type":"VideoObject","duration":"{d}"}}"#);
+        let cases: Vec<(PageSnapshot, Option<f64>)> = vec![
+            (snap_with(&[&vo("PT2M34S")], &[]), Some(154.0)),
+            (snap_with(&[&vo("PT1H2M3.5S")], &[]), Some(3723.5)),
+            (snap_with(&[r#"{"@graph":[{"@type":"WebPage"},{"@type":["Thing","VideoObject"],"duration":"PT45S"}]}"#], &[]), Some(45.0)),
+            (snap_with(&[&format!("[{}]", vo("PT1M"))], &[]), Some(60.0)),
+            (snap_with(&[], &[("og:video:duration", "154")]), Some(154.0)),
+            (snap_with(&[], &[("video:duration", "30.5")]), Some(30.5)),
+            (snap_with(&[], &[("duration", "PT3M")]), Some(180.0)),
+            (snap_with(&[&vo("PT2M")], &[("og:video:duration", "999")]), Some(120.0)),
+            (snap_with(&[&vo("junk")], &[]), None),
+            (snap_with(&["not json"], &[("og:video:duration", "abc")]), None),
+            (snap_with(&[&vo("PT0S")], &[]), None),
+            (snap_with(&[&vo("PT1S")], &[]), None),
+            (snap_with(&[&vo("PT10H")], &[]), None),
+            (snap_with(&[], &[("og:video:duration", "0")]), None),
+            (snap_with(&[], &[("og:video:duration", "36000")]), None),
+            (snap_with(&[r#"{"@type":"NewsArticle","duration":"PT2M"}"#], &[]), None),
+            (snap_with(&[&vo("PT")], &[]), None),
+            (PageSnapshot::new("https://x.example/"), None),
+        ];
+        for (i, (s, want)) in cases.iter().enumerate() {
+            assert_eq!(expected_duration_secs(s), *want, "case {i}");
+        }
+    }
+
+    #[test]
+    fn ad_media_is_capped_and_deduplicated_in_the_snapshot() {
+        let mut s = PageSnapshot::new("https://news.example/a");
+        assert!(s.push_ad_media("https://ads.example/a.mp4"));
+        assert!(!s.push_ad_media("https://ads.example/a.mp4"));
+        for i in 0..100 {
+            s.push_ad_media(&format!("https://ads.example/{i}.mp4"));
+        }
+        assert_eq!(s.ad_media.len(), MAX_AD_MEDIA);
+        let back: PageSnapshot = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.ad_media.len(), MAX_AD_MEDIA);
+        // An older saved snapshot without the field still loads.
+        let old: PageSnapshot = serde_json::from_str(r#"{"page_url":"https://x.example/","final_url":null,"title":null,"canonical":null,"meta":[],"ld_json":[],"network":[],"players":[],"scripts":[],"posters":[],"html":null,"captured_at":"t"}"#).unwrap();
+        assert!(old.ad_media.is_empty());
+    }
+
+    #[test]
+    fn capping_drops_ad_media_before_any_network_entry() {
+        let mut s = PageSnapshot::new("https://news.example/a");
+        for i in 0..20 {
+            s.push_network(NetworkEntry { url: format!("https://news.example/r/{i}"), ..Default::default() });
+        }
+        for i in 0..64 {
+            s.push_ad_media(&format!("https://ads.example/{i}/{}", "x".repeat(400)));
+        }
+        let cap = serde_json::to_string(&s).unwrap().len() - 1000;
+        let back: PageSnapshot = serde_json::from_str(&s.to_capped_json(cap)).unwrap();
+        assert_eq!(back.network.len(), 20, "network entries survive while ad_media can still go");
+        assert!(back.ad_media.is_empty());
     }
 }

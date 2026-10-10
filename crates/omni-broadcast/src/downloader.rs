@@ -446,6 +446,61 @@ impl Downloader {
     }
 }
 
+/// What yt-dlp says about the video at a link, without downloading it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlatformInfo {
+    pub duration_secs: Option<f64>,
+    pub height: Option<u32>,
+    pub live: bool,
+}
+
+/// `--print "%(duration)s|%(height)s|%(is_live)s|%(live_status)s"`: the first
+/// non-empty line. A field yt-dlp does not know is `NA`.
+pub fn parse_platform_line(stdout: &str) -> Option<PlatformInfo> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let f: Vec<&str> = line.split('|').map(str::trim).collect();
+    if f.len() != 4 {
+        return None;
+    }
+    fn known(s: &str) -> Option<&str> {
+        (s != "NA" && !s.is_empty()).then_some(s)
+    }
+    Some(PlatformInfo {
+        duration_secs: known(f[0]).and_then(|s| s.parse::<f64>().ok()).filter(|d| d.is_finite()),
+        height: known(f[1]).and_then(|s| s.parse::<f64>().ok()).filter(|h| *h >= 0.0).map(|h| h as u32),
+        live: f[2] == "True" || matches!(f[3], "is_live" | "is_upcoming"),
+    })
+}
+
+impl Downloader {
+    /// Length, height and live flag of the video at `url` (a page or platform
+    /// link), without downloading it. `Err` is the one-line reason.
+    pub async fn probe_media(&self, url: &str, timeout: Duration) -> std::result::Result<PlatformInfo, String> {
+        let mut args: Vec<String> = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "15",
+            "--print",
+            "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_platform_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
+            Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
+            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
+        }
+    }
+}
+
 /// What `--flat-playlist -J` made of a page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageScan {
@@ -786,5 +841,22 @@ mod tests {
         let msg = first_error_line(stderr);
         assert!(msg.contains("Private video"), "{msg}");
         assert!(!msg.contains("Exiting with code"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod platform_probe_tests {
+    use super::*;
+
+    #[test]
+    fn platform_line_is_parsed() {
+        let p = parse_platform_line("154.5|720|False|not_live\n").unwrap();
+        assert_eq!((p.duration_secs, p.height, p.live), (Some(154.5), Some(720), false));
+        let p = parse_platform_line("NA|NA|True|is_live").unwrap();
+        assert_eq!((p.duration_secs, p.height, p.live), (None, None, true));
+        assert!(parse_platform_line("90|480|NA|is_upcoming").unwrap().live);
+        assert!(!parse_platform_line("90|480|NA|was_live").unwrap().live);
+        assert!(parse_platform_line("garbage").is_none());
+        assert!(parse_platform_line("").is_none());
     }
 }
