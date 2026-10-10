@@ -10,13 +10,11 @@
 
 use crate::evidence::PageSnapshot;
 use async_trait::async_trait;
-use omni_core::net::is_non_public;
 use regex::{Regex, RegexBuilder};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
 use std::time::Instant;
 use tracing::debug;
 
@@ -467,36 +465,7 @@ enum Flow {
 /// disagree about the host of the raw text. The error holds the host only.
 fn check_url(snap: &PageSnapshot, raw: &str) -> Result<reqwest::Url, String> {
     use reqwest::Url;
-    let url = Url::parse(raw).map_err(|_| "url".to_string())?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err("scheme".to_string());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("userinfo".to_string());
-    }
-    let host = match url.host() {
-        Some(url::Host::Domain(d)) if !d.is_empty() => {
-            let d = d.to_ascii_lowercase();
-            let d = d.trim_end_matches('.').to_string();
-            if d == "localhost" || d.ends_with(".localhost") {
-                return Err(format!("host {d} is local"));
-            }
-            d
-        }
-        Some(url::Host::Ipv4(ip)) => {
-            if is_non_public(IpAddr::V4(ip)) {
-                return Err(format!("host {ip} is a private address"));
-            }
-            ip.to_string()
-        }
-        Some(url::Host::Ipv6(ip)) => {
-            if is_non_public(IpAddr::V6(ip)) {
-                return Err(format!("host {ip} is a private address"));
-            }
-            ip.to_string()
-        }
-        _ => return Err("host missing".to_string()),
-    };
+    let (url, host) = omni_core::net::parse_public_url(raw)?;
     if let Some(port) = url.port() {
         let seen = snap
             .network

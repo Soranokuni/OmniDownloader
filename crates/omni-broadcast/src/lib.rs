@@ -1,10 +1,12 @@
 pub mod article;
 pub mod delivery;
 pub mod errors;
+pub mod imagehash;
 pub mod downloader;
 pub mod pipeline;
 pub mod preview;
 pub mod probe;
+pub mod repair_gate;
 pub mod verify;
 pub mod rewrapper;
 pub mod selftest;

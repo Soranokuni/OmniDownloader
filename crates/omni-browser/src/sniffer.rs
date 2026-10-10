@@ -254,6 +254,9 @@ impl StreamSniffer {
             }
         }
         let mut diag = state.diag.lock().map(|d| d.clone()).unwrap_or_default();
+        for a in &diag.ad_media {
+            snapshot.push_ad_media(a);
+        }
         let main_ok = state.main_doc.lock().is_ok_and(|m| m.status.is_some_and(|s| (200..300).contains(&s)));
         // A page that ended up somewhere else (a login, a consent wall) was
         // not the one asked for.
