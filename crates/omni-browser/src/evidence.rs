@@ -409,6 +409,18 @@ pub struct Diagnostic {
     /// answered 2xx and the page facts were read. Without it, an empty result
     /// says nothing about the page.
     pub complete: bool,
+    /// What each live action of a recipe did, in order ("clicked", "missing",
+    /// "waited", ...; never a selector). Empty on a passive run.
+    #[serde(default)]
+    pub live_actions: Vec<String>,
+    /// The page itself was looked at properly (before the live actions' own
+    /// outcomes are counted): document 2xx, facts read, still the same page.
+    #[serde(default)]
+    pub live_page_ok: bool,
+    /// Before the first live action the page's `readyState` was read and was
+    /// not `loading`. A slow page may simply not have its element yet.
+    #[serde(default)]
+    pub live_ready_before: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

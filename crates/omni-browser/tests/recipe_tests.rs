@@ -2,7 +2,7 @@
 //! All snapshots are invented.
 
 use async_trait::async_trait;
-use omni_browser::recipe::{run, Fetcher, Recipe, RecipeError, RecipeOutcome};
+use omni_browser::recipe::{action_key, live_actions, run, run_after_live, Fetcher, LiveAction, Recipe, RecipeError, RecipeOutcome};
 use omni_browser::{NetworkEntry, PageSnapshot};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -680,4 +680,71 @@ async fn a_large_data_attribute_on_a_leaf_is_read_in_full() {
     );
     let r = one(r#"{"op":"attr","css":"div[data-player]","attr":"data-player"}"#);
     assert_eq!(go(&r, &snap(&html)).await, media(&url));
+}
+
+#[test]
+fn live_actions_come_out_in_step_order_and_only_the_live_ones() {
+    let r = recipe(
+        r##"{"dsl_version":1,"steps":[{"op":"click","css":"button.play"},{"op":"wait","ms":500},{"op":"net","url_re":"[.]m3u8"},{"op":"media","from":2,"referer":"page"}]}"##,
+    );
+    assert_eq!(live_actions(&r), vec![LiveAction::Click("button.play".into()), LiveAction::Wait(500)]);
+    let r = recipe(
+        r##"{"dsl_version":1,"steps":[{"op":"scroll_to","css":"#lazy"},{"op":"click","css":"#go"},{"op":"net","url_re":"[.]m3u8"},{"op":"media","from":2,"referer":"page"}]}"##,
+    );
+    assert_eq!(live_actions(&r), vec![LiveAction::ScrollTo("#lazy".into()), LiveAction::Click("#go".into())]);
+    let passive = one(r#"{"op":"ldjson","field":"contentUrl"}"#);
+    assert!(live_actions(&passive).is_empty());
+}
+
+#[test]
+fn action_key_is_equal_exactly_for_equal_actions() {
+    use LiveAction::*;
+    let a = [Click("#go".into()), Wait(500)];
+    assert_eq!(action_key(&a), action_key(&[Click("#go".into()), Wait(500)]));
+    assert_ne!(action_key(&a), action_key(&[Click("#go".into()), Wait(501)]));
+    assert_ne!(action_key(&a), action_key(&[Click("#gx".into()), Wait(500)]));
+    assert_ne!(action_key(&a), action_key(&[ScrollTo("#go".into()), Wait(500)]));
+    assert_ne!(action_key(&a), action_key(&[Wait(500), Click("#go".into())]));
+    assert_ne!(action_key(&[Click("a".into())]), action_key(&[]));
+    // a selector cannot imitate the separator between two actions
+    assert_ne!(action_key(&[Click("a\",[\"wait\",5]".into())]), action_key(&[Click("a".into()), Wait(5)]));
+}
+
+#[tokio::test]
+async fn run_after_live_reads_the_net_value_of_a_recipe_with_a_click() {
+    let r = recipe(
+        r##"{"dsl_version":1,"steps":[{"op":"click","css":"#load"},{"op":"net","url_re":"master[.]m3u8"},{"op":"media","from":1,"referer":"page"}]}"##,
+    );
+    let mut page = snap("<p></p>");
+    let f = Fake::none();
+    // Before the click the page shows no stream: the recipe has no value.
+    assert_eq!(run(&r, &page, &f, deadline()).await, RecipeOutcome::NeedsLivePage);
+    assert_eq!(run_after_live(&r, &page, &f, deadline()).await, RecipeOutcome::NoValue { at_step: 1 });
+    page.network.push(NetworkEntry {
+        url: "https://news.example.gr/v/master.m3u8".to_string(),
+        method: Some("GET".into()),
+        status: Some(200),
+        mime: None,
+        resource_type: None,
+        frame_id: None,
+    });
+    assert_eq!(
+        run_after_live(&r, &page, &f, deadline()).await,
+        RecipeOutcome::Media {
+            url: "https://news.example.gr/v/master.m3u8".to_string(),
+            referer: Some("https://news.example.gr/story/1".to_string())
+        }
+    );
+}
+
+#[tokio::test]
+async fn run_after_live_on_a_passive_recipe_equals_run() {
+    let r = one(r#"{"op":"ldjson","field":"contentUrl"}"#);
+    let mut page = snap("<p></p>");
+    let f = Fake::none();
+    assert_eq!(run(&r, &page, &f, deadline()).await, run_after_live(&r, &page, &f, deadline()).await);
+    page.ld_json = vec![r#"{"contentUrl":"https://cdn.example.gr/v.mp4"}"#.to_string()];
+    let a = run(&r, &page, &f, deadline()).await;
+    assert!(matches!(a, RecipeOutcome::Media { .. }));
+    assert_eq!(a, run_after_live(&r, &page, &f, deadline()).await);
 }

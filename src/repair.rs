@@ -25,11 +25,13 @@ use omni_broadcast::card::{self, ImageEvidence, ImageSource};
 use omni_broadcast::repair::JobKind;
 use omni_broadcast::pipeline::{BroadcastEngine, DeliveryMode, LeaseLost, RunOutcome};
 use omni_broadcast::repair_gate::{self, Candidate, GateFacts, Prober, Resolver, ToolProber, Verified};
-use omni_browser::recipe::{self, Fetcher, Recipe, RecipeOutcome};
+use omni_browser::recipe::{self, Fetcher, LiveAction, Recipe, RecipeOutcome};
+use omni_browser::sniffer::{classify_live_run, LiveRun};
 use omni_browser::{HttpFetcher, PageSnapshot, StreamSniffer};
 use omni_core::config::RepairMode;
 use omni_core::models::{Job, JobStage};
 use omni_core::recipe_score::Event;
+use omni_core::recipe_score::RankedRecipe;
 use omni_core::repository::{AttemptEnd, Repository};
 
 /// The browser user agent the download of a repaired video presents.
@@ -41,6 +43,14 @@ const RECIPE_SLICE: Duration = Duration::from_secs(10);
 const DIAGNOSE_SECS: u64 = 30;
 /// Safety net around steps a-d: they end at the deadline by themselves.
 const GRACE: Duration = Duration::from_secs(2);
+/// A live page load (P10.11c) starts only with at least this much budget left.
+const LIVE_MIN_LEFT: Duration = Duration::from_secs(30);
+/// The most one live page load may take.
+const LIVE_SECS: u64 = 40;
+/// Budget the gate keeps for itself: a live load never takes it.
+const GATE_RESERVE: Duration = Duration::from_secs(20);
+/// Time past a live run's own seconds that its browser launch may take.
+const LIVE_LAUNCH_ALLOWANCE: Duration = Duration::from_secs(5);
 /// Largest `candidates_json` of one attempt.
 const CANDIDATES_JSON_MAX: usize = 32 * 1024;
 /// Downloads tried for one job, however many candidates verified.
@@ -136,6 +146,17 @@ async fn detached<T: Send + 'static>(work: impl std::future::Future<Output = T> 
 pub trait Env: Send + Sync {
     /// One diagnostic look at the page; `Some` only when the run was complete.
     async fn diagnose(&self, url: &str, secs: u64) -> Option<PageSnapshot>;
+    /// One live page load that performs a recipe's actions (P10.11c): the page
+    /// afterwards, what the run can say about the recipe, and what each action
+    /// did. `None` when no live load ran (the browser did not start). The
+    /// default sees nothing.
+    async fn live_snapshot(&self, _url: &str, _actions: &[LiveAction], _secs: u64) -> Option<(PageSnapshot, LiveRun, Vec<String>)> {
+        None
+    }
+    /// Test only: the longest live run, and how long past it the ladder waits.
+    fn live_limits(&self) -> (u64, Duration) {
+        (LIVE_SECS, LIVE_LAUNCH_ALLOWANCE)
+    }
     fn fetcher(&self) -> &dyn Fetcher;
     fn prober(&self) -> &dyn Prober;
     fn resolver(&self) -> &dyn Resolver;
@@ -218,6 +239,11 @@ impl Env for RealEnv {
         let (snap, diag) = detached(async move { StreamSniffer::diagnose(&url, secs).await }).await?;
         diag.complete.then_some(snap)
     }
+    async fn live_snapshot(&self, url: &str, actions: &[LiveAction], secs: u64) -> Option<(PageSnapshot, LiveRun, Vec<String>)> {
+        let (url, acts) = (url.to_string(), actions.to_vec());
+        let (snap, diag) = detached(async move { StreamSniffer::diagnose_live(&url, secs, &acts).await }).await?;
+        live_result(snap, &diag, actions)
+    }
     fn fetcher(&self) -> &dyn Fetcher {
         &self.fetcher
     }
@@ -248,6 +274,15 @@ impl Env for RealEnv {
             .process_job_mode(job, owner, referer.as_deref(), Some(BROWSER_UA), None, Some(cancel.clone()), mode)
             .await
     }
+}
+
+/// A finished live run as the ladder reads it. `None` when the browser never
+/// started (no action has an outcome): no live load ran, so none is recorded.
+fn live_result(snap: PageSnapshot, diag: &omni_browser::evidence::Diagnostic, actions: &[LiveAction]) -> Option<(PageSnapshot, LiveRun, Vec<String>)> {
+    if diag.live_actions.is_empty() {
+        return None;
+    }
+    Some((snap, classify_live_run(actions, diag), diag.live_actions.clone()))
 }
 
 /// What kind of job this is, for [`omni_broadcast::repair::eligible`].
@@ -431,6 +466,8 @@ enum Phase {
         cut: bool,
         /// The page the recipes ran on (the card picture comes from it).
         snap: Box<PageSnapshot>,
+        /// A live page load ran: "recipes_live:" and what each action did.
+        live: Option<String>,
     },
 }
 
@@ -438,6 +475,60 @@ enum Phase {
 struct Ran {
     id: i64,
     url: String,
+}
+
+/// What the recipes have produced so far.
+#[derive(Default)]
+struct Acc {
+    cands: Vec<Candidate>,
+    by_url: HashMap<String, (i64, String)>,
+    ran: Vec<Ran>,
+    /// The budget cut the search short.
+    cut: bool,
+}
+
+/// Take one recipe's outcome on `page` (the passive page, or the one the live
+/// load produced) into the candidates, or record its miss.
+fn absorb(
+    ctx: &RepairCtx,
+    acc: &mut Acc,
+    prior: &Prior,
+    r: &RankedRecipe,
+    page: &PageSnapshot,
+    outcome: RecipeOutcome,
+    domain: &str,
+    deadline: Instant,
+) {
+    match outcome {
+        RecipeOutcome::Media { url, referer } => {
+            let url = omni_core::net::parse_public_url(&url).map(|(u, _)| u.to_string()).unwrap_or(url);
+            let already = prior.tried.iter().any(|t| equal_address(&t.url, &url) && t.referer == referer)
+                || prior.rejected_by_mcr.iter().any(|u| equal_address(u, &url));
+            // Not the recipe fault: the normal path tried this address, or
+            // MCR rejected it before (the desk records that itself).
+            if already {
+                return;
+            }
+            acc.by_url.entry(url.clone()).or_insert_with(|| (r.id, r.hash.clone()));
+            if !acc.cands.iter().any(|c| c.url == url && c.referer == referer) {
+                let (position, in_article) = player_for(page, &url);
+                acc.cands.push(Candidate {
+                    url: url.clone(),
+                    referer,
+                    origin: format!("recipe:{}", hash8(&r.hash)),
+                    position,
+                    in_article,
+                });
+            }
+            acc.ran.push(Ran { id: r.id, url });
+        }
+        // A live recipe is never passed here; nothing to learn from it.
+        RecipeOutcome::NeedsLivePage => {}
+        // Not the recipe's fault: another evaluation held the one permit, or time ran out.
+        RecipeOutcome::Rejected(why) if why == "busy" => {}
+        RecipeOutcome::Rejected(why) if why == "deadline exceeded" => acc.cut = acc.cut || Instant::now() >= deadline,
+        RecipeOutcome::NoValue { .. } | RecipeOutcome::Rejected(_) => no_candidate(ctx, r.id, domain),
+    }
 }
 
 fn no_candidate(ctx: &RepairCtx, id: i64, domain: &str) {
@@ -497,16 +588,15 @@ async fn find_and_verify(
             return Phase::NoPage;
         }
     };
-    let mut cands: Vec<Candidate> = Vec::new();
-    let mut by_url: HashMap<String, (i64, String)> = HashMap::new();
-    let mut ran: Vec<Ran> = Vec::new();
-    let mut cut = false;
+    let mut acc = Acc::default();
+    // Recipes that need a click or a wait: held back for the one live load.
+    let mut live: Vec<(&RankedRecipe, Recipe)> = Vec::new();
     for r in &ranked {
         if lost(ctx, job.id, owner, cancel) {
             return Phase::Lost;
         }
         if Instant::now() >= deadline {
-            cut = true;
+            acc.cut = true;
             break;
         }
         let Ok(parsed) = Recipe::from_json(&r.recipe_json) else {
@@ -518,45 +608,93 @@ async fn find_and_verify(
             o = recipe::run(&parsed, &snap, env.fetcher(), slice) => o,
             _ = cancel.cancelled() => return Phase::Lost,
         };
-        match outcome {
-            RecipeOutcome::Media { url, referer } => {
-                let url = omni_core::net::parse_public_url(&url).map(|(u, _)| u.to_string()).unwrap_or(url);
-                let already = prior.tried.iter().any(|t| equal_address(&t.url, &url) && t.referer == referer)
-                    || prior.rejected_by_mcr.iter().any(|u| equal_address(u, &url));
-                // Not the recipe fault: the normal path tried this address, or
-                // MCR rejected it before (the desk records that itself).
-                if already {
-                    continue;
+        if outcome == RecipeOutcome::NeedsLivePage {
+            live.push((r, parsed));
+            continue;
+        }
+        absorb(ctx, &mut acc, prior, r, &snap, outcome, domain, deadline);
+    }
+
+    // b2. Recipes with live actions: at most one live page load per ladder
+    // run, and only with enough budget left for it. The first such recipe
+    // (best first) sets the actions; every other with the same actions is read
+    // from the same page, the rest wait for another run.
+    let mut live_note: Option<String> = None;
+    let mut live_facts: Option<GateFacts> = None;
+    let left = deadline.saturating_duration_since(Instant::now());
+    // The gate keeps its own share of the budget: the live load never takes it.
+    if let (Some((first, _)), true) = (live.first(), left >= LIVE_MIN_LEFT + GATE_RESERVE) {
+        if lost(ctx, job.id, owner, cancel) {
+            return Phase::Lost;
+        }
+        let actions = Recipe::from_json(&first.recipe_json).map(|p| recipe::live_actions(&p)).unwrap_or_default();
+        let key = recipe::action_key(&actions);
+        let (cap_secs, allowance) = env.live_limits();
+        let secs = (left - GATE_RESERVE).as_secs().min(cap_secs).max(1);
+        // The run ends itself at `secs` after its browser started; the launch is
+        // outside that, so the wait is bounded here too, never by the ladder deadline.
+        let wait_until = (Instant::now() + Duration::from_secs(secs) + allowance).min(deadline);
+        let seen = tokio::select! {
+            r = tokio::time::timeout_at(tokio::time::Instant::from_std(wait_until), env.live_snapshot(orig_url, &actions, secs)) => r.ok().flatten(),
+            _ = cancel.cancelled() => return Phase::Lost,
+        };
+        if lost(ctx, job.id, owner, cancel) {
+            return Phase::Lost;
+        }
+        match seen {
+            None => {}
+            Some((lsnap, run, outcomes)) => {
+                live_note = Some(format!("recipes_live:{}", outcomes.join(",")));
+                info!("Job #{}: repair live load on {}: {run:?}", job.id, domain);
+                // Only a complete run can produce candidates. A missing click
+                // target on an otherwise clean page is a conclusive miss for every
+                // recipe with these actions; anything else says nothing about them.
+                if run == LiveRun::Missing {
+                    for (r, parsed) in &live {
+                        if recipe::action_key(&recipe::live_actions(parsed)) == key {
+                            no_candidate(ctx, r.id, domain);
+                        }
+                    }
                 }
-                by_url.entry(url.clone()).or_insert_with(|| (r.id, r.hash.clone()));
-                if !cands.iter().any(|c| c.url == url && c.referer == referer) {
-                    let (position, in_article) = player_for(&snap, &url);
-                    cands.push(Candidate {
-                        url: url.clone(),
-                        referer,
-                        origin: format!("recipe:{}", hash8(&r.hash)),
-                        position,
-                        in_article,
-                    });
+                if run == LiveRun::Complete {
+                    live_facts = Some(gate_facts(&lsnap, domain));
+                    for (r, parsed) in &live {
+                        if recipe::action_key(&recipe::live_actions(parsed)) != key {
+                            continue;
+                        }
+                        if lost(ctx, job.id, owner, cancel) {
+                            return Phase::Lost;
+                        }
+                        if Instant::now() >= deadline {
+                            acc.cut = true;
+                            break;
+                        }
+                        let slice = (Instant::now() + RECIPE_SLICE).min(deadline);
+                        let outcome = tokio::select! {
+                            o = recipe::run_after_live(parsed, &lsnap, env.fetcher(), slice) => o,
+                            _ = cancel.cancelled() => return Phase::Lost,
+                        };
+                        absorb(ctx, &mut acc, prior, r, &lsnap, outcome, domain, deadline);
+                    }
                 }
-                ran.push(Ran { id: r.id, url });
             }
-            RecipeOutcome::NeedsLivePage => {}
-            // Not the recipe's fault: another evaluation held the one permit, or time ran out.
-            RecipeOutcome::Rejected(why) if why == "busy" => {}
-            RecipeOutcome::Rejected(why) if why == "deadline exceeded" => cut = cut || Instant::now() >= deadline,
-            RecipeOutcome::NoValue { .. } | RecipeOutcome::Rejected(_) => no_candidate(ctx, r.id, domain),
         }
     }
+    let Acc { cands, by_url, ran, mut cut } = acc;
     if cands.is_empty() {
-        return Phase::Found { verified: Vec::new(), recipes: by_url, cut, snap: Box::new(snap) };
+        return Phase::Found { verified: Vec::new(), recipes: by_url, cut, snap: Box::new(snap), live: live_note };
     }
     if lost(ctx, job.id, owner, cancel) {
         return Phase::Lost;
     }
 
     // c. The gate, for every candidate.
-    let facts = gate_facts(&snap, domain);
+    let mut facts = gate_facts(&snap, domain);
+    if let Some(lf) = live_facts {
+        // What the page requested after the live actions counts as observed.
+        facts.observed_hosts.extend(lf.observed_hosts);
+        facts.ad_media.extend(lf.ad_media);
+    }
     let is_ad = |u: &str| env.is_ad(u);
     let gate = async {
         if env.allow_loopback() {
@@ -584,7 +722,7 @@ async fn find_and_verify(
             no_candidate(ctx, r.id, domain);
         }
     }
-    Phase::Found { verified, recipes: by_url, cut, snap: Box::new(snap) }
+    Phase::Found { verified, recipes: by_url, cut, snap: Box::new(snap), live: live_note }
 }
 
 /// Run the ladder once for a failed web job.
@@ -728,7 +866,12 @@ async fn ladder(
             end.outcome = Some("no_page".into());
             return LadderResult::NothingVerified;
         }
-        Phase::Found { verified, recipes, cut, snap } => (verified, recipes, cut, snap),
+        Phase::Found { verified, recipes, cut, snap, live } => {
+            if let Some(note) = live {
+                end.rung = Some(note);
+            }
+            (verified, recipes, cut, snap)
+        }
     };
     if lost(ctx, job_id, owner, cancel) {
         return LadderResult::Lost;

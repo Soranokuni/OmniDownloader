@@ -3,8 +3,9 @@ use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{
     EventRequestWillBeSent, EventResponseReceived, GetResponseBodyParams, RequestId, ResourceType, SetBlockedUrLsParams,
 };
+use chromiumoxide::cdp::browser_protocol::browser::{SetDownloadBehaviorBehavior, SetDownloadBehaviorParams};
 use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
-use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams, EvaluateParams, EventConsoleApiCalled};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,13 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::adblock::UnifiedAdBlocker;
 use crate::agent::BrowserError;
 use crate::browser::HeadlessBrowserManager;
 use crate::evidence::{vast_candidate, vast_media_files, Diagnostic, NetworkEntry, NetworkLog, PageSnapshot, DIAG_JS, PAGE_FACTS_JS};
 use crate::glomex;
+use crate::recipe::LiveAction;
 
 /// Click a cookie-consent button, if the page shows one. Fixed text.
 const COOKIE_BYPASS_JS: &str = r#"
@@ -56,6 +58,19 @@ const COOKIE_BYPASS_JS: &str = r#"
                 return null;
             })()
         "#;
+
+/// Live recipe actions (P10.11c). Fixed text: the recipe's selector reaches the
+/// page only as a call argument (`Runtime.callFunctionOn`), never inside this
+/// script, so a selector cannot become code.
+const CLICK_FN: &str = "function (css) { try { const el = document.querySelector(css); if (!el) return 'missing'; el.scrollIntoView({block: 'center'}); el.click(); return 'clicked'; } catch (e) { return 'error'; } }";
+const SCROLL_FN: &str = "function (css) { try { const el = document.querySelector(css); if (!el) return 'missing'; el.scrollIntoView({block: 'center'}); return 'scrolled'; } catch (e) { return 'error'; } }";
+
+/// The whole live run is cut here whatever the caller's budget.
+const LIVE_RUN_CAP_SECS: u64 = 40;
+/// A recipe has at most this many live steps, and a wait at most this long
+/// (the recipe validator's limits, held again here).
+const LIVE_MAX_ACTIONS: usize = 2;
+const LIVE_MAX_WAIT_MS: u32 = 8000;
 
 /// Media session metadata and extracted video streams.
 /// Captures browser context (cookies, user-agent, referer) to forward to downstream
@@ -218,7 +233,16 @@ impl StreamSniffer {
     /// Bounded by `budget_secs`; on a timeout or a launch failure it returns
     /// what it has (possibly nothing) rather than an error.
     pub async fn diagnose(target_url: &str, budget_secs: u64) -> (PageSnapshot, Diagnostic) {
-        Self::diagnose_with(HeadlessBrowserManager::launch().await, target_url, budget_secs).await
+        Self::diagnose_with(HeadlessBrowserManager::launch().await, target_url, budget_secs, &[]).await
+    }
+
+    /// `diagnose` that also performs a recipe's live actions (click, wait,
+    /// scroll) after the normal settle, on this one page load (P10.11c).
+    /// Downloads are denied for the run. The result is `complete` only when
+    /// every click and scroll found its element and the page stayed the page
+    /// asked for. Cut at `min(budget_secs, 40)` seconds.
+    pub async fn diagnose_live(target_url: &str, budget_secs: u64, actions: &[LiveAction]) -> (PageSnapshot, Diagnostic) {
+        Self::diagnose_with(HeadlessBrowserManager::launch().await, target_url, budget_secs, actions).await
     }
 
     /// `diagnose` on an already attempted launch (a failed one is a run that
@@ -227,6 +251,7 @@ impl StreamSniffer {
         launched: Result<crate::browser::BrowserSession>,
         target_url: &str,
         budget_secs: u64,
+        actions: &[LiveAction],
     ) -> (PageSnapshot, Diagnostic) {
         let host = reqwest::Url::parse(target_url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
         let mut snapshot = PageSnapshot::new(target_url);
@@ -238,7 +263,8 @@ impl StreamSniffer {
             }
         };
         let state = Arc::new(DiagState::default());
-        let run = Self::diagnose_page(&session.browser, target_url, &state);
+        let budget_secs = if actions.is_empty() { budget_secs } else { budget_secs.min(LIVE_RUN_CAP_SECS) };
+        let run = Self::diagnose_page(&session.browser, target_url, &state, actions);
         if tokio::time::timeout(Duration::from_secs(budget_secs), run).await.is_err() {
             warn!("StreamSniffer: diagnostic run for {host} hit its {budget_secs} s budget");
         }
@@ -261,10 +287,14 @@ impl StreamSniffer {
         // A page that ended up somewhere else (a login, a consent wall) was
         // not the one asked for.
         diag.complete = crate::evidence::run_was_complete(main_ok, &snapshot, target_url);
+        if !actions.is_empty() {
+            diag.live_page_ok = diag.complete;
+            diag.complete = diag.complete && live_outcomes_ok(actions, &diag.live_actions);
+        }
         (snapshot, diag)
     }
 
-    async fn diagnose_page(browser: &Browser, target_url: &str, state: &Arc<DiagState>) {
+    async fn diagnose_page(browser: &Browser, target_url: &str, state: &Arc<DiagState>, actions: &[LiveAction]) {
         let page = match browser.new_page("about:blank").await {
             Ok(p) => p,
             Err(e) => return warn!("StreamSniffer: diagnostic run could not open a page: {e}"),
@@ -351,6 +381,21 @@ impl StreamSniffer {
             m.frame_id = main_frame;
         }
 
+        if !actions.is_empty() {
+            // A click must never save a file onto this machine.
+            let denied = match SetDownloadBehaviorParams::builder().behavior(SetDownloadBehaviorBehavior::Deny).build() {
+                Ok(p) => browser.execute(p).await.is_ok(),
+                Err(_) => false,
+            };
+            if !denied {
+                warn!("StreamSniffer: live actions refused, downloads could not be denied");
+                if let Ok(mut d) = state.diag.lock() {
+                    d.live_actions.push("refused".to_string());
+                }
+                return;
+            }
+        }
+
         let started = std::time::Instant::now();
         let settle = Duration::from_secs(15);
         // The load may never finish on a page with a live player; the wait
@@ -389,6 +434,18 @@ impl StreamSniffer {
             tokio::time::sleep(rest).await;
         }
 
+        if !actions.is_empty() {
+            // A fixed read, no selector involved: is the page still loading?
+            let ready = tokio::time::timeout(Duration::from_secs(3), page.evaluate("document.readyState")).await;
+            let ready = ready.ok().and_then(|r| r.ok()).and_then(|e| e.value().and_then(Value::as_str).map(str::to_string));
+            if let Ok(mut d) = state.diag.lock() {
+                d.live_ready_before = ready.as_deref().is_some_and(|s| s != "loading");
+            }
+            Self::run_live_actions(&page, actions, state).await;
+            // What the actions started needs a moment to show.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
         if let Ok(Ok(eval)) = tokio::time::timeout(Duration::from_secs(3), page.evaluate(PAGE_FACTS_JS)).await {
             if let Ok(mut f) = state.facts.lock() {
                 f.facts = eval.value().cloned();
@@ -416,6 +473,59 @@ impl StreamSniffer {
                     }
                 }
             }
+        }
+    }
+
+    /// Run a recipe's live actions in order, recording one outcome each.
+    /// Selectors go to the page only as call arguments to the fixed functions.
+    async fn run_live_actions(page: &chromiumoxide::Page, actions: &[LiveAction], state: &Arc<DiagState>) {
+        let note = |s: &str| {
+            if let Ok(mut d) = state.diag.lock() {
+                d.live_actions.push(s.to_string());
+            }
+        };
+        for (i, action) in actions.iter().enumerate() {
+            if i >= LIVE_MAX_ACTIONS {
+                note("skipped");
+                continue;
+            }
+            let outcome = match action {
+                LiveAction::Wait(ms) => {
+                    tokio::time::sleep(Duration::from_millis((*ms).min(LIVE_MAX_WAIT_MS) as u64)).await;
+                    "waited".to_string()
+                }
+                LiveAction::Click(css) => Self::call_on_document(page, CLICK_FN, css).await,
+                LiveAction::ScrollTo(css) => Self::call_on_document(page, SCROLL_FN, css).await,
+            };
+            debug!(step = i, outcome = %outcome, "live action");
+            note(&outcome);
+        }
+    }
+
+    /// Call one of the fixed functions with `css` as its only argument, on the
+    /// page's current `document` object. Returns the function's answer, or
+    /// "error" / "timeout" when the call itself failed.
+    async fn call_on_document(page: &chromiumoxide::Page, function: &'static str, css: &str) -> String {
+        let call = async {
+            let doc = EvaluateParams::builder().expression("document").build().ok()?;
+            let doc = page.execute(doc).await.ok()?;
+            let object_id = doc.result.result.object_id.clone()?;
+            let arg = CallArgument::builder().value(Value::String(css.to_string())).build();
+            let params = CallFunctionOnParams::builder()
+                .function_declaration(function)
+                .object_id(object_id)
+                .argument(arg)
+                .return_by_value(true)
+                .user_gesture(true)
+                .build()
+                .ok()?;
+            let out = page.execute(params).await.ok()?;
+            out.result.result.value.as_ref().and_then(Value::as_str).map(str::to_string)
+        };
+        match tokio::time::timeout(Duration::from_secs(3), call).await {
+            Ok(Some(s)) if matches!(s.as_str(), "clicked" | "scrolled" | "missing" | "error") => s,
+            Ok(_) => "error".to_string(),
+            Err(_) => "timeout".to_string(),
         }
     }
 
@@ -940,6 +1050,49 @@ impl StreamSniffer {
     }
 }
 
+/// What a live run can say about the recipe that asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveRun {
+    /// Every action did its job on the page asked for.
+    Complete,
+    /// The page was fine and every action ran, but a click or scroll found no
+    /// such element: the recipe's target is not on the page (a conclusive miss).
+    Missing,
+    /// A timeout, an error, a refusal, a skipped action, another page, a page
+    /// that did not answer: nothing can be said about the recipe.
+    Inconclusive,
+}
+
+/// Classify a finished live run (see [`LiveRun`]).
+pub fn classify_live_run(actions: &[LiveAction], diag: &Diagnostic) -> LiveRun {
+    if diag.complete {
+        return LiveRun::Complete;
+    }
+    let o = &diag.live_actions;
+    // A page still loading before the first action may simply not have its element yet.
+    let ran_all = diag.live_page_ok && diag.live_ready_before && o.len() == actions.len();
+    let only_missing = actions.iter().zip(o).all(|(a, o)| match a {
+        LiveAction::Click(_) => o == "clicked" || o == "missing",
+        LiveAction::ScrollTo(_) => o == "scrolled" || o == "missing",
+        LiveAction::Wait(_) => o == "waited",
+    });
+    if ran_all && only_missing && o.iter().any(|x| x == "missing") {
+        LiveRun::Missing
+    } else {
+        LiveRun::Inconclusive
+    }
+}
+
+/// Every action ran and every click and scroll found its element.
+fn live_outcomes_ok(actions: &[LiveAction], outcomes: &[String]) -> bool {
+    actions.len() == outcomes.len()
+        && actions.iter().zip(outcomes).all(|(a, o)| match a {
+            LiveAction::Click(_) => o == "clicked",
+            LiveAction::ScrollTo(_) => o == "scrolled",
+            LiveAction::Wait(_) => o == "waited",
+        })
+}
+
 /// The candidates, best first, without the network copy of a glomex clip
 /// that is also found as its player: the player URL gives yt-dlp the clip's
 /// best rendition and its title, and the copy would be offered to MCR as a
@@ -961,9 +1114,97 @@ fn final_candidates(mut list: Vec<(u32, String)>) -> Vec<(u32, String)> {
 mod tests {
     use super::*;
 
+    /// Production source only (everything before the test module).
+    fn production_source() -> &'static str {
+        include_str!("sniffer.rs").split("#[cfg(test)]").next().unwrap()
+    }
+
+    #[test]
+    fn a_selector_is_never_formatted_into_script_text() {
+        let production = production_source();
+        assert!(production.contains("CLICK_FN") && production.contains("SCROLL_FN"));
+        let mut rest = production;
+        while let Some(i) = rest.find("format!(") {
+            rest = &rest[i + 8..];
+            let call = rest.split(");").next().unwrap_or("");
+            assert!(!call.contains("querySelector("), "a format! builds a selector lookup: {call}");
+        }
+        assert!(!CLICK_FN.contains("{}") && !SCROLL_FN.contains("{}"));
+        // The fixed functions are never built from other text.
+        for line in production.lines().filter(|l| l.contains("CLICK_FN") || l.contains("SCROLL_FN")) {
+            for bad in ["format!", ".replace(", "concat!", " + ", "push_str", "&format"] {
+                assert!(!line.contains(bad), "`{bad}` on a line with a fixed live function: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_selector_reaches_the_browser_only_as_a_call_argument() {
+        let production = production_source();
+        let start = production.find("async fn run_live_actions").unwrap();
+        let end = production.find("async fn sniff(").unwrap();
+        let live = &production[start..end];
+        // No script is evaluated in the live code: the only Runtime.evaluate is the fixed `document`.
+        assert!(!live.contains(".evaluate("), "page.evaluate in the live code");
+        assert_eq!(live.matches(".expression(").count(), 1);
+        assert!(live.contains(".expression(\"document\")"));
+        // The selector is handed over in exactly one place, as a call argument value.
+        assert_eq!(live.matches("Value::String(css").count(), 1);
+        assert!(live.contains("CallArgument::builder().value(Value::String(css.to_string()))"));
+        assert!(live.contains("call_on_document(page, CLICK_FN, css)") && live.contains("call_on_document(page, SCROLL_FN, css)"));
+        // `function_declaration` takes only the fixed `&'static str` parameter.
+        assert!(live.contains("function: &'static str") && live.contains(".function_declaration(function)"));
+    }
+
+    #[test]
+    fn a_live_run_is_complete_only_when_every_action_did_its_job() {
+        use LiveAction::*;
+        let acts = [Click("a".into()), Wait(1), ScrollTo("b".into())];
+        let ok = |o: &[&str]| live_outcomes_ok(&acts, &o.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(ok(&["clicked", "waited", "scrolled"]));
+        assert!(!ok(&["missing", "waited", "scrolled"]));
+        assert!(!ok(&["clicked", "waited", "error"]));
+        assert!(!ok(&["clicked", "waited"]), "cut short");
+        assert!(!ok(&["clicked", "waited", "scrolled", "x"]));
+        assert!(!ok(&["scrolled", "waited", "clicked"]));
+    }
+
+    #[test]
+    fn only_a_missing_target_on_a_clean_page_is_a_conclusive_miss() {
+        use LiveAction::*;
+        let acts = [Click("a".into()), Wait(1)];
+        let run = |o: &[&str], page_ok: bool| {
+            let outcomes: Vec<String> = o.iter().map(|s| s.to_string()).collect();
+            let complete = page_ok && live_outcomes_ok(&acts, &outcomes);
+            classify_live_run(&acts, &Diagnostic { live_actions: outcomes, complete, live_page_ok: page_ok, live_ready_before: true, ..Default::default() })
+        };
+        assert_eq!(run(&["clicked", "waited"], true), LiveRun::Complete);
+        assert_eq!(run(&["missing", "waited"], true), LiveRun::Missing);
+        assert_eq!(run(&["missing", "waited"], false), LiveRun::Inconclusive, "page not read properly / left");
+        assert_eq!(run(&["timeout", "waited"], true), LiveRun::Inconclusive);
+        assert_eq!(run(&["error", "waited"], true), LiveRun::Inconclusive);
+        assert_eq!(run(&["refused"], true), LiveRun::Inconclusive);
+        assert_eq!(run(&["missing"], true), LiveRun::Inconclusive, "cut short");
+        assert_eq!(run(&["missing", "waited", "skipped"], true), LiveRun::Inconclusive);
+        assert_eq!(run(&[], true), LiveRun::Inconclusive);
+    }
+
+    #[test]
+    fn a_page_still_loading_before_the_first_action_is_never_a_conclusive_miss() {
+        let acts = [LiveAction::Click("a".into())];
+        let d = |ready: bool| Diagnostic {
+            live_actions: vec!["missing".into()],
+            live_page_ok: true,
+            live_ready_before: ready,
+            ..Default::default()
+        };
+        assert_eq!(classify_live_run(&acts, &d(true)), LiveRun::Missing, "interactive or complete");
+        assert_eq!(classify_live_run(&acts, &d(false)), LiveRun::Inconclusive, "loading, or unknown");
+    }
+
     #[tokio::test]
     async fn a_diagnostic_run_that_could_not_launch_is_incomplete() {
-        let (snap, diag) = StreamSniffer::diagnose_with(Err(anyhow!("no browser here")), "https://news.example/a", 5).await;
+        let (snap, diag) = StreamSniffer::diagnose_with(Err(anyhow!("no browser here")), "https://news.example/a", 5, &[]).await;
         assert!(!diag.complete, "a run that saw nothing must not read as a clean page");
         assert!(snap.network.is_empty() && snap.html.is_none());
         let e = crate::evidence::classify(&snap, &[], Some(&diag), |_| false);
