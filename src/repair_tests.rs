@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use omni_broadcast::repair_gate::{ProbeInfo, ProbeKind};
+use omni_browser::sniffer::LiveRun;
 use omni_browser::NetworkEntry;
 use omni_core::models::{JobStatus, NewJob};
 use omni_core::net::EgressError;
@@ -65,6 +66,14 @@ struct Fake {
     card_ffmpeg: Option<PathBuf>,
     card_cap: Option<Duration>,
     pics: Pics,
+    // The live page load (P10.11c): what it returns, and what it was asked.
+    live_result: Mutex<Option<(PageSnapshot, LiveRun, Vec<String>)>>,
+    live_calls: AtomicUsize,
+    live_seen: Mutex<Vec<Vec<LiveAction>>>,
+    live_secs_seen: Mutex<Vec<u64>>,
+    live_hangs: bool,
+    live_panics: bool,
+    live_limits: Option<(u64, Duration)>,
 }
 
 /// The article pictures of the card step: one body or a failure, counted; `hook` runs at each request.
@@ -110,6 +119,13 @@ impl Fake {
             card_ffmpeg: None,
             card_cap: None,
             pics: Pics::default(),
+            live_result: Mutex::new(None),
+            live_calls: AtomicUsize::new(0),
+            live_seen: Mutex::new(Vec::new()),
+            live_secs_seen: Mutex::new(Vec::new()),
+            live_hangs: false,
+            live_panics: false,
+            live_limits: None,
         }
     }
     fn probes(&self) -> usize {
@@ -147,6 +163,19 @@ impl Env for Fake {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
         self.diagnose_snap.lock().unwrap().clone()
+    }
+    fn live_limits(&self) -> (u64, Duration) {
+        self.live_limits.unwrap_or((LIVE_SECS, LIVE_LAUNCH_ALLOWANCE))
+    }
+    async fn live_snapshot(&self, _url: &str, actions: &[LiveAction], secs: u64) -> Option<(PageSnapshot, LiveRun, Vec<String>)> {
+        assert!(!self.live_panics, "the ladder asked for a live page load");
+        self.live_calls.fetch_add(1, Ordering::SeqCst);
+        self.live_seen.lock().unwrap().push(actions.to_vec());
+        self.live_secs_seen.lock().unwrap().push(secs);
+        if self.live_hangs {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        self.live_result.lock().unwrap().clone()
     }
     fn fetcher(&self) -> &dyn Fetcher {
         &self.fetch
@@ -192,6 +221,9 @@ struct PanicEnv;
 impl Env for PanicEnv {
     async fn diagnose(&self, _: &str, _: u64) -> Option<PageSnapshot> {
         panic!("the ladder called diagnose")
+    }
+    async fn live_snapshot(&self, _: &str, _: &[LiveAction], _: u64) -> Option<(PageSnapshot, LiveRun, Vec<String>)> {
+        panic!("the ladder asked for a live page load")
     }
     fn fetcher(&self) -> &dyn Fetcher {
         panic!("the ladder asked for the fetcher")
@@ -1326,4 +1358,308 @@ async fn guarantee_a_successful_job_never_calls_the_ladder() {
     assert_eq!(done.status, JobStatus::Completed, "{:?}", done.error_message);
     assert!(repo.latest_attempt(id).unwrap().is_none());
     assert_eq!(std::fs::read_dir(root.join("watchfolder")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".mxf")).count(), 1);
+}
+
+// ---- P10.11c: recipes with live actions, one live page load per ladder run ----
+
+const LIVE_A: &str = "https://cdn.news.example.gr/live/a.m3u8";
+const LIVE_B: &str = "https://cdn.news.example.gr/live/b.m3u8";
+/// A video host the passive page never showed: observed only after the click.
+const LIVE_OTHER: &str = "https://video.player-cdn.example.net/live/c.m3u8";
+
+/// Store a recipe of `scope` ("site" on the page's domain, or "generic");
+/// steps `[click css, net re, media]`. Returns its row id.
+fn add_live_recipe(r: &Rig, scope: &str, click: &str, url_re: &str) -> i64 {
+    use omni_core::recipe_score::{InsertOutcome, NewRecipe, Origin, ScopeKind};
+    let json = format!(
+        r#"{{"dsl_version":1,"steps":[{{"op":"click","css":"{click}"}},{{"op":"net","url_re":"{url_re}"}},{{"op":"media","from":1,"referer":"page"}}]}}"#
+    );
+    let rec = Recipe::from_json(&json).unwrap();
+    let key = if scope == "site" { DOMAIN } else { "live-test" };
+    let new = NewRecipe {
+        scope_kind: if scope == "site" { ScopeKind::Site } else { ScopeKind::Generic },
+        scope_key: key.to_string(),
+        family: None,
+        recipe_json: rec.canonical_json(),
+        hash: recipe::scope_hash(scope, key, &rec),
+        steps_hash: recipe::steps_hash(&rec),
+        dsl_version: rec.dsl_version,
+        origin: Origin::Admin,
+    };
+    match r.repo.insert_recipe(&new, Utc::now()).unwrap() {
+        InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) => id,
+        other => panic!("recipe not stored: {other:?}"),
+    }
+}
+
+fn live_page(urls: &[&str]) -> PageSnapshot {
+    let mut s = page("<html><body><button id=\"load\">play</button></body></html>");
+    for u in urls {
+        s.network.push(NetworkEntry {
+            url: (*u).to_string(),
+            method: Some("GET".into()),
+            status: Some(200),
+            mime: None,
+            resource_type: None,
+            frame_id: None,
+        });
+    }
+    s
+}
+
+fn set_live(f: &Fake, snap: PageSnapshot, complete: LiveRun, outcomes: &[&str]) {
+    *f.live_result.lock().unwrap() = Some((snap, complete, outcomes.iter().map(|s| s.to_string()).collect()));
+}
+
+/// Whether the recipe has an event row on the page's domain.
+fn has_event(r: &Rig, id: i64) -> bool {
+    r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap().iter().find(|x| x.id == id).unwrap().site_state.is_some()
+}
+
+fn blank() -> PageSnapshot {
+    page("<html><body><p>no video yet</p></body></html>")
+}
+
+#[tokio::test]
+async fn three_live_recipes_cost_one_live_load_and_those_sharing_its_actions_are_all_read() {
+    let fake = Fake::new();
+    let live_o = "https://cdn.news.example.gr/live/o.m3u8";
+    set_live(&fake, live_page(&[LIVE_A, LIVE_B, live_o]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    // (id, click, the address its regex finds): two share the actions, one differs.
+    let made = [
+        (add_live_recipe(&r, "site", "#play", "a[.]m3u8"), "#play", LIVE_A),
+        (add_live_recipe(&r, "site", "#play", "b[.]m3u8"), "#play", LIVE_B),
+        (add_live_recipe(&r, "site", "#load", "o[.]m3u8"), "#load", live_o),
+    ];
+    // Which one the ladder takes first is the store's ranking, not this test's business.
+    let order: Vec<i64> = r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap().iter().map(|x| x.id).collect();
+    let first = made.iter().min_by_key(|m| order.iter().position(|i| *i == m.0).unwrap()).unwrap();
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    let LadderResult::ShadowFound { verified } = res else { panic!("expected a find, got {res:?}") };
+    assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 1, "one live load, three live recipes");
+    assert_eq!(*r.fake.live_seen.lock().unwrap(), vec![vec![LiveAction::Click(first.1.into())]]);
+    let mut urls: Vec<String> = verified.iter().map(|v| v.candidate.url.clone()).collect();
+    urls.sort();
+    let mut want: Vec<String> = made.iter().filter(|m| m.1 == first.1).map(|m| m.2.to_string()).collect();
+    want.sort();
+    assert_eq!(want.len(), 2, "the test needs the shared pair to be first");
+    assert_eq!(urls, want, "every recipe sharing the first one's actions was read, no other");
+    for m in &made {
+        assert!(!has_event(&r, m.0), "a read recipe found its video; one with other actions is skipped without an event");
+    }
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!(at.rung.as_deref(), Some("recipes_live:clicked"));
+}
+
+#[tokio::test]
+async fn a_live_candidate_goes_through_the_gate_with_the_passive_ones() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let res = go(&r, Some(page(&next_data(B))), &Prior::default()).await;
+    let LadderResult::ShadowFound { verified } = res else { panic!("expected a find, got {res:?}") };
+    let urls: Vec<&str> = verified.iter().map(|v| v.candidate.url.as_str()).collect();
+    assert!(urls.contains(&B) && urls.contains(&LIVE_A), "{urls:?}");
+    assert_eq!(r.fake.probes(), 2, "one gate run for both");
+    assert!(verified.iter().find(|v| v.candidate.url == LIVE_A).unwrap().candidate.origin.starts_with("recipe:"));
+}
+
+#[tokio::test]
+async fn hosts_seen_only_after_the_click_count_as_observed_for_the_gate() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_OTHER]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    add_live_recipe(&r, "site", "#load", "c[.]m3u8");
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    let LadderResult::ShadowFound { verified } = res else { panic!("expected a find, got {res:?}") };
+    assert_eq!(verified[0].candidate.url, LIVE_OTHER);
+}
+
+#[tokio::test]
+async fn an_incomplete_live_run_gives_no_candidates_and_no_events() {
+    let fake = Fake::new();
+    // The click found nothing; the network shows a video anyway (must not be used).
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Inconclusive, &["timeout"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::NothingVerified), "{res:?}");
+    assert_eq!(r.fake.probes(), 0);
+    assert!(!has_event(&r, id), "an incomplete run says nothing about the recipe");
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!(at.rung.as_deref(), Some("recipes_live:timeout"));
+}
+
+#[tokio::test]
+async fn a_complete_live_run_that_finds_nothing_is_a_miss_for_the_recipe() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::NothingVerified), "{res:?}");
+    assert!(has_event(&r, id), "complete run, no value: NoCandidate");
+}
+
+#[tokio::test]
+async fn a_live_candidate_the_gate_rejects_conclusively_is_a_miss_for_the_recipe() {
+    let fake = Fake::new();
+    fake.probe.lock().unwrap().insert(LIVE_A.to_string(), Err("ffprobe could not read the address".to_string()));
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::NothingVerified), "{res:?}");
+    assert_eq!(r.fake.probes(), 1);
+    assert!(has_event(&r, id));
+}
+
+#[tokio::test]
+async fn with_less_than_thirty_seconds_left_there_is_no_live_load() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(25), fake);
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::NothingVerified), "{res:?}");
+    assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 0);
+    assert!(!has_event(&r, id), "a recipe that was not tried has no event");
+}
+
+#[tokio::test]
+async fn cancel_during_the_live_load_is_lost_and_writes_nothing() {
+    let mut fake = Fake::new();
+    fake.live_hangs = true;
+    let r = rig_with(RepairMode::Hold, Duration::from_secs(120), fake);
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        c2.cancel();
+    });
+    let t = Instant::now();
+    let res = run(&r.ctx, &r.job, OWNER, PAGE, Some(blank()), &Prior::default(), &cancel).await;
+    assert!(matches!(res, LadderResult::Lost), "{res:?}");
+    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 1);
+    assert!(!has_event(&r, id));
+    assert!(r.fake.downloads().is_empty());
+    assert!(events(&r).iter().all(|m| !m.contains("επισκευή")), "{:?}", events(&r));
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!(at.outcome.as_deref(), Some("lost"));
+}
+
+#[tokio::test]
+async fn without_live_recipes_the_ladder_never_asks_for_a_live_load() {
+    let mut fake = Fake::new();
+    fake.live_panics = true;
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::ShadowFound { .. }), "{res:?}");
+    assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 0);
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!(at.rung.as_deref(), Some("recipes"));
+}
+
+#[tokio::test]
+async fn a_live_load_that_overruns_never_eats_the_gates_time() {
+    // The live run sleeps far past its allowance; a passive candidate exists.
+    let mut fake = Fake::new();
+    fake.live_hangs = true;
+    fake.live_limits = Some((1, Duration::from_millis(500)));
+    fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let r = rig_with(RepairMode::Hold, Duration::from_secs(120), fake);
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let t = Instant::now();
+    let res = go(&r, Some(page(&next_data(B))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.downloads().iter().map(|d| d.0.clone()).collect::<Vec<_>>(), vec![B.to_string()]);
+    assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 1);
+    assert!(t.elapsed() < Duration::from_secs(10), "the wait ended at the ladder deadline: {:?}", t.elapsed());
+    assert!(!has_event(&r, id), "an overrun says nothing about the recipe");
+}
+
+#[tokio::test]
+async fn too_little_budget_for_the_gate_reserve_means_no_live_load() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Complete, &["clicked"]);
+    // 40 s is over the old 30 s rule, under 30 s + the gate's 20 s.
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(40), fake);
+    add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let res = go(&r, Some(page(&next_data(B))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::ShadowFound { .. }), "{res:?}");
+    assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_click_target_missing_on_a_clean_page_is_a_miss_for_every_recipe_with_those_actions() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_A, LIVE_B]), LiveRun::Missing, &["missing"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+    let a = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    let b = add_live_recipe(&r, "site", "#load", "b[.]m3u8");
+    let res = go(&r, Some(blank()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::NothingVerified), "{res:?}");
+    assert_eq!(r.fake.probes(), 0, "a missing target gives no candidates, even if the network shows a video");
+    assert!(has_event(&r, a) && has_event(&r, b), "NoCandidate for each recipe sharing the actions");
+    assert_eq!(r.repo.latest_attempt(r.job.id).unwrap().unwrap().rung.as_deref(), Some("recipes_live:missing"));
+}
+
+#[tokio::test]
+async fn an_inconclusive_live_run_gives_no_events_whatever_its_outcome() {
+    for outcome in ["timeout", "error", "refused", "skipped"] {
+        let fake = Fake::new();
+        set_live(&fake, live_page(&[]), LiveRun::Inconclusive, &[outcome]);
+        let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), fake);
+        let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+        go(&r, Some(blank()), &Prior::default()).await;
+        assert!(!has_event(&r, id), "{outcome}");
+    }
+}
+
+#[tokio::test]
+async fn no_live_note_when_the_browser_never_ran_the_live_load() {
+    // The fake returns None, as RealEnv does for a launch failure.
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(120), Fake::new());
+    let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    go(&r, Some(blank()), &Prior::default()).await;
+    assert_eq!(r.repo.latest_attempt(r.job.id).unwrap().unwrap().rung.as_deref(), Some("recipes"));
+    assert!(!has_event(&r, id));
+}
+
+#[test]
+fn a_run_without_action_outcomes_is_no_live_load() {
+    use omni_browser::evidence::Diagnostic;
+    let acts = [LiveAction::Click("#load".into())];
+    // launch failure: the default diagnostic
+    assert!(live_result(blank(), &Diagnostic::default(), &acts).is_none());
+    let ran = Diagnostic { live_actions: vec!["clicked".into()], complete: true, live_page_ok: true, ..Default::default() };
+    let (_, run, outcomes) = live_result(blank(), &ran, &acts).unwrap();
+    assert_eq!((run, outcomes), (LiveRun::Complete, vec!["clicked".to_string()]));
+}
+
+#[tokio::test]
+async fn the_live_seconds_leave_the_gate_its_reserve() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(55), fake);
+    add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    go(&r, Some(page(&next_data(B))), &Prior::default()).await;
+    let secs = r.fake.live_secs_seen.lock().unwrap().clone();
+    assert_eq!(secs.len(), 1, "55 s left is enough for a live load");
+    // left is at most 55 s: the load may use at most 35 s, never the gate's 20 s.
+    assert!(secs[0] <= 35 && secs[0] >= 30, "{secs:?}");
+}
+
+#[tokio::test]
+async fn under_fifty_seconds_left_no_live_load_is_requested() {
+    let fake = Fake::new();
+    set_live(&fake, live_page(&[LIVE_A]), LiveRun::Complete, &["clicked"]);
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(49), fake);
+    add_live_recipe(&r, "site", "#load", "a[.]m3u8");
+    go(&r, Some(page(&next_data(B))), &Prior::default()).await;
+    assert!(r.fake.live_secs_seen.lock().unwrap().is_empty());
 }

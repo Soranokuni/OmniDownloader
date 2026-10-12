@@ -867,7 +867,8 @@ fn eval_range(
                     Some(url.to_string())
                 }
             }
-            Step::Click { .. } | Step::Wait { .. } | Step::ScrollTo { .. } => None,
+            // Live steps only matter to `run_after_live`, where they are done already.
+            Step::Click { .. } | Step::Wait { .. } | Step::ScrollTo { .. } => continue,
             Step::Media { from, referer } => {
                 let Some(v) = values[*from].clone() else {
                     return Err(Stop::NoValue(i));
@@ -1153,13 +1154,67 @@ fn stop_outcome(s: Stop) -> RecipeOutcome {
     }
 }
 
+/// One live step of a recipe, as the browser executes it (P10.11c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveAction {
+    Click(String),
+    Wait(u32),
+    ScrollTo(String),
+}
+
+/// The recipe's live steps, in step order.
+pub fn live_actions(recipe: &Recipe) -> Vec<LiveAction> {
+    recipe
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Click { css } => Some(LiveAction::Click(css.clone())),
+            Step::Wait { ms } => Some(LiveAction::Wait(*ms)),
+            Step::ScrollTo { css } => Some(LiveAction::ScrollTo(css.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A canonical text for an action list, equal exactly when the lists are
+/// equal (JSON strings, so no selector can imitate a separator).
+pub fn action_key(actions: &[LiveAction]) -> String {
+    let parts: Vec<Value> = actions
+        .iter()
+        .map(|a| match a {
+            LiveAction::Click(c) => serde_json::json!(["click", c]),
+            LiveAction::Wait(ms) => serde_json::json!(["wait", ms]),
+            LiveAction::ScrollTo(c) => serde_json::json!(["scroll_to", c]),
+        })
+        .collect();
+    Value::Array(parts).to_string()
+}
+
 /// Run a recipe on a saved page. Pure apart from the fetcher and the deadline.
 pub async fn run(recipe: &Recipe, snap: &PageSnapshot, fetcher: &dyn Fetcher, deadline: Instant) -> RecipeOutcome {
+    if recipe.validate().is_ok() && recipe.steps.iter().any(|s| s.is_live()) {
+        return RecipeOutcome::NeedsLivePage;
+    }
+    run_value_steps(recipe, snap, fetcher, deadline).await
+}
+
+/// `run` on a snapshot taken after the recipe's live steps were executed in
+/// the browser. All live actions count as done before any value step runs:
+/// live steps produce no value and no value step can refer to one, so the
+/// order between them cannot matter. A recipe without live steps gives the
+/// same outcome as `run`.
+pub async fn run_after_live(
+    recipe: &Recipe,
+    snap: &PageSnapshot,
+    fetcher: &dyn Fetcher,
+    deadline: Instant,
+) -> RecipeOutcome {
+    run_value_steps(recipe, snap, fetcher, deadline).await
+}
+
+async fn run_value_steps(recipe: &Recipe, snap: &PageSnapshot, fetcher: &dyn Fetcher, deadline: Instant) -> RecipeOutcome {
     if let Err(e) = recipe.validate() {
         return RecipeOutcome::Rejected(format!("invalid recipe: {e}"));
-    }
-    if recipe.steps.iter().any(|s| s.is_live()) {
-        return RecipeOutcome::NeedsLivePage;
     }
     let n = recipe.steps.len();
     let mut values: Vec<Option<String>> = vec![None; n];
