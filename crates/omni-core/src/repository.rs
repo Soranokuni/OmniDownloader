@@ -35,6 +35,50 @@ pub struct EvidenceRow {
     pub created_at: Option<chrono::DateTime<Utc>>,
 }
 
+/// One run of the repair ladder on a job (plan P10.11a).
+#[derive(Debug, Clone)]
+pub struct RepairAttempt {
+    pub id: i64,
+    pub job_id: i64,
+    /// `None` when the stored text does not parse; never shown as "now".
+    pub started_at: Option<chrono::DateTime<Utc>>,
+    pub finished_at: Option<chrono::DateTime<Utc>>,
+    /// `shadow` | `hold`.
+    pub mode: String,
+    pub rung: Option<String>,
+    pub outcome: Option<String>,
+    /// The full `recipes.hash` behind the top candidate.
+    pub recipe_hash: Option<String>,
+    pub recipe_id: Option<i64>,
+    pub domain: Option<String>,
+    pub llm_calls: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    /// The verified candidates with their checks, in rank order.
+    pub candidates_json: Option<String>,
+    pub next_index: i64,
+    pub duration_ms: Option<i64>,
+    /// The exact address that was held, when the attempt held one.
+    pub held_url: Option<String>,
+    /// What MCR decided about the held video: approved | rejected | expired.
+    pub mcr_decision: Option<String>,
+}
+
+/// What a repair attempt concluded, for [`Repository::finish_attempt`].
+#[derive(Debug, Clone, Default)]
+pub struct AttemptEnd {
+    pub rung: Option<String>,
+    pub outcome: Option<String>,
+    pub recipe_hash: Option<String>,
+    pub recipe_id: Option<i64>,
+    pub domain: Option<String>,
+    pub candidates_json: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub held_url: Option<String>,
+    /// Place of the held video in `candidates_json`.
+    pub next_index: i64,
+}
+
 /// A finished video held back until MCR approves it (plan P10.5).
 #[derive(Debug, Clone)]
 pub struct HeldOutput {
@@ -299,13 +343,18 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // Already queued or running?
+        // Already queued or running, or finished and waiting for MCR's approval
+        // for this same journalist (a re-sent link must not deliver the story
+        // twice; another journalist needs their own slug, as with the
+        // completed-job rule below)?
         let active: Option<i64> = tx
             .query_row(
                 "SELECT id FROM queue
-                 WHERE url_normalized = ? AND status IN ('PENDING','RUNNING')
+                 WHERE url_normalized = ?
+                   AND (status IN ('PENDING','RUNNING')
+                        OR (status = 'AWAITING_APPROVAL' AND journalist = ?))
                  ORDER BY id ASC LIMIT 1",
-                params![normalized],
+                params![normalized, job.journalist.to_uppercase()],
                 |r| r.get(0),
             )
             .optional()?;
@@ -790,6 +839,111 @@ impl Repository {
             params![url, crate::urlnorm::normalize(url), timestamps::now_string(), job_id, owner],
         )?;
         Ok(changed == 1)
+    }
+
+    /// How this job's video was found (`extraction_method`), written by the
+    /// worker holding the lease. `false` when the job is no longer its own.
+    pub fn set_leased_extraction_method(&self, job_id: i64, owner: &str, method: Option<&str>) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE queue SET extraction_method = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![method, timestamps::now_string(), job_id, owner],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// A run of the repair ladder begins (P10.11a). Returns the attempt's id.
+    pub fn start_attempt(&self, job_id: i64, mode: &str, now: chrono::DateTime<Utc>) -> Result<i64> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO repair_attempts (job_id, started_at, mode) VALUES (?, ?, ?)",
+            params![job_id, timestamps::format(now), mode],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// The run ended: what it concluded, and the verified candidates in rank order.
+    pub fn finish_attempt(&self, id: i64, end: &AttemptEnd, now: chrono::DateTime<Utc>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE repair_attempts
+             SET finished_at = ?, rung = ?, outcome = ?, recipe_hash = ?, recipe_id = ?, domain = ?,
+                 candidates_json = ?, duration_ms = ?, held_url = ?, next_index = ?
+             WHERE id = ?",
+            params![
+                timestamps::format(now),
+                end.rung,
+                end.outcome,
+                end.recipe_hash,
+                end.recipe_id,
+                end.domain,
+                end.candidates_json,
+                end.duration_ms,
+                end.held_url,
+                end.next_index,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The job's most recent repair attempt.
+    pub fn latest_attempt(&self, job_id: i64) -> Result<Option<RepairAttempt>> {
+        let conn = self.pool.get()?;
+        let row = conn
+            .query_row(
+                "SELECT id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
+                        llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
+                        held_url, mcr_decision
+                 FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                params![job_id],
+                |r| {
+                    Ok(RepairAttempt {
+                        id: r.get(0)?,
+                        job_id: r.get(1)?,
+                        started_at: timestamps::parse(&r.get::<_, String>(2)?),
+                        finished_at: timestamps::parse_opt(r.get(3)?),
+                        mode: r.get(4)?,
+                        rung: r.get(5)?,
+                        outcome: r.get(6)?,
+                        recipe_hash: r.get(7)?,
+                        recipe_id: r.get(8)?,
+                        domain: r.get(9)?,
+                        llm_calls: r.get(10)?,
+                        tokens_in: r.get(11)?,
+                        tokens_out: r.get(12)?,
+                        candidates_json: r.get(13)?,
+                        next_index: r.get(14)?,
+                        duration_ms: r.get(15)?,
+                        held_url: r.get(16)?,
+                        mcr_decision: r.get(17)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Every address MCR rejected for this job: the `held_url` of each of its
+    /// attempts with `mcr_decision = 'rejected'`. An expired or approved hold
+    /// is not in it.
+    pub fn rejected_held_urls(&self, job_id: i64) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT held_url FROM repair_attempts
+             WHERE job_id = ? AND mcr_decision = 'rejected' AND held_url IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![job_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Retention: attempts that started more than `days` days ago (their jobs'
+    /// own deletion removes the rest).
+    pub fn purge_repair_attempts(&self, days: i64) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(Utc::now() - Duration::days(days));
+        Ok(conn.execute("DELETE FROM repair_attempts WHERE started_at < ?", params![cutoff])?)
     }
 
     /// Store the videos offered to MCR for this job (`candidates_json`).
@@ -1312,6 +1466,13 @@ impl Repository {
                 "UPDATE held_outputs SET decision = 'superseded', decided_at = ?
                  WHERE job_id = ? AND (decision IS NULL OR decision = 'approved')",
                 params![timestamps::now_string(), id],
+            )?;
+            // The repair attempts that made those holds are settled too, so a
+            // later MCR decision can only land on the new run's attempt (P10.11a).
+            tx.execute(
+                "UPDATE repair_attempts SET mcr_decision = 'superseded'
+                 WHERE job_id = ? AND outcome = 'held' AND mcr_decision IS NULL",
+                params![id],
             )?;
         }
         tx.commit()?;
@@ -3254,6 +3415,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
+        note_mcr_decision(&tx, job_id, "approved")?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'INFO', ?)",
             params![job_id, now, format!("Approved by {by}; delivering the held file")],
@@ -3287,6 +3449,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
+        note_mcr_decision(&tx, job_id, "rejected")?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
             params![job_id, now, format!("Rejected by {by} ({reason}): {message}")],
@@ -3320,6 +3483,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
+        note_mcr_decision(&tx, job_id, "expired")?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
             params![job_id, at, "Nobody approved the held video in time; it was deleted"],
@@ -4682,6 +4846,20 @@ pub struct TaxonomyBackup {
     pub bytes: u64,
     pub groups: usize,
     pub people: usize,
+}
+
+/// MCR decided about a held video: note it on the job's latest repair attempt
+/// that held one and has no decision yet, in the same transaction as the
+/// decision itself (P10.11a). Nothing to note for a hold the ladder did not make.
+fn note_mcr_decision(tx: &rusqlite::Transaction<'_>, job_id: i64, decision: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE repair_attempts SET mcr_decision = ?
+         WHERE id = (SELECT id FROM repair_attempts
+                     WHERE job_id = ? AND outcome = 'held' AND mcr_decision IS NULL
+                     ORDER BY id DESC LIMIT 1)",
+        params![decision, job_id],
+    )?;
+    Ok(())
 }
 
 /// `taxonomy-20260930T134501123Z-before-import.json`, and nothing else: no

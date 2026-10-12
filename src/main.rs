@@ -27,6 +27,7 @@ use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
 mod canary;
+mod repair;
 mod selfcheck;
 
 #[derive(Parser)]
@@ -844,6 +845,7 @@ async fn run_daemon(
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
     info!("  yt-dlp:       {:?}", ytdl_path);
 
+    let repair_ffprobe = ffprobe_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
@@ -1183,7 +1185,16 @@ async fn run_daemon(
     let worker_health = health.clone();
     let worker_watchfolder = watchfolder_path.clone();
     let worker_temp = temp_path.clone();
-    let worker_repair_mode = config.repair.mode;
+    let worker_repair = Arc::new(repair::RepairCtx {
+        repo: repo.clone(),
+        cfg: repair::RepairCfg {
+            mode: config.repair.mode,
+            budget: Duration::from_secs(config.repair.budget_secs),
+            hold_hours: config.repair.hold_hours,
+            held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
+        },
+        env: Arc::new(repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone())),
+    });
     let worker_canary = canary_env.clone();
 
     tokio::spawn(async move {
@@ -1294,6 +1305,7 @@ async fn run_daemon(
             let evidence_dir = worker_temp.join("evidence");
             let job_health = worker_health.clone();
             let job_canary = worker_canary.clone();
+            let job_repair = worker_repair.clone();
 
             tokio::spawn(async move {
                 // Held for the whole job, including every error path: dropping
@@ -1341,7 +1353,7 @@ async fn run_daemon(
                     })
                 };
 
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, worker_repair_mode, &job_health, &job_canary).await;
+                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, &job_repair, &job_health, &job_canary).await;
                 cancel.cancel();
                 heartbeat.abort();
 
@@ -1510,10 +1522,11 @@ async fn run_job(
     job: omni_core::models::Job,
     cancel: CancellationToken,
     evidence_dir: &std::path::Path,
-    repair_mode: RepairMode,
+    repair: &repair::RepairCtx,
     health: &HealthState,
     canary: &Arc<canary::CanaryEnv>,
 ) -> Result<()> {
+    let repair_mode = repair.cfg.mode;
     let job_id = job.id;
     let orig_url = job.url.clone();
 
@@ -1677,6 +1690,8 @@ async fn run_job(
     // What the browser saw, kept for a job that ends without a video (P10.1).
     let mut snapshot: Option<omni_browser::PageSnapshot> = None;
     let mut sniffed_streams: Vec<String> = Vec::new();
+    // The referer the sniffed stream was tried with (the repair ladder does not retry it).
+    let mut sniff_referer: Option<String> = None;
     let sniff = match &process_result {
         Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
         Ok(_) => false,
@@ -1729,6 +1744,7 @@ async fn run_job(
                         }
                         omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams);
                         retry_job.url = primary;
+                        sniff_referer = Some(bundle.referer.clone());
                         if !repo.set_stage(job_id, owner, JobStage::Download)? {
                             warn!("Job #{job_id}: no longer ours; not downloading the sniffed stream");
                             return Ok(());
@@ -1861,6 +1877,54 @@ async fn run_job(
                     }
                     snapshot = seen;
                 }
+                let wants_evidence = |code: ErrorCode| {
+                    matches!(original, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
+                        || matches!(
+                            code,
+                            ErrorCode::DrmProtected
+                                | ErrorCode::NoVideoOnPage
+                                | ErrorCode::VideoUnresolved
+                                | ErrorCode::RepairExhausted
+                        )
+                };
+
+                // The page showed a video the normal path could not resolve:
+                // the repair ladder (P10.11a). Only here, only for a web page,
+                // only with repair on; a held video waits for MCR.
+                let tried = repair::Tried::of(&job, &orig_url, page_referer.as_deref(), &sniffed_streams, sniff_referer.as_deref());
+                if let Some(ladder) = repair::after_failure(repair, &job, owner, &orig_url, code, &snapshot, tried, &cancel).await {
+                    match &ladder {
+                        repair::LadderResult::ShadowFound { verified } => {
+                            info!("Job #{job_id}: repair (shadow) verified {} video(s); the job ends as before", verified.len())
+                        }
+                        repair::LadderResult::Held { recipe_hash } => {
+                            info!("Job #{job_id}: a repaired video is held for MCR (recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
+                        }
+                        _ => {}
+                    }
+                    match repair::disposition(&ladder, repair_mode, repair.cfg.budget) {
+                        repair::Disposition::Held => {
+                            if let Some(snap) = &snapshot {
+                                if wants_evidence(code) && still_ours(repo, job_id, owner) {
+                                    save_page_evidence(repo, evidence_dir, job_id, snap).await;
+                                }
+                            }
+                            // Waiting, not failed: no site-health record.
+                            finish_held(repo, job_id, owner)?;
+                            return Ok(());
+                        }
+                        repair::Disposition::Lost => {
+                            warn!("Job #{job_id}: no longer ours; nothing more to do");
+                            return Ok(());
+                        }
+                        repair::Disposition::Finish { code: c, message: m } => {
+                            code = c;
+                            message = m;
+                        }
+                        repair::Disposition::Unchanged => {}
+                    }
+                }
+
                 // Nothing more is written for a job that is no longer ours.
                 if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
                     repo.record_event(job_id, "ERROR", None, code.hint_el())?;
@@ -1868,11 +1932,7 @@ async fn run_job(
                 // Only the job's owner writes evidence: a job MCR cancelled
                 // or the reaper gave away has no business leaving a file.
                 if let Some(snap) = &snapshot {
-                    if (matches!(original, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
-                        || matches!(code, ErrorCode::DrmProtected | ErrorCode::NoVideoOnPage | ErrorCode::VideoUnresolved))
-                        && !cancel.is_cancelled()
-                        && still_ours(repo, job_id, owner)
-                    {
+                    if wants_evidence(code) && !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
                         save_page_evidence(repo, evidence_dir, job_id, snap).await;
                     }
                 }
@@ -1886,17 +1946,19 @@ async fn run_job(
                 )?;
                 // Site health (P10.3): only a finished job, and only the
                 // codes that say something about the site, not this page.
+                // A repair that ran out of time counts as the unresolved video it was.
+                let site_code = repair::site_code(code);
                 if done
                     && !cancel.is_cancelled()
                     && job.parent_job_id.is_none()
-                    && omni_core::site_health::counts_against_site(code.as_str())
+                    && omni_core::site_health::counts_against_site(site_code.as_str())
                 {
                     let noted = note_site_outcome(
                         repo,
                         health,
                         job_id,
                         &orig_url,
-                        SiteOutcome::SiteFailure(code.as_str().to_string()),
+                        SiteOutcome::SiteFailure(site_code.as_str().to_string()),
                     );
                     // A site that just started failing: look at its recent
                     // articles in the background (P10.4). Never awaited here.
@@ -2732,6 +2794,11 @@ async fn run_one_task(
                 Ok(rep) if rep.changed() => info!("Retention: recipe store {rep:?}"),
                 Ok(_) => {}
                 Err(e) => warn!("Retention: recipe store not cleaned: {e:#}"),
+            }
+            match repo.purge_repair_attempts(90) {
+                Ok(n) if n > 0 => info!("Retention: removed {n} old repair attempt(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: repair attempts not purged: {e:#}"),
             }
             match repo.purge_login_attempts(90) {
                 Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),

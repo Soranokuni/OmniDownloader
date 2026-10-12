@@ -1734,6 +1734,7 @@ name = "omni-ingest"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "omni-broadcast",
