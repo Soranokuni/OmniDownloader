@@ -54,6 +54,7 @@ impl WebServer {
             .route("/api/jobs/:id/preview/video", get(api_preview_video))
             .route("/api/jobs/:id/preview/contact", get(api_preview_contact))
             .route("/api/jobs/:id/preview/article", get(api_preview_article))
+            .route("/api/jobs/:id/preview/frame", get(api_preview_frame))
             .route("/api/jobs/:id/redownload", post(api_redownload_job))
             .route("/api/jobs/:id/mark-done", post(api_mark_done_job))
             .route("/api/jobs/:id/cancel", post(api_cancel_job))

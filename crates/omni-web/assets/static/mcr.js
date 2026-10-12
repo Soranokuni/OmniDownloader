@@ -23,7 +23,7 @@ import {
 } from '/static/desk.js?v=10';
 import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=16';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=10';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=3';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=4';
 
 let journalists = [];
 

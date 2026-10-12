@@ -1120,7 +1120,7 @@ async fn the_desk_seeks_in_the_preview_with_a_range_request() -> Result<()> {
     let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
     assert_eq!(
         json["job"]["held"]["preview"],
-        json!({ "video": true, "audio_only": false, "contact": true, "article": false }),
+        json!({ "video": true, "audio_only": false, "contact": true, "article": false, "frame": false }),
         "{json}"
     );
     Ok(())
@@ -1222,5 +1222,127 @@ async fn a_held_row_outside_the_jobs_held_directory_serves_no_preview() -> Resul
     let (status, _, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_ne!(body, b"secret");
+    Ok(())
+}
+
+// ---- the approval card's evidence (P10.11b) ----
+
+#[tokio::test]
+async fn the_closest_frame_is_served_to_mcr_only_when_it_exists() -> Result<()> {
+    let app = App::new()?;
+    let (id, dir) = held_job_with_preview(&app)?;
+    let uri = format!("/api/jobs/{id}/preview/frame");
+
+    let (status, _, _) = app.get_raw(&uri, &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no frame yet: 404, not an empty 200");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["held"]["preview"]["frame"], false, "{json}");
+
+    std::fs::write(dir.join("_frame.jpg"), b"framebytes")?;
+    let (status, headers, body) = app.get_raw(&uri, &app.mcr_token, &[]).await?;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, b"framebytes".as_slice()));
+    assert_eq!(headers["content-type"], "image/jpeg");
+    assert_eq!(headers["cache-control"], "no-store");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["held"]["preview"]["frame"], true, "{json}");
+
+    // Who may ask is the MATRIX row of the route.
+    Ok(())
+}
+
+/// A held job whose repair attempt is on record: found by an admin recipe that
+/// MCR approved twice, the held candidate the second one, a picture compared.
+fn held_repaired_job(app: &App) -> Result<i64> {
+    use omni_core::recipe_score::{Event, NewRecipe, Origin, ScopeKind};
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://news.example.gr/story/1", "1_NIKOLAOU_REPAIR", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let now = chrono::Utc::now();
+    let recipe = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: "example.gr".into(),
+        family: None,
+        recipe_json: "{}".into(),
+        hash: "h-admin-1".into(),
+        steps_hash: "s-admin-1".into(),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let rid = match app.repo.insert_recipe(&recipe, now)? {
+        omni_core::recipe_score::InsertOutcome::Inserted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    app.repo.recipe_event(rid, "example.gr", Event::Approval, now)?;
+    app.repo.recipe_event(rid, "example.gr", Event::Approval, now)?;
+    // Approvals on another domain must not count.
+    app.repo.recipe_event(rid, "other.example", Event::Approval, now)?;
+
+    let attempt = app.repo.start_attempt(id, "hold", now)?;
+    let list = json!([
+        {"url": "https://cdn.news.example.gr/first.mp4", "duration_secs": 30.0, "checks": [{"name": "probe", "ok": false, "detail": "x"}]},
+        {"url": "https://cdn.news.example.gr/second.mp4", "duration_secs": 118.0, "checks": [
+            {"name": "egress", "ok": true, "detail": "Δημόσιος κόμβος"},
+            {"name": "length", "ok": true, "detail": "Ταιριάζει με τα 120 δλ της σελίδας"}
+        ]}
+    ]);
+    let end = omni_core::repository::AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        recipe_id: Some(rid),
+        recipe_hash: Some("h-admin-1".into()),
+        domain: Some("example.gr".into()),
+        candidates_json: Some(list.to_string()),
+        held_url: Some("https://cdn.news.example.gr/second.mp4?sig=abc".into()),
+        next_index: 1,
+        expected_secs: Some(120.0),
+        ..Default::default()
+    };
+    app.repo.finish_attempt(attempt, &end, now)?;
+    assert!(app.repo.record_card_evidence(attempt, id, "test-worker", Some(4), Some(7.0), Some("img.news.example.gr"))?);
+
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("clip.mxf"), b"abc")?;
+    assert!(app.repo.hold_output(id, "test-worker", &dir.join("clip.mxf").to_string_lossy(), 3, HELD_SHA, Some(118.0), now + chrono::Duration::hours(24))?);
+    assert!(app.repo.finish(id, "test-worker", JobStatus::AwaitingApproval, None, None, None)?);
+    Ok(id)
+}
+
+#[tokio::test]
+async fn the_approval_view_carries_the_repair_card_of_the_held_candidate() -> Result<()> {
+    let app = App::new()?;
+    let id = held_repaired_job(&app)?;
+    let (status, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let r = &page["jobs"][0]["repair"];
+    assert_eq!(page["jobs"][0]["id"], id);
+    assert_eq!(r["found"], "recipe", "{page}");
+    assert_eq!(r["recipe_approvals"], 2, "only this domain's approvals count: {page}");
+    assert_eq!(r["source_host"], "cdn.news.example.gr");
+    assert_eq!((r["duration_secs"].as_f64(), r["expected_secs"].as_f64()), (Some(118.0), Some(120.0)));
+    let names: Vec<&str> = r["checks"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["egress", "length"], "the held candidate's checks, not the first one's");
+    assert_eq!(r["short_clip"], false);
+    assert_eq!(r["image"], json!({ "distance": 4, "frame_secs": 7.0, "match": true }), "{page}");
+    assert!(!r.to_string().contains("sig=abc") && !r.to_string().contains("second.mp4"), "hosts only: {r}");
+    // The single-job view the mail panel uses says the same.
+    let (_, one) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(one["job"]["repair"], *r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_held_job_without_a_repair_attempt_has_a_null_repair() -> Result<()> {
+    let app = App::new()?;
+    held_job(&app, 1)?;
+    let (_, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(page["total"], 1, "{page}");
+    assert!(page["jobs"][0]["repair"].is_null(), "{page}");
+    assert!(page["jobs"][0]["held"].is_object());
     Ok(())
 }

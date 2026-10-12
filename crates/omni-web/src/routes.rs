@@ -410,14 +410,32 @@ fn held_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::
 /// Which preview files this held video has (P10.6), so the desk knows what to
 /// show; the files live next to the held MXF, under fixed names.
 fn preview_flags(dir: &std::path::Path) -> serde_json::Value {
-    use omni_broadcast::preview::{ARTICLE_FILE, AUDIO_FILE, CONTACT_FILE, VIDEO_FILE};
+    use omni_broadcast::preview::{ARTICLE_FILE, AUDIO_FILE, CONTACT_FILE, FRAME_FILE, VIDEO_FILE};
     let has = |name: &str| dir.join(name).is_file();
     serde_json::json!({
         "video": has(VIDEO_FILE),
         "audio_only": !has(VIDEO_FILE) && has(AUDIO_FILE),
         "contact": has(CONTACT_FILE),
         "article": has(ARTICLE_FILE),
+        "frame": has(FRAME_FILE),
     })
+}
+
+/// How a repaired video was found and why it can be trusted (P10.11b), for the
+/// approval card: `null` unless this job's latest held repair attempt exists.
+fn repair_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+    if job.status != JobStatus::AwaitingApproval {
+        return serde_json::Value::Null;
+    }
+    let Ok(Some(attempt)) = state.repo.latest_held_attempt(job.id) else {
+        return serde_json::Value::Null;
+    };
+    let origin = attempt.recipe_id.and_then(|id| state.repo.recipe_origin(id).ok().flatten());
+    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
+        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
+        _ => 0,
+    };
+    crate::repair_card::build(&attempt, origin.as_deref(), approvals).unwrap_or(serde_json::Value::Null)
 }
 
 /// The directory a job's preview files are in: the parent of the held row's
@@ -476,6 +494,11 @@ pub async fn api_preview_article(RequireMcr(_p): RequireMcr, AxumPath(id): AxumP
     serve_preview(&state, id, &[(omni_broadcast::preview::ARTICLE_FILE, "image/jpeg")], req).await
 }
 
+/// `GET /api/jobs/:id/preview/frame`: the preview frame closest to the article picture.
+pub async fn api_preview_frame(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    serve_preview(&state, id, &[(omni_broadcast::preview::FRAME_FILE, "image/jpeg")], req).await
+}
+
 pub async fn api_get_jobs(
     RequireMcr(principal): RequireMcr,
     Query(query): Query<JobsQuery>,
@@ -508,6 +531,7 @@ pub async fn api_get_jobs(
             .map(|j| {
                 let mut v = job_for_desk(j);
                 v["held"] = held_for_desk(&state, j);
+                v["repair"] = repair_for_desk(&state, j);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -570,6 +594,7 @@ pub async fn api_get_job(
         .map_err(internal_error("Could not read the job."))?;
     let mut desk_job = job_for_desk(&job);
     desk_job["held"] = held_for_desk(&state, &job);
+    desk_job["repair"] = repair_for_desk(&state, &job);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
 }
 
@@ -2227,6 +2252,7 @@ pub async fn api_get_mail_view(
             by_id.get(&p.job_id).map(|j| {
                 let mut v = job_for_desk(j);
                 v["held"] = held_for_desk(&state, j);
+                v["repair"] = repair_for_desk(&state, j);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }

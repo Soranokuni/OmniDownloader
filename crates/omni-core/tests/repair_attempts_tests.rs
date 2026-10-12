@@ -90,6 +90,7 @@ fn attempts_are_recorded_read_back_and_go_with_their_job() -> Result<()> {
         held_url: Some("https://cdn.example/a.mp4".into()),
         next_index: 1,
         duration_ms: Some(1234),
+        expected_secs: Some(95.0),
     };
     repo.finish_attempt(second, &end, t0 + Duration::seconds(6))?;
     let got = repo.latest_attempt(id)?.unwrap();
@@ -101,6 +102,8 @@ fn attempts_are_recorded_read_back_and_go_with_their_job() -> Result<()> {
     assert_eq!(got.candidates_json, end.candidates_json);
     assert_eq!((got.held_url.as_deref(), got.next_index), (Some("https://cdn.example/a.mp4"), 1));
     assert!(got.finished_at.is_some());
+    assert_eq!(got.expected_secs, Some(95.0));
+    assert_eq!((got.image_distance, got.image_frame_secs, got.image_host), (None, None, None), "no comparison yet");
 
     repo.delete_job(id)?;
     assert!(repo.latest_attempt(id)?.is_none(), "attempts are deleted with their job");
@@ -235,5 +238,49 @@ fn a_rejection_never_lands_on_the_attempt_of_a_hold_superseded_by_a_retry() -> R
     assert!(repo.reject_held(id, "wrong", "not the story", "desk")?);
 
     assert!(repo.rejected_held_urls(id)?.is_empty(), "video A was never rejected");
+    Ok(())
+}
+
+#[test]
+fn card_evidence_is_written_only_by_the_lease_holder_and_only_on_that_attempt() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let id = queue(&repo, "https://news.example/a", 1).job_id();
+    repo.lease_job("w", 180)?.expect("leased");
+    let at = repo.start_attempt(id, "hold", Utc::now())?;
+    let other = queue(&repo, "https://news.example/b", 2).job_id();
+
+    assert!(!repo.record_card_evidence(at, id, "someone-else", Some(3), Some(4.5), Some("img.example"))?, "not our lease");
+    assert!(!repo.record_card_evidence(at, other, "w", Some(3), Some(4.5), Some("img.example"))?, "another job's attempt id");
+    let got = repo.latest_attempt(id)?.unwrap();
+    assert_eq!((got.image_distance, got.image_frame_secs, got.image_host), (None, None, None), "refused writes leave NULL");
+
+    assert!(repo.record_card_evidence(at, id, "w", Some(3), Some(4.5), Some("img.example"))?);
+    let got = repo.latest_attempt(id)?.unwrap();
+    assert_eq!((got.image_distance, got.image_frame_secs, got.image_host.as_deref()), (Some(3), Some(4.5), Some("img.example")));
+    // A picture kept without a comparison: host only.
+    assert!(repo.record_card_evidence(at, id, "w", None, None, Some("img.example"))?);
+    let got = repo.latest_attempt(id)?.unwrap();
+    assert_eq!((got.image_distance, got.image_frame_secs), (None, None));
+
+    // Once the job is parked (the lease is gone) nothing more is written.
+    assert!(repo.finish(id, "w", JobStatus::AwaitingApproval, None, None, None)?);
+    assert!(!repo.record_card_evidence(at, id, "w", Some(1), Some(1.0), Some("late.example"))?);
+    assert_eq!(repo.latest_attempt(id)?.unwrap().image_host.as_deref(), Some("img.example"));
+    Ok(())
+}
+
+#[test]
+fn the_latest_held_attempt_skips_later_attempts_that_did_not_hold() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let id = queue(&repo, "https://news.example/a", 1).job_id();
+    assert!(repo.latest_held_attempt(id)?.is_none());
+    let held = repo.start_attempt(id, "hold", Utc::now())?;
+    repo.finish_attempt(held, &AttemptEnd { outcome: Some("held".into()), ..Default::default() }, Utc::now())?;
+    let later = repo.start_attempt(id, "hold", Utc::now())?;
+    repo.finish_attempt(later, &AttemptEnd { outcome: Some("nothing_verified".into()), ..Default::default() }, Utc::now())?;
+    assert_eq!(repo.latest_attempt(id)?.unwrap().id, later);
+    assert_eq!(repo.latest_held_attempt(id)?.unwrap().id, held, "the card describes the attempt that held");
     Ok(())
 }

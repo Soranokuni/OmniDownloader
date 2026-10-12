@@ -60,6 +60,41 @@ export function expiryText(iso, now = Date.now()) {
   return `Λήγει σε ${hours} ${hours === 1 ? 'ώρα' : 'ώρες'} (${at})`;
 }
 
+/** m:ss for a number of seconds; empty when unknown. */
+export function clockSecs(secs) {
+  const n = Number(secs);
+  if (!Number.isFinite(n) || n < 0) return '';
+  const s = Math.round(n);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** «Βρέθηκε με …» from the repair record; the job's method when there is none. */
+export function foundText(repair, method) {
+  if (!repair) return foundHow(method);
+  switch (repair.found) {
+    case 'shipped': return 'Βρέθηκε με: γενική συνταγή';
+    case 'recipe': {
+      const n = Number(repair.recipe_approvals) || 0;
+      return n > 0 ? `Βρέθηκε με: γνωστή συνταγή, εγκρίθηκε ${n} ${n === 1 ? 'φορά' : 'φορές'}` : 'Βρέθηκε με: νέα συνταγή';
+    }
+    case 'llm': return 'Βρέθηκε με: τη βοήθεια AI — ελέγξτε προσεκτικά';
+    default: return foundHow(method);
+  }
+}
+
+const CHECK_LABELS = {
+  egress: 'Διεύθυνση',
+  ad: 'Διαφήμιση',
+  probe: 'Βίντεο',
+  length: 'Διάρκεια',
+  short: 'Μήκος',
+};
+
+/** The Greek label of a gate check; an unknown name is shown as it is. */
+export function checkLabel(name) {
+  return Object.prototype.hasOwnProperty.call(CHECK_LABELS, name) ? CHECK_LABELS[name] : String(name || '');
+}
+
 const previewUrl = (job, kind) => `/api/jobs/${job.id}/preview/${kind}`;
 
 /** The contact sheet is 4 columns by 3 rows of equal tiles. */
@@ -163,6 +198,8 @@ function buildCard(job, ctx) {
   // about the outcome, so this one is re-enabled afterwards (it refreshes).
   const markDone = mk('btn', 'Το έβαλα στο Dalet', guarded(async () => { await ctx.markDone(job); return false; }));
   const history = ctx.historyPanel(job);
+  const repair = job.repair || null;
+  const media = mediaNode(job, held);
   const expiry = el('span', { class: 'note' }, expiryText(held.expires_at));
 
   const node = el('div', { class: 'card attention stack ap-card', 'data-job': String(job.id), tabindex: '-1' },
@@ -176,11 +213,11 @@ function buildCard(job, ctx) {
           ctx.mailLink(job),
         )),
       el('span', { class: 'badge warn' }, 'Για έγκριση')),
-    mediaNode(job, held),
-    pvArticle(job, held),
+    media,
+    pvArticle(job, held, repair, media.querySelector('video')),
+    pvChecks(repair),
     el('div', { class: 'ap-facts note' },
-      el('span', {}, `Διάρκεια ${fmtDuration(held.duration)}`),
-      el('span', {}, foundHow(job.extraction_method)),
+      ...pvFacts(job, held, repair),
       href ? el('a', { href, target: '_blank', rel: 'noopener noreferrer', title: job.url }, 'Άνοιγμα σελίδας') : null,
       expiry),
     el('div', { class: 'row' }, approve, wrong, toggle, markDone, history[0], status),
@@ -189,11 +226,67 @@ function buildCard(job, ctx) {
   return { node, job, expiry };
 }
 
-function pvArticle(job, held) {
-  if (!(held.preview && held.preview.article)) return null;
-  return el('div', { class: 'ap-article' },
-    el('span', { class: 'note' }, 'Εικόνα άρθρου'),
-    el('img', { src: previewUrl(job, 'article'), alt: 'Εικόνα άρθρου' }));
+/** One picture with its caption; `onClick` makes it a button that seeks the video. */
+function figure(src, alt, caption, onClick) {
+  const img = el('img', { src, alt });
+  if (onClick) {
+    img.classList.add('ap-seek');
+    img.title = 'Πατήστε για να πάτε σε αυτό το σημείο του βίντεο';
+    img.addEventListener('click', onClick);
+  }
+  return el('figure', { class: 'ap-figure' }, img, el('figcaption', { class: 'note' }, caption));
+}
+
+/**
+ * The article's own picture beside the video frame that looks most like it.
+ * A match is a good sign; no match is neutral (many pictures are designed
+ * graphics), never a failure.
+ */
+function pvArticle(job, held, repair, video) {
+  const pv = held.preview || {};
+  if (!pv.article) return null;
+  const image = repair && repair.image;
+  const parts = [figure(previewUrl(job, 'article'), 'Εικόνα άρθρου', 'Εικόνα άρθρου')];
+  if (pv.frame) {
+    const t = image && Number.isFinite(Number(image.frame_secs)) ? Number(image.frame_secs) : null;
+    const seek = video && t !== null ? () => { video.currentTime = t; } : null;
+    const label = t !== null ? `Πλησιέστερο καρέ ${clockSecs(t)}` : 'Πλησιέστερο καρέ';
+    parts.push(figure(previewUrl(job, 'frame'), label, label, seek));
+  }
+  let verdict = null;
+  if (image && image.match) {
+    verdict = el('span', { class: 'ap-same' }, 'ίδια εικόνα ✓');
+  } else if (image && image.distance !== null && image.distance !== undefined) {
+    verdict = el('span', { class: 'note' }, 'η εικόνα του άρθρου δεν μοιάζει με κάποιο καρέ (συχνό σε γραφικά)');
+  }
+  return el('div', { class: 'ap-article' }, el('div', { class: 'row ap-pics' }, ...parts), verdict);
+}
+
+/** «Έλεγχοι»: the gate's checklist for the video that was held. */
+function pvChecks(repair) {
+  const checks = repair && Array.isArray(repair.checks) ? repair.checks : [];
+  if (!checks.length) return null;
+  return el('div', { class: 'ap-checks' },
+    el('span', { class: 'note' }, 'Έλεγχοι'),
+    el('ul', { class: 'ap-checklist' },
+      ...checks.map((c) => el('li', { class: c.ok ? 'ap-ok' : 'ap-bad' },
+        el('span', { class: 'ap-mark', 'aria-label': c.ok ? 'πέρασε' : 'απέτυχε' }, c.ok ? '✓' : '✗'),
+        el('b', {}, checkLabel(c.name)),
+        c.detail ? el('span', { class: 'note' }, ` ${c.detail}`) : null))));
+}
+
+/** The short facts line: length against the page's, the source host, a short-clip warning. */
+function pvFacts(job, held, repair) {
+  const expected = repair && Number(repair.expected_secs) > 0 ? clockSecs(repair.expected_secs) : '';
+  const length = expected
+    ? `Διάρκεια: ${clockSecs(held.duration)} (σελίδα: ${expected})`
+    : `Διάρκεια ${fmtDuration(held.duration)}`;
+  return [
+    el('span', {}, length),
+    repair && repair.source_host ? el('span', {}, `Πηγή: ${repair.source_host}`) : null,
+    repair && repair.short_clip ? el('span', { class: 'ap-warn' }, 'Σύντομο κλιπ — μπορεί να είναι διαφήμιση') : null,
+    el('span', {}, foundText(repair, job.extraction_method)),
+  ];
 }
 
 /**

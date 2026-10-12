@@ -169,6 +169,13 @@ enum Commands {
         /// Journalist surname for the job
         #[arg(long)]
         journalist: Option<String>,
+        /// A picture to show as the article's image on the card, next to the
+        /// closest frame of the preview (also records a held repair attempt)
+        #[arg(long)]
+        article_image: Option<std::path::PathBuf>,
+        /// Record a held repair attempt with a fixed, invented checklist
+        #[arg(long)]
+        checks: bool,
     },
 }
 
@@ -366,6 +373,8 @@ async fn dev_hold(
     file: &std::path::Path,
     slug: Option<String>,
     journalist: Option<String>,
+    article_image: Option<std::path::PathBuf>,
+    checks: bool,
 ) -> Result<()> {
     use omni_broadcast::pipeline::{DeliveryMode, RunOutcome};
 
@@ -386,15 +395,19 @@ async fn dev_hold(
             .or_else(|| deps.find_binary(name))
             .unwrap_or_else(|| PathBuf::from(format!("{name}.exe")))
     };
+    let ffmpeg = tool(&config.ffmpeg_path, "ffmpeg");
     let engine = BroadcastEngine::new(
         repo.clone(),
         tool(&config.ytdl_path, "yt-dlp"),
-        tool(&config.ffmpeg_path, "ffmpeg"),
+        ffmpeg.clone(),
         tool(&config.ffprobe_path, "ffprobe"),
         tool(&config.bmxtranswrap_path, "bmxtranswrap"),
         temp_path.clone(),
         watchfolder_path,
     );
+    if let Some(img) = &article_image {
+        anyhow::ensure!(img.is_file(), "{img:?} is not a file");
+    }
 
     let journalist = journalist.unwrap_or_else(|| "DEVTEST".to_string()).to_uppercase();
     let slug = slug.unwrap_or_else(|| format!("1_{journalist}_DEVHOLD"));
@@ -426,10 +439,101 @@ async fn dev_hold(
     };
     match engine.process_job_mode(job, &owner, None, None, None, None, mode).await? {
         RunOutcome::Held => {
+            if article_image.is_some() || checks {
+                dev_hold_card(&repo, id, &owner, &ffmpeg, article_image.as_deref(), checks).await?;
+            }
             anyhow::ensure!(finish_held(&repo, id, &owner)?, "job #{id} is no longer ours");
             println!("Held job #{id}");
         }
         RunOutcome::Delivered => anyhow::bail!("job #{id} was delivered instead of held"),
+    }
+    Ok(())
+}
+
+/// What a repaired hold would have recorded, so the card can be seen on a dev
+/// instance: an invented checklist and a held attempt on an invented host, and
+/// the same card evidence step the ladder runs (a local picture instead of a fetch).
+#[cfg(debug_assertions)]
+async fn dev_hold_card(
+    repo: &Repository,
+    id: i64,
+    owner: &str,
+    ffmpeg: &std::path::Path,
+    article_image: Option<&std::path::Path>,
+    checks: bool,
+) -> Result<()> {
+    use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, ScopeKind};
+
+    let held = repo.waiting_held(id)?.context("no held row to describe")?;
+    let dir = std::path::Path::new(&held.path).parent().context("the held file has no directory")?.to_path_buf();
+    let duration = held.duration.unwrap_or(0.0);
+    let now = chrono::Utc::now();
+    let list = if checks {
+        serde_json::json!([{
+            "url": "https://cdn.dev-hold.example/video/clip.mp4",
+            "referer": "https://news.dev-hold.example/story/1",
+            "origin": "recipe:dev0hold",
+            "duration_secs": duration,
+            "score": 10,
+            "checks": [
+                {"name": "egress", "ok": true, "detail": "Δημόσιος κόμβος cdn.dev-hold.example της σελίδας"},
+                {"name": "ad", "ok": true, "detail": "Δεν είναι διαφήμιση"},
+                {"name": "probe", "ok": true, "detail": format!("{duration:.0} δλ, 720p (cdn.dev-hold.example)")},
+                {"name": "length", "ok": true, "detail": format!("Ταιριάζει με τα {:.0} δλ της σελίδας", duration + 2.0)},
+            ],
+        }])
+    } else {
+        serde_json::json!([])
+    };
+    // A recipe MCR already approved twice on this invented domain.
+    let recipe = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: "dev-hold.example".into(),
+        family: None,
+        recipe_json: "{}".into(),
+        hash: "dev-hold-recipe".into(),
+        steps_hash: "dev-hold-steps".into(),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let recipe_id = match repo.insert_recipe(&recipe, now)? {
+        InsertOutcome::Inserted(r) | InsertOutcome::Merged(r) => Some(r),
+        _ => None,
+    };
+    if let Some(r) = recipe_id {
+        if repo.recipe_site_approvals(r, "dev-hold.example")? == 0 {
+            repo.recipe_event(r, "dev-hold.example", Event::Approval, now)?;
+            repo.recipe_event(r, "dev-hold.example", Event::Approval, now)?;
+        }
+    }
+    let attempt = repo.start_attempt(id, "hold", now)?;
+    let end = omni_core::repository::AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        recipe_id,
+        recipe_hash: Some("dev-hold-recipe".into()),
+        domain: Some("dev-hold.example".into()),
+        candidates_json: Some(list.to_string()),
+        duration_ms: Some(0),
+        held_url: Some("https://cdn.dev-hold.example/video/clip.mp4".into()),
+        next_index: 0,
+        expected_secs: Some(duration + 2.0),
+    };
+    repo.finish_attempt(attempt, &end, now)?;
+    if let Some(img) = article_image {
+        let t = std::time::Instant::now();
+        let done = omni_broadcast::card::card_from_file(ffmpeg, &dir, img, duration).await;
+        println!("Card evidence took {} ms", t.elapsed().as_millis());
+        match done {
+            Some((distance, frame_secs)) => {
+                anyhow::ensure!(
+                    repo.record_card_evidence(attempt, id, owner, distance.map(i64::from), frame_secs, Some("img.dev-hold.example"))?,
+                    "job #{id} is no longer ours"
+                );
+                println!("Article image: distance {distance:?}, closest frame at {frame_secs:?} s");
+            }
+            None => println!("The article image could not be decoded; the card has none."),
+        }
     }
     Ok(())
 }
@@ -615,8 +719,8 @@ async fn main() -> Result<()> {
             mail_ingest(&paths, &eml).await?;
         }
         #[cfg(debug_assertions)]
-        Some(Commands::DevHold { file, slug, journalist }) => {
-            dev_hold(&paths, &file, slug, journalist).await?;
+        Some(Commands::DevHold { file, slug, journalist, article_image, checks }) => {
+            dev_hold(&paths, &file, slug, journalist, article_image, checks).await?;
         }
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)
@@ -846,6 +950,7 @@ async fn run_daemon(
     info!("  yt-dlp:       {:?}", ytdl_path);
 
     let repair_ffprobe = ffprobe_path.clone();
+    let repair_ffmpeg = ffmpeg_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
@@ -1193,7 +1298,7 @@ async fn run_daemon(
             hold_hours: config.repair.hold_hours,
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
         },
-        env: Arc::new(repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone())),
+        env: Arc::new(repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone())),
     });
     let worker_canary = canary_env.clone();
 

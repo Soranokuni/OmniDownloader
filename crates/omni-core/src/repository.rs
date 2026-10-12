@@ -62,6 +62,14 @@ pub struct RepairAttempt {
     pub held_url: Option<String>,
     /// What MCR decided about the held video: approved | rejected | expired.
     pub mcr_decision: Option<String>,
+    /// dHash distance between the article picture and the closest preview frame (P10.11b); `None` = no comparison.
+    pub image_distance: Option<i64>,
+    /// Time of that frame in the preview.
+    pub image_frame_secs: Option<f64>,
+    /// The host the article picture came from.
+    pub image_host: Option<String>,
+    /// The length the page itself stated for its video.
+    pub expected_secs: Option<f64>,
 }
 
 /// What a repair attempt concluded, for [`Repository::finish_attempt`].
@@ -77,6 +85,7 @@ pub struct AttemptEnd {
     pub held_url: Option<String>,
     /// Place of the held video in `candidates_json`.
     pub next_index: i64,
+    pub expected_secs: Option<f64>,
 }
 
 /// A finished video held back until MCR approves it (plan P10.5).
@@ -869,7 +878,7 @@ impl Repository {
         conn.execute(
             "UPDATE repair_attempts
              SET finished_at = ?, rung = ?, outcome = ?, recipe_hash = ?, recipe_id = ?, domain = ?,
-                 candidates_json = ?, duration_ms = ?, held_url = ?, next_index = ?
+                 candidates_json = ?, duration_ms = ?, held_url = ?, next_index = ?, expected_secs = ?
              WHERE id = ?",
             params![
                 timestamps::format(now),
@@ -882,6 +891,7 @@ impl Repository {
                 end.duration_ms,
                 end.held_url,
                 end.next_index,
+                end.expected_secs,
                 id
             ],
         )?;
@@ -890,39 +900,96 @@ impl Repository {
 
     /// The job's most recent repair attempt.
     pub fn latest_attempt(&self, job_id: i64) -> Result<Option<RepairAttempt>> {
+        self.attempt_where(job_id, "")
+    }
+
+    /// The job's most recent attempt that ended with a held video (the one the
+    /// approval card describes).
+    pub fn latest_held_attempt(&self, job_id: i64) -> Result<Option<RepairAttempt>> {
+        self.attempt_where(job_id, "AND outcome = 'held'")
+    }
+
+    /// `extra` is fixed text from the two callers above, never a value.
+    fn attempt_where(&self, job_id: i64, extra: &str) -> Result<Option<RepairAttempt>> {
         let conn = self.pool.get()?;
+        let sql = format!(
+            "SELECT id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
+                    llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
+                    held_url, mcr_decision, image_distance, image_frame_secs, image_host, expected_secs
+             FROM repair_attempts WHERE job_id = ? {extra} ORDER BY id DESC LIMIT 1"
+        );
         let row = conn
-            .query_row(
-                "SELECT id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
-                        llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
-                        held_url, mcr_decision
-                 FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1",
-                params![job_id],
-                |r| {
-                    Ok(RepairAttempt {
-                        id: r.get(0)?,
-                        job_id: r.get(1)?,
-                        started_at: timestamps::parse(&r.get::<_, String>(2)?),
-                        finished_at: timestamps::parse_opt(r.get(3)?),
-                        mode: r.get(4)?,
-                        rung: r.get(5)?,
-                        outcome: r.get(6)?,
-                        recipe_hash: r.get(7)?,
-                        recipe_id: r.get(8)?,
-                        domain: r.get(9)?,
-                        llm_calls: r.get(10)?,
-                        tokens_in: r.get(11)?,
-                        tokens_out: r.get(12)?,
-                        candidates_json: r.get(13)?,
-                        next_index: r.get(14)?,
-                        duration_ms: r.get(15)?,
-                        held_url: r.get(16)?,
-                        mcr_decision: r.get(17)?,
-                    })
-                },
-            )
+            .query_row(&sql, params![job_id], |r| {
+                Ok(RepairAttempt {
+                    id: r.get(0)?,
+                    job_id: r.get(1)?,
+                    started_at: timestamps::parse(&r.get::<_, String>(2)?),
+                    finished_at: timestamps::parse_opt(r.get(3)?),
+                    mode: r.get(4)?,
+                    rung: r.get(5)?,
+                    outcome: r.get(6)?,
+                    recipe_hash: r.get(7)?,
+                    recipe_id: r.get(8)?,
+                    domain: r.get(9)?,
+                    llm_calls: r.get(10)?,
+                    tokens_in: r.get(11)?,
+                    tokens_out: r.get(12)?,
+                    candidates_json: r.get(13)?,
+                    next_index: r.get(14)?,
+                    duration_ms: r.get(15)?,
+                    held_url: r.get(16)?,
+                    mcr_decision: r.get(17)?,
+                    image_distance: r.get(18)?,
+                    image_frame_secs: r.get(19)?,
+                    image_host: r.get(20)?,
+                    expected_secs: r.get(21)?,
+                })
+            })
             .optional()?;
         Ok(row)
+    }
+
+    /// The article-picture evidence of a held attempt (P10.11b), written only
+    /// while `owner` still holds the job's lease. `false` when it does not
+    /// (nothing is written then).
+    pub fn record_card_evidence(
+        &self,
+        attempt_id: i64,
+        job_id: i64,
+        owner: &str,
+        distance: Option<i64>,
+        frame_secs: Option<f64>,
+        host: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let changed = conn.execute(
+            "UPDATE repair_attempts SET image_distance = ?, image_frame_secs = ?, image_host = ?
+             WHERE id = ? AND job_id = ?
+               AND EXISTS (SELECT 1 FROM queue WHERE id = ? AND lease_owner = ? AND status = 'RUNNING')",
+            params![distance, frame_secs, host, attempt_id, job_id, job_id, owner],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// How many times MCR approved this recipe's video on `domain` (0 when it has no row there).
+    pub fn recipe_site_approvals(&self, recipe_id: i64, domain: &str) -> Result<i64> {
+        let conn = self.pool.get()?;
+        let n: Option<i64> = conn
+            .query_row(
+                "SELECT approvals FROM recipe_sites WHERE recipe_id = ? AND domain = ?",
+                params![recipe_id, domain],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// `shipped` | `admin` | `llm`, or `None` when the recipe is gone.
+    pub fn recipe_origin(&self, recipe_id: i64) -> Result<Option<String>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row("SELECT origin FROM recipes WHERE id = ?", params![recipe_id], |r| r.get(0))
+            .optional()?)
     }
 
     /// Every address MCR rejected for this job: the `held_url` of each of its
