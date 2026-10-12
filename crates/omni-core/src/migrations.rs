@@ -603,6 +603,20 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_repair_attempts_job ON repair_attempts(job_id);
         "#,
     ),
+    (
+        21,
+        // What the approval card shows next to a held repaired video
+        // (P10.11b): how far the article's picture is from the closest frame
+        // of the preview (a dHash distance; NULL = no article picture or no
+        // comparison), the time of that frame, the host the picture came from,
+        // and the length the page itself stated for its video.
+        r#"
+        ALTER TABLE repair_attempts ADD COLUMN image_distance   INTEGER;
+        ALTER TABLE repair_attempts ADD COLUMN image_frame_secs REAL;
+        ALTER TABLE repair_attempts ADD COLUMN image_host       TEXT;
+        ALTER TABLE repair_attempts ADD COLUMN expected_secs    REAL;
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -986,6 +1000,48 @@ mod tests {
         assert_eq!((llm, next), (0, 0));
         conn.execute("DELETE FROM queue WHERE id = 5", []).unwrap();
         assert_eq!(count("repair_attempts"), 0, "the attempts go with their job");
+    }
+
+    /// A database at version 20 with an attempt row keeps it when 21 is
+    /// applied; the image columns appear empty (no comparison made).
+    #[test]
+    fn migration_21_adds_the_card_evidence_columns_and_keeps_the_attempt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 20) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 20);
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');
+             INSERT INTO repair_attempts (job_id, started_at, mode, outcome, held_url) VALUES (5, 'x', 'hold', 'held', 'https://cdn.a.example/v.mp4');",
+        )
+        .unwrap();
+        for c in ["image_distance", "image_frame_secs", "image_host", "expected_secs"] {
+            assert!(!columns_of(&conn, "repair_attempts").iter().any(|x| x == c), "{c} must not exist before 21");
+        }
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 21);
+        let have = columns_of(&conn, "repair_attempts");
+        for c in ["image_distance", "image_frame_secs", "image_host", "expected_secs"] {
+            assert!(have.iter().any(|x| x == c), "repair_attempts.{c} missing: {have:?}");
+        }
+        let (outcome, url, dist, secs, host, exp): (String, String, Option<i64>, Option<f64>, Option<String>, Option<f64>) = conn
+            .query_row(
+                "SELECT outcome, held_url, image_distance, image_frame_secs, image_host, expected_secs FROM repair_attempts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!((outcome.as_str(), url.as_str()), ("held", "https://cdn.a.example/v.mp4"), "the row survives");
+        assert_eq!((dist, secs, host, exp), (None, None, None, None), "NULL means no comparison");
     }
 
     #[test]

@@ -986,3 +986,15 @@ body.desk-wide main { max-width: 1480px; }
 .ap-facts { display: flex; flex-wrap: wrap; gap: 4px 16px; }
 .ap-reject { gap: 8px; }
 .ap-reject input { flex: 1 1 220px; }
+.ap-pics { gap: 12px; align-items: flex-start; }
+.ap-figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.ap-figure img { max-width: 320px; width: 100%; border-radius: 6px; border: 1px solid var(--line); }
+.ap-figure img.ap-seek { cursor: pointer; }
+.ap-same { color: var(--ok); font-weight: 600; }
+.ap-checks { display: flex; flex-direction: column; gap: 4px; }
+.ap-checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.ap-checklist li { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.ap-mark { width: 1.2em; font-weight: 700; }
+.ap-ok .ap-mark { color: var(--ok); }
+.ap-bad .ap-mark { color: var(--bad); }
+.ap-warn { color: var(--warn); font-weight: 600; }

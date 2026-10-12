@@ -12,7 +12,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use omni_browser::http_fetcher::{check_target, MAX_BODY_BYTES};
+use omni_browser::http_fetcher::{check_target, MAX_BODY_BYTES, MAX_IMAGE_BYTES};
 use omni_browser::{Fetcher, HttpFetcher};
 
 const FAKE: &str = "player.example.test";
@@ -45,6 +45,16 @@ async fn handler(State((hits, port)): State<(Arc<Hits>, u16)>, Path(name): Path<
         }
         "big" => vec![b'a'; MAX_BODY_BYTES + 1].into_response(),
         "edge" => vec![b'a'; MAX_BODY_BYTES].into_response(),
+        "imgbig" => vec![b'a'; MAX_IMAGE_BYTES + 1].into_response(),
+        "imgedge" => vec![b'a'; MAX_IMAGE_BYTES].into_response(),
+        "slow1" => {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            to("hang")
+        }
+        "hang" => {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            "late".into_response()
+        }
         "gone" => StatusCode::NOT_FOUND.into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -142,4 +152,71 @@ async fn no_cookies_a_browser_user_agent_and_no_time_means_no_request() {
     assert_eq!(hits.cookies.load(Ordering::SeqCst), 0);
     assert!(hits.last_ua.lock().unwrap().starts_with("Mozilla/5.0"), "{}", hits.last_ua.lock().unwrap());
     assert!(f.get(&format!("{base}/ok"), Instant::now()).await.is_err(), "a spent deadline");
+}
+
+#[tokio::test]
+async fn an_article_picture_may_be_two_mib_and_not_a_byte_more_while_a_recipe_fetch_stays_at_one() {
+    let (addr, _hits) = server().await;
+    let f = HttpFetcher::pinned_for_tests(FAKE, addr);
+    let url = |n: &str| format!("http://{FAKE}:{}/{n}", addr.port());
+    assert_eq!(f.get_image_bytes(&url("imgedge"), soon()).await.unwrap().len(), MAX_IMAGE_BYTES);
+    let err = f.get_image_bytes(&url("imgbig"), soon()).await.unwrap_err().to_string();
+    assert!(err.contains("larger than"), "{err}");
+    // The same body is far over the recipe cap.
+    assert!(MAX_IMAGE_BYTES > MAX_BODY_BYTES);
+    assert!(f.get(&url("imgedge"), soon()).await.is_err(), "the recipe path keeps its 1 MiB cap");
+    // A private address is refused before anything connects.
+    assert!(f.get_image_bytes(&format!("http://127.0.0.1:{}/imgedge", addr.port()), soon()).await.is_err());
+}
+
+/// The query of a signed picture address is a secret: no error text may carry it.
+#[tokio::test]
+async fn a_failed_picture_fetch_never_puts_the_address_query_in_the_error() {
+    let (addr, _hits) = server().await;
+    let f = HttpFetcher::pinned_for_tests(FAKE, addr);
+    // Connection refused: a port nobody listens on.
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+    let f_dead = HttpFetcher::pinned_for_tests(FAKE, dead_addr);
+    let url = format!("http://{FAKE}:{}/p.jpg?X-Amz-Signature=SECRET&token=SECRET", dead_addr.port());
+    let err = format!("{:#}", f_dead.get_image_bytes(&url, soon()).await.unwrap_err());
+    assert!(!err.contains("SECRET") && !err.contains("token="), "refused: {err}");
+    assert!(err.contains(FAKE), "the host is still named: {err}");
+    // A recipe fetch too.
+    let err = format!("{:#}", f_dead.get(&url, soon()).await.unwrap_err());
+    assert!(!err.contains("SECRET") && !err.contains("token="), "recipe fetch: {err}");
+    // A timeout: the server never answers.
+    let url = format!("http://{FAKE}:{}/hang?token=SECRET", addr.port());
+    let started = Instant::now();
+    let err = format!("{:#}", f.get_image_bytes(&url, Instant::now() + Duration::from_millis(800)).await.unwrap_err());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!err.contains("SECRET") && !err.contains("token="), "timeout: {err}");
+}
+
+/// One slow picture may take at most 10 s of the card's budget, however much
+/// is left, so the next candidate is still tried.
+#[tokio::test]
+async fn a_slow_name_server_counts_against_the_deadline() {
+    // Review finding (P10.11b): the lookup ran on its own 3 s clock after
+    // the time left was measured, so a fetch could end ~3 s past its deadline.
+    let (addr, _hits) = server().await;
+    let f = HttpFetcher::pinned_for_tests(FAKE, addr).with_resolve_delay_for_tests(Duration::from_secs(3));
+    let started = Instant::now();
+    let r = f.get_image_bytes(&format!("http://{FAKE}:{}/p.png", addr.port()), Instant::now() + Duration::from_millis(500)).await;
+    let took = started.elapsed();
+    assert!(r.is_err(), "the lookup outlived the deadline, so nothing may be fetched");
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
+}
+
+#[tokio::test]
+async fn a_slow_picture_takes_ten_seconds_at_most_whatever_deadline_is_left() {
+    let (addr, _hits) = server().await;
+    let f = HttpFetcher::pinned_for_tests(FAKE, addr);
+    let started = Instant::now();
+    // 6 s on the first hop, then a hop that never answers: the limit is for the whole fetch.
+    let r = f.get_image_bytes(&format!("http://{FAKE}:{}/slow1", addr.port()), Instant::now() + Duration::from_secs(60)).await;
+    let took = started.elapsed();
+    assert!(r.is_err());
+    assert!(took >= Duration::from_secs(8) && took < Duration::from_secs(12), "took {took:?}");
 }

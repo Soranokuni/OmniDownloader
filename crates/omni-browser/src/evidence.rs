@@ -816,7 +816,11 @@ fn plausible_secs(v: f64) -> Option<f64> {
 }
 
 fn is_video_object(v: &Value) -> bool {
-    match v.get("@type") {
+    type_is_video(v.get("@type"))
+}
+
+fn type_is_video(t: Option<&Value>) -> bool {
+    match t {
         Some(Value::String(t)) => t == "VideoObject",
         Some(Value::Array(a)) => a.iter().any(|t| t.as_str() == Some("VideoObject")),
         _ => false,
@@ -869,6 +873,78 @@ pub fn expected_duration_secs(snap: &PageSnapshot) -> Option<f64> {
         }
     }
     None
+}
+
+
+/// The most article-picture addresses the approval card tries.
+pub const MAX_ARTICLE_IMAGES: usize = 3;
+
+/// A JSON-LD picture value as an address: a string, the first of an array, or
+/// an object's `url`.
+fn ld_picture(v: &Value) -> Option<&str> {
+    match v {
+        Value::String(s) => Some(s.as_str()),
+        Value::Array(a) => a.first().and_then(ld_picture),
+        Value::Object(o) => o.get("url").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// Every JSON-LD object in document order, through arrays, `@graph` and
+/// nested objects (bounded depth).
+fn ld_objects<'a>(v: &'a Value, depth: usize, out: &mut Vec<&'a serde_json::Map<String, Value>>) {
+    if depth > 6 {
+        return;
+    }
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| ld_objects(x, depth + 1, out)),
+        Value::Object(o) => {
+            out.push(o);
+            o.values().for_each(|x| ld_objects(x, depth + 1, out));
+        }
+        _ => {}
+    }
+}
+
+/// Where the article's own picture may be, best first, for the approval card
+/// (P10.11b): a VideoObject's `thumbnailUrl`, then the posters in the order
+/// the page gave them (a video's `poster`, then `og:image` / `twitter:image`),
+/// then a JSON-LD `image`. Relative addresses are resolved against the page;
+/// only http and https are kept; no address twice; at most
+/// [`MAX_ARTICLE_IMAGES`].
+pub fn article_images(snap: &PageSnapshot) -> Vec<String> {
+    let base = snap.final_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&snap.page_url);
+    let base = url::Url::parse(base).ok();
+    let docs: Vec<Value> = snap.ld_json.iter().filter_map(|raw| serde_json::from_str::<Value>(raw).ok()).collect();
+    let mut objects: Vec<&serde_json::Map<String, Value>> = Vec::new();
+    for d in &docs {
+        ld_objects(d, 0, &mut objects);
+    }
+    let thumbs = objects.iter().filter(|o| type_is_video(o.get("@type"))).filter_map(|o| o.get("thumbnailUrl").and_then(ld_picture));
+    let posters = snap.posters.iter().map(String::as_str);
+    let images = objects.iter().filter_map(|o| o.get("image").and_then(ld_picture));
+    let mut out: Vec<String> = Vec::new();
+    for raw in thumbs.chain(posters).chain(images) {
+        if out.len() >= MAX_ARTICLE_IMAGES {
+            break;
+        }
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let resolved = match &base {
+            Some(b) => b.join(raw).ok(),
+            None => url::Url::parse(raw).ok(),
+        };
+        let Some(u) = resolved.filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some()) else {
+            continue;
+        };
+        let s = u.to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Whether a response may be an ad server's VAST reply worth reading: an XML
@@ -1599,5 +1675,58 @@ mod tests {
         let back: PageSnapshot = serde_json::from_str(&s.to_capped_json(cap)).unwrap();
         assert_eq!(back.network.len(), 20, "network entries survive while ad_media can still go");
         assert!(back.ad_media.is_empty());
+    }
+
+    fn pics(ld: &[&str], posters: &[&str]) -> Vec<String> {
+        let mut s = PageSnapshot::new("https://news.example/story/1");
+        s.ld_json = ld.iter().map(|x| x.to_string()).collect();
+        s.posters = posters.iter().map(|x| x.to_string()).collect();
+        article_images(&s)
+    }
+
+    #[test]
+    fn article_images_come_thumbnail_then_posters_then_ld_image() {
+        let ld = r#"{"@type":"NewsArticle","image":"https://img.example/ld.jpg"}"#;
+        let vid = r#"{"@type":"VideoObject","thumbnailUrl":"https://img.example/thumb.jpg"}"#;
+        let got = pics(&[ld, vid], &["https://img.example/poster.jpg", "https://img.example/og.jpg"]);
+        assert_eq!(got, ["https://img.example/thumb.jpg", "https://img.example/poster.jpg", "https://img.example/og.jpg"]);
+        // The cap leaves the JSON-LD image out when three better ones exist, and keeps it otherwise.
+        assert_eq!(pics(&[ld], &["https://img.example/og.jpg"]), ["https://img.example/og.jpg", "https://img.example/ld.jpg"]);
+    }
+
+    #[test]
+    fn article_images_are_deduplicated_resolved_and_http_only() {
+        let got = pics(
+            &[],
+            &["/img/a.jpg", "https://news.example/img/a.jpg", "data:image/png;base64,AAAA", "javascript:alert(1)", "ftp://x.example/a.jpg", "", "  img/b.jpg  "],
+        );
+        assert_eq!(got, ["https://news.example/img/a.jpg", "https://news.example/story/img/b.jpg"]);
+        // Relative addresses resolve against the final address when the page was redirected.
+        let mut s = PageSnapshot::new("https://short.example/x");
+        s.final_url = Some("https://news.example/deep/page".into());
+        s.posters = vec!["p.jpg".into()];
+        assert_eq!(article_images(&s), ["https://news.example/deep/p.jpg"]);
+    }
+
+    #[test]
+    fn article_images_are_capped_at_three() {
+        let posters: Vec<String> = (0..10).map(|i| format!("https://img.example/{i}.jpg")).collect();
+        let refs: Vec<&str> = posters.iter().map(String::as_str).collect();
+        assert_eq!(pics(&[], &refs).len(), MAX_ARTICLE_IMAGES);
+        assert_eq!(pics(&[], &refs)[0], "https://img.example/0.jpg");
+    }
+
+    #[test]
+    fn article_images_read_graph_arrays_and_objects_in_json_ld() {
+        let graph = r#"{"@context":"https://schema.org","@graph":[{"@type":"WebPage"},{"@type":["Thing","VideoObject"],"thumbnailUrl":["https://img.example/g1.jpg","https://img.example/g2.jpg"]}]}"#;
+        assert_eq!(pics(&[graph], &[]), ["https://img.example/g1.jpg"], "first of an array");
+        let obj = r#"{"@type":"NewsArticle","image":{"@type":"ImageObject","url":"https://img.example/o.jpg"}}"#;
+        assert_eq!(pics(&[obj], &[]), ["https://img.example/o.jpg"], "an ImageObject's url");
+        let arr = r#"{"@type":"NewsArticle","image":["https://img.example/a1.jpg","https://img.example/a2.jpg"]}"#;
+        assert_eq!(pics(&[arr], &[]), ["https://img.example/a1.jpg"]);
+        // A thumbnail on something that is not a VideoObject is not a video thumbnail.
+        let not_video = r#"{"@type":"NewsArticle","thumbnailUrl":"https://img.example/t.jpg"}"#;
+        assert!(pics(&[not_video], &[]).is_empty());
+        assert!(pics(&["not json", "{}"], &[]).is_empty());
     }
 }

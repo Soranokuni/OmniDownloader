@@ -24,10 +24,12 @@ const D: &str = "https://cdn.news.example.gr/v/d.mp4";
 
 /// A scratch directory that removes itself.
 struct Scratch(PathBuf);
+static SCRATCH_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 impl Scratch {
     fn new() -> Self {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("omni-repair-test-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omni-repair-test-{}-{nanos}-{}", std::process::id(), SCRATCH_SEQ.fetch_add(1, Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
     }
@@ -59,6 +61,32 @@ struct Fake {
     downloads: Mutex<Vec<(String, Option<String>, DeliveryMode)>>,
     script: Mutex<VecDeque<std::result::Result<RunOutcome, ErrorCode>>>,
     fetch: NoFetch,
+    /// ffmpeg for the card evidence; `None` = the ladder gets no card tools.
+    card_ffmpeg: Option<PathBuf>,
+    card_cap: Option<Duration>,
+    pics: Pics,
+}
+
+/// The article pictures of the card step: one body or a failure, counted; `hook` runs at each request.
+#[derive(Default)]
+struct Pics {
+    calls: AtomicUsize,
+    hang: AtomicBool,
+    body: Mutex<Option<Vec<u8>>>,
+    hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+}
+#[async_trait]
+impl ImageSource for Pics {
+    async fn get_image(&self, _url: &str, _deadline: Instant) -> Result<Vec<u8>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(h) = self.hook.lock().unwrap().as_ref() {
+            h();
+        }
+        if self.hang.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        self.body.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("scripted picture failure"))
+    }
 }
 
 fn info(secs: f64) -> ProbeInfo {
@@ -79,6 +107,9 @@ impl Fake {
             downloads: Mutex::new(Vec::new()),
             script: Mutex::new(VecDeque::new()),
             fetch: NoFetch,
+            card_ffmpeg: None,
+            card_cap: None,
+            pics: Pics::default(),
         }
     }
     fn probes(&self) -> usize {
@@ -131,6 +162,12 @@ impl Env for Fake {
     }
     async fn host_is_public(&self, _host: &str, _port: u16) -> bool {
         self.host_public.load(Ordering::SeqCst)
+    }
+    fn card_tools(&self) -> Option<(PathBuf, &dyn ImageSource)> {
+        self.card_ffmpeg.clone().map(|f| (f, &self.pics as &dyn ImageSource))
+    }
+    fn card_cap(&self) -> Duration {
+        self.card_cap.unwrap_or(card::CARD_CAP)
     }
     async fn download(
         &self,
@@ -843,6 +880,159 @@ async fn the_whole_recipe_pass_on_a_multi_megabyte_page_stays_inside_the_budget(
     assert!(took < Duration::from_secs(20), "the recipe pass took {took:?}");
     let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
     assert!(at.duration_ms.unwrap() < 20_000);
+}
+
+// ------------------------------------------------ the approval card's evidence (P10.11b)
+
+const PIC: &str = "https://cdn.news.example.gr/img/p.jpg";
+
+/// A held row for the job and its directory, as the pipeline leaves them.
+fn held_dir_for(r: &Rig) -> PathBuf {
+    let dir = r._dir.0.join("held").join(r.job.id.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mxf = dir.join("1_ANNA_TEST.mxf");
+    std::fs::write(&mxf, b"not a real mxf").unwrap();
+    let expires = Utc::now() + chrono::Duration::hours(24);
+    assert!(r.repo.hold_output(r.job.id, OWNER, &mxf.to_string_lossy(), 14, "abc", Some(120.0), expires).unwrap());
+    dir
+}
+
+/// A page with the shipped recipe's video, the page's stated length (2 min) and one article picture.
+fn page_with_picture() -> PageSnapshot {
+    let mut s = page(&next_data(A));
+    s.ld_json.push(r#"{"@type":"VideoObject","duration":"PT2M"}"#.to_string());
+    s.posters = vec![PIC.to_string()];
+    s
+}
+
+fn hold_rig(card_ffmpeg: Option<PathBuf>, body: Option<Vec<u8>>) -> Rig {
+    let mut fake = Fake::new();
+    fake.card_ffmpeg = card_ffmpeg;
+    *fake.pics.body.lock().unwrap() = body;
+    let r = rig_with(RepairMode::Hold, Duration::from_secs(60), fake);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    r
+}
+
+/// A 4 s `_preview.mp4` of a moving picture and one frame of it as a PNG body.
+async fn preview_and_picture(ffmpeg: &Path, dir: &Path) -> Vec<u8> {
+    let run = |args: Vec<String>| async move {
+        let o = omni_core::process::run(ffmpeg, &args, omni_core::process::RunOpts::new(Duration::from_secs(60))).await.unwrap();
+        assert!(o.success, "{}", o.stderr_tail);
+    };
+    let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let preview = dir.join("_preview.mp4").to_string_lossy().into_owned();
+    let mut a = s(&["-y", "-v", "error", "-f", "lavfi", "-i", "mandelbrot=size=640x360:rate=25", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]);
+    a.push(preview);
+    run(a).await;
+    let png = dir.join("pic.png");
+    let mut a = s(&["-y", "-v", "error", "-f", "lavfi", "-i", "mandelbrot=size=640x360:rate=25", "-ss", "2", "-frames:v", "1"]);
+    a.push(png.to_string_lossy().into_owned());
+    run(a).await;
+    let bytes = std::fs::read(&png).unwrap();
+    std::fs::remove_file(png).unwrap();
+    bytes
+}
+
+#[tokio::test]
+async fn a_held_run_records_the_picture_evidence_and_the_pages_stated_length_on_the_attempt() {
+    let Some(ffmpeg) = tool("ffmpeg") else {
+        eprintln!("WARNING: skipping the card evidence ladder test -- bin/ffmpeg.exe missing");
+        return;
+    };
+    let r = hold_rig(Some(ffmpeg.clone()), None);
+    let dir = held_dir_for(&r);
+    *r.fake.pics.body.lock().unwrap() = Some(preview_and_picture(&ffmpeg, &dir).await);
+    let res = go(&r, Some(page_with_picture()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.pics.calls.load(Ordering::SeqCst), 1, "card evidence runs once");
+    let at = r.repo.latest_held_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!(at.image_host.as_deref(), Some("cdn.news.example.gr"));
+    assert!(at.image_distance.is_some_and(|d| d <= 10), "{:?}", at.image_distance);
+    assert!(at.image_frame_secs.is_some_and(|t| (t - 2.0).abs() <= 1.0), "{:?}", at.image_frame_secs);
+    assert_eq!(at.expected_secs, Some(120.0));
+    assert!(dir.join("_article.jpg").is_file() && dir.join("_frame.jpg").is_file());
+    assert!(!dir.join("_article.src").exists());
+}
+
+#[tokio::test]
+async fn a_card_evidence_failure_never_changes_the_hold() {
+    // ffmpeg cannot even start, and a picture that is only a header: the step fails.
+    for body in [Some([&[0xFF, 0xD8, 0xFF][..], &[1u8; 64][..]].concat()), None] {
+        let r = hold_rig(Some(PathBuf::from("no-such-ffmpeg.exe")), body.clone());
+        let dir = held_dir_for(&r);
+        let res = go(&r, Some(page_with_picture()), &Prior::default()).await;
+        let hash = shipped_hash("next_data_media");
+        let LadderResult::Held { recipe_hash } = res else { panic!("expected Held, got {res:?}") };
+        assert_eq!(recipe_hash, hash);
+        assert_eq!(r.fake.pics.calls.load(Ordering::SeqCst), 1, "the step ran ({})", body.is_some());
+        let at = r.repo.latest_held_attempt(r.job.id).unwrap().unwrap();
+        assert_eq!((at.outcome.as_deref(), at.held_url.as_deref(), at.next_index), (Some("held"), Some(A), 0));
+        assert_eq!(at.recipe_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!((at.image_distance, at.image_frame_secs, at.image_host), (None, None, None), "nothing written");
+        assert_eq!(at.expected_secs, Some(120.0), "the page's length is recorded regardless");
+        assert!(!dir.join("_article.jpg").exists() && !dir.join("_article.src").exists());
+        assert!(r.repo.waiting_held(r.job.id).unwrap().is_some(), "the hold stands");
+    }
+}
+
+/// The card step has its own cap; a picture that never arrives cannot hold the job.
+#[tokio::test]
+async fn a_picture_that_never_arrives_ends_at_the_card_cap_and_the_hold_stands() {
+    let mut fake = Fake::new();
+    fake.card_ffmpeg = Some(PathBuf::from("no-such-ffmpeg.exe"));
+    fake.card_cap = Some(Duration::from_millis(800));
+    fake.pics.hang.store(true, Ordering::SeqCst);
+    let r = rig_with(RepairMode::Hold, Duration::from_secs(60), fake);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let dir = held_dir_for(&r);
+    let started = Instant::now();
+    let res = go(&r, Some(page_with_picture()), &Prior::default()).await;
+    assert!(started.elapsed() < Duration::from_secs(4), "took {:?}", started.elapsed());
+    let hash = shipped_hash("next_data_media");
+    let LadderResult::Held { recipe_hash } = res else { panic!("expected Held, got {res:?}") };
+    assert_eq!(recipe_hash, hash);
+    assert_eq!(r.fake.pics.calls.load(Ordering::SeqCst), 1, "the step did start");
+    let at = r.repo.latest_held_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!((at.outcome.as_deref(), at.held_url.as_deref(), at.next_index), (Some("held"), Some(A), 0));
+    assert_eq!((at.image_distance, at.image_frame_secs, at.image_host), (None, None, None));
+    assert!(!dir.join("_card_work").exists() && !dir.join("_article.jpg").exists());
+    assert!(r.repo.waiting_held(r.job.id).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn without_card_tools_or_in_shadow_no_picture_is_ever_fetched() {
+    let r = hold_rig(None, Some(vec![0xFF, 0xD8, 0xFF, 0]));
+    held_dir_for(&r);
+    assert!(matches!(go(&r, Some(page_with_picture()), &Prior::default()).await, LadderResult::Held { .. }));
+    assert_eq!(r.fake.pics.calls.load(Ordering::SeqCst), 0);
+    let mut fake = Fake::new();
+    fake.card_ffmpeg = Some(PathBuf::from("no-such-ffmpeg.exe"));
+    let r = rig_with(RepairMode::Shadow, Duration::from_secs(60), fake);
+    assert!(matches!(go(&r, Some(page_with_picture()), &Prior::default()).await, LadderResult::ShadowFound { .. }));
+    assert_eq!(r.fake.pics.calls.load(Ordering::SeqCst), 0, "shadow holds nothing, so there is no card");
+}
+
+#[tokio::test]
+async fn a_lease_lost_during_the_card_step_writes_no_image_columns() {
+    let Some(ffmpeg) = tool("ffmpeg") else {
+        eprintln!("WARNING: skipping the lost-lease card test -- bin/ffmpeg.exe missing");
+        return;
+    };
+    let r = hold_rig(Some(ffmpeg.clone()), None);
+    let dir = held_dir_for(&r);
+    *r.fake.pics.body.lock().unwrap() = Some(preview_and_picture(&ffmpeg, &dir).await);
+    // The picture arrives, but the job is no longer this worker's by then.
+    let (repo, id) = (r.repo.clone(), r.job.id);
+    *r.fake.pics.hook.lock().unwrap() = Some(Box::new(move || {
+        assert!(repo.finish(id, OWNER, JobStatus::AwaitingApproval, None, None, None).unwrap());
+    }));
+    let res = go(&r, Some(page_with_picture()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.pics.calls.load(Ordering::SeqCst), 1);
+    let at = r.repo.latest_held_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!((at.image_distance, at.image_frame_secs, at.image_host), (None, None, None));
+    assert!(!dir.join("_article.jpg").exists() && !dir.join("_frame.jpg").exists(), "a lost job keeps no picture files");
 }
 
 // --------------------------------------------------------- through the real engine

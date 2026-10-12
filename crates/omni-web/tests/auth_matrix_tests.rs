@@ -323,6 +323,11 @@ const MATRIX: &[Row] = &[
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
     ),
     (
+        "GET",
+        "/api/jobs/1/preview/frame",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
         "POST",
         "/api/jobs/1/approve",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],

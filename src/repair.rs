@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use omni_broadcast::errors::ErrorCode;
+use omni_broadcast::card::{self, ImageEvidence, ImageSource};
 use omni_broadcast::repair::JobKind;
 use omni_broadcast::pipeline::{BroadcastEngine, DeliveryMode, LeaseLost, RunOutcome};
 use omni_broadcast::repair_gate::{self, Candidate, GateFacts, Prober, Resolver, ToolProber, Verified};
@@ -145,6 +146,15 @@ pub trait Env: Send + Sync {
     }
     /// Just before a download: does `host` still resolve to public addresses only?
     async fn host_is_public(&self, host: &str, port: u16) -> bool;
+    /// What the approval card's picture comparison needs (P10.11b): ffmpeg and
+    /// a source of article pictures. `None`: the card gets no picture.
+    fn card_tools(&self) -> Option<(std::path::PathBuf, &dyn ImageSource)> {
+        None
+    }
+    /// The time the card step may take (not part of the repair budget).
+    fn card_cap(&self) -> Duration {
+        card::CARD_CAP
+    }
     /// The unchanged pipeline, for one verified address.
     async fn download(
         &self,
@@ -167,15 +177,34 @@ pub struct RepairCtx {
 pub struct RealEnv {
     engine: Arc<BroadcastEngine>,
     fetcher: HttpFetcher,
+    images: HttpImages,
+    ffmpeg: std::path::PathBuf,
     prober: ToolProber,
     resolver: repair_gate::SystemResolver,
 }
 
+/// Article pictures over the same public-address rule as a recipe fetch, up to 2 MiB.
+pub struct HttpImages(pub HttpFetcher);
+
+#[async_trait]
+impl ImageSource for HttpImages {
+    async fn get_image(&self, url: &str, deadline: Instant) -> Result<Vec<u8>> {
+        self.0.get_image_bytes(url, deadline).await
+    }
+}
+
 impl RealEnv {
-    pub fn new(engine: Arc<BroadcastEngine>, ffprobe: std::path::PathBuf, ytdl: std::path::PathBuf) -> Self {
+    pub fn new(
+        engine: Arc<BroadcastEngine>,
+        ffprobe: std::path::PathBuf,
+        ytdl: std::path::PathBuf,
+        ffmpeg: std::path::PathBuf,
+    ) -> Self {
         Self {
             engine,
             fetcher: HttpFetcher::new(),
+            images: HttpImages(HttpFetcher::new()),
+            ffmpeg,
             prober: ToolProber::new(ffprobe, Some(ytdl)),
             resolver: repair_gate::SystemResolver,
         }
@@ -203,6 +232,9 @@ impl Env for RealEnv {
     }
     async fn host_is_public(&self, host: &str, port: u16) -> bool {
         omni_core::net::resolve_public(host, port, CONNECT_CHECK).await.is_ok()
+    }
+    fn card_tools(&self) -> Option<(std::path::PathBuf, &dyn ImageSource)> {
+        Some((self.ffmpeg.clone(), &self.images))
     }
     async fn download(
         &self,
@@ -397,6 +429,8 @@ enum Phase {
         recipes: HashMap<String, (i64, String)>,
         /// The budget cut the search short.
         cut: bool,
+        /// The page the recipes ran on (the card picture comes from it).
+        snap: Box<PageSnapshot>,
     },
 }
 
@@ -515,7 +549,7 @@ async fn find_and_verify(
         }
     }
     if cands.is_empty() {
-        return Phase::Found { verified: Vec::new(), recipes: by_url, cut };
+        return Phase::Found { verified: Vec::new(), recipes: by_url, cut, snap: Box::new(snap) };
     }
     if lost(ctx, job.id, owner, cancel) {
         return Phase::Lost;
@@ -550,7 +584,7 @@ async fn find_and_verify(
             no_candidate(ctx, r.id, domain);
         }
     }
-    Phase::Found { verified, recipes: by_url, cut }
+    Phase::Found { verified, recipes: by_url, cut, snap: Box::new(snap) }
 }
 
 /// Run the ladder once for a failed web job.
@@ -577,7 +611,7 @@ pub async fn run(
         }
     };
     let mut end = AttemptEnd { rung: Some("recipes".into()), ..Default::default() };
-    let result = ladder(ctx, job, owner, orig_url, snapshot, prior, cancel, started, &mut end).await;
+    let result = ladder(ctx, job, owner, orig_url, snapshot, prior, cancel, started, attempt, &mut end).await;
     let outcome = match &result {
         LadderResult::Held { .. } => "held".to_string(),
         LadderResult::ShadowFound { .. } => "shadow_found".to_string(),
@@ -596,6 +630,68 @@ pub async fn run(
     result
 }
 
+/// The held video's directory: the parent of the held row's file.
+fn held_dir_of(repo: &Repository, job_id: i64) -> Option<std::path::PathBuf> {
+    let held = repo.waiting_held(job_id).ok()??;
+    std::path::Path::new(&held.path).parent().map(std::path::Path::to_path_buf)
+}
+
+/// Right after a download was held: the article's picture and the preview frame
+/// closest to it, for MCR's card (P10.11b). Best effort and bounded by its own
+/// 45 s cap (not part of the repair budget): any failure leaves the hold exactly
+/// as it was. Writes only while the lease is still ours.
+async fn card_step(
+    ctx: &RepairCtx,
+    job_id: i64,
+    owner: &str,
+    attempt: Option<i64>,
+    snap: &PageSnapshot,
+    facts: &GateFacts,
+    duration: f64,
+    cancel: &CancellationToken,
+) {
+    let Some((ffmpeg, source)) = ctx.env.card_tools() else { return };
+    let candidates = omni_browser::evidence::article_images(snap);
+    if candidates.is_empty() || lost(ctx, job_id, owner, cancel) {
+        return;
+    }
+    let Some(dir) = held_dir_of(&ctx.repo, job_id) else { return };
+    let work = card::card_evidence_capped(&ffmpeg, &dir, &candidates, facts, duration, source, ctx.env.card_cap());
+    let ev = tokio::select! {
+        ev = work => ev,
+        _ = cancel.cancelled() => {
+            // Stopped part-way: nothing of it is recorded, so nothing of it stays.
+            card::remove_dir_retrying(&dir.join(card::WORK_DIR)).await;
+            for f in [omni_broadcast::preview::ARTICLE_FILE, omni_broadcast::preview::FRAME_FILE] {
+                let _ = std::fs::remove_file(dir.join(f));
+            }
+            return;
+        }
+    };
+    record_card(ctx, job_id, owner, attempt, &dir, &ev);
+}
+
+/// Write what the card step found on the held attempt, if the lease is ours.
+/// Without it the picture files are removed too: nothing of a lost job stays.
+fn record_card(ctx: &RepairCtx, job_id: i64, owner: &str, attempt: Option<i64>, dir: &std::path::Path, ev: &ImageEvidence) {
+    if ev.host.is_none() {
+        return;
+    }
+    let written = attempt.is_some_and(|id| {
+        ctx.repo
+            .record_card_evidence(id, job_id, owner, ev.distance.map(i64::from), ev.frame_secs, ev.host.as_deref())
+            .unwrap_or_else(|e| {
+                warn!("Job #{job_id}: the card evidence could not be recorded: {e:#}");
+                false
+            })
+    });
+    if !written {
+        for f in [omni_broadcast::preview::ARTICLE_FILE, omni_broadcast::preview::FRAME_FILE] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+    }
+}
+
 async fn ladder(
     ctx: &RepairCtx,
     job: &Job,
@@ -605,6 +701,7 @@ async fn ladder(
     prior: &Prior,
     cancel: &CancellationToken,
     started: Instant,
+    attempt: Option<i64>,
     end: &mut AttemptEnd,
 ) -> LadderResult {
     let job_id = job.id;
@@ -624,20 +721,22 @@ async fn ladder(
     )
     .await
     .unwrap_or(Phase::Exhausted);
-    let (verified, recipes, cut) = match phase {
+    let (verified, recipes, cut, snap) = match phase {
         Phase::Lost => return LadderResult::Lost,
         Phase::Exhausted => return LadderResult::Exhausted,
         Phase::NoPage => {
             end.outcome = Some("no_page".into());
             return LadderResult::NothingVerified;
         }
-        Phase::Found { verified, recipes, cut } => (verified, recipes, cut),
+        Phase::Found { verified, recipes, cut, snap } => (verified, recipes, cut, snap),
     };
     if lost(ctx, job_id, owner, cancel) {
         return LadderResult::Lost;
     }
 
     // d. What was found, in rank order, for MCR and for what comes next.
+    let facts = gate_facts(&snap, &domain);
+    end.expected_secs = facts.expected_secs;
     end.candidates_json = Some(verified_json(&verified));
     let Some(best) = verified.first() else {
         if ctx.cfg.mode == RepairMode::Shadow {
@@ -724,6 +823,7 @@ async fn ladder(
                 end.recipe_hash = (!recipe_hash.is_empty()).then(|| recipe_hash.clone());
                 end.held_url = Some(url.to_string());
                 end.next_index = index as i64;
+                card_step(ctx, job_id, owner, attempt, &snap, &facts, v.duration_secs, cancel).await;
                 return LadderResult::Held { recipe_hash };
             }
             Ok(RunOutcome::Delivered) => {

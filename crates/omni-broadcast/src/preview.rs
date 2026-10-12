@@ -18,8 +18,10 @@ use tracing::warn;
 pub const VIDEO_FILE: &str = "_preview.mp4";
 pub const AUDIO_FILE: &str = "_preview.m4a";
 pub const CONTACT_FILE: &str = "_contact.jpg";
-/// Filled by a later item; served when present.
+/// The article's own picture, re-encoded small (P10.11b); served when present.
 pub const ARTICLE_FILE: &str = "_article.jpg";
+/// The frame of the preview closest to the article picture (P10.11b).
+pub const FRAME_FILE: &str = "_frame.jpg";
 
 /// Which H.264 encoder this ffmpeg has. `None` means audio-only previews.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
