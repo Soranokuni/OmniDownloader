@@ -434,6 +434,95 @@ impl Recipe {
     }
 }
 
+/// Hash of a recipe in one scope (`site`, `player` or `generic`): the same
+/// steps in another scope are another recipe in the store.
+pub fn scope_hash(scope_kind: &str, scope_key: &str, recipe: &Recipe) -> String {
+    let text = format!(
+        r#"{{"scope_kind":{},"scope_key":{},"recipe":{}}}"#,
+        serde_json::to_string(scope_kind).unwrap_or_default(),
+        serde_json::to_string(scope_key).unwrap_or_default(),
+        recipe.canonical_json()
+    );
+    let d = Sha256::digest(text.as_bytes());
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The steps alone, without a scope; one set of steps can serve many sites.
+pub fn steps_hash(recipe: &Recipe) -> String {
+    recipe.hash()
+}
+
+/// First http(s) video address in a text: a `.m3u8` or `.mp4` file, JSON-escaped
+/// slashes allowed (`Unescape` follows).
+const MEDIA_URL_RE: &str = r#"https?:(?:\\?/){2}[^"'\s<>]+?\.(?:m3u8|mp4)(?:\?[^"'\s<>]*)?"#;
+
+fn media_page(from: usize) -> Step {
+    Step::Media { from, referer: Referer::Page }
+}
+
+fn attr_recipe(css: &str, attr: &str) -> Recipe {
+    Recipe {
+        dsl_version: DSL_VERSION,
+        steps: vec![
+            Step::Attr { css: css.to_string(), attr: attr.to_string() },
+            Step::Abs { from: 0 },
+            media_page(1),
+        ],
+    }
+}
+
+fn re_recipe(css: Option<&str>, re: String) -> Recipe {
+    Recipe {
+        dsl_version: DSL_VERSION,
+        steps: vec![Step::Re { css: css.map(str::to_string), re }, Step::Unescape { from: 0 }, media_page(1)],
+    }
+}
+
+/// The generic recipes that ship with the daemon: the usual places a news page
+/// puts its video. Built in code so they are checked by the compiler's tests,
+/// and always active (they carry no learned score of their own).
+pub fn shipped() -> Vec<(&'static str, Recipe)> {
+    vec![
+        (
+            "ldjson_content_url",
+            Recipe {
+                dsl_version: DSL_VERSION,
+                steps: vec![Step::Ldjson { field: "contentUrl".to_string() }, Step::Abs { from: 0 }, media_page(1)],
+            },
+        ),
+        ("og_video", attr_recipe(r#"meta[property="og:video"]"#, "content")),
+        ("og_video_url", attr_recipe(r#"meta[property="og:video:url"]"#, "content")),
+        ("og_video_secure_url", attr_recipe(r#"meta[property="og:video:secure_url"]"#, "content")),
+        ("next_data_media", re_recipe(Some("script#__NEXT_DATA__"), format!("({MEDIA_URL_RE})"))),
+        ("nuxt_media", re_recipe(None, format!(r"__NUXT__[\s\S]*?({MEDIA_URL_RE})"))),
+        (
+            "jwplayer_sources",
+            re_recipe(
+                None,
+                format!(r#"sources["']?\s*:[\s\S]*?["']?file["']?\s*:\s*["']({MEDIA_URL_RE})["']"#),
+            ),
+        ),
+        ("videojs_source", attr_recipe("video source[src]", "src")),
+        ("data_src", attr_recipe("video[data-src], source[data-src]", "data-src")),
+        ("data_hls", attr_recipe("[data-hls]", "data-hls")),
+        ("data_video_url", attr_recipe("[data-video-url]", "data-video-url")),
+    ]
+}
+
+/// `shipped()` in the form the recipe store syncs: scope `generic`, the name as key.
+pub fn shipped_for_store() -> Vec<omni_core::recipe_score::ShippedRecipe> {
+    shipped()
+        .into_iter()
+        .map(|(name, r)| omni_core::recipe_score::ShippedRecipe {
+            name: name.to_string(),
+            hash: scope_hash("generic", name, &r),
+            steps_hash: steps_hash(&r),
+            recipe_json: r.canonical_json(),
+            dsl_version: r.dsl_version,
+        })
+        .collect()
+}
+
 /// Fetches one address for a `Fetch` step. P10.8 ships no network version.
 #[async_trait]
 pub trait Fetcher: Send + Sync {
@@ -1287,5 +1376,159 @@ mod tests {
         assert!(prescan(&format!("<a href=\"{}\">", "h".repeat(MAX_ATTR_BYTES))));
         assert!(!prescan(&format!("<i class='{}'>", "a ".repeat(MAX_CLASS_TOKENS + 1))));
         assert!(prescan(&format!("<i class='{}'>", "a ".repeat(MAX_CLASS_TOKENS))));
+    }
+
+    // ---- scope hashes and the shipped recipes (P10.10) ----
+
+    struct NeverFetch;
+    #[async_trait]
+    impl Fetcher for NeverFetch {
+        async fn get(&self, _: &str, _: Instant) -> anyhow::Result<String> {
+            anyhow::bail!("shipped recipes make no request")
+        }
+    }
+
+    async fn outcome(name: &str, snap: &PageSnapshot) -> RecipeOutcome {
+        let (_, r) = shipped().into_iter().find(|(n, _)| *n == name).expect("shipped recipe");
+        run(&r, snap, &NeverFetch, Instant::now() + Duration::from_secs(30)).await
+    }
+
+    fn media(url: &str) -> RecipeOutcome {
+        RecipeOutcome::Media { url: url.to_string(), referer: Some("https://news.example.gr/a".to_string()) }
+    }
+
+    fn page_html(html: &str) -> PageSnapshot {
+        let mut s = PageSnapshot::new("https://news.example.gr/a");
+        s.html = Some(html.to_string());
+        s
+    }
+
+    #[test]
+    fn scope_hash_covers_scope_and_steps_in_a_fixed_form() {
+        let r = Recipe::from_json(
+            r#"{"dsl_version":1,"steps":[{"op":"ldjson","field":"contentUrl"},{"op":"media","from":0,"referer":"page"}]}"#,
+        )
+        .unwrap();
+        let text = format!(r#"{{"scope_kind":"site","scope_key":"a.example","recipe":{}}}"#, r.canonical_json());
+        let want: String = Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(scope_hash("site", "a.example", &r), want);
+        assert_eq!(scope_hash("site", "a.example", &r), scope_hash("site", "a.example", &r));
+        assert_ne!(scope_hash("site", "b.example", &r), want, "the key is part of the hash");
+        assert_ne!(scope_hash("player", "a.example", &r), want, "the kind is part of the hash");
+        assert_eq!(steps_hash(&r), r.hash());
+        assert_ne!(want, r.hash(), "a scoped hash is not the steps hash");
+        let mut other = r.clone();
+        other.steps[0] = Step::Ldjson { field: "embedUrl".to_string() };
+        assert_ne!(scope_hash("site", "a.example", &other), want);
+        // a key with characters JSON must escape cannot forge another field
+        assert_ne!(scope_hash("site", "a\",\"x", &r), scope_hash("site", "a", &r));
+    }
+
+    #[test]
+    fn shipped_recipes_are_valid_few_and_uniquely_named() {
+        let list = shipped();
+        assert!(!list.is_empty() && list.len() <= 16, "{} shipped recipes", list.len());
+        let mut names: Vec<&str> = list.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), list.len(), "names must be unique");
+        let snake = Regex::new("^[a-z][a-z0-9]*(_[a-z0-9]+)*$").unwrap();
+        for (name, r) in &list {
+            assert!(snake.is_match(name), "{name} is not snake_case");
+            r.validate().unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(&Recipe::from_json(&r.canonical_json()).unwrap(), r, "{name} survives its canonical form");
+            assert!(r.canonical_json().len() <= 4096, "{name} is too big to store");
+            assert!(r.steps.iter().all(|s| !s.is_live()), "{name}: shipped recipes need no live page");
+        }
+        let store = shipped_for_store();
+        assert_eq!(store.len(), list.len());
+        let mut hashes: Vec<&str> = store.iter().map(|s| s.hash.as_str()).collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), store.len(), "store hashes are unique");
+        for (s, (name, r)) in store.iter().zip(&list) {
+            assert_eq!(s.name, *name);
+            assert_eq!(s.hash, scope_hash("generic", name, r));
+            assert_eq!(s.steps_hash, r.hash());
+            assert_eq!(s.recipe_json, r.canonical_json());
+            assert_eq!(s.dsl_version, DSL_VERSION);
+        }
+    }
+
+    #[tokio::test]
+    async fn shipped_recipes_find_their_source() {
+        let mut ld = PageSnapshot::new("https://news.example.gr/a");
+        ld.ld_json.push(r#"{"@type":"VideoObject","contentUrl":"https://cdn.example.gr/v/a.mp4"}"#.to_string());
+        assert_eq!(outcome("ldjson_content_url", &ld).await, media("https://cdn.example.gr/v/a.mp4"));
+
+        let og = |prop: &str, v: &str| {
+            page_html(&format!(r#"<html><head><meta property="{prop}" content="{v}"></head><body></body></html>"#))
+        };
+        assert_eq!(
+            outcome("og_video", &og("og:video", "https://cdn.example.gr/v/b.mp4")).await,
+            media("https://cdn.example.gr/v/b.mp4")
+        );
+        assert_eq!(outcome("og_video", &og("og:video", "/v/b.mp4")).await, media("https://news.example.gr/v/b.mp4"));
+        assert_eq!(
+            outcome("og_video_url", &og("og:video:url", "https://cdn.example.gr/v/b2.mp4")).await,
+            media("https://cdn.example.gr/v/b2.mp4")
+        );
+        assert_eq!(
+            outcome("og_video_secure_url", &og("og:video:secure_url", "https://cdn.example.gr/v/b3.m3u8")).await,
+            media("https://cdn.example.gr/v/b3.m3u8")
+        );
+
+        let next = page_html(
+            r#"<html><body><script id="__NEXT_DATA__" type="application/json">{"props":{"poster":"https:\/\/cdn.example.gr\/p.jpg","video":{"src":"https:\/\/cdn.example.gr\/v\/c.m3u8?t=1"}}}</script></body></html>"#,
+        );
+        assert_eq!(outcome("next_data_media", &next).await, media("https://cdn.example.gr/v/c.m3u8?t=1"));
+
+        let nuxt = page_html(
+            r#"<html><body><script>window.__NUXT__={state:{video:{url:"https://cdn.example.gr/v/d.mp4"}}}</script></body></html>"#,
+        );
+        assert_eq!(outcome("nuxt_media", &nuxt).await, media("https://cdn.example.gr/v/d.mp4"));
+
+        let jw = page_html(
+            r#"<html><body><script>jwplayer("p").setup({title:"x",sources:[{file:"https://cdn.example.gr/v/e.m3u8"}]});</script></body></html>"#,
+        );
+        assert_eq!(outcome("jwplayer_sources", &jw).await, media("https://cdn.example.gr/v/e.m3u8"));
+        let mut jw_json = PageSnapshot::new("https://news.example.gr/a");
+        jw_json.scripts.push(r#"{"playlist":[{"sources":[{"file":"https:\/\/cdn.example.gr\/v\/e2.mp4"}]}]}"#.to_string());
+        assert_eq!(outcome("jwplayer_sources", &jw_json).await, media("https://cdn.example.gr/v/e2.mp4"));
+
+        let vjs = page_html(r#"<html><body><video controls><source src="/v/f.mp4" type="video/mp4"></video></body></html>"#);
+        assert_eq!(outcome("videojs_source", &vjs).await, media("https://news.example.gr/v/f.mp4"));
+
+        let ds = page_html(r#"<html><body><video data-src="https://cdn.example.gr/v/g.mp4"></video></body></html>"#);
+        assert_eq!(outcome("data_src", &ds).await, media("https://cdn.example.gr/v/g.mp4"));
+        let ds2 = page_html(r#"<html><body><video><source data-src="https://cdn.example.gr/v/g2.mp4"></video></body></html>"#);
+        assert_eq!(outcome("data_src", &ds2).await, media("https://cdn.example.gr/v/g2.mp4"));
+        let hls = page_html(r#"<html><body><div class="player" data-hls="https://cdn.example.gr/v/h.m3u8"></div></body></html>"#);
+        assert_eq!(outcome("data_hls", &hls).await, media("https://cdn.example.gr/v/h.m3u8"));
+        let vu = page_html(r#"<html><body><div data-video-url="https://cdn.example.gr/v/i.mp4"></div></body></html>"#);
+        assert_eq!(outcome("data_video_url", &vu).await, media("https://cdn.example.gr/v/i.mp4"));
+    }
+
+    #[tokio::test]
+    async fn shipped_recipes_give_nothing_on_a_page_without_their_source() {
+        // a page with no video, and decoys that look close: an image where a
+        // video address would be, a data-src on an <img>, a jwplayer with no file
+        let mut blank = page_html(
+            r#"<html><head><meta property="og:image" content="https://cdn.example.gr/p.jpg"><meta property="og:title" content="t"></head>
+               <body><p>text</p><img data-src="https://cdn.example.gr/i.mp4"><div class="x" data-id="3"></div>
+               <script id="__NEXT_DATA__" type="application/json">{"poster":"https:\/\/cdn.example.gr\/p.jpg"}</script>
+               <script>window.__NUXT__={img:"https://cdn.example.gr/a.jpg"};jwplayer("p").setup({sources:[{label:"x"}]});</script></body></html>"#,
+        );
+        blank.ld_json.push(r#"{"@type":"NewsArticle","headline":"h"}"#.to_string());
+        blank.scripts.push("var sources = 1; var file = 'a.jpg';".to_string());
+        let nothing = PageSnapshot::new("https://news.example.gr/a");
+        for (name, _) in shipped() {
+            for snap in [&blank, &nothing] {
+                match outcome(name, snap).await {
+                    RecipeOutcome::NoValue { .. } => {}
+                    other => panic!("{name} found {other:?} on a page without its source"),
+                }
+            }
+        }
     }
 }
