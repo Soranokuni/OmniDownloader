@@ -36,6 +36,11 @@ const NO_POSITION: usize = 50;
 const MIN_SECS: f64 = 5.0;
 /// Below this a video is suspected to be an ad.
 const SHORT_SECS: f64 = 20.0;
+/// Details of the checks that say "not looked at" or "ran out of time" rather
+/// than "looked and it failed"; see [`Rejected::is_conclusive`].
+const NOT_CHECKED: &str = "Δεν ελέγχθηκε: υπάρχει ήδη αποδεκτό βίντεο";
+const PROBE_TIMEOUT_DETAIL: &str = "Έληξε ο χρόνος ελέγχου";
+const RESOLVE_TIMEOUT_DETAIL: &str = "Λήξη χρόνου στην ανάλυση";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -91,6 +96,22 @@ pub struct Verified {
 pub struct Rejected {
     pub candidate: Candidate,
     pub checks: Vec<Check>,
+}
+
+impl Rejected {
+    /// The candidate was really looked at and failed a check. `false` when it
+    /// was not checked at all (a better video was already accepted) or the
+    /// check ran out of time: that says nothing about the candidate.
+    pub fn is_conclusive(&self) -> bool {
+        match self.checks.last() {
+            Some(c) if !c.ok => {
+                c.detail != NOT_CHECKED
+                    && !c.detail.starts_with(PROBE_TIMEOUT_DETAIL)
+                    && !c.detail.starts_with(RESOLVE_TIMEOUT_DETAIL)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// What a probe found.
@@ -305,7 +326,7 @@ async fn check_one(
         let port = url.port_or_known_default().unwrap_or(443);
         match tokio::time::timeout_at(deadline, resolver.resolve(&host, port)).await {
             Err(_) => {
-                checks.push(check("egress", false, format!("Λήξη χρόνου στην ανάλυση του {host}")));
+                checks.push(check("egress", false, format!("{RESOLVE_TIMEOUT_DETAIL} του {host}")));
                 return Err(checks);
             }
             Ok(Err(_)) => {
@@ -334,7 +355,7 @@ async fn check_one(
     // 3. Probe.
     let info = match tokio::time::timeout_at(deadline, prober.probe(cand)).await {
         Err(_) => {
-            checks.push(check("probe", false, format!("Έληξε ο χρόνος ελέγχου ({host})")));
+            checks.push(check("probe", false, format!("{PROBE_TIMEOUT_DETAIL} ({host})")));
             return Err(checks);
         }
         Ok(Err(why)) => {
@@ -482,7 +503,7 @@ async fn verify_inner(
     }
     let timed_out = TokioInstant::now() >= deadline;
     for c in &cands[next..] {
-        let detail = if timed_out { "Έληξε ο χρόνος ελέγχου" } else { "Δεν ελέγχθηκε: υπάρχει ήδη αποδεκτό βίντεο" };
+        let detail = if timed_out { PROBE_TIMEOUT_DETAIL } else { NOT_CHECKED };
         rejected.push(Rejected { candidate: c.clone(), checks: vec![check("probe", false, detail)] });
     }
 
@@ -518,6 +539,22 @@ async fn verify_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rejected(checks: Vec<Check>) -> Rejected {
+        Rejected { candidate: Candidate { url: "https://a.example/x.mp4".into(), referer: None, origin: "recipe:abcd1234".into(), position: None, in_article: None }, checks }
+    }
+
+    /// Only a candidate that was looked at and failed is a verdict on it.
+    #[test]
+    fn a_rejection_is_conclusive_only_when_the_candidate_really_failed_a_check() {
+        assert!(rejected(vec![check("egress", true, "ok"), check("probe", false, "Ο έλεγχος του a.example απέτυχε")]).is_conclusive());
+        assert!(rejected(vec![check("egress", false, "Ο κόμβος a.example δεν χρησιμοποιήθηκε από τη σελίδα")]).is_conclusive());
+        assert!(!rejected(vec![check("probe", false, NOT_CHECKED)]).is_conclusive(), "not looked at");
+        assert!(!rejected(vec![check("probe", false, format!("{PROBE_TIMEOUT_DETAIL} (a.example)"))]).is_conclusive(), "probe timed out");
+        assert!(!rejected(vec![check("egress", false, format!("{RESOLVE_TIMEOUT_DETAIL} του a.example"))]).is_conclusive(), "resolve timed out");
+        assert!(!rejected(vec![]).is_conclusive());
+        assert!(!rejected(vec![check("probe", true, "ok")]).is_conclusive());
+    }
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;

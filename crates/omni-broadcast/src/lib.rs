@@ -6,6 +6,7 @@ pub mod downloader;
 pub mod pipeline;
 pub mod preview;
 pub mod probe;
+pub mod repair;
 pub mod repair_gate;
 pub mod verify;
 pub mod rewrapper;

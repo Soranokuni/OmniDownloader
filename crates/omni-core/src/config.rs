@@ -468,6 +468,14 @@ pub struct RepairConfig {
     /// hold over it fails with LOW_DISK and is retried.
     #[serde(default = "default_held_max_gb")]
     pub held_max_gb: u64,
+    /// Seconds the repair ladder may spend finding and checking a video
+    /// before the download itself (P10.11a).
+    #[serde(default = "default_repair_budget_secs")]
+    pub budget_secs: u64,
+}
+
+fn default_repair_budget_secs() -> u64 {
+    180
 }
 
 fn default_hold_hours() -> i64 {
@@ -494,6 +502,7 @@ impl Default for RepairConfig {
             evidence_max_mb: default_evidence_max_mb(),
             hold_hours: default_hold_hours(),
             held_max_gb: default_held_max_gb(),
+            budget_secs: default_repair_budget_secs(),
         }
     }
 }

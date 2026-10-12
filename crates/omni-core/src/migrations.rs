@@ -570,6 +570,39 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        20,
+        // One row per run of the repair ladder on a job (P10.11a): what it
+        // tried, the verified candidates in rank order (`candidates_json`,
+        // at most 32 KiB), and the full hash of the recipe behind the top
+        // candidate so MCR's decision can find it. `held_url` is the exact
+        // address that was held, `next_index` its place in the list, and
+        // `mcr_decision` (approved | rejected | expired) is what the desk
+        // later decided about it. Goes with its job and after 90 days.
+        r#"
+        CREATE TABLE IF NOT EXISTS repair_attempts (
+            id              INTEGER PRIMARY KEY,
+            job_id          INTEGER NOT NULL REFERENCES queue(id) ON DELETE CASCADE,
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT,
+            mode            TEXT NOT NULL,
+            rung            TEXT,
+            outcome         TEXT,
+            recipe_hash     TEXT,
+            recipe_id       INTEGER,
+            domain          TEXT,
+            llm_calls       INTEGER NOT NULL DEFAULT 0,
+            tokens_in       INTEGER NOT NULL DEFAULT 0,
+            tokens_out      INTEGER NOT NULL DEFAULT 0,
+            candidates_json TEXT,
+            next_index      INTEGER NOT NULL DEFAULT 0,
+            duration_ms     INTEGER,
+            held_url        TEXT,
+            mcr_decision    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_repair_attempts_job ON repair_attempts(job_id);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -909,6 +942,50 @@ mod tests {
         assert_eq!(count("recipe_sites"), 1);
         conn.execute("DELETE FROM recipes WHERE id = 1", []).unwrap();
         assert_eq!(count("recipe_sites"), 0, "ON DELETE CASCADE must remove the site rows");
+    }
+
+    /// A database at version 19 keeps its rows when 20 is applied; the attempts
+    /// table appears and goes with its job.
+    #[test]
+    fn migration_20_adds_repair_attempts_and_deletes_with_the_job() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 19) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 19);
+        conn.execute_batch("INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');")
+            .unwrap();
+        assert!(columns_of(&conn, "repair_attempts").is_empty(), "the table exists before 20");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 20);
+        let have = columns_of(&conn, "repair_attempts");
+        for c in [
+            "id", "job_id", "started_at", "finished_at", "mode", "rung", "outcome", "recipe_hash", "recipe_id", "domain",
+            "llm_calls", "tokens_in", "tokens_out", "candidates_json", "next_index", "duration_ms", "held_url", "mcr_decision",
+        ] {
+            assert!(have.iter().any(|x| x == c), "repair_attempts.{c} missing: {have:?}");
+        }
+        let count = |t: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("queue"), 1, "existing job rows must survive");
+        conn.execute("INSERT INTO repair_attempts (job_id, started_at, mode) VALUES (5, 'x', 'hold')", []).unwrap();
+        assert!(
+            conn.execute("INSERT INTO repair_attempts (job_id, started_at, mode) VALUES (99, 'x', 'hold')", []).is_err(),
+            "an attempt needs its job"
+        );
+        let (llm, next): (i64, i64) = conn
+            .query_row("SELECT llm_calls, next_index FROM repair_attempts", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((llm, next), (0, 0));
+        conn.execute("DELETE FROM queue WHERE id = 5", []).unwrap();
+        assert_eq!(count("repair_attempts"), 0, "the attempts go with their job");
     }
 
     #[test]
