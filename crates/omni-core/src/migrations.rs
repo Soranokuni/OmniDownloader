@@ -509,6 +509,67 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        19,
+        // Learned page recipes (P10.10), bounded and scored per site. `hash`
+        // is scope + recipe; `steps_hash` is the steps alone, so one set of
+        // steps can be shared by every site that uses the same video player.
+        // A tombstone keeps a recipe MCR rejected from coming back.
+        r#"
+        CREATE TABLE IF NOT EXISTS recipes (
+            id             INTEGER PRIMARY KEY,
+            hash           TEXT NOT NULL UNIQUE,
+            steps_hash     TEXT NOT NULL,
+            scope_kind     TEXT NOT NULL,
+            scope_key      TEXT NOT NULL,
+            family         TEXT,
+            recipe_json    TEXT NOT NULL,
+            dsl_version    INTEGER NOT NULL,
+            origin         TEXT NOT NULL,
+            state          TEXT NOT NULL,
+            created_at     TEXT NOT NULL,
+            retired_at     TEXT,
+            retired_reason TEXT,
+            revived_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipes_scope ON recipes(scope_kind, scope_key);
+        CREATE INDEX IF NOT EXISTS idx_recipes_steps ON recipes(steps_hash);
+        CREATE TABLE IF NOT EXISTS recipe_sites (
+            recipe_id        INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+            domain           TEXT NOT NULL,
+            alpha            REAL NOT NULL DEFAULT 1,
+            beta             REAL NOT NULL DEFAULT 1,
+            scored_at        TEXT NOT NULL,
+            created_at       TEXT NOT NULL,
+            approvals        INTEGER NOT NULL DEFAULT 0,
+            rejections       INTEGER NOT NULL DEFAULT 0,
+            uses             INTEGER NOT NULL DEFAULT 0,
+            consecutive_fail INTEGER NOT NULL DEFAULT 0,
+            pass_streak      INTEGER NOT NULL DEFAULT 0,
+            state            TEXT NOT NULL DEFAULT 'candidate',
+            suspended_reason TEXT,
+            suspended_at     TEXT,
+            last_used_at     TEXT,
+            last_ok_at       TEXT,
+            PRIMARY KEY (recipe_id, domain)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipe_sites_domain ON recipe_sites(domain);
+        CREATE TABLE IF NOT EXISTS recipe_tombstones (
+            hash   TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            at     TEXT NOT NULL,
+            steps_hash TEXT,
+            scope_kind TEXT,
+            scope_key  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS recipe_bars (
+            steps_hash TEXT NOT NULL,
+            domain     TEXT NOT NULL,
+            at         TEXT NOT NULL,
+            PRIMARY KEY (steps_hash, domain)
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -761,6 +822,93 @@ mod tests {
             assert!(columns.iter().any(|x| x == c), "held_outputs.{c} missing: {columns:?}");
         }
         assert!(target_version() >= 18);
+    }
+
+    fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A database at version 18 keeps its rows when 19 is applied, the recipe
+    /// tables appear, and deleting a recipe takes its site rows with it.
+    #[test]
+    fn migration_19_adds_recipe_tables_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 18) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 18);
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');
+             INSERT INTO site_stats (domain, state, state_since, updated_at) VALUES ('a.example', 'healthy', 'x', 'x');
+             INSERT INTO held_outputs (job_id, path, bytes, sha256, created_at, expires_at)
+                VALUES (5, 'p', 1, 'abc', 'x', 'y');",
+        )
+        .unwrap();
+        for t in ["recipes", "recipe_sites", "recipe_tombstones"] {
+            assert!(columns_of(&conn, t).is_empty(), "{t} exists before 19");
+        }
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 19);
+
+        let count = |t: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!((count("queue"), count("site_stats"), count("held_outputs")), (1, 1, 1));
+        for (t, cols) in [
+            (
+                "recipes",
+                &["id", "hash", "steps_hash", "scope_kind", "scope_key", "family", "recipe_json", "dsl_version",
+                  "origin", "state", "created_at", "retired_at", "retired_reason", "revived_at"][..],
+            ),
+            (
+                "recipe_sites",
+                &["recipe_id", "domain", "alpha", "beta", "scored_at", "created_at", "approvals", "rejections",
+                  "uses", "consecutive_fail", "pass_streak", "state", "suspended_reason", "suspended_at",
+                  "last_used_at", "last_ok_at"][..],
+            ),
+            ("recipe_tombstones", &["hash", "reason", "at", "steps_hash", "scope_kind", "scope_key"][..]),
+            ("recipe_bars", &["steps_hash", "domain", "at"][..]),
+        ] {
+            let have = columns_of(&conn, t);
+            for c in cols {
+                assert!(have.iter().any(|x| x == c), "{t}.{c} missing: {have:?}");
+            }
+        }
+
+        conn.execute_batch(
+            "INSERT INTO recipes (id, hash, steps_hash, scope_kind, scope_key, recipe_json, dsl_version, origin, state, created_at)
+                VALUES (1, 'h1', 's1', 'site', 'a.example', '{}', 1, 'llm', 'candidate', 'x');
+             INSERT INTO recipe_sites (recipe_id, domain, scored_at, created_at) VALUES (1, 'a.example', 'x', 'x');",
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO recipes (hash, steps_hash, scope_kind, scope_key, recipe_json, dsl_version, origin, state, created_at)
+                 VALUES ('h1', 's1', 'site', 'b.example', '{}', 1, 'llm', 'candidate', 'x')",
+                [],
+            )
+            .is_err(),
+            "hash must be unique"
+        );
+        assert!(
+            conn.execute("INSERT INTO recipe_sites (recipe_id, domain, scored_at, created_at) VALUES (99, 'x', 'x', 'x')", [])
+                .is_err(),
+            "a site row needs its recipe"
+        );
+        assert_eq!(count("recipe_sites"), 1);
+        conn.execute("DELETE FROM recipes WHERE id = 1", []).unwrap();
+        assert_eq!(count("recipe_sites"), 0, "ON DELETE CASCADE must remove the site rows");
     }
 
     #[test]

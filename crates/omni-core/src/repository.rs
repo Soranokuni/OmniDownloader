@@ -3372,6 +3372,875 @@ impl Repository {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Recipe store (plan P10.10). Rules live in `recipe_score`; this is the SQL.
+//
+// Every public method is one IMMEDIATE transaction. A path that answers
+// "over cap" or "refused" drops the transaction, so it leaves no trace.
+// ---------------------------------------------------------------------------
+
+mod recipe_sql {
+    use super::*;
+    use crate::recipe_score::{
+        self as rs, Event, InsertOutcome, NewRecipe, Origin, PromoSource, RankKey, RankedRecipe, RecipeCounts,
+        RecipeGcReport, RecipeMeta, RecipeState, RetiredReason, ScopeKind, ShippedRecipe, SiteRow, SiteState,
+        SuspendReason,
+    };
+    use chrono::DateTime;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+
+    // Column lists as macros so statements are built with `concat!`, never `format!`.
+    macro_rules! site_cols {
+        () => {
+            "alpha, beta, scored_at, created_at, approvals, rejections, uses, consecutive_fail, pass_streak, state, suspended_reason, suspended_at, last_used_at, last_ok_at"
+        };
+    }
+    macro_rules! head_cols {
+        () => {
+            "id, hash, steps_hash, scope_kind, scope_key, family, origin, state, created_at, retired_at, retired_reason, revived_at"
+        };
+    }
+
+    fn ts(d: DateTime<Utc>) -> String {
+        timestamps::format(d)
+    }
+
+    fn ts_opt(d: Option<DateTime<Utc>>) -> Option<String> {
+        d.map(timestamps::format)
+    }
+
+    fn parse_opt(s: Option<String>) -> Option<DateTime<Utc>> {
+        s.as_deref().and_then(timestamps::parse)
+    }
+
+    /// An unreadable required time counts as the oldest possible one: the row
+    /// decays away and retention removes it, instead of looking fresh.
+    fn parse_required(s: String) -> DateTime<Utc> {
+        timestamps::parse(&s).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    }
+
+    fn site_row_at(r: &rusqlite::Row, o: usize) -> rusqlite::Result<SiteRow> {
+        let state: String = r.get(o + 9)?;
+        let reason: Option<String> = r.get(o + 10)?;
+        Ok(SiteRow {
+            alpha: r.get(o)?,
+            beta: r.get(o + 1)?,
+            scored_at: parse_required(r.get(o + 2)?),
+            created_at: parse_required(r.get(o + 3)?),
+            approvals: r.get(o + 4)?,
+            rejections: r.get(o + 5)?,
+            uses: r.get(o + 6)?,
+            consecutive_fail: r.get(o + 7)?,
+            pass_streak: r.get(o + 8)?,
+            state: SiteState::parse(&state).unwrap_or(SiteState::Candidate),
+            suspended_reason: reason.as_deref().and_then(SuspendReason::parse),
+            suspended_at: parse_opt(r.get(o + 11)?),
+            last_used_at: parse_opt(r.get(o + 12)?),
+            last_ok_at: parse_opt(r.get(o + 13)?),
+        })
+    }
+
+    fn load_rows(conn: &Connection, recipe_id: i64) -> Result<Vec<(String, SiteRow)>> {
+        let mut stmt = conn.prepare(concat!(
+            "SELECT domain, ", site_cols!(), " FROM recipe_sites WHERE recipe_id = ? ORDER BY domain"
+        ))?;
+        let rows = stmt
+            .query_map(params![recipe_id], |r| Ok((r.get::<_, String>(0)?, site_row_at(r, 1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn store_row(conn: &Connection, recipe_id: i64, domain: &str, r: &SiteRow) -> Result<()> {
+        conn.execute(
+            "INSERT INTO recipe_sites (recipe_id, domain, alpha, beta, scored_at, created_at, approvals, rejections,
+                 uses, consecutive_fail, pass_streak, state, suspended_reason, suspended_at, last_used_at, last_ok_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(recipe_id, domain) DO UPDATE SET
+                 alpha = excluded.alpha, beta = excluded.beta, scored_at = excluded.scored_at,
+                 created_at = excluded.created_at, approvals = excluded.approvals,
+                 rejections = excluded.rejections, uses = excluded.uses,
+                 consecutive_fail = excluded.consecutive_fail, pass_streak = excluded.pass_streak,
+                 state = excluded.state, suspended_reason = excluded.suspended_reason,
+                 suspended_at = excluded.suspended_at, last_used_at = excluded.last_used_at,
+                 last_ok_at = excluded.last_ok_at",
+            params![
+                recipe_id,
+                domain,
+                r.alpha,
+                r.beta,
+                ts(r.scored_at),
+                ts(r.created_at),
+                r.approvals,
+                r.rejections,
+                r.uses,
+                r.consecutive_fail,
+                r.pass_streak,
+                r.state.as_str(),
+                r.suspended_reason.map(|x| x.as_str()),
+                ts_opt(r.suspended_at),
+                ts_opt(r.last_used_at),
+                ts_opt(r.last_ok_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// A recipe's header row. Unreadable enum text falls back to the least
+    /// privileged reading; only this code writes the table.
+    struct Head {
+        id: i64,
+        hash: String,
+        steps_hash: String,
+        scope_kind: ScopeKind,
+        scope_key: String,
+        origin: Origin,
+        state: RecipeState,
+        created_at: DateTime<Utc>,
+        revived_at: Option<DateTime<Utc>>,
+        retired_reason: Option<RetiredReason>,
+    }
+
+    fn head_from_row(r: &rusqlite::Row) -> rusqlite::Result<Head> {
+        let kind: String = r.get(3)?;
+        let origin: String = r.get(6)?;
+        let state: String = r.get(7)?;
+        let reason: Option<String> = r.get(10)?;
+        Ok(Head {
+            id: r.get(0)?,
+            hash: r.get(1)?,
+            steps_hash: r.get(2)?,
+            scope_kind: ScopeKind::parse(&kind).unwrap_or(ScopeKind::Site),
+            scope_key: r.get(4)?,
+            origin: Origin::parse(&origin).unwrap_or(Origin::Llm),
+            state: RecipeState::parse(&state).unwrap_or(RecipeState::Candidate),
+            created_at: parse_required(r.get(8)?),
+            revived_at: parse_opt(r.get(11)?),
+            retired_reason: reason.as_deref().and_then(RetiredReason::parse),
+        })
+    }
+
+    fn head_by_hash(conn: &Connection, hash: &str) -> Result<Option<Head>> {
+        Ok(conn
+            .query_row(concat!("SELECT ", head_cols!(), " FROM recipes WHERE hash = ?"), params![hash], head_from_row)
+            .optional()?)
+    }
+
+    fn head_by_id(conn: &Connection, id: i64) -> Result<Option<Head>> {
+        Ok(conn
+            .query_row(concat!("SELECT ", head_cols!(), " FROM recipes WHERE id = ?"), params![id], head_from_row)
+            .optional()?)
+    }
+
+    fn count(conn: &Connection, sql: &str) -> Result<usize> {
+        let n: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Recompute a non-retired recipe's state from its site rows.
+    fn recompute_state(conn: &Connection, id: i64) -> Result<()> {
+        let Some(head) = head_by_id(conn, id)? else { return Ok(()) };
+        if head.state == RecipeState::Retired {
+            return Ok(());
+        }
+        let states: Vec<SiteState> = load_rows(conn, id)?.into_iter().map(|(_, r)| r.state).collect();
+        let next = rs::recipe_state(head.origin, head.state, &states);
+        if next != head.state {
+            conn.execute("UPDATE recipes SET state = ? WHERE id = ?", params![next.as_str(), id])?;
+        }
+        Ok(())
+    }
+
+    fn retire(conn: &Connection, id: i64, reason: RetiredReason, now: DateTime<Utc>) -> Result<()> {
+        conn.execute(
+            "UPDATE recipes SET state = 'retired', retired_at = ?, retired_reason = ? WHERE id = ?",
+            params![ts(now), reason.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    fn delete_recipe(conn: &Connection, id: i64) -> Result<()> {
+        // Explicit, so a connection without foreign keys cannot leave orphans.
+        conn.execute("DELETE FROM recipe_sites WHERE recipe_id = ?", params![id])?;
+        conn.execute("DELETE FROM recipes WHERE id = ?", params![id])?;
+        Ok(())
+    }
+
+    /// Keep at most `limit` tombstones. Those that refuse nothing go first, oldest
+    /// first: a recent `rejected` or `admin` tombstone is the one that must last.
+    fn trim_tombstones(conn: &Connection, limit: usize) -> Result<usize> {
+        let excess = count(conn, "SELECT COUNT(*) FROM recipe_tombstones")?.saturating_sub(limit);
+        if excess == 0 {
+            return Ok(0);
+        }
+        Ok(conn.execute(
+            "DELETE FROM recipe_tombstones WHERE hash IN (
+                 SELECT hash FROM recipe_tombstones
+                 ORDER BY (reason IN ('rejected', 'admin')) ASC, at ASC, hash ASC LIMIT ?)",
+            params![excess as i64],
+        )?)
+    }
+
+    /// These steps produced a video MCR rejected on this domain.
+    fn is_barred(conn: &Connection, steps_hash: &str, domain: &str) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM recipe_bars WHERE steps_hash = ? AND domain = ?",
+                params![steps_hash, domain],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Keep at most `limit` bars, oldest out.
+    fn trim_bars(conn: &Connection, limit: usize) -> Result<usize> {
+        let excess = count(conn, "SELECT COUNT(*) FROM recipe_bars")?.saturating_sub(limit);
+        if excess == 0 {
+            return Ok(0);
+        }
+        Ok(conn.execute(
+            "DELETE FROM recipe_bars WHERE rowid IN (
+                 SELECT rowid FROM recipe_bars ORDER BY at ASC, steps_hash ASC, domain ASC LIMIT ?)",
+            params![excess as i64],
+        )?)
+    }
+
+    fn write_bar(conn: &Connection, steps_hash: &str, domain: &str, now: DateTime<Utc>) -> Result<()> {
+        conn.execute(
+            "INSERT INTO recipe_bars (steps_hash, domain, at) VALUES (?, ?, ?)
+             ON CONFLICT(steps_hash, domain) DO UPDATE SET at = excluded.at",
+            params![steps_hash, domain, ts(now)],
+        )?;
+        trim_bars(conn, rs::BAR_CAP)?;
+        Ok(())
+    }
+
+    /// Remember a hash. Write it BEFORE deleting the recipe: the recipe's steps and
+    /// scope are copied onto the tombstone so a rejection can still be matched
+    /// against other recipes with the same steps.
+    fn write_tombstone(conn: &Connection, hash: &str, reason: RetiredReason, now: DateTime<Utc>) -> Result<()> {
+        conn.execute(
+            "INSERT INTO recipe_tombstones (hash, reason, at) VALUES (?, ?, ?)
+             ON CONFLICT(hash) DO UPDATE SET reason = excluded.reason, at = excluded.at",
+            params![hash, reason.as_str(), ts(now)],
+        )?;
+        conn.execute(
+            "UPDATE recipe_tombstones SET
+                 steps_hash = COALESCE((SELECT steps_hash FROM recipes WHERE hash = ?1), steps_hash),
+                 scope_kind = COALESCE((SELECT scope_kind FROM recipes WHERE hash = ?1), scope_kind),
+                 scope_key = COALESCE((SELECT scope_key FROM recipes WHERE hash = ?1), scope_key)
+             WHERE hash = ?1",
+            params![hash],
+        )?;
+        trim_tombstones(conn, rs::TOMBSTONE_CAP)?;
+        Ok(())
+    }
+
+    /// Delete site rows until at most `limit` remain: the oldest by last event,
+    /// suspended rows last (a suspension is the memory that stops a retry).
+    fn shed_site_rows(conn: &Connection, limit: usize) -> Result<usize> {
+        let mut removed = 0;
+        while count(conn, "SELECT COUNT(*) FROM recipe_sites")? > limit {
+            let victim: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT recipe_id, domain FROM recipe_sites
+                     ORDER BY (state = 'suspended') ASC, scored_at ASC, recipe_id ASC, domain ASC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((id, domain)) = victim else { break };
+            conn.execute("DELETE FROM recipe_sites WHERE recipe_id = ? AND domain = ?", params![id, domain])?;
+            recompute_state(conn, id)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Retire the lowest-ranked evictable recipe in `scope` (or anywhere).
+    /// `llm` goes before `admin`, and `admin` only for an `admin` insert.
+    fn evict_one(
+        conn: &Connection,
+        scope: Option<(ScopeKind, &str)>,
+        inserting: Origin,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let kind = scope.map(|(k, _)| k.as_str());
+        let key = scope.map(|(_, k)| k);
+        let mut rows: HashMap<i64, Vec<SiteRow>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(concat!(
+                "SELECT recipe_id, ", site_cols!(), " FROM recipe_sites WHERE recipe_id IN (
+                     SELECT id FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'
+                       AND (?1 IS NULL OR (scope_kind = ?1 AND scope_key = ?2)))"
+            ))?;
+            let it = stmt.query_map(params![kind, key], |r| Ok((r.get::<_, i64>(0)?, site_row_at(r, 1)?)))?;
+            for item in it {
+                let (id, row) = item?;
+                rows.entry(id).or_default().push(row);
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, hash, origin FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'
+               AND (?1 IS NULL OR (scope_kind = ?1 AND scope_key = ?2))",
+        )?;
+        let cands = stmt
+            .query_map(params![kind, key], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut llm: Vec<(i64, RankKey)> = Vec::new();
+        let mut admin: Vec<(i64, RankKey)> = Vec::new();
+        for (id, hash, origin) in cands {
+            let mine = rows.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            let k = RankKey {
+                rank: rs::pooled_rank(mine, now),
+                last_ok_at: mine.iter().filter_map(|r| r.last_ok_at).max(),
+                hash,
+            };
+            match Origin::parse(&origin) {
+                Some(Origin::Admin) if inserting == Origin::Admin => admin.push((id, k)),
+                Some(Origin::Admin) => {}
+                _ => llm.push((id, k)),
+            }
+        }
+        let mut pool = if llm.is_empty() { admin } else { llm };
+        rs::rank_order(&mut pool, |(_, k)| k.clone());
+        match pool.last() {
+            Some((id, _)) => {
+                retire(conn, *id, RetiredReason::Evicted, now)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Scope cap, then the global live cap. False: nothing could be evicted.
+    fn make_room(conn: &Connection, kind: ScopeKind, key: &str, inserting: Origin, now: DateTime<Utc>) -> Result<bool> {
+        if kind != ScopeKind::Generic {
+            while count_scope(conn, kind, key)? >= rs::SCOPE_CAP {
+                if !evict_one(conn, Some((kind, key)), inserting, now)? {
+                    return Ok(false);
+                }
+            }
+        }
+        while count(
+            conn,
+            "SELECT COUNT(*) FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'",
+        )? >= rs::NONSHIPPED_LIVE_CAP
+        {
+            if !evict_one(conn, None, inserting, now)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn count_scope(conn: &Connection, kind: ScopeKind, key: &str) -> Result<usize> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'
+               AND scope_kind = ? AND scope_key = ?",
+            params![kind.as_str(), key],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Room for one more non-shipped row: delete the oldest-retired ones (never
+    /// those in `protect`), each leaving a tombstone with its reason. False:
+    /// there was nothing to delete.
+    fn make_row_room(conn: &Connection, protect: &[i64], now: DateTime<Utc>) -> Result<bool> {
+        while count(conn, "SELECT COUNT(*) FROM recipes WHERE origin <> 'shipped'")? >= rs::NONSHIPPED_ROW_CAP {
+            let mut stmt = conn.prepare(
+                "SELECT id, hash, retired_reason FROM recipes WHERE origin <> 'shipped' AND state = 'retired'
+                 ORDER BY retired_at ASC, id ASC",
+            )?;
+            let all = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let Some((id, hash, reason)) = all.into_iter().find(|(id, _, _)| !protect.contains(id)) else {
+                return Ok(false);
+            };
+            let reason = reason.as_deref().and_then(RetiredReason::parse).unwrap_or(RetiredReason::Evicted);
+            write_tombstone(conn, &hash, reason, now)?;
+            delete_recipe(conn, id)?;
+        }
+        Ok(true)
+    }
+
+    /// An admin re-adding a recipe makes it an admin recipe, so a later llm insert
+    /// cannot evict what an admin just chose.
+    fn upgrade_origin(conn: &Connection, id: i64, inserting: Origin) -> Result<()> {
+        if inserting == Origin::Admin {
+            conn.execute("UPDATE recipes SET origin = 'admin' WHERE id = ? AND origin = 'llm'", params![id])?;
+        }
+        Ok(())
+    }
+
+    /// The insert rules, in order. The caller commits unless it is `OverCap` or
+    /// `Refused`. `protect`: recipes the row cap must not delete.
+    fn insert_in_tx(conn: &Connection, new: &NewRecipe, protect: &[i64], now: DateTime<Utc>) -> Result<InsertOutcome> {
+        // b. a tombstone that forbids a return; any other is stale
+        let tomb: Option<String> = conn
+            .query_row("SELECT reason FROM recipe_tombstones WHERE hash = ?", params![new.hash], |r| r.get(0))
+            .optional()?;
+        if let Some(reason) = tomb {
+            if RetiredReason::parse(&reason).map_or(false, RetiredReason::refuses_return) {
+                return Ok(InsertOutcome::Refused(reason));
+            }
+            conn.execute("DELETE FROM recipe_tombstones WHERE hash = ?", params![new.hash])?;
+        }
+        // b2. a stored recipe retired as rejected or by an admin: before anything can merge it away
+        let existing = head_by_hash(conn, &new.hash)?;
+        if let Some(reason) = existing
+            .as_ref()
+            .filter(|h| h.state == RecipeState::Retired)
+            .and_then(|h| h.retired_reason)
+            .filter(|r| r.refuses_return())
+        {
+            return Ok(InsertOutcome::Refused(reason.as_str().to_string()));
+        }
+        // b3. MCR rejected these steps on this very site: no site recipe may carry them again
+        if new.scope_kind == ScopeKind::Site && is_barred(conn, &new.steps_hash, &new.scope_key)? {
+            return Ok(InsertOutcome::Refused("rejected".to_string()));
+        }
+        // c. a player recipe with these steps already covers every site of the family
+        if new.scope_kind == ScopeKind::Site {
+            if let Some(family) = new.family.as_deref() {
+                let id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM recipes WHERE scope_kind = 'player' AND scope_key = ? AND steps_hash = ?
+                           AND state <> 'retired' ORDER BY id LIMIT 1",
+                        params![family, new.steps_hash],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = id {
+                    upgrade_origin(conn, id, new.origin)?;
+                    return Ok(InsertOutcome::Merged(id));
+                }
+            }
+        }
+        // d. the same recipe again
+        if let Some(head) = existing {
+            if head.state != RecipeState::Retired {
+                if let Some(f) = new.family.as_deref() {
+                    conn.execute("UPDATE recipes SET family = ? WHERE id = ? AND family IS NULL", params![f, head.id])?;
+                }
+                upgrade_origin(conn, head.id, new.origin)?;
+                return Ok(InsertOutcome::Merged(head.id));
+            }
+            if !make_room(conn, head.scope_kind, &head.scope_key, new.origin, now)? {
+                return Ok(InsertOutcome::OverCap);
+            }
+            conn.execute(
+                "UPDATE recipes SET state = 'candidate', retired_at = NULL, retired_reason = NULL, revived_at = ? WHERE id = ?",
+                params![ts(now), head.id],
+            )?;
+            conn.execute(
+                "UPDATE recipe_sites SET state = 'candidate', suspended_reason = NULL, suspended_at = NULL,
+                        consecutive_fail = 0
+                 WHERE recipe_id = ? AND state = 'suspended' AND suspended_reason = 'failing'",
+                params![head.id],
+            )?;
+            upgrade_origin(conn, head.id, new.origin)?;
+            return Ok(InsertOutcome::Revived(head.id));
+        }
+        // e. a new recipe
+        if !make_room(conn, new.scope_kind, &new.scope_key, new.origin, now)? || !make_row_room(conn, protect, now)? {
+            return Ok(InsertOutcome::OverCap);
+        }
+        conn.execute(
+            "INSERT INTO recipes (hash, steps_hash, scope_kind, scope_key, family, recipe_json, dsl_version, origin,
+                                  state, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'candidate', ?)",
+            params![
+                new.hash,
+                new.steps_hash,
+                new.scope_kind.as_str(),
+                new.scope_key,
+                new.family,
+                new.recipe_json,
+                new.dsl_version,
+                new.origin.as_str(),
+                ts(now),
+            ],
+        )?;
+        Ok(InsertOutcome::Inserted(conn.last_insert_rowid()))
+    }
+
+    fn check_new(new: &NewRecipe) -> Result<()> {
+        if new.recipe_json.len() > rs::MAX_RECIPE_JSON {
+            anyhow::bail!("recipe is {} bytes, the limit is {}", new.recipe_json.len(), rs::MAX_RECIPE_JSON);
+        }
+        if new.origin == Origin::Shipped {
+            anyhow::bail!("shipped recipes are added with sync_shipped");
+        }
+        if new.scope_kind == ScopeKind::Generic {
+            anyhow::bail!("only shipped recipes have the generic scope");
+        }
+        if new.hash.is_empty() || new.steps_hash.is_empty() || new.scope_key.is_empty() {
+            anyhow::bail!("a recipe needs a hash, a steps hash and a scope key");
+        }
+        Ok(())
+    }
+
+    impl Repository {
+        /// Add a recipe, or find the one it already is. See `InsertOutcome`.
+        pub fn insert_recipe(&self, new: &NewRecipe, now: DateTime<Utc>) -> Result<InsertOutcome> {
+            check_new(new)?;
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let out = insert_in_tx(&tx, new, &[], now)?;
+            match out {
+                InsertOutcome::OverCap | InsertOutcome::Refused(_) => drop(tx),
+                _ => tx.commit()?,
+            }
+            Ok(out)
+        }
+
+        /// Score one event for a recipe on a domain; the row is created when missing.
+        pub fn recipe_event(&self, recipe_id: i64, domain: &str, event: Event, now: DateTime<Utc>) -> Result<SiteRow> {
+            if domain.is_empty() {
+                anyhow::bail!("a recipe event needs a domain");
+            }
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let Some(head) = head_by_id(&tx, recipe_id)? else {
+                anyhow::bail!("no recipe #{recipe_id}");
+            };
+            let current = load_rows(&tx, recipe_id)?.into_iter().find(|(d, _)| d == domain).map(|(_, r)| r);
+            let row = match current {
+                Some(r) => r,
+                None => {
+                    shed_site_rows(&tx, rs::SITE_ROW_CAP - 1)?;
+                    SiteRow::new(now)
+                }
+            };
+            let next = rs::apply(&row, event, now);
+            if event == Event::Rejection {
+                write_bar(&tx, &head.steps_hash, domain, now)?;
+            }
+            store_row(&tx, recipe_id, domain, &next)?;
+            recompute_state(&tx, recipe_id)?;
+            tx.commit()?;
+            Ok(next)
+        }
+
+        /// The recipes to try for a page of `domain`, best first: this site's
+        /// proven recipes, its untried ones, the player family's, then the
+        /// shipped generic ones. Never retired, never suspended on `domain`.
+        pub fn recipes_for_site(
+            &self,
+            domain: &str,
+            family: Option<&str>,
+            now: DateTime<Utc>,
+        ) -> Result<Vec<RankedRecipe>> {
+            let conn = self.pool.get()?;
+            let mut stmt = conn.prepare(concat!(
+                "SELECT ", head_cols!(), ", recipe_json, dsl_version FROM recipes
+                 WHERE state <> 'retired' AND ((scope_kind = 'site' AND scope_key = ?1)
+                    OR (scope_kind = 'player' AND ?2 IS NOT NULL AND scope_key = ?2)
+                    OR scope_kind = 'generic')"
+            ))?;
+            let found = stmt
+                .query_map(params![domain, family], |r| Ok((head_from_row(r)?, r.get::<_, String>(12)?, r.get::<_, u32>(13)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let prior = rs::lcb(1.0, 1.0);
+            let mut out: Vec<(u8, RankKey, RankedRecipe)> = Vec::new();
+            for (head, json, dsl) in found {
+                let rows = load_rows(&conn, head.id)?;
+                let mine = rows.iter().find(|(d, _)| d == domain).map(|(_, r)| r);
+                if mine.map_or(false, SiteRow::is_suspended) {
+                    continue;
+                }
+                // Steps MCR rejected on this domain stay barred, whatever recipe carries them.
+                if is_barred(&conn, &head.steps_hash, domain)? {
+                    continue;
+                }
+                let active = mine.map_or(false, |r| r.state == SiteState::Active);
+                let tier = match head.scope_kind {
+                    ScopeKind::Site if active => 1,
+                    ScopeKind::Site => 2,
+                    ScopeKind::Player if active => 3,
+                    ScopeKind::Player => 4,
+                    ScopeKind::Generic => 5,
+                };
+                let rank = match (mine, head.scope_kind) {
+                    (Some(r), _) => rs::site_rank(r, now),
+                    (None, ScopeKind::Player) => {
+                        let all: Vec<SiteRow> = rows.iter().map(|(_, r)| r.clone()).collect();
+                        rs::pooled_rank(&all, now)
+                    }
+                    (None, _) => prior,
+                };
+                let last_ok_at = match mine {
+                    Some(r) => r.last_ok_at,
+                    None => rows.iter().filter_map(|(_, r)| r.last_ok_at).max(),
+                };
+                let key = RankKey { rank, last_ok_at, hash: head.hash.clone() };
+                out.push((
+                    tier,
+                    key,
+                    RankedRecipe {
+                        id: head.id,
+                        hash: head.hash,
+                        steps_hash: head.steps_hash,
+                        scope_kind: head.scope_kind,
+                        scope_key: head.scope_key,
+                        origin: head.origin,
+                        recipe_json: json,
+                        dsl_version: dsl,
+                        site_state: mine.map(|r| r.state),
+                        rank,
+                    },
+                ));
+            }
+            out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| rs::rank_cmp(&a.1, &b.1)));
+            Ok(out.into_iter().map(|(_, _, r)| r).collect())
+        }
+
+        /// Retire a recipe for good and remember its hash (MCR / admin use).
+        /// A shipped recipe is never tombstoned.
+        pub fn tombstone_recipe(&self, hash: &str, reason: RetiredReason, now: DateTime<Utc>) -> Result<()> {
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let head = head_by_hash(&tx, hash)?;
+            if let Some(h) = &head {
+                if h.origin == Origin::Shipped {
+                    anyhow::bail!("a shipped recipe cannot be tombstoned");
+                }
+                if matches!(reason, RetiredReason::Admin | RetiredReason::Rejected) && h.scope_kind == ScopeKind::Site {
+                    write_bar(&tx, &h.steps_hash, &h.scope_key, now)?;
+                }
+            }
+            write_tombstone(&tx, hash, reason, now)?;
+            if let Some(h) = head {
+                if h.state == RecipeState::Retired {
+                    tx.execute("UPDATE recipes SET retired_reason = ? WHERE id = ?", params![reason.as_str(), h.id])?;
+                } else {
+                    retire(&tx, h.id, reason, now)?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        }
+
+        /// Replace the site recipes that share `steps_hash` by one player recipe
+        /// when two different sites of `family` have proven them. The caller
+        /// supplies the player recipe and its hash. `Ok(None)`: nothing to do,
+        /// or the player recipe may not exist (refused or over cap).
+        pub fn promote_to_player(
+            &self,
+            steps_hash: &str,
+            family: &str,
+            player_hash: &str,
+            player_json: &str,
+            dsl_version: u32,
+            now: DateTime<Utc>,
+        ) -> Result<Option<i64>> {
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let sources: Vec<PromoSource> = {
+                let mut stmt = tx.prepare(
+                    "SELECT r.id, r.scope_key, r.family, r.origin,
+                            EXISTS (SELECT 1 FROM recipe_sites s
+                                    WHERE s.recipe_id = r.id AND s.domain = r.scope_key AND s.state = 'active')
+                     FROM recipes r
+                     WHERE r.scope_kind = 'site' AND r.state <> 'retired' AND r.steps_hash = ?
+                     ORDER BY r.id",
+                )?;
+                let rows = stmt
+                    .query_map(params![steps_hash], |r| {
+                        let origin: String = r.get(3)?;
+                        Ok(PromoSource {
+                            id: r.get(0)?,
+                            scope_key: r.get(1)?,
+                            family: r.get(2)?,
+                            origin: Origin::parse(&origin).unwrap_or(Origin::Llm),
+                            own_active: r.get(4)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let Some(plan) = rs::plan_promotion(&sources, family) else { return Ok(None) };
+            let new = NewRecipe {
+                scope_kind: ScopeKind::Player,
+                scope_key: family.to_string(),
+                family: Some(family.to_string()),
+                recipe_json: player_json.to_string(),
+                hash: player_hash.to_string(),
+                steps_hash: steps_hash.to_string(),
+                dsl_version,
+                origin: plan.origin,
+            };
+            check_new(&new)?;
+            // The sources go first: they free the room the player recipe needs.
+            for id in &plan.source_ids {
+                retire(&tx, *id, RetiredReason::Superseded, now)?;
+            }
+            let player = match insert_in_tx(&tx, &new, &plan.source_ids, now)? {
+                InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) | InsertOutcome::Revived(id) => id,
+                InsertOutcome::Refused(_) | InsertOutcome::OverCap => return Ok(None),
+            };
+            for id in &plan.source_ids {
+                for (domain, row) in load_rows(&tx, *id)? {
+                    // A rejection stays with its retired source: the bar keeps P off that
+                    // domain, and P must not look rejected because of it.
+                    if row.state == SiteState::Suspended && row.suspended_reason == Some(SuspendReason::Rejected) {
+                        continue;
+                    }
+                    let existing = load_rows(&tx, player)?.into_iter().find(|(d, _)| *d == domain).map(|(_, r)| r);
+                    let moved = match existing {
+                        Some(have) => rs::merge_rows(&have, &row, now),
+                        None => row,
+                    };
+                    store_row(&tx, player, &domain, &moved)?;
+                    tx.execute("DELETE FROM recipe_sites WHERE recipe_id = ? AND domain = ?", params![id, domain])?;
+                }
+            }
+            recompute_state(&tx, player)?;
+            tx.commit()?;
+            Ok(Some(player))
+        }
+
+        /// Make the shipped generic recipes in the store equal `list`.
+        /// Returns (added, removed). No cap and no tombstone applies.
+        pub fn sync_shipped(&self, list: &[ShippedRecipe], now: DateTime<Utc>) -> Result<(usize, usize)> {
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let have: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare("SELECT id, hash FROM recipes WHERE origin = 'shipped'")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let mut removed = 0;
+            for (id, hash) in &have {
+                if !list.iter().any(|s| &s.hash == hash) {
+                    delete_recipe(&tx, *id)?;
+                    removed += 1;
+                }
+            }
+            let mut added = 0;
+            for s in list {
+                if have.iter().any(|(_, h)| *h == s.hash) {
+                    continue;
+                }
+                added += tx.execute(
+                    "INSERT OR IGNORE INTO recipes (hash, steps_hash, scope_kind, scope_key, family, recipe_json,
+                                                    dsl_version, origin, state, created_at)
+                     VALUES (?, ?, 'generic', ?, NULL, ?, ?, 'shipped', 'active', ?)",
+                    params![s.hash, s.steps_hash, s.name, s.recipe_json, s.dsl_version, ts(now)],
+                )?;
+            }
+            tx.commit()?;
+            Ok((added, removed))
+        }
+
+        /// Nightly upkeep: forget stale scores, retire what was not used or keeps
+        /// failing, delete what has been retired long enough, expire tombstones,
+        /// and hold the caps.
+        pub fn recipe_gc(&self, now: DateTime<Utc>) -> Result<RecipeGcReport> {
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut rep = RecipeGcReport::default();
+
+            // a. scores nobody has touched for half a year
+            let stale = ts(now - Duration::days(rs::STALE_ROW_DAYS));
+            let touched: Vec<i64> = {
+                let mut stmt = tx.prepare("SELECT DISTINCT recipe_id FROM recipe_sites WHERE scored_at <= ?
+                     AND NOT (state = 'suspended' AND suspended_reason = 'rejected')")?;
+                let ids = stmt.query_map(params![stale], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                ids
+            };
+            rep.stale_rows = tx.execute(
+                "DELETE FROM recipe_sites WHERE scored_at <= ?
+                   AND NOT (state = 'suspended' AND suspended_reason = 'rejected')",
+                params![stale],
+            )?;
+            for id in touched {
+                recompute_state(&tx, id)?;
+            }
+
+            // b. time-driven retirement
+            let live: Vec<Head> = {
+                let mut stmt = tx.prepare(concat!(
+                    "SELECT ", head_cols!(), " FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'"
+                ))?;
+                let heads = stmt.query_map([], head_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                heads
+            };
+            for h in live {
+                let rows: Vec<SiteRow> = load_rows(&tx, h.id)?.into_iter().map(|(_, r)| r).collect();
+                let meta = RecipeMeta { origin: h.origin, state: h.state, created_at: h.created_at, revived_at: h.revived_at };
+                if let Some(reason) = rs::due_retirement(&meta, &rows, now) {
+                    retire(&tx, h.id, reason, now)?;
+                    match reason {
+                        RetiredReason::Idle => rep.retired_idle += 1,
+                        RetiredReason::Failing => rep.retired_failing += 1,
+                        _ => rep.retired_rejected += 1,
+                    }
+                }
+            }
+
+            // c. retired long enough: gone, but remembered under its reason
+            let old: Vec<(i64, String, Option<String>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, hash, retired_reason FROM recipes
+                     WHERE origin <> 'shipped' AND state = 'retired' AND retired_at <= ?
+                     ORDER BY retired_at, id",
+                )?;
+                let rows = stmt
+                    .query_map(params![ts(now - Duration::days(rs::RETIRED_KEEP_DAYS))], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            for (id, hash, reason) in old {
+                let reason = reason.as_deref().and_then(RetiredReason::parse).unwrap_or(RetiredReason::Evicted);
+                write_tombstone(&tx, &hash, reason, now)?;
+                delete_recipe(&tx, id)?;
+                rep.deleted_recipes += 1;
+            }
+
+            // d. tombstones expire; e. and are capped
+            rep.tombstones_expired = tx.execute(
+                "DELETE FROM recipe_tombstones WHERE at <= ?",
+                params![ts(now - Duration::days(rs::TOMBSTONE_DAYS))],
+            )?;
+            rep.tombstones_trimmed = trim_tombstones(&tx, rs::TOMBSTONE_CAP)?;
+            rep.bars_expired = tx.execute(
+                "DELETE FROM recipe_bars WHERE at <= ?",
+                params![ts(now - Duration::days(rs::BAR_DAYS))],
+            )?;
+            rep.bars_trimmed = trim_bars(&tx, rs::BAR_CAP)?;
+
+            // f. the site-row cap
+            rep.rows_trimmed = shed_site_rows(&tx, rs::SITE_ROW_CAP)?;
+            tx.commit()?;
+            Ok(rep)
+        }
+
+        pub fn recipe_counts(&self) -> Result<RecipeCounts> {
+            let conn = self.pool.get()?;
+            Ok(RecipeCounts {
+                live: count(&conn, "SELECT COUNT(*) FROM recipes WHERE origin <> 'shipped' AND state <> 'retired'")?,
+                retired: count(&conn, "SELECT COUNT(*) FROM recipes WHERE origin <> 'shipped' AND state = 'retired'")?,
+                shipped: count(&conn, "SELECT COUNT(*) FROM recipes WHERE origin = 'shipped'")?,
+                sites: count(&conn, "SELECT COUNT(*) FROM recipe_sites")?,
+                tombstones: count(&conn, "SELECT COUNT(*) FROM recipe_tombstones")?,
+                bars: count(&conn, "SELECT COUNT(*) FROM recipe_bars")?,
+                json_bytes: count(&conn, "SELECT COALESCE(SUM(LENGTH(recipe_json)), 0) FROM recipes")?,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

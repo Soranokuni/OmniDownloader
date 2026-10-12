@@ -784,6 +784,14 @@ async fn run_daemon(
         Err(e) => warn!("Could not create the first-run administrator: {e:#}"),
     }
 
+    // The generic recipes that ship with this build (P10.10). A failure here
+    // costs the shipped recipes, never the daemon.
+    match repo.sync_shipped(&omni_browser::recipe::shipped_for_store(), chrono::Utc::now()) {
+        Ok((added, removed)) if added + removed > 0 => info!("Shipped recipes: +{added} -{removed}"),
+        Ok(_) => {}
+        Err(e) => warn!("Shipped recipes not synced: {e:#}"),
+    }
+
     // Sessions that expired while the daemon was down are dead rows; clearing
     // them at start-up keeps the table from growing without bound on a machine
     // that is restarted far more often than it is logged into.
@@ -2717,6 +2725,13 @@ async fn run_one_task(
                 }
                 Ok(_) => {}
                 Err(e) => warn!("Retention: site records not purged: {e:#}"),
+            }
+            // Learned recipes (P10.10): idle and failing ones retire, old ones go,
+            // and the caps hold.
+            match repo.recipe_gc(chrono::Utc::now()) {
+                Ok(rep) if rep.changed() => info!("Retention: recipe store {rep:?}"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: recipe store not cleaned: {e:#}"),
             }
             match repo.purge_login_attempts(90) {
                 Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),

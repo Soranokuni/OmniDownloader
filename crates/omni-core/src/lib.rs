@@ -8,6 +8,7 @@ pub mod logging;
 pub mod migrations;
 pub mod paths;
 pub mod process;
+pub mod recipe_score;
 pub mod repository;
 pub mod scheduler;
 pub mod secrets;
