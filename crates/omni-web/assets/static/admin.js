@@ -449,6 +449,291 @@ document.getElementById('selfcheck-run').addEventListener('click', async () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Sites, recipes and the repair report (plan P10.15a)
+ * ------------------------------------------------------------------ */
+
+const SITE_CLASS = { healthy: 'ok', degraded: 'warn', broken: 'bad' };
+
+const pct = (matched, known) => (known > 0 ? `${Math.round((matched / known) * 100)}% (${matched}/${known})` : '—');
+
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return '—';
+  const s = Math.round(ms / 1000);
+  return s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+}
+
+// Broken and degraded sites come first from the server; the table shows the first 25.
+const SITE_PAGE = 25;
+const sitesView = { all: [], shown: SITE_PAGE, canRun: false };
+
+async function loadSites() {
+  let data;
+  try {
+    data = await api('/api/admin/sites');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  const mode = data.repair_mode || 'off';
+  render('sites-note', document.createTextNode(
+    `Repair mode: ${mode}. ` + (mode === 'off'
+      ? 'With repair off, «Run now» only checks the site.'
+      : 'A broken site is also probed for a new way to find its video.')));
+  sitesView.all = data.sites || [];
+  sitesView.canRun = !!data.can_run;
+  renderSites();
+}
+
+function renderSites() {
+  const sites = sitesView.all.slice(0, sitesView.shown);
+  document.getElementById('sites-more').hidden = sitesView.all.length <= sites.length;
+  if (sitesView.all.length === 0) {
+    render('sites-body', el('tr', {}, el('td', { colspan: '8', class: 'empty' }, 'No site has been seen yet.')));
+    return;
+  }
+  render('sites-body', sites.map((s) => el('tr', {},
+    el('td', { class: 'mono' }, s.domain),
+    el('td', {},
+      el('span', { class: `badge ${SITE_CLASS[s.state] || ''}`, title: s.state_since ? `since ${fmtTime(s.state_since)}` : '' }, s.state)),
+    el('td', {}, s.recent_rate === null || s.recent_rate === undefined ? '—' : `${Math.round(s.recent_rate * 100)}% of ${s.recent_len}`),
+    el('td', { class: 'num' }, fmtTime(s.last_ok_at)),
+    el('td', { class: 'mono' }, s.last_code || '—'),
+    el('td', { class: 'num' }, s.llm_breaker_until ? fmtTime(s.llm_breaker_until) : '—'),
+    el('td', {}, s.canaries === 0 ? '—' : `${s.canaries_ok}/${s.canaries}`),
+    el('td', { class: 'right' },
+      el('button', {
+        class: 'btn',
+        type: 'button',
+        disabled: !sitesView.canRun || s.canaries === 0,
+        title: s.canaries === 0 ? 'This site has no canary pages yet.' : 'Check this site now',
+        onClick: () => runSiteNow(s),
+      }, 'Run now')),
+  )));
+}
+
+async function runSiteNow(site) {
+  try {
+    await api(`/api/admin/sites/${encodeURIComponent(site.domain)}/check`, { method: 'POST' });
+    toast(`Checking ${site.domain}. This takes a few minutes; press Refresh to see the result.`, 'ok');
+    setTimeout(loadSites, 20000);
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+const RECIPE_PAGE = 25;
+const recipesView = { all: [], shown: RECIPE_PAGE, retired: false };
+
+function recipeScope(r) {
+  if (r.scope_kind === 'generic') return `built-in: ${r.scope_key}`;
+  return `${r.scope_kind}: ${r.scope_key}`;
+}
+
+function recipeSiteRows(r) {
+  const rows = r.sites.slice();
+  // A site recipe can be suspended on its own site before it has any score there.
+  if (r.scope_kind === 'site' && !rows.some((s) => s.domain === r.scope_key)) {
+    rows.unshift({ domain: r.scope_key, state: 'no score yet', placeholder: true, approvals: 0, rejections: 0, uses: 0 });
+  }
+  return rows;
+}
+
+function recipeCard(r) {
+  const live = r.state !== 'retired';
+  const sites = recipeSiteRows(r);
+  const table = sites.length === 0
+    ? el('p', { class: 'note' }, 'No site has used it yet.')
+    : el('div', { class: 'card flush' }, el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'Site'), el('th', {}, 'State'), el('th', { class: 'right' }, 'Rank'),
+          el('th', { class: 'right' }, 'Approvals'), el('th', { class: 'right' }, 'Rejections'),
+          el('th', { class: 'right' }, 'Uses'), el('th', {}, 'Last used'), el('th', { class: 'right' }, ''))),
+        el('tbody', {}, sites.map((s) => el('tr', {},
+          el('td', { class: 'mono' }, s.domain),
+          el('td', {}, el('span', { class: `badge ${s.state === 'active' ? 'ok' : s.state === 'suspended' ? 'bad' : ''}` },
+            s.suspended_reason ? `suspended (${s.suspended_reason})` : s.state)),
+          el('td', { class: 'right' }, s.placeholder ? '—' : s.rank.toFixed(2)),
+          el('td', { class: 'right' }, String(s.approvals)),
+          el('td', { class: 'right' }, String(s.rejections)),
+          el('td', { class: 'right' }, String(s.uses)),
+          el('td', { class: 'num' }, fmtTime(s.last_used_at)),
+          el('td', { class: 'right' }, live && s.state !== 'suspended'
+            ? el('button', { class: 'btn', type: 'button', onClick: () => suspendRecipe(r, s.domain) }, 'Suspend')
+            : null),
+        )))));
+  return el('details', { class: 'card' },
+    el('summary', { class: 'row tight', style: 'cursor:pointer' },
+      el('span', { class: 'mono strong' }, recipeScope(r)),
+      el('span', { class: `badge ${r.state === 'active' ? 'ok' : r.state === 'retired' ? '' : r.state === 'suspended' ? 'bad' : 'info'}` },
+        r.state === 'retired' && r.retired_reason ? `retired (${r.retired_reason})` : r.state),
+      el('span', { class: 'badge' }, r.origin),
+      el('span', { class: 'note' }, `rank ${r.rank.toFixed(2)}`)),
+    el('div', { class: 'stack', style: 'margin-top:10px' },
+      el('p', { class: 'note' },
+        `#${r.id} · ${r.hash} · steps: ${r.ops.join(' → ') || '—'}` +
+        (r.family ? ` · player: ${r.family}` : '') +
+        ` · added ${fmtTime(r.created_at)}` + (r.retired_at ? ` · retired ${fmtTime(r.retired_at)}` : '')),
+      table,
+      el('div', { class: 'row' }, (live || !['admin', 'rejected'].includes(r.retired_reason)) && r.origin !== 'shipped'
+        ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => retireRecipe(r) }, 'Retire for good')
+        : null)));
+}
+
+function renderRecipes() {
+  const list = recipesView.all.filter((r) => recipesView.retired || r.state !== 'retired');
+  const page = list.slice(0, recipesView.shown);
+  render('recipes-list', page.length === 0
+    ? el('p', { class: 'note' }, 'No recipes.')
+    : page.map(recipeCard));
+  document.getElementById('recipes-more').hidden = list.length <= page.length;
+}
+
+async function loadRecipes() {
+  let data;
+  try {
+    data = await api('/api/admin/recipes');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  recipesView.all = data.recipes || [];
+  renderRecipes();
+}
+
+async function suspendRecipe(recipe, domain) {
+  if (!confirm(`Suspend this recipe on ${domain}? It is tried there again after two canary checks in a row pass.`)) return;
+  try {
+    await api(`/api/admin/recipes/${recipe.id}/suspend`, { method: 'POST', body: { domain } });
+    toast('Suspended.', 'ok');
+    loadRecipes();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function retireRecipe(recipe) {
+  if (!confirm('Retire this recipe for good? It can never be added again, by the model or by an import.')) return;
+  try {
+    await api(`/api/admin/recipes/${recipe.id}/retire`, { method: 'POST' });
+    toast('Retired.', 'ok');
+    loadRecipes();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+const recipesResult = document.getElementById('recipes-result');
+
+function showRecipes(message, ok) {
+  recipesResult.textContent = message;
+  recipesResult.className = ok ? 'note ok' : 'note bad';
+}
+
+const IMPORT_RESULT = {
+  inserted: 'added',
+  merged: 'already there (merged)',
+  revived: 'brought back',
+  refused: 'refused (it was retired or rejected before)',
+  over_cap: 'not stored (the store is full)',
+};
+
+async function importRecipes(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    showRecipes('That is not valid JSON.', false);
+    return;
+  }
+  // A bare array is accepted as well as {"recipes": [...]}.
+  const body = Array.isArray(parsed) ? { recipes: parsed } : parsed;
+  try {
+    const out = await api('/api/admin/recipes/import', { method: 'POST', body });
+    const line = (r) => `${r.index}. ${r.scope}: ${IMPORT_RESULT[r.outcome] || r.outcome}${r.detail ? ` (${r.detail})` : ''}` +
+      (r.evicted || []).map((e) => `\n    evicted #${e.id} (${e.scope}, ${e.why})`).join('');
+    showRecipes(
+      'Imported:\n' + out.results.map(line).join('\n'),
+      true,
+    );
+    loadRecipes();
+  } catch (e) { showRecipes(e.message, false); }
+}
+
+async function loadReport() {
+  let data;
+  try {
+    data = await api('/api/admin/repair-report?days=30');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  render('report-note', document.createTextNode(
+    `Repair mode: ${data.repair_mode}. Page stated a length: of the found videos, how many had a length on their page (a video that did not match it was already dropped). Runs are the ladder's own; next choices are MCR's «next choice» downloads, counted apart. ` +
+    `Picture matched: of those with an article picture, how many looked like it (distance up to ${data.image_match_max}). ` +
+    'A rate is blank when nothing could be measured.'));
+  const sites = data.sites || [];
+  if (sites.length === 0) {
+    render('report-body', el('tr', {}, el('td', { colspan: '14', class: 'empty' }, 'No repair run in the last 30 days.')));
+    return;
+  }
+  const sum = (key) => sites.reduce((n, s) => n + s[key], 0);
+  const row = (name, s, strong) => el('tr', {},
+    el('td', { class: strong ? 'mono strong' : 'mono' }, name),
+    el('td', { class: 'right', title: `${s.shadow_attempts} shadow, ${s.hold_attempts} hold` }, String(s.attempts)),
+    el('td', { class: 'right' }, String(s.next_choices)),
+    el('td', { class: 'right' }, String(s.found)),
+    el('td', { class: 'right' }, String(s.held)),
+    el('td', { class: 'right' }, String(s.approved)),
+    el('td', { class: 'right' }, String(s.rejected_wrong_video)),
+    el('td', { class: 'right' }, String(s.rejected_other)),
+    el('td', { class: 'right' }, String(s.expired)),
+    el('td', { class: 'right' }, pct(s.length_stated, s.found)),
+    el('td', { class: 'right' }, pct(s.image_matched, s.image_known)),
+    el('td', { class: 'right', title: `${s.tokens_in} tokens in, ${s.tokens_out} out` }, String(s.llm_calls)),
+    el('td', { class: 'right' }, fmtMs(s.median_duration_ms)),
+    el('td', { class: 'right' }, s.heal_runs > 0 ? `${s.heal_found}/${s.heal_runs}` : '—'),
+  );
+  const total = {
+    attempts: sum('attempts'), shadow_attempts: sum('shadow_attempts'), hold_attempts: sum('hold_attempts'),
+    found: sum('found'), held: sum('held'), approved: sum('approved'),
+    rejected_wrong_video: sum('rejected_wrong_video'), rejected_other: sum('rejected_other'), expired: sum('expired'),
+    length_stated: sum('length_stated'), next_choices: sum('next_choices'),
+    image_known: sum('image_known'), image_matched: sum('image_matched'),
+    llm_calls: sum('llm_calls'), tokens_in: sum('tokens_in'), tokens_out: sum('tokens_out'),
+    median_duration_ms: null, heal_runs: sum('heal_runs'), heal_found: sum('heal_found'),
+  };
+  render('report-body', sites.map((s) => row(s.domain, s)), row('All sites', total, true));
+}
+
+document.getElementById('sites-refresh').addEventListener('click', loadSites);
+document.getElementById('sites-more').addEventListener('click', () => {
+  sitesView.shown += SITE_PAGE;
+  renderSites();
+});
+document.getElementById('recipes-refresh').addEventListener('click', loadRecipes);
+document.getElementById('report-refresh').addEventListener('click', loadReport);
+document.getElementById('recipes-retired').addEventListener('change', (event) => {
+  recipesView.retired = event.target.checked;
+  recipesView.shown = RECIPE_PAGE;
+  renderRecipes();
+});
+document.getElementById('recipes-more').addEventListener('click', () => {
+  recipesView.shown += RECIPE_PAGE;
+  renderRecipes();
+});
+document.getElementById('recipes-export').addEventListener('click', async () => {
+  try {
+    saveJson('recipes.json', await api('/api/admin/recipes/export'));
+    showRecipes('Exported the live admin and model recipes. Built-in recipes are not included.', true);
+  } catch (e) { showRecipes(e.message, false); }
+});
+document.getElementById('recipes-import-btn').addEventListener('click', () => {
+  importRecipes(document.getElementById('recipes-import-text').value);
+});
+const recipeFile = document.getElementById('recipes-import-file');
+document.getElementById('recipes-import-pick').addEventListener('click', () => recipeFile.click());
+recipeFile.addEventListener('change', async () => {
+  const file = recipeFile.files && recipeFile.files[0];
+  recipeFile.value = '';
+  if (file) document.getElementById('recipes-import-text').value = await file.text();
+});
+
+
+/* ------------------------------------------------------------------ *
  * Audit log
  * ------------------------------------------------------------------ */
 
@@ -938,6 +1223,9 @@ loadDependencies();
 loadSecrets();
 loadMaintenance();
 loadSelfcheck();
+loadSites();
+loadRecipes();
+loadReport();
 loadUsers();
 loadTaxonomy();
 loadMail();

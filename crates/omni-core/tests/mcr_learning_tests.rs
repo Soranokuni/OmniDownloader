@@ -371,3 +371,24 @@ fn a_reused_recipe_id_gets_no_event_and_no_tombstone() -> Result<()> {
     assert_eq!(r.site(other).unwrap().1, 1, "a matching hash still teaches");
     Ok(())
 }
+
+#[test]
+fn a_rejection_stores_its_reason_with_the_decision_and_approval_and_expiry_store_none() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("why", Origin::Llm);
+    let reason_of = |job: i64| -> (Option<String>, Option<String>) {
+        r.raw()
+            .query_row("SELECT mcr_decision, mcr_reason FROM repair_attempts WHERE job_id = ?", params![job], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+    };
+    let a = r.held(1, Some((rid, &hash)), &[A], 0);
+    assert!(r.repo.reject_held(a, "wrong_video", "no", "desk")?);
+    assert_eq!(reason_of(a), (Some("rejected".into()), Some("wrong_video".into())));
+    let b = r.held(2, Some((rid, &hash)), &[B], 0);
+    assert!(r.repo.reject_held(b, "other", "no", "desk")?);
+    assert_eq!(reason_of(b), (Some("rejected".into()), Some("other".into())));
+    let c = r.held(3, Some((rid, &hash)), &[C], 0);
+    assert!(r.repo.expire_held(c, Utc::now())?);
+    assert_eq!(reason_of(c), (Some("expired".into()), None));
+    Ok(())
+}

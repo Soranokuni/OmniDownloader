@@ -128,6 +128,81 @@
       </p>
     </section>
 
+    <section class="card stack" id="sites">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Sites</h2>
+        <button class="btn" type="button" id="sites-refresh">Refresh</button>
+      </div>
+      <p class="note">
+        A site turns degraded when its jobs start failing and broken when its recent
+        articles (the canaries) confirm it. «Run now» checks one site's canaries in the
+        background and, if the site is broken and repair is on, looks for a new way to
+        find its video. Press Refresh to see the result.
+      </p>
+      <p id="sites-note" class="note"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr><th>Site</th><th>State</th><th>Recent success</th><th>Last success</th><th>Last code</th><th>Model paused until</th><th>Canaries ok</th><th class="right"></th></tr>
+          </thead>
+          <tbody id="sites-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="row"><button class="btn" type="button" id="sites-more" hidden>Show more</button></div>
+    </section>
+
+    <section class="card stack" id="recipes">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Recipes</h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="recipes-refresh">Refresh</button>
+          <button class="btn" type="button" id="recipes-export">Export recipes.json</button>
+        </div>
+      </div>
+      <p class="note">
+        A recipe is a short list of steps that finds the video on a page. The program ships
+        a few; the model writes others, and you can import more. A recipe suspended on a
+        site is not tried there until two canary checks in a row pass; a retired one never
+        comes back. An imported recipe is a candidate: the videos it finds still wait for
+        MCR's approval.
+      </p>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="recipes-retired" style="width:auto">
+        <span>Show retired recipes</span>
+      </label>
+      <div id="recipes-list" class="stack"></div>
+      <div class="row"><button class="btn" type="button" id="recipes-more" hidden>Show more</button></div>
+      <h3 class="card-title" style="font-size:0.95rem">Import recipes</h3>
+      <textarea id="recipes-import-text" rows="5" class="mono" placeholder='Paste the contents of a recipes.json file: {"recipes":[…]}'></textarea>
+      <div class="row tight">
+        <button class="btn" type="button" id="recipes-import-btn">Import</button>
+        <input type="file" id="recipes-import-file" accept="application/json,.json" hidden>
+        <button class="btn" type="button" id="recipes-import-pick">Choose a file…</button>
+      </div>
+      <p id="recipes-result" class="note" style="white-space:pre-line"></p>
+    </section>
+
+    <section class="card stack" id="repair-report">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Repair report (30 days)</h2>
+        <button class="btn" type="button" id="report-refresh">Refresh</button>
+      </div>
+      <p id="report-note" class="note"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Site</th><th class="right">Runs</th><th class="right">Next choices</th><th class="right">Found</th><th class="right">Held</th>
+              <th class="right">Approved</th><th class="right">Wrong video</th><th class="right">Rejected, other</th><th class="right">Expired</th>
+              <th class="right">Page stated a length</th><th class="right">Picture matched</th><th class="right">Model calls</th>
+              <th class="right">Median time</th><th class="right">Self-heal found</th>
+            </tr>
+          </thead>
+          <tbody id="report-body"><tr><td colspan="14" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
@@ -467,6 +542,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=12"></script>
+<script type="module" src="/static/admin.js?v=15"></script>
 </body>
 </html>

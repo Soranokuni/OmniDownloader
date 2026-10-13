@@ -1,3 +1,4 @@
+pub mod admin_sites;
 pub mod assets;
 pub mod auth;
 pub mod middleware;

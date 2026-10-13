@@ -6,6 +6,24 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::ratelimit::LoginRateLimiter;
 
+/// What «Run now» on the admin's Sites card got (P10.15a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunNow {
+    /// The check runs in the background.
+    Started,
+    /// Another canary run, or the yt-dlp update, holds the lock.
+    Busy,
+    /// The site was started less than the cooldown ago; this many seconds remain.
+    Cooldown(u64),
+}
+
+/// Starts one canary check of a site (and the self-heal when it is broken and
+/// repair is on). The daemon implements it; the web crate cannot see the canary
+/// code. Never waits for the check.
+pub trait SiteRunner: Send + Sync {
+    fn run_now(&self, domain: &str) -> RunNow;
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Repository,
@@ -45,6 +63,8 @@ pub struct AppState {
     /// for approval (P10.5). `None` in tests that have none: a rejection then
     /// leaves the directory to the sweep.
     pub temp_dir: Option<PathBuf>,
+    /// The canary runner behind «Run now» (P10.15a); `None` in tests that have none.
+    pub site_runner: Option<Arc<dyn SiteRunner>>,
 }
 
 impl AppState {
@@ -77,12 +97,19 @@ impl AppState {
             llm,
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
+            site_runner: None,
         }
     }
 
     /// Where held videos live, so a rejection can remove its file now.
     pub fn with_temp_dir(mut self, temp_dir: PathBuf) -> Self {
         self.temp_dir = Some(temp_dir);
+        self
+    }
+
+    /// The canary runner for the Sites card's «Run now».
+    pub fn with_site_runner(mut self, runner: Arc<dyn SiteRunner>) -> Self {
+        self.site_runner = Some(runner);
         self
     }
 

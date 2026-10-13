@@ -579,6 +579,34 @@ async fn the_daytime_heal_waits_for_an_idle_queue_and_runs_once_per_two_hours() 
     assert!(!canary::heal_by_day(&canary_env(&r), &r.ctx, DOMAIN).await);
 }
 
+/// The admin's «Run now» (P10.15a) probes a broken site again at once, which the
+/// daytime trigger's once-per-2-hours limit would refuse; the other rules stay.
+#[tokio::test]
+async fn an_admins_run_now_is_not_held_to_the_two_hour_limit_but_still_needs_repair_on_and_an_idle_queue() {
+    let r = rig(RepairMode::Shadow);
+    clip_recipe(&r);
+    serve_clip(&r);
+    canary_pages(&r, 3, 120.0);
+    broken(&r);
+    let env = canary_env(&r);
+
+    // A job is running: not now, whoever asks.
+    assert!(!canary::heal_now(&env, &r.ctx, DOMAIN, false).await);
+    assert!(reports(&r).is_empty());
+
+    assert!(r.repo.finish(r.job.id, OWNER, JobStatus::Completed, None, None, None).unwrap());
+    assert!(canary::heal_by_day(&env, &r.ctx, DOMAIN).await);
+    assert!(!canary::heal_by_day(&env, &r.ctx, DOMAIN).await, "the daytime trigger waits two hours");
+    assert!(canary::heal_now(&env, &r.ctx, DOMAIN, false).await, "an admin's request does not");
+    assert_eq!(reports(&r).len(), 2);
+
+    // Repair off: never, even when asked.
+    let r = rig(RepairMode::Off);
+    assert!(r.repo.finish(r.job.id, OWNER, JobStatus::Completed, None, None, None).unwrap());
+    canary_pages(&r, 3, 120.0);
+    assert!(!canary::heal_now(&canary_env(&r), &r.ctx, DOMAIN, false).await);
+}
+
 #[tokio::test]
 async fn the_nightly_heal_waits_for_the_canary_lock() {
     let r = rig(RepairMode::Shadow);

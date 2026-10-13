@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::admin_sites;
 use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, security_headers};
 use crate::routes::*;
@@ -107,6 +108,14 @@ impl WebServer {
             .route("/api/admin/selfcheck", get(api_admin_selfcheck))
             .route("/api/admin/selfcheck/links", post(api_admin_selfcheck_add))
             .route("/api/admin/selfcheck/links/:id/delete", post(api_admin_selfcheck_delete))
+            .route("/api/admin/sites", get(admin_sites::api_admin_sites))
+            .route("/api/admin/sites/:domain/check", post(admin_sites::api_admin_site_check))
+            .route("/api/admin/recipes", get(admin_sites::api_admin_recipes))
+            .route("/api/admin/recipes/export", get(admin_sites::api_admin_recipes_export))
+            .route("/api/admin/recipes/import", post(admin_sites::api_admin_recipes_import))
+            .route("/api/admin/recipes/:id/suspend", post(admin_sites::api_admin_recipe_suspend))
+            .route("/api/admin/recipes/:id/retire", post(admin_sites::api_admin_recipe_retire))
+            .route("/api/admin/repair-report", get(admin_sites::api_admin_repair_report))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))

@@ -23,6 +23,7 @@ use omni_core::health::HealthState;
 use omni_core::models::{CompletedPage, SiteCanary};
 use omni_core::repository::Repository;
 use omni_core::site_health::{self, SiteState};
+use omni_web::state::{RunNow, SiteRunner};
 
 use crate::selfcheck::LinkOutcome;
 
@@ -467,8 +468,77 @@ impl CanaryEnv {
         });
     }
 
+    /// The admin's «Run now» (P10.15a): check one site in the background, and
+    /// when it is broken afterwards (and repair is on) probe its canary pages.
+    /// Not held to the daytime rate limit: an admin asked. Never waits.
+    pub fn run_now(self: &Arc<Self>, domain: &str) -> RunNow {
+        let Ok(guard) = self.run_lock.clone().try_lock_owned() else {
+            return RunNow::Busy;
+        };
+        let env = self.clone();
+        let domain = domain.to_string();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let probe = LiveProbe { ytdl: env.ytdl() };
+            manual_check(&env, &probe, &domain).await;
+        });
+        RunNow::Started
+    }
+
     fn ytdl(&self) -> PathBuf {
         DependencyManager::new(&self.bin_dir).ytdl_live()
+    }
+}
+
+/// What «Run now» does under the canary lock: check the site, store what that
+/// means, say so in the audit log, and, when the site is broken afterwards,
+/// probe its canary pages (a no-op with repair off or a job running).
+async fn manual_check(env: &CanaryEnv, probe: &impl SiteProbe, domain: &str) {
+    let check = check_domain(env, probe, domain, Instant::now() + NIGHTLY_BUDGET).await;
+    settle(env, domain, &check, Utc::now()).await;
+    let said = match &check {
+        SiteCheck::Pass => "works",
+        SiteCheck::Fail(_) => "no recent article gives video",
+        SiteCheck::Unknown => "undecided",
+    };
+    let _ = env.repo.log_audit("INFO", "ADMIN", &format!("Manual check of {domain}: {said}"));
+    let broken = matches!(env.repo.get_site(domain), Ok(Some(row)) if row.state == SiteState::Broken);
+    if broken {
+        if let Some(ctx) = env.heal.get() {
+            heal_now(env, ctx, domain, false).await;
+        }
+    }
+}
+
+/// One «Run now» per site in this time (in memory).
+const RUN_NOW_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// The web panel's way in to [`CanaryEnv::run_now`], with a cooldown per site.
+pub struct AdminRunner {
+    env: Arc<CanaryEnv>,
+    started: Mutex<HashMap<String, Instant>>,
+}
+
+impl AdminRunner {
+    pub fn new(env: Arc<CanaryEnv>) -> Self {
+        Self { env, started: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl SiteRunner for AdminRunner {
+    fn run_now(&self, domain: &str) -> RunNow {
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = started.get(domain) {
+            let left = RUN_NOW_COOLDOWN.saturating_sub(at.elapsed());
+            if !left.is_zero() {
+                return RunNow::Cooldown(left.as_secs().max(1));
+            }
+        }
+        let answer = self.env.run_now(domain);
+        if answer == RunNow::Started {
+            started.insert(domain.to_string(), Instant::now());
+        }
+        answer
     }
 }
 
@@ -670,6 +740,11 @@ pub(crate) async fn heal_nightly_with(env: &CanaryEnv, ctx: &crate::repair::Repa
 /// only with no job running and at most once per site per [`TRIGGER_GAP`]. The
 /// caller holds the canary lock.
 pub(crate) async fn heal_by_day(env: &CanaryEnv, ctx: &crate::repair::RepairCtx, domain: &str) -> bool {
+    heal_now(env, ctx, domain, true).await
+}
+
+/// [`heal_by_day`]; `limited` false (an admin's «Run now») skips the once-per-2-hours limit only.
+pub(crate) async fn heal_now(env: &CanaryEnv, ctx: &crate::repair::RepairCtx, domain: &str, limited: bool) -> bool {
     use crate::repair::record_report;
     if ctx.cfg.mode == RepairMode::Off {
         return false;
@@ -686,7 +761,7 @@ pub(crate) async fn heal_by_day(env: &CanaryEnv, ctx: &crate::repair::RepairCtx,
         }
     }
     let pages = live_pages(&env.repo, domain);
-    if pages.is_empty() || !env.heal_limiter.lock().unwrap_or_else(|e| e.into_inner()).allow(domain, Instant::now()) {
+    if pages.is_empty() || (limited && !env.heal_limiter.lock().unwrap_or_else(|e| e.into_inner()).allow(domain, Instant::now())) {
         return false;
     }
     let deadline = Instant::now() + (ctx.cfg.budget * HEAL_BUDGET_FACTOR).min(NIGHTLY_BUDGET);
@@ -1197,6 +1272,58 @@ mod tests {
         drop(held);
     }
 
+
+    #[tokio::test]
+    async fn a_manual_check_confirms_a_degraded_site_broken_and_a_pass_restores_it() {
+        let (env, _db) = env();
+        degrade(&env.repo, "news.example");
+        pool(&env.repo, &["https://news.example/a"]);
+        let failing = fake(&[("https://news.example/a", OK200)], &[("https://news.example/a", false)]);
+        manual_check(&env, &failing, "news.example").await;
+        assert_eq!(env.repo.get_site("news.example").unwrap().unwrap().state, SiteState::Broken);
+
+        let works = fake(&[("https://news.example/a", OK200)], &[("https://news.example/a", true)]);
+        manual_check(&env, &works, "news.example").await;
+        assert_eq!(env.repo.get_site("news.example").unwrap().unwrap().state, SiteState::Healthy);
+
+        let said: Vec<String> = env.repo.get_recent_audit_logs(20).unwrap().into_iter().filter(|a| a.category == "ADMIN").map(|a| a.message).collect();
+        assert!(said.iter().any(|m| m == "Manual check of news.example: works"), "{said:?}");
+        assert!(said.iter().any(|m| m == "Manual check of news.example: no recent article gives video"), "{said:?}");
+    }
+
+    #[tokio::test]
+    async fn run_now_starts_when_the_lock_is_free_and_says_busy_while_a_run_holds_it() {
+        let (env, _db) = env();
+        // A site with no canaries is undecided without any outside call.
+        assert_eq!(env.run_now("quiet.example"), RunNow::Started);
+        // The check holds the lock until it is done.
+        drop(env.lock_run().await);
+        let said: Vec<String> = env.repo.get_recent_audit_logs(5).unwrap().into_iter().map(|a| a.message).collect();
+        assert_eq!(said, ["Manual check of quiet.example: undecided"]);
+
+        let held = env.lock_run().await;
+        assert_eq!(env.run_now("quiet.example"), RunNow::Busy, "a canary run or the yt-dlp update holds it");
+        drop(held);
+        assert!(env.repo.get_recent_audit_logs(5).unwrap().len() == 1, "the refused request ran nothing");
+    }
+
+    #[tokio::test]
+    async fn run_now_from_the_panel_has_a_ten_minute_cooldown_per_site_and_a_refusal_does_not_start_it() {
+        let (env, _db) = env();
+        let runner = AdminRunner::new(env.clone());
+        // Refused while the lock is held: no cooldown starts.
+        let held = env.lock_run().await;
+        assert_eq!(runner.run_now("quiet.example"), RunNow::Busy);
+        drop(held);
+        assert_eq!(runner.run_now("quiet.example"), RunNow::Started);
+        drop(env.lock_run().await);
+        match runner.run_now("quiet.example") {
+            RunNow::Cooldown(secs) => assert!((590..=600).contains(&secs), "about ten minutes left: {secs}"),
+            other => panic!("expected a cooldown, got {other:?}"),
+        }
+        assert_eq!(runner.run_now("other.example"), RunNow::Started, "another site is not held back");
+        drop(env.lock_run().await);
+    }
     #[tokio::test]
     async fn the_nightly_update_task_keeps_canary_runs_out_while_it_holds_the_lock() {
         let (env, _db) = env();
