@@ -209,6 +209,8 @@ impl Downloader {
             // Never resume a `.part` left by an earlier or cancelled run: the
             // same job may be retried with a different link (P1.15).
             "--no-continue".into(),
+            // The file keeps its download time, not the server's Last-Modified.
+            "--no-mtime".into(),
             // Nor take a complete `source.*` left in a kept workspace (a
             // restart or reap, then an override to a new link) as "already
             // downloaded": that would deliver the old link's video (P1.16).
@@ -306,6 +308,15 @@ impl Downloader {
             run_opts = run_opts.with_cancel(token);
         }
 
+        // The workspace is this job's own; a `source.*` left by an earlier
+        // owner must not be mistaken for this run's file by the fallback scan.
+        if let Err(e) = clear_stale_sources(output_dir).await {
+            return Err(DownloadError {
+                code: ErrorCode::PipelineFailed,
+                message: format!("could not clear a leftover source file in {output_dir:?}: {e}"),
+            }
+            .into());
+        }
         let outcome = run(&self.ytdl_path, &args, run_opts)
             .await
             .with_context(|| format!("Could not run yt-dlp at {:?}", self.ytdl_path))?;
@@ -329,14 +340,11 @@ impl Downloader {
         // directory scan only if that produced nothing usable, because a wrong
         // guess here feeds the wrong file to the transcoder.
         let candidates = printed_paths.lock().unwrap().clone();
-        for line in candidates.iter().rev() {
-            let p = PathBuf::from(line);
-            if p.is_file() {
-                return Ok(p);
-            }
+        if let Some(p) = printed_path_in_dir(&candidates, output_dir) {
+            return Ok(p);
         }
 
-        warn!("Job #{job_id}: yt-dlp did not print an output path; scanning {output_dir:?}");
+        warn!("Job #{job_id}: yt-dlp did not print a usable output path; scanning {output_dir:?}");
         find_downloaded_file(output_dir)
             .await
             .ok_or_else(|| anyhow!("yt-dlp reported success but produced no file in {output_dir:?}"))
@@ -540,17 +548,63 @@ fn parse_progress(rest: &str) -> Option<DownloadProgress> {
     })
 }
 
-/// The largest complete file in the job's workspace.
+/// The last printed line that names a file inside `output_dir`. A path that
+/// resolves elsewhere is refused: it is not this run's download.
+fn printed_path_in_dir(lines: &[String], output_dir: &Path) -> Option<PathBuf> {
+    let root = output_dir.canonicalize();
+    lines.iter().rev().find_map(|line| {
+        let p = PathBuf::from(line);
+        if !p.is_file() {
+            return None;
+        }
+        let inside = match (p.canonicalize(), &root) {
+            (Ok(real), Ok(root)) => real.starts_with(root),
+            _ => lexically_directly_inside(&p, output_dir),
+        };
+        inside.then_some(p)
+    })
+}
+
+/// Fallback when a path cannot be canonicalised: absolute, and its parent is
+/// exactly `output_dir`.
+fn lexically_directly_inside(p: &Path, output_dir: &Path) -> bool {
+    p.is_absolute() && p.parent() == Some(output_dir)
+}
+
+/// Remove every `source.*` file left in `dir` by an earlier owner of the job,
+/// so the fallback scan can only ever see this run's output. A file that
+/// cannot be removed is an error: running on with it present is the bug.
+async fn clear_stale_sources(dir: &Path) -> std::io::Result<()> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_name().to_string_lossy().to_lowercase().starts_with("source.") {
+            continue;
+        }
+        if entry.metadata().await?.is_file() {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The largest complete `source.*` file in the job's workspace.
 ///
-/// Only used when yt-dlp printed no path. `.part` and `.ytdl` are in-progress
-/// artefacts; picking one would hand a truncated file to the transcoder.
+/// Only used when yt-dlp printed no path, after [`clear_stale_sources`] ran
+/// before the spawn. `.part*` and `.ytdl` are in-progress artefacts; picking
+/// one would hand a truncated file to the transcoder. No mtime test: yt-dlp may
+/// stamp a fresh file with the server's date.
 async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.ends_with(".part") || name.ends_with(".ytdl") || name.ends_with(".tmp") {
+        if !name.starts_with("source.")
+            || name.contains(".part")
+            || name.ends_with(".ytdl")
+            || name.ends_with(".tmp")
+            || name.ends_with(".temp")
+        {
             continue;
         }
         let Ok(meta) = entry.metadata().await else {
@@ -582,6 +636,7 @@ fn first_error_line(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     fn args_for(opts: &DownloadOpts<'_>) -> Vec<String> {
         Downloader::build_args(
@@ -611,6 +666,12 @@ mod tests {
     fn a_stale_part_file_is_never_resumed() {
         let args = args_for(&DownloadOpts::default());
         assert!(args.iter().any(|a| a == "--no-continue"), "{args:?}");
+    }
+
+    #[test]
+    fn the_download_is_not_stamped_with_the_servers_date() {
+        let args = args_for(&DownloadOpts::default());
+        assert!(args.iter().any(|a| a == "--no-mtime"), "{args:?}");
     }
 
     #[test]
@@ -831,6 +892,82 @@ mod tests {
 
         let found = find_downloaded_file(dir.path()).await.expect("a file");
         assert_eq!(found.file_name().unwrap(), "source.mp4");
+    }
+
+    #[tokio::test]
+    async fn leftovers_from_an_earlier_owner_are_cleared_before_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        // What a previous owner left behind: a bigger source and a delivered output.
+        tokio::fs::write(dir.path().join("source.webm"), vec![0u8; 900_000]).await.unwrap();
+        tokio::fs::write(dir.path().join("SOURCE.MP4"), vec![0u8; 800_000]).await.unwrap();
+        tokio::fs::write(dir.path().join("7_output.mxf"), vec![0u8; 950_000]).await.unwrap();
+
+        clear_stale_sources(dir.path()).await.unwrap();
+        // This run's file arrives (smaller than the stale ones).
+        tokio::fs::write(dir.path().join("source.mkv"), vec![0u8; 1000]).await.unwrap();
+
+        let found = find_downloaded_file(dir.path()).await.expect("the fresh file");
+        assert_eq!(found.file_name().unwrap(), "source.mkv");
+        // Only source.* is cleared; other files are left alone.
+        assert!(dir.path().join("7_output.mxf").exists());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_found_when_the_run_wrote_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("source.webm"), vec![0u8; 900_000]).await.unwrap();
+        tokio::fs::write(dir.path().join("7_output.mxf"), vec![0u8; 950_000]).await.unwrap();
+        clear_stale_sources(dir.path()).await.unwrap();
+        assert!(find_downloaded_file(dir.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_file_with_an_old_mtime_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.mp4");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        // yt-dlp can stamp the server's Last-Modified on the download.
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_680_000_000);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+
+        let found = find_downloaded_file(dir.path()).await.expect("the file");
+        assert_eq!(found.file_name().unwrap(), "source.mp4");
+    }
+
+    #[test]
+    fn the_lexical_fallback_accepts_only_a_direct_child_of_the_output_dir() {
+        let root = if cfg!(windows) { Path::new(r"C:\jobs\7") } else { Path::new("/jobs/7") };
+        assert!(lexically_directly_inside(&root.join("source.mp4"), root));
+        assert!(!lexically_directly_inside(&root.join("sub").join("source.mp4"), root));
+        assert!(!lexically_directly_inside(&root.parent().unwrap().join("source.mp4"), root));
+        assert!(!lexically_directly_inside(Path::new("source.mp4"), root));
+    }
+
+    #[tokio::test]
+    async fn the_fallback_scan_ignores_fresh_partial_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("source.mp4.part"), vec![0u8; 1000]).await.unwrap();
+        tokio::fs::write(dir.path().join("source.mp4.part-Frag3"), vec![0u8; 1000]).await.unwrap();
+        tokio::fs::write(dir.path().join("source.mp4.ytdl"), vec![0u8; 1000]).await.unwrap();
+
+        assert!(find_downloaded_file(dir.path()).await.is_none());
+    }
+
+    #[test]
+    fn a_printed_path_outside_the_output_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("source.mp4");
+        std::fs::write(&outside, b"x").unwrap();
+        let inside = dir.path().join("source.mp4");
+        std::fs::write(&inside, b"x").unwrap();
+
+        let lines = vec![inside.display().to_string(), outside.display().to_string()];
+        // The last line is outside, so it is skipped and the inside one wins.
+        let got = printed_path_in_dir(&lines, dir.path()).expect("inside file");
+        assert_eq!(got.file_name().unwrap(), "source.mp4");
+        assert!(got.canonicalize().unwrap().starts_with(dir.path().canonicalize().unwrap()));
+        assert!(printed_path_in_dir(&lines[1..], dir.path()).is_none());
     }
 
     #[test]
