@@ -702,6 +702,35 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // Cookie jars for login-walled sites (P3.5): admin only.
+    ("GET", "/api/admin/cookies", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/cookies", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/cookies/x.com/delete", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/cookies/x.com/test", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // The admin's Test URL (P10.15b): a dry run, admin only.
     ("GET", "/api/admin/test-url", &[
             (Anonymous, Denied),

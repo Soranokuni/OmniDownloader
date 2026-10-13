@@ -43,6 +43,16 @@ pub trait UrlTester: Send + Sync {
     fn test_url<'a>(&'a self, url: &'a str, use_llm: bool) -> TestUrlFuture<'a>;
 }
 
+pub type CookieTestFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(bool, String), String>> + Send + 'a>>;
+
+/// The admin's cookie-jar «Test» (P3.5): runs yt-dlp with the site's jar on a
+/// sample link and stores the outcome. The daemon implements it (it knows where
+/// yt-dlp is). `Ok((ok, detail))`; `Err` is a reason the test could not start.
+pub trait CookieTester: Send + Sync {
+    fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> CookieTestFuture<'a>;
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Repository,
@@ -86,6 +96,10 @@ pub struct AppState {
     pub site_runner: Option<Arc<dyn SiteRunner>>,
     /// The dry-run tester behind the admin's «Test URL» (P10.15b); `None` in tests that have none.
     pub url_tester: Option<Arc<dyn UrlTester>>,
+    /// The cookie-jar tester behind the Cookies card (P3.5); `None` in tests that have none.
+    pub cookie_tester: Option<Arc<dyn CookieTester>>,
+    /// The log redactor: an uploaded jar's values join it at once (P3.5).
+    pub redactions: Option<omni_core::logging::Redactions>,
 }
 
 impl AppState {
@@ -120,6 +134,8 @@ impl AppState {
             temp_dir: None,
             site_runner: None,
             url_tester: None,
+            cookie_tester: None,
+            redactions: None,
         }
     }
 
@@ -138,6 +154,18 @@ impl AppState {
     /// The dry-run tester for the admin's «Test URL».
     pub fn with_url_tester(mut self, tester: Arc<dyn UrlTester>) -> Self {
         self.url_tester = Some(tester);
+        self
+    }
+
+    /// The cookie-jar tester for the Cookies card's «Test».
+    pub fn with_cookie_tester(mut self, tester: Arc<dyn CookieTester>) -> Self {
+        self.cookie_tester = Some(tester);
+        self
+    }
+
+    /// The daemon's log redactor, so a jar uploaded while it runs is redacted at once.
+    pub fn with_redactions(mut self, redactions: omni_core::logging::Redactions) -> Self {
+        self.redactions = Some(redactions);
         self
     }
 

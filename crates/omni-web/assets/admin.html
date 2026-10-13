@@ -225,6 +225,44 @@
       <div id="test-url-result" class="stack"></div>
     </section>
 
+    <section class="card stack" id="cookies">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Cookies</h2>
+        <button class="btn" type="button" id="cookies-refresh">Refresh</button>
+      </div>
+      <p class="note">
+        Some sites (X, Facebook, Instagram) show a video only to a logged-in account. Export
+        the station account's cookies as a Netscape <span class="mono">cookies.txt</span> from a
+        browser that is logged in, and upload them here, one file per site. They are encrypted
+        on this machine and are never shown again. Only the lines of that site are kept. Use
+        «Test» with a public link of the site to check that they still log in; it is repeated
+        every night, and the Cookies health line turns amber when they are about to expire
+        or stop working.
+      </p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Site</th><th class="right">Cookies</th><th>Earliest expiry</th><th>Uploaded</th>
+              <th>Last test</th><th>Test link</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="cookies-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <h3 class="card-title" style="font-size:0.95rem">Upload cookies</h3>
+      <form id="cookies-form" class="stack">
+        <div class="row tight">
+          <input type="text" id="cookies-domain" class="grow" placeholder="Site, for example x.com" autocomplete="off" required>
+          <input type="file" id="cookies-file" accept=".txt,text/plain" hidden>
+          <button class="btn" type="button" id="cookies-pick">Choose cookies.txt…</button>
+          <button class="btn btn-primary" type="submit" id="cookies-upload">Upload</button>
+        </div>
+        <p id="cookies-file-note" class="note"></p>
+      </form>
+      <p id="cookies-result" class="note" style="white-space:pre-line"></p>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
@@ -564,6 +602,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=18"></script>
+<script type="module" src="/static/admin.js?v=19"></script>
 </body>
 </html>

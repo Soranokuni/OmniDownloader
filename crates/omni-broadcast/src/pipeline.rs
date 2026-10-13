@@ -77,6 +77,18 @@ fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
     cancel.as_ref().is_some_and(|t| t.is_cancelled())
 }
 
+/// Forgets a job's extra login site when dropped (see [`BroadcastEngine::set_login_site`]).
+pub struct LoginSiteGuard {
+    sites: Arc<Mutex<HashMap<i64, String>>>,
+    job_id: i64,
+}
+
+impl Drop for LoginSiteGuard {
+    fn drop(&mut self) {
+        self.sites.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.job_id);
+    }
+}
+
 #[derive(Clone)]
 pub struct BroadcastEngine {
     repo: Repository,
@@ -93,6 +105,10 @@ pub struct BroadcastEngine {
     encoder_slots: Arc<Semaphore>,
     /// The download slot each job holds until it reaches the encoder.
     download_slots: Arc<Mutex<HashMap<i64, OwnedSemaphorePermit>>>,
+    /// The address of a video the page of job N embeds on another site, so the
+    /// job's yt-dlp runs also carry that site's cookie jar (P3.5). The job's own
+    /// address, and every other argument of its download, are unchanged.
+    login_sites: Arc<Mutex<HashMap<i64, String>>>,
     /// The H.264 encoder previews use, found on first use (P10.6).
     preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
 }
@@ -109,6 +125,12 @@ impl BroadcastEngine {
     /// [`Self::release_download_slot`] when the job ends before that.
     pub fn hold_download_slot(&self, job_id: i64, permit: OwnedSemaphorePermit) {
         self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, permit);
+    }
+
+    /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
+    pub fn set_login_site(&self, job_id: i64, video_url: &str) -> LoginSiteGuard {
+        self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, video_url.to_string());
+        LoginSiteGuard { sites: self.login_sites.clone(), job_id }
     }
 
     /// Hand back job `job_id`'s download slot, if it still holds one.
@@ -150,6 +172,7 @@ impl BroadcastEngine {
             watchfolder_dir,
             encoder_slots: Arc::new(Semaphore::new(DEFAULT_ENCODER_SLOTS)),
             download_slots: Arc::new(Mutex::new(HashMap::new())),
+            login_sites: Arc::new(Mutex::new(HashMap::new())),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -158,7 +181,10 @@ impl BroadcastEngine {
     /// order, and whether yt-dlp has no extractor for it. See
     /// [`crate::downloader::PageScan`].
     pub async fn page_videos(&self, url: &str) -> crate::downloader::PageScan {
+        // The site's cookie jar, for the length of the call (P3.5).
+        let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
         crate::downloader::Downloader::new(&self.ytdl_path)
+            .with_cookie_jar(jar.as_ref())
             .page_videos(url, std::time::Duration::from_secs(90))
             .await
     }
@@ -168,7 +194,13 @@ impl BroadcastEngine {
     /// so ("No video could be found in this tweet"); a failure that proves
     /// nothing (network, login, timeout) is `None`.
     pub async fn post_has_video(&self, url: &str) -> Option<bool> {
-        match Downloader::new(&self.ytdl_path).probe(url, std::time::Duration::from_secs(60)).await {
+        let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
+        let probed = Downloader::new(&self.ytdl_path)
+            .with_cookie_jar(jar.as_ref())
+            .probe(url, std::time::Duration::from_secs(60))
+            .await;
+        drop(jar);
+        match probed {
             Ok(_) => Some(true),
             Err(line) if crate::errors::classify_download_error(&line) == ErrorCode::NoStreamFound => Some(false),
             Err(_) => None,
@@ -312,6 +344,11 @@ impl BroadcastEngine {
         // 1. Download stage
         let downloader = Downloader::new(&self.ytdl_path);
         let repo_clone = self.repo.clone();
+        // The site's cookie jar (P3.5), a file in this job's workspace for the
+        // length of the download only: the guard removes it on every way out.
+        let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
+        let jar_urls: Vec<&str> = std::iter::once(url.as_str()).chain(login_site.as_deref()).collect();
+        let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, &job_temp, false);
         let raw_download_res = downloader
             .download(
                 job_id,
@@ -321,6 +358,8 @@ impl BroadcastEngine {
                     referer,
                     user_agent,
                     cookie_header: cookies,
+                    cookie_jar: cookie_file.as_ref().map(|f| f.path()),
+                    cookie_values: cookie_file.as_ref().map(|f| f.values()).unwrap_or(&[]),
                     cancel: cancel.clone(),
                     ..Default::default()
                 },
@@ -334,6 +373,7 @@ impl BroadcastEngine {
                 },
             )
             .await;
+        drop(cookie_file);
 
         let downloaded_file = match raw_download_res {
             Ok(path) => path,

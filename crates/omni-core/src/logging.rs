@@ -94,6 +94,17 @@ impl Redactions {
         }
     }
 
+    /// Add values to the set (cookie jars, plan P3.5), keeping what is there.
+    pub fn extend(&self, more: Vec<String>) {
+        if let Ok(mut guard) = self.values.write() {
+            for v in more.into_iter().filter(|v| v.len() >= 6) {
+                if !guard.contains(&v) {
+                    guard.push(v);
+                }
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.values.read().map(|v| v.is_empty()).unwrap_or(true)
     }

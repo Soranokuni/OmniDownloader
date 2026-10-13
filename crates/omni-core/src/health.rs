@@ -143,6 +143,10 @@ pub mod checks {
     pub const ACCOUNTS: &str = "accounts";
     /// News sites that stopped giving video (plan P10.3).
     pub const SITES: &str = "sites";
+    /// Cookie jars for login-walled sites: expiring, failing or untested (plan P3.5).
+    pub const COOKIES: &str = "cookies";
+    /// `data\` and `temp\` restricted to SYSTEM, Administrators and the service account (P3.5).
+    pub const LOCKDOWN: &str = "lockdown";
 }
 
 impl Default for HealthState {

@@ -379,10 +379,11 @@ pub struct JobsQuery {
 
 /// A job as the MCR desk shows it: the row, plus what its error code means
 /// and what to do about it, in the operators' language.
-fn job_for_desk(job: &omni_core::models::Job) -> serde_json::Value {
+fn job_for_desk(repo: &omni_core::repository::Repository, job: &omni_core::models::Job) -> serde_json::Value {
     let mut v = serde_json::to_value(job).unwrap_or_default();
     if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
-        v["hint"] = serde_json::Value::String(code.hint_el().to_string());
+        // A login wall names the site and says whether its cookies are there (P3.5).
+        v["hint"] = serde_json::Value::String(omni_broadcast::errors::hint_for_job(code, &job.url, repo));
     }
     v
 }
@@ -539,7 +540,7 @@ pub async fn api_get_jobs(
             .jobs
             .iter()
             .map(|j| {
-                let mut v = job_for_desk(j);
+                let mut v = job_for_desk(&state.repo, j);
                 v["held"] = held_for_desk(&state, j);
                 v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
@@ -602,7 +603,7 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
-    let mut desk_job = job_for_desk(&job);
+    let mut desk_job = job_for_desk(&state.repo, &job);
     desk_job["held"] = held_for_desk(&state, &job);
     desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
@@ -2326,7 +2327,7 @@ pub async fn api_get_mail_view(
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
-                let mut v = job_for_desk(j);
+                let mut v = job_for_desk(&state.repo, j);
                 v["held"] = held_for_desk(&state, j);
                 v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {

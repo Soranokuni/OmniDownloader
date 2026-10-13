@@ -679,6 +679,26 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE repair_attempts ADD COLUMN mcr_reason TEXT;
         "#,
     ),
+    (
+        26,
+        // Cookie jars for login-walled sites (P3.5). `sealed` is the Netscape text
+        // under machine-scope DPAPI; every other column is safe to show. One jar per
+        // registrable domain (x.com also serves twitter.com).
+        r#"
+        CREATE TABLE IF NOT EXISTS cookie_jars (
+            domain           TEXT PRIMARY KEY,
+            sealed           BLOB NOT NULL,
+            cookie_count     INTEGER NOT NULL,
+            expires_min      TEXT,
+            updated_at       TEXT NOT NULL,
+            updated_by       TEXT NOT NULL,
+            last_test_at     TEXT,
+            last_test_ok     INTEGER,
+            last_test_detail TEXT,
+            last_sample_url  TEXT
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -1241,6 +1261,28 @@ mod tests {
             .query_row("SELECT mcr_decision, mcr_reason FROM repair_attempts", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((decision.as_str(), reason), ("rejected", None), "an old row keeps its decision and has no reason");
+    }
+
+    #[test]
+    fn migration_26_creates_cookie_jars_without_touching_old_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 25) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert!(conn.prepare("SELECT 1 FROM cookie_jars").is_err(), "not before 26");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 26);
+        let columns = columns_of(&conn, "cookie_jars");
+        for c in ["domain", "sealed", "cookie_count", "expires_min", "updated_at", "updated_by", "last_test_at", "last_test_ok", "last_test_detail", "last_sample_url"] {
+            assert!(columns.iter().any(|x| x == c), "cookie_jars.{c} missing: {columns:?}");
+        }
     }
 
     #[test]

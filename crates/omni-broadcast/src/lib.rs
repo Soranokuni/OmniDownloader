@@ -1,4 +1,5 @@
 pub mod article;
+pub mod cookie_file;
 pub mod card;
 pub mod delivery;
 pub mod errors;
