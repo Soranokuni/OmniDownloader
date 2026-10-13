@@ -1713,3 +1713,292 @@ async fn under_fifty_seconds_left_no_live_load_is_requested() {
 
 #[path = "repair_llm_tests.rs"]
 mod llm;
+
+// ---- P10.13: learning from MCR, «Επόμενη επιλογή» ----
+
+/// MCR called `url` a wrong video on `DOMAIN`: another job of the store held it and was rejected as wrong.
+fn mcr_calls_wrong(repo: &Repository, n: u32, url: &str) {
+    let id = repo
+        .enqueue(&NewJob::new(format!("https://news.example.gr/other-{n}"), format!("{n}_PETROU_X"), "PETROU"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+        .unwrap()
+        .job_id();
+    assert!(repo.lease_job_by_id(id, "desk-test", 600).unwrap());
+    let at = repo.start_attempt(id, "hold", Utc::now()).unwrap();
+    let end = AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        domain: Some(DOMAIN.into()),
+        held_url: Some(url.to_string()),
+        candidates_json: Some(serde_json::json!([{"url": url}]).to_string()),
+        ..Default::default()
+    };
+    repo.finish_attempt(at, &end, Utc::now()).unwrap();
+    assert!(repo.hold_output(id, "desk-test", "temp/held/x/clip.mxf", 3, &"ab".repeat(32), Some(9.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
+    assert!(repo.finish(id, "desk-test", JobStatus::AwaitingApproval, None, None, None).unwrap());
+    assert!(repo.reject_held(id, "wrong_video", "no", "desk").unwrap());
+}
+
+#[tokio::test]
+async fn a_skipped_address_is_dropped_before_the_gate_with_no_recipe_event() {
+    let skip = omni_core::urlnorm::skip_pattern(A).unwrap();
+    // Control: without the skip the same page is found and probed.
+    let r = rig(RepairMode::Shadow);
+    assert!(matches!(go(&r, Some(page(&next_data(A))), &Prior::default()).await, LadderResult::ShadowFound { .. }));
+    assert!(r.fake.probes() > 0);
+    // The query is not part of the pattern: the skip holds for a changed token.
+    let r = rig(RepairMode::Shadow);
+    let p = Prior { skips: vec![skip], ..Default::default() };
+    let res = go(&r, Some(page(&next_data(&format!("{A}?token=new")))), &p).await;
+    assert!(matches!(res, LadderResult::NothingVerified), "{res:?}");
+    assert_eq!(r.fake.probes(), 0, "dropped before the gate");
+    let rows = r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap();
+    let hit = rows.iter().find(|x| x.hash == shipped_hash("next_data_media")).unwrap();
+    assert!(hit.site_state.is_none(), "a skip is MCR's doing, not a miss of the recipe");
+}
+
+#[tokio::test]
+async fn the_ladder_reads_the_skip_list_of_the_site_from_the_store() {
+    let r = rig(RepairMode::Hold);
+    mcr_calls_wrong(&r.repo, 1, &format!("{A}?sig=1"));
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let got = after_failure(&r.ctx, &r.job, OWNER, PAGE, ErrorCode::VideoUnresolved, &Some(page(&next_data(A))), vec![], &CancellationToken::new()).await;
+    assert!(matches!(got, Some(LadderResult::NothingVerified)), "{got:?}");
+    assert_eq!(r.fake.probes(), 0);
+    assert!(r.fake.downloads().is_empty(), "the wrong video is not downloaded again");
+}
+
+#[tokio::test]
+async fn the_attempt_names_the_recipe_behind_every_verified_candidate() {
+    let r = rig(RepairMode::Shadow);
+    let res = go(&r, Some(three()), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::ShadowFound { .. }), "{res:?}");
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    let list: serde_json::Value = serde_json::from_str(at.candidates_json.as_deref().unwrap()).unwrap();
+    let rows = r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap();
+    let id_of = |hash: &str| rows.iter().find(|x| x.hash == hash).unwrap().id;
+    let (first, second) = (shipped_hash("og_video"), shipped_hash("next_data_media"));
+    assert_eq!(list[0]["url"], A);
+    assert_eq!((list[0]["recipe_id"].as_i64(), list[0]["recipe_hash"].as_str()), (Some(id_of(&first)), Some(first.as_str())));
+    assert_eq!((list[1]["recipe_id"].as_i64(), list[1]["recipe_hash"].as_str()), (Some(id_of(&second)), Some(second.as_str())));
+    assert!(list[1]["origin"].as_str().unwrap().starts_with("recipe:"), "the existing fields stay");
+}
+
+/// The world of the next-candidate path: it may only download (and resolve the
+/// host just before). Anything else the ladder uses panics the test.
+struct NextEnv {
+    downloads: Mutex<Vec<(String, Option<String>, DeliveryMode)>>,
+    script: Mutex<VecDeque<std::result::Result<RunOutcome, ErrorCode>>>,
+}
+
+impl NextEnv {
+    fn new(script: Vec<std::result::Result<RunOutcome, ErrorCode>>) -> Arc<Self> {
+        Arc::new(Self { downloads: Mutex::new(Vec::new()), script: Mutex::new(script.into()) })
+    }
+}
+
+#[async_trait]
+impl Env for NextEnv {
+    async fn diagnose(&self, _: &str, _: u64) -> Option<PageSnapshot> {
+        panic!("the next path looked at the page")
+    }
+    async fn live_snapshot(&self, _: &str, _: &[LiveAction], _: u64) -> Option<(PageSnapshot, LiveRun, Vec<String>)> {
+        panic!("the next path asked for a live page load")
+    }
+    fn model(&self) -> Option<&dyn RepairModel> {
+        panic!("the next path asked for the model")
+    }
+    fn fetcher(&self) -> &dyn Fetcher {
+        panic!("the next path ran a recipe")
+    }
+    fn prober(&self) -> &dyn Prober {
+        panic!("the next path ran the gate")
+    }
+    fn resolver(&self) -> &dyn Resolver {
+        panic!("the next path ran the gate")
+    }
+    fn is_ad(&self, _: &str) -> bool {
+        panic!("the next path ran the gate")
+    }
+    async fn host_is_public(&self, _: &str, _: u16) -> bool {
+        true
+    }
+    async fn download(&self, job: Job, _: &str, referer: Option<String>, _: &CancellationToken, mode: DeliveryMode) -> Result<RunOutcome> {
+        self.downloads.lock().unwrap().push((job.url.clone(), referer, mode));
+        match self.script.lock().unwrap().pop_front() {
+            Some(Ok(o)) => Ok(o),
+            Some(Err(code)) => Err(anyhow::anyhow!("scripted failure").context(code.as_str())),
+            None => panic!("a download nobody scripted"),
+        }
+    }
+}
+
+struct NextRig {
+    _dir: Scratch,
+    root: PathBuf,
+    repo: Repository,
+    engine: Arc<BroadcastEngine>,
+    job_id: i64,
+}
+
+/// A job that held candidate #1 of [A, B, C] (recipe-made, with the recipe's id and hash on
+/// each entry) and that MCR answered with «Επόμενη επιλογή»: PENDING, a `next` attempt on B.
+fn next_rig() -> NextRig {
+    let dir = Scratch::new();
+    let root = dir.0.clone();
+    let engine = engine_in(&root, None);
+    let repo = Repository::new(root.join("omni.db")).unwrap();
+    let job = leased_job(&repo);
+    let entry = |url: &str, id: i64| {
+        serde_json::json!({
+            "url": url, "referer": PAGE, "origin": format!("recipe:{:08}", id), "duration_secs": 61.0,
+            "recipe_id": id, "recipe_hash": format!("{id:064}"), "checks": [],
+        })
+    };
+    let at = repo.start_attempt(job.id, "hold", Utc::now()).unwrap();
+    let end = AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        domain: Some(DOMAIN.into()),
+        candidates_json: Some(serde_json::json!([entry(A, 1), entry(B, 2), entry(C, 3)]).to_string()),
+        held_url: Some(A.to_string()),
+        next_index: 0,
+        expected_secs: Some(60.0),
+        ..Default::default()
+    };
+    repo.finish_attempt(at, &end, Utc::now()).unwrap();
+    assert!(repo.hold_output(job.id, OWNER, "temp/held/x/clip.mxf", 3, &"ab".repeat(32), Some(61.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
+    assert!(repo.finish(job.id, OWNER, JobStatus::AwaitingApproval, None, None, None).unwrap());
+    assert_eq!(repo.next_candidate(job.id, &"ab".repeat(32), "desk", Utc::now()).unwrap(), Some(1));
+    NextRig { _dir: dir, root, repo, engine, job_id: job.id }
+}
+
+impl NextRig {
+    fn lease(&self) -> Job {
+        self.repo.lease_job(OWNER, 600).unwrap().expect("the job is queued again")
+    }
+
+    async fn run(&self, env: Arc<NextEnv>, job: Job) {
+        let mut c = cfg(RepairMode::Hold, Duration::from_secs(5));
+        c.llm = LlmCfg { enabled: true, model: Some("m".into()), ..LlmCfg::default() };
+        let ctx = RepairCtx { repo: self.repo.clone(), cfg: c, env };
+        let health = omni_core::health::HealthState::new();
+        let canary = Arc::new(crate::canary::CanaryEnv::new(self.repo.clone(), health.clone(), self.root.join("bin"), "stable".into()));
+        crate::run_job(&self.repo, &self.engine, OWNER, job, CancellationToken::new(), &self.root.join("evidence"), &ctx, &health, &canary)
+            .await
+            .unwrap();
+    }
+}
+
+/// «Επόμενη επιλογή» through the worker: candidate #2 is downloaded held with the
+/// hold the ladder uses, and nothing else of the ladder (page look, recipes, model,
+/// the normal download -- the engine here has no tools at all) is reached.
+#[tokio::test]
+async fn the_next_choice_holds_candidate_two_and_never_reruns_the_rungs() {
+    let n = next_rig();
+    let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+    n.run(env.clone(), n.lease()).await;
+
+    let d = env.downloads.lock().unwrap().clone();
+    assert_eq!(d.len(), 1, "one download, of the next candidate only");
+    assert_eq!((d[0].0.as_str(), d[0].1.as_deref()), (B, Some(PAGE)));
+    assert_eq!(d[0].2, DeliveryMode::Hold { hold_hours: 24, held_max_bytes: 20 << 30 }, "held again, for MCR");
+    let job = n.repo.get_job(n.job_id).unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::AwaitingApproval, "parked by the worker: {:?}", job.error_message);
+    assert_eq!(job.extraction_method, Some(format!("repair:recipe:{:08}", 2)), "named after the recipe behind #2");
+    let at = n.repo.latest_attempt(n.job_id).unwrap().unwrap();
+    assert_eq!((at.rung.as_deref(), at.outcome.as_deref()), (Some("next"), Some("held")));
+    assert_eq!((at.held_url.as_deref(), at.next_index, at.recipe_id), (Some(B), 1, Some(2)));
+    assert_eq!(at.recipe_hash.as_deref(), Some(format!("{:064}", 2).as_str()));
+    assert_eq!(at.expected_secs, Some(60.0), "the page's stated length is carried over");
+    assert!(at.finished_at.is_some());
+    // It is the attempt the card describes now, and C is still offered.
+    assert_eq!(n.repo.latest_held_attempt(n.job_id).unwrap().unwrap().id, at.id);
+    assert_eq!(n.repo.next_left(n.job_id, Utc::now()).unwrap(), 1);
+    assert_eq!(n.repo.rejected_held_urls(n.job_id).unwrap(), vec![A.to_string()]);
+}
+
+#[tokio::test]
+async fn a_failed_next_download_ends_in_review_with_the_greek_message_and_tries_nothing_else() {
+    let n = next_rig();
+    let env = NextEnv::new(vec![Err(ErrorCode::Http403), Ok(RunOutcome::Held)]);
+    n.run(env.clone(), n.lease()).await;
+    assert_eq!(env.downloads.lock().unwrap().len(), 1, "no further candidate by itself, though C is verified");
+    let job = n.repo.get_job(n.job_id).unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::RequiresReview);
+    assert_eq!(job.error_code.as_deref(), Some("VIDEO_UNRESOLVED"));
+    assert_eq!(job.error_message.as_deref(), Some("Η επόμενη επιλογή δεν κατέβηκε"));
+    assert_eq!(job.extraction_method, None, "the repair mark is taken back");
+    let at = n.repo.latest_attempt(n.job_id).unwrap().unwrap();
+    assert_eq!((at.rung.as_deref(), at.outcome.as_deref()), (Some("next"), Some("next_failed")));
+    assert!(n.repo.get_held(n.job_id).unwrap().is_some_and(|h| h.decision.as_deref() == Some("rejected")), "nothing is held");
+}
+
+#[tokio::test]
+async fn the_next_path_checks_the_skip_list_and_rejections_again_before_downloading() {
+    // B was called a wrong video (another job) after MCR chose it.
+    let n = next_rig();
+    mcr_calls_wrong(&n.repo, 7, &format!("{B}?sig=zz"));
+    let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+    n.run(env.clone(), n.lease()).await;
+    assert!(env.downloads.lock().unwrap().is_empty(), "a skipped address is never downloaded");
+    let job = n.repo.get_job(n.job_id).unwrap().unwrap();
+    assert_eq!((job.status, job.error_message.as_deref()), (JobStatus::RequiresReview, Some("Η επόμενη επιλογή δεν κατέβηκε")));
+    assert_eq!(n.repo.latest_attempt(n.job_id).unwrap().unwrap().outcome.as_deref(), Some("next_skipped"));
+
+    // The rejected-URL half: MCR rejected the address for this very job (not as «wrong»).
+    let dir = Scratch::new();
+    let repo = Repository::new(dir.0.join("omni.db")).unwrap();
+    let job = leased_job(&repo);
+    let at = repo.start_attempt(job.id, "hold", Utc::now()).unwrap();
+    let end = AttemptEnd { rung: Some("recipes".into()), outcome: Some("held".into()), domain: Some(DOMAIN.into()), held_url: Some(B.into()), ..Default::default() };
+    repo.finish_attempt(at, &end, Utc::now()).unwrap();
+    assert!(repo.hold_output(job.id, OWNER, "temp/held/x/clip.mxf", 3, &"ab".repeat(32), Some(9.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
+    assert!(repo.finish(job.id, OWNER, JobStatus::AwaitingApproval, None, None, None).unwrap());
+    assert_eq!(next_barred(&repo, job.id, DOMAIN, B), Some(false), "still undecided");
+    assert!(repo.reject_held(job.id, "not_usable", "no", "desk").unwrap());
+    assert_eq!(next_barred(&repo, job.id, DOMAIN, B), Some(true), "rejected for this job");
+    assert_eq!(next_barred(&repo, job.id, DOMAIN, &format!("{B}#t=3")), Some(true), "on the normalized address");
+    assert_eq!(next_barred(&repo, job.id, DOMAIN, C), Some(false));
+}
+
+#[tokio::test]
+async fn the_next_path_writes_nothing_once_the_lease_is_gone() {
+    let n = next_rig();
+    let job = n.lease();
+    let ctx = RepairCtx { repo: n.repo.clone(), cfg: cfg(RepairMode::Hold, Duration::from_secs(5)), env: NextEnv::new(vec![Ok(RunOutcome::Held)]) };
+    let attempt = open_next(&n.repo, n.job_id).unwrap().expect("an open next attempt");
+    let got = run_next(&ctx, &job, "someone-else", &n.root.join("evidence"), &attempt, &CancellationToken::new()).await;
+    assert_eq!(got, NextResult::Lost);
+    assert!(open_next(&n.repo, n.job_id).unwrap().is_some(), "the attempt stays open: a new lease does it again");
+    assert_eq!(n.repo.get_job(n.job_id).unwrap().unwrap().status, JobStatus::Running);
+}
+
+/// A plain failed job with an older ladder attempt is not a next run.
+#[tokio::test]
+async fn only_an_unfinished_next_attempt_is_a_next_run() {
+    let r = rig(RepairMode::Hold);
+    assert!(open_next(&r.repo, r.job.id).unwrap().is_none(), "no attempt");
+    let at = r.repo.start_attempt(r.job.id, "hold", Utc::now()).unwrap();
+    assert!(open_next(&r.repo, r.job.id).unwrap().is_none(), "an open attempt that is not a next one");
+    r.repo.finish_attempt(at, &AttemptEnd { rung: Some("next".into()), outcome: Some("held".into()), ..Default::default() }, Utc::now()).unwrap();
+    assert!(open_next(&r.repo, r.job.id).unwrap().is_none(), "a finished next attempt");
+}
+
+/// With repair off or in shadow a pending next choice downloads nothing: review, with the Greek reason.
+#[tokio::test]
+async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
+    for mode in [RepairMode::Off, RepairMode::Shadow] {
+        let n = next_rig();
+        let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+        let ctx = RepairCtx { repo: n.repo.clone(), cfg: cfg(mode, Duration::from_secs(5)), env: env.clone() };
+        let health = omni_core::health::HealthState::new();
+        let canary = Arc::new(crate::canary::CanaryEnv::new(n.repo.clone(), health.clone(), n.root.join("bin"), "stable".into()));
+        crate::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
+            .await
+            .unwrap();
+        assert!(env.downloads.lock().unwrap().is_empty(), "{mode:?}: nothing is downloaded");
+        let job = n.repo.get_job(n.job_id).unwrap().unwrap();
+        assert_eq!((job.status, job.error_message.as_deref()), (JobStatus::RequiresReview, Some("Η αυτόματη επισκευή είναι απενεργοποιημένη")), "{mode:?}");
+        assert_eq!(n.repo.latest_attempt(n.job_id).unwrap().unwrap().outcome.as_deref(), Some("repair_off"));
+    }
+}

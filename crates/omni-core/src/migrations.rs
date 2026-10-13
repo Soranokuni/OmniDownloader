@@ -636,6 +636,21 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        23,
+        // Videos MCR called «Λάθος βίντεο» (P10.13): per page domain, the
+        // host and path (no scheme, query or fragment) of the address, kept
+        // 30 days (`until`), at most 50 per domain. The repair ladder drops
+        // any candidate with such a pattern before the gate.
+        r#"
+        CREATE TABLE IF NOT EXISTS repair_skips (
+            domain  TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            until   TEXT NOT NULL,
+            PRIMARY KEY (domain, pattern)
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -1100,6 +1115,42 @@ mod tests {
         let calls: i64 = conn.query_row("SELECT calls FROM llm_usage", [], |r| r.get(0)).unwrap();
         assert_eq!(calls, 0);
         assert!(conn.execute("INSERT INTO llm_usage (day) VALUES ('2026-10-12')", []).is_err(), "one row per day");
+    }
+
+    /// A database at version 22 keeps its rows when 23 is applied; the skip
+    /// table appears empty, one row per (domain, pattern).
+    #[test]
+    fn migration_23_adds_the_repair_skips_table_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 22) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 22);
+        conn.execute_batch("INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');")
+            .unwrap();
+        assert!(columns_of(&conn, "repair_skips").is_empty(), "the table exists before 23");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 23);
+        let have = columns_of(&conn, "repair_skips");
+        for c in ["domain", "pattern", "until"] {
+            assert!(have.iter().any(|x| x == c), "repair_skips.{c} missing: {have:?}");
+        }
+        let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 1, "existing job rows must survive");
+        conn.execute("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'x')", [])
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'y')", []).is_err(),
+            "one row per domain and pattern"
+        );
     }
 
     #[test]

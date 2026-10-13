@@ -198,14 +198,33 @@ async fn rejected_candidates_are_not_offered_again_and_round_two_with_nothing_ne
 #[tokio::test]
 async fn addresses_the_normal_path_or_mcr_already_had_are_not_offered() {
     let r = llm_rig(RepairMode::Hold, MockModel::new(vec![ptr_answer("/video/src")]));
-    let prior = Prior { tried: vec![Tried { url: CLIP.into(), referer: Some(PAGE.into()) }], rejected_by_mcr: vec![] };
+    let prior = Prior { tried: vec![Tried { url: CLIP.into(), referer: Some(PAGE.into()) }], rejected_by_mcr: vec![], skips: vec![] };
     assert!(matches!(go(&r, Some(llm_page("a")), &prior).await, LadderResult::NothingVerified));
     assert_eq!((mock(&r).asks(), r.fake.probes()), (1, 0), "tried by the normal path: dropped before the gate");
 
     let r = llm_rig(RepairMode::Hold, MockModel::new(vec![ptr_answer("/video/src")]));
-    let prior = Prior { tried: vec![], rejected_by_mcr: vec![CLIP.into()] };
+    let prior = Prior { tried: vec![], rejected_by_mcr: vec![CLIP.into()], skips: vec![] };
     assert!(matches!(go(&r, Some(llm_page("a")), &prior).await, LadderResult::NothingVerified));
     assert_eq!((mock(&r).asks(), r.fake.probes()), (1, 0), "rejected by MCR: never again");
+}
+
+/// P10.13: an address MCR called a wrong video on this site is dropped from what the
+/// model pointed at, before the gate, whatever its query says.
+#[tokio::test]
+async fn an_address_mcr_called_wrong_is_dropped_from_the_models_pointer_before_the_gate() {
+    let skip = omni_core::urlnorm::skip_pattern(&format!("{CLIP}?token=old")).unwrap();
+    let r = llm_rig(RepairMode::Hold, MockModel::new(vec![ptr_answer("/video/src")]));
+    let prior = Prior { skips: vec![skip], ..Default::default() };
+    assert!(matches!(go(&r, Some(llm_page("a")), &prior).await, LadderResult::NothingVerified));
+    assert_eq!((mock(&r).asks(), r.fake.probes()), (1, 0), "skipped: the model was asked, the gate never saw it");
+    assert!(r.fake.downloads().is_empty());
+
+    // Control: another address's skip leaves the pointer alone.
+    let r = llm_rig(RepairMode::Hold, MockModel::new(vec![ptr_answer("/video/src")]));
+    held_once(&r);
+    let prior = Prior { skips: vec![omni_core::urlnorm::skip_pattern(CLIP99).unwrap()], ..Default::default() };
+    assert!(matches!(go(&r, Some(llm_page("a")), &prior).await, LadderResult::Held { .. }));
+    assert_eq!(r.fake.downloads()[0].0, CLIP);
 }
 
 // ---- acceptance (5): not resolvable ----
@@ -588,6 +607,58 @@ async fn a_recipe_that_reproduces_the_address_is_stored_for_the_site_and_linked_
     assert_eq!(r.repo.recipe_origin(stored[0].id).unwrap().as_deref(), Some("llm"));
     let method = r.repo.get_job(r.job.id).unwrap().unwrap().extraction_method.unwrap();
     assert_eq!(method, format!("repair:llm:{}", &scope[..8]), "the method names the reproduced recipe");
+}
+
+/// P10.13: the model's recipe merges into a player recipe with the same steps. The attempt must
+/// name that player recipe by its own hash, so MCR's «Λάθος βίντεο» suspends and bars it.
+#[tokio::test]
+async fn a_model_recipe_merged_into_a_player_recipe_is_judged_as_the_player_recipe() {
+    use omni_core::recipe_score::NewRecipe;
+    let answer = json!({"assessment": "resolvable", "candidates": [ptr_answer("/video/src")["candidates"][0].clone()], "recipe": good_recipe().to_string()});
+    let r = llm_rig(RepairMode::Hold, MockModel::new(vec![answer]));
+    held_once(&r);
+    let rec = Recipe::from_json(&good_recipe().to_string()).unwrap();
+    let steps = recipe::steps_hash(&rec);
+    let player = NewRecipe {
+        scope_kind: ScopeKind::Player,
+        scope_key: "hlsjs".into(),
+        family: Some("hlsjs".into()),
+        recipe_json: rec.canonical_json(),
+        hash: "player-hash-for-test".into(),
+        steps_hash: steps.clone(),
+        dsl_version: rec.dsl_version,
+        origin: Origin::Admin,
+    };
+    let player_id = match r.repo.insert_recipe(&player, Utc::now()).unwrap() {
+        InsertOutcome::Inserted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    // The player recipe is suspended on this site (failing), so the recipe rung skips it and the
+    // model rung finds the video; the model's recipe then merges into it. No bar is written yet.
+    for _ in 0..3 {
+        r.repo.recipe_event(player_id, DOMAIN, Event::NoCandidate, Utc::now()).unwrap();
+    }
+    assert!(!r.repo.recipe_steps_barred(&steps, DOMAIN).unwrap());
+    let mut snap = llm_page("Invented story");
+    snap.html = Some(r#"<html><body><script src="/static/hls.js"></script><p>no video here</p></body></html>"#.into());
+    let res = go(&r, Some(snap), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!((at.recipe_id, at.recipe_hash.as_deref()), (Some(player_id), Some("player-hash-for-test")), "the player recipe, with its own hash");
+
+    // Park it and let MCR call it the wrong video.
+    assert!(r.repo.hold_output(r.job.id, OWNER, "temp/held/x/clip.mxf", 3, &"ab".repeat(32), Some(9.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
+    assert!(crate::finish_held(&r.repo, r.job.id, OWNER).unwrap());
+    assert!(r.repo.reject_held(r.job.id, "wrong_video", "no", "desk").unwrap());
+    assert!(r.repo.recipe_steps_barred(&steps, DOMAIN).unwrap(), "the steps are barred on the domain");
+    let offered = r.repo.recipes_for_site(DOMAIN, Some("hlsjs"), Utc::now()).unwrap();
+    assert!(offered.iter().all(|x| x.id != player_id), "the player recipe is suspended there");
+    let rejections: i64 = {
+        // The Rejection landed on the player recipe's row (a missing event would leave it at 0).
+        let row = r.repo.recipe_event(player_id, DOMAIN, Event::NoCandidate, Utc::now()).unwrap();
+        row.rejections
+    };
+    assert_eq!(rejections, 1);
 }
 
 #[tokio::test]

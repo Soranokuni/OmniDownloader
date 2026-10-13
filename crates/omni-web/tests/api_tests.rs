@@ -36,9 +36,14 @@ struct App {
 
 impl App {
     fn new() -> Result<Self> {
+        Self::with_repair_mode(omni_core::config::RepairMode::Hold)
+    }
+
+    fn with_repair_mode(mode: omni_core::config::RepairMode) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        config.repair.mode = mode;
 
         let mcr_id = repo.create_user(
             "desk@station.gr",
@@ -1344,5 +1349,105 @@ async fn a_held_job_without_a_repair_attempt_has_a_null_repair() -> Result<()> {
     assert_eq!(page["total"], 1, "{page}");
     assert!(page["jobs"][0]["repair"].is_null(), "{page}");
     assert!(page["jobs"][0]["held"].is_object());
+    Ok(())
+}
+
+// ---- «Επόμενη επιλογή» (P10.13) ----
+
+/// A held job (see `held_job`) whose repair attempt verified `urls` and held `urls[index]`.
+fn held_with_candidates(app: &App, n: u32, urls: &[&str], index: usize) -> Result<i64> {
+    let id = held_job(app, n)?;
+    let now = chrono::Utc::now();
+    let attempt = app.repo.start_attempt(id, "hold", now)?;
+    let list: Vec<serde_json::Value> =
+        urls.iter().map(|u| json!({"url": u, "origin": "recipe:abcd1234", "duration_secs": 60.0, "checks": []})).collect();
+    let end = omni_core::repository::AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        domain: Some("example.gr".into()),
+        candidates_json: Some(serde_json::Value::Array(list).to_string()),
+        held_url: Some(urls[index].to_string()),
+        next_index: index as i64,
+        ..Default::default()
+    };
+    app.repo.finish_attempt(attempt, &end, now)?;
+    Ok(id)
+}
+
+const NEXT_URLS: [&str; 3] = [
+    "https://cdn.news.example.gr/a.mp4",
+    "https://cdn.news.example.gr/b.mp4",
+    "https://cdn.news.example.gr/c.mp4",
+];
+
+#[tokio::test]
+async fn the_repair_card_says_how_many_next_choices_are_left() -> Result<()> {
+    let app = App::new()?;
+    held_with_candidates(&app, 1, &NEXT_URLS, 0)?;
+    let (_, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(page["jobs"][0]["repair"]["next_left"], 2, "{page}");
+    let last = held_with_candidates(&app, 2, &NEXT_URLS, 2)?;
+    let (_, one) = app.send("GET", &format!("/api/jobs/{last}"), &app.mcr_token, None).await?;
+    assert_eq!(one["job"]["repair"]["next_left"], 0, "the last candidate has nothing after it: {one}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_choice_needs_the_held_file_and_a_verified_candidate_after_it() -> Result<()> {
+    let app = App::new()?;
+    let id = held_with_candidates(&app, 1, &NEXT_URLS, 0)?;
+    let last = held_with_candidates(&app, 2, &NEXT_URLS, 2)?;
+    let held_dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    let post = |sha: String| {
+        let uri = format!("/api/jobs/{id}/next");
+        let token = app.mcr_token.clone();
+        let app = &app;
+        async move { app.send("POST", &uri, &token, Some(json!({ "sha256": sha }))).await }
+    };
+
+    // A malformed or other file's SHA: nothing changes.
+    let (status, _) = post("xyz".into()).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, json) = post("0".repeat(64)).await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NO_NEXT")), "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+    assert!(held_dir.exists());
+
+    let (status, json) = post(HELD_SHA.to_uppercase()).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["index"], 1);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
+    assert!(!held_dir.exists(), "the rejected file goes now");
+    let attempt = app.repo.latest_attempt(id)?.unwrap();
+    assert_eq!((attempt.rung.as_deref(), attempt.outcome.as_deref(), attempt.next_index), (Some("next"), None, 1));
+    // The job is not held any more: a second press is a 409.
+    let (status, _) = post(HELD_SHA.to_string()).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Nothing left after the last candidate: 409, the video stays held.
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{last}/next"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA })))
+        .await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NO_NEXT")), "{json}");
+    assert_eq!(app.repo.get_job(last)?.unwrap().status, JobStatus::AwaitingApproval);
+    assert!(app.repo.waiting_held(last)?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_choice_is_only_for_hold_mode() -> Result<()> {
+    for mode in [omni_core::config::RepairMode::Off, omni_core::config::RepairMode::Shadow] {
+        let app = App::with_repair_mode(mode)?;
+        let id = held_with_candidates(&app, 1, &NEXT_URLS, 0)?;
+        let (_, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+        assert_eq!(page["jobs"][0]["repair"]["next_left"], 0, "{mode:?}: the button is hidden: {page}");
+        let (status, json) = app
+            .send("POST", &format!("/api/jobs/{id}/next"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA })))
+            .await?;
+        assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("REPAIR_OFF")), "{mode:?}: {json}");
+        assert!(json["error"]["message"].as_str().unwrap().contains("απενεργοποιημένη"));
+        assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval, "{mode:?}: nothing changed");
+        assert!(app.repo.waiting_held(id)?.is_some());
+    }
     Ok(())
 }

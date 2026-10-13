@@ -339,6 +339,11 @@ const MATRIX: &[Row] = &[
     ),
     (
         "POST",
+        "/api/jobs/1/next",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
         "/api/jobs/1/redownload",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),
@@ -983,7 +988,7 @@ async fn w07_state_changing_requests_need_the_panel_marker_and_a_same_origin() -
 #[tokio::test]
 async fn approving_or_rejecting_a_held_video_needs_the_csrf_marker() -> Result<()> {
     let h = Harness::new(true)?;
-    for uri in ["/api/jobs/1/approve", "/api/jobs/1/reject"] {
+    for uri in ["/api/jobs/1/approve", "/api/jobs/1/reject", "/api/jobs/1/next"] {
         let send = |headers: &[(&str, &str)]| {
             let mut builder = Request::builder()
                 .method("POST")

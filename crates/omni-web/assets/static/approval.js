@@ -159,7 +159,10 @@ function buildCard(job, ctx) {
     return true;
   };
   const failedAction = (e) => {
-    if (e.status === 409 || e.code === 'NOT_HELD') {
+    if (e.code === 'NO_NEXT') {
+      toast(e.message, 'bad');
+      ctx.refresh();
+    } else if (e.status === 409 || e.code === 'NOT_HELD') {
       toast('Το βίντεο άλλαξε ή δεν περιμένει πια έγκριση', 'bad');
       ctx.refresh();
     } else {
@@ -183,6 +186,19 @@ function buildCard(job, ctx) {
     } catch (e) { failedAction(e); return false; }
   };
   const wrong = mk('btn btn-danger', 'Λάθος βίντεο', guarded(() => reject('wrong_video')));
+  // «Επόμενη επιλογή»: only while the repair verified another video after this
+  // one. The held one counts as wrong; the next is downloaded and held again.
+  const repair = job.repair || null;
+  const nextLeft = repair && Number(repair.next_left) > 0 ? Number(repair.next_left) : 0;
+  const next = nextLeft > 0
+    ? mk('btn', `Επόμενη επιλογή (${nextLeft})`, guarded(async () => {
+      if (!confirm('Το τρέχον βίντεο απορρίπτεται ως λάθος και κατεβαίνει η επόμενη επιλογή.')) return false;
+      try {
+        await api(`/api/jobs/${job.id}/next`, { method: 'POST', body: { sha256: held.sha256 } });
+        return done('Η επόμενη επιλογή κατεβαίνει.', 'Επόμενη επιλογή…');
+      } catch (e) { failedAction(e); return false; }
+    }))
+    : null;
 
   // «Απόρριψη…» opens a small inline form instead of a dialog.
   const reason = el('select', { 'aria-label': 'Λόγος απόρριψης' },
@@ -198,7 +214,6 @@ function buildCard(job, ctx) {
   // about the outcome, so this one is re-enabled afterwards (it refreshes).
   const markDone = mk('btn', 'Το έβαλα στο Dalet', guarded(async () => { await ctx.markDone(job); return false; }));
   const history = ctx.historyPanel(job);
-  const repair = job.repair || null;
   const media = mediaNode(job, held);
   const expiry = el('span', { class: 'note' }, expiryText(held.expires_at));
 
@@ -220,7 +235,7 @@ function buildCard(job, ctx) {
       ...pvFacts(job, held, repair),
       href ? el('a', { href, target: '_blank', rel: 'noopener noreferrer', title: job.url }, 'Άνοιγμα σελίδας') : null,
       expiry),
-    el('div', { class: 'row' }, approve, wrong, toggle, markDone, history[0], status),
+    el('div', { class: 'row' }, approve, wrong, next, toggle, markDone, history[0], status),
     form,
     history[1]);
   return { node, job, expiry };
