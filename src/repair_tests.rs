@@ -52,6 +52,8 @@ impl Fetcher for NoFetch {
 /// Everything outside the ladder, scripted.
 struct Fake {
     diagnose_snap: Mutex<Option<PageSnapshot>>,
+    /// Answers of the next diagnose calls, first; then `diagnose_snap` for every later one.
+    diagnose_script: Mutex<VecDeque<Option<PageSnapshot>>>,
     diagnose_calls: AtomicUsize,
     diagnose_hangs: bool,
     probe: Mutex<HashMap<String, std::result::Result<ProbeInfo, String>>>,
@@ -149,6 +151,7 @@ impl Fake {
     fn new() -> Self {
         Self {
             diagnose_snap: Mutex::new(None),
+            diagnose_script: Mutex::new(VecDeque::new()),
             diagnose_calls: AtomicUsize::new(0),
             diagnose_hangs: false,
             probe: Mutex::new(HashMap::new()),
@@ -205,6 +208,9 @@ impl Env for Fake {
         self.diagnose_calls.fetch_add(1, Ordering::SeqCst);
         if self.diagnose_hangs {
             tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        if let Some(next) = self.diagnose_script.lock().unwrap().pop_front() {
+            return next;
         }
         self.diagnose_snap.lock().unwrap().clone()
     }
@@ -1713,6 +1719,9 @@ async fn under_fifty_seconds_left_no_live_load_is_requested() {
 
 #[path = "repair_llm_tests.rs"]
 mod llm;
+
+#[path = "repair_probe_tests.rs"]
+mod probe;
 
 // ---- P10.13: learning from MCR, «Επόμενη επιλογή» ----
 

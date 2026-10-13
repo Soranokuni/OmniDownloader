@@ -235,7 +235,9 @@ async fn a_picture_declaring_an_enormous_canvas_is_refused_quickly() {
     let started = Instant::now();
     let ev = run(&ffm, dir.path(), &[URL], &Fake::new(vec![Reply::Bytes(body)]), 4.0).await;
     assert_eq!(ev, ImageEvidence::default());
-    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    // What proves the refusal is the missing picture; the bound only catches
+    // a decode that runs on and on (it was 5 s and failed under a loaded gate).
+    assert!(started.elapsed() < Duration::from_secs(30), "took {:?}", started.elapsed());
     assert!(!dir.path().join(ARTICLE_FILE).exists());
     assert!(!dir.path().join("_card_work").exists(), "the work directory is removed");
 }
@@ -291,8 +293,10 @@ async fn when_the_comparison_runs_out_of_time_the_complete_picture_stays_without
     let urls = vec![URL.to_string()];
     let src = Fake::new(vec![Reply::Bytes(body)]);
     let started = Instant::now();
-    let ev = card_evidence_capped(&shim, dir.path(), &urls, &facts(), 4.0, &src, Duration::from_secs(6)).await;
-    assert!(started.elapsed() < Duration::from_secs(12), "took {:?}", started.elapsed());
+    // 20 s: the picture phase must finish inside the cap even on a loaded
+    // machine (6 s failed during a full gate); the shim's comparison hangs 60 s.
+    let ev = card_evidence_capped(&shim, dir.path(), &urls, &facts(), 4.0, &src, Duration::from_secs(20)).await;
+    assert!(started.elapsed() < Duration::from_secs(40), "took {:?}", started.elapsed());
     assert_eq!(ev.host.as_deref(), Some("img.news.example"));
     assert_eq!((ev.distance, ev.frame_secs), (None, None));
     assert!(dir.path().join(ARTICLE_FILE).is_file(), "the finished picture is kept");

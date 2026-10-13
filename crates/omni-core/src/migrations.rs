@@ -651,6 +651,25 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        24,
+        // What the overnight self-heal found per broken site (P10.14): one row
+        // per run, a host and a recipe hash only (no page address). Kept 30
+        // days, at most 500 rows; MCR's morning line and the admin card read it.
+        r#"
+        CREATE TABLE IF NOT EXISTS selfheal_reports (
+            id          INTEGER PRIMARY KEY,
+            domain      TEXT NOT NULL,
+            at          TEXT NOT NULL,
+            outcome     TEXT NOT NULL,
+            recipe_hash TEXT,
+            origin      TEXT,
+            pages       INTEGER NOT NULL DEFAULT 0,
+            detail      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_selfheal_reports_at ON selfheal_reports(at);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -1151,6 +1170,39 @@ mod tests {
             conn.execute("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'y')", []).is_err(),
             "one row per domain and pattern"
         );
+    }
+
+    /// A database at version 23 keeps its rows when 24 is applied; the self-heal
+    /// report table appears empty, with a null-able recipe hash and origin.
+    #[test]
+    fn migration_24_adds_the_selfheal_reports_table_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 23) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 23);
+        conn.execute_batch("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'x');")
+            .unwrap();
+        assert!(columns_of(&conn, "selfheal_reports").is_empty(), "the table exists before 24");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 24);
+        let have = columns_of(&conn, "selfheal_reports");
+        for c in ["id", "domain", "at", "outcome", "recipe_hash", "origin", "pages", "detail"] {
+            assert!(have.iter().any(|x| x == c), "selfheal_reports.{c} missing: {have:?}");
+        }
+        let skips: i64 = conn.query_row("SELECT COUNT(*) FROM repair_skips", [], |r| r.get(0)).unwrap();
+        assert_eq!(skips, 1, "existing rows must survive");
+        conn.execute("INSERT INTO selfheal_reports (domain, at, outcome) VALUES ('a.example', 'x', 'nothing')", []).unwrap();
+        let pages: i64 = conn.query_row("SELECT pages FROM selfheal_reports", [], |r| r.get(0)).unwrap();
+        assert_eq!(pages, 0, "pages defaults to 0");
     }
 
     #[test]

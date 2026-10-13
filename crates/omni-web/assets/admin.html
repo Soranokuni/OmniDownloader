@@ -80,6 +80,21 @@
   </div>
 
   <div class="stack" style="grid-column:span 2">
+    <section class="card stack" id="selfheal">
+      <h2 class="card-title" style="border:none;margin:0;padding:0">Self-heal</h2>
+      <p class="note">
+        When a news site's recent articles stop giving video, the system tries its known
+        ways of finding the video on those articles overnight (nothing is downloaded).
+        A way that works again is used for the next job, which still waits for MCR's
+        approval. The last 30 days:
+      </p>
+      <div class="card flush">
+        <table>
+          <thead><tr><th>Site</th><th>When</th><th>Result</th><th>Method</th><th class="right">Pages</th></tr></thead>
+          <tbody id="selfheal-body"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
     <section class="card stack" id="selfcheck">
       <div class="section-head">
         <h2 class="card-title" style="border:none;margin:0;padding:0">Self-check</h2>
@@ -452,6 +467,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=11"></script>
+<script type="module" src="/static/admin.js?v=12"></script>
 </body>
 </html>

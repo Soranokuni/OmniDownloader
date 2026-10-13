@@ -343,6 +343,28 @@ function checkLine(title, check) {
   );
 }
 
+const HEAL_RESULT = {
+  found: 'Found a way',
+  nothing: 'Nothing found',
+  skipped: 'Not tried',
+  outage: 'Our own outage',
+};
+
+// The overnight self-heal runs (P10.14): a host, the time, what came of it.
+function renderSelfheal(rows) {
+  if (rows.length === 0) {
+    render('selfheal-body', el('tr', {}, el('td', { colspan: '5', class: 'empty' }, 'No site needed it in the last 30 days.')));
+    return;
+  }
+  render('selfheal-body', rows.map((r) => el('tr', {},
+    el('td', { class: 'mono' }, r.domain),
+    el('td', {}, fmtTime(r.at)),
+    el('td', {}, el('span', { class: `badge ${r.outcome === 'found' ? 'ok' : r.outcome === 'nothing' ? 'warn' : ''}` }, HEAL_RESULT[r.outcome] || r.outcome)),
+    el('td', { class: 'mono' }, r.origin || ''),
+    el('td', { class: 'right' }, r.outcome === 'found' ? String(r.pages ?? 0) : ''),
+  )));
+}
+
 async function loadSelfcheck() {
   let data;
   try {
@@ -355,6 +377,7 @@ async function loadSelfcheck() {
     checkLine('Browser (for news articles)', data.browser),
     checkLine('Links', data.summary),
   );
+  renderSelfheal(data.selfheal || []);
   const links = data.links || [];
   if (links.length === 0) {
     render('selfcheck-body', el('tr', {}, el('td', { colspan: '5', class: 'empty' }, 'No links. Add one below.')));

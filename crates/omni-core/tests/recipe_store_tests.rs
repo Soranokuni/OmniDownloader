@@ -1429,3 +1429,77 @@ fn a_rejected_tombstone_of_a_site_recipe_bars_its_steps_without_any_event() -> R
     assert_eq!(r.insert_recipe(&other_family, now)?, InsertOutcome::Refused("rejected".into()));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// P10.14: the recipes the overnight self-heal tries on a site's canary pages.
+// ---------------------------------------------------------------------------
+
+fn canary_offered(r: &Repository, domain: &str, family: Option<&str>, now: DateTime<Utc>) -> Vec<i64> {
+    r.recipes_for_canary(domain, family, now).unwrap().iter().map(|x| x.id).collect()
+}
+
+#[test]
+fn recipes_for_canary_adds_only_failing_suspensions() -> Result<()> {
+    let dir = TempDir::new()?;
+    let r = repo(&dir);
+    let now = t0() + days(1);
+    let s_fine = id_of(r.insert_recipe(&site("a.example", 1, Origin::Llm), t0())?);
+    let s_failing = id_of(r.insert_recipe(&site("a.example", 2, Origin::Llm), t0())?);
+    let s_rejected = id_of(r.insert_recipe(&site("a.example", 3, Origin::Llm), t0())?);
+    let s_barred = id_of(r.insert_recipe(&site("a.example", 4, Origin::Llm), t0())?);
+    let p_failing = id_of(r.insert_recipe(&recipe(ScopeKind::Player, "jwplayer", Some("jwplayer"), 5, Origin::Llm), t0())?);
+    r.sync_shipped(&[shipped("g_failing", 1)], t0())?;
+    let g_failing = r.recipes_for_site("zzz.example", None, now)?.iter().find(|x| x.scope_key == "g_failing").unwrap().id;
+
+    for id in [s_failing, p_failing, g_failing] {
+        for _ in 0..3 {
+            r.recipe_event(id, "a.example", Event::NoCandidate, t0())?;
+        }
+    }
+    r.recipe_event(s_rejected, "a.example", Event::Rejection, t0())?;
+    // MCR rejected the steps of s_barred on this domain through another recipe carrying them.
+    r.recipe_event(s_barred, "a.example", Event::Approval, t0())?;
+    let carrier = id_of(r.insert_recipe(&site("a.example", 4, Origin::Admin), t0())?);
+    assert_eq!(carrier, s_barred, "same steps merge into one recipe");
+    r.recipe_event(s_barred, "a.example", Event::Rejection, t0())?;
+    assert!(r.recipe_steps_barred(&sha(&json(4)), "a.example")?, "the bar is set");
+
+    // A rejection whose bar has expired: the recipe stays suspended as rejected, and is still never tried.
+    let s_expired = id_of(r.insert_recipe(&recipe(ScopeKind::Player, "jwplayer", Some("jwplayer"), 6, Origin::Llm), t0())?);
+    r.recipe_event(s_expired, "a.example", Event::Rejection, t0())?;
+    assert!(r.recipe_steps_barred(&sha(&json(6)), "a.example")?, "a rejection bars its steps");
+    raw(&dir).execute("DELETE FROM recipe_bars WHERE steps_hash = ?", params![sha(&json(6))])?;
+    assert!(!r.recipe_steps_barred(&sha(&json(6)), "a.example")?);
+
+    // The job path offers none of the five; the self-heal adds the ones suspended as failing.
+    let normal = offered(&r, "a.example", Some("jwplayer"), now);
+    assert!(![s_failing, s_rejected, s_barred, p_failing, g_failing].iter().any(|i| normal.contains(i)), "{normal:?}");
+    assert!(normal.contains(&s_fine));
+    let canary = canary_offered(&r, "a.example", Some("jwplayer"), now);
+    assert!(canary.contains(&s_fine));
+    assert!(canary.contains(&s_failing), "a recipe suspended as failing is tried again");
+    assert!(canary.contains(&p_failing), "a player recipe suspended as failing is tried again");
+    assert!(canary.contains(&g_failing), "a shipped recipe suspended as failing is tried again too");
+    assert!(!canary.contains(&s_rejected), "a recipe MCR rejected is never tried");
+    assert!(!canary.contains(&s_barred), "barred steps are never tried");
+    assert!(!canary.contains(&s_expired), "a rejected suspension is never lifted into the canary list, bar or no bar");
+    Ok(())
+}
+
+#[test]
+fn two_canary_passes_lift_a_failing_suspension_and_the_job_path_offers_it_again() -> Result<()> {
+    let dir = TempDir::new()?;
+    let r = repo(&dir);
+    let id = id_of(r.insert_recipe(&site("a.example", 1, Origin::Llm), t0())?);
+    for _ in 0..3 {
+        r.recipe_event(id, "a.example", Event::NoCandidate, t0())?;
+    }
+    assert!(!offered(&r, "a.example", None, t0() + days(1)).contains(&id), "suspended");
+    r.recipe_event(id, "a.example", Event::CanaryPass, t0() + days(1))?;
+    assert!(!offered(&r, "a.example", None, t0() + days(1)).contains(&id), "one pass is not enough");
+    r.recipe_event(id, "a.example", Event::CanaryPass, t0() + days(1))?;
+    let now = t0() + days(1);
+    assert!(offered(&r, "a.example", None, now).contains(&id), "two passes lift it");
+    assert_eq!(r.recipes_for_site("a.example", None, now)?.iter().find(|x| x.id == id).unwrap().site_state, Some(SiteState::Active));
+    Ok(())
+}

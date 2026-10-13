@@ -5,14 +5,14 @@
 use super::*;
 use serde_json::{json, Value};
 
-const CLIP: &str = "https://cdn.news.example.gr/play/clip42";
+pub(super) const CLIP: &str = "https://cdn.news.example.gr/play/clip42";
 /// The page's own network entry N1 (the only one), a host the page used.
-const OTHER: &str = "https://cdn.news.example.gr/play/other77";
+pub(super) const OTHER: &str = "https://cdn.news.example.gr/play/other77";
 const CLIP99: &str = "https://cdn.news.example.gr/play/clip99";
 
 /// A page whose only video address sits in a JSON script window (S1), without a
 /// `.mp4`/`.m3u8` ending, so no shipped recipe finds it.
-fn llm_page(title: &str) -> PageSnapshot {
+pub(super) fn llm_page(title: &str) -> PageSnapshot {
     let mut s = page("<html><body><p>no video here</p></body></html>");
     s.title = Some(title.to_string());
     s.network.push(NetworkEntry { url: OTHER.into(), method: Some("GET".into()), status: Some(200), mime: None, resource_type: None, frame_id: None });
@@ -20,34 +20,34 @@ fn llm_page(title: &str) -> PageSnapshot {
     s
 }
 
-fn ptr_answer(ptr: &str) -> Value {
+pub(super) fn ptr_answer(ptr: &str) -> Value {
     json!({"assessment": "resolvable", "candidates": [{"from": "S1", "extract": {"kind": "ptr", "value": ptr}, "transforms": ["unescape"]}]})
 }
 
-fn llm_on() -> LlmCfg {
+pub(super) fn llm_on() -> LlmCfg {
     LlmCfg { enabled: true, model: Some("test-model".into()), timeout: Duration::from_secs(5), max_calls_per_day: 15 }
 }
 
-fn llm_rig_with(mode: RepairMode, budget: Duration, mut fake: Fake, model: MockModel) -> Rig {
+pub(super) fn llm_rig_with(mode: RepairMode, budget: Duration, mut fake: Fake, model: MockModel) -> Rig {
     fake.model = Some(model);
     let mut r = rig_with(mode, budget, fake);
     r.ctx.cfg.llm = llm_on();
     r
 }
 
-fn llm_rig(mode: RepairMode, model: MockModel) -> Rig {
+pub(super) fn llm_rig(mode: RepairMode, model: MockModel) -> Rig {
     llm_rig_with(mode, Duration::from_secs(60), Fake::new(), model)
 }
 
-fn mock(r: &Rig) -> &MockModel {
+pub(super) fn mock(r: &Rig) -> &MockModel {
     r.fake.model.as_ref().unwrap()
 }
 
-fn held_once(r: &Rig) {
+pub(super) fn held_once(r: &Rig) {
     r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
 }
 
-fn today() -> String {
+pub(super) fn today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
@@ -63,12 +63,12 @@ async fn run_on(ctx: &RepairCtx, job: &Job, url: &str, snap: PageSnapshot) -> La
     run(ctx, job, OWNER, url, Some(snap), &Prior::default(), &CancellationToken::new()).await
 }
 
-fn llm_recipes(r: &Rig) -> Vec<omni_core::recipe_score::RankedRecipe> {
+pub(super) fn llm_recipes(r: &Rig) -> Vec<omni_core::recipe_score::RankedRecipe> {
     r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap().into_iter().filter(|x| x.origin == Origin::Llm).collect()
 }
 
 /// A recipe that reads the script's `src` and gives back exactly `CLIP`.
-fn good_recipe() -> Value {
+pub(super) fn good_recipe() -> Value {
     json!({"dsl_version": 1, "steps": [
         {"op": "re", "re": r#""src":"(https:[^"]+)""#},
         {"op": "unescape", "from": 0},
@@ -77,7 +77,7 @@ fn good_recipe() -> Value {
 }
 
 /// A valid recipe that finds nothing on the page.
-fn wrong_recipe() -> Value {
+pub(super) fn wrong_recipe() -> Value {
     json!({"dsl_version": 1, "steps": [
         {"op": "re", "re": r#""nothing":"([^"]+)""#},
         {"op": "media", "from": 0, "referer": "page"}
@@ -455,7 +455,7 @@ async fn contact_details_are_redacted_for_an_online_endpoint_and_not_for_a_local
 
 // ---- the click ----
 
-fn click_answer() -> Value {
+pub(super) fn click_answer() -> Value {
     json!({"assessment": "resolvable", "candidates": [], "action": {"click": "button.play"}})
 }
 

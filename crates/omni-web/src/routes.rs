@@ -1818,10 +1818,27 @@ pub async fn api_admin_selfcheck(RequireAdmin(_): RequireAdmin, State(state): St
             })
         })
         .collect();
+    // The overnight self-heal runs of the last 30 days (plan P10.14).
+    let selfheal: Vec<serde_json::Value> = state
+        .repo
+        .selfheal_since(chrono::Utc::now() - chrono::Duration::days(omni_core::repository::SELFHEAL_KEEP_DAYS))
+        .map_err(internal_error("Could not read the self-heal reports."))?
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "domain": r.domain,
+                "at": r.at,
+                "outcome": r.outcome,
+                "origin": r.origin,
+                "pages": r.pages,
+            })
+        })
+        .collect();
     let checks = state.health.all();
     Ok(Json(serde_json::json!({
         "links": links,
         "canaries": canaries,
+        "selfheal": selfheal,
         "summary": checks.get(omni_core::health::checks::SELFCHECK),
         "browser": checks.get(omni_core::health::checks::BROWSER),
     })))
@@ -2024,11 +2041,20 @@ pub async fn api_system_status(
             .collect::<Vec<_>>()
     });
 
+    // What last night's self-heal found (P10.14); `null` when the query failed.
+    // A host, the time, the outcome and the kind of recipe: never a page address.
+    let selfheal = state.repo.selfheal_since(chrono::Utc::now() - chrono::Duration::hours(24)).ok().map(|rows| {
+        rows.into_iter()
+            .map(|r| serde_json::json!({ "domain": r.domain, "at": r.at, "outcome": r.outcome, "origin": r.origin }))
+            .collect::<Vec<_>>()
+    });
+
     Json(serde_json::json!({
         "status": state.health.overall().as_str(),
         "checks": checks,
         "queue": queue,
         "sites": sites,
+        "selfheal": selfheal,
         "disk": {
             "watchfolder": disk_of(&watchfolder),
             "temp": disk_of(&temp_path),

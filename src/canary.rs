@@ -10,8 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -38,6 +38,10 @@ const TRIGGER_GAP: Duration = Duration::from_secs(2 * 3600);
 const VERSION_LOOKUP: Duration = Duration::from_secs(60);
 /// This many sites all failing in one pass looks like our outage, not theirs.
 const OUTAGE_SITES: usize = 3;
+/// All daytime heals of one local day together may make this many model calls.
+const DAY_HEAL_LLM_CALLS: u32 = 3;
+/// A site's self-heal may take this many times `repair.budget_secs` (one budget per canary page).
+const HEAL_BUDGET_FACTOR: u32 = 3;
 
 // ------------------------------------------------------------------ pool
 
@@ -366,6 +370,14 @@ pub struct CanaryEnv {
     limiter: Mutex<TriggerLimiter>,
     /// Daytime checks started (a test hook as much as a statistic).
     spawned: AtomicUsize,
+    /// The repair ladder's world, set once at start-up: the self-heal (P10.14) needs it.
+    heal: OnceLock<Arc<crate::repair::RepairCtx>>,
+    /// At most one daytime self-heal per site per [`TRIGGER_GAP`].
+    heal_limiter: Mutex<TriggerLimiter>,
+    /// The last nightly pass looked like our own outage.
+    outage: AtomicBool,
+    /// Model calls the daytime heals made on this local day: (date, calls). In memory only.
+    day_llm: Mutex<(String, u32)>,
 }
 
 impl CanaryEnv {
@@ -378,7 +390,48 @@ impl CanaryEnv {
             run_lock: Arc::new(tokio::sync::Mutex::new(())),
             limiter: Mutex::new(TriggerLimiter::default()),
             spawned: AtomicUsize::new(0),
+            heal: OnceLock::new(),
+            heal_limiter: Mutex::new(TriggerLimiter::default()),
+            outage: AtomicBool::new(false),
+            day_llm: Mutex::new((String::new(), 0)),
         }
+    }
+
+    /// Calls of the daytime heals still allowed today (the count restarts with the local date).
+    fn day_llm_left(&self) -> u32 {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let mut g = self.day_llm.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0 != today {
+            *g = (today, 0);
+        }
+        DAY_HEAL_LLM_CALLS.saturating_sub(g.1)
+    }
+
+    fn add_day_llm(&self, n: u32) {
+        self.day_llm.lock().unwrap_or_else(|e| e.into_inner()).1 += n;
+    }
+
+    /// Test hook: model calls the daytime heals made today.
+    #[cfg(test)]
+    pub(crate) fn day_llm_used(&self) -> u32 {
+        DAY_HEAL_LLM_CALLS - self.day_llm_left()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_day_llm_used_for_tests(&self, n: u32) {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        *self.day_llm.lock().unwrap() = (today, n);
+    }
+
+    /// Test hook: pretend the last nightly pass looked like our own outage.
+    #[cfg(test)]
+    pub(crate) fn mark_outage(&self, on: bool) {
+        self.outage.store(on, Ordering::SeqCst);
+    }
+
+    /// Give the self-heal the repair ladder's world. Once; later calls change nothing.
+    pub fn set_heal(&self, ctx: Arc<crate::repair::RepairCtx>) {
+        let _ = self.heal.set(ctx);
     }
 
     /// Wait for any canary run to end and keep new ones out while held.
@@ -404,7 +457,13 @@ impl CanaryEnv {
             let _guard = guard;
             let probe = LiveProbe { ytdl: env.ytdl() };
             let check = check_domain(&env, &probe, &domain, Instant::now() + NIGHTLY_BUDGET).await;
-            settle(&env, &domain, &check, Utc::now()).await;
+            let broken = settle(&env, &domain, &check, Utc::now()).await;
+            // Confirmed broken in the daytime: try to find a way before a journalist's job needs it.
+            if broken {
+                if let Some(ctx) = env.heal.get() {
+                    heal_by_day(&env, ctx, &domain).await;
+                }
+            }
         });
     }
 
@@ -441,10 +500,13 @@ async fn check_domain(env: &CanaryEnv, probe: &impl SiteProbe, domain: &str, dea
 
 /// Store what a check means; when the site just turned broken, say whether a
 /// newer yt-dlp is waiting for 03:00.
-async fn settle(env: &CanaryEnv, domain: &str, check: &SiteCheck, checked_at: DateTime<Utc>) {
+/// Returns whether the site was just confirmed broken.
+async fn settle(env: &CanaryEnv, domain: &str, check: &SiteCheck, checked_at: DateTime<Utc>) -> bool {
     if matches!(apply_check(&env.repo, &env.health, domain, check, checked_at), Some((_, SiteState::Broken))) {
         announce_newer_ytdl(env).await;
+        return true;
     }
+    false
 }
 
 /// A site is broken: is there a newer yt-dlp? Only said, never installed
@@ -492,7 +554,9 @@ async fn nightly_with(env: &CanaryEnv, probe: &impl SiteProbe) -> (usize, usize)
     }
     let checked = results.len();
     let all: Vec<&SiteCheck> = results.iter().map(|(_, c, _)| c).collect();
-    if outage_suspected(&all) {
+    let outage = outage_suspected(&all);
+    env.outage.store(outage, Ordering::SeqCst);
+    if outage {
         warn!("Canary: all {checked} sites failed; treated as an outage on our side, no site changed");
         let _ = env.repo.log_audit(
             "WARN",
@@ -506,6 +570,135 @@ async fn nightly_with(env: &CanaryEnv, probe: &impl SiteProbe) -> (usize, usize)
         info!("Canary: {checked} site(s) checked");
     }
     (checked, skipped)
+}
+
+// ------------------------------------------------------------- self-heal
+
+/// The live canary pages of a site, newest first.
+fn live_pages(repo: &Repository, domain: &str) -> Vec<String> {
+    repo.list_canaries_for(domain).unwrap_or_default().into_iter().filter(|c| !c.is_gone()).map(|c| c.url).collect()
+}
+
+/// Sites whose canaries say they are broken, the one with the most recent jobs first.
+fn broken_sites(repo: &Repository) -> Vec<String> {
+    let mut rows: Vec<_> = repo.list_sites_not_healthy().unwrap_or_default().into_iter().filter(|r| r.state == SiteState::Broken).collect();
+    rows.sort_by(|a, b| {
+        let at = |r: &site_health::SiteRow| r.last_ok_at.max(r.last_fail_at);
+        at(b).cmp(&at(a)).then_with(|| a.domain.cmp(&b.domain))
+    });
+    rows.into_iter().map(|r| r.domain).collect()
+}
+
+/// What one site's self-heal says, to the audit log: hosts and outcomes only.
+fn announce_heal(repo: &Repository, heal: &crate::repair::SiteHeal) {
+    if heal.found.is_some() {
+        info!("Self-heal: {}: a new way to find the video was found; the next job there is held for MCR", heal.domain);
+        let _ = repo.log_audit(
+            "INFO",
+            "SYSTEM",
+            &format!("Site {}: a new way to find its video was found on its canary pages; the next job there waits for MCR's approval", heal.domain),
+        );
+    }
+}
+
+/// After the nightly canaries settled: every site still broken gets its canary
+/// pages probed, one site at a time under the canary lock (never while the
+/// yt-dlp updater holds it), within the nightly budget and three repair budgets
+/// per site. Nothing runs with repair off, nor after a pass that looked like our
+/// own outage. Returns the number of sites probed.
+pub async fn heal_nightly(env: &CanaryEnv) -> usize {
+    match env.heal.get() {
+        Some(ctx) => heal_nightly_with(env, ctx).await,
+        None => 0,
+    }
+}
+
+pub(crate) async fn heal_nightly_with(env: &CanaryEnv, ctx: &crate::repair::RepairCtx) -> usize {
+    use crate::repair::{record_report, SiteHeal};
+    if ctx.cfg.mode == RepairMode::Off {
+        return 0;
+    }
+    let broken = broken_sites(&env.repo);
+    if broken.is_empty() {
+        return 0;
+    }
+    // A late start (the machine was off at the usual hour) must not run the browser
+    // beside live jobs; the next night tries again. No report: nothing was decided.
+    match env.repo.running_job_ids() {
+        Ok(ids) if ids.is_empty() => {}
+        Ok(_) => {
+            info!("Self-heal: skipped tonight, a job is running");
+            return 0;
+        }
+        Err(e) => {
+            warn!("Self-heal: the running jobs could not be counted, skipped: {e:#}");
+            return 0;
+        }
+    }
+    if env.outage.load(Ordering::SeqCst) {
+        warn!("Self-heal: the last canary pass looked like our own outage; no site is probed");
+        for domain in &broken {
+            let heal = SiteHeal { domain: domain.clone(), found: None, outcome: "outage", detail: "all canary sites failed at once".into() };
+            record_report(&env.repo, &heal, Utc::now());
+        }
+        return 0;
+    }
+    let deadline = Instant::now() + NIGHTLY_BUDGET;
+    let mut probed = 0;
+    // The run's model calls, shared by all its sites.
+    let llm_left = std::sync::atomic::AtomicU32::new(crate::repair::PROBE_LLM_CALLS);
+    for domain in &broken {
+        if Instant::now() >= deadline {
+            warn!("Self-heal: the nightly budget is used up; the remaining broken site(s) wait for tomorrow");
+            break;
+        }
+        let pages = live_pages(&env.repo, domain);
+        if pages.is_empty() {
+            continue;
+        }
+        let _guard = env.run_lock.lock().await;
+        let site_deadline = (Instant::now() + ctx.cfg.budget * HEAL_BUDGET_FACTOR).min(deadline);
+        let heal = crate::repair::probe_site_with(ctx, domain, &pages, Utc::now(), site_deadline, &llm_left).await;
+        record_report(&env.repo, &heal, Utc::now());
+        announce_heal(&env.repo, &heal);
+        probed += 1;
+    }
+    probed
+}
+
+/// A site was just confirmed broken in the daytime: probe its canary pages once,
+/// only with no job running and at most once per site per [`TRIGGER_GAP`]. The
+/// caller holds the canary lock.
+pub(crate) async fn heal_by_day(env: &CanaryEnv, ctx: &crate::repair::RepairCtx, domain: &str) -> bool {
+    use crate::repair::record_report;
+    if ctx.cfg.mode == RepairMode::Off {
+        return false;
+    }
+    match env.repo.running_job_ids() {
+        Ok(ids) if ids.is_empty() => {}
+        Ok(_) => {
+            info!("Self-heal: {domain} waits for tonight: a job is running");
+            return false;
+        }
+        Err(e) => {
+            warn!("Self-heal: the running jobs could not be counted: {e:#}");
+            return false;
+        }
+    }
+    let pages = live_pages(&env.repo, domain);
+    if pages.is_empty() || !env.heal_limiter.lock().unwrap_or_else(|e| e.into_inner()).allow(domain, Instant::now()) {
+        return false;
+    }
+    let deadline = Instant::now() + (ctx.cfg.budget * HEAL_BUDGET_FACTOR).min(NIGHTLY_BUDGET);
+    // One model call for this heal, and a few for the whole day: a daytime heal must not
+    // drain the day's cap across several broken sites.
+    let budget = crate::repair::DAY_PROBE_LLM_CALLS.min(env.day_llm_left());
+    let left = std::sync::atomic::AtomicU32::new(budget);
+    let heal = crate::repair::probe_site_with(ctx, domain, &pages, Utc::now(), deadline, &left).await;
+    env.add_day_llm(budget - left.load(Ordering::SeqCst).min(budget));
+    record_report(&env.repo, &heal, Utc::now());
+    announce_heal(&env.repo, &heal);
+    true
 }
 
 #[cfg(test)]
