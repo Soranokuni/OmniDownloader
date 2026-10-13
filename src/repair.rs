@@ -33,7 +33,7 @@ use omni_core::config::RepairMode;
 use omni_core::models::{Job, JobStage};
 use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, RankedRecipe, ScopeKind};
 use omni_email::llm::{LlmClient, Usage};
-use omni_core::repository::{AttemptEnd, Repository};
+use omni_core::repository::{AttemptEnd, RepairAttempt, Repository};
 
 /// The browser user agent the download of a repaired video presents.
 const BROWSER_UA: &str =
@@ -144,6 +144,16 @@ pub struct Prior {
     pub tried: Vec<Tried>,
     /// Addresses of videos MCR rejected for this job: never offered again.
     pub rejected_by_mcr: Vec<String>,
+    /// `urlnorm::skip_pattern`s MCR called a wrong video on this site (30 days):
+    /// a candidate with one is dropped before the gate, with no recipe event.
+    pub skips: Vec<String>,
+}
+
+impl Prior {
+    /// MCR called this address a wrong video on this site.
+    fn skipped(&self, url: &str) -> bool {
+        omni_core::urlnorm::skip_pattern(url).is_some_and(|p| self.skips.contains(&p))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -472,8 +482,21 @@ pub async fn after_failure(
     {
         return None;
     }
-    let prior = Prior { tried, rejected_by_mcr: rejected_before(&ctx.repo, job)? };
+    let prior = Prior { tried, rejected_by_mcr: rejected_before(&ctx.repo, job)?, skips: skips_of_site(&ctx.repo, job, orig_url)? };
     Some(run(ctx, job, owner, orig_url, snapshot.clone(), &prior, cancel).await)
+}
+
+/// The wrong-video patterns MCR set for this job's site. `None` when the store
+/// cannot say: better no repair than a wrong video offered again.
+fn skips_of_site(repo: &Repository, job: &Job, orig_url: &str) -> Option<Vec<String>> {
+    let Some(domain) = omni_core::urlnorm::registrable_domain(orig_url) else { return Some(Vec::new()) };
+    match repo.repair_skip_patterns(&domain, Utc::now()) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!("Job #{}: the repair skip list could not be read, no repair: {e:#}", job.id);
+            None
+        }
+    }
 }
 
 fn lost(ctx: &RepairCtx, job_id: i64, owner: &str, cancel: &CancellationToken) -> bool {
@@ -533,14 +556,21 @@ fn player_for(snap: &PageSnapshot, url: &str) -> (Option<usize>, Option<bool>) {
 }
 
 /// The verified candidates in rank order, with every check, as stored on the attempt.
-fn verified_json(list: &[Verified]) -> String {
+///
+/// An entry a stored recipe produced also carries that recipe's `recipe_id` and
+/// full `recipe_hash` (from `recipes`, address -> (id, hash)), so «Επόμενη
+/// επιλογή» can name the recipe behind a later candidate (P10.13).
+fn verified_json(list: &[Verified], recipes: &HashMap<String, (i64, String)>) -> String {
     let mut items: Vec<serde_json::Value> = list
         .iter()
         .map(|v| {
+            let link = recipes.get(&v.candidate.url);
             serde_json::json!({
                 "url": v.candidate.url,
                 "referer": v.candidate.referer,
                 "origin": v.candidate.origin,
+                "recipe_id": link.map(|l| l.0),
+                "recipe_hash": link.map(|l| l.1.as_str()),
                 "duration_secs": v.duration_secs,
                 "height": v.height,
                 "score": v.score,
@@ -616,8 +646,9 @@ fn absorb(
             let already = prior.tried.iter().any(|t| equal_address(&t.url, &url) && t.referer == referer)
                 || prior.rejected_by_mcr.iter().any(|u| equal_address(u, &url));
             // Not the recipe fault: the normal path tried this address, or
-            // MCR rejected it before (the desk records that itself).
-            if already {
+            // MCR rejected it before (the desk records that itself), or called
+            // it a wrong video on this site: dropped before the gate.
+            if already || prior.skipped(&url) {
                 return;
             }
             acc.by_url.entry(url.clone()).or_insert_with(|| (r.id, r.hash.clone()));
@@ -1011,7 +1042,12 @@ fn store_llm_recipe(ctx: &RepairCtx, domain: &str, snap: &PageSnapshot, rec: &Re
         origin: Origin::Llm,
     };
     match ctx.repo.insert_recipe(&new, Utc::now()) {
-        Ok(InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) | InsertOutcome::Revived(id)) => Some((id, hash)),
+        // A merge can land on another recipe (a player recipe with the same steps): the
+        // hash is the stored recipe's own, so MCR's decision finds it.
+        Ok(InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) | InsertOutcome::Revived(id)) => match ctx.repo.recipe_hash_of(id) {
+            Ok(Some(stored)) => Some((id, stored)),
+            _ => None,
+        },
         Ok(InsertOutcome::Refused(_) | InsertOutcome::OverCap) => {
             info!("the model's recipe for {domain} was not stored (refused or the store is full)");
             None
@@ -1194,6 +1230,7 @@ async fn llm_rung(
                 .filter(|c| {
                     !(prior.tried.iter().any(|t| equal_address(&t.url, &c.url) && t.referer.as_deref() == Some(page_ref.as_str()))
                         || prior.rejected_by_mcr.iter().any(|u| equal_address(u, &c.url))
+                        || prior.skipped(&c.url)
                         || tried.iter().any(|u| equal_address(u, &c.url)))
                 })
                 .collect()
@@ -1430,7 +1467,7 @@ async fn ladder(
             return LadderResult::Lost;
         }
     }
-    end.candidates_json = Some(verified_json(&verified));
+    end.candidates_json = Some(verified_json(&verified, &recipes));
     let Some(best) = verified.first() else {
         if ctx.cfg.mode == RepairMode::Shadow {
             note(ctx, job_id, "INFO", "Η αυτόματη επισκευή δεν βρήκε επαληθευμένο βίντεο");
@@ -1470,27 +1507,6 @@ async fn ladder(
         let _ = ctx.repo.set_leased_extraction_method(job_id, owner, job.extraction_method.as_deref());
     };
     for (index, v) in verified.iter().enumerate().take(MAX_DOWNLOADS) {
-        if lost(ctx, job_id, owner, cancel) {
-            return LadderResult::Lost;
-        }
-        let host = host_of(&v.candidate.url);
-        // DNS can change between the gate and now: the host must still resolve
-        // to public addresses only, and the pipeline gets the gate own address.
-        let Ok((url, host_name)) = omni_core::net::parse_public_url(&v.candidate.url) else {
-            continue;
-        };
-        // A rooted name ("host.") could miss an address pin; never used.
-        if url.host_str().is_some_and(|h| h.ends_with('.')) {
-            continue;
-        }
-        let port = url.port_or_known_default().unwrap_or(443);
-        if host_name.parse::<std::net::IpAddr>().is_err() && !ctx.env.host_is_public(&host_name, port).await {
-            note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: το {host} δεν δείχνει πια σε δημόσια διεύθυνση, παραλείφθηκε"));
-            continue;
-        }
-        if lost(ctx, job_id, owner, cancel) {
-            return LadderResult::Lost;
-        }
         // The method names the recipe behind the candidate being downloaded now.
         let (mut recipe_id, mut recipe_hash) = recipes.get(&v.candidate.url).cloned().unwrap_or((0, String::new()));
         let from_llm = llm_found.get(&v.candidate.url);
@@ -1498,75 +1514,277 @@ async fn ladder(
             Some(l) => format!("repair:llm:{}", hash8(&l.hash)),
             None => format!("repair:recipe:{}", hash8(&recipe_hash)),
         };
-        match ctx.repo.set_leased_extraction_method(job_id, owner, Some(&method)) {
-            Ok(true) => {}
-            Ok(false) => return LadderResult::Lost,
-            Err(e) => {
-                warn!("Job #{job_id}: the repair method could not be noted: {e:#}");
-                restore(ctx);
-                return LadderResult::NothingVerified;
+        let url = match hold_one(ctx, job, owner, &v.candidate.url, v.candidate.referer.clone(), &method, mode, cancel).await {
+            HoldStep::Held { url } => url,
+            HoldStep::Skipped | HoldStep::Failed => continue,
+            HoldStep::Lost => return LadderResult::Lost,
+            HoldStep::Stop => return LadderResult::NothingVerified,
+        };
+        let host = host_of(&v.candidate.url);
+        note(
+            ctx,
+            job_id,
+            "INFO",
+            &format!(
+                "Η αυτόματη επισκευή βρήκε βίντεο: {host} ({}, {}), περιμένει έγκριση από το MCR",
+                mm_ss(v.duration_secs),
+                v.candidate.origin
+            ),
+        );
+        // The model's pointer is stored as a recipe only now that a video is
+        // really held, and only when the recipe reproduces the address.
+        if let Some(l) = from_llm {
+            end.rung = Some("llm".into());
+            if lost(ctx, job_id, owner, cancel) {
+                return LadderResult::Lost;
             }
+            recipe_hash = l.hash.clone();
+            (recipe_id, end.recipe_hash) = match &l.recipe {
+                Some(rec) => match store_llm_recipe(ctx, &domain, &snap, rec) {
+                    Some((id, hash)) => (id, Some(hash)),
+                    None => (0, None),
+                },
+                None => (0, None),
+            };
+        } else {
+            end.recipe_hash = (!recipe_hash.is_empty()).then(|| recipe_hash.clone());
         }
-        let mut repaired = job.clone();
-        repaired.url = url.to_string();
-        match ctx.env.download(repaired, owner, v.candidate.referer.clone(), cancel, mode).await {
-            Ok(RunOutcome::Held) => {
-                note(
-                    ctx,
-                    job_id,
-                    "INFO",
-                    &format!(
-                        "Η αυτόματη επισκευή βρήκε βίντεο: {host} ({}, {}), περιμένει έγκριση από το MCR",
-                        mm_ss(v.duration_secs),
-                        v.candidate.origin
-                    ),
-                );
-                // The model's pointer is stored as a recipe only now that a video is
-                // really held, and only when the recipe reproduces the address.
-                if let Some(l) = from_llm {
-                    end.rung = Some("llm".into());
-                    if lost(ctx, job_id, owner, cancel) {
-                        return LadderResult::Lost;
-                    }
-                    recipe_hash = l.hash.clone();
-                    (recipe_id, end.recipe_hash) = match &l.recipe {
-                        Some(rec) => match store_llm_recipe(ctx, &domain, &snap, rec) {
-                            Some((id, hash)) => (id, Some(hash)),
-                            None => (0, None),
-                        },
-                        None => (0, None),
-                    };
-                } else {
-                    end.recipe_hash = (!recipe_hash.is_empty()).then(|| recipe_hash.clone());
-                }
-                // What MCR decision will find: the candidate actually held.
-                end.recipe_id = (recipe_id != 0).then_some(recipe_id);
-                end.held_url = Some(url.to_string());
-                end.next_index = index as i64;
-                card_step(ctx, job_id, owner, attempt, &snap, &facts, v.duration_secs, cancel).await;
-                return LadderResult::Held { recipe_hash };
-            }
-            Ok(RunOutcome::Delivered) => {
-                // Hold never delivers; if it ever did, say so loudly and stop.
-                warn!("Job #{job_id}: a held repair download reported a delivery; stopping the ladder");
-                note(ctx, job_id, "ERROR", "Η αυτόματη επισκευή: απροσδόκητη παράδοση, διακόπηκε");
-                restore(ctx);
-                return LadderResult::NothingVerified;
-            }
-            Err(e) => {
-                if e.downcast_ref::<LeaseLost>().is_some() || lost(ctx, job_id, owner, cancel) {
-                    return LadderResult::Lost;
-                }
-                let code: ErrorCode = crate::classify_pipeline_error(&e);
-                info!("Job #{job_id}: repair download from {host} failed: {code}");
-                note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: η λήψη από {host} απέτυχε ({})", code.as_str()));
-            }
-        }
+        // What MCR decision will find: the candidate actually held.
+        end.recipe_id = (recipe_id != 0).then_some(recipe_id);
+        end.held_url = Some(url);
+        end.next_index = index as i64;
+        card_step(ctx, job_id, owner, attempt, &snap, &facts, v.duration_secs, cancel).await;
+        return LadderResult::Held { recipe_hash };
     }
     // No download worked: the job is as it was, without the repair mark.
     restore(ctx);
     end.outcome = Some("download_failed".into());
     LadderResult::NothingVerified
+}
+
+/// What the next-candidate path (P10.13) came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NextResult {
+    /// The next verified video is held for MCR: park the job.
+    Held,
+    /// The job is no longer this worker's: write nothing more.
+    Lost,
+    /// It was not held (the download failed, or the address was rejected or skipped
+    /// meanwhile): the job ends in review; no further candidate is tried by itself.
+    Failed,
+}
+
+/// The Greek message of a job whose next choice did not come.
+pub const NEXT_FAILED_EL: &str = "Η επόμενη επιλογή δεν κατέβηκε";
+
+/// The message of a job whose pending next choice found repair switched off.
+pub const REPAIR_OFF_EL: &str = "Η αυτόματη επισκευή είναι απενεργοποιημένη";
+
+/// MCR's pending «Επόμενη επιλογή» for this job: its latest repair attempt is a
+/// `next` one nobody has finished.
+pub fn open_next(repo: &Repository, job_id: i64) -> Result<Option<RepairAttempt>> {
+    Ok(repo.latest_attempt(job_id)?.filter(|a| a.rung.as_deref() == Some("next") && a.outcome.is_none()))
+}
+
+/// «Επόμενη επιλογή» (P10.13): hold the candidate MCR's choice named, from the
+/// list the earlier run already verified. No page look, no recipe, no model, no
+/// normal download: only the hold step the ladder uses. A lost lease writes
+/// nothing (the attempt stays open: a new lease does it again, a retry drops it).
+pub async fn run_next(
+    ctx: &RepairCtx,
+    job: &Job,
+    owner: &str,
+    evidence_dir: &std::path::Path,
+    attempt: &RepairAttempt,
+    cancel: &CancellationToken,
+) -> NextResult {
+    let started = Instant::now();
+    let mut end = AttemptEnd {
+        rung: Some("next".into()),
+        domain: attempt.domain.clone(),
+        candidates_json: attempt.candidates_json.clone(),
+        next_index: attempt.next_index,
+        ..Default::default()
+    };
+    let result = next_step(ctx, job, owner, evidence_dir, attempt, cancel, &mut end).await;
+    if result != NextResult::Lost {
+        end.outcome = Some(match result {
+            NextResult::Held => "held".to_string(),
+            _ => end.outcome.take().unwrap_or_else(|| "next_failed".to_string()),
+        });
+        end.duration_ms = Some(started.elapsed().as_millis() as i64);
+        // Bookkeeping of the ladder's own table, not a write on the job.
+        if let Err(e) = ctx.repo.finish_attempt(attempt.id, &end, Utc::now()) {
+            warn!("Job #{}: the next-choice attempt could not be closed: {e:#}", job.id);
+        }
+    }
+    result
+}
+
+/// Is this address one MCR rejected for the job, or called a wrong video on its
+/// site? `None` when the store cannot say.
+fn next_barred(repo: &Repository, job_id: i64, domain: &str, url: &str) -> Option<bool> {
+    let rejected = repo.rejected_held_urls(job_id).ok()?;
+    let skips = repo.repair_skip_patterns(domain, Utc::now()).ok()?;
+    Some(rejected.iter().any(|u| equal_address(u, url)) || omni_core::urlnorm::skip_pattern(url).is_some_and(|p| skips.contains(&p)))
+}
+
+async fn next_step(
+    ctx: &RepairCtx,
+    job: &Job,
+    owner: &str,
+    evidence_dir: &std::path::Path,
+    attempt: &RepairAttempt,
+    cancel: &CancellationToken,
+    end: &mut AttemptEnd,
+) -> NextResult {
+    let job_id = job.id;
+    let restore = || {
+        let _ = ctx.repo.set_leased_extraction_method(job_id, owner, job.extraction_method.as_deref());
+    };
+    let list: Vec<serde_json::Value> = attempt.candidates_json.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or_default();
+    let entry = usize::try_from(attempt.next_index).ok().and_then(|i| list.get(i));
+    let (Some(entry), Some(domain)) = (entry, attempt.domain.as_deref()) else {
+        warn!("Job #{job_id}: the next choice names no candidate");
+        return NextResult::Failed;
+    };
+    let Some(url) = entry.get("url").and_then(serde_json::Value::as_str) else { return NextResult::Failed };
+    let referer = entry.get("referer").and_then(serde_json::Value::as_str).map(str::to_string);
+    let origin = entry.get("origin").and_then(serde_json::Value::as_str).unwrap_or("");
+    let duration = entry.get("duration_secs").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+    if lost(ctx, job_id, owner, cancel) {
+        return NextResult::Lost;
+    }
+    // MCR may have rejected or skipped this address since the choice was made.
+    let Some(barred) = next_barred(&ctx.repo, job_id, domain, url) else {
+        warn!("Job #{job_id}: the repair history could not be read, the next choice is not downloaded");
+        return NextResult::Failed;
+    };
+    if barred {
+        note(ctx, job_id, "WARN", &format!("Η επόμενη επιλογή ({}) έχει απορριφθεί από το MCR, δεν κατεβαίνει", host_of(url)));
+        end.outcome = Some("next_skipped".into());
+        return NextResult::Failed;
+    }
+    // The method names the recipe behind the candidate, as the ladder's does.
+    let tag = |t: &str| t.chars().filter(char::is_ascii_alphanumeric).collect::<String>();
+    let method = match origin.split_once(':') {
+        Some(("recipe", h)) => format!("repair:recipe:{}", tag(h)),
+        Some(("llm", h)) => format!("repair:llm:{}", tag(h)),
+        _ => "repair:next".to_string(),
+    };
+    let mode = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
+    let held_url = match hold_one(ctx, job, owner, url, referer, &method, mode, cancel).await {
+        HoldStep::Held { url } => url,
+        HoldStep::Lost => return NextResult::Lost,
+        HoldStep::Skipped | HoldStep::Failed => {
+            restore();
+            return NextResult::Failed;
+        }
+        HoldStep::Stop => return NextResult::Failed,
+    };
+    note(
+        ctx,
+        job_id,
+        "INFO",
+        &format!("Η επόμενη επιλογή: {} ({}, {origin}), περιμένει έγκριση από το MCR", host_of(url), mm_ss(duration)),
+    );
+    end.recipe_id = entry.get("recipe_id").and_then(serde_json::Value::as_i64).filter(|id| *id != 0);
+    end.recipe_hash = entry.get("recipe_hash").and_then(serde_json::Value::as_str).map(str::to_string);
+    end.held_url = Some(held_url);
+    // The length the page stated is the earlier run's; the page's own evidence, when saved, says it again.
+    end.expected_secs = ctx.repo.latest_held_attempt(job_id).ok().flatten().and_then(|a| a.expected_secs);
+    // The card's picture: only from the page evidence the job saved (no page look here).
+    let saved = tokio::fs::read_to_string(evidence_dir.join(format!("{job_id}.json"))).await.ok();
+    if let Some(snap) = saved.and_then(|t| serde_json::from_str::<PageSnapshot>(&t).ok()) {
+        let facts = gate_facts(&snap, domain);
+        end.expected_secs = facts.expected_secs.or(end.expected_secs);
+        card_step(ctx, job_id, owner, Some(attempt.id), &snap, &facts, duration, cancel).await;
+    }
+    NextResult::Held
+}
+
+/// What one held download of a verified address came to.
+enum HoldStep {
+    /// Held, from this address; the caller records it.
+    Held { url: String },
+    /// Not tried: the address or its host is no longer one to use.
+    Skipped,
+    /// The download failed (noted on the job).
+    Failed,
+    /// The job is no longer this worker's: write nothing more.
+    Lost,
+    /// Stop here: the repair mark could not be written, or the pipeline delivered.
+    Stop,
+}
+
+/// Download one verified address through the unchanged pipeline, held for MCR
+/// (the ladder's hold step and the next-candidate path share it). DNS can change
+/// between the gate and now: the host must still resolve to public addresses
+/// only, and the pipeline gets the gate's own address. `method` is written as the
+/// job's `extraction_method` first; on a failure it is put back.
+async fn hold_one(
+    ctx: &RepairCtx,
+    job: &Job,
+    owner: &str,
+    candidate_url: &str,
+    referer: Option<String>,
+    method: &str,
+    mode: DeliveryMode,
+    cancel: &CancellationToken,
+) -> HoldStep {
+    let job_id = job.id;
+    let restore = || {
+        let _ = ctx.repo.set_leased_extraction_method(job_id, owner, job.extraction_method.as_deref());
+    };
+    if lost(ctx, job_id, owner, cancel) {
+        return HoldStep::Lost;
+    }
+    let host = host_of(candidate_url);
+    let Ok((url, host_name)) = omni_core::net::parse_public_url(candidate_url) else {
+        return HoldStep::Skipped;
+    };
+    // A rooted name ("host.") could miss an address pin; never used.
+    if url.host_str().is_some_and(|h| h.ends_with('.')) {
+        return HoldStep::Skipped;
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    if host_name.parse::<std::net::IpAddr>().is_err() && !ctx.env.host_is_public(&host_name, port).await {
+        note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: το {host} δεν δείχνει πια σε δημόσια διεύθυνση, παραλείφθηκε"));
+        return HoldStep::Skipped;
+    }
+    if lost(ctx, job_id, owner, cancel) {
+        return HoldStep::Lost;
+    }
+    match ctx.repo.set_leased_extraction_method(job_id, owner, Some(method)) {
+        Ok(true) => {}
+        Ok(false) => return HoldStep::Lost,
+        Err(e) => {
+            warn!("Job #{job_id}: the repair method could not be noted: {e:#}");
+            restore();
+            return HoldStep::Stop;
+        }
+    }
+    let mut repaired = job.clone();
+    repaired.url = url.to_string();
+    match ctx.env.download(repaired, owner, referer, cancel, mode).await {
+        Ok(RunOutcome::Held) => HoldStep::Held { url: url.to_string() },
+        Ok(RunOutcome::Delivered) => {
+            // Hold never delivers; if it ever did, say so loudly and stop.
+            warn!("Job #{job_id}: a held repair download reported a delivery; stopping the ladder");
+            note(ctx, job_id, "ERROR", "Η αυτόματη επισκευή: απροσδόκητη παράδοση, διακόπηκε");
+            restore();
+            HoldStep::Stop
+        }
+        Err(e) => {
+            if e.downcast_ref::<LeaseLost>().is_some() || lost(ctx, job_id, owner, cancel) {
+                return HoldStep::Lost;
+            }
+            let code: ErrorCode = crate::classify_pipeline_error(&e);
+            info!("Job #{job_id}: repair download from {host} failed: {code}");
+            note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: η λήψη από {host} απέτυχε ({})", code.as_str()));
+            HoldStep::Failed
+        }
+    }
 }
 
 #[cfg(test)]

@@ -992,6 +992,14 @@ impl Repository {
         Ok(n.unwrap_or(0))
     }
 
+    /// The recipe's own full hash, or `None` when it is gone.
+    pub fn recipe_hash_of(&self, recipe_id: i64) -> Result<Option<String>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row("SELECT hash FROM recipes WHERE id = ?", params![recipe_id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// `shipped` | `admin` | `llm`, or `None` when the recipe is gone.
     pub fn recipe_origin(&self, recipe_id: i64) -> Result<Option<String>> {
         let conn = self.pool.get()?;
@@ -1005,12 +1013,7 @@ impl Repository {
     /// is not in it.
     pub fn rejected_held_urls(&self, job_id: i64) -> Result<Vec<String>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT held_url FROM repair_attempts
-             WHERE job_id = ? AND mcr_decision = 'rejected' AND held_url IS NOT NULL ORDER BY id",
-        )?;
-        let rows = stmt.query_map(params![job_id], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        rejected_urls_in(&conn, job_id)
     }
 
     /// Reserve one model call for local day `day` (`YYYY-MM-DD`) under `cap`
@@ -1675,6 +1678,13 @@ impl Repository {
                 "UPDATE repair_attempts SET mcr_decision = 'superseded'
                  WHERE job_id = ? AND outcome = 'held' AND mcr_decision IS NULL",
                 params![id],
+            )?;
+            // A «next candidate» run that has not started is dropped: the retry
+            // is a clean new run, not the old pick (P10.13).
+            tx.execute(
+                "UPDATE repair_attempts SET outcome = 'superseded', finished_at = ?
+                 WHERE job_id = ? AND rung = 'next' AND outcome IS NULL",
+                params![timestamps::now_string(), id],
             )?;
         }
         tx.commit()?;
@@ -3618,7 +3628,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
-        note_mcr_decision(&tx, job_id, "approved")?;
+        note_mcr_decision(&tx, job_id, "approved", Learn::Approved, chrono::Utc::now())?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'INFO', ?)",
             params![job_id, now, format!("Approved by {by}; delivering the held file")],
@@ -3652,7 +3662,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
-        note_mcr_decision(&tx, job_id, "rejected")?;
+        note_mcr_decision(&tx, job_id, "rejected", if reason == "wrong_video" { Learn::WrongVideo } else { Learn::Nothing }, chrono::Utc::now())?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
             params![job_id, now, format!("Rejected by {by} ({reason}): {message}")],
@@ -3686,13 +3696,102 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
-        note_mcr_decision(&tx, job_id, "expired")?;
+        note_mcr_decision(&tx, job_id, "expired", Learn::Nothing, now)?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
             params![job_id, at, "Nobody approved the held video in time; it was deleted"],
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// MCR's «Επόμενη επιλογή» (P10.13): the held video is called the wrong
+    /// one (everything `reject_held(.., "wrong_video", ..)` does: the decision,
+    /// the recipe's rejection, the skip) and the job goes back to PENDING with a
+    /// new `next` repair attempt that names the next verified candidate of the
+    /// same run. The worker that leases it downloads that one, held again; nothing
+    /// is searched again. One transaction. `None` (nothing changed): the job is
+    /// not waiting, the file is not the one named, or no candidate is left.
+    /// Otherwise the place of the chosen candidate in the attempt's list.
+    pub fn next_candidate(&self, job_id: i64, sha256: &str, by: &str, now: chrono::DateTime<Utc>) -> Result<Option<usize>> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let waiting: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM held_outputs h JOIN queue q ON q.id = h.job_id
+                 WHERE h.job_id = ? AND h.decision IS NULL AND h.sha256 = ? AND q.status = 'AWAITING_APPROVAL'",
+                params![job_id, sha256],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if waiting.is_none() {
+            return Ok(None);
+        }
+        let Some(hold) = open_hold(&tx, job_id)? else { return Ok(None) };
+        let Some(domain) = hold.domain.clone() else { return Ok(None) };
+        let mut excluded = rejected_urls_in(&tx, job_id)?;
+        excluded.extend(hold.held_url.clone());
+        let skips = skips_of(&tx, &domain, now)?;
+        let Some(&index) = next_options(hold.candidates_json.as_deref(), hold.next_index, &excluded, &skips).first() else {
+            return Ok(None);
+        };
+        let at = timestamps::format(now);
+        let held = tx.execute(
+            "UPDATE held_outputs SET decision = 'rejected', decided_by = ?, decided_at = ?, reason = 'wrong_video'
+             WHERE job_id = ? AND decision IS NULL",
+            params![by, at, job_id],
+        )?;
+        // Back to the queue like a retry, but the history of the run stays.
+        let queued = tx.execute(
+            r#"
+            UPDATE queue
+            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
+                completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
+                updated_at = ?
+            WHERE id = ? AND status = 'AWAITING_APPROVAL'
+            "#,
+            params![at, job_id],
+        )?;
+        if held != 1 || queued != 1 {
+            return Ok(None);
+        }
+        note_mcr_decision(&tx, job_id, "rejected", Learn::WrongVideo, now)?;
+        tx.execute(
+            "INSERT INTO repair_attempts (job_id, started_at, mode, rung, candidates_json, next_index, domain)
+             VALUES (?, ?, 'hold', 'next', ?, ?, ?)",
+            params![job_id, at, hold.candidates_json, index as i64, domain],
+        )?;
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
+            params![job_id, at, format!("Rejected by {by} (wrong video); trying the next verified candidate")],
+        )?;
+        tx.commit()?;
+        Ok(Some(index))
+    }
+
+    /// How many verified candidates MCR could still ask for after the held one
+    /// of this job (the count behind «Επόμενη επιλογή (n)»).
+    pub fn next_left(&self, job_id: i64, now: chrono::DateTime<Utc>) -> Result<usize> {
+        let Some(hold) = self.latest_held_attempt(job_id)? else { return Ok(0) };
+        let Some(domain) = hold.domain.as_deref() else { return Ok(0) };
+        let mut excluded = self.rejected_held_urls(job_id)?;
+        excluded.extend(hold.held_url.clone());
+        let skips = self.repair_skip_patterns(domain, now)?;
+        Ok(next_options(hold.candidates_json.as_deref(), hold.next_index, &excluded, &skips).len())
+    }
+
+    /// The wrong-video patterns MCR set for `domain` that still hold at `now`.
+    pub fn repair_skip_patterns(&self, domain: &str, now: chrono::DateTime<Utc>) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        skips_of(&conn, domain, now)
+    }
+
+    /// Retention: skips that ran out before `now`.
+    pub fn purge_repair_skips(&self, now: chrono::DateTime<Utc>) -> Result<usize> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("DELETE FROM repair_skips WHERE until <= ?", params![timestamps::format(now)])?)
     }
 
     /// A held row whose job moved on without it: the condition of
@@ -4237,6 +4336,88 @@ mod recipe_sql {
         Ok(InsertOutcome::Inserted(conn.last_insert_rowid()))
     }
 
+    /// One scoring event, inside the caller's transaction (the row is created when missing).
+    fn event_in_tx(conn: &Connection, recipe_id: i64, domain: &str, event: Event, now: DateTime<Utc>) -> Result<SiteRow> {
+        if domain.is_empty() {
+            anyhow::bail!("a recipe event needs a domain");
+        }
+        let Some(head) = head_by_id(conn, recipe_id)? else {
+            anyhow::bail!("no recipe #{recipe_id}");
+        };
+        let current = load_rows(conn, recipe_id)?.into_iter().find(|(d, _)| d == domain).map(|(_, r)| r);
+        let row = match current {
+            Some(r) => r,
+            None => {
+                shed_site_rows(conn, rs::SITE_ROW_CAP - 1)?;
+                SiteRow::new(now)
+            }
+        };
+        let next = rs::apply(&row, event, now);
+        if event == Event::Rejection {
+            write_bar(conn, &head.steps_hash, domain, now)?;
+        }
+        store_row(conn, recipe_id, domain, &next)?;
+        recompute_state(conn, recipe_id)?;
+        Ok(next)
+    }
+
+    /// Retire a recipe for good and remember its hash, inside the caller's transaction.
+    fn tombstone_in_tx(conn: &Connection, hash: &str, reason: RetiredReason, now: DateTime<Utc>) -> Result<()> {
+        let head = head_by_hash(conn, hash)?;
+        if let Some(h) = &head {
+            if h.origin == Origin::Shipped {
+                anyhow::bail!("a shipped recipe cannot be tombstoned");
+            }
+            if matches!(reason, RetiredReason::Admin | RetiredReason::Rejected) && h.scope_kind == ScopeKind::Site {
+                write_bar(conn, &h.steps_hash, &h.scope_key, now)?;
+            }
+        }
+        write_tombstone(conn, hash, reason, now)?;
+        if let Some(h) = head {
+            if h.state == RecipeState::Retired {
+                conn.execute("UPDATE recipes SET retired_reason = ? WHERE id = ?", params![reason.as_str(), h.id])?;
+            } else {
+                retire(conn, h.id, reason, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What MCR's decision on a held video teaches the recipe that found it
+    /// (P10.13), in the decision's own transaction: an approval is an
+    /// `Approval` on that domain; «Λάθος βίντεο» is a `Rejection` there (it
+    /// suspends the recipe and bars its steps) and, for a recipe the model
+    /// wrote that MCR never approved anywhere, a tombstone so it cannot come
+    /// back. A recipe that is gone teaches nothing (the decision still stands).
+    pub(super) fn learn_from_mcr(
+        conn: &Connection,
+        recipe_id: i64,
+        recipe_hash: Option<&str>,
+        domain: &str,
+        approved: bool,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        if domain.is_empty() {
+            return Ok(());
+        }
+        let Some(head) = head_by_id(conn, recipe_id)? else { return Ok(()) };
+        // Ids are reused after a delete: the attempt's hash must be the recipe's, or it is another one.
+        if recipe_hash != Some(head.hash.as_str()) {
+            return Ok(());
+        }
+        if approved {
+            event_in_tx(conn, recipe_id, domain, Event::Approval, now)?;
+            return Ok(());
+        }
+        event_in_tx(conn, recipe_id, domain, Event::Rejection, now)?;
+        let approvals: i64 =
+            conn.query_row("SELECT COALESCE(SUM(approvals), 0) FROM recipe_sites WHERE recipe_id = ?", params![recipe_id], |r| r.get(0))?;
+        if head.origin == Origin::Llm && approvals == 0 {
+            tombstone_in_tx(conn, &head.hash, RetiredReason::Rejected, now)?;
+        }
+        Ok(())
+    }
+
     fn check_new(new: &NewRecipe) -> Result<()> {
         if new.recipe_json.len() > rs::MAX_RECIPE_JSON {
             anyhow::bail!("recipe is {} bytes, the limit is {}", new.recipe_json.len(), rs::MAX_RECIPE_JSON);
@@ -4276,28 +4457,9 @@ mod recipe_sql {
 
         /// Score one event for a recipe on a domain; the row is created when missing.
         pub fn recipe_event(&self, recipe_id: i64, domain: &str, event: Event, now: DateTime<Utc>) -> Result<SiteRow> {
-            if domain.is_empty() {
-                anyhow::bail!("a recipe event needs a domain");
-            }
             let mut conn = self.pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let Some(head) = head_by_id(&tx, recipe_id)? else {
-                anyhow::bail!("no recipe #{recipe_id}");
-            };
-            let current = load_rows(&tx, recipe_id)?.into_iter().find(|(d, _)| d == domain).map(|(_, r)| r);
-            let row = match current {
-                Some(r) => r,
-                None => {
-                    shed_site_rows(&tx, rs::SITE_ROW_CAP - 1)?;
-                    SiteRow::new(now)
-                }
-            };
-            let next = rs::apply(&row, event, now);
-            if event == Event::Rejection {
-                write_bar(&tx, &head.steps_hash, domain, now)?;
-            }
-            store_row(&tx, recipe_id, domain, &next)?;
-            recompute_state(&tx, recipe_id)?;
+            let next = event_in_tx(&tx, recipe_id, domain, event, now)?;
             tx.commit()?;
             Ok(next)
         }
@@ -4380,23 +4542,7 @@ mod recipe_sql {
         pub fn tombstone_recipe(&self, hash: &str, reason: RetiredReason, now: DateTime<Utc>) -> Result<()> {
             let mut conn = self.pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let head = head_by_hash(&tx, hash)?;
-            if let Some(h) = &head {
-                if h.origin == Origin::Shipped {
-                    anyhow::bail!("a shipped recipe cannot be tombstoned");
-                }
-                if matches!(reason, RetiredReason::Admin | RetiredReason::Rejected) && h.scope_kind == ScopeKind::Site {
-                    write_bar(&tx, &h.steps_hash, &h.scope_key, now)?;
-                }
-            }
-            write_tombstone(&tx, hash, reason, now)?;
-            if let Some(h) = head {
-                if h.state == RecipeState::Retired {
-                    tx.execute("UPDATE recipes SET retired_reason = ? WHERE id = ?", params![reason.as_str(), h.id])?;
-                } else {
-                    retire(&tx, h.id, reason, now)?;
-                }
-            }
+            tombstone_in_tx(&tx, hash, reason, now)?;
             tx.commit()?;
             Ok(())
         }
@@ -5058,18 +5204,135 @@ pub struct TaxonomyBackup {
     pub people: usize,
 }
 
+/// The `held_url` of each of the job's attempts MCR rejected, oldest first.
+fn rejected_urls_in(conn: &rusqlite::Connection, job_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT held_url FROM repair_attempts
+         WHERE job_id = ? AND mcr_decision = 'rejected' AND held_url IS NOT NULL ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![job_id], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// What a decision teaches the recipe store (P10.13).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Learn {
+    Nothing,
+    /// MCR approved the held video: the recipe behind it gains an approval.
+    Approved,
+    /// MCR said it is the wrong video: the recipe is rejected on that site and
+    /// the address is skipped for 30 days.
+    WrongVideo,
+}
+
+/// How long «Λάθος βίντεο» keeps an address out of the ladder, and how many a domain keeps.
+const SKIP_DAYS: i64 = 30;
+const SKIPS_PER_DOMAIN: i64 = 50;
+
+/// The repair attempt a decision is about.
+struct OpenHold {
+    id: i64,
+    recipe_id: Option<i64>,
+    recipe_hash: Option<String>,
+    domain: Option<String>,
+    held_url: Option<String>,
+    candidates_json: Option<String>,
+    next_index: i64,
+}
+
+/// The job's latest repair attempt that held a video nobody decided on yet.
+fn open_hold(tx: &rusqlite::Transaction<'_>, job_id: i64) -> Result<Option<OpenHold>> {
+    Ok(tx
+        .query_row(
+            "SELECT id, recipe_id, recipe_hash, domain, held_url, candidates_json, next_index FROM repair_attempts
+             WHERE job_id = ? AND outcome = 'held' AND mcr_decision IS NULL ORDER BY id DESC LIMIT 1",
+            params![job_id],
+            |r| {
+                Ok(OpenHold {
+                    id: r.get(0)?,
+                    recipe_id: r.get(1)?,
+                    recipe_hash: r.get(2)?,
+                    domain: r.get(3)?,
+                    held_url: r.get(4)?,
+                    candidates_json: r.get(5)?,
+                    next_index: r.get(6)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 /// MCR decided about a held video: note it on the job's latest repair attempt
-/// that held one and has no decision yet, in the same transaction as the
-/// decision itself (P10.11a). Nothing to note for a hold the ladder did not make.
-fn note_mcr_decision(tx: &rusqlite::Transaction<'_>, job_id: i64, decision: &str) -> Result<()> {
+/// that held one and has no decision yet, and teach the recipe store what the
+/// decision says (P10.13), in the same transaction as the decision itself, so
+/// a failure of either rolls both back. Nothing to note for a hold the ladder
+/// did not make. Returns that attempt.
+fn note_mcr_decision(
+    tx: &rusqlite::Transaction<'_>,
+    job_id: i64,
+    decision: &str,
+    learn: Learn,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<OpenHold>> {
+    let Some(hold) = open_hold(tx, job_id)? else { return Ok(None) };
+    tx.execute("UPDATE repair_attempts SET mcr_decision = ? WHERE id = ?", params![decision, hold.id])?;
+    if learn == Learn::Nothing {
+        return Ok(Some(hold));
+    }
+    if let (Some(recipe_id), Some(domain)) = (hold.recipe_id, hold.domain.as_deref()) {
+        recipe_sql::learn_from_mcr(tx, recipe_id, hold.recipe_hash.as_deref(), domain, learn == Learn::Approved, now)?;
+    }
+    if learn == Learn::WrongVideo {
+        if let (Some(domain), Some(pattern)) = (hold.domain.as_deref(), hold.held_url.as_deref().and_then(crate::urlnorm::skip_pattern)) {
+            write_skip(tx, domain, &pattern, now)?;
+        }
+    }
+    Ok(Some(hold))
+}
+
+/// Remember `pattern` as a wrong video on `domain` for 30 days (a second
+/// rejection extends it); the domain keeps at most 50, the soonest to expire out.
+fn write_skip(tx: &rusqlite::Transaction<'_>, domain: &str, pattern: &str, now: chrono::DateTime<Utc>) -> Result<()> {
+    let until = timestamps::format(now + Duration::days(SKIP_DAYS));
     tx.execute(
-        "UPDATE repair_attempts SET mcr_decision = ?
-         WHERE id = (SELECT id FROM repair_attempts
-                     WHERE job_id = ? AND outcome = 'held' AND mcr_decision IS NULL
-                     ORDER BY id DESC LIMIT 1)",
-        params![decision, job_id],
+        "INSERT INTO repair_skips (domain, pattern, until) VALUES (?, ?, ?)
+         ON CONFLICT(domain, pattern) DO UPDATE SET until = MAX(until, excluded.until)",
+        params![domain, pattern, until],
+    )?;
+    tx.execute(
+        "DELETE FROM repair_skips WHERE domain = ?1 AND pattern NOT IN
+           (SELECT pattern FROM repair_skips WHERE domain = ?1 ORDER BY until DESC, rowid DESC LIMIT ?2)",
+        params![domain, SKIPS_PER_DOMAIN],
     )?;
     Ok(())
+}
+
+/// The still-valid skip patterns of `domain`.
+fn skips_of(tx: &rusqlite::Connection, domain: &str, now: chrono::DateTime<Utc>) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare("SELECT pattern FROM repair_skips WHERE domain = ? AND until > ? ORDER BY pattern")?;
+    let rows = stmt.query_map(params![domain, timestamps::format(now)], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The places in `candidates_json` after `next_index` that may still be
+/// offered: not an address MCR rejected or the one held, and not skipped.
+fn next_options(candidates_json: Option<&str>, next_index: i64, excluded: &[String], skips: &[String]) -> Vec<usize> {
+    let list: Vec<serde_json::Value> = candidates_json.and_then(|t| serde_json::from_str(t).ok()).unwrap_or_default();
+    let barred: std::collections::HashSet<String> = excluded.iter().map(|u| crate::urlnorm::normalize(u)).collect();
+    // The held and the rejected addresses are skipped by pattern too: a copy that differs
+    // only in its query is the same video, and the decision's own skip would bar it.
+    let barred_patterns: std::collections::HashSet<String> = excluded.iter().filter_map(|u| crate::urlnorm::skip_pattern(u)).collect();
+    let first = usize::try_from(next_index).map_or(0, |i| i + 1);
+    list.iter()
+        .enumerate()
+        .skip(first)
+        .filter(|(_, c)| {
+            let Some(url) = c.get("url").and_then(serde_json::Value::as_str) else { return false };
+            !barred.contains(&crate::urlnorm::normalize(url))
+                && !crate::urlnorm::skip_pattern(url).is_some_and(|p| skips.contains(&p) || barred_patterns.contains(&p))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// `taxonomy-20260930T134501123Z-before-import.json`, and nothing else: no

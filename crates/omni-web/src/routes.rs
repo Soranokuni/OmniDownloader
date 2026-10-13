@@ -421,9 +421,14 @@ fn preview_flags(dir: &std::path::Path) -> serde_json::Value {
     })
 }
 
+/// Whether the live config lets MCR ask for the next verified candidate (`repair.mode = hold`).
+async fn next_choice_allowed(state: &AppState) -> bool {
+    state.config.read().await.repair.mode == omni_core::config::RepairMode::Hold
+}
+
 /// How a repaired video was found and why it can be trusted (P10.11b), for the
 /// approval card: `null` unless this job's latest held repair attempt exists.
-fn repair_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+fn repair_for_desk(state: &AppState, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
     if job.status != JobStatus::AwaitingApproval {
         return serde_json::Value::Null;
     }
@@ -435,7 +440,11 @@ fn repair_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json
         (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
         _ => 0,
     };
-    crate::repair_card::build(&attempt, origin.as_deref(), approvals).unwrap_or(serde_json::Value::Null)
+    // `next_ok`: only `hold` mode lets MCR walk the verified list (P10.13); the handler read the live mode.
+    let next_left = if next_ok { state.repo.next_left(job.id, chrono::Utc::now()).unwrap_or(0) } else { 0 };
+    crate::repair_card::build(&attempt, origin.as_deref(), approvals)
+        .map(|card| crate::repair_card::with_next_left(card, next_left))
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// The directory a job's preview files are in: the parent of the held row's
@@ -525,13 +534,14 @@ pub async fn api_get_jobs(
         } else {
             Default::default()
         };
+        let next_ok = next_choice_allowed(&state).await;
         let jobs: Vec<serde_json::Value> = page
             .jobs
             .iter()
             .map(|j| {
                 let mut v = job_for_desk(j);
                 v["held"] = held_for_desk(&state, j);
-                v["repair"] = repair_for_desk(&state, j);
+                v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -594,7 +604,7 @@ pub async fn api_get_job(
         .map_err(internal_error("Could not read the job."))?;
     let mut desk_job = job_for_desk(&job);
     desk_job["held"] = held_for_desk(&state, &job);
-    desk_job["repair"] = repair_for_desk(&state, &job);
+    desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
 }
 
@@ -983,6 +993,45 @@ pub async fn api_reject_job(
     audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected ({})", payload.reason));
     state.broadcast_event("job_updated");
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// MCR's «Επόμενη επιλογή» (P10.13): the held video is the wrong one, and the
+/// next candidate the repair already verified is downloaded and held for approval.
+/// The file goes now, like a rejection; the page is not searched again.
+pub async fn api_next_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<ApprovePayload>,
+) -> JsonResult {
+    let sha = payload.sha256.trim().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("Λάθος αποτύπωμα αρχείου (SHA-256)."));
+    }
+    if state.config.read().await.repair.mode != omni_core::config::RepairMode::Hold {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "REPAIR_OFF",
+            "Η αυτόματη επισκευή είναι απενεργοποιημένη· η επόμενη επιλογή δεν είναι διαθέσιμη.",
+        ));
+    }
+    let index = state
+        .repo
+        .next_candidate(job_id, &sha, &principal.audit_label(), chrono::Utc::now())
+        .map_err(internal_error("Could not choose the next video."))?;
+    let Some(index) = index else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "NO_NEXT",
+            "Δεν υπάρχει άλλη επαληθευμένη επιλογή, ή το βίντεο δεν περιμένει πια έγκριση. Ανανεώστε τη λίστα.",
+        ));
+    };
+    if let Some(temp) = state.temp_dir.clone() {
+        let _ = tokio::task::spawn_blocking(move || omni_core::held::remove_held_dir(&temp, job_id)).await;
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected (wrong video); next choice #{}", index + 1));
+    state.broadcast_event("job_updated");
+    Ok(Json(serde_json::json!({ "status": "ok", "index": index })))
 }
 
 /// Take every delivered job off the live queue. Nothing is deleted.
@@ -2245,6 +2294,7 @@ pub async fn api_get_mail_view(
     let by_id: HashMap<i64, &omni_core::models::Job> = jobs.iter().map(|j| (j.id, j)).collect();
     // The Email tab's cards say the place in the queue too (plan P7.19).
     let positions = state.repo.pending_positions().unwrap_or_default();
+    let next_ok = next_choice_allowed(&state).await;
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
@@ -2252,7 +2302,7 @@ pub async fn api_get_mail_view(
             by_id.get(&p.job_id).map(|j| {
                 let mut v = job_for_desk(j);
                 v["held"] = held_for_desk(&state, j);
-                v["repair"] = repair_for_desk(&state, j);
+                v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }

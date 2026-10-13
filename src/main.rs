@@ -173,7 +173,8 @@ enum Commands {
         /// closest frame of the preview (also records a held repair attempt)
         #[arg(long)]
         article_image: Option<std::path::PathBuf>,
-        /// Record a held repair attempt with a fixed, invented checklist
+        /// Record a held repair attempt with a fixed, invented checklist and two
+        /// more verified candidates (the card then offers «Επόμενη επιλογή (2)»)
         #[arg(long)]
         checks: bool,
     },
@@ -469,7 +470,18 @@ async fn dev_hold_card(
     let duration = held.duration.unwrap_or(0.0);
     let now = chrono::Utc::now();
     let list = if checks {
-        serde_json::json!([{
+        // Two more verified candidates after the held one: the card offers «Επόμενη επιλογή (2)».
+        let more = |name: &str| {
+            serde_json::json!({
+                "url": format!("https://cdn.dev-hold.example/video/{name}.mp4"),
+                "referer": "https://news.dev-hold.example/story/1",
+                "origin": "recipe:dev0hold",
+                "duration_secs": duration,
+                "score": 5,
+                "checks": [{"name": "probe", "ok": true, "detail": format!("{duration:.0} δλ, 720p (cdn.dev-hold.example)")}],
+            })
+        };
+        let mut list = serde_json::json!([{
             "url": "https://cdn.dev-hold.example/video/clip.mp4",
             "referer": "https://news.dev-hold.example/story/1",
             "origin": "recipe:dev0hold",
@@ -481,7 +493,12 @@ async fn dev_hold_card(
                 {"name": "probe", "ok": true, "detail": format!("{duration:.0} δλ, 720p (cdn.dev-hold.example)")},
                 {"name": "length", "ok": true, "detail": format!("Ταιριάζει με τα {:.0} δλ της σελίδας", duration + 2.0)},
             ],
-        }])
+        }]);
+        if let Some(a) = list.as_array_mut() {
+            a.push(more("clip2"));
+            a.push(more("clip3"));
+        }
+        list
     } else {
         serde_json::json!([])
     };
@@ -1683,6 +1700,61 @@ async fn run_job(
     // nothing of what follows (no download, no page scan, no sniffing).
     if let Some(held) = repo.approved_held(job_id)? {
         return run_approved_delivery(repo, engine, owner, &job, &held, &cancel).await;
+    }
+
+    // MCR asked for the next verified candidate of this job (P10.13): hold that
+    // one, from the list the earlier run already verified. No download of the
+    // link, no page scan, no sniffing, no recipes, no model.
+    if let Some(attempt) = repair::open_next(repo, job_id)? {
+        if !repo.set_stage(job_id, owner, JobStage::Download)? {
+            warn!("Job #{job_id}: no longer ours; stopping without the next choice");
+            return Ok(());
+        }
+        // Only `hold` lets MCR walk the verified list; with repair off or in shadow
+        // nothing is downloaded and the job goes to review.
+        if repair_mode != omni_core::config::RepairMode::Hold {
+            let end = omni_core::repository::AttemptEnd {
+                rung: Some("next".into()),
+                outcome: Some("repair_off".into()),
+                domain: attempt.domain.clone(),
+                candidates_json: attempt.candidates_json.clone(),
+                next_index: attempt.next_index,
+                ..Default::default()
+            };
+            if let Err(e) = repo.finish_attempt(attempt.id, &end, chrono::Utc::now()) {
+                warn!("Job #{job_id}: the next-choice attempt could not be closed: {e:#}");
+            }
+            repo.finish(
+                job_id,
+                owner,
+                JobStatus::RequiresReview,
+                Some(ErrorCode::VideoUnresolved.as_str()),
+                Some(repair::REPAIR_OFF_EL),
+                None,
+            )?;
+            return Ok(());
+        }
+        match repair::run_next(repair, &job, owner, evidence_dir, &attempt, &cancel).await {
+            repair::NextResult::Held => {
+                info!("Job #{job_id}: MCR's next choice is held for approval");
+                finish_held(repo, job_id, owner)?;
+            }
+            repair::NextResult::Lost => warn!("Job #{job_id}: no longer ours; nothing more to do"),
+            repair::NextResult::Failed => {
+                if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
+                    repo.record_event(job_id, "ERROR", None, ErrorCode::VideoUnresolved.hint_el())?;
+                }
+                repo.finish(
+                    job_id,
+                    owner,
+                    JobStatus::RequiresReview,
+                    Some(ErrorCode::VideoUnresolved.as_str()),
+                    Some(repair::NEXT_FAILED_EL),
+                    None,
+                )?;
+            }
+        }
+        return Ok(());
     }
 
     if !repo.set_stage(job_id, owner, JobStage::Download)? {
@@ -2931,6 +3003,12 @@ async fn run_one_task(
                 Ok(n) if n > 0 => info!("Retention: removed {n} old repair attempt(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("Retention: repair attempts not purged: {e:#}"),
+            }
+            // Wrong videos MCR marked (P10.13) are forgotten after their 30 days.
+            match repo.purge_repair_skips(chrono::Utc::now()) {
+                Ok(n) if n > 0 => info!("Retention: removed {n} expired repair skip(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: repair skips not purged: {e:#}"),
             }
             // The model rung's limits (P10.12): a bundle is remembered 24 h, a day's totals 90 days.
             {

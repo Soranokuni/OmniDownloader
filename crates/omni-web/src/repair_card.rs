@@ -66,6 +66,13 @@ pub fn build(attempt: &RepairAttempt, origin: Option<&str>, approvals: i64) -> O
     }))
 }
 
+/// The card's `repair` object with how many verified candidates MCR could still
+/// ask for after this one («Επόμενη επιλογή (n)», P10.13).
+pub fn with_next_left(mut card: Value, next_left: usize) -> Value {
+    card["next_left"] = json!(next_left);
+    card
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +124,14 @@ mod tests {
         assert_eq!(names, ["egress", "probe", "short"], "the checks of #2, after a fallback from #1");
         assert!(!v.to_string().contains("SECRET") && !v.to_string().contains("b.mp4"), "hosts only: {v}");
         assert_eq!(v["image"], Value::Null, "no article picture, no image block");
+    }
+
+    #[test]
+    fn the_card_carries_how_many_next_choices_are_left() {
+        let v = with_next_left(build(&attempt(), None, 0).unwrap(), 3);
+        assert_eq!(v["next_left"], 3);
+        assert_eq!(with_next_left(build(&attempt(), None, 0).unwrap(), 0)["next_left"], 0);
+        assert_eq!(build(&attempt(), None, 0).unwrap().get("next_left"), None, "only the route adds it");
     }
 
     #[test]
