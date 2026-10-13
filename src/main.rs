@@ -778,6 +778,8 @@ async fn main() -> Result<()> {
     // must not rotate or prune the log the running service is writing to
     // (plan P6.1, defect W-11).
     let _log_guard = init_logging(&cli, &paths)?;
+    // The log's redaction set, so cookie jars (P3.5) can join it once the database is open.
+    let log_redactions = _log_guard.as_ref().map(|g| g.redactions());
     info!("Install root: {:?}", paths.root);
 
     // The adblock cache must be absolute before any sniff can run.
@@ -785,7 +787,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None | Some(Commands::Run) => {
-            run_daemon(&paths, None).await?;
+            run_daemon(&paths, None, log_redactions).await?;
         }
         Some(Commands::RunService) => {
             let paths = paths.clone();
@@ -795,7 +797,7 @@ async fn main() -> Result<()> {
                     .build()
                     .expect("Failed to build Tokio runtime for Windows Service");
                 rt.block_on(async {
-                    if let Err(e) = run_daemon(&paths, Some(shutdown_rx)).await {
+                    if let Err(e) = run_daemon(&paths, Some(shutdown_rx), log_redactions).await {
                         error!("Daemon error inside Windows Service: {:?}", e);
                     }
                 });
@@ -1028,6 +1030,7 @@ async fn main() -> Result<()> {
 async fn run_daemon(
     paths: &AppPaths,
     service_shutdown_rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    log_redactions: Option<Redactions>,
 ) -> Result<()> {
 
     info!("============================================================");
@@ -1069,11 +1072,17 @@ async fn run_daemon(
     let bin_dir = paths.resolve(&config.bin_dir);
 
     tokio::fs::create_dir_all(&temp_path).await?;
+    // A scratch cookie jar left by a crash (P3.5): nothing is using one yet.
+    omni_broadcast::cookie_file::sweep_scratch(&temp_path);
     tokio::fs::create_dir_all(&watchfolder_path).await?;
     tokio::fs::create_dir_all(&bin_dir).await?;
 
     info!("Initializing SQLite database at: {:?}", db_path);
     let repo = Repository::new(&db_path)?;
+    // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them.
+    if let Some(r) = &log_redactions {
+        r.extend(repo.cookie_values());
+    }
     // A brand-new installation starts with Admin / Admin (owner's decision,
     // 2026-10-08). First, before anything writes to the audit log, which
     // is how a used database is told apart from a new one.
@@ -1264,14 +1273,25 @@ async fn run_daemon(
     ));
     // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
     let url_tester = Arc::new(repair::AdminTester::new());
-    let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
+    omni_core::cookies::refresh_health(&repo, &health);
+    // Only the Windows service locks its folders; a console run would lock the developer out.
+    lock_down_install(service_shutdown_rx.is_some(), &[paths.data.clone(), temp_path.clone()], &health).await;
+    let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_url_tester(url_tester.clone())
+        .with_cookie_tester(Arc::new(CookieJarTester {
+            repo: repo.clone(),
+            bin_dir: bin_dir.clone(),
+            temp_path: temp_path.clone(),
+        }))
         .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
         .with_llm(live_llm.clone())
         .with_busy_jobs(busy_jobs.clone())
         .with_temp_dir(temp_path.clone());
+    if let Some(r) = &log_redactions {
+        web_state = web_state.with_redactions(r.clone());
+    }
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();
@@ -1830,7 +1850,7 @@ async fn run_approved_delivery(
                 repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
             } else {
                 if still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
                 }
                 repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None)?;
             }
@@ -1991,6 +2011,8 @@ async fn run_job(
     let mut known_unsupported = false;
     // How many videos yt-dlp's page scan named (P10.2).
     let mut scanned_videos = 0usize;
+    // An embedded video on another site, whose cookie jar this job also carries (P3.5).
+    let mut login_site: Option<String> = None;
 
     // A portal whose video one API request names (plan P3.8): no yt-dlp
     // page scan, no browser. A failed request just takes the usual way.
@@ -2031,12 +2053,18 @@ async fn run_job(
             omni_broadcast::article::queue_article_siblings(repo, owner, &mut job, &videos[0], &videos);
             job.url = videos[0].clone();
             page_referer = Some(orig_url.clone());
+        } else if videos.len() == 1 && other_site(&orig_url, &videos[0]) {
+            // The article's one video is another site's (an X post, say): that site's
+            // cookie jar joins the job's, and its name is in the login hint. The
+            // download itself is unchanged.
+            login_site = Some(videos[0].clone());
         }
     }
     if !still_ours(repo, job_id, owner) {
         warn!("Job #{job_id}: no longer ours; not downloading");
         return Ok(());
     }
+    let _login_guard = login_site.as_deref().map(|v| engine.set_login_site(job_id, v));
     let mut process_result = if known_unsupported {
         repo.record_event(
             job_id,
@@ -2312,7 +2340,7 @@ async fn run_job(
 
                 // Nothing more is written for a job that is no longer ours.
                 if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, code.hint_el())?;
+                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, login_site.as_deref().unwrap_or(&job.url), repo))?;
                 }
                 // Only the job's owner writes evidence: a job MCR cancelled
                 // or the reaper gave away has no business leaving a file.
@@ -2440,6 +2468,14 @@ struct FailedPage<'a> {
 
 /// The site or yt-dlp's page scan named a video for this job: the API
 /// resolved it (a referer is kept), or the scan found at least one.
+/// Whether `video` is on another registrable domain than `article`.
+fn other_site(article: &str, video: &str) -> bool {
+    match (omni_core::urlnorm::registrable_domain(article), omni_core::urlnorm::registrable_domain(video)) {
+        (Some(a), Some(v)) => a != v,
+        _ => false,
+    }
+}
+
 fn site_named_video(api_or_sibling: bool, scanned_videos: usize) -> bool {
     api_or_sibling || scanned_videos >= 1
 }
@@ -3024,6 +3060,48 @@ async fn ensure_ytdl_folder_build(dep_mgr: &DependencyManager, channel: &str, au
 }
 
 /// Everything the maintenance tasks need, gathered once at start-up.
+/// Restrict `dirs` to SYSTEM, Administrators and the service account (P3.5).
+/// Does nothing unless `service_mode`. A failure is a warning and an amber
+/// health line; it never stops the service.
+async fn lock_down_install(service_mode: bool, dirs: &[PathBuf], health: &HealthState) {
+    use omni_core::health::{checks, Check};
+    if !service_mode {
+        return;
+    }
+    // LocalSystem re-applies the restriction. A named service account has Modify, which
+    // cannot change an ACL, so there the start only checks what install set.
+    use omni_core::lockdown::{action_for, Action};
+    let sid = omni_core::lockdown::current_sid().await;
+    let result = match action_for(sid.as_deref()) {
+        Action::Apply => omni_core::lockdown::apply(dirs, omni_core::lockdown::Account::System).await,
+        Action::Verify => omni_core::lockdown::verify(dirs).await,
+    };
+    match result {
+        Ok(()) => health.set(checks::LOCKDOWN, Check::ok("data and temp folders are restricted")),
+        Err(e) => {
+            warn!("Folder permissions not restricted: {e:#}");
+            health.set(checks::LOCKDOWN, Check::degraded(format!("data and temp folders are not restricted: {e:#}")));
+        }
+    }
+}
+
+/// The Cookies card's «Test» (P3.5): yt-dlp with the site's jar on a sample link.
+struct CookieJarTester {
+    repo: Repository,
+    bin_dir: PathBuf,
+    temp_path: PathBuf,
+}
+
+impl omni_web::state::CookieTester for CookieJarTester {
+    fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> omni_web::state::CookieTestFuture<'a> {
+        Box::pin(async move {
+            let ytdl = DependencyManager::new(&self.bin_dir).ytdl_live();
+            let t = omni_broadcast::cookie_file::test_jar(&ytdl, &self.temp_path, &self.repo, domain, url).await?;
+            Ok((t.ok, t.detail))
+        })
+    }
+}
+
 struct MaintenanceContext {
     bin_dir: PathBuf,
     temp_path: PathBuf,
@@ -3144,6 +3222,34 @@ async fn run_one_task(
             canary::heal_nightly(&ctx.canary).await;
             if failing > 0 {
                 anyhow::bail!("{failing} self-check link(s) not working; see Administration → Self-check");
+            }
+            Ok(TaskOutcome::Ok)
+        }
+
+        "cookie_test" => {
+            // Every jar against the last link it was tested with (P3.5), so an
+            // expired login is seen overnight and not by a journalist.
+            let jars = repo.list_cookie_jars()?;
+            let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
+            let (mut tested, mut failing) = (0usize, Vec::<String>::new());
+            for jar in &jars {
+                let Some(url) = jar.last_sample_url.as_deref() else { continue };
+                tested += 1;
+                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, url).await {
+                    Ok(t) if t.ok => {}
+                    Ok(_) => failing.push(jar.domain.clone()),
+                    Err(why) => {
+                        warn!("Cookie test for {} could not run: {why}", jar.domain);
+                        failing.push(jar.domain.clone());
+                    }
+                }
+            }
+            omni_core::cookies::refresh_health(repo, &ctx.health);
+            if tested == 0 {
+                return Ok(TaskOutcome::Skipped);
+            }
+            if !failing.is_empty() {
+                anyhow::bail!("The cookies for {} no longer log in; see Administration → Cookies", failing.join(", "));
             }
             Ok(TaskOutcome::Ok)
         }
@@ -3449,6 +3555,37 @@ fn sweep_evidence_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_single_video_on_another_site_names_that_site_and_leaves_the_job_alone() {
+        assert!(other_site("https://www.news.example/story/1", "https://x.com/a/status/1"));
+        assert!(!other_site("https://www.news.example/story/1", "https://cdn.news.example/v/1"));
+        // The hint is keyed on the embed's site while the job's own address stays the article.
+        let dir = std::env::temp_dir().join(format!("omni-f6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::new(dir.join("omni.db")).unwrap();
+        let article = "https://www.news.example/story/1";
+        let embed = Some("https://x.com/a/status/1".to_string());
+        assert_eq!(
+            omni_broadcast::errors::hint_for_job(ErrorCode::LoginRequired, embed.as_deref().unwrap_or(article), &repo),
+            omni_broadcast::errors::login_hint_el("x.com", false)
+        );
+        assert_eq!(
+            omni_broadcast::errors::hint_for_job(ErrorCode::LoginRequired, None::<String>.as_deref().unwrap_or(article), &repo),
+            ErrorCode::LoginRequired.hint_el()
+        );
+        drop(repo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn console_mode_never_restricts_the_folders() {
+        use omni_core::health::checks;
+        let dir = std::env::temp_dir();
+        let health = HealthState::new();
+        lock_down_install(false, &[dir], &health).await;
+        assert!(health.get(checks::LOCKDOWN).is_none(), "a console run must not touch permissions or report on it");
+    }
+
     use super::*;
     use omni_core::health::Health;
     use omni_core::models::QueueWatch;

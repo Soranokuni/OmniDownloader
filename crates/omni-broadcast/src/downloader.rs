@@ -46,6 +46,9 @@ pub struct DownloadOpts<'a> {
     pub cookie_header: Option<&'a str>,
     /// Netscape cookie jar for this domain (plan P3.5).
     pub cookie_jar: Option<&'a Path>,
+    /// The jar's values: yt-dlp quotes a line it rejects, so every error text of a
+    /// run that had a jar is scrubbed of them.
+    pub cookie_values: &'a [String],
     /// Skip TLS verification. Off by default (defect D-17): a station that
     /// ingests whatever a MITM hands it is not a station with working ingest.
     pub insecure_tls: bool,
@@ -65,6 +68,7 @@ impl Default for DownloadOpts<'_> {
             user_agent: None,
             cookie_header: None,
             cookie_jar: None,
+            cookie_values: &[],
             insecure_tls: false,
             max_height: 1080,
             concurrent_fragments: 4,
@@ -143,6 +147,28 @@ pub struct Downloader {
     ytdl_path: PathBuf,
     /// `deno.exe` next to yt-dlp, when it is there.
     deno: Option<PathBuf>,
+    /// The site's cookie jar file for the probes of this value (P3.5); a
+    /// download takes its own from `DownloadOpts::cookie_jar`.
+    cookie_jar: Option<PathBuf>,
+    cookie_values: Vec<String>,
+}
+
+/// `line` without any of the jar's `values` (and without query strings, see
+/// [`omni_core::cookies::scrub_detail`]); unchanged when there is no jar.
+pub(crate) fn scrub_error(line: String, values: &[String]) -> String {
+    if values.is_empty() {
+        line
+    } else {
+        omni_core::cookies::scrub_detail(&line, values)
+    }
+}
+
+/// `--cookies <path>` when a jar is given.
+fn cookie_args(jar: Option<&Path>) -> Vec<String> {
+    match jar {
+        Some(p) => vec!["--cookies".into(), p.to_string_lossy().into_owned()],
+        None => Vec::new(),
+    }
 }
 
 /// `--js-runtimes deno:<path>`: yt-dlp only looks for Deno on PATH by
@@ -165,7 +191,21 @@ impl Downloader {
             .take(2)
             .map(|d| d.join("deno.exe"))
             .find(|p| p.is_file());
-        Self { ytdl_path, deno }
+        Self { ytdl_path, deno, cookie_jar: None, cookie_values: Vec::new() }
+    }
+
+    /// Probes made through this value carry the jar file (plan P3.5). The caller
+    /// keeps the file alive for the call and removes it after.
+    pub fn with_cookie_jar(mut self, jar: Option<&crate::cookie_file::CookieFile>) -> Self {
+        self.cookie_jar = jar.map(|j| j.path().to_path_buf());
+        self.cookie_values = jar.map(|j| j.values().to_vec()).unwrap_or_default();
+        self
+    }
+
+    /// A yt-dlp error line as it may be stored, logged or returned: with a jar
+    /// in play, without its values.
+    fn scrubbed(&self, line: String) -> String {
+        scrub_error(line, &self.cookie_values)
     }
 
     /// Build the yt-dlp argument vector.
@@ -331,7 +371,7 @@ impl Downloader {
             };
             return Err(DownloadError {
                 code,
-                message: first_error_line(&outcome.stderr_tail),
+                message: scrub_error(first_error_line(&outcome.stderr_tail), opts.cookie_values),
             }
             .into());
         }
@@ -425,11 +465,12 @@ impl Downloader {
         .map(|s| s.to_string())
         .collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
-            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
     }
@@ -442,6 +483,7 @@ impl Downloader {
         let mut args: Vec<String> =
             ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()).collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => PageScan { videos: parse_page_videos(&o.stdout), unsupported: false },
@@ -499,11 +541,12 @@ impl Downloader {
         .map(|s| s.to_string())
         .collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => parse_platform_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
-            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
     }
@@ -554,11 +597,12 @@ impl Downloader {
         .map(|s| s.to_string())
         .collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => parse_info_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
-            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
     }
@@ -676,7 +720,7 @@ async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The first `ERROR:` line, which is the one worth showing an operator.
-fn first_error_line(stderr: &str) -> String {
+pub(crate) fn first_error_line(stderr: &str) -> String {
     stderr
         .lines()
         .find(|l| l.trim_start().to_uppercase().starts_with("ERROR"))
@@ -845,6 +889,37 @@ mod tests {
         let args = args_for(&DownloadOpts::default());
         let i = args.iter().position(|a| a == "--print").expect("--print");
         assert_eq!(args[i + 1], "after_move:filepath");
+    }
+
+    /// yt-dlp quotes a cookie line it rejects, value included, in its error text.
+    #[test]
+    fn an_error_of_a_run_that_had_a_jar_is_scrubbed_of_its_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = crate::cookie_file::CookieFile::write(dir.path(), ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\tleaky-value-998877\n").unwrap();
+        let quoted = "ERROR: invalid Netscape format cookies file: '.x.com\tFALSE\t/\tTRUE\t0\tauth_token\tleaky-value-998877'".to_string();
+
+        let dl = Downloader::new("yt-dlp").with_cookie_jar(Some(&jar));
+        let out = dl.scrubbed(quoted.clone());
+        assert!(!out.contains("leaky-value-998877"), "{out}");
+        assert!(out.contains("invalid Netscape format"));
+        // The download path uses the same function with the values from its options.
+        assert!(!scrub_error(quoted.clone(), jar.values()).contains("leaky-value-998877"));
+        // Without a jar the line is left exactly as it was.
+        assert_eq!(Downloader::new("yt-dlp").scrubbed(quoted.clone()), quoted);
+    }
+
+    #[test]
+    fn without_a_jar_there_is_no_cookies_flag_and_with_one_it_is_passed_by_path() {
+        let url = "https://x.com/i/status/1";
+        let none = Downloader::build_args(url, Path::new("C:/temp/jobs/7"), &DownloadOpts::default());
+        assert!(!none.iter().any(|a| a == "--cookies"), "{none:?}");
+        let jar = PathBuf::from("C:/temp/jobs/7/cookies.txt");
+        let with = Downloader::build_args(url, Path::new("C:/temp/jobs/7"), &DownloadOpts { cookie_jar: Some(&jar), ..Default::default() });
+        let i = with.iter().position(|a| a == "--cookies").expect("--cookies");
+        assert_eq!(with[i + 1], jar.to_string_lossy());
+        assert_eq!(with.last().unwrap(), url, "the link stays last");
+        assert_eq!(cookie_args(Some(&jar)), vec!["--cookies".to_string(), jar.to_string_lossy().into_owned()]);
+        assert!(cookie_args(None).is_empty());
     }
 
     #[test]

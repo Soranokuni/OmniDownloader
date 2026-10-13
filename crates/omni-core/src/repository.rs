@@ -5354,6 +5354,134 @@ mod recipe_sql {
     }
 }
 
+// ---------------------------------------------------------------- cookie jars (P3.5)
+
+impl Repository {
+    /// Store the jar for `domain`, sealed, replacing any earlier one. The
+    /// text is never logged. At most [`crate::cookies::MAX_JARS`] jars: a new
+    /// domain beyond that is refused, a replacement is not.
+    pub fn put_cookie_jar(
+        &self,
+        domain: &str,
+        jar: &crate::cookies::ParsedJar,
+        updated_by: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let sealed = crate::secrets::seal_bytes(jar.text.as_bytes()).context("Could not seal the cookie jar")?;
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row("SELECT COUNT(*) FROM cookie_jars WHERE domain = ?", params![domain], |r| r.get::<_, i64>(0))? > 0;
+        if !exists {
+            let n: i64 = tx.query_row("SELECT COUNT(*) FROM cookie_jars", [], |r| r.get(0))?;
+            if n as usize >= crate::cookies::MAX_JARS {
+                anyhow::bail!("At most {} cookie jars can be stored.", crate::cookies::MAX_JARS);
+            }
+        }
+        // A new upload starts a new life: the old test result described other cookies.
+        // The sample address stays, so the nightly test has something to run.
+        tx.execute(
+            "INSERT INTO cookie_jars (domain, sealed, cookie_count, expires_min, updated_at, updated_by)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(domain) DO UPDATE SET sealed = excluded.sealed, cookie_count = excluded.cookie_count,
+               expires_min = excluded.expires_min, updated_at = excluded.updated_at, updated_by = excluded.updated_by,
+               last_test_at = NULL, last_test_ok = NULL, last_test_detail = NULL",
+            params![
+                domain,
+                sealed,
+                jar.count as i64,
+                jar.expires_min.map(timestamps::format),
+                timestamps::format(now),
+                updated_by
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The Netscape text of the jar for `domain`, unsealed. `None` when there is
+    /// no jar; an error when it cannot be opened (a database moved to another machine).
+    pub fn cookie_jar_text(&self, domain: &str) -> Result<Option<String>> {
+        let conn = self.pool.get()?;
+        let sealed: Option<Vec<u8>> = conn
+            .query_row("SELECT sealed FROM cookie_jars WHERE domain = ?", params![domain], |r| r.get(0))
+            .optional()?;
+        let Some(sealed) = sealed else { return Ok(None) };
+        let plain = crate::secrets::unseal_bytes(&sealed).context("Could not open the cookie jar")?;
+        Ok(Some(String::from_utf8(plain).context("The cookie jar is not text")?))
+    }
+
+    /// Whether a jar exists for `domain`, without opening it.
+    pub fn has_cookie_jar(&self, domain: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.query_row("SELECT COUNT(*) FROM cookie_jars WHERE domain = ?", params![domain], |r| r.get::<_, i64>(0))? > 0)
+    }
+
+    /// Every jar's cookie values, for the log redactor. Jars that cannot be
+    /// opened are skipped.
+    pub fn cookie_values(&self) -> Vec<String> {
+        let domains: Vec<String> = match self.list_cookie_jars() {
+            Ok(j) => j.into_iter().map(|j| j.domain).collect(),
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for d in domains {
+            if let Ok(Some(text)) = self.cookie_jar_text(&d) {
+                out.extend(text.lines().filter(|l| !l.starts_with('#') || l.starts_with("#HttpOnly_")).filter_map(|l| {
+                    let v = l.split('\t').nth(6)?;
+                    (!v.is_empty()).then(|| v.to_string())
+                }));
+            }
+        }
+        out
+    }
+
+    /// The jars, without contents, by domain.
+    pub fn list_cookie_jars(&self) -> Result<Vec<crate::cookies::CookieJarInfo>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT domain, cookie_count, expires_min, updated_at, updated_by, last_test_at, last_test_ok,
+                    last_test_detail, last_sample_url FROM cookie_jars ORDER BY domain",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::cookies::CookieJarInfo {
+                domain: r.get(0)?,
+                cookie_count: r.get(1)?,
+                expires_min: timestamps::parse_opt(r.get(2)?),
+                updated_at: timestamps::parse_opt(r.get(3)?),
+                updated_by: r.get(4)?,
+                last_test_at: timestamps::parse_opt(r.get(5)?),
+                last_test_ok: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                last_test_detail: r.get(7)?,
+                last_sample_url: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_cookie_jar(&self, domain: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("DELETE FROM cookie_jars WHERE domain = ?", params![domain])? > 0)
+    }
+
+    /// The outcome of a test of the jar for `domain`, and the address it used.
+    /// `detail` is already scrubbed (see [`crate::cookies::scrub_detail`]).
+    pub fn record_cookie_test(
+        &self,
+        domain: &str,
+        ok: bool,
+        detail: &str,
+        sample_url: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE cookie_jars SET last_test_at = ?, last_test_ok = ?, last_test_detail = ?, last_sample_url = ? WHERE domain = ?",
+            params![timestamps::format(now), ok as i64, detail, sample_url, domain],
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

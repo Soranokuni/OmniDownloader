@@ -889,6 +889,115 @@ document.getElementById('test-url-form').addEventListener('submit', async (event
 
 
 /* ------------------------------------------------------------------ *
+ * Cookies (plan P3.5): one cookie jar per login-walled site
+ * ------------------------------------------------------------------ */
+
+// The file's text is held only until it is uploaded; the page never shows it
+// and the server never sends cookies back.
+let cookieFileText = '';
+const cookiesResult = document.getElementById('cookies-result');
+
+function showCookies(message, ok) {
+  cookiesResult.textContent = message;
+  cookiesResult.className = ok ? 'note ok' : 'note bad';
+}
+
+function cookieTestBadge(jar) {
+  if (jar.last_test_ok === null || jar.last_test_ok === undefined) return el('span', { class: 'badge' }, 'not tested');
+  return el('span', { class: jar.last_test_ok ? 'badge ok' : 'badge bad', title: jar.last_test_detail || '' },
+    jar.last_test_ok ? 'ok' : 'failed');
+}
+
+async function testCookies(jar, input, button) {
+  const url = input.value.trim() || (jar.sample ? `https://${jar.sample}` : '');
+  if (!url) { toast('Enter a public link of the site to test with.', 'bad'); return; }
+  button.disabled = true;
+  button.textContent = 'Testing…';
+  try {
+    const out = await api(`/api/admin/cookies/${encodeURIComponent(jar.domain)}/test`, { method: 'POST', body: { url } });
+    toast(out.ok ? 'The cookies log in.' : `The test failed: ${out.detail}`, out.ok ? 'ok' : 'bad');
+  } catch (e) {
+    toast(e.message, 'bad');
+  }
+  loadCookies();
+}
+
+async function deleteCookies(jar) {
+  if (!confirm(`Delete the cookies for ${jar.domain}? Jobs on that site will no longer be logged in.`)) return;
+  try {
+    await api(`/api/admin/cookies/${encodeURIComponent(jar.domain)}/delete`, { method: 'POST' });
+    toast('Deleted.', 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+  loadCookies();
+}
+
+async function loadCookies() {
+  let data;
+  try {
+    data = await api('/api/admin/cookies');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  const jars = data.jars || [];
+  if (jars.length === 0) {
+    render('cookies-body', el('tr', {}, el('td', { colspan: '7', class: 'empty' }, 'No cookies uploaded.')));
+    return;
+  }
+  render('cookies-body', jars.map((jar) => {
+    const input = el('input', { type: 'text', class: 'mono', placeholder: jar.sample || `https://${jar.domain}/…`, autocomplete: 'off' });
+    const testBtn = el('button', { class: 'btn', type: 'button' }, 'Test');
+    testBtn.addEventListener('click', () => testCookies(jar, input, testBtn));
+    const delBtn = el('button', { class: 'btn btn-danger', type: 'button' }, 'Delete');
+    delBtn.addEventListener('click', () => deleteCookies(jar));
+    return el('tr', {},
+      el('td', { class: 'mono strong' }, jar.domain),
+      el('td', { class: 'right' }, String(jar.cookie_count)),
+      el('td', {}, jar.expires_min ? fmtTime(jar.expires_min) : 'session only'),
+      el('td', {}, `${jar.updated_by} · ${fmtTime(jar.updated_at)}`),
+      el('td', {}, cookieTestBadge(jar), ' ', el('span', { class: 'note' }, jar.last_test_at ? fmtTime(jar.last_test_at) : ''),
+        jar.last_test_ok === false && jar.last_test_detail ? el('div', { class: 'note' }, jar.last_test_detail) : null),
+      el('td', {}, input, jar.sample ? el('div', { class: 'note mono' }, `last: ${jar.sample}`) : null),
+      el('td', {}, el('div', { class: 'row tight' }, testBtn, delBtn)),
+    );
+  }));
+}
+
+const cookiesFile = document.getElementById('cookies-file');
+document.getElementById('cookies-pick').addEventListener('click', () => cookiesFile.click());
+cookiesFile.addEventListener('change', async () => {
+  const file = cookiesFile.files && cookiesFile.files[0];
+  cookiesFile.value = '';
+  if (!file) return;
+  cookieFileText = await file.text();
+  document.getElementById('cookies-file-note').textContent = `${file.name} chosen (${Math.ceil(file.size / 1024)} KiB). It is not shown.`;
+});
+document.getElementById('cookies-refresh').addEventListener('click', loadCookies);
+document.getElementById('cookies-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const domain = document.getElementById('cookies-domain').value.trim().toLowerCase();
+  if (!cookieFileText) { showCookies('Choose the cookies.txt file first.', false); return; }
+  const button = document.getElementById('cookies-upload');
+  button.disabled = true;
+  try {
+    const out = await api('/api/admin/cookies', { method: 'POST', body: { domain, netscape: cookieFileText } });
+    showCookies(
+      `${out.replaced ? 'Replaced' : 'Stored'} ${out.cookie_count} cookie(s) for ${out.domain}.` +
+      (out.skipped_other_site ? `\n${out.skipped_other_site} line(s) of other sites were dropped.` : '') +
+      (out.skipped_malformed ? `\n${out.skipped_malformed} line(s) were not cookies and were dropped.` : ''),
+      true);
+    cookieFileText = '';
+    document.getElementById('cookies-file-note').textContent = '';
+  } catch (e) {
+    showCookies(e.message, false);
+  } finally {
+    button.disabled = false;
+    loadCookies();
+  }
+});
+
+
+/* ------------------------------------------------------------------ *
  * Audit log
  * ------------------------------------------------------------------ */
 
@@ -1381,6 +1490,7 @@ loadSelfcheck();
 loadSites();
 loadRecipes();
 loadReport();
+loadCookies();
 loadTestUrl();
 loadUsers();
 loadTaxonomy();

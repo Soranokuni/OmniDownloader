@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::admin_cookies;
 use crate::admin_sites;
 use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, security_headers};
@@ -117,6 +118,9 @@ impl WebServer {
             .route("/api/admin/recipes/:id/retire", post(admin_sites::api_admin_recipe_retire))
             .route("/api/admin/repair-report", get(admin_sites::api_admin_repair_report))
             .route("/api/admin/test-url", get(admin_sites::api_admin_test_url_info).post(admin_sites::api_admin_test_url))
+            .route("/api/admin/cookies", get(admin_cookies::api_admin_cookies).post(admin_cookies::api_admin_cookies_put))
+            .route("/api/admin/cookies/:domain/delete", post(admin_cookies::api_admin_cookies_delete))
+            .route("/api/admin/cookies/:domain/test", post(admin_cookies::api_admin_cookies_test))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))

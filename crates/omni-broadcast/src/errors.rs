@@ -261,6 +261,33 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// The card's hint for a login wall, naming the site (P3.5): no jar yet, or a
+/// jar that no longer gets in. Greek, for MCR; the action is the admin's.
+pub fn login_hint_el(domain: &str, jar_exists: bool) -> String {
+    if jar_exists {
+        format!("Τα cookies για {domain} έληξαν· ανεβάστε νέα")
+    } else {
+        format!("Χρειάζονται cookies για {domain}: Διαχείριση → Cookies")
+    }
+}
+
+/// What the card tells the operator for a job that failed with `code`: the
+/// code's own hint, except a login wall on a video platform (or a site that has
+/// a jar), which names the site and says whether a jar is already there. A
+/// login wall on a news article does not name the article's site: the wall was
+/// the embedded player's, which this link does not tell, so the generic hint stands.
+pub fn hint_for_job(code: ErrorCode, url: &str, repo: &omni_core::repository::Repository) -> String {
+    if code == ErrorCode::LoginRequired {
+        if let Some(domain) = omni_core::cookies::jar_domain_for_url(url) {
+            let jar = repo.has_cookie_jar(&domain).unwrap_or(false);
+            if jar || crate::downloader::is_video_platform(url) {
+                return login_hint_el(&domain, jar);
+            }
+        }
+    }
+    code.hint_el().to_string()
+}
+
 /// Classify a download failure from the tool's stderr tail.
 ///
 /// Order matters: the specific messages are matched before the generic ones,
@@ -307,6 +334,11 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
         || s.contains("cookies-from-browser")
         || s.contains("members-only")
         || s.contains("private account")
+        // X, Facebook and Instagram when the link needs the station's login (P3.5).
+        || s.contains("this post is unavailable")
+        || s.contains("age-restricted")
+        || s.contains("you need to log in")
+        || s.contains("you must log in")
     {
         return ErrorCode::LoginRequired;
     }
@@ -464,6 +496,68 @@ mod tests {
             classify_download_error("ERROR: [youtube] zzzzzzzzzz0: This video is unavailable in your country"),
             ErrorCode::GeoBlocked
         );
+    }
+
+    /// P3.5: what the login-wall messages of X, Facebook and Instagram look like.
+    #[test]
+    fn login_walls_are_recognised_and_ordinary_failures_are_not() {
+        for msg in [
+            "ERROR: [twitter] 1: NSFW tweet requires authentication. Use --cookies, --cookies-from-browser, --username and --password",
+            "ERROR: [twitter] 2: This post is unavailable",
+            "ERROR: [Instagram] abc: Requested content is not available, rate-limit reached or login required. Use --cookies",
+            "ERROR: [facebook] 3: You must log in to continue",
+            "ERROR: [facebook] 4: You need to log in to access this content",
+            "ERROR: [youtube] 5: Sign in to confirm your age. This video may be inappropriate for some users.",
+            "ERROR: [youtube] 6: This video is age-restricted",
+        ] {
+            assert_eq!(classify_download_error(msg), ErrorCode::LoginRequired, "{msg}");
+        }
+        for (msg, not) in [
+            ("ERROR: [twitter] 1: No video could be found in this tweet", ErrorCode::LoginRequired),
+            ("ERROR: unable to download video data: HTTP Error 403: Forbidden", ErrorCode::LoginRequired),
+            ("ERROR: [youtube] 1: Private video. Sign in if you've been granted access", ErrorCode::LoginRequired),
+            ("ERROR: Unsupported URL: https://www.example.gr/a", ErrorCode::LoginRequired),
+        ] {
+            assert_ne!(classify_download_error(msg), not, "{msg}");
+        }
+        assert!(!ErrorCode::LoginRequired.is_retryable());
+    }
+
+    #[test]
+    fn a_url_that_merely_says_nsfw_is_not_a_login_wall() {
+        assert_eq!(
+            classify_download_error("ERROR: [generic] https://example.org/nsfw-clip: HTTP Error 403: Forbidden"),
+            ErrorCode::Http403
+        );
+        // X's own NSFW message is still caught by its other words.
+        assert_eq!(
+            classify_download_error("ERROR: [twitter] 1: NSFW tweet requires authentication. Use --cookies"),
+            ErrorCode::LoginRequired
+        );
+    }
+
+    #[test]
+    fn the_login_hint_names_the_site_and_says_whether_a_jar_exists() {
+        assert_eq!(login_hint_el("x.com", false), "Χρειάζονται cookies για x.com: Διαχείριση → Cookies");
+        assert_eq!(login_hint_el("x.com", true), "Τα cookies για x.com έληξαν· ανεβάστε νέα");
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let url = "https://twitter.com/someone/status/1";
+        // An article on a news site is not the site that asked for a login.
+        let article = "https://www.news.example/story/12345";
+        assert_eq!(hint_for_job(ErrorCode::LoginRequired, article, &repo), ErrorCode::LoginRequired.hint_el());
+        assert_eq!(hint_for_job(ErrorCode::LoginRequired, url, &repo), login_hint_el("x.com", false));
+        let jar = omni_core::cookies::parse_netscape("x.com", ".x.com	TRUE	/	TRUE	0	n	value-123456
+").unwrap();
+        repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
+        assert_eq!(hint_for_job(ErrorCode::LoginRequired, url, &repo), login_hint_el("x.com", true));
+        // A site the admin gave a jar is named even when it is not a known platform.
+        let jar = omni_core::cookies::parse_netscape("news.example", ".news.example\tTRUE\t/\tTRUE\t0\tn\tvalue-123456\n").unwrap();
+        repo.put_cookie_jar("news.example", &jar, "admin", chrono::Utc::now()).unwrap();
+        assert_eq!(hint_for_job(ErrorCode::LoginRequired, article, &repo), login_hint_el("news.example", true));
+        // Another code keeps its own hint.
+        assert_eq!(hint_for_job(ErrorCode::GeoBlocked, url, &repo), ErrorCode::GeoBlocked.hint_el());
     }
 
     #[test]

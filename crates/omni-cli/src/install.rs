@@ -213,6 +213,17 @@ pub async fn install(o: InstallOptions) -> Result<()> {
                 grant_modify(&a.name, &watch).await;
             }
         }
+        // data\ and temp\ hold the sealed secrets and cookie jars (P3.5): after the
+        // grant above, so the service account keeps Modify on them.
+        let account_arg = match &account {
+            Some(a) => omni_core::lockdown::Account::Named(a.name.clone()),
+            None => omni_core::lockdown::Account::System,
+        };
+        let dirs = [paths.data.clone(), paths.resolve(&config.temp_path)];
+        match omni_core::lockdown::apply(&dirs, account_arg).await {
+            Ok(()) => println!("  data and temp folders restricted to SYSTEM, Administrators and the service account."),
+            Err(e) => println!("! Could not restrict the data and temp folders ({e:#}); set it by hand."),
+        }
     }
     if !o.no_firewall && !is_loopback(&config.web_host) {
         open_firewall(&target_exe, config.web_port).await;
