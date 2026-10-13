@@ -56,3 +56,6 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.regex]
 opt-level = 3
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }

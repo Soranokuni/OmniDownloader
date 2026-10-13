@@ -35,6 +35,26 @@ pub struct EvidenceRow {
     pub created_at: Option<chrono::DateTime<Utc>>,
 }
 
+/// Self-heal runs kept (P10.14).
+pub const SELFHEAL_MAX_ROWS: i64 = 500;
+/// Days a self-heal run is kept.
+pub const SELFHEAL_KEEP_DAYS: i64 = 30;
+
+/// One overnight self-heal run on a broken site (plan P10.14).
+#[derive(Debug, Clone)]
+pub struct SelfhealReport {
+    pub id: i64,
+    pub domain: String,
+    /// `None` when the stored text does not parse; never shown as "now".
+    pub at: Option<chrono::DateTime<Utc>>,
+    /// `found` | `nothing` | `skipped` | `outage`.
+    pub outcome: String,
+    pub recipe_hash: Option<String>,
+    pub origin: Option<String>,
+    pub pages: i64,
+    pub detail: Option<String>,
+}
+
 /// One run of the repair ladder on a job (plan P10.11a).
 #[derive(Debug, Clone)]
 pub struct RepairAttempt {
@@ -3794,6 +3814,65 @@ impl Repository {
         Ok(conn.execute("DELETE FROM repair_skips WHERE until <= ?", params![timestamps::format(now)])?)
     }
 
+    /// One overnight self-heal run on a broken site (P10.14), kept 30 days and
+    /// at most [`SELFHEAL_MAX_ROWS`] rows (the oldest go first). Hosts and a
+    /// recipe hash only: no page address ever lands here.
+    pub fn record_selfheal(
+        &self,
+        domain: &str,
+        outcome: &str,
+        recipe_hash: Option<&str>,
+        origin: Option<&str>,
+        pages: usize,
+        detail: Option<&str>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO selfheal_reports (domain, at, outcome, recipe_hash, origin, pages, detail)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![domain.trim().to_lowercase(), timestamps::format(now), outcome, recipe_hash, origin, pages as i64, detail],
+        )?;
+        tx.execute(
+            "DELETE FROM selfheal_reports WHERE id NOT IN (SELECT id FROM selfheal_reports ORDER BY id DESC LIMIT ?)",
+            params![SELFHEAL_MAX_ROWS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The self-heal runs since `since`, newest first.
+    pub fn selfheal_since(&self, since: chrono::DateTime<Utc>) -> Result<Vec<SelfhealReport>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, domain, at, outcome, recipe_hash, origin, pages, detail FROM selfheal_reports
+             WHERE at >= ? ORDER BY at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![timestamps::format(since)], |r| {
+                Ok(SelfhealReport {
+                    id: r.get(0)?,
+                    domain: r.get(1)?,
+                    at: timestamps::parse(&r.get::<_, String>(2)?),
+                    outcome: r.get(3)?,
+                    recipe_hash: r.get(4)?,
+                    origin: r.get(5)?,
+                    pages: r.get(6)?,
+                    detail: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Retention: self-heal runs older than 30 days.
+    pub fn purge_selfheal(&self, now: chrono::DateTime<Utc>) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let cutoff = timestamps::format(now - Duration::days(SELFHEAL_KEEP_DAYS));
+        Ok(conn.execute("DELETE FROM selfheal_reports WHERE at < ?", params![cutoff])?)
+    }
+
     /// A held row whose job moved on without it: the condition of
     /// [`held_sweep_action`], checked again in SQL.
     pub fn supersede_held(&self, job_id: i64) -> Result<bool> {
@@ -4473,6 +4552,31 @@ mod recipe_sql {
             family: Option<&str>,
             now: DateTime<Utc>,
         ) -> Result<Vec<RankedRecipe>> {
+            self.ranked_recipes(domain, family, now, false)
+        }
+
+        /// The recipes the overnight self-heal tries on a site's canary pages
+        /// (P10.14): [`Self::recipes_for_site`] plus every recipe (site, player or
+        /// shipped) suspended here as `failing`, so a recipe the site outgrew can
+        /// earn its way back; the canary misses that suspend one fast are the same
+        /// events that lift it. Never one suspended as `rejected`
+        /// (MCR said it gave a wrong video), never barred steps, never retired.
+        pub fn recipes_for_canary(
+            &self,
+            domain: &str,
+            family: Option<&str>,
+            now: DateTime<Utc>,
+        ) -> Result<Vec<RankedRecipe>> {
+            self.ranked_recipes(domain, family, now, true)
+        }
+
+        fn ranked_recipes(
+            &self,
+            domain: &str,
+            family: Option<&str>,
+            now: DateTime<Utc>,
+            with_failing: bool,
+        ) -> Result<Vec<RankedRecipe>> {
             let conn = self.pool.get()?;
             let mut stmt = conn.prepare(concat!(
                 "SELECT ", head_cols!(), ", recipe_json, dsl_version FROM recipes
@@ -4488,7 +4592,8 @@ mod recipe_sql {
             for (head, json, dsl) in found {
                 let rows = load_rows(&conn, head.id)?;
                 let mine = rows.iter().find(|(d, _)| d == domain).map(|(_, r)| r);
-                if mine.map_or(false, SiteRow::is_suspended) {
+                let retry = with_failing && mine.is_some_and(|r| r.suspended_reason == Some(SuspendReason::Failing));
+                if mine.map_or(false, SiteRow::is_suspended) && !retry {
                     continue;
                 }
                 // Steps MCR rejected on this domain stay barred, whatever recipe carries them.

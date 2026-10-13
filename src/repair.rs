@@ -11,6 +11,7 @@
 //! is gone, and spends a bounded time (`repair.budget_secs`) before the download.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use omni_browser::sniffer::{classify_live_run, LiveRun};
 use omni_browser::{HttpFetcher, PageSnapshot, StreamSniffer};
 use omni_core::config::RepairMode;
 use omni_core::models::{Job, JobStage};
-use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, RankedRecipe, ScopeKind};
+use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, RankedRecipe, ScopeKind, SiteState};
 use omni_email::llm::{LlmClient, Usage};
 use omni_core::repository::{AttemptEnd, RepairAttempt, Repository};
 
@@ -499,8 +500,11 @@ fn skips_of_site(repo: &Repository, job: &Job, orig_url: &str) -> Option<Vec<Str
     }
 }
 
+/// The job id of a self-heal probe (P10.14): there is no job, so no lease to lose.
+const NO_JOB: i64 = 0;
+
 fn lost(ctx: &RepairCtx, job_id: i64, owner: &str, cancel: &CancellationToken) -> bool {
-    cancel.is_cancelled() || !crate::still_ours(&ctx.repo, job_id, owner)
+    cancel.is_cancelled() || (job_id != NO_JOB && !crate::still_ours(&ctx.repo, job_id, owner))
 }
 
 fn note(ctx: &RepairCtx, job_id: i64, level: &str, text: &str) {
@@ -1076,7 +1080,7 @@ fn rejection_note(round: usize, r: &repair_gate::Rejected) -> RoundNote {
 /// a URL from the answer's text; stops at the first verified candidate.
 async fn llm_rung(
     ctx: &RepairCtx,
-    job: &Job,
+    job_id: i64,
     owner: &str,
     orig_url: &str,
     domain: &str,
@@ -1086,9 +1090,9 @@ async fn llm_rung(
     cancel: &CancellationToken,
     deadline: Instant,
     live_used: bool,
+    max_rounds: usize,
     stats: &mut LlmStats,
 ) -> LlmFlow {
-    let job_id = job.id;
     let cfg = &ctx.cfg.llm;
     let Some(model) = ctx.env.model().filter(|_| cfg.active()) else {
         return LlmFlow::Nothing;
@@ -1133,7 +1137,7 @@ async fn llm_rung(
     let mut live_spent = live_used;
     let mut click_attempted = false;
 
-    for round in 1..=LLM_MAX_ROUNDS {
+    for round in 1..=max_rounds {
         if lost(ctx, job_id, owner, cancel) {
             return LlmFlow::Lost;
         }
@@ -1202,7 +1206,7 @@ async fn llm_rung(
                 && resolved.click.is_some()
                 && !live_spent
                 && !click_attempted
-                && round < LLM_MAX_ROUNDS;
+                && round < max_rounds;
             if !click_round {
                 stats.reason = resolved.reason;
                 break;
@@ -1326,7 +1330,7 @@ async fn llm_rung(
         }
 
         // A click: once per ladder run, with the budget for it and for the gate.
-        let click = resolved.click.clone().filter(|_| !live_spent && !click_attempted && round < LLM_MAX_ROUNDS);
+        let click = resolved.click.clone().filter(|_| !live_spent && !click_attempted && round < max_rounds);
         if let Some(css) = click {
             let left = deadline.saturating_duration_since(Instant::now());
             if left >= LIVE_MIN_LEFT + GATE_RESERVE {
@@ -1433,7 +1437,7 @@ async fn ladder(
         let mut stats = LlmStats::default();
         let flow = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline + GRACE),
-            llm_rung(ctx, job, owner, orig_url, &domain, &snap, &tried, prior, cancel, deadline, live_used, &mut stats),
+            llm_rung(ctx, job_id, owner, orig_url, &domain, &snap, &tried, prior, cancel, deadline, live_used, LLM_MAX_ROUNDS, &mut stats),
         )
         .await;
         end.llm_calls = stats.calls;
@@ -1784,6 +1788,425 @@ async fn hold_one(
             note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: η λήψη από {host} απέτυχε ({})", code.as_str()));
             HoldStep::Failed
         }
+    }
+}
+
+// ------------------------------------------------------- self-heal (P10.14)
+
+/// Canary pages one probe looks at, per site.
+const PROBE_MAX_PAGES: usize = 3;
+/// Model calls one self-heal run may make in all, on top of the day's cap.
+pub(crate) const PROBE_LLM_CALLS: u32 = 5;
+/// Model calls one daytime heal may make.
+pub(crate) const DAY_PROBE_LLM_CALLS: u32 = 1;
+/// Pages a recipe must give a verified, matching video on before it earns any pass.
+const PROBE_MIN_PAGES: usize = 2;
+
+/// What a probe found for a broken site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealFound {
+    pub recipe_id: i64,
+    /// The recipe's full hash.
+    pub recipe_hash: String,
+    /// `shipped` | `admin` | `llm`.
+    pub origin: String,
+    /// Canary pages it gave a verified, matching video on.
+    pub pages: usize,
+}
+
+/// What the overnight self-heal came to for one site.
+#[derive(Debug, Clone)]
+pub struct SiteHeal {
+    pub domain: String,
+    pub found: Option<HealFound>,
+    /// `found` | `nothing` | `skipped` | `outage`.
+    pub outcome: &'static str,
+    pub detail: String,
+}
+
+impl SiteHeal {
+    pub fn skipped(domain: &str, detail: &str) -> Self {
+        Self { domain: domain.to_string(), found: None, outcome: "skipped", detail: detail.to_string() }
+    }
+}
+
+/// Store a run for the admin card and the desk's morning line. Bookkeeping only.
+pub fn record_report(repo: &Repository, heal: &SiteHeal, now: chrono::DateTime<Utc>) {
+    let (hash, origin, pages) = match &heal.found {
+        Some(f) => (Some(f.recipe_hash.as_str()), Some(f.origin.as_str()), f.pages),
+        None => (None, None, 0),
+    };
+    let detail = Some(heal.detail.as_str()).filter(|d| !d.is_empty());
+    if let Err(e) = repo.record_selfheal(&heal.domain, heal.outcome, hash, origin, pages, detail, now) {
+        warn!("Self-heal: the report for {} could not be stored: {e:#}", heal.domain);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// A verified candidate whose length matches what the canary delivered.
+    Hit,
+    /// It ran on a complete page and conclusively found nothing.
+    Miss,
+}
+
+/// What each recipe did on each canary page, in page order.
+#[derive(Default)]
+struct Tally {
+    order: Vec<i64>,
+    /// id -> (full hash, origin).
+    meta: HashMap<i64, (String, String)>,
+    events: Vec<(i64, Verdict)>,
+    /// id -> its state on the site before this run (`None`: no row yet).
+    before: HashMap<i64, Option<SiteState>>,
+    /// id -> the `skip_pattern`s of the addresses it was counted with: one video is one page.
+    counted_with: HashMap<i64, Vec<(String, f64)>>,
+    /// Pages of this site that got the model rung (at most one per run).
+    llm_pages: usize,
+}
+
+impl Tally {
+    /// Count a hit unless the recipe was already counted with the same video.
+    /// The same video is the same host and path with a length within max(3 s, 5 %); a query
+    /// that only tells two videos apart by their length still gives two pages.
+    fn add_hit(&mut self, id: i64, hash: &str, origin: &str, url: &str, secs: f64) -> bool {
+        let key = omni_core::urlnorm::skip_pattern(url).unwrap_or_else(|| url.to_string());
+        let seen = self.counted_with.entry(id).or_default();
+        if seen.iter().any(|(k, d)| *k == key && (secs - d).abs() <= (d * 0.05).max(3.0)) {
+            return false;
+        }
+        seen.push((key, secs));
+        self.add(id, hash, origin, Verdict::Hit);
+        true
+    }
+
+    fn add(&mut self, id: i64, hash: &str, origin: &str, v: Verdict) {
+        if !self.meta.contains_key(&id) {
+            self.order.push(id);
+            self.meta.insert(id, (hash.to_string(), origin.to_string()));
+        }
+        self.events.push((id, v));
+    }
+    fn hits(&self, id: i64) -> usize {
+        self.events.iter().filter(|(i, v)| *i == id && *v == Verdict::Hit).count()
+    }
+}
+
+/// What the recipes gave on one canary page.
+#[derive(Default)]
+struct PageAcc {
+    cands: Vec<Candidate>,
+    /// (recipe id, address) for every address a recipe produced.
+    produced: Vec<(i64, String)>,
+    misses: Vec<i64>,
+}
+
+fn probe_take(acc: &mut PageAcc, prior: &Prior, r: &RankedRecipe, page: &PageSnapshot, outcome: RecipeOutcome) {
+    match outcome {
+        RecipeOutcome::Media { url, referer } => {
+            let url = omni_core::net::parse_public_url(&url).map(|(u, _)| u.to_string()).unwrap_or(url);
+            // Videos MCR called wrong on this site are never offered, and give no event.
+            if prior.skipped(&url) {
+                return;
+            }
+            if !acc.cands.iter().any(|c| c.url == url && c.referer == referer) {
+                let (position, in_article) = player_for(page, &url);
+                acc.cands.push(Candidate { url: url.clone(), referer, origin: format!("recipe:{}", hash8(&r.hash)), position, in_article });
+            }
+            acc.produced.push((r.id, url));
+        }
+        RecipeOutcome::NeedsLivePage => {}
+        // Not the recipe's fault: another evaluation held the permit, or time ran out.
+        RecipeOutcome::Rejected(why) if why == "busy" || why == "deadline exceeded" => {}
+        RecipeOutcome::NoValue { .. } | RecipeOutcome::Rejected(_) => acc.misses.push(r.id),
+    }
+}
+
+/// Does this verified video count for a canary page? With the length the
+/// canary's own job delivered, it must match within max(3 s, 5 %); with none
+/// known, the gate must have matched a length the page itself states.
+fn duration_counts(v: &Verified, delivered: Option<f64>) -> bool {
+    match delivered.filter(|d| *d > 0.0) {
+        Some(d) => (v.duration_secs - d).abs() <= (d * 0.05).max(3.0),
+        None => v.checks.iter().any(|c| c.name == "length" && c.ok),
+    }
+}
+
+/// The length the canary's original job delivered; `None` when not known.
+fn delivered_secs(repo: &Repository, domain: &str, url: &str) -> Option<f64> {
+    let row = repo.list_canaries_for(domain).ok()?.into_iter().find(|c| c.url == url)?;
+    let job = repo.get_job(row.job_id?).ok().flatten()?;
+    (job.duration_secs > 0.0).then_some(job.duration_secs)
+}
+
+/// The overnight self-heal for one broken site (P10.14): the recipe rung and,
+/// when allowed, the model rung on up to three canary pages, **probe only**:
+/// nothing is downloaded, held or delivered, no job and no repair attempt is
+/// created. A recipe that gives a verified video of the right length on at
+/// least two pages earns a `CanaryPass` for each (so it becomes active, or a
+/// recipe suspended as `failing` is lifted); one that ran on a complete page
+/// and conclusively missed earns a `CanaryFail`. One counted page records no
+/// pass at all: a single page is not proof. Inconclusive pages (an incomplete
+/// look, a timeout, a busy evaluation, the budget) record nothing. A recipe
+/// suspended as `rejected` is never tried, nor steps MCR barred, nor addresses
+/// MCR called a wrong video.
+#[cfg(test)]
+pub async fn probe_site(
+    ctx: &RepairCtx,
+    domain: &str,
+    pages: &[String],
+    now: chrono::DateTime<Utc>,
+    deadline: Instant,
+) -> SiteHeal {
+    probe_site_with(ctx, domain, pages, now, deadline, &AtomicU32::new(PROBE_LLM_CALLS)).await
+}
+
+/// [`probe_site`] with the model calls left to this self-heal run, shared by its sites.
+pub async fn probe_site_with(
+    ctx: &RepairCtx,
+    domain: &str,
+    pages: &[String],
+    now: chrono::DateTime<Utc>,
+    deadline: Instant,
+    llm_left: &AtomicU32,
+) -> SiteHeal {
+    if ctx.cfg.mode == RepairMode::Off {
+        return SiteHeal::skipped(domain, "repair off");
+    }
+    let pages = &pages[..pages.len().min(PROBE_MAX_PAGES)];
+    if pages.is_empty() {
+        return SiteHeal::skipped(domain, "no canary pages");
+    }
+    let skips = match ctx.repo.repair_skip_patterns(domain, now) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Self-heal: the skip list of {domain} could not be read: {e:#}");
+            return SiteHeal::skipped(domain, "store unreadable");
+        }
+    };
+    let prior = Prior { skips, ..Default::default() };
+    let mut tally = Tally::default();
+    let mut complete = 0usize;
+    for url in pages {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let page_deadline = (Instant::now() + ctx.cfg.budget).min(deadline);
+        let delivered = delivered_secs(&ctx.repo, domain, url);
+        if probe_page(ctx, domain, url, delivered, &prior, now, page_deadline, llm_left, &mut tally).await {
+            complete += 1;
+        }
+    }
+
+    // A recipe with any conclusive miss in this run gets only its CanaryFail events: a
+    // pass between two fails would reset the streak anyway. Passes only with enough
+    // pages; the site's heal is `found` only when the last event left the recipe active
+    // and it was not active here before this run.
+    let mut found = None;
+    for &id in &tally.order {
+        let hits = tally.hits(id);
+        let missed = tally.events.iter().any(|(i, v)| *i == id && *v == Verdict::Miss);
+        let passes = !missed && hits >= PROBE_MIN_PAGES;
+        let mut last = None;
+        for (_, verdict) in tally.events.iter().filter(|(i, _)| *i == id) {
+            let event = match verdict {
+                Verdict::Hit if passes => Event::CanaryPass,
+                Verdict::Hit => continue,
+                Verdict::Miss => Event::CanaryFail,
+            };
+            match ctx.repo.recipe_event(id, domain, event, now) {
+                Ok(row) => last = Some(row),
+                Err(e) => warn!("recipe #{id}: could not record the canary result on {domain}: {e:#}"),
+            }
+        }
+        let was_active = tally.before.get(&id).copied().flatten() == Some(SiteState::Active);
+        if passes && !was_active && found.is_none() && last.is_some_and(|row| row.state == SiteState::Active) {
+            let (hash, origin) = tally.meta[&id].clone();
+            found = Some(HealFound { recipe_id: id, recipe_hash: hash, origin, pages: hits });
+        }
+    }
+    let (outcome, detail) = match (&found, complete) {
+        (Some(_), _) => ("found", String::new()),
+        (None, 0) => ("skipped", "no canary page could be looked at".to_string()),
+        (None, n) => ("nothing", format!("{n} page(s) looked at")),
+    };
+    info!("Self-heal: {domain}: {outcome} ({complete} of {} page(s) looked at)", pages.len());
+    SiteHeal { domain: domain.to_string(), found, outcome, detail }
+}
+
+/// One canary page: the page look, the recipes (passive, then the one live
+/// load), the gate, and the model rung when no recipe verified. Adds what each
+/// recipe did to `tally`. `true` when the page look was complete.
+async fn probe_page(
+    ctx: &RepairCtx,
+    domain: &str,
+    url: &str,
+    delivered: Option<f64>,
+    prior: &Prior,
+    now: chrono::DateTime<Utc>,
+    deadline: Instant,
+    llm_left: &AtomicU32,
+    tally: &mut Tally,
+) -> bool {
+    let env = &ctx.env;
+    let tokio_deadline = tokio::time::Instant::from_std(deadline);
+    let secs = deadline.saturating_duration_since(Instant::now()).as_secs().clamp(1, DIAGNOSE_SECS);
+    let seen = tokio::time::timeout_at(tokio_deadline, env.diagnose(url, secs)).await.ok().flatten();
+    let Some(snap) = seen.filter(|s| s.html.is_some()) else {
+        return false;
+    };
+    let family = omni_browser::player_family(&snap);
+    let ranked = match ctx.repo.recipes_for_canary(domain, family, now) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Self-heal: the recipe store could not be read: {e:#}");
+            return false;
+        }
+    };
+    for r in &ranked {
+        tally.before.entry(r.id).or_insert(r.site_state);
+    }
+    let mut acc = PageAcc::default();
+    let mut live: Vec<(&RankedRecipe, Recipe)> = Vec::new();
+    for r in &ranked {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(parsed) = Recipe::from_json(&r.recipe_json) else {
+            acc.misses.push(r.id);
+            continue;
+        };
+        let slice = (Instant::now() + RECIPE_SLICE).min(deadline);
+        let outcome = recipe::run(&parsed, &snap, env.fetcher(), slice).await;
+        if outcome == RecipeOutcome::NeedsLivePage {
+            live.push((r, parsed));
+            continue;
+        }
+        probe_take(&mut acc, prior, r, &snap, outcome);
+    }
+
+    // The one live page load of this page, with the gate's share of the budget kept.
+    let mut live_facts: Option<GateFacts> = None;
+    let mut live_tried = false;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if let (Some((first, _)), true) = (live.first(), left >= LIVE_MIN_LEFT + GATE_RESERVE) {
+        let actions = Recipe::from_json(&first.recipe_json).map(|p| recipe::live_actions(&p)).unwrap_or_default();
+        let key = recipe::action_key(&actions);
+        let (cap_secs, allowance) = env.live_limits();
+        let live_secs = (left - GATE_RESERVE).as_secs().min(cap_secs).max(1);
+        live_tried = true;
+        let wait_until = (Instant::now() + Duration::from_secs(live_secs) + allowance).min(deadline);
+        let seen = tokio::time::timeout_at(tokio::time::Instant::from_std(wait_until), env.live_snapshot(url, &actions, live_secs))
+            .await
+            .ok()
+            .flatten();
+        if let Some((lsnap, run, _)) = seen {
+            if run == LiveRun::Missing {
+                for (r, parsed) in &live {
+                    if recipe::action_key(&recipe::live_actions(parsed)) == key {
+                        acc.misses.push(r.id);
+                    }
+                }
+            }
+            if run == LiveRun::Complete {
+                live_facts = Some(gate_facts(&lsnap, domain));
+                for (r, parsed) in &live {
+                    if recipe::action_key(&recipe::live_actions(parsed)) != key || Instant::now() >= deadline {
+                        continue;
+                    }
+                    let slice = (Instant::now() + RECIPE_SLICE).min(deadline);
+                    let outcome = recipe::run_after_live(parsed, &lsnap, env.fetcher(), slice).await;
+                    probe_take(&mut acc, prior, r, &lsnap, outcome);
+                }
+            }
+        }
+    }
+
+    // The gate, for every candidate.
+    let mut facts = gate_facts(&snap, domain);
+    if let Some(lf) = live_facts {
+        facts.observed_hosts.extend(lf.observed_hosts);
+        facts.ad_media.extend(lf.ad_media);
+    }
+    let PageAcc { cands, produced, misses } = acc;
+    let (verified, rejected) = if cands.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let is_ad = |u: &str| env.is_ad(u);
+        if env.allow_loopback() {
+            repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, env.prober(), env.resolver(), deadline).await
+        } else {
+            repair_gate::verify(cands, &facts, &is_ad, env.prober(), env.resolver(), deadline).await
+        }
+    };
+    for id in misses {
+        record_verdict(tally, &ranked, id, Verdict::Miss);
+    }
+    let mut ids: Vec<i64> = Vec::new();
+    for (id, _) in &produced {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    let mut hit_any = false;
+    for id in ids {
+        let mine: Vec<&String> = produced.iter().filter(|(i, _)| *i == id).map(|(_, u)| u).collect();
+        let good = verified.iter().find(|v| mine.contains(&&v.candidate.url) && duration_counts(v, delivered));
+        let any_verified = mine.iter().any(|u| verified.iter().any(|v| &&v.candidate.url == u));
+        if let Some(v) = good {
+            // The same clip on every page (a sidebar video) is one page, not several.
+            hit_any = true;
+            if let Some(r) = ranked.iter().find(|r| r.id == id) {
+                tally.add_hit(id, &r.hash, r.origin.as_str(), &v.candidate.url, v.duration_secs);
+            }
+        } else if !any_verified
+            && mine.iter().all(|u| rejected.iter().find(|x| &&x.candidate.url == u).is_some_and(|x| x.is_conclusive()))
+        {
+            record_verdict(tally, &ranked, id, Verdict::Miss);
+        }
+        // A verified video of the wrong length, a candidate the gate never looked at, or
+        // one that ran out of time: not counted either way.
+    }
+
+    // The model rung, only when no recipe gave a verified video here. There is no
+    // held video on a canary page, so this is the one place a model recipe is stored
+    // without a hold: only one that passed every keeping rule of the ladder (it
+    // reproduces the address, depends on the page, follows its item, is not barred),
+    // and only for a video of the right length.
+    // At most one page per site, and at most PROBE_LLM_CALLS calls per run in all.
+    let calls_left = llm_left.load(Ordering::SeqCst) as usize;
+    if verified.is_empty() && !hit_any && ctx.cfg.llm.active() && tally.llm_pages == 0 && calls_left > 0 {
+        tally.llm_pages += 1;
+        let tried: Vec<String> = produced.iter().map(|(_, u)| u.clone()).collect();
+        let mut stats = LlmStats::default();
+        let flow = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline + GRACE),
+            llm_rung(ctx, NO_JOB, "", url, domain, &snap, &tried, prior, &CancellationToken::new(), deadline, live_tried, calls_left.min(LLM_MAX_ROUNDS), &mut stats),
+        )
+        .await;
+        let spent = u32::try_from(stats.calls).unwrap_or(u32::MAX);
+        let _ = llm_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(spent)));
+        if stats.calls > 0 {
+            info!("Self-heal: {domain}: model rung, {} round(s), {} call(s)", stats.rounds, stats.calls);
+        }
+        if let Ok(LlmFlow::Verified(v)) = flow {
+            for ver in v.verified.iter().filter(|x| duration_counts(x, delivered)) {
+                let Some(rec) = v.found.get(&ver.candidate.url).and_then(|l| l.recipe.as_ref()) else { continue };
+                if let Some((id, hash)) = store_llm_recipe(ctx, domain, &snap, rec) {
+                    tally.before.entry(id).or_insert(None);
+                    tally.add_hit(id, &hash, "llm", &ver.candidate.url, ver.duration_secs);
+                    break;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Put one recipe's verdict on this page into the tally, with its hash and origin.
+fn record_verdict(tally: &mut Tally, ranked: &[RankedRecipe], id: i64, v: Verdict) {
+    if let Some(r) = ranked.iter().find(|r| r.id == id) {
+        tally.add(id, &r.hash, r.origin.as_str(), v);
     }
 }
 

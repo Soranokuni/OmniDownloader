@@ -240,7 +240,25 @@ async function loadStatusOnce() {
       }),
     ));
   }
+  renderSelfheal(data.selfheal);
   watchStatus(data);
+}
+
+// One line per site the overnight self-heal found a new way for in the last 24 h
+// (P10.14). A line only: a broken site is the banner's, never a chime. The
+// video it finds still waits for MCR's approval.
+function renderSelfheal(list) {
+  const box = document.getElementById('selfheal-lines');
+  const found = new Set((Array.isArray(list) ? list : []).filter((r) => r.outcome === 'found').map((r) => r.domain));
+  if (found.size === 0) {
+    box.hidden = true;
+    render(box);
+    return;
+  }
+  box.hidden = false;
+  render(box, el('div', { class: 'card' },
+    ...[...found].map((domain) => el('div', {}, `${domain}: η σελίδα άλλαξε· βρέθηκε νέος τρόπος (θα ζητηθεί έγκριση)`)),
+  ));
 }
 
 function label(check) {

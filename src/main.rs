@@ -178,6 +178,27 @@ enum Commands {
         #[arg(long)]
         checks: bool,
     },
+    /// Development only (debug builds): add one invented overnight self-heal
+    /// report, so the desk's morning line and the admin «Self-heal» card can be
+    /// seen. Use a dev config.
+    #[cfg(debug_assertions)]
+    DevSelfhealReport {
+        /// The site (default `news.dev-selfheal.example`)
+        #[arg(long, default_value = "news.dev-selfheal.example")]
+        domain: String,
+        /// found | nothing | skipped | outage
+        #[arg(long, default_value = "found")]
+        outcome: String,
+        /// shipped | admin | llm
+        #[arg(long, default_value = "admin")]
+        origin: String,
+        /// Canary pages the recipe worked on
+        #[arg(long, default_value_t = 2)]
+        pages: usize,
+        /// Hours ago the run happened
+        #[arg(long, default_value_t = 1)]
+        hours_ago: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -739,6 +760,26 @@ async fn main() -> Result<()> {
         #[cfg(debug_assertions)]
         Some(Commands::DevHold { file, slug, journalist, article_image, checks }) => {
             dev_hold(&paths, &file, slug, journalist, article_image, checks).await?;
+        }
+        #[cfg(debug_assertions)]
+        Some(Commands::DevSelfhealReport { domain, outcome, origin, pages, hours_ago }) => {
+            let config_given = std::env::args().any(|a| a == "-c" || a == "--config" || a.starts_with("--config="));
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let db_path = paths.resolve(&config.database_path);
+            dev_hold_guard(&paths, config_given, &db_path)?;
+            let repo = Repository::new(&db_path)?;
+            let found = outcome == "found";
+            repo.record_selfheal(
+                &domain,
+                &outcome,
+                found.then_some("0123456789abcdef0123456789abcdef"),
+                found.then_some(origin.as_str()),
+                if found { pages } else { 0 },
+                None,
+                chrono::Utc::now() - chrono::Duration::hours(hours_ago),
+            )?;
+            println!("Added a {outcome} self-heal report for {domain}.");
         }
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)
@@ -1338,6 +1379,8 @@ async fn run_daemon(
         },
         env: Arc::new(repair_env),
     });
+    // The overnight self-heal (P10.14) probes with the same ladder world as the workers.
+    canary_env.set_heal(worker_repair.clone());
     let worker_canary = canary_env.clone();
 
     tokio::spawn(async move {
@@ -2954,6 +2997,9 @@ async fn run_one_task(
             // Then the recent articles of each frequent site (P10.4). Always
             // on; a site's verdict never changes this task's outcome.
             canary::nightly(&ctx.canary).await;
+            // Then, for every site still broken, the repair ladder on its canary
+            // pages, probe only (P10.14).
+            canary::heal_nightly(&ctx.canary).await;
             if failing > 0 {
                 anyhow::bail!("{failing} self-check link(s) not working; see Administration → Self-check");
             }
@@ -3009,6 +3055,12 @@ async fn run_one_task(
                 Ok(n) if n > 0 => info!("Retention: removed {n} expired repair skip(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("Retention: repair skips not purged: {e:#}"),
+            }
+            // The overnight self-heal's reports (P10.14): 30 days (and at most 500 rows, on write).
+            match repo.purge_selfheal(chrono::Utc::now()) {
+                Ok(n) if n > 0 => info!("Retention: removed {n} old self-heal report(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: self-heal reports not purged: {e:#}"),
             }
             // The model rung's limits (P10.12): a bundle is remembered 24 h, a day's totals 90 days.
             {

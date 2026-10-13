@@ -1744,6 +1744,7 @@ dependencies = [
  "omni-email",
  "omni-service",
  "omni-web",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

@@ -888,6 +888,23 @@ async fn mcr_can_hide_old_review_videos_and_show_them_again() -> Result<()> {
 }
 
 #[tokio::test]
+async fn the_self_check_panel_lists_thirty_days_of_self_heal() -> Result<()> {
+    let app = App::new()?;
+    let (_, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    assert_eq!(json["selfheal"], json!([]));
+
+    let now = chrono::Utc::now();
+    app.repo.record_selfheal("old.example", "nothing", None, None, 0, None, now - chrono::Duration::days(31))?;
+    app.repo.record_selfheal("news.example", "found", Some("0123abcd"), Some("llm"), 3, None, now - chrono::Duration::days(3))?;
+    let (_, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    let rows = json["selfheal"].as_array().expect("selfheal array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0]["domain"].as_str(), rows[0]["outcome"].as_str(), rows[0]["origin"].as_str()), (Some("news.example"), Some("found"), Some("llm")));
+    assert_eq!(rows[0]["pages"], 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_self_check_panel_lists_the_site_canaries() -> Result<()> {
     let app = App::new()?;
     let (status, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
