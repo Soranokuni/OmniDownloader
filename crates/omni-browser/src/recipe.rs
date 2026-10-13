@@ -20,7 +20,7 @@ use tracing::debug;
 
 pub const DSL_VERSION: u32 = 1;
 const MAX_STEPS: usize = 8;
-const MAX_FIELD_CHARS: usize = 200;
+pub(crate) const MAX_FIELD_CHARS: usize = 200;
 const MAX_TEMPLATE_CHARS: usize = 300;
 const MAX_WAIT_MS: u32 = 8000;
 const MAX_LIVE_ACTIONS: usize = 2;
@@ -145,14 +145,14 @@ pub enum RecipeError {
     FetchArgs { step: usize },
 }
 
-fn build_regex(s: &str) -> Option<Regex> {
+pub(crate) fn build_regex(s: &str) -> Option<Regex> {
     RegexBuilder::new(s).size_limit(REGEX_SIZE_LIMIT).build().ok()
 }
 
 /// Only a small, plain subset of CSS is accepted: no sibling combinators, no
 /// `:has`, `:is`, `:where`, pseudo-elements, comments or escapes. Anything the
 /// scanner does not recognise is refused, so a clever spelling cannot slip by.
-fn selector_allowed(v: &str) -> bool {
+pub(crate) fn selector_allowed(v: &str) -> bool {
     if !v.is_ascii() || v.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return false;
     }
@@ -251,7 +251,13 @@ fn selector_allowed(v: &str) -> bool {
     quote.is_none() && !bracket && not_depth == 0
 }
 
-fn valid_pointer(p: &str) -> bool {
+/// A selector a recipe step (or the repair rung's click) may use: short, plain
+/// CSS the scanner understands, and one the HTML parser accepts.
+pub fn css_allowed(v: &str) -> bool {
+    v.chars().count() <= MAX_FIELD_CHARS && selector_allowed(v) && Selector::parse(v).is_ok()
+}
+
+pub(crate) fn valid_pointer(p: &str) -> bool {
     if p.is_empty() {
         return true;
     }
@@ -552,7 +558,7 @@ enum Flow {
 /// explicit port the page did not use. The caller must use the returned,
 /// serialized URL, never the raw string: the parser and other URL readers can
 /// disagree about the host of the raw text. The error holds the host only.
-fn check_url(snap: &PageSnapshot, raw: &str) -> Result<reqwest::Url, String> {
+pub(crate) fn check_url(snap: &PageSnapshot, raw: &str) -> Result<reqwest::Url, String> {
     use reqwest::Url;
     let (url, host) = omni_core::net::parse_public_url(raw)?;
     if let Some(port) = url.port() {
@@ -642,7 +648,7 @@ fn ldjson_find(v: &Value, field: &str, depth: usize) -> Option<String> {
 }
 
 /// JSON string escapes, then HTML entities.
-fn unescape(s: &str) -> String {
+pub(crate) fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let chars: Vec<char> = s.chars().collect();
     let hex4 = |at: usize| -> Option<u32> {

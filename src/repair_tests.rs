@@ -74,6 +74,49 @@ struct Fake {
     live_hangs: bool,
     live_panics: bool,
     live_limits: Option<(u64, Duration)>,
+    /// The scripted model of the LLM rung (P10.12); `None`: the ladder has no model.
+    model: Option<MockModel>,
+}
+
+/// The model behind [`RepairModel`]: scripted answers, every user text kept.
+struct MockModel {
+    answers: Mutex<VecDeque<std::result::Result<serde_json::Value, String>>>,
+    asked: Mutex<Vec<String>>,
+    usage: Usage,
+    hang: bool,
+    /// Any call fails the test.
+    panics: AtomicBool,
+}
+
+impl MockModel {
+    fn new(answers: Vec<serde_json::Value>) -> Self {
+        Self {
+            answers: Mutex::new(answers.into_iter().map(Ok).collect()),
+            asked: Mutex::new(Vec::new()),
+            usage: Usage { prompt_tokens: 1000, completion_tokens: 100 },
+            hang: false,
+            panics: AtomicBool::new(false),
+        }
+    }
+    fn asks(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl RepairModel for MockModel {
+    async fn ask(&self, _system: &str, user: &str, _schema: &serde_json::Value) -> Result<(serde_json::Value, Usage)> {
+        assert!(!self.panics.load(Ordering::SeqCst), "the ladder asked the model");
+        self.asked.lock().unwrap().push(user.to_string());
+        if self.hang {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        match self.answers.lock().unwrap().pop_front() {
+            Some(Ok(v)) => Ok((v, self.usage)),
+            Some(Err(e)) => Err(anyhow::anyhow!(e)),
+            None => Ok((serde_json::json!({"assessment": "resolvable", "candidates": []}), self.usage)),
+        }
+    }
 }
 
 /// The article pictures of the card step: one body or a failure, counted; `hook` runs at each request.
@@ -126,6 +169,7 @@ impl Fake {
             live_hangs: false,
             live_panics: false,
             live_limits: None,
+            model: None,
         }
     }
     fn probes(&self) -> usize {
@@ -176,6 +220,9 @@ impl Env for Fake {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
         self.live_result.lock().unwrap().clone()
+    }
+    fn model(&self) -> Option<&dyn RepairModel> {
+        self.model.as_ref().map(|m| m as &dyn RepairModel)
     }
     fn fetcher(&self) -> &dyn Fetcher {
         &self.fetch
@@ -254,7 +301,7 @@ struct Rig {
 }
 
 fn cfg(mode: RepairMode, budget: Duration) -> RepairCfg {
-    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30 }
+    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, llm: LlmCfg::default() }
 }
 
 fn leased_job(repo: &Repository) -> Job {
@@ -1663,3 +1710,6 @@ async fn under_fifty_seconds_left_no_live_load_is_requested() {
     go(&r, Some(page(&next_data(B))), &Prior::default()).await;
     assert!(r.fake.live_secs_seen.lock().unwrap().is_empty());
 }
+
+#[path = "repair_llm_tests.rs"]
+mod llm;

@@ -91,6 +91,7 @@ fn attempts_are_recorded_read_back_and_go_with_their_job() -> Result<()> {
         next_index: 1,
         duration_ms: Some(1234),
         expected_secs: Some(95.0),
+        ..Default::default()
     };
     repo.finish_attempt(second, &end, t0 + Duration::seconds(6))?;
     let got = repo.latest_attempt(id)?.unwrap();
