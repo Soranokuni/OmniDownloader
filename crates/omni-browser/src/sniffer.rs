@@ -23,7 +23,9 @@ use crate::evidence::{vast_candidate, vast_media_files, Diagnostic, NetworkEntry
 use crate::glomex;
 use crate::recipe::LiveAction;
 
-/// Click a cookie-consent button, if the page shows one. Fixed text.
+/// Click a cookie-consent button, if the page shows one. Fixed text. It runs in
+/// the top document and in every frame (a Sourcepoint or Quantcast dialog lives
+/// in its own iframe), so each frame looks only at its own document.
 const COOKIE_BYPASS_JS: &str = r#"
             (() => {
                 const selectors = [
@@ -39,21 +41,52 @@ const COOKIE_BYPASS_JS: &str = r#"
                     'button[class*="agree"]',
                     'button[aria-label*="accept"]',
                     'button[aria-label*="agree"]',
-                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll'
+                    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+                    '#CybotCookiebotDialogBodyButtonAccept',
+                    '#CybotCookiebotDialogBodyLevelButtonAccept',
+                    'button[title="Accept all"]',
+                    '.sp_choice_type_11',
+                    '.qc-cmp2-summary-buttons button[mode="primary"]'
                 ];
+                // Visible, and not a form's submit button: a generic "accept" in a name is often
+                // "accept terms" on a form.
+                const isShown = (el) => {
+                    const r = el.getBoundingClientRect();
+                    if (!(r.width > 0 && r.height > 0)) return false;
+                    const cs = getComputedStyle(el);
+                    if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+                    // A fixed banner has no offsetParent but is shown.
+                    return el.offsetParent !== null || cs.position === 'fixed';
+                };
                 for (const sel of selectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
+                    // The exact CMP ids and classes are trusted; the substring guesses are not.
+                    const generic = /\*=/.test(sel) && sel.startsWith('button[') && !sel.includes('title=');
+                    for (const el of Array.from(document.querySelectorAll(sel))) {
+                        if (generic && (!isShown(el) || (el.form && el.type === 'submit'))) continue;
                         try { el.click(); return sel; } catch (e) {}
+                        break;
                     }
                 }
-                // Search buttons by Greek or English text
-                const buttons = Array.from(document.querySelectorAll('button, a'));
-                for (const b of buttons) {
-                    const txt = (b.textContent || '').trim().toUpperCase();
-                    if (txt.includes('ΣΥΜΦΩΝΩ') || txt.includes('ΑΠΟΔΟΧΗ') || txt.includes('ACCEPT') || txt.includes('AGREE')) {
-                        try { b.click(); return 'button-text:' + txt; } catch (e) {}
-                    }
+                // Search buttons by Greek or English text, case and accents ignored. Only a short,
+                // visible label made entirely of consent words counts: a headline that happens to
+                // contain "αποδοχής" is not a consent button. A link must go nowhere.
+                const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+                    .replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+                const consentWords = new Set(['ΑΠΟΔΟΧΗ', 'ΑΠΟΔΕΧΟΜΑΙ', 'ΣΥΜΦΩΝΩ', 'ACCEPT', 'AGREE', 'ALLOW', 'OK', 'ΟΚ']);
+                const fillerWords = new Set(['ΟΛΩΝ', 'ΟΛΑ', 'ALL', 'COOKIES', 'I', 'AND', 'CONTINUE', 'ΚΑΙ', 'ΣΥΝΕΧΙΖΩ', 'YES', 'CLOSE', 'PROCEED', 'ΤΩΝ', 'ΤΑ', 'ΚΛΕΙΣΙΜΟ', 'ΣΥΝΕΧΕΙΑ']);
+                const isConsentLabel = (txt) => {
+                    if (!txt || txt.length > 40) return false;
+                    const words = txt.split(' ');
+                    return words.some(w => consentWords.has(w)) && words.every(w => consentWords.has(w) || fillerWords.has(w));
+                };
+                const goesNowhere = (el) => {
+                    if (el.tagName !== 'A') return true;
+                    const h = el.getAttribute('href');
+                    return h === null || h.startsWith('#') || /^javascript:/i.test(h.trim());
+                };
+                for (const b of Array.from(document.querySelectorAll('button, a'))) {
+                    if (!isConsentLabel(norm(b.textContent)) || !goesNowhere(b) || !isShown(b)) continue;
+                    try { b.click(); return 'button-text'; } catch (e) {}
                 }
                 return null;
             })()
@@ -65,7 +98,56 @@ const COOKIE_BYPASS_JS: &str = r#"
 const CLICK_FN: &str = "function (css) { try { const el = document.querySelector(css); if (!el) return 'missing'; el.scrollIntoView({block: 'center'}); el.click(); return 'clicked'; } catch (e) { return 'error'; } }";
 const SCROLL_FN: &str = "function (css) { try { const el = document.querySelector(css); if (!el) return 'missing'; el.scrollIntoView({block: 'center'}); return 'scrolled'; } catch (e) { return 'error'; } }";
 
+/// Wake lazy players: bring each iframe, video and player block into view in
+/// turn (a nested scroller or an IntersectionObserver only fires then), walk
+/// down the page in fixed steps (a sentinel far below needs the window itself
+/// to scroll), then start every video muted. Fixed text; nothing from the page
+/// is put into it. The two constants differ only in where the page is left.
+macro_rules! lazy_scroll_js {
+    ($tail:literal) => {
+        concat!(
+            r#"
+            (async () => {
+                try {
+                    const els = Array.from(document.querySelectorAll('iframe, video, [class*=player]')).slice(0, 15);
+                    for (const el of els) {
+                        try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
+                        await new Promise(r => setTimeout(r, 300));
+                    }
+                    const totalHeight = Math.min(document.body.scrollHeight, 4000);
+                    for (let y = 0; y < totalHeight; y += 800) {
+                        window.scrollTo(0, y);
+                        await new Promise(r => setTimeout(r, 200));
+                    }
+                    for (const v of Array.from(document.querySelectorAll('video'))) {
+                        try {
+                            v.muted = true;
+                            const p = v.play();
+                            if (p && p.catch) p.catch(() => {});
+                        } catch (e) {}
+                    }
+                    "#,
+            $tail,
+            r#"
+                    return els.length;
+                } catch (e) { return 0; }
+            })()
+        "#
+        )
+    };
+}
+/// The normal sniff: the page is left at the top.
+const LAZY_SCROLL_JS: &str = lazy_scroll_js!("window.scrollTo(0, 0);");
+/// The diagnostic run: the last player stays in view for what is read next.
+const LAZY_SCROLL_KEEP_JS: &str = lazy_scroll_js!("if (els.length) { try { els[els.length - 1].scrollIntoView({ block: 'center' }); } catch (e) {} }");
+
+
 /// The whole live run is cut here whatever the caller's budget.
+/// A page that has shown nothing decisive this far into the sniff may be visited once at its canonical address.
+const CANONICAL_RETRY_AFTER: Duration = Duration::from_secs(10);
+/// Frames the consent bypass visits per round.
+const CONSENT_MAX_FRAMES: usize = 20;
+
 const LIVE_RUN_CAP_SECS: u64 = 40;
 /// A recipe has at most this many live steps, and a wait at most this long
 /// (the recipe validator's limits, held again here).
@@ -129,6 +211,25 @@ pub fn log_addr(url: &str) -> String {
         Ok(u) => format!("{}{}", u.host_str().unwrap_or("?"), u.path()),
         Err(_) => "(not an address)".to_string(),
     }
+}
+
+/// `Target.sendMessageToTarget`: no typed wrapper in the CDP bindings, and the
+/// only way to reach a frame that lives in another process from here.
+#[derive(Serialize)]
+struct SendMessageToTarget {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    message: String,
+}
+
+impl chromiumoxide::Method for SendMessageToTarget {
+    fn identifier(&self) -> chromiumoxide::types::MethodId {
+        "Target.sendMessageToTarget".into()
+    }
+}
+
+impl chromiumoxide::Command for SendMessageToTarget {
+    type Response = Value;
 }
 
 impl StreamSniffer {
@@ -414,31 +515,7 @@ impl StreamSniffer {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let _ = page.evaluate(COOKIE_BYPASS_JS).await;
 
-        let scroll_js = r#"
-            (async () => {
-                try {
-                    const els = Array.from(document.querySelectorAll('video, iframe, [class*=player]')).slice(0, 15);
-                    for (const el of els) {
-                        try { el.scrollIntoView({ block: 'center' }); } catch (e) {}
-                        await new Promise(r => setTimeout(r, 300));
-                    }
-                    return els.length;
-                } catch (e) { return 0; }
-            })()
-        "#;
-        let _ = page.evaluate(scroll_js).await;
-        let play_js = r#"
-            (() => {
-                for (const v of Array.from(document.querySelectorAll('video'))) {
-                    try {
-                        v.muted = true;
-                        const p = v.play();
-                        if (p && p.catch) p.catch(() => {});
-                    } catch (e) {}
-                }
-            })()
-        "#;
-        let _ = page.evaluate(play_js).await;
+        let _ = page.evaluate(LAZY_SCROLL_KEEP_JS).await;
 
         if let Some(rest) = settle.checked_sub(started.elapsed()) {
             tokio::time::sleep(rest).await;
@@ -551,14 +628,17 @@ impl StreamSniffer {
         timeout_secs: u64,
         snapshot: &mut PageSnapshot,
     ) -> Result<DiscoveredMedia> {
+        // Open blank, install the blocker and every listener, and only then navigate: a
+        // player that fetches its playlist the instant the page starts loading is otherwise missed.
         let page = browser
-            .new_page(target_url)
+            .new_page("about:blank")
             .await
             .map_err(|e| anyhow!("Failed opening page: {}", e))?;
 
         // 1. Injected CDP Hardware Ad-Blocking: Instruct Chrome to drop ad sockets immediately
         let blocker = UnifiedAdBlocker::global();
-        let blocked_patterns = blocker.generate_cdp_blocked_patterns();
+        // Never a pattern that matches the page itself: a path with "vast" in it is an article.
+        let blocked_patterns = patterns_not_matching(blocker.generate_cdp_blocked_patterns(), target_url);
         if let Ok(params) = SetBlockedUrLsParams::builder().urls(blocked_patterns).build() {
             let _ = page.execute(params).await;
         }
@@ -632,43 +712,43 @@ impl StreamSniffer {
             }
         });
 
-        // 3. Initial wait for page scripts and DOM initialization
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Navigate now that everything is listening. The load may never finish on a page with a
+        // live player; the polling below is what bounds it.
+        match tokio::time::timeout(Duration::from_secs(15), page.goto(target_url)).await {
+            Ok(Err(e)) => return Err(anyhow!("Failed opening page: {}", e)),
+            Ok(Ok(_)) | Err(_) => {}
+        }
 
-        // 4. Bypass Cookie Consent (OneTrust, Didomi, Quantcast, Google Funding Choices, Greek portals)
-        let cookie_bypass_js = COOKIE_BYPASS_JS;
-        let _ = page.evaluate(cookie_bypass_js).await;
+        // 3. Initial wait for page scripts and DOM initialization
+        let loaded_at = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 4. Bypass Cookie Consent (OneTrust, Didomi, Quantcast, Sourcepoint, Google Funding Choices,
+        // Greek portals) in the top document and in every frame; a second round at ~3 s is in the poll loop.
+        let _ = tokio::time::timeout(Duration::from_secs(8), Self::consent_all_frames(browser, &page)).await;
+        let mut second_consent_done = false;
 
         // 5. Programmatic Lazy-Scroll (Operational Protocol from PDF Benchmark)
-        // Triggers IntersectionObserver callbacks down long-form editorial articles (Iefimerida, Gazzetta, News247)
-        let lazy_scroll_js = r#"
-            (async () => {
-                try {
-                    const totalHeight = Math.min(document.body.scrollHeight, 4000);
-                    const step = 800;
-                    for (let y = 0; y < totalHeight; y += step) {
-                        window.scrollTo(0, y);
-                        await new Promise(r => setTimeout(r, 200));
-                    }
-                    window.scrollTo(0, 0);
-                    return true;
-                } catch(e) {
-                    return false;
-                }
-            })()
-        "#;
-        let _ = page.evaluate(lazy_scroll_js).await;
+        // Brings each player-like element into view, which fires IntersectionObserver callbacks
+        // (Iefimerida, Gazzetta, News247), then starts every video muted.
+        let _ = page.evaluate(LAZY_SCROLL_JS).await;
 
         // 6. Inspect DOM for Embedded Media Platforms (Twitter/X, Glomex, YouTube, Dailymotion, TikTok, Inline Script HLS)
         let dom_embed_js = r#"
             (() => {
                 const found = [];
 
+                // An AMP page carries its embeds as amp-iframe, which is read like an iframe:
+                // every `iframe[...]` selector below also matches `amp-iframe[...]`.
+                const qa = (sel) => Array.from(document.querySelectorAll(
+                    sel.split(',').map(p => p.trim()).filter(p => p).flatMap(p => p.startsWith('iframe[') ? [p, 'amp-' + p] : [p]).join(',')
+                ));
+
                 // Helper to get effective src from an element (handles data-src, data-lazy-src from WP Rocket, etc.)
                 const getSrc = (el) => el.src || el.getAttribute('src') || el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || '';
 
                 // 1. Twitter / X tweet embeds
-                const tweetNodes = Array.from(document.querySelectorAll(
+                const tweetNodes = Array.from(qa(
                     'blockquote.twitter-tweet a, .twitter-tweet a, iframe[src*="twitter.com"], iframe[src*="x.com"], div[data-tweet-id], a[href*="/status/"]'
                 ));
                 // Every post, not just the first: an article routinely embeds
@@ -691,7 +771,7 @@ impl StreamSniffer {
                 }
 
                 // 2. Glomex player embeds (web components, divs, iframes)
-                const glomexNodes = Array.from(document.querySelectorAll(
+                const glomexNodes = Array.from(qa(
                     'glomex-integration, glomex-player, .glomex-player, [data-integration-id], [integration-id], [data-playlist-id], [playlist-id]'
                 ));
                 for (const d of glomexNodes) {
@@ -703,28 +783,28 @@ impl StreamSniffer {
                         found.push({ type: 'glomex', url: `https://player.glomex.com/integration/1/iframe-player.html?playlistId=${pId}` });
                     }
                 }
-                const glomexIframes = Array.from(document.querySelectorAll('iframe[src*="glomex.com"], iframe[data-src*="glomex.com"], iframe[data-lazy-src*="glomex.com"]'));
+                const glomexIframes = Array.from(qa('iframe[src*="glomex.com"], iframe[data-src*="glomex.com"], iframe[data-lazy-src*="glomex.com"]'));
                 for (const f of glomexIframes) {
                     const src = getSrc(f);
                     if (src) found.push({ type: 'glomex', url: src });
                 }
 
                 // 3. JWPlayer / JWPlatform embeds (Proto Thema, Antenna, Star, etc.)
-                const jwIframes = Array.from(document.querySelectorAll(
+                const jwIframes = Array.from(qa(
                     'iframe[src*="jwplayer.com"], iframe[src*="jwplatform.com"], iframe[data-src*="jwplayer.com"], iframe[data-lazy-src*="jwplayer.com"]'
                 ));
                 for (const j of jwIframes) {
                     const src = getSrc(j);
                     if (src) found.push({ type: 'jwplayer', url: src });
                 }
-                const jwDivs = Array.from(document.querySelectorAll('[data-media-id], [data-jwplayer-id]'));
+                const jwDivs = Array.from(qa('[data-media-id], [data-jwplayer-id]'));
                 for (const jd of jwDivs) {
                     const mId = jd.getAttribute('data-media-id') || jd.getAttribute('data-jwplayer-id');
                     if (mId) found.push({ type: 'jwplayer', url: `https://cdn.jwplayer.com/players/${mId}.html` });
                 }
 
                 // 4. ERT WebTV / ERTFLIX player embeds
-                const ertIframes = Array.from(document.querySelectorAll(
+                const ertIframes = Array.from(qa(
                     'iframe[src*="ert.gr/webtv"], iframe[src*="ertflix.gr"], iframe[data-src*="ert.gr/webtv"], iframe[data-lazy-src*="ert.gr/webtv"]'
                 ));
                 for (const e of ertIframes) {
@@ -740,7 +820,7 @@ impl StreamSniffer {
                 }
 
                 // 5. Brightcove / OVP embeds (The Guardian, CNN)
-                const bcIframes = Array.from(document.querySelectorAll(
+                const bcIframes = Array.from(qa(
                     'iframe[src*="players.brightcove.net"], iframe[src*="brightcove.com"], iframe[data-src*="players.brightcove.net"], iframe[data-lazy-src*="players.brightcove.net"]'
                 ));
                 for (const b of bcIframes) {
@@ -758,7 +838,7 @@ impl StreamSniffer {
                     );
                     return m ? m[1] : null;
                 };
-                const ytNodes = Array.from(document.querySelectorAll(
+                const ytNodes = Array.from(qa(
                     'iframe[src*="youtube.com"], iframe[src*="youtube-nocookie.com"], iframe[src*="youtu.be"],' +
                     'iframe[data-src*="youtube.com"], iframe[data-lazy-src*="youtube.com"],' +
                     '.rll-youtube-player, [data-plugin-youtube]'
@@ -776,7 +856,7 @@ impl StreamSniffer {
                     }
                 }
 
-                const ytLinks = Array.from(document.querySelectorAll('a[href*="youtube.com/watch"], a[href*="youtu.be/"]'));
+                const ytLinks = Array.from(qa('a[href*="youtube.com/watch"], a[href*="youtu.be/"]'));
                 for (const a of ytLinks) {
                     const id = ytId(a.href);
                     if (id) {
@@ -786,7 +866,7 @@ impl StreamSniffer {
                 }
 
                 // 7. Facebook video & reel embeds (ERT News, Iefimerida, Protothema)
-                const fbIframes = Array.from(document.querySelectorAll(
+                const fbIframes = Array.from(qa(
                     'iframe[src*="facebook.com/plugins/video"], iframe[data-src*="facebook.com/plugins/video"], iframe[data-lazy-src*="facebook.com/plugins/video"]'
                 ));
                 for (const f of fbIframes) {
@@ -799,7 +879,7 @@ impl StreamSniffer {
                 }
 
                 // 8. Dailymotion embeds
-                const dmIframes = Array.from(document.querySelectorAll(
+                const dmIframes = Array.from(qa(
                     'iframe[src*="dailymotion.com"], iframe[data-src*="dailymotion.com"], iframe[data-lazy-src*="dailymotion.com"]'
                 ));
                 for (const d of dmIframes) {
@@ -809,7 +889,7 @@ impl StreamSniffer {
                 }
 
                 // 9. Vimeo embeds
-                const vimIframes = Array.from(document.querySelectorAll(
+                const vimIframes = Array.from(qa(
                     'iframe[src*="player.vimeo.com"], iframe[data-src*="player.vimeo.com"], iframe[data-lazy-src*="player.vimeo.com"]'
                 ));
                 for (const v of vimIframes) {
@@ -818,7 +898,7 @@ impl StreamSniffer {
                 }
 
                 // 10. TikTok embeds
-                const ttEmbeds = Array.from(document.querySelectorAll('blockquote.tiktok-embed'));
+                const ttEmbeds = Array.from(qa('blockquote.tiktok-embed'));
                 for (const t of ttEmbeds) {
                     if (t.getAttribute('cite')) found.push({ type: 'tiktok', url: t.getAttribute('cite') });
                 }
@@ -831,7 +911,7 @@ impl StreamSniffer {
                     const kind = m[1].toLowerCase() === 'p' ? 'p' : (m[1].toLowerCase() === 'tv' ? 'tv' : 'reel');
                     return `https://www.instagram.com/${kind}/${m[2]}/`;
                 };
-                const igNodes = Array.from(document.querySelectorAll(
+                const igNodes = Array.from(qa(
                     'blockquote.instagram-media, [data-instgrm-permalink], iframe[src*="instagram.com/"], iframe[data-src*="instagram.com/"]'
                 ));
                 for (const n of igNodes) {
@@ -840,7 +920,7 @@ impl StreamSniffer {
                 }
 
                 // 10c. Streamable players.
-                for (const f of Array.from(document.querySelectorAll('iframe[src*="streamable.com"], iframe[data-src*="streamable.com"], iframe[data-lazy-src*="streamable.com"]'))) {
+                for (const f of Array.from(qa('iframe[src*="streamable.com"], iframe[data-src*="streamable.com"], iframe[data-lazy-src*="streamable.com"]'))) {
                     const m = getSrc(f).match(/streamable\.com\/(?:e|o|s)\/([A-Za-z0-9]+)/i);
                     if (m) found.push({ type: 'streamable', url: 'https://streamable.com/' + m[1] });
                 }
@@ -848,7 +928,7 @@ impl StreamSniffer {
                 // 10d. A portal's own oEmbed proxy (iefimerida.gr:
                 // <iframe data-src="/oembed?url=https%3A%2F%2Fwww.instagram.com%2Freel%2F…">),
                 // lazy, so the post inside never loads in a headless visit.
-                for (const f of Array.from(document.querySelectorAll('iframe[src*="oembed"], iframe[data-src*="oembed"], iframe[data-lazy-src*="oembed"]'))) {
+                for (const f of Array.from(qa('iframe[src*="oembed"], iframe[data-src*="oembed"], iframe[data-lazy-src*="oembed"]'))) {
                     let inner = null;
                     try { inner = new URL(getSrc(f), location.href).searchParams.get('url'); } catch (e) {}
                     if (!inner || !/^https?:\/\//i.test(inner)) continue;
@@ -856,8 +936,42 @@ impl StreamSniffer {
                     found.push({ type: 'oembed', url: ig || inner.replace(/[?&]utm_[^&#]*/g, '') });
                 }
 
+                // 10e. AMP components. An id is checked before it is put into an address.
+                const ampId = (v, max) => {
+                    const t = String(v || '');
+                    return t.length > 0 && t.length <= max && /^[A-Za-z0-9_-]+$/.test(t) ? t : null;
+                };
+                for (const n of qa('amp-youtube[data-videoid]')) {
+                    const id = ampId(n.getAttribute('data-videoid'), 11);
+                    if (id && id.length === 11) found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
+                }
+                for (const n of qa('amp-vimeo[data-videoid]')) {
+                    const id = ampId(n.getAttribute('data-videoid'), 12);
+                    if (id && /^[0-9]+$/.test(id)) found.push({ type: 'vimeo', url: 'https://vimeo.com/' + id });
+                }
+                for (const n of qa('amp-dailymotion[data-videoid]')) {
+                    const id = ampId(n.getAttribute('data-videoid'), 20);
+                    if (id && /^[A-Za-z0-9]+$/.test(id)) found.push({ type: 'dailymotion', url: 'https://www.dailymotion.com/video/' + id });
+                }
+                for (const n of qa('amp-twitter[data-tweetid]')) {
+                    const id = ampId(n.getAttribute('data-tweetid'), 25);
+                    if (id && /^[0-9]+$/.test(id)) addTweet(id, 'https://x.com/i/status/' + id);
+                }
+                for (const n of qa('amp-facebook[data-href]')) {
+                    const h = n.getAttribute('data-href') || '';
+                    const isVideoUrl = /^https?:\/\/(?:(?:www\.|m\.|web\.)?facebook\.com\/(?:[^?#]*\/videos\/|watch|reel)|fb\.watch\/)/i.test(h);
+                    const declared = (n.getAttribute('data-embed-as') || '').toLowerCase() === 'video' && /^https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\//i.test(h);
+                    if ((isVideoUrl || declared) && h.length <= 500) found.push({ type: 'facebook', url: h });
+                }
+                for (const n of qa('amp-video source[src], amp-video[src]')) {
+                    try {
+                        const u = new URL(n.getAttribute('src') || '', location.href);
+                        if (u.protocol === 'http:' || u.protocol === 'https:') found.push({ type: 'source_src', url: u.href });
+                    } catch (e) {}
+                }
+
                 // 11. Direct HTML5 <video> and <source> elements (In.gr, Star.gr, ERT)
-                const videoElements = Array.from(document.querySelectorAll('video, video source, source'));
+                const videoElements = Array.from(qa('video, video source, source'));
                 for (const el of videoElements) {
                     const src = getSrc(el);
                     if (src && src.startsWith('http')) {
@@ -881,7 +995,7 @@ impl StreamSniffer {
 
         // Where the page really is (after redirects): what a contextual glomex
         // player is matched against.
-        let page_url = page.url().await.ok().flatten().unwrap_or_else(|| target_url.to_string());
+        let mut page_url = Self::current_page_url(&page, target_url).await;
         let mut handled: HashSet<String> = HashSet::new();
         match page.evaluate(dom_embed_js).await {
             Ok(eval) => {
@@ -911,6 +1025,7 @@ impl StreamSniffer {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
         let mut last_dom_poll = std::time::Instant::now();
+        let mut canonical_tried = false;
 
         while start.elapsed() < timeout {
             {
@@ -927,10 +1042,45 @@ impl StreamSniffer {
                 }
             }
 
+            let remaining = timeout.saturating_sub(start.elapsed());
+
+            // Second consent round: a dialog that renders late (Sourcepoint, Quantcast) is not there at 0.5 s.
+            if !second_consent_done && loaded_at.elapsed() >= Duration::from_secs(3) {
+                second_consent_done = true;
+                let _ = tokio::time::timeout(remaining, Self::consent_all_frames(browser, &page)).await;
+            }
+
+            // Nothing decisive 10 s in: one visit to the page's canonical address, if it is the same site.
+            if !canonical_tried && start.elapsed() >= CANONICAL_RETRY_AFTER {
+                let decisive = candidates.lock().await.iter().any(|(s, _)| *s >= 95);
+                if !decisive {
+                    canonical_tried = true;
+                    let hop = async {
+                        let next = Self::canonical_to_follow(&page, &page_url).await?;
+                        debug!("StreamSniffer: no stream on {}, trying its canonical {}", log_addr(&page_url), log_addr(&next));
+                        let _ = tokio::time::timeout(Duration::from_secs(8), page.goto(next.as_str())).await;
+                        page_url = Self::current_page_url(&page, &next).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Self::consent_all_frames(browser, &page).await;
+                        let _ = page.evaluate(LAZY_SCROLL_JS).await;
+                        if let Ok(eval) = page.evaluate(dom_embed_js).await {
+                            if let Some(arr) = eval.value().and_then(Value::as_array) {
+                                Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
+                            }
+                        }
+                        Some(())
+                    };
+                    if tokio::time::timeout(remaining, hop).await.is_ok() {
+                        last_dom_poll = std::time::Instant::now();
+                    }
+                }
+            }
+
             // Periodically re-evaluate DOM embeds if no high-score candidate is found yet.
             // Handles delayed frame hydration, consent dismissals, and execution context recreation.
             if last_dom_poll.elapsed() >= Duration::from_millis(1500) {
                 last_dom_poll = std::time::Instant::now();
+                page_url = Self::current_page_url(&page, &page_url).await;
                 if let Ok(eval) = page.evaluate(dom_embed_js).await {
                     if let Some(arr) = eval.value().and_then(Value::as_array) {
                         Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
@@ -1010,6 +1160,104 @@ impl StreamSniffer {
         }
     }
 
+    /// Run the consent bypass in the top document and in every other frame of
+    /// the page. A frame of the page's own process is reached through its
+    /// execution context; a frame of another site (a consent dialog's usual
+    /// home) lives in its own target and is reached through that target.
+    /// Best effort: a frame that does not answer in 2 s is skipped.
+    async fn consent_all_frames(browser: &Browser, page: &chromiumoxide::Page) {
+        let _ = page.evaluate(COOKIE_BYPASS_JS).await;
+        let main = page.mainframe().await.ok().flatten();
+        let frames = page.frames().await.unwrap_or_default();
+        let mut clicked = 0usize;
+        for frame in frames.into_iter().filter(|f| Some(f) != main.as_ref()).take(CONSENT_MAX_FRAMES) {
+            let Ok(Some(ctx)) = page.frame_execution_context(frame.clone()).await else { continue };
+            let Ok(params) = EvaluateParams::builder()
+                .expression(COOKIE_BYPASS_JS)
+                .context_id(ctx)
+                .return_by_value(true)
+                .user_gesture(true)
+                .build()
+            else {
+                continue;
+            };
+            if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(2), page.execute(params)).await {
+                if out.result.result.value.as_ref().is_some_and(|v| !v.is_null()) {
+                    clicked += 1;
+                    if let Ok(Some(url)) = page.frame_url(frame).await {
+                        debug!("StreamSniffer: consent answered in a frame of {}", log_addr(&url));
+                    }
+                }
+            }
+        }
+        let remote = tokio::time::timeout(Duration::from_secs(5), Self::consent_in_remote_frames(browser, page)).await.unwrap_or(0);
+        if clicked + remote > 0 {
+            debug!("StreamSniffer: consent script ran in {} frame(s) of other sites", remote);
+        }
+    }
+
+    /// The consent script in this page's frames that live in their own target.
+    /// The script is sent as a fixed message; the answer is not read (the
+    /// click's effect shows in the page). Returns how many frames were sent it.
+    async fn consent_in_remote_frames(browser: &Browser, page: &chromiumoxide::Page) -> usize {
+        use chromiumoxide::cdp::browser_protocol::target::{AttachToTargetParams, DetachFromTargetParams, GetTargetsParams};
+        // The page's own iframes, by host: the target list does not say which page a frame belongs to.
+        const IFRAME_SRCS_JS: &str = "Array.from(document.querySelectorAll('iframe')).map(f => f.src || '')";
+        let Ok(eval) = page.evaluate(IFRAME_SRCS_JS).await else { return 0 };
+        let hosts: HashSet<String> = eval
+            .value()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|u| reqwest::Url::parse(u).ok())
+            .filter_map(|u| u.host_str().map(str::to_ascii_lowercase))
+            .collect();
+        if hosts.is_empty() {
+            return 0;
+        }
+        let Ok(targets) = browser.execute(GetTargetsParams::default()).await else { return 0 };
+        let message = serde_json::json!({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": { "expression": COOKIE_BYPASS_JS, "userGesture": true },
+        })
+        .to_string();
+        let mut sent = 0;
+        for info in targets.result.target_infos.iter().filter(|t| t.r#type == "iframe" && reqwest::Url::parse(&t.url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).is_some_and(|h| hosts.contains(&h))) {
+            if sent >= CONSENT_MAX_FRAMES {
+                break;
+            }
+            let mut attach = AttachToTargetParams::new(info.target_id.clone());
+            attach.flatten = Some(false);
+            let Ok(session) = browser.execute(attach).await else { continue };
+            let session_id = session.result.session_id;
+            let msg = SendMessageToTarget { session_id: session_id.inner().clone(), message: message.clone() };
+            if browser.execute(msg).await.is_ok() {
+                sent += 1;
+                debug!("StreamSniffer: consent script sent to a frame of {}", log_addr(&info.url));
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = browser.execute(DetachFromTargetParams { session_id: Some(session_id) }).await;
+        }
+        sent
+    }
+
+    /// Where the page is now, if that is a web address; otherwise `fallback`
+    /// (a page in transit reports `about:blank` or an error page).
+    async fn current_page_url(page: &chromiumoxide::Page, fallback: &str) -> String {
+        http_url_or(page.url().await.ok().flatten(), fallback)
+    }
+
+    /// The page's `<link rel="canonical">`, when it is a different address on
+    /// the same site. Fixed script; the answer is checked by `canonical_target`.
+    async fn canonical_to_follow(page: &chromiumoxide::Page, current: &str) -> Option<String> {
+        const CANONICAL_JS: &str = "(() => { const l = document.querySelector('link[rel~=\"canonical\"]'); return l ? l.href : null; })()";
+        let eval = tokio::time::timeout(Duration::from_secs(2), page.evaluate(CANONICAL_JS)).await.ok()?.ok()?;
+        let href = eval.value().and_then(Value::as_str)?.to_string();
+        canonical_target(current, &href)
+    }
+
     /// One DOM inspection's findings into the candidate list. `handled` holds
     /// the URLs already looked at, so a glomex player is resolved once, not on
     /// every re-poll.
@@ -1058,6 +1306,91 @@ impl StreamSniffer {
             }
         }
     }
+}
+
+/// The canonical address worth a second visit: a different page (after URL
+/// normalisation) on the same site as `current`. A canonical on another site is
+/// never followed, nor the site root or a listing above the current page (a
+/// canonical that is the home page or a section would only lose the video).
+/// IP-literal hosts must match exactly (they have no domain).
+fn canonical_target(current: &str, canonical: &str) -> Option<String> {
+    let (cur, can) = (reqwest::Url::parse(current).ok()?, reqwest::Url::parse(canonical).ok()?);
+    if !matches!(can.scheme(), "http" | "https") {
+        return None;
+    }
+    if omni_core::urlnorm::normalize(current) == omni_core::urlnorm::normalize(canonical) {
+        return None;
+    }
+    let can_path = can.path().trim_end_matches('/');
+    let cur_path = cur.path().trim_end_matches('/');
+    // Same path with fewer query parameters: the dropped ones usually choose the video
+    // (/videos?id=123 -> /videos is a listing).
+    if can_path == cur_path {
+        let pairs = |u: &str| -> HashSet<String> {
+            let n = omni_core::urlnorm::normalize(u);
+            n.split_once('?').map(|(_, q)| q.split('&').filter(|p| !p.is_empty()).map(str::to_string).collect()).unwrap_or_default()
+        };
+        let (cp, np) = (pairs(current), pairs(canonical));
+        if np.len() < cp.len() && np.is_subset(&cp) {
+            return None;
+        }
+    }
+    if can_path.is_empty() {
+        return None;
+    }
+    // A section or listing above the page (/news for /news/a-story) is not the page. (An AMP copy
+    // at <article>/amp or ?amp normalises equal to its article and never gets here.)
+    if cur_path.len() > can_path.len() && cur_path.starts_with(can_path) && cur_path[can_path.len()..].starts_with('/') {
+        return None;
+    }
+    let (ch, nh) = (cur.host_str()?.to_ascii_lowercase(), can.host_str()?.to_ascii_lowercase());
+    let is_ip = |h: &str| h.parse::<std::net::IpAddr>().is_ok() || h.starts_with('[');
+    let same_site = if is_ip(&ch) || is_ip(&nh) {
+        ch == nh
+    } else {
+        omni_core::urlnorm::registrable_domain(current)? == omni_core::urlnorm::registrable_domain(canonical)?
+    };
+    same_site.then(|| can.to_string())
+}
+
+/// `url` when it is an http(s) address, else `fallback`.
+fn http_url_or(url: Option<String>, fallback: &str) -> String {
+    match url {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => u,
+        _ => fallback.to_string(),
+    }
+}
+
+/// Chrome's `*literal*` URL patterns: does `pattern` match `url`? Only `*` is special.
+fn glob_matches(pattern: &str, url: &str) -> bool {
+    let (pattern, url) = (pattern.to_ascii_lowercase(), url.to_ascii_lowercase());
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let last = parts.len() - 1;
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !url.starts_with(part) {
+                return false;
+            }
+            pos = part.len();
+        } else if i == last {
+            return url.len() >= pos + part.len() && url.ends_with(part);
+        } else {
+            match url[pos..].find(part) {
+                Some(at) => pos += at + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+/// The blocked-URL patterns, without any that would block `target_url` itself.
+fn patterns_not_matching(patterns: Vec<String>, target_url: &str) -> Vec<String> {
+    patterns.into_iter().filter(|p| !glob_matches(p, target_url)).collect()
 }
 
 /// What a live run can say about the recipe that asked for it.
@@ -1189,6 +1522,95 @@ mod tests {
         assert!(live.contains("call_on_document(page, CLICK_FN, css)") && live.contains("call_on_document(page, SCROLL_FN, css)"));
         // `function_declaration` takes only the fixed `&'static str` parameter.
         assert!(live.contains("function: &'static str") && live.contains(".function_declaration(function)"));
+    }
+
+    #[test]
+    fn a_canonical_is_followed_only_when_it_is_another_page_of_the_same_site() {
+        let cur = "https://www.example.gr/news/a-story?utm_source=x";
+        assert_eq!(canonical_target(cur, "https://www.example.gr/news/a-story-full").as_deref(), Some("https://www.example.gr/news/a-story-full"));
+        // Another subdomain of the same registrable domain is the same site.
+        assert!(canonical_target(cur, "https://amp.example.gr/news/a-story-amp").is_some());
+        // The same page once normalised (tracking query, fragment, case): nothing to visit.
+        assert_eq!(canonical_target(cur, "https://WWW.example.gr/news/a-story#top"), None);
+        // Another site is never followed; nor is a non-web address.
+        assert_eq!(canonical_target(cur, "https://other.example.com/news/a-story"), None);
+        assert_eq!(canonical_target(cur, "javascript:alert(1)"), None);
+        assert_eq!(canonical_target(cur, "not an address"), None);
+        // IP hosts have no domain: exact host or nothing.
+        assert!(canonical_target("http://10.0.0.1:80/a", "http://10.0.0.1:80/b").is_some());
+        assert_eq!(canonical_target("http://10.0.0.1/a", "http://11.0.0.1/b"), None);
+        assert_eq!(canonical_target("http://127.0.0.1:1/a", "http://localhost:1/b"), None);
+    }
+
+    #[test]
+    fn a_canonical_that_is_a_root_or_a_listing_above_the_page_is_not_followed() {
+        let cur = "https://www.example.gr/news/a-story";
+        assert_eq!(canonical_target(cur, "https://www.example.gr/"), None);
+        assert_eq!(canonical_target(cur, "https://www.example.gr"), None);
+        assert_eq!(canonical_target(cur, "https://www.example.gr/news"), None);
+        assert_eq!(canonical_target(cur, "https://www.example.gr/news/"), None);
+        // A longer name that merely starts the same is a different page, not an ancestor.
+        assert!(canonical_target(cur, "https://www.example.gr/news/a-story-full").is_some());
+        assert!(canonical_target("https://www.example.gr/news/a-story-amp", "https://www.example.gr/news/a-story").is_some());
+        // The same path without the parameter that picks the video is a listing.
+        assert_eq!(canonical_target("https://www.example.gr/videos?id=123", "https://www.example.gr/videos"), None);
+        assert_eq!(canonical_target("https://www.example.gr/video.php?v=abc&page=2", "https://www.example.gr/video.php?v=abc"), None);
+        assert_eq!(canonical_target("https://www.example.gr/videos?id=123", "https://www.example.gr/videos?id=123&utm_source=x"), None);
+        assert!(canonical_target("https://www.example.gr/videos?id=123", "https://www.example.gr/videos/123").is_some());
+        assert!(canonical_target("https://www.example.gr/videos?id=123", "https://www.example.gr/videos?id=456").is_some());
+        // Sibling and AMP-to-article still work.
+        assert!(canonical_target("https://www.example.gr/news/b-story", "https://www.example.gr/news/a-story").is_some());
+        // urlnorm already treats <article>/amp and ?amp as the article itself: no second visit.
+        assert_eq!(canonical_target("https://www.example.gr/news/a-story/amp", "https://www.example.gr/news/a-story"), None);
+        assert!(canonical_target("https://www.example.gr/amp/news/a-story", "https://www.example.gr/news/a-story").is_some());
+    }
+
+    #[test]
+    fn the_blocked_url_patterns_never_include_one_that_blocks_the_page_itself() {
+        let all = UnifiedAdBlocker::new(std::path::PathBuf::new()).generate_cdp_blocked_patterns();
+        let page = "https://www.example.gr/news/vast-majority-of-voters";
+        assert!(all.iter().any(|p| glob_matches(p, page)), "the fixture must hit a pattern");
+        let kept = patterns_not_matching(all.clone(), page);
+        assert!(kept.iter().all(|p| !glob_matches(p, page)));
+        assert_eq!(kept.len(), all.len() - all.iter().filter(|p| glob_matches(p, page)).count());
+        assert!(kept.iter().any(|p| p.contains("doubleclick")));
+        assert!(glob_matches("*teads.tv*", "https://s.teads.tv/x"));
+        assert!(!glob_matches("*teads.tv*", "https://example.gr/x"));
+        assert!(glob_matches("*/ads/*", "https://example.gr/ads/a"));
+    }
+
+    #[test]
+    fn a_page_address_that_is_not_http_falls_back() {
+        assert_eq!(http_url_or(Some("about:blank".into()), "https://a.gr/x"), "https://a.gr/x");
+        assert_eq!(http_url_or(Some("chrome-error://chromewebdata/".into()), "https://a.gr/x"), "https://a.gr/x");
+        assert_eq!(http_url_or(None, "https://a.gr/x"), "https://a.gr/x");
+        assert_eq!(http_url_or(Some("https://a.gr/y".into()), "https://a.gr/x"), "https://a.gr/y");
+    }
+
+    #[test]
+    fn only_the_normal_sniff_returns_the_page_to_the_top() {
+        assert!(LAZY_SCROLL_JS.contains("scrollTo(0, 0)"));
+        assert!(!LAZY_SCROLL_KEEP_JS.contains("scrollTo(0, 0)"));
+        // Both do the per-element pass and the stepped window scroll.
+        for js in [LAZY_SCROLL_JS, LAZY_SCROLL_KEEP_JS] {
+            assert!(js.contains("scrollIntoView") && js.contains("y += 800") && js.contains("v.play()"));
+        }
+    }
+
+    #[test]
+    fn the_consent_and_lazy_scripts_are_fixed_text_run_in_every_frame() {
+        let production = production_source();
+        // One lazy script body for both paths (per-element pass, then the stepped scroll).
+        assert_eq!(production.matches("evaluate(LAZY_SCROLL_JS)").count(), 2);
+        assert_eq!(production.matches("evaluate(LAZY_SCROLL_KEEP_JS)").count(), 1);
+        assert!(!production.contains("let lazy_scroll_js") && !production.contains("let scroll_js") && !production.contains("let play_js"));
+        let start = production.find("async fn consent_all_frames").unwrap();
+        let end = production.find("async fn canonical_to_follow").unwrap();
+        let frames = &production[start..end];
+        assert!(frames.contains(".expression(COOKIE_BYPASS_JS)") && !frames.contains("format!"));
+        for sel in ["sp_choice_type_11", "button[title=\"Accept all\"]", "qc-cmp2-summary-buttons", "CybotCookiebot", "ΑΠΟΔΕΧΟΜΑΙ", "ΑΠΟΔΟΧΗ", "ΣΥΜΦΩΝΩ"] {
+            assert!(COOKIE_BYPASS_JS.contains(sel), "consent script lacks {sel}");
+        }
     }
 
     #[test]
