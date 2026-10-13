@@ -1262,7 +1262,10 @@ async fn run_daemon(
         bin_dir.clone(),
         config.ytdl_channel.clone(),
     ));
+    // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
+    let url_tester = Arc::new(repair::AdminTester::new());
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
+        .with_url_tester(url_tester.clone())
         .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
@@ -1519,6 +1522,7 @@ async fn run_daemon(
     });
     // The overnight self-heal (P10.14) probes with the same ladder world as the workers.
     canary_env.set_heal(worker_repair.clone());
+    url_tester.set_ctx(worker_repair.clone());
     let worker_canary = canary_env.clone();
 
     tokio::spawn(async move {

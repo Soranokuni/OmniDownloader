@@ -116,6 +116,7 @@ impl WebServer {
             .route("/api/admin/recipes/:id/suspend", post(admin_sites::api_admin_recipe_suspend))
             .route("/api/admin/recipes/:id/retire", post(admin_sites::api_admin_recipe_retire))
             .route("/api/admin/repair-report", get(admin_sites::api_admin_repair_report))
+            .route("/api/admin/test-url", get(admin_sites::api_admin_test_url_info).post(admin_sites::api_admin_test_url))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))

@@ -24,6 +24,25 @@ pub trait SiteRunner: Send + Sync {
     fn run_now(&self, domain: &str) -> RunNow;
 }
 
+/// Why a Test URL run did not happen (P10.15b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestUrlError {
+    /// Another test is running; only one at a time in the process.
+    Busy,
+    /// The address may not be tested; the reason is short and names no path.
+    Refused(String),
+}
+
+pub type TestUrlFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, TestUrlError>> + Send + 'a>>;
+
+/// The admin's «Test URL»: a dry run of the normal path and the repair ladder
+/// on one address. The daemon implements it; the web crate cannot see the repair
+/// code. Nothing is downloaded, queued or delivered.
+pub trait UrlTester: Send + Sync {
+    fn test_url<'a>(&'a self, url: &'a str, use_llm: bool) -> TestUrlFuture<'a>;
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Repository,
@@ -65,6 +84,8 @@ pub struct AppState {
     pub temp_dir: Option<PathBuf>,
     /// The canary runner behind «Run now» (P10.15a); `None` in tests that have none.
     pub site_runner: Option<Arc<dyn SiteRunner>>,
+    /// The dry-run tester behind the admin's «Test URL» (P10.15b); `None` in tests that have none.
+    pub url_tester: Option<Arc<dyn UrlTester>>,
 }
 
 impl AppState {
@@ -98,6 +119,7 @@ impl AppState {
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
             site_runner: None,
+            url_tester: None,
         }
     }
 
@@ -110,6 +132,12 @@ impl AppState {
     /// The canary runner for the Sites card's «Run now».
     pub fn with_site_runner(mut self, runner: Arc<dyn SiteRunner>) -> Self {
         self.site_runner = Some(runner);
+        self
+    }
+
+    /// The dry-run tester for the admin's «Test URL».
+    pub fn with_url_tester(mut self, tester: Arc<dyn UrlTester>) -> Self {
+        self.url_tester = Some(tester);
         self
     }
 

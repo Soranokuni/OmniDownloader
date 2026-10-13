@@ -21,6 +21,7 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use omni_broadcast::downloader::{Downloader, LinkInfo};
 use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::card::{self, ImageEvidence, ImageSource};
 use omni_broadcast::repair::JobKind;
@@ -284,6 +285,20 @@ pub trait Env: Send + Sync {
     fn card_cap(&self) -> Duration {
         card::CARD_CAP
     }
+    /// The video the site's own API names for a page (`pages::resolve`, as the real job asks first).
+    /// The default has none.
+    async fn site_api(&self, _url: &str) -> std::result::Result<Option<String>, String> {
+        Ok(None)
+    }
+    /// What yt-dlp says about a link without downloading it (Test URL, P10.15b).
+    /// The default has no yt-dlp.
+    async fn ytdl_probe(&self, _url: &str, _timeout: Duration) -> std::result::Result<LinkInfo, String> {
+        Err("yt-dlp is not available here".to_string())
+    }
+    /// One sniff of a page for its streams (Test URL, P10.15b); read-only. The default sees nothing.
+    async fn sniff(&self, _url: &str, _secs: u64) -> SniffSeen {
+        SniffSeen::default()
+    }
     /// The unchanged pipeline, for one verified address.
     async fn download(
         &self,
@@ -293,6 +308,15 @@ pub trait Env: Send + Sync {
         cancel: &CancellationToken,
         mode: DeliveryMode,
     ) -> Result<RunOutcome>;
+}
+
+/// What one sniff saw: the best stream and how many there were (or why none), and the page.
+#[derive(Debug, Clone, Default)]
+pub struct SniffSeen {
+    pub stream: Option<String>,
+    pub streams: usize,
+    pub error: Option<String>,
+    pub snapshot: Option<PageSnapshot>,
 }
 
 /// Everything a worker needs to run the ladder.
@@ -308,6 +332,7 @@ pub struct RealEnv {
     fetcher: HttpFetcher,
     images: HttpImages,
     ffmpeg: std::path::PathBuf,
+    ytdl: std::path::PathBuf,
     prober: ToolProber,
     resolver: repair_gate::SystemResolver,
     model: Option<LlmModel>,
@@ -335,6 +360,7 @@ impl RealEnv {
             fetcher: HttpFetcher::new(),
             images: HttpImages(HttpFetcher::new()),
             ffmpeg,
+            ytdl: ytdl.clone(),
             prober: ToolProber::new(ffprobe, Some(ytdl)),
             resolver: repair_gate::SystemResolver,
             model: None,
@@ -381,6 +407,26 @@ impl Env for RealEnv {
     fn card_tools(&self) -> Option<(std::path::PathBuf, &dyn ImageSource)> {
         Some((self.ffmpeg.clone(), &self.images))
     }
+    async fn site_api(&self, url: &str) -> std::result::Result<Option<String>, String> {
+        match tokio::time::timeout(Duration::from_secs(20), omni_browser::pages::resolve(url)).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(_) => Err("the site's API did not answer in time".to_string()),
+        }
+    }
+    async fn ytdl_probe(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
+        Downloader::new(&self.ytdl).probe_info(url, timeout).await
+    }
+    async fn sniff(&self, url: &str, secs: u64) -> SniffSeen {
+        let url = url.to_string();
+        let Some(s) = detached(async move { StreamSniffer::extract_with_evidence(&url, secs).await }).await else {
+            return SniffSeen { error: Some("the browser run ended abnormally".into()), ..Default::default() };
+        };
+        match s.media {
+            Ok(m) => SniffSeen { stream: Some(m.primary_stream), streams: m.all_streams.len(), error: None, snapshot: Some(s.snapshot) },
+            Err(e) => SniffSeen { error: Some(format!("{e:#}").chars().take(200).collect()), snapshot: Some(s.snapshot), ..Default::default() },
+        }
+    }
     async fn download(
         &self,
         job: Job,
@@ -406,11 +452,16 @@ fn live_result(snap: PageSnapshot, diag: &omni_browser::evidence::Diagnostic, ac
 
 /// What kind of job this is, for [`omni_broadcast::repair::eligible`].
 pub fn job_kind(job: &Job, url: &str) -> JobKind {
+    kind_of(url, job.extraction_method.as_deref() == Some("locker"), job.parent_job_id.is_some())
+}
+
+/// [`job_kind`] from its facts: whether the job was marked a locker, and whether it is an article's sibling.
+pub fn kind_of(url: &str, marked_locker: bool, sibling: bool) -> JobKind {
     use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
     if url.starts_with("attachment://") {
         return JobKind::Attachment;
     }
-    if job.extraction_method.as_deref() == Some("locker") || ComputerUseAgentPlaceholder::new(None, None).can_handle(url) {
+    if marked_locker || ComputerUseAgentPlaceholder::new(None, None).can_handle(url) {
         return JobKind::Locker;
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -419,7 +470,7 @@ pub fn job_kind(job: &Job, url: &str) -> JobKind {
     if omni_broadcast::downloader::is_video_platform(url) {
         return JobKind::Platform;
     }
-    if job.parent_job_id.is_some() {
+    if sibling {
         return JobKind::ArticleSibling;
     }
     JobKind::WebPage
@@ -1009,6 +1060,8 @@ struct LlmStats {
     reason: Option<Reason>,
     /// The budget ran out between rounds.
     cut: bool,
+    /// What the gate rejected among the addresses the model pointed at (Test URL shows them).
+    rejected: Vec<repair_gate::Rejected>,
 }
 
 /// An address the model pointed at: the hash its method name carries (of the recipe
@@ -1091,6 +1144,7 @@ async fn llm_rung(
     deadline: Instant,
     live_used: bool,
     max_rounds: usize,
+    dry: bool,
     stats: &mut LlmStats,
 ) -> LlmFlow {
     let cfg = &ctx.cfg.llm;
@@ -1115,8 +1169,10 @@ async fn llm_rung(
     let mut notes = vec![RoundNote { what: "recipes".into(), host: None, reason: "no recipe produced a verified video".into() }];
     // The notes are not part of the hash: the same page is the same bundle.
     let first = repair_llm::build_bundle(snap, &notes);
+    // A dry run (Test URL) neither honours nor sets the 24 h resend memory: it is the admin's own question.
     match ctx.repo.llm_bundle_sent_since(&first.hash, now - chrono::Duration::hours(LLM_RESEND_HOURS)) {
         Ok(false) => {}
+        Ok(true) if dry => {}
         Ok(true) => {
             info!("Job #{job_id}: the same page bundle went to the repair model in the last 24 h, not sent again");
             return LlmFlow::Nothing;
@@ -1163,8 +1219,10 @@ async fn llm_rung(
         stats.rounds = round;
         let bundle = match first.take() {
             Some(b) => {
-                if let Err(e) = ctx.repo.record_llm_bundle(&b.hash, domain, Utc::now()) {
-                    warn!("Job #{job_id}: the repair model bundle could not be recorded: {e:#}");
+                if !dry {
+                    if let Err(e) = ctx.repo.record_llm_bundle(&b.hash, domain, Utc::now()) {
+                        warn!("Job #{job_id}: the repair model bundle could not be recorded: {e:#}");
+                    }
                 }
                 b
             }
@@ -1323,10 +1381,12 @@ async fn llm_rung(
                 return LlmFlow::Lost;
             }
             if !verified.is_empty() {
+                stats.rejected.extend(rejected);
                 found.retain(|u, _| verified.iter().any(|v| &v.candidate.url == u));
                 return LlmFlow::Verified(LlmVerified { verified, found, facts });
             }
             notes.extend(rejected.iter().map(|r| rejection_note(round, r)));
+            stats.rejected.extend(rejected);
         }
 
         // A click: once per ladder run, with the budget for it and for the gate.
@@ -1437,7 +1497,7 @@ async fn ladder(
         let mut stats = LlmStats::default();
         let flow = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline + GRACE),
-            llm_rung(ctx, job_id, owner, orig_url, &domain, &snap, &tried, prior, cancel, deadline, live_used, LLM_MAX_ROUNDS, &mut stats),
+            llm_rung(ctx, job_id, owner, orig_url, &domain, &snap, &tried, prior, cancel, deadline, live_used, LLM_MAX_ROUNDS, false, &mut stats),
         )
         .await;
         end.llm_calls = stats.calls;
@@ -2181,7 +2241,7 @@ async fn probe_page(
         let mut stats = LlmStats::default();
         let flow = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline + GRACE),
-            llm_rung(ctx, NO_JOB, "", url, domain, &snap, &tried, prior, &CancellationToken::new(), deadline, live_tried, calls_left.min(LLM_MAX_ROUNDS), &mut stats),
+            llm_rung(ctx, NO_JOB, "", url, domain, &snap, &tried, prior, &CancellationToken::new(), deadline, live_tried, calls_left.min(LLM_MAX_ROUNDS), false, &mut stats),
         )
         .await;
         let spent = u32::try_from(stats.calls).unwrap_or(u32::MAX);
@@ -2209,6 +2269,11 @@ fn record_verdict(tally: &mut Tally, ranked: &[RankedRecipe], id: i64, v: Verdic
         tally.add(id, &r.hash, r.origin.as_str(), v);
     }
 }
+
+/// The admin's «Test URL» (P10.15b): the normal path and the ladder, nothing downloaded.
+#[path = "repair_dry.rs"]
+mod dry;
+pub use dry::AdminTester;
 
 #[cfg(test)]
 #[path = "repair_tests.rs"]

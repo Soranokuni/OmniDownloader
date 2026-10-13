@@ -509,6 +509,61 @@ impl Downloader {
     }
 }
 
+/// What yt-dlp says about a link, for the admin's Test URL (P10.15b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkInfo {
+    pub extractor: String,
+    pub title: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub formats: usize,
+}
+
+/// `--print "%(extractor)s|%(duration)s|%(formats.:.format_id)j|%(title)s"`: the first
+/// non-empty line. The title is last, so a `|` in it stays in it.
+pub fn parse_info_line(stdout: &str) -> Option<LinkInfo> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let f: Vec<&str> = line.splitn(4, '|').collect();
+    if f.len() != 4 || f[0].is_empty() || f[0] == "NA" {
+        return None;
+    }
+    let known = |s: &str| (s != "NA" && !s.is_empty()).then(|| s.to_string());
+    Some(LinkInfo {
+        extractor: f[0].to_string(),
+        title: known(f[3].trim()).map(|t| t.chars().take(200).collect()),
+        duration_secs: known(f[1].trim()).and_then(|s| s.parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0),
+        formats: serde_json::from_str::<Vec<serde_json::Value>>(f[2].trim()).map(|v| v.len()).unwrap_or(0),
+    })
+}
+
+impl Downloader {
+    /// Extractor, title, length and number of formats of the video at `url`, without
+    /// downloading it (`--simulate`). `Err` is the one-line reason.
+    pub async fn probe_info(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
+        let mut args: Vec<String> = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "15",
+            "--print",
+            "%(extractor)s|%(duration)s|%(formats.:.format_id)j|%(title)s",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_info_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
+            Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
+            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
+        }
+    }
+}
+
 /// What `--flat-playlist -J` made of a page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageScan {
@@ -644,6 +699,16 @@ mod tests {
             Path::new("C:/temp/jobs/7"),
             opts,
         )
+    }
+
+    #[test]
+    fn the_info_line_gives_extractor_length_formats_and_a_title_with_bars() {
+        let i = parse_info_line("generic|93.5|[\"hls-720\",\"hls-480\"]|Ena | dyo\n").unwrap();
+        assert_eq!((i.extractor.as_str(), i.duration_secs, i.formats), ("generic", Some(93.5), 2));
+        assert_eq!(i.title.as_deref(), Some("Ena | dyo"));
+        let n = parse_info_line("youtube|NA|null|NA").unwrap();
+        assert_eq!((n.duration_secs, n.formats, n.title), (None, 0, None));
+        assert!(parse_info_line("").is_none() && parse_info_line("NA|1|[]|x").is_none());
     }
 
     #[test]
