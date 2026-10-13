@@ -78,6 +78,15 @@ struct Fake {
     live_limits: Option<(u64, Duration)>,
     /// The scripted model of the LLM rung (P10.12); `None`: the ladder has no model.
     model: Option<MockModel>,
+    // Test URL (P10.15b): what yt-dlp and the sniffer say, and how often each was asked.
+    ytdl: Mutex<Option<std::result::Result<LinkInfo, String>>>,
+    ytdl_hangs: bool,
+    ytdl_calls: AtomicUsize,
+    sniff_seen: Mutex<Option<SniffSeen>>,
+    site_api: Mutex<Option<std::result::Result<Option<String>, String>>>,
+    site_api_calls: AtomicUsize,
+    sniff_delay: Duration,
+    sniff_calls: AtomicUsize,
 }
 
 /// The model behind [`RepairModel`]: scripted answers, every user text kept.
@@ -173,6 +182,14 @@ impl Fake {
             live_panics: false,
             live_limits: None,
             model: None,
+            ytdl: Mutex::new(None),
+            ytdl_hangs: false,
+            ytdl_calls: AtomicUsize::new(0),
+            sniff_seen: Mutex::new(None),
+            site_api: Mutex::new(None),
+            site_api_calls: AtomicUsize::new(0),
+            sniff_delay: Duration::ZERO,
+            sniff_calls: AtomicUsize::new(0),
         }
     }
     fn probes(&self) -> usize {
@@ -250,6 +267,24 @@ impl Env for Fake {
     }
     fn card_cap(&self) -> Duration {
         self.card_cap.unwrap_or(card::CARD_CAP)
+    }
+    async fn ytdl_probe(&self, _url: &str, _timeout: Duration) -> std::result::Result<LinkInfo, String> {
+        self.ytdl_calls.fetch_add(1, Ordering::SeqCst);
+        if self.ytdl_hangs {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        self.ytdl.lock().unwrap().clone().unwrap_or_else(|| Err("ERROR: Unsupported URL".to_string()))
+    }
+    async fn site_api(&self, _url: &str) -> std::result::Result<Option<String>, String> {
+        self.site_api_calls.fetch_add(1, Ordering::SeqCst);
+        self.site_api.lock().unwrap().clone().unwrap_or(Ok(None))
+    }
+    async fn sniff(&self, _url: &str, _secs: u64) -> SniffSeen {
+        self.sniff_calls.fetch_add(1, Ordering::SeqCst);
+        if !self.sniff_delay.is_zero() {
+            tokio::time::sleep(self.sniff_delay).await;
+        }
+        self.sniff_seen.lock().unwrap().clone().unwrap_or_default()
     }
     async fn download(
         &self,
@@ -2011,3 +2046,6 @@ async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
         assert_eq!(n.repo.latest_attempt(n.job_id).unwrap().unwrap().outcome.as_deref(), Some("repair_off"));
     }
 }
+
+#[path = "repair_dry_tests.rs"]
+mod dry_run_tests;

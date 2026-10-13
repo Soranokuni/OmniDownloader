@@ -203,6 +203,28 @@
       </div>
     </section>
 
+    <section class="card stack" id="test-url">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Test URL</h2>
+      </div>
+      <p class="note">
+        Paste an article address to see what the program would do with it, without downloading,
+        queuing or delivering anything: first what yt-dlp and the page sniffer say, and when
+        both fail, what the repair ladder would try, with every candidate and its checks. It
+        takes up to three minutes, and one test runs at a time.
+      </p>
+      <form id="test-url-form" class="row">
+        <input type="url" id="test-url-input" class="grow" placeholder="https://… an article page" required>
+        <button class="btn btn-primary" type="submit" id="test-url-run">Run</button>
+      </form>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="test-url-llm" style="width:auto">
+        <span id="test-url-llm-label">Use the model</span>
+      </label>
+      <p id="test-url-progress" class="note"></p>
+      <div id="test-url-result" class="stack"></div>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
@@ -542,6 +564,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=15"></script>
+<script type="module" src="/static/admin.js?v=18"></script>
 </body>
 </html>

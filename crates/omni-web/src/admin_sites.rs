@@ -15,7 +15,7 @@ use omni_core::recipe_score::{InsertOutcome, NewRecipe, Origin, ScopeKind, MAX_R
 use omni_core::repository::{AdminRetire, SiteReport};
 
 use crate::auth::{internal_error, ApiError, RequireAdmin};
-use crate::state::{AppState, RunNow};
+use crate::state::{AppState, RunNow, TestUrlError};
 
 type JsonResult = Result<Json<Value>, ApiError>;
 
@@ -413,4 +413,61 @@ pub async fn api_admin_repair_report(
         "image_match_max": omni_core::repository::IMAGE_MATCH_MAX,
         "sites": report.iter().map(report_json).collect::<Vec<_>>(),
     })))
+}
+
+// -------------------------------------------------------------- test url
+
+/// Longest address the Test URL accepts.
+const MAX_TEST_URL: usize = 2048;
+
+/// What the Test URL card needs to know before a run: whether it can run and
+/// what is left of today's model calls (a ticked run counts toward the cap).
+pub async fn api_admin_test_url_info(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let cfg = state.config.read().await;
+    let model_set = cfg.repair.llm_model.as_deref().is_some_and(|m| !m.trim().is_empty());
+    let (cap, available) = (cfg.repair.llm_max_calls_per_day, cfg.repair.llm_enabled && model_set);
+    drop(cfg);
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let used = state.repo.llm_usage_for(&day).map_err(internal_error("Could not read the model's calls."))?.0;
+    Ok(Json(json!({
+        "can_run": state.url_tester.is_some(),
+        "llm_available": available,
+        "llm_cap": cap,
+        "llm_left": (i64::from(cap) - used).max(0),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct TestUrlPayload {
+    url: String,
+    #[serde(default)]
+    use_llm: bool,
+}
+
+/// «Run»: the dry run of the normal path and the repair ladder on one public
+/// address. Downloads, queues and delivers nothing. 409 while another test runs.
+pub async fn api_admin_test_url(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Json(payload): Json<TestUrlPayload>,
+) -> JsonResult {
+    let url = payload.url.trim();
+    if url.is_empty() || url.len() > MAX_TEST_URL {
+        return Err(ApiError::bad_request("Enter one address (http or https)."));
+    }
+    let (_, host) = omni_core::net::parse_public_url(url)
+        .map_err(|_| ApiError::bad_request("Only a public http or https address can be tested."))?;
+    let Some(tester) = state.url_tester.as_ref() else {
+        return Err(ApiError::new(StatusCode::CONFLICT, "UNAVAILABLE", "The test is not available here."));
+    };
+    let _ = state.repo.log_audit("INFO", "ADMIN", &format!("{} ran Test URL on {host}", admin.email));
+    match tester.test_url(url, payload.use_llm).await {
+        Ok(report) => Ok(Json(report)),
+        Err(TestUrlError::Busy) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "BUSY",
+            "Another test is running. Wait for it to finish (up to three minutes).",
+        )),
+        Err(TestUrlError::Refused(why)) => Err(ApiError::bad_request(format!("This address cannot be tested: {why}."))),
+    }
 }

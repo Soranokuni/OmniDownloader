@@ -122,6 +122,12 @@ pub enum Resolved {
 
 /// Turn a found glomex player into something yt-dlp can download.
 ///
+/// A request error without the address it asked: the contextual one embeds the article
+/// address with its query, and reqwest prints it.
+fn no_url(e: reqwest::Error) -> reqwest::Error {
+    e.without_url()
+}
+
 /// A concrete clip only needs the canonical form. A contextual one is asked
 /// of glomex; a failed request keeps the player out rather than handing
 /// yt-dlp a URL it is known to reject.
@@ -141,11 +147,14 @@ pub async fn resolve(embed: &GlomexEmbed, page_url: &str) -> Result<Resolved> {
         .header("Referer", page_url)
         .send()
         .await
+        .map_err(no_url)
         .context("glomex contextual playlist request")?
         .error_for_status()
+        .map_err(no_url)
         .context("glomex contextual playlist request")?
         .json()
         .await
+        .map_err(no_url)
         .context("glomex contextual playlist answer")?;
     Ok(match first_clip(&answer) {
         Some(clip) => Resolved::Embed(
@@ -159,6 +168,17 @@ pub async fn resolve(embed: &GlomexEmbed, page_url: &str) -> Result<Resolved> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_failed_request_names_neither_the_address_nor_its_query() {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        // A refused local connection: the error reqwest builds would carry the whole address.
+        let url = "http://127.0.0.1:1/contextual?current_url=https%3A%2F%2Fnews.example%2Fa%3Ftoken%3DSECRETVALUE";
+        let raw = client.get(url).send().await.unwrap_err();
+        assert!(format!("{raw:#}").contains("SECRETVALUE"), "the control: reqwest prints the address");
+        let plain = anyhow::Error::from(no_url(raw)).context("glomex contextual playlist request");
+        assert!(!format!("{plain:#}").contains("SECRETVALUE"), "{plain:#}");
+    }
 
     #[test]
     fn every_player_url_form_parses_to_integration_and_playlist() {

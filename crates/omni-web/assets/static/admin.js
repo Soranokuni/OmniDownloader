@@ -732,6 +732,161 @@ recipeFile.addEventListener('change', async () => {
   if (file) document.getElementById('recipes-import-text').value = await file.text();
 });
 
+/* ------------------------------------------------------------------ *
+ * Test URL (plan P10.15b): a dry run, nothing is downloaded or queued
+ * ------------------------------------------------------------------ */
+
+const fmtSecs = (s) => (s === null || s === undefined ? '—' : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`);
+const fmtMsShort = (ms) => (ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+function tuBlock(title, ...children) {
+  return el('div', { class: 'card flush stack', style: 'padding:12px' },
+    el('h3', { class: 'card-title', style: 'font-size:0.95rem;margin:0' }, title),
+    ...children);
+}
+
+function tuTable(head, rows) {
+  return el('div', { class: 'card flush' }, el('table', {},
+    el('thead', {}, el('tr', {}, head.map((h) => el('th', {}, h)))),
+    el('tbody', {}, rows)));
+}
+
+function renderTestNormal(n) {
+  const out = [];
+  out.push(tuBlock('Normal path: kind of link',
+    el('div', { class: 'spec-row' }, el('span', {}, 'Kind'), el('span', { class: 'mono' }, n.kind || '—'))));
+  const a = n.site_api;
+  if (a) {
+    out.push(tuBlock('Normal path: site API',
+      el('p', {}, el('span', { class: `badge ${a.video ? 'ok' : (a.error ? 'bad' : '')}` },
+        a.video ? 'names a video' : (a.error ? 'failed' : 'has nothing for this page')), ` ${fmtMsShort(a.ms)}`),
+      a.video ? el('div', { class: 'spec-row' }, el('span', {}, 'Video'), el('span', { class: 'mono' }, a.video)) : null,
+      a.error ? el('p', { class: 'note mono' }, a.error) : null));
+  }
+  const y = n.ytdlp;
+  if (y) {
+    out.push(tuBlock('Normal path: yt-dlp',
+      el('p', {}, el('span', { class: `badge ${y.ok ? 'ok' : 'bad'}` }, y.ok ? 'reads the link' : 'fails'), ` ${fmtMsShort(y.ms)}`),
+      y.ok
+        ? el('div', { class: 'spec-row' }, el('span', {}, 'Extractor'), el('span', { class: 'mono' }, y.extractor))
+        : el('p', { class: 'note mono' }, y.error || ''),
+      y.ok ? el('div', { class: 'spec-row' }, el('span', {}, 'Title'), el('span', {}, y.title || '—')) : null,
+      y.ok ? el('div', { class: 'spec-row' }, el('span', {}, 'Length'), el('span', {}, fmtSecs(y.duration_secs))) : null,
+      y.ok ? el('div', { class: 'spec-row' }, el('span', {}, 'Formats'), el('span', {}, String(y.formats))) : null));
+  }
+  const s = n.sniff;
+  if (s) {
+    out.push(tuBlock('Normal path: page sniffer',
+      el('p', {}, el('span', { class: `badge ${s.ok ? 'ok' : 'bad'}` }, s.ok ? 'finds a stream' : 'finds no stream'), ` ${fmtMsShort(s.ms)}`),
+      s.ok ? el('div', { class: 'spec-row' }, el('span', {}, `Best of ${s.streams}`), el('span', { class: 'mono' }, s.stream)) : null,
+      s.error ? el('p', { class: 'note mono' }, s.error) : null));
+  }
+  return out;
+}
+
+function renderTestCandidates(list) {
+  if (list.length === 0) return el('p', { class: 'note' }, 'No candidate address reached the gate.');
+  return tuTable(['Rank', 'Address', 'Origin', 'Length', 'Height', 'Score', 'Checks'], list.map((c) => el('tr', {},
+    el('td', {}, c.verified ? `#${c.rank}` : el('span', { class: 'badge bad' }, 'rejected')),
+    el('td', { class: 'mono' }, c.address),
+    el('td', { class: 'mono' }, c.origin),
+    el('td', { class: 'num' }, fmtSecs(c.duration_secs)),
+    el('td', { class: 'num' }, c.height ? `${c.height}p` : '—'),
+    el('td', { class: 'num' }, c.score === null || c.score === undefined ? '—' : String(c.score)),
+    el('td', {}, c.checks.map((k) => el('div', { class: k.ok ? 'ok' : 'bad', title: k.detail },
+      `${k.ok ? '✓' : '✗'} ${k.name}: ${k.detail}`))))));
+}
+
+function renderTestLadder(l) {
+  const out = [];
+  if (!l.page_looked) {
+    out.push(tuBlock('Repair ladder: page', el('p', { class: 'note' }, 'No complete look at the page could be made.')));
+    return out;
+  }
+  out.push(tuBlock('Repair ladder: the page',
+    el('div', { class: 'spec-row' }, el('span', {}, 'Class'), el('span', { class: 'badge' }, l.class || '—')),
+    el('div', { class: 'spec-row' }, el('span', {}, 'Signals'), el('span', { class: 'mono' }, l.signals.length ? l.signals.join(', ') : '—')),
+    el('div', { class: 'spec-row' }, el('span', {}, 'Player family'), el('span', { class: 'mono' }, l.family || '—'))));
+  out.push(tuBlock('Repair ladder: recipes',
+    l.recipes.length === 0
+      ? el('p', { class: 'note' }, 'No recipe applies to this site.')
+      : tuTable(["Recipe", "Tier", "Origin", 'Outcome', 'Address', 'Gate', 'Time'], l.recipes.map((r) => el('tr', {},
+        el('td', { class: 'mono', title: r.hash }, r.name),
+        el('td', {}, r.tier === 'generic' ? 'built-in' : r.tier),
+        el('td', {}, r.origin),
+        el('td', {}, r.outcome),
+        el('td', { class: 'mono' }, r.address || '—'),
+        el('td', {}, r.gate || '—'),
+        el('td', { class: 'num' }, fmtMsShort(r.ms)))))));
+  if (l.live) {
+    out.push(tuBlock('Repair ladder: live page load',
+      el('p', {}, `${l.live.run}, ${fmtMsShort(l.live.ms)}`),
+      l.live.actions.length ? el('p', { class: 'note mono' }, l.live.actions.join(', ')) : null));
+  }
+  if (l.llm) {
+    out.push(tuBlock('Repair ladder: the model',
+      el('p', {}, l.llm.asked
+        ? `${l.llm.calls} call(s), ${l.llm.rounds} round(s), ${l.llm.tokens_in} tokens in, ${l.llm.tokens_out} out`
+        : 'The model was not called.'),
+      el('p', { class: 'note' }, l.llm.outcome)));
+  }
+  out.push(tuBlock('Candidates and the gate', renderTestCandidates(l.candidates)));
+  return out;
+}
+
+function renderTestReport(r) {
+  render('test-url-result', [
+    el('p', {}, el('strong', {}, r.verdict)),
+    el('p', { class: 'note' }, `Repair mode: ${r.repair_mode}. Total ${fmtMsShort(r.total_ms)}. Nothing was downloaded, queued or delivered.`),
+    ...renderTestNormal(r.normal),
+    ...(r.ladder ? renderTestLadder(r.ladder) : []),
+    tuBlock('Timings', tuTable(['Step', 'Time', 'Note'], r.steps.map((s) => el('tr', {},
+      el('td', {}, s.name), el('td', { class: 'num' }, fmtMsShort(s.ms)), el('td', {}, s.note))))),
+  ]);
+}
+
+async function loadTestUrl() {
+  let info;
+  try {
+    info = await api('/api/admin/test-url');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  const box = document.getElementById('test-url-llm');
+  box.disabled = !info.llm_available || info.llm_left <= 0;
+  if (box.disabled) box.checked = false;
+  document.getElementById('test-url-run').disabled = !info.can_run;
+  document.getElementById('test-url-llm-label').textContent = !info.llm_available
+    ? 'Use the model (not set up: Settings, repair model)'
+    : `Use the model (${info.llm_left} of ${info.llm_cap} calls left today; a run counts toward the limit)`;
+}
+
+document.getElementById('test-url-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const run = document.getElementById('test-url-run');
+  const url = document.getElementById('test-url-input').value.trim();
+  const useLlm = document.getElementById('test-url-llm').checked;
+  run.disabled = true;
+  render('test-url-result', []);
+  const started = Date.now();
+  const progress = document.getElementById('test-url-progress');
+  const tick = setInterval(() => {
+    progress.textContent = `Running… ${Math.round((Date.now() - started) / 1000)} s of at most 180 s`;
+  }, 1000);
+  progress.textContent = 'Running… 0 s of at most 180 s';
+  try {
+    renderTestReport(await api('/api/admin/test-url', { method: 'POST', body: { url, use_llm: useLlm } }));
+    progress.textContent = '';
+  } catch (e) {
+    progress.textContent = e.message;
+  } finally {
+    clearInterval(tick);
+    run.disabled = false;
+    loadTestUrl();
+  }
+});
+
 
 /* ------------------------------------------------------------------ *
  * Audit log
@@ -1226,6 +1381,7 @@ loadSelfcheck();
 loadSites();
 loadRecipes();
 loadReport();
+loadTestUrl();
 loadUsers();
 loadTaxonomy();
 loadMail();

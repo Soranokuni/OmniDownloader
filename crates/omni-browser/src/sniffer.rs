@@ -121,6 +121,16 @@ struct DiagFacts {
 /// trigger programmatic lazy hydration, and extract broadcast-grade video streams.
 pub struct StreamSniffer;
 
+/// An address as the log may show it: host and path, never the query or fragment
+/// (a media address often carries a token there).
+pub fn log_addr(url: &str) -> String {
+    let full = if url.starts_with("//") { format!("https:{url}") } else { url.to_string() };
+    match reqwest::Url::parse(&full) {
+        Ok(u) => format!("{}{}", u.host_str().unwrap_or("?"), u.path()),
+        Err(_) => "(not an address)".to_string(),
+    }
+}
+
 impl StreamSniffer {
     /// Determines whether a URL belongs to known ad networks, trackers, or non-media assets.
     pub fn is_ad_or_tracking(url: &str) -> bool {
@@ -213,7 +223,7 @@ impl StreamSniffer {
 
     /// The same extraction, also returning what the browser saw.
     pub async fn extract_with_evidence(target_url: &str, timeout_secs: u64) -> Sniffed {
-        info!("StreamSniffer: Starting browser extraction for {}", target_url);
+        info!("StreamSniffer: Starting browser extraction for {}", log_addr(target_url));
 
         let mut session = match HeadlessBrowserManager::launch().await {
             Ok(s) => s,
@@ -612,7 +622,7 @@ impl StreamSniffer {
                 if score > 0 {
                     info!(
                         "StreamSniffer: Discovered candidate (score: {}): {}",
-                        score, req_url
+                        score, log_addr(&req_url)
                     );
                     let mut list = candidates_clone.lock().await;
                     if !list.iter().any(|(_, u)| u == &req_url) {
@@ -910,7 +920,7 @@ impl StreamSniffer {
                         stop_flag.store(true, Ordering::Relaxed);
                         info!(
                             "StreamSniffer: Selected high-confidence stream (score: {}): {}",
-                            best_score, best_url
+                            best_score, log_addr(best_url)
                         );
                         break;
                     }
@@ -972,7 +982,7 @@ impl StreamSniffer {
                 "StreamSniffer: Discovered {} media streams total. Selected primary (score: {}): {}",
                 sorted_candidates.len(),
                 score,
-                best_url
+                log_addr(best_url)
             );
 
             let all_urls = sorted_candidates.iter().map(|(_, u)| u.clone()).collect();
@@ -996,7 +1006,7 @@ impl StreamSniffer {
                 Ok(Err(e)) => warn!("StreamSniffer: page facts could not be read: {}", e),
                 Err(_) => warn!("StreamSniffer: page facts read timed out"),
             }
-            Err(BrowserError::NoStreamFound(target_url.to_string()).into())
+            Err(BrowserError::NoStreamFound(log_addr(target_url)).into())
         }
     }
 
@@ -1022,11 +1032,11 @@ impl StreamSniffer {
                 match glomex::resolve(&embed, page_url).await {
                     Ok(glomex::Resolved::Embed(u)) => (95, u),
                     Ok(glomex::Resolved::Empty) => {
-                        info!("StreamSniffer: glomex player {raw} has no video for this page; ignored");
+                        info!("StreamSniffer: glomex player {} has no video for this page; ignored", log_addr(raw));
                         continue;
                     }
                     Err(e) => {
-                        warn!("StreamSniffer: could not ask glomex which video {raw} plays: {e:#}");
+                        warn!("StreamSniffer: could not ask glomex which video {} plays: {e:#}", log_addr(raw));
                         continue;
                     }
                 }
@@ -1042,7 +1052,7 @@ impl StreamSniffer {
             if score > 0 {
                 let mut list = candidates.lock().await;
                 if !list.iter().any(|(_, u)| *u == url) {
-                    info!("StreamSniffer: Identified DOM embedded media [{embed_type}] (score: {score}): {url}");
+                    info!("StreamSniffer: Identified DOM embedded media [{embed_type}] (score: {score}): {}", log_addr(&url));
                     list.push((score, url));
                 }
             }
@@ -1117,6 +1127,31 @@ mod tests {
     /// Production source only (everything before the test module).
     fn production_source() -> &'static str {
         include_str!("sniffer.rs").split("#[cfg(test)]").next().unwrap()
+    }
+
+    #[test]
+    fn the_log_shows_host_and_path_never_the_query() {
+        assert_eq!(log_addr("https://cdn.example/v/a.m3u8?token=SECRET&x=1#frag"), "cdn.example/v/a.m3u8");
+        assert_eq!(log_addr("//cdn.example/p?token=SECRET"), "cdn.example/p");
+        assert!(!log_addr("not a url?token=SECRET").contains("SECRET"));
+    }
+
+    #[test]
+    fn no_log_line_prints_a_raw_address() {
+        let production = production_source();
+        for mac in ["info!(", "warn!("] {
+            let mut rest = production;
+            while let Some(i) = rest.find(mac) {
+                rest = &rest[i + mac.len()..];
+                let end = [");", "),
+", ")
+"].iter().filter_map(|p| rest.find(p)).min().unwrap_or(rest.len());
+                let call = &rest[..end];
+                for raw in ["req_url", "best_url", "target_url", "{url}", "{raw}"] {
+                    assert!(!call.contains(raw) || call.contains("log_addr("), "{mac} prints `{raw}` raw: {call}");
+                }
+            }
+        }
     }
 
     #[test]
