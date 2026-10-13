@@ -86,6 +86,10 @@ pub struct AttemptEnd {
     /// Place of the held video in `candidates_json`.
     pub next_index: i64,
     pub expected_secs: Option<f64>,
+    /// Model calls this run made, and the tokens they used (P10.12).
+    pub llm_calls: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
 }
 
 /// A finished video held back until MCR approves it (plan P10.5).
@@ -878,7 +882,8 @@ impl Repository {
         conn.execute(
             "UPDATE repair_attempts
              SET finished_at = ?, rung = ?, outcome = ?, recipe_hash = ?, recipe_id = ?, domain = ?,
-                 candidates_json = ?, duration_ms = ?, held_url = ?, next_index = ?, expected_secs = ?
+                 candidates_json = ?, duration_ms = ?, held_url = ?, next_index = ?, expected_secs = ?,
+                 llm_calls = ?, tokens_in = ?, tokens_out = ?
              WHERE id = ?",
             params![
                 timestamps::format(now),
@@ -892,6 +897,9 @@ impl Repository {
                 end.held_url,
                 end.next_index,
                 end.expected_secs,
+                end.llm_calls,
+                end.tokens_in,
+                end.tokens_out,
                 id
             ],
         )?;
@@ -1003,6 +1011,133 @@ impl Repository {
         )?;
         let rows = stmt.query_map(params![job_id], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Reserve one model call for local day `day` (`YYYY-MM-DD`) under `cap`
+    /// calls per day, over all jobs. `false`: the cap is reached (nothing is
+    /// counted). One immediate transaction, so concurrent jobs cannot both take
+    /// the last call; the count is in the database, so a restart keeps it.
+    pub fn reserve_llm_call(&self, day: &str, cap: u32) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT OR IGNORE INTO llm_usage (day, calls, tokens_in, tokens_out) VALUES (?, 0, 0, 0)", params![day])?;
+        let calls: i64 = tx.query_row("SELECT calls FROM llm_usage WHERE day = ?", params![day], |r| r.get(0))?;
+        if calls >= i64::from(cap) {
+            return Ok(false);
+        }
+        tx.execute("UPDATE llm_usage SET calls = calls + 1 WHERE day = ?", params![day])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Add the tokens a model call used to the day's total.
+    pub fn add_llm_tokens(&self, day: &str, tokens_in: u32, tokens_out: u32) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("INSERT OR IGNORE INTO llm_usage (day, calls, tokens_in, tokens_out) VALUES (?, 0, 0, 0)", params![day])?;
+        tx.execute(
+            "UPDATE llm_usage SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ? WHERE day = ?",
+            params![i64::from(tokens_in), i64::from(tokens_out), day],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The calls and tokens counted for `day`: (calls, tokens_in, tokens_out).
+    pub fn llm_usage_for(&self, day: &str) -> Result<(i64, i64, i64)> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row("SELECT calls, tokens_in, tokens_out FROM llm_usage WHERE day = ?", params![day], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?
+            .unwrap_or((0, 0, 0)))
+    }
+
+    /// Was a page bundle with this hash sent to the model at or after `since`?
+    pub fn llm_bundle_sent_since(&self, hash: &str, since: chrono::DateTime<Utc>) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM repair_llm_sent WHERE hash = ? AND at >= ?",
+                params![hash, timestamps::format(since)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Remember that a bundle was sent (a later send of the same hash replaces the time).
+    pub fn record_llm_bundle(&self, hash: &str, domain: &str, now: chrono::DateTime<Utc>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO repair_llm_sent (hash, domain, at) VALUES (?, ?, ?)
+             ON CONFLICT(hash) DO UPDATE SET domain = excluded.domain, at = excluded.at",
+            params![hash, domain, timestamps::format(now)],
+        )?;
+        Ok(())
+    }
+
+    /// Repair attempts on `domain` since `since` that called the model and
+    /// found nothing (not held, not shadow-found, not lost with the lease).
+    pub fn llm_misses_since(&self, domain: &str, since: chrono::DateTime<Utc>) -> Result<u32> {
+        let conn = self.pool.get()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repair_attempts
+             WHERE domain = ? AND llm_calls > 0 AND started_at >= ?
+               AND COALESCE(outcome, '') NOT IN ('held', 'shadow_found', 'lost')",
+            params![domain, timestamps::format(since)],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// Stop asking the model about `domain` until `until`.
+    pub fn open_llm_breaker(&self, domain: &str, until: chrono::DateTime<Utc>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO site_stats (domain, llm_breaker_until, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(domain) DO UPDATE SET llm_breaker_until = excluded.llm_breaker_until, updated_at = excluded.updated_at",
+            params![domain.trim().to_lowercase(), timestamps::format(until), timestamps::now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Is the model rung shut for `domain` at `now`?
+    pub fn llm_breaker_open(&self, domain: &str, now: chrono::DateTime<Utc>) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let until: Option<Option<String>> = conn
+            .query_row(
+                "SELECT llm_breaker_until FROM site_stats WHERE domain = ?",
+                params![domain.trim().to_lowercase()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(until.flatten().and_then(|t| timestamps::parse_opt(Some(t))).is_some_and(|t| t > now))
+    }
+
+    pub fn close_llm_breaker(&self, domain: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE site_stats SET llm_breaker_until = NULL WHERE domain = ?",
+            params![domain.trim().to_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// Every site's model breaker closes (a new yt-dlp build is kept).
+    pub fn close_all_llm_breakers(&self) -> Result<usize> {
+        let conn = self.pool.get()?;
+        Ok(conn.execute("UPDATE site_stats SET llm_breaker_until = NULL WHERE llm_breaker_until IS NOT NULL", [])?)
+    }
+
+    /// Retention: bundles sent before `sent_before` and day totals before day
+    /// `usage_before` (`YYYY-MM-DD`).
+    pub fn purge_llm_limits(&self, sent_before: chrono::DateTime<Utc>, usage_before: &str) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let a = conn.execute("DELETE FROM repair_llm_sent WHERE at < ?", params![timestamps::format(sent_before)])?;
+        let b = conn.execute("DELETE FROM llm_usage WHERE day < ?", params![usage_before])?;
+        Ok(a + b)
     }
 
     /// Retention: attempts that started more than `days` days ago (their jobs'
@@ -2263,8 +2398,9 @@ impl Repository {
         let cutoff = timestamps::format(Utc::now() - Duration::days(days));
         let n = conn.execute(
             "DELETE FROM site_stats
-             WHERE (last_ok_at IS NULL OR last_ok_at < ?) AND (last_fail_at IS NULL OR last_fail_at < ?)",
-            params![cutoff, cutoff],
+             WHERE (last_ok_at IS NULL OR last_ok_at < ?) AND (last_fail_at IS NULL OR last_fail_at < ?)
+               AND (llm_breaker_until IS NULL OR llm_breaker_until < ?)",
+            params![cutoff, cutoff, timestamps::now_string()],
         )?;
         Ok(n)
     }
@@ -2273,7 +2409,7 @@ impl Repository {
     pub fn reset_site_failures(&self, domain: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute(
-            "UPDATE site_stats SET consecutive_fail = 0, updated_at = ? WHERE domain = ?",
+            "UPDATE site_stats SET consecutive_fail = 0, llm_breaker_until = NULL, updated_at = ? WHERE domain = ?",
             params![timestamps::now_string(), domain.trim().to_lowercase()],
         )?;
         Ok(())
@@ -4129,6 +4265,13 @@ mod recipe_sql {
                 _ => tx.commit()?,
             }
             Ok(out)
+        }
+
+        /// MCR rejected a video these steps produced on `domain`: no recipe
+        /// with them is offered or stored for it again.
+        pub fn recipe_steps_barred(&self, steps_hash: &str, domain: &str) -> Result<bool> {
+            let conn = self.pool.get()?;
+            is_barred(&conn, steps_hash, domain)
         }
 
         /// Score one event for a recipe on a domain; the row is created when missing.

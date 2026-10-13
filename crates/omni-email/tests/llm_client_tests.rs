@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use omni_core::config::{LlmAuth, LlmConfig};
 use omni_email::assist::redact_contacts;
-use omni_email::llm::{check_base_url, is_local_endpoint, LlmClient};
+use omni_email::llm::{check_base_url, is_local_endpoint, LlmClient, Usage};
 
 #[derive(Default)]
 struct Mock {
@@ -28,6 +28,8 @@ struct Mock {
     /// What the model "says", or None for the default answer.
     content: Option<Value>,
     finish_reason: Option<&'static str>,
+    /// The `usage` object the answer carries, if any.
+    usage: Option<Value>,
     requests: Vec<(HeaderMap, Value)>,
 }
 
@@ -56,7 +58,11 @@ async fn completions(State(mock): State<Shared>, headers: HeaderMap, Json(body):
         return (StatusCode::BAD_REQUEST, r#"{"error":{"message":"invalid request"}}"#).into_response();
     }
     let content = m.content.clone().unwrap_or_else(|| json!(r#"{"word":"LIMANI"}"#));
-    Json(json!({ "choices": [ { "message": { "role": "assistant", "content": content }, "finish_reason": m.finish_reason.unwrap_or("stop") } ] }))
+    let mut answer = json!({ "choices": [ { "message": { "role": "assistant", "content": content }, "finish_reason": m.finish_reason.unwrap_or("stop") } ] });
+    if let Some(u) = &m.usage {
+        answer["usage"] = u.clone();
+    }
+    Json(answer)
         .into_response()
 }
 
@@ -195,4 +201,39 @@ fn contact_details_are_redacted_but_links_are_not() {
     assert!(out.contains("https://www.youtube.com/watch?v=12345678901234"), "a link was changed: {out}");
     assert!(out.contains("https://example.gr/contact?mail=a@b.gr"), "a link was changed: {out}");
     assert!(out.contains("15:30") || !text.contains("15:30"));
+}
+
+#[tokio::test]
+async fn token_usage_is_read_from_the_answer_and_is_zero_when_absent() {
+    let usage = json!({"prompt_tokens": 1234, "completion_tokens": 56, "total_tokens": 1290});
+    let (_m, addr) = start(Mock { usage: Some(usage), ..Default::default() }).await;
+    let (v, u) = client(addr, LlmAuth::None, "").chat_json_usage("Answer JSON.", "x", &schema(), 100).await.unwrap();
+    assert_eq!(v["word"], "LIMANI");
+    assert_eq!(u, Usage { prompt_tokens: 1234, completion_tokens: 56 });
+
+    let (_m, addr) = start(Mock::default()).await;
+    let (_, u) = client(addr, LlmAuth::None, "").chat_json_usage("Answer JSON.", "x", &schema(), 100).await.unwrap();
+    assert_eq!(u, Usage::default());
+}
+
+#[tokio::test]
+async fn an_explicit_reasoning_effort_is_sent_instead_of_none_and_a_refusal_still_drops_it() {
+    let (m, addr) = start(Mock::default()).await;
+    // disable_thinking is on in `client`, yet the explicit value wins.
+    let c = client(addr, LlmAuth::None, "").with_reasoning_effort(Some("medium".into()));
+    ask(&c).await.unwrap();
+    assert_eq!(m.lock().unwrap().requests[0].1["reasoning_effort"], "medium");
+
+    let (m, addr) = start(Mock { refuse: vec!["reasoning_effort"], ..Default::default() }).await;
+    let c = client(addr, LlmAuth::None, "").with_reasoning_effort(Some("medium".into()));
+    assert_eq!(ask(&c).await.unwrap()["word"], "LIMANI");
+    let reqs = m.lock().unwrap().requests.clone();
+    assert_eq!(reqs[0].1["reasoning_effort"], "medium");
+    assert!(reqs[1].1.get("reasoning_effort").is_none(), "the refused field was sent again");
+
+    // Not asked for and thinking not disabled: nothing is sent.
+    let (m, addr) = start(Mock::default()).await;
+    let cfg = LlmConfig { timeout_secs: 10, disable_thinking: false, ..LlmConfig::default() };
+    ask(&LlmClient::from_settings(&format!("http://{addr}/v1/"), "test-model", &cfg)).await.unwrap();
+    assert!(m.lock().unwrap().requests[0].1.get("reasoning_effort").is_none());
 }

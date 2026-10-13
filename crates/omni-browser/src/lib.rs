@@ -7,6 +7,7 @@ pub mod http_fetcher;
 pub mod pages;
 pub mod player_family;
 pub mod recipe;
+pub mod repair_llm;
 pub mod sniffer;
 
 pub use adblock::{AdBlockStats, UnifiedAdBlocker};

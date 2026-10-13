@@ -472,6 +472,42 @@ pub struct RepairConfig {
     /// before the download itself (P10.11a).
     #[serde(default = "default_repair_budget_secs")]
     pub budget_secs: u64,
+    /// The LLM rung of the repair ladder (P10.12): off by default. It runs only
+    /// when this is on AND `llm_model` is set; it never uses the mail model.
+    /// Endpoint, key and auth are the `llm` section's.
+    #[serde(default)]
+    pub llm_enabled: bool,
+    /// The model the repair rung asks (for example a paid Gemini Flash).
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// Seconds one model call may take.
+    #[serde(default = "default_repair_llm_timeout_secs")]
+    pub llm_timeout_secs: u64,
+    /// Tokens one answer may use, thinking included.
+    #[serde(default = "default_repair_llm_max_tokens")]
+    pub llm_max_tokens: u32,
+    /// `reasoning_effort` sent with the call; `null` leaves it to `llm.disable_thinking`.
+    #[serde(default = "default_repair_llm_effort")]
+    pub llm_reasoning_effort: Option<String>,
+    /// Model calls the rung may make per local day, over all jobs.
+    #[serde(default = "default_repair_llm_calls_per_day")]
+    pub llm_max_calls_per_day: u32,
+}
+
+fn default_repair_llm_timeout_secs() -> u64 {
+    60
+}
+
+fn default_repair_llm_max_tokens() -> u32 {
+    4000
+}
+
+fn default_repair_llm_effort() -> Option<String> {
+    Some("medium".into())
+}
+
+fn default_repair_llm_calls_per_day() -> u32 {
+    15
 }
 
 fn default_repair_budget_secs() -> u64 {
@@ -503,6 +539,12 @@ impl Default for RepairConfig {
             hold_hours: default_hold_hours(),
             held_max_gb: default_held_max_gb(),
             budget_secs: default_repair_budget_secs(),
+            llm_enabled: false,
+            llm_model: None,
+            llm_timeout_secs: default_repair_llm_timeout_secs(),
+            llm_max_tokens: default_repair_llm_max_tokens(),
+            llm_reasoning_effort: default_repair_llm_effort(),
+            llm_max_calls_per_day: default_repair_llm_calls_per_day(),
         }
     }
 }
@@ -941,6 +983,24 @@ mod tests {
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);
         assert_eq!(set.repair.evidence_max_mb, 200);
+    }
+
+    #[test]
+    fn the_repair_model_rung_is_off_by_default_and_needs_a_model_name() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        let r = &old.repair;
+        assert!(!r.llm_enabled && r.llm_model.is_none(), "off, and no model fallback");
+        assert_eq!((r.llm_timeout_secs, r.llm_max_tokens, r.llm_max_calls_per_day), (60, 4000, 15));
+        assert_eq!(r.llm_reasoning_effort.as_deref(), Some("medium"));
+        let set: AppConfig = serde_json::from_str(
+            r#"{"repair":{"llm_enabled":true,"llm_model":"model-x","llm_reasoning_effort":null,"llm_max_calls_per_day":5}}"#,
+        )
+        .unwrap();
+        assert!(set.repair.llm_enabled);
+        assert_eq!(set.repair.llm_model.as_deref(), Some("model-x"));
+        assert_eq!(set.repair.llm_reasoning_effort, None);
+        assert_eq!(set.repair.llm_max_calls_per_day, 5);
+        assert_eq!(set.repair.llm_timeout_secs, 60);
     }
 
     #[test]

@@ -518,6 +518,7 @@ async fn dev_hold_card(
         held_url: Some("https://cdn.dev-hold.example/video/clip.mp4".into()),
         next_index: 0,
         expected_secs: Some(duration + 2.0),
+        ..Default::default()
     };
     repo.finish_attempt(attempt, &end, now)?;
     if let Some(img) = article_image {
@@ -1290,6 +1291,25 @@ async fn run_daemon(
     let worker_health = health.clone();
     let worker_watchfolder = watchfolder_path.clone();
     let worker_temp = temp_path.clone();
+    // The LLM rung of the repair ladder (P10.12): both the switch and a model name,
+    // never the mail model. Endpoint, key and auth are the `llm` section's.
+    let repair_llm_cfg = repair::LlmCfg {
+        enabled: config.repair.llm_enabled,
+        model: config.repair.llm_model.clone().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
+        timeout: Duration::from_secs(config.repair.llm_timeout_secs.clamp(5, 600)),
+        max_calls_per_day: config.repair.llm_max_calls_per_day,
+    };
+    if config.repair.llm_enabled && repair_llm_cfg.model.is_none() {
+        warn!("repair.llm_enabled is on but repair.llm_model is not set: the repair model rung stays off");
+    }
+    let mut repair_env = repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
+    if let (true, Some(model)) = (repair_llm_cfg.active(), repair_llm_cfg.model.as_deref()) {
+        let client_cfg = omni_core::config::LlmConfig { timeout_secs: repair_llm_cfg.timeout.as_secs(), ..config.llm.clone() };
+        let client = omni_email::llm::LlmClient::from_settings(&config.ollama_endpoint, model, &client_cfg)
+            .with_reasoning_effort(config.repair.llm_reasoning_effort.clone());
+        info!("Repair model rung on: model {model}, at most {} call(s) a day", repair_llm_cfg.max_calls_per_day);
+        repair_env = repair_env.with_model(repair::LlmModel::new(client, config.repair.llm_max_tokens));
+    }
     let worker_repair = Arc::new(repair::RepairCtx {
         repo: repo.clone(),
         cfg: repair::RepairCfg {
@@ -1297,8 +1317,9 @@ async fn run_daemon(
             budget: Duration::from_secs(config.repair.budget_secs),
             hold_hours: config.repair.hold_hours,
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
+            llm: repair_llm_cfg,
         },
-        env: Arc::new(repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone())),
+        env: Arc::new(repair_env),
     });
     let worker_canary = canary_env.clone();
 
@@ -2026,6 +2047,8 @@ async fn run_job(
                             code = c;
                             message = m;
                         }
+                        // The model said why nothing can be resolved: MCR reads it on the card.
+                        repair::Disposition::Annotate(reason) => message = repair::annotate(&message, &reason),
                         repair::Disposition::Unchanged => {}
                     }
                 }
@@ -2544,6 +2567,10 @@ async fn nightly_ytdl_update(
                     &staged.sha256[..16]
                 ),
             );
+            // A new downloader may resolve what the model once could not be asked about.
+            if let Err(e) = repo.close_all_llm_breakers() {
+                warn!("The repair model breakers could not be closed after the update: {e:#}");
+            }
             TaskOutcome::Ok
         }
         UpdateVerdict::RolledBack { broken } => {
@@ -2904,6 +2931,16 @@ async fn run_one_task(
                 Ok(n) if n > 0 => info!("Retention: removed {n} old repair attempt(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("Retention: repair attempts not purged: {e:#}"),
+            }
+            // The model rung's limits (P10.12): a bundle is remembered 24 h, a day's totals 90 days.
+            {
+                let now = chrono::Utc::now();
+                let usage_before = (chrono::Local::now() - chrono::Duration::days(90)).format("%Y-%m-%d").to_string();
+                match repo.purge_llm_limits(now - chrono::Duration::hours(24), &usage_before) {
+                    Ok(n) if n > 0 => info!("Retention: removed {n} old repair model record(s)"),
+                    Ok(_) => {}
+                    Err(e) => warn!("Retention: repair model records not purged: {e:#}"),
+                }
             }
             match repo.purge_login_attempts(90) {
                 Ok(n) if n > 0 => info!("Retention: removed {n} old login record(s)"),

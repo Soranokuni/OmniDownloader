@@ -1,4 +1,4 @@
-//! The repair ladder, rung one: recipes (plan P10.11a).
+//! The repair ladder: recipes (plan P10.11a-c), then a model that only points (P10.12).
 //!
 //! Runs only after a web job's normal path has finished in failure AND the
 //! page showed a video that was not resolved (`VIDEO_UNRESOLVED`). It tries
@@ -26,12 +26,13 @@ use omni_broadcast::repair::JobKind;
 use omni_broadcast::pipeline::{BroadcastEngine, DeliveryMode, LeaseLost, RunOutcome};
 use omni_broadcast::repair_gate::{self, Candidate, GateFacts, Prober, Resolver, ToolProber, Verified};
 use omni_browser::recipe::{self, Fetcher, LiveAction, Recipe, RecipeOutcome};
+use omni_browser::repair_llm::{self, Assessment, Reason, RoundNote};
 use omni_browser::sniffer::{classify_live_run, LiveRun};
 use omni_browser::{HttpFetcher, PageSnapshot, StreamSniffer};
 use omni_core::config::RepairMode;
 use omni_core::models::{Job, JobStage};
-use omni_core::recipe_score::Event;
-use omni_core::recipe_score::RankedRecipe;
+use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, RankedRecipe, ScopeKind};
+use omni_email::llm::{LlmClient, Usage};
 use omni_core::repository::{AttemptEnd, Repository};
 
 /// The browser user agent the download of a repaired video presents.
@@ -57,6 +58,14 @@ const CANDIDATES_JSON_MAX: usize = 32 * 1024;
 const MAX_DOWNLOADS: usize = 2;
 /// The time allowed to resolve a host just before the download.
 const CONNECT_CHECK: Duration = Duration::from_secs(5);
+/// The model rung starts a round only with the gate's reserve and this much more left.
+const LLM_MIN_ROUND: Duration = Duration::from_secs(15);
+/// Rounds one ladder run may ask the model.
+const LLM_MAX_ROUNDS: usize = 3;
+/// The same page bundle is not sent again within this time.
+const LLM_RESEND_HOURS: i64 = 24;
+/// After this many misses on a site within 24 h the model rung closes for it for 24 h.
+const LLM_BREAKER_MISSES: u32 = 3;
 
 /// What `run_job` does with the ladder's answer.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +76,8 @@ pub enum Disposition {
     Lost,
     /// End the job (REQUIRES_REVIEW) with this code and message instead of the one it had.
     Finish { code: ErrorCode, message: String },
+    /// The job ends as it would have, and its message gains this (the model's reason, in Greek).
+    Annotate(String),
     /// The job ends exactly as it would have without the ladder.
     Unchanged,
 }
@@ -81,7 +92,20 @@ pub fn disposition(result: &LadderResult, mode: RepairMode, budget: Duration) ->
             code: ErrorCode::RepairExhausted,
             message: format!("Η αυτόματη επισκευή δεν ολοκληρώθηκε μέσα σε {} δευτερόλεπτα", budget.as_secs()),
         },
-        LadderResult::Exhausted | LadderResult::ShadowFound { .. } | LadderResult::NothingVerified => Disposition::Unchanged,
+        LadderResult::Unresolvable { reason } if mode == RepairMode::Hold => Disposition::Annotate(reason.greek().to_string()),
+        LadderResult::Exhausted
+        | LadderResult::ShadowFound { .. }
+        | LadderResult::NothingVerified
+        | LadderResult::Unresolvable { .. } => Disposition::Unchanged,
+    }
+}
+
+/// `message` with the model's reason added (what MCR reads on the card).
+pub fn annotate(message: &str, reason_el: &str) -> String {
+    if message.trim().is_empty() {
+        format!("Η αυτόματη επισκευή: {reason_el}")
+    } else {
+        format!("{message} (Η αυτόματη επισκευή: {reason_el})")
     }
 }
 
@@ -108,6 +132,9 @@ pub enum LadderResult {
     Exhausted,
     /// The job is no longer this worker's (cancelled, lease gone). Write nothing.
     Lost,
+    /// The model said the page has nothing to resolve (DRM, login, a click, no media data)
+    /// and nothing else verified.
+    Unresolvable { reason: Reason },
 }
 
 /// Addresses the normal path already tried, and videos MCR already rejected.
@@ -131,6 +158,72 @@ pub struct RepairCfg {
     pub budget: Duration,
     pub hold_hours: i64,
     pub held_max_bytes: u64,
+    pub llm: LlmCfg,
+}
+
+/// The model rung's settings (`repair.llm_*`). Off unless enabled AND a model is named.
+#[derive(Debug, Clone)]
+pub struct LlmCfg {
+    pub enabled: bool,
+    pub model: Option<String>,
+    /// One model call may take this long.
+    pub timeout: Duration,
+    pub max_calls_per_day: u32,
+}
+
+impl Default for LlmCfg {
+    fn default() -> Self {
+        Self { enabled: false, model: None, timeout: Duration::from_secs(60), max_calls_per_day: 15 }
+    }
+}
+
+impl LlmCfg {
+    /// The rung runs only with both set; it never falls back to the mail model.
+    pub fn active(&self) -> bool {
+        self.enabled && self.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+    }
+}
+
+/// The model the repair rung asks. It returns the JSON answer and the tokens used.
+#[async_trait]
+pub trait RepairModel: Send + Sync {
+    async fn ask(&self, system: &str, user: &str, schema: &serde_json::Value) -> Result<(serde_json::Value, Usage)>;
+}
+
+/// The real model: the OpenAI-compatible client of the mail assist (same endpoint, key and
+/// auth) with the repair model name, and the contact-detail redaction the assist applies to
+/// an online provider.
+pub struct LlmModel {
+    client: LlmClient,
+    max_tokens: u32,
+    redact: bool,
+}
+
+impl LlmModel {
+    pub fn new(client: LlmClient, max_tokens: u32) -> Self {
+        let redact = client.is_online();
+        Self { client, max_tokens, redact }
+    }
+
+    /// Test only: force the redaction on or off whatever the endpoint is.
+    #[cfg(test)]
+    fn with_redaction(mut self, on: bool) -> Self {
+        self.redact = on;
+        self
+    }
+}
+
+#[async_trait]
+impl RepairModel for LlmModel {
+    async fn ask(&self, system: &str, user: &str, schema: &serde_json::Value) -> Result<(serde_json::Value, Usage)> {
+        // Page text may hold an address or a phone number: online, they stay home.
+        if self.redact {
+            let clean = omni_email::assist::redact_contacts(user);
+            self.client.chat_json_usage(system, &clean, schema, self.max_tokens).await
+        } else {
+            self.client.chat_json_usage(system, user, schema, self.max_tokens).await
+        }
+    }
 }
 
 /// Run `work` to its own end even when the caller stops waiting (the ladder
@@ -156,6 +249,10 @@ pub trait Env: Send + Sync {
     /// Test only: the longest live run, and how long past it the ladder waits.
     fn live_limits(&self) -> (u64, Duration) {
         (LIVE_SECS, LIVE_LAUNCH_ALLOWANCE)
+    }
+    /// The model of the LLM rung (P10.12); `None`: there is none.
+    fn model(&self) -> Option<&dyn RepairModel> {
+        None
     }
     fn fetcher(&self) -> &dyn Fetcher;
     fn prober(&self) -> &dyn Prober;
@@ -202,6 +299,7 @@ pub struct RealEnv {
     ffmpeg: std::path::PathBuf,
     prober: ToolProber,
     resolver: repair_gate::SystemResolver,
+    model: Option<LlmModel>,
 }
 
 /// Article pictures over the same public-address rule as a recipe fetch, up to 2 MiB.
@@ -228,7 +326,14 @@ impl RealEnv {
             ffmpeg,
             prober: ToolProber::new(ffprobe, Some(ytdl)),
             resolver: repair_gate::SystemResolver,
+            model: None,
         }
+    }
+
+    /// The model the LLM rung asks.
+    pub fn with_model(mut self, model: LlmModel) -> Self {
+        self.model = Some(model);
+        self
     }
 }
 
@@ -243,6 +348,9 @@ impl Env for RealEnv {
         let (url, acts) = (url.to_string(), actions.to_vec());
         let (snap, diag) = detached(async move { StreamSniffer::diagnose_live(&url, secs, &acts).await }).await?;
         live_result(snap, &diag, actions)
+    }
+    fn model(&self) -> Option<&dyn RepairModel> {
+        self.model.as_ref().map(|m| m as &dyn RepairModel)
     }
     fn fetcher(&self) -> &dyn Fetcher {
         &self.fetcher
@@ -352,7 +460,8 @@ pub async fn after_failure(
     tried: Vec<Tried>,
     cancel: &CancellationToken,
 ) -> Option<LadderResult> {
-    // The site breaker arrives with P10.12; until then it is never open.
+    // The model breaker (P10.12) closes only the model rung, inside the ladder:
+    // the recipe rung still runs for a site whose breaker is open.
     let site_breaker_open = false;
     // A video MCR rejected is dropped from the candidates inside the ladder
     // (the top candidate is not known before it runs).
@@ -468,6 +577,8 @@ enum Phase {
         snap: Box<PageSnapshot>,
         /// A live page load ran: "recipes_live:" and what each action did.
         live: Option<String>,
+        /// A live page load was tried (it may have failed): the one live load is spent.
+        live_tried: bool,
     },
 }
 
@@ -621,6 +732,7 @@ async fn find_and_verify(
     // from the same page, the rest wait for another run.
     let mut live_note: Option<String> = None;
     let mut live_facts: Option<GateFacts> = None;
+    let mut live_tried = false;
     let left = deadline.saturating_duration_since(Instant::now());
     // The gate keeps its own share of the budget: the live load never takes it.
     if let (Some((first, _)), true) = (live.first(), left >= LIVE_MIN_LEFT + GATE_RESERVE) {
@@ -631,6 +743,7 @@ async fn find_and_verify(
         let key = recipe::action_key(&actions);
         let (cap_secs, allowance) = env.live_limits();
         let secs = (left - GATE_RESERVE).as_secs().min(cap_secs).max(1);
+        live_tried = true;
         // The run ends itself at `secs` after its browser started; the launch is
         // outside that, so the wait is bounded here too, never by the ladder deadline.
         let wait_until = (Instant::now() + Duration::from_secs(secs) + allowance).min(deadline);
@@ -682,7 +795,7 @@ async fn find_and_verify(
     }
     let Acc { cands, by_url, ran, mut cut } = acc;
     if cands.is_empty() {
-        return Phase::Found { verified: Vec::new(), recipes: by_url, cut, snap: Box::new(snap), live: live_note };
+        return Phase::Found { verified: Vec::new(), recipes: by_url, cut, snap: Box::new(snap), live: live_note, live_tried };
     }
     if lost(ctx, job.id, owner, cancel) {
         return Phase::Lost;
@@ -722,7 +835,7 @@ async fn find_and_verify(
             no_candidate(ctx, r.id, domain);
         }
     }
-    Phase::Found { verified, recipes: by_url, cut, snap: Box::new(snap), live: live_note }
+    Phase::Found { verified, recipes: by_url, cut, snap: Box::new(snap), live: live_note, live_tried }
 }
 
 /// Run the ladder once for a failed web job.
@@ -756,6 +869,7 @@ pub async fn run(
         LadderResult::NothingVerified => end.outcome.take().unwrap_or_else(|| "nothing_verified".to_string()),
         LadderResult::Exhausted => "exhausted".to_string(),
         LadderResult::Lost => "lost".to_string(),
+        LadderResult::Unresolvable { .. } => "not_resolvable".to_string(),
     };
     end.outcome = Some(outcome);
     end.duration_ms = Some(started.elapsed().as_millis() as i64);
@@ -763,6 +877,25 @@ pub async fn run(
         // Bookkeeping of the ladder's own table, not a write on the job.
         if let Err(e) = ctx.repo.finish_attempt(id, &end, Utc::now()) {
             warn!("Job #{}: the repair attempt could not be closed: {e:#}", job.id);
+        }
+    }
+    // A model rung that found nothing is a miss; three on one site within 24 h
+    // close the rung for it for 24 h (a canary pass or a new yt-dlp build reopens it).
+    let found = matches!(result, LadderResult::Held { .. } | LadderResult::ShadowFound { .. } | LadderResult::Lost);
+    if end.llm_calls > 0 && !found {
+        if let Some(domain) = end.domain.as_deref() {
+            let now = Utc::now();
+            match ctx.repo.llm_misses_since(domain, now - chrono::Duration::hours(LLM_RESEND_HOURS)) {
+                Ok(n) if n >= LLM_BREAKER_MISSES => {
+                    if let Err(e) = ctx.repo.open_llm_breaker(domain, now + chrono::Duration::hours(LLM_RESEND_HOURS)) {
+                        warn!("Job #{}: the repair model breaker could not be opened: {e:#}", job.id);
+                    } else {
+                        info!("Job #{}: the repair model is not asked about {domain} for 24 h ({n} misses)", job.id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Job #{}: the repair model misses could not be counted: {e:#}", job.id),
+            }
         }
     }
     result
@@ -830,6 +963,379 @@ fn record_card(ctx: &RepairCtx, job_id: i64, owner: &str, attempt: Option<i64>, 
     }
 }
 
+/// What the model rung cost and concluded (kept outside the rung so a timeout cannot lose it).
+#[derive(Default)]
+struct LlmStats {
+    rounds: usize,
+    calls: i64,
+    tokens_in: i64,
+    tokens_out: i64,
+    /// The model's verdict when it said nothing can be resolved.
+    reason: Option<Reason>,
+    /// The budget ran out between rounds.
+    cut: bool,
+}
+
+/// An address the model pointed at: the hash its method name carries (of the recipe
+/// scope when one reproduced it, else of the pointer) and that recipe.
+struct LlmFound {
+    hash: String,
+    recipe: Option<Recipe>,
+}
+
+struct LlmVerified {
+    verified: Vec<Verified>,
+    found: HashMap<String, LlmFound>,
+    /// The gate's facts, with the hosts a click page showed merged in.
+    facts: GateFacts,
+}
+
+enum LlmFlow {
+    Lost,
+    Verified(LlmVerified),
+    Nothing,
+}
+
+/// Store the model's recipe (scope: this site) as a candidate. `None`: the store
+/// refused it or failed; the hold stands either way.
+fn store_llm_recipe(ctx: &RepairCtx, domain: &str, snap: &PageSnapshot, rec: &Recipe) -> Option<(i64, String)> {
+    let hash = recipe::scope_hash("site", domain, rec);
+    let new = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: domain.to_string(),
+        family: omni_browser::player_family(snap).map(str::to_string),
+        recipe_json: rec.canonical_json(),
+        hash: hash.clone(),
+        steps_hash: recipe::steps_hash(rec),
+        dsl_version: rec.dsl_version,
+        origin: Origin::Llm,
+    };
+    match ctx.repo.insert_recipe(&new, Utc::now()) {
+        Ok(InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) | InsertOutcome::Revived(id)) => Some((id, hash)),
+        Ok(InsertOutcome::Refused(_) | InsertOutcome::OverCap) => {
+            info!("the model's recipe for {domain} was not stored (refused or the store is full)");
+            None
+        }
+        Err(e) => {
+            warn!("the model's recipe for {domain} could not be stored: {e:#}");
+            None
+        }
+    }
+}
+
+/// The reason line of one gate rejection: the failing check, hosts only.
+fn rejection_note(round: usize, r: &repair_gate::Rejected) -> RoundNote {
+    let why = r
+        .checks
+        .iter()
+        .rev()
+        .find(|c| !c.ok)
+        .map(|c| format!("{}: {}", c.name, c.detail))
+        .unwrap_or_else(|| "not checked".to_string());
+    RoundNote { what: format!("round {round}: an address you pointed at was rejected"), host: Some(host_of(&r.candidate.url)), reason: why }
+}
+
+/// The model rung (P10.12): up to three rounds in which the model points at page
+/// items, our code computes the addresses and the gate checks them. Never creates
+/// a URL from the answer's text; stops at the first verified candidate.
+async fn llm_rung(
+    ctx: &RepairCtx,
+    job: &Job,
+    owner: &str,
+    orig_url: &str,
+    domain: &str,
+    snap: &PageSnapshot,
+    recipe_urls: &[String],
+    prior: &Prior,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    live_used: bool,
+    stats: &mut LlmStats,
+) -> LlmFlow {
+    let job_id = job.id;
+    let cfg = &ctx.cfg.llm;
+    let Some(model) = ctx.env.model().filter(|_| cfg.active()) else {
+        return LlmFlow::Nothing;
+    };
+    let now = Utc::now();
+    match ctx.repo.llm_breaker_open(domain, now) {
+        Ok(false) => {}
+        Ok(true) => {
+            info!("Job #{job_id}: the repair model is shut for {domain} (breaker open)");
+            return LlmFlow::Nothing;
+        }
+        Err(e) => {
+            warn!("Job #{job_id}: the repair model breaker could not be read, no model call: {e:#}");
+            return LlmFlow::Nothing;
+        }
+    }
+    if deadline.saturating_duration_since(Instant::now()) < GATE_RESERVE + LLM_MIN_ROUND {
+        return LlmFlow::Nothing;
+    }
+    let mut notes = vec![RoundNote { what: "recipes".into(), host: None, reason: "no recipe produced a verified video".into() }];
+    // The notes are not part of the hash: the same page is the same bundle.
+    let first = repair_llm::build_bundle(snap, &notes);
+    match ctx.repo.llm_bundle_sent_since(&first.hash, now - chrono::Duration::hours(LLM_RESEND_HOURS)) {
+        Ok(false) => {}
+        Ok(true) => {
+            info!("Job #{job_id}: the same page bundle went to the repair model in the last 24 h, not sent again");
+            return LlmFlow::Nothing;
+        }
+        Err(e) => {
+            warn!("Job #{job_id}: the repair model history could not be read, no model call: {e:#}");
+            return LlmFlow::Nothing;
+        }
+    }
+
+    let schema = repair_llm::answer_schema();
+    let mut first = Some(first);
+    let mut live_snap: Option<PageSnapshot> = None;
+    let mut facts = gate_facts(snap, domain);
+    let mut tried: Vec<String> = recipe_urls.to_vec();
+    // The click this run performed, and whether its one live load is spent.
+    let mut clicked: Option<String> = None;
+    let mut live_spent = live_used;
+    let mut click_attempted = false;
+
+    for round in 1..=LLM_MAX_ROUNDS {
+        if lost(ctx, job_id, owner, cancel) {
+            return LlmFlow::Lost;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left < GATE_RESERVE + LLM_MIN_ROUND {
+            stats.cut = true;
+            break;
+        }
+        // The day's cap is reserved before the call, atomically, over all jobs.
+        let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+        match ctx.repo.reserve_llm_call(&day, cfg.max_calls_per_day) {
+            Ok(true) => {}
+            Ok(false) => {
+                info!("Job #{job_id}: the repair model's calls for today are used up");
+                break;
+            }
+            Err(e) => {
+                warn!("Job #{job_id}: the repair model call could not be reserved: {e:#}");
+                break;
+            }
+        }
+        stats.calls += 1;
+        stats.rounds = round;
+        let bundle = match first.take() {
+            Some(b) => {
+                if let Err(e) = ctx.repo.record_llm_bundle(&b.hash, domain, Utc::now()) {
+                    warn!("Job #{job_id}: the repair model bundle could not be recorded: {e:#}");
+                }
+                b
+            }
+            None => repair_llm::build_bundle(live_snap.as_ref().unwrap_or(snap), &notes),
+        };
+        let timeout = cfg.timeout.min(left - GATE_RESERVE);
+        let asked = tokio::select! {
+            r = tokio::time::timeout(timeout, model.ask(repair_llm::REPAIR_PROMPT_V1, &bundle.text, &schema)) => r,
+            _ = cancel.cancelled() => return LlmFlow::Lost,
+        };
+        let (answer, usage) = match asked {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                warn!("Job #{job_id}: the repair model call failed");
+                tracing::debug!("Job #{job_id}: repair model failure: {e:#}");
+                break;
+            }
+            Err(_) => {
+                warn!("Job #{job_id}: the repair model call timed out");
+                break;
+            }
+        };
+        stats.tokens_in += i64::from(usage.prompt_tokens);
+        stats.tokens_out += i64::from(usage.completion_tokens);
+        if let Err(e) = ctx.repo.add_llm_tokens(&day, usage.prompt_tokens, usage.completion_tokens) {
+            warn!("Job #{job_id}: the repair model tokens could not be counted: {e:#}");
+        }
+        if lost(ctx, job_id, owner, cancel) {
+            return LlmFlow::Lost;
+        }
+
+        let cur: &PageSnapshot = live_snap.as_ref().unwrap_or(snap);
+        let resolved = repair_llm::resolve_answer(&answer, &bundle, cur);
+        // "Needs a click" with a click to make and the one live load free is a click round,
+        // not an end; every other not_resolvable ends the rung with its reason.
+        let not_resolvable = resolved.assessment == Assessment::NotResolvable;
+        if not_resolvable {
+            let click_round = resolved.reason == Some(Reason::NeedsClick)
+                && resolved.click.is_some()
+                && !live_spent
+                && !click_attempted
+                && round < LLM_MAX_ROUNDS;
+            if !click_round {
+                stats.reason = resolved.reason;
+                break;
+            }
+        }
+        for why in &resolved.dropped {
+            tracing::debug!("Job #{job_id}: repair model answer, round {round}: {why}");
+        }
+        // Steps MCR rejected on this site stay barred: nothing built on them is offered.
+        let mut recipe_in = resolved.recipe.clone();
+        let barred = recipe_in
+            .as_ref()
+            .is_some_and(|r| ctx.repo.recipe_steps_barred(&recipe::steps_hash(r), domain).unwrap_or(false));
+        if barred {
+            recipe_in = None;
+            notes.push(RoundNote { what: format!("round {round}"), host: None, reason: "that recipe was rejected by MCR on this site".into() });
+        }
+        let page_ref = cur.final_url.clone().unwrap_or_else(|| cur.page_url.clone());
+        let fresh: Vec<&repair_llm::LlmCandidate> = if barred || not_resolvable {
+            Vec::new()
+        } else {
+            resolved
+                .candidates
+                .iter()
+                .filter(|c| {
+                    !(prior.tried.iter().any(|t| equal_address(&t.url, &c.url) && t.referer.as_deref() == Some(page_ref.as_str()))
+                        || prior.rejected_by_mcr.iter().any(|u| equal_address(u, &c.url))
+                        || tried.iter().any(|u| equal_address(u, &c.url)))
+                })
+                .collect()
+        };
+
+        if !fresh.is_empty() {
+            // Each address is read again by the recipe the model offered, if it gave one;
+            // only an exact match keeps the recipe, and only for that address.
+            let mut found: HashMap<String, LlmFound> = HashMap::new();
+            let mut cands: Vec<Candidate> = Vec::new();
+            for c in &fresh {
+                let mut reproduced: Option<Recipe> = None;
+                if let Some(rec) = &recipe_in {
+                    let acts = recipe::live_actions(rec);
+                    // No actions: the recipe has to work on the page as every later run
+                    // sees it. The click it names: on the page after exactly that click.
+                    let on: Option<&PageSnapshot> = if acts.is_empty() {
+                        Some(snap)
+                    } else if clicked
+                        .as_ref()
+                        .is_some_and(|css| recipe::action_key(&acts) == recipe::action_key(&[LiveAction::Click(css.clone())]))
+                    {
+                        Some(cur)
+                    } else {
+                        None
+                    };
+                    if let Some(on) = on {
+                        let slice = (Instant::now() + RECIPE_SLICE).min(deadline);
+                        let ok = tokio::select! {
+                            ok = repair_llm::recipe_reproduces(rec, on, &c.url, ctx.env.fetcher(), slice) => ok,
+                            _ = cancel.cancelled() => return LlmFlow::Lost,
+                        };
+                        // The recipe must depend on the page: without the item the address came
+                        // from, it must no longer give the address. (If another item carries the
+                        // same address the recipe is not kept: one place to depend on.) Not
+                        // checkable on a page other than the one the bundle was built from: not kept.
+                        let page_dependent = ok && std::ptr::eq(on, cur) && match bundle.item(&c.from) {
+                            Some(item) => {
+                                let blank = repair_llm::blank_item(cur, item);
+                                let still = tokio::select! {
+                                    v = repair_llm::recipe_reproduces(rec, &blank, &c.url, ctx.env.fetcher(), slice) => v,
+                                    _ = cancel.cancelled() => return LlmFlow::Lost,
+                                };
+                                // And it must follow the item: with the address stem changed in the
+                                // item it must give the changed address (nothing is written into it).
+                                !still && tokio::select! {
+                                    v = repair_llm::follow_check(rec, cur, item, &c.url, ctx.env.fetcher(), slice) => v,
+                                    _ = cancel.cancelled() => return LlmFlow::Lost,
+                                }
+                            }
+                            None => false,
+                        };
+                        if page_dependent {
+                            reproduced = Some(rec.clone());
+                        }
+                    }
+                }
+                let hash = match &reproduced {
+                    Some(r) => recipe::scope_hash("site", domain, r),
+                    None => repair_llm::candidate_hash(c),
+                };
+                let (position, in_article) = player_for(cur, &c.url);
+                cands.push(Candidate {
+                    url: c.url.clone(),
+                    referer: Some(page_ref.clone()),
+                    origin: format!("llm:{}", hash8(&hash)),
+                    position,
+                    in_article,
+                });
+                found.insert(c.url.clone(), LlmFound { hash, recipe: reproduced });
+            }
+            tried.extend(cands.iter().map(|c| c.url.clone()));
+            let is_ad = |u: &str| ctx.env.is_ad(u);
+            let gate = async {
+                if ctx.env.allow_loopback() {
+                    repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, ctx.env.prober(), ctx.env.resolver(), deadline).await
+                } else {
+                    repair_gate::verify(cands, &facts, &is_ad, ctx.env.prober(), ctx.env.resolver(), deadline).await
+                }
+            };
+            let (verified, rejected) = tokio::select! {
+                r = gate => r,
+                _ = cancel.cancelled() => return LlmFlow::Lost,
+            };
+            if lost(ctx, job_id, owner, cancel) {
+                return LlmFlow::Lost;
+            }
+            if !verified.is_empty() {
+                found.retain(|u, _| verified.iter().any(|v| &v.candidate.url == u));
+                return LlmFlow::Verified(LlmVerified { verified, found, facts });
+            }
+            notes.extend(rejected.iter().map(|r| rejection_note(round, r)));
+        }
+
+        // A click: once per ladder run, with the budget for it and for the gate.
+        let click = resolved.click.clone().filter(|_| !live_spent && !click_attempted && round < LLM_MAX_ROUNDS);
+        if let Some(css) = click {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left >= LIVE_MIN_LEFT + GATE_RESERVE {
+                click_attempted = true;
+                let actions = vec![LiveAction::Click(css.clone())];
+                let (cap_secs, allowance) = ctx.env.live_limits();
+                let secs = (left - GATE_RESERVE).as_secs().min(cap_secs).max(1);
+                let wait_until = (Instant::now() + Duration::from_secs(secs) + allowance).min(deadline);
+                let seen = tokio::select! {
+                    r = tokio::time::timeout_at(tokio::time::Instant::from_std(wait_until), ctx.env.live_snapshot(orig_url, &actions, secs)) => r.ok().flatten(),
+                    _ = cancel.cancelled() => return LlmFlow::Lost,
+                };
+                if lost(ctx, job_id, owner, cancel) {
+                    return LlmFlow::Lost;
+                }
+                match seen {
+                    Some((lsnap, run, _)) => {
+                        live_spent = true;
+                        info!("Job #{job_id}: repair live load on {domain} for the model's click: {run:?}");
+                        if run == LiveRun::Complete {
+                            let lf = gate_facts(&lsnap, domain);
+                            facts.observed_hosts.extend(lf.observed_hosts);
+                            facts.ad_media.extend(lf.ad_media);
+                            clicked = Some(css);
+                            live_snap = Some(lsnap);
+                            notes.push(RoundNote { what: format!("round {round}"), host: None, reason: "your click was done; the page below is the page after it".into() });
+                        } else {
+                            notes.push(RoundNote { what: format!("round {round}"), host: None, reason: "your click could not be done on the page".into() });
+                        }
+                    }
+                    None => notes.push(RoundNote { what: format!("round {round}"), host: None, reason: "the click could not be tried".into() }),
+                }
+                continue;
+            }
+        }
+        if fresh.is_empty() {
+            // Nothing new and nothing to click: another round would get the same answer.
+            if not_resolvable {
+                stats.reason = resolved.reason;
+            }
+            break;
+        }
+    }
+    LlmFlow::Nothing
+}
+
 async fn ladder(
     ctx: &RepairCtx,
     job: &Job,
@@ -859,18 +1365,19 @@ async fn ladder(
     )
     .await
     .unwrap_or(Phase::Exhausted);
-    let (verified, recipes, cut, snap) = match phase {
+    let (mut verified, recipes, mut cut, snap, live_used) = match phase {
         Phase::Lost => return LadderResult::Lost,
         Phase::Exhausted => return LadderResult::Exhausted,
         Phase::NoPage => {
             end.outcome = Some("no_page".into());
             return LadderResult::NothingVerified;
         }
-        Phase::Found { verified, recipes, cut, snap, live } => {
+        Phase::Found { verified, recipes, cut, snap, live, live_tried } => {
+            let used = live_tried;
             if let Some(note) = live {
                 end.rung = Some(note);
             }
-            (verified, recipes, cut, snap)
+            (verified, recipes, cut, snap, used)
         }
     };
     if lost(ctx, job_id, owner, cancel) {
@@ -878,16 +1385,65 @@ async fn ladder(
     }
 
     // d. What was found, in rank order, for MCR and for what comes next.
-    let facts = gate_facts(&snap, &domain);
+    let mut facts = gate_facts(&snap, &domain);
     end.expected_secs = facts.expected_secs;
+
+    // d2. The recipes found nothing that verified: ask the model to point (P10.12).
+    let mut llm_found: HashMap<String, LlmFound> = HashMap::new();
+    let mut unresolvable: Option<Reason> = None;
+    if verified.is_empty() && ctx.cfg.llm.active() {
+        let tried: Vec<String> = recipes.keys().cloned().collect();
+        let mut stats = LlmStats::default();
+        let flow = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline + GRACE),
+            llm_rung(ctx, job, owner, orig_url, &domain, &snap, &tried, prior, cancel, deadline, live_used, &mut stats),
+        )
+        .await;
+        end.llm_calls = stats.calls;
+        end.tokens_in = stats.tokens_in;
+        end.tokens_out = stats.tokens_out;
+        let verdict = match flow {
+            Err(_) => {
+                cut = true;
+                "out of time"
+            }
+            Ok(LlmFlow::Lost) => return LadderResult::Lost,
+            Ok(LlmFlow::Verified(v)) => {
+                verified = v.verified;
+                llm_found = v.found;
+                facts = v.facts;
+                "found"
+            }
+            Ok(LlmFlow::Nothing) => {
+                cut = cut || stats.cut;
+                unresolvable = stats.reason;
+                if stats.reason.is_some() { "not resolvable" } else { "nothing" }
+            }
+        };
+        if stats.calls > 0 {
+            info!(
+                "Job #{job_id}: repair model rung: {verdict}, {} round(s), {} call(s), {} tokens in, {} out",
+                stats.rounds, stats.calls, stats.tokens_in, stats.tokens_out
+            );
+        }
+        if lost(ctx, job_id, owner, cancel) {
+            return LadderResult::Lost;
+        }
+    }
     end.candidates_json = Some(verified_json(&verified));
     let Some(best) = verified.first() else {
         if ctx.cfg.mode == RepairMode::Shadow {
             note(ctx, job_id, "INFO", "Η αυτόματη επισκευή δεν βρήκε επαληθευμένο βίντεο");
         }
+        if let Some(reason) = unresolvable {
+            return LadderResult::Unresolvable { reason };
+        }
         return if cut { LadderResult::Exhausted } else { LadderResult::NothingVerified };
     };
     let (top_id, top_hash) = recipes.get(&best.candidate.url).cloned().unwrap_or((0, String::new()));
+    if llm_found.contains_key(&best.candidate.url) {
+        end.rung = Some("llm".into());
+    }
 
     // Shadow: only say what would have been used.
     if ctx.cfg.mode == RepairMode::Shadow {
@@ -936,8 +1492,12 @@ async fn ladder(
             return LadderResult::Lost;
         }
         // The method names the recipe behind the candidate being downloaded now.
-        let (recipe_id, recipe_hash) = recipes.get(&v.candidate.url).cloned().unwrap_or((0, String::new()));
-        let method = format!("repair:recipe:{}", hash8(&recipe_hash));
+        let (mut recipe_id, mut recipe_hash) = recipes.get(&v.candidate.url).cloned().unwrap_or((0, String::new()));
+        let from_llm = llm_found.get(&v.candidate.url);
+        let method = match from_llm {
+            Some(l) => format!("repair:llm:{}", hash8(&l.hash)),
+            None => format!("repair:recipe:{}", hash8(&recipe_hash)),
+        };
         match ctx.repo.set_leased_extraction_method(job_id, owner, Some(&method)) {
             Ok(true) => {}
             Ok(false) => return LadderResult::Lost,
@@ -961,9 +1521,26 @@ async fn ladder(
                         v.candidate.origin
                     ),
                 );
+                // The model's pointer is stored as a recipe only now that a video is
+                // really held, and only when the recipe reproduces the address.
+                if let Some(l) = from_llm {
+                    end.rung = Some("llm".into());
+                    if lost(ctx, job_id, owner, cancel) {
+                        return LadderResult::Lost;
+                    }
+                    recipe_hash = l.hash.clone();
+                    (recipe_id, end.recipe_hash) = match &l.recipe {
+                        Some(rec) => match store_llm_recipe(ctx, &domain, &snap, rec) {
+                            Some((id, hash)) => (id, Some(hash)),
+                            None => (0, None),
+                        },
+                        None => (0, None),
+                    };
+                } else {
+                    end.recipe_hash = (!recipe_hash.is_empty()).then(|| recipe_hash.clone());
+                }
                 // What MCR decision will find: the candidate actually held.
                 end.recipe_id = (recipe_id != 0).then_some(recipe_id);
-                end.recipe_hash = (!recipe_hash.is_empty()).then(|| recipe_hash.clone());
                 end.held_url = Some(url.to_string());
                 end.next_index = index as i64;
                 card_step(ctx, job_id, owner, attempt, &snap, &facts, v.duration_secs, cancel).await;

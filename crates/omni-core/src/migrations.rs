@@ -617,6 +617,25 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE repair_attempts ADD COLUMN expected_secs    REAL;
         "#,
     ),
+    (
+        22,
+        // The LLM rung's limits (P10.12): calls and tokens per local day (the
+        // daily cap lives here, so it holds across restarts and jobs), and the
+        // page bundles sent in the last 24 h (the same bundle is not sent twice).
+        r#"
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            day        TEXT PRIMARY KEY,
+            calls      INTEGER NOT NULL DEFAULT 0,
+            tokens_in  INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS repair_llm_sent (
+            hash   TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            at     TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -1042,6 +1061,45 @@ mod tests {
             .unwrap();
         assert_eq!((outcome.as_str(), url.as_str()), ("held", "https://cdn.a.example/v.mp4"), "the row survives");
         assert_eq!((dist, secs, host, exp), (None, None, None, None), "NULL means no comparison");
+    }
+
+    /// A database at version 21 keeps its rows when 22 is applied; the two
+    /// LLM-limit tables appear empty.
+    #[test]
+    fn migration_22_adds_the_llm_limit_tables_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 21) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 21);
+        conn.execute_batch("INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');")
+            .unwrap();
+        assert!(columns_of(&conn, "llm_usage").is_empty(), "the table exists before 22");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 22);
+        for (table, cols) in [
+            ("llm_usage", vec!["day", "calls", "tokens_in", "tokens_out"]),
+            ("repair_llm_sent", vec!["hash", "domain", "at"]),
+        ] {
+            let have = columns_of(&conn, table);
+            for c in cols {
+                assert!(have.iter().any(|x| x == c), "{table}.{c} missing: {have:?}");
+            }
+        }
+        let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 1, "existing job rows must survive");
+        conn.execute("INSERT INTO llm_usage (day) VALUES ('2026-10-12')", []).unwrap();
+        let calls: i64 = conn.query_row("SELECT calls FROM llm_usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(calls, 0);
+        assert!(conn.execute("INSERT INTO llm_usage (day) VALUES ('2026-10-12')", []).is_err(), "one row per day");
     }
 
     #[test]
