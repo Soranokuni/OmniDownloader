@@ -55,6 +55,216 @@ pub struct SelfhealReport {
     pub detail: Option<String>,
 }
 
+/// One site for the admin's Sites card (P10.15a): its health row and its canaries.
+#[derive(Debug, Clone)]
+pub struct SiteListRow {
+    pub site: SiteRow,
+    /// Canaries whose page is still there.
+    pub canaries: usize,
+    /// ...of which the last check passed.
+    pub canaries_ok: usize,
+    /// The newest canary check; `None` = never checked.
+    pub canary_checked_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// One (recipe, site) row of the admin's Recipes card.
+#[derive(Debug, Clone)]
+pub struct RecipeSiteView {
+    pub domain: String,
+    pub state: String,
+    pub suspended_reason: Option<String>,
+    pub rank: f64,
+    pub approvals: i64,
+    pub rejections: i64,
+    pub uses: i64,
+    pub last_used_at: Option<chrono::DateTime<Utc>>,
+    pub last_ok_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// One stored recipe with its per-site scores (P10.15a).
+#[derive(Debug, Clone)]
+pub struct RecipeListRow {
+    pub id: i64,
+    pub hash: String,
+    pub scope_kind: String,
+    pub scope_key: String,
+    pub family: Option<String>,
+    pub origin: String,
+    pub state: String,
+    pub created_at: Option<chrono::DateTime<Utc>>,
+    pub retired_at: Option<chrono::DateTime<Utc>>,
+    pub retired_reason: Option<String>,
+    pub recipe_json: String,
+    /// Score over all the sites it has a row on.
+    pub rank: f64,
+    pub sites: Vec<RecipeSiteView>,
+}
+
+/// A recipe for the admin's export file.
+#[derive(Debug, Clone)]
+pub struct RecipeExportRow {
+    pub scope_kind: String,
+    pub scope_key: String,
+    pub family: Option<String>,
+    pub recipe_json: String,
+}
+
+/// What an admin's retirement of a recipe did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminRetire {
+    Retired,
+    NotFound,
+    /// A shipped recipe leaves with the program, never by hand.
+    Shipped,
+    AlreadyRetired,
+}
+
+/// A recipe an admin's import pushed out to make room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvictedRecipe {
+    pub id: i64,
+    pub scope_kind: String,
+    pub scope_key: String,
+    /// `its scope was full` | `the store was full`.
+    pub why: String,
+}
+
+/// What one entry of an import did, and whom it evicted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipeImportResult {
+    pub outcome: crate::recipe_score::InsertOutcome,
+    pub evicted: Vec<EvictedRecipe>,
+}
+
+/// An image distance up to this counts as «the article's picture is in the video» (P10.11b's card).
+pub const IMAGE_MATCH_MAX: i64 = 10;
+
+/// What the repair ladder did on one site in a period (P10.15a), the owner's
+/// evidence for moving `repair.mode`. Every rate is `None` when nothing could
+/// be measured (never a made-up 0 %).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SiteReport {
+    /// `(unknown)` for runs that never found the site.
+    pub domain: String,
+    /// Ladder runs; the «Επόμενη επιλογή» rows are counted apart in `next_choices`.
+    pub attempts: i64,
+    /// MCR's «next choice» downloads.
+    pub next_choices: i64,
+    pub shadow_attempts: i64,
+    pub hold_attempts: i64,
+    /// Ended with a held video or, in shadow mode, one that would have been held.
+    pub found: i64,
+    pub held: i64,
+    pub approved: i64,
+    /// MCR's «Λάθος βίντεο».
+    pub rejected_wrong_video: i64,
+    /// Rejected for any other reason.
+    pub rejected_other: i64,
+    pub expired: i64,
+    /// Found runs whose page stated a length (the gate has already dropped a video that did not match it).
+    pub length_stated: i64,
+    /// Found runs with an article-picture comparison, and those within [`IMAGE_MATCH_MAX`].
+    pub image_known: i64,
+    pub image_matched: i64,
+    pub llm_calls: i64,
+    pub tokens_in: i64,
+    pub tokens_out: i64,
+    pub median_duration_ms: Option<i64>,
+    /// Overnight / daytime self-heal runs on the site, and those that found a way.
+    pub heal_runs: i64,
+    pub heal_found: i64,
+}
+
+impl SiteReport {
+    pub fn length_stated_rate(&self) -> Option<f64> {
+        (self.found > 0).then(|| self.length_stated as f64 / self.found as f64)
+    }
+
+    pub fn image_match_rate(&self) -> Option<f64> {
+        (self.image_known > 0).then(|| self.image_matched as f64 / self.image_known as f64)
+    }
+}
+
+/// One attempt as the report reads it.
+struct ReportRow {
+    domain: Option<String>,
+    mode: String,
+    outcome: Option<String>,
+    decision: Option<String>,
+    rung: Option<String>,
+    wrong_video: bool,
+    expected_secs: Option<f64>,
+    image_distance: Option<i64>,
+    llm_calls: i64,
+    tokens_in: i64,
+    tokens_out: i64,
+    duration_ms: Option<i64>,
+}
+
+/// Median of the values, the mean of the middle two when there is an even number.
+fn median(mut v: Vec<i64>) -> Option<i64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let n = v.len();
+    Some(if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2 })
+}
+
+fn aggregate_report(rows: Vec<ReportRow>) -> Vec<SiteReport> {
+    use std::collections::BTreeMap;
+    let mut by: BTreeMap<String, (SiteReport, Vec<i64>)> = BTreeMap::new();
+    for r in rows {
+        let domain = r.domain.clone().filter(|d| !d.is_empty()).unwrap_or_else(|| "(unknown)".to_string());
+        let (rep, durations) = by.entry(domain.clone()).or_insert_with(|| (SiteReport { domain, ..Default::default() }, Vec::new()));
+        let next = r.rung.as_deref() == Some("next");
+        if next {
+            rep.next_choices += 1;
+        } else {
+            rep.attempts += 1;
+            match r.mode.as_str() {
+                "shadow" => rep.shadow_attempts += 1,
+                "hold" => rep.hold_attempts += 1,
+                _ => {}
+            }
+            durations.extend(r.duration_ms);
+        }
+        rep.llm_calls += r.llm_calls;
+        rep.tokens_in += r.tokens_in;
+        rep.tokens_out += r.tokens_out;
+        let outcome = r.outcome.as_deref();
+        let found = !next && matches!(outcome, Some("held" | "shadow_found"));
+        if found {
+            rep.found += 1;
+            if r.expected_secs.is_some() {
+                rep.length_stated += 1;
+            }
+            if let Some(d) = r.image_distance {
+                rep.image_known += 1;
+                if d <= IMAGE_MATCH_MAX {
+                    rep.image_matched += 1;
+                }
+            }
+        }
+        if outcome == Some("held") {
+            rep.held += 1;
+        }
+        match r.decision.as_deref() {
+            Some("approved") => rep.approved += 1,
+            Some("rejected") if r.wrong_video => rep.rejected_wrong_video += 1,
+            Some("rejected") => rep.rejected_other += 1,
+            Some("expired") => rep.expired += 1,
+            _ => {}
+        }
+    }
+    by.into_values()
+        .map(|(mut rep, durations)| {
+            rep.median_duration_ms = median(durations);
+            rep
+        })
+        .collect()
+}
+
 /// One run of the repair ladder on a job (plan P10.11a).
 #[derive(Debug, Clone)]
 pub struct RepairAttempt {
@@ -3648,7 +3858,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
-        note_mcr_decision(&tx, job_id, "approved", Learn::Approved, chrono::Utc::now())?;
+        note_mcr_decision(&tx, job_id, "approved", None, Learn::Approved, chrono::Utc::now())?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'INFO', ?)",
             params![job_id, now, format!("Approved by {by}; delivering the held file")],
@@ -3682,7 +3892,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
-        note_mcr_decision(&tx, job_id, "rejected", if reason == "wrong_video" { Learn::WrongVideo } else { Learn::Nothing }, chrono::Utc::now())?;
+        note_mcr_decision(&tx, job_id, "rejected", Some(reason), if reason == "wrong_video" { Learn::WrongVideo } else { Learn::Nothing }, chrono::Utc::now())?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
             params![job_id, now, format!("Rejected by {by} ({reason}): {message}")],
@@ -3716,7 +3926,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(false);
         }
-        note_mcr_decision(&tx, job_id, "expired", Learn::Nothing, now)?;
+        note_mcr_decision(&tx, job_id, "expired", None, Learn::Nothing, now)?;
         tx.execute(
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
             params![job_id, at, "Nobody approved the held video in time; it was deleted"],
@@ -3777,7 +3987,7 @@ impl Repository {
         if held != 1 || queued != 1 {
             return Ok(None);
         }
-        note_mcr_decision(&tx, job_id, "rejected", Learn::WrongVideo, now)?;
+        note_mcr_decision(&tx, job_id, "rejected", Some("wrong_video"), Learn::WrongVideo, now)?;
         tx.execute(
             "INSERT INTO repair_attempts (job_id, started_at, mode, rung, candidates_json, next_index, domain)
              VALUES (?, ?, 'hold', 'next', ?, ?, ?)",
@@ -3871,6 +4081,99 @@ impl Repository {
         let conn = self.pool.get()?;
         let cutoff = timestamps::format(now - Duration::days(SELFHEAL_KEEP_DAYS));
         Ok(conn.execute("DELETE FROM selfheal_reports WHERE at < ?", params![cutoff])?)
+    }
+
+    /// Debug builds only, for `dev-seed-repair`: what MCR decided about an
+    /// attempt and the article-picture distance the card measured.
+    #[cfg(debug_assertions)]
+    pub fn dev_decide_attempt(&self, attempt_id: i64, decision: Option<&str>, image_distance: Option<i64>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE repair_attempts SET mcr_decision = ?, image_distance = ? WHERE id = ?",
+            params![decision, image_distance, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every site the daemon keeps health for, the broken first, with its
+    /// canaries (P10.15a). An LLM breaker that has run out is not reported.
+    pub fn list_sites(&self, now: chrono::DateTime<Utc>) -> Result<Vec<SiteListRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT s.domain, s.recent, s.consecutive_fail, s.last_ok_at, s.last_fail_at, s.last_code,
+                    s.state, s.state_since, s.llm_breaker_until,
+                    (SELECT COUNT(*) FROM site_canaries c WHERE c.domain = s.domain
+                        AND (COALESCE(c.last_ok, -1) <> 0 OR COALESCE(c.last_detail, '') <> ?1)),
+                    (SELECT COUNT(*) FROM site_canaries c WHERE c.domain = s.domain AND c.last_ok = 1),
+                    (SELECT MAX(c.last_checked_at) FROM site_canaries c WHERE c.domain = s.domain)
+             FROM site_stats s
+             ORDER BY CASE s.state WHEN 'broken' THEN 0 WHEN 'degraded' THEN 1 ELSE 2 END, s.domain",
+        )?;
+        let rows = stmt
+            .query_map(params![crate::models::CANARY_GONE], |r| {
+                let mut site = site_from_row(r)?;
+                site.llm_breaker_until = site.llm_breaker_until.filter(|t| *t > now);
+                Ok(SiteListRow {
+                    site,
+                    canaries: r.get::<_, i64>(9)?.max(0) as usize,
+                    canaries_ok: r.get::<_, i64>(10)?.max(0) as usize,
+                    canary_checked_at: timestamps::parse_opt(r.get::<_, Option<String>>(11)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// What the repair ladder did per site since `since` (P10.15a). Attempts
+    /// with no domain are one row, `(unknown)`. MCR's «next choice» rows are
+    /// counted apart from the ladder's own runs. A rejection counts as «wrong
+    /// video» by the reason stored with the decision (`mcr_reason`); a row from
+    /// before that column has none and counts as another reason.
+    pub fn repair_report(&self, since: chrono::DateTime<Utc>) -> Result<Vec<SiteReport>> {
+        let conn = self.pool.get()?;
+        let since = timestamps::format(since);
+        let mut stmt = conn.prepare(
+            "SELECT a.domain, a.mode, a.outcome, a.mcr_decision, a.rung, a.expected_secs, a.image_distance,
+                    a.llm_calls, a.tokens_in, a.tokens_out, a.duration_ms, a.mcr_reason
+             FROM repair_attempts a WHERE a.started_at >= ? ORDER BY a.id",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                Ok(ReportRow {
+                    domain: r.get(0)?,
+                    mode: r.get(1)?,
+                    outcome: r.get(2)?,
+                    decision: r.get(3)?,
+                    rung: r.get(4)?,
+                    wrong_video: r.get::<_, Option<String>>(11)?.as_deref() == Some("wrong_video"),
+                    expected_secs: r.get(5)?,
+                    image_distance: r.get(6)?,
+                    llm_calls: r.get(7)?,
+                    tokens_in: r.get(8)?,
+                    tokens_out: r.get(9)?,
+                    duration_ms: r.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut report = aggregate_report(rows);
+        let mut stmt = conn.prepare(
+            "SELECT domain, COUNT(*), COALESCE(SUM(outcome = 'found'), 0) FROM selfheal_reports
+             WHERE at >= ? AND outcome IN ('found', 'nothing') GROUP BY domain",
+        )?;
+        let heals = stmt
+            .query_map(params![since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (domain, runs, found) in heals {
+            match report.iter_mut().find(|s| s.domain == domain) {
+                Some(s) => {
+                    s.heal_runs = runs;
+                    s.heal_found = found;
+                }
+                None => report.push(SiteReport { domain, heal_runs: runs, heal_found: found, ..Default::default() }),
+            }
+        }
+        report.sort_by(|a, b| b.attempts.cmp(&a.attempts).then_with(|| a.domain.cmp(&b.domain)));
+        Ok(report)
     }
 
     /// A held row whose job moved on without it: the condition of
@@ -4209,6 +4512,7 @@ mod recipe_sql {
         conn: &Connection,
         scope: Option<(ScopeKind, &str)>,
         inserting: Origin,
+        protect: &[i64],
         now: DateTime<Utc>,
     ) -> Result<bool> {
         let kind = scope.map(|(k, _)| k.as_str());
@@ -4237,7 +4541,7 @@ mod recipe_sql {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut llm: Vec<(i64, RankKey)> = Vec::new();
         let mut admin: Vec<(i64, RankKey)> = Vec::new();
-        for (id, hash, origin) in cands {
+        for (id, hash, origin) in cands.into_iter().filter(|(id, _, _)| !protect.contains(id)) {
             let mine = rows.get(&id).map(Vec::as_slice).unwrap_or(&[]);
             let k = RankKey {
                 rank: rs::pooled_rank(mine, now),
@@ -4262,10 +4566,10 @@ mod recipe_sql {
     }
 
     /// Scope cap, then the global live cap. False: nothing could be evicted.
-    fn make_room(conn: &Connection, kind: ScopeKind, key: &str, inserting: Origin, now: DateTime<Utc>) -> Result<bool> {
+    fn make_room(conn: &Connection, kind: ScopeKind, key: &str, inserting: Origin, protect: &[i64], now: DateTime<Utc>) -> Result<bool> {
         if kind != ScopeKind::Generic {
             while count_scope(conn, kind, key)? >= rs::SCOPE_CAP {
-                if !evict_one(conn, Some((kind, key)), inserting, now)? {
+                if !evict_one(conn, Some((kind, key)), inserting, protect, now)? {
                     return Ok(false);
                 }
             }
@@ -4275,7 +4579,7 @@ mod recipe_sql {
             "SELECT COUNT(*) FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'",
         )? >= rs::NONSHIPPED_LIVE_CAP
         {
-            if !evict_one(conn, None, inserting, now)? {
+            if !evict_one(conn, None, inserting, protect, now)? {
                 return Ok(false);
             }
         }
@@ -4376,7 +4680,7 @@ mod recipe_sql {
                 upgrade_origin(conn, head.id, new.origin)?;
                 return Ok(InsertOutcome::Merged(head.id));
             }
-            if !make_room(conn, head.scope_kind, &head.scope_key, new.origin, now)? {
+            if !make_room(conn, head.scope_kind, &head.scope_key, new.origin, protect, now)? {
                 return Ok(InsertOutcome::OverCap);
             }
             conn.execute(
@@ -4393,7 +4697,7 @@ mod recipe_sql {
             return Ok(InsertOutcome::Revived(head.id));
         }
         // e. a new recipe
-        if !make_room(conn, new.scope_kind, &new.scope_key, new.origin, now)? || !make_row_room(conn, protect, now)? {
+        if !make_room(conn, new.scope_kind, &new.scope_key, new.origin, protect, now)? || !make_row_room(conn, protect, now)? {
             return Ok(InsertOutcome::OverCap);
         }
         conn.execute(
@@ -4849,6 +5153,190 @@ mod recipe_sql {
             rep.rows_trimmed = shed_site_rows(&tx, rs::SITE_ROW_CAP)?;
             tx.commit()?;
             Ok(rep)
+        }
+
+        /// Every recipe, shipped and retired too, with its per-site scores, newest
+        /// first (the admin's Recipes card, P10.15a).
+        pub fn list_recipes(&self, now: DateTime<Utc>) -> Result<Vec<super::RecipeListRow>> {
+            let conn = self.pool.get()?;
+            let mut stmt = conn.prepare(concat!(
+                "SELECT ", head_cols!(), ", recipe_json FROM recipes ORDER BY id DESC"
+            ))?;
+            let heads = stmt
+                .query_map([], |r| Ok((head_from_row(r)?, r.get::<_, Option<String>>(5)?, r.get::<_, Option<String>>(9)?, r.get::<_, String>(12)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut out = Vec::with_capacity(heads.len());
+            for (h, family, retired_at, json) in heads {
+                let rows = load_rows(&conn, h.id)?;
+                let all: Vec<SiteRow> = rows.iter().map(|(_, r)| r.clone()).collect();
+                out.push(super::RecipeListRow {
+                    id: h.id,
+                    hash: h.hash,
+                    scope_kind: h.scope_kind.as_str().to_string(),
+                    scope_key: h.scope_key,
+                    family,
+                    origin: h.origin.as_str().to_string(),
+                    state: h.state.as_str().to_string(),
+                    created_at: Some(h.created_at),
+                    retired_at: parse_opt(retired_at),
+                    retired_reason: h.retired_reason.map(|r| r.as_str().to_string()),
+                    recipe_json: json,
+                    rank: rs::pooled_rank(&all, now),
+                    sites: rows
+                        .into_iter()
+                        .map(|(domain, r)| super::RecipeSiteView {
+                            domain,
+                            state: r.state.as_str().to_string(),
+                            suspended_reason: r.suspended_reason.map(|x| x.as_str().to_string()),
+                            rank: rs::site_rank(&r, now),
+                            approvals: r.approvals,
+                            rejections: r.rejections,
+                            uses: r.uses,
+                            last_used_at: r.last_used_at,
+                            last_ok_at: r.last_ok_at,
+                        })
+                        .collect(),
+                });
+            }
+            Ok(out)
+        }
+
+        /// The recipes an admin may carry to another installation: live, and written
+        /// by an admin or the model. Never a shipped one (the program carries those).
+        pub fn export_recipes(&self) -> Result<Vec<super::RecipeExportRow>> {
+            let conn = self.pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT scope_kind, scope_key, family, recipe_json FROM recipes
+                 WHERE state <> 'retired' AND origin IN ('admin', 'llm')
+                   AND NOT (scope_kind = 'site' AND EXISTS
+                        (SELECT 1 FROM recipe_bars b WHERE b.steps_hash = recipes.steps_hash AND b.domain = recipes.scope_key))
+                 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(super::RecipeExportRow {
+                        scope_kind: r.get(0)?,
+                        scope_key: r.get(1)?,
+                        family: r.get(2)?,
+                        recipe_json: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }
+
+        /// An admin's import, all in ONE immediate transaction: any `Err` leaves
+        /// nothing stored. An entry never evicts another entry of the same batch;
+        /// when there is no other room it is `OverCap`. An entry that is refused or
+        /// over the cap leaves no trace (its own savepoint is rolled back). Each
+        /// result names the recipes its insert evicted.
+        pub fn import_recipes(&self, entries: &[NewRecipe], now: DateTime<Utc>) -> Result<Vec<super::RecipeImportResult>> {
+            let mut conn = self.pool.get()?;
+            let mut tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut mine: Vec<i64> = Vec::new();
+            let mut out = Vec::with_capacity(entries.len());
+            let live = |c: &Connection| -> Result<Vec<(i64, String, String)>> {
+                let mut stmt = c.prepare(
+                    "SELECT id, scope_kind, scope_key FROM recipes WHERE state <> 'retired' AND origin <> 'shipped'",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            };
+            for new in entries {
+                check_new(new)?;
+                let before = live(&tx)?;
+                let sp = tx.savepoint()?;
+                let outcome = insert_in_tx(&sp, new, &mine, now)?;
+                let kept = !matches!(outcome, InsertOutcome::OverCap | InsertOutcome::Refused(_));
+                let mut evicted = Vec::new();
+                if kept {
+                    let after: Vec<i64> = live(&sp)?.into_iter().map(|(id, _, _)| id).collect();
+                    for (id, kind, key) in before {
+                        if !after.contains(&id) {
+                            let same = kind == new.scope_kind.as_str() && key == new.scope_key;
+                            evicted.push(super::EvictedRecipe {
+                                id,
+                                scope_kind: kind,
+                                scope_key: key,
+                                why: if same { "its scope was full" } else { "the store was full" }.to_string(),
+                            });
+                        }
+                    }
+                    sp.commit()?;
+                }
+                if let InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) | InsertOutcome::Revived(id) = outcome {
+                    mine.push(id);
+                }
+                out.push(super::RecipeImportResult { outcome, evicted });
+            }
+            tx.commit()?;
+            Ok(out)
+        }
+
+        /// An admin switches a recipe off on one site. It is the same suspension a
+        /// run of failures makes (`failing`), so two canary passes in a row lift it
+        /// again, and so does a `failing` suspension's 30-day retirement. `false`:
+        /// no such live recipe.
+        pub fn admin_suspend_recipe(&self, id: i64, domain: &str, now: DateTime<Utc>) -> Result<bool> {
+            let domain = domain.trim().to_lowercase();
+            if domain.is_empty() {
+                anyhow::bail!("a suspension needs a domain");
+            }
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            match head_by_id(&tx, id)? {
+                Some(h) if h.state != RecipeState::Retired => {}
+                _ => return Ok(false),
+            }
+            let current = load_rows(&tx, id)?.into_iter().find(|(d, _)| *d == domain).map(|(_, r)| r);
+            let mut row = match current {
+                Some(r) => r,
+                None => {
+                    shed_site_rows(&tx, rs::SITE_ROW_CAP - 1)?;
+                    SiteRow::new(now)
+                }
+            };
+            // A rejection's suspension is MCR's word and stays as it is.
+            if !(row.state == SiteState::Suspended && row.suspended_reason == Some(SuspendReason::Rejected)) {
+                if !row.is_suspended() {
+                    row.suspended_at = Some(now);
+                }
+                row.state = SiteState::Suspended;
+                row.suspended_reason = Some(SuspendReason::Failing);
+                row.pass_streak = 0;
+            }
+            store_row(&tx, id, &domain, &row)?;
+            recompute_state(&tx, id)?;
+            tx.commit()?;
+            Ok(true)
+        }
+
+        /// An admin retires a recipe for good: its hash is remembered as `admin`, so
+        /// it cannot be inserted again, and its steps are barred on its own site.
+        pub fn admin_retire_recipe(&self, id: i64, now: DateTime<Utc>) -> Result<super::AdminRetire> {
+            use super::AdminRetire;
+            let mut conn = self.pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let Some(head) = head_by_id(&tx, id)? else { return Ok(AdminRetire::NotFound) };
+            if head.origin == Origin::Shipped {
+                return Ok(AdminRetire::Shipped);
+            }
+            // Retired as evicted, superseded or failing it could still be revived: re-label it `admin`.
+            if head.state == RecipeState::Retired && head.retired_reason.map_or(false, RetiredReason::refuses_return) {
+                return Ok(AdminRetire::AlreadyRetired);
+            }
+            if head.state == RecipeState::Retired {
+                // Only the memory that it may not return: no bar, which would stop the same steps
+                // on this site even in the recipe that superseded this one.
+                write_tombstone(&tx, &head.hash, RetiredReason::Admin, now)?;
+                tx.execute("UPDATE recipes SET retired_reason = 'admin' WHERE id = ?", params![id])?;
+            } else {
+                tombstone_in_tx(&tx, &head.hash, RetiredReason::Admin, now)?;
+            }
+            tx.commit()?;
+            Ok(AdminRetire::Retired)
         }
 
         pub fn recipe_counts(&self) -> Result<RecipeCounts> {
@@ -5376,11 +5864,15 @@ fn note_mcr_decision(
     tx: &rusqlite::Transaction<'_>,
     job_id: i64,
     decision: &str,
+    reason: Option<&str>,
     learn: Learn,
     now: chrono::DateTime<Utc>,
 ) -> Result<Option<OpenHold>> {
     let Some(hold) = open_hold(tx, job_id)? else { return Ok(None) };
-    tx.execute("UPDATE repair_attempts SET mcr_decision = ? WHERE id = ?", params![decision, hold.id])?;
+    tx.execute(
+        "UPDATE repair_attempts SET mcr_decision = ?, mcr_reason = ? WHERE id = ?",
+        params![decision, reason, hold.id],
+    )?;
     if learn == Learn::Nothing {
         return Ok(Some(hold));
     }

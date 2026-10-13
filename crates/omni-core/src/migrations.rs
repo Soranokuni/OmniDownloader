@@ -670,6 +670,15 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_selfheal_reports_at ON selfheal_reports(at);
         "#,
     ),
+    (
+        25,
+        // Why MCR rejected a held video (P10.15a): `wrong_video` or another
+        // reason, written with the decision, so the repair report counts each
+        // rejection by its own reason. Rows from before have none (count as other).
+        r#"
+        ALTER TABLE repair_attempts ADD COLUMN mcr_reason TEXT;
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -1203,6 +1212,35 @@ mod tests {
         conn.execute("INSERT INTO selfheal_reports (domain, at, outcome) VALUES ('a.example', 'x', 'nothing')", []).unwrap();
         let pages: i64 = conn.query_row("SELECT pages FROM selfheal_reports", [], |r| r.get(0)).unwrap();
         assert_eq!(pages, 0, "pages defaults to 0");
+    }
+
+    #[test]
+    fn migration_25_adds_the_mcr_reason_column_and_keeps_the_attempt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 24) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/x', '1_A_B', 'PENDING');
+             INSERT INTO repair_attempts (job_id, started_at, mode, outcome, mcr_decision) VALUES (5, 'x', 'hold', 'held', 'rejected');",
+        )
+        .unwrap();
+        assert!(!columns_of(&conn, "repair_attempts").iter().any(|x| x == "mcr_reason"), "not before 25");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 25);
+        assert!(columns_of(&conn, "repair_attempts").iter().any(|x| x == "mcr_reason"));
+        let (decision, reason): (String, Option<String>) = conn
+            .query_row("SELECT mcr_decision, mcr_reason FROM repair_attempts", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((decision.as_str(), reason), ("rejected", None), "an old row keeps its decision and has no reason");
     }
 
     #[test]

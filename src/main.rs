@@ -199,6 +199,11 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         hours_ago: i64,
     },
+    /// Debug builds only: invented sites, canaries, recipes and repair attempts,
+    /// so the admin's Sites, Recipes and Repair-report cards can be seen. Use a
+    /// dev config (refused on the install's own config and database).
+    #[cfg(debug_assertions)]
+    DevSeedRepair,
 }
 
 #[derive(Subcommand)]
@@ -469,6 +474,129 @@ async fn dev_hold(
         }
         RunOutcome::Delivered => anyhow::bail!("job #{id} was delivered instead of held"),
     }
+    Ok(())
+}
+
+/// Invented sites, canaries, recipes and repair attempts for the admin cards
+/// (P10.15a). Every name is `*.dev-seed.example`; running it again adds more
+/// attempts and merges the recipes.
+#[cfg(debug_assertions)]
+fn dev_seed_repair(repo: &Repository) -> Result<()> {
+    use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, ScopeKind};
+    use omni_core::site_health::{SiteOutcome, SiteState};
+
+    let now = chrono::Utc::now();
+    let hours = chrono::Duration::hours;
+    let days = chrono::Duration::days;
+
+    // Sites: one broken with a canary that fails, one degraded, one healthy.
+    for (domain, fails, state) in [
+        ("broken.dev-seed.example", 4, Some(SiteState::Broken)),
+        ("slow.dev-seed.example", 2, Some(SiteState::Degraded)),
+        ("calm.dev-seed.example", 0, None),
+    ] {
+        for _ in 0..3 {
+            repo.record_site_outcome(domain, SiteOutcome::Success)?;
+        }
+        for _ in 0..fails {
+            repo.record_site_outcome(domain, SiteOutcome::SiteFailure("NO_VIDEO_FOUND".into()))?;
+        }
+        if let Some(s) = state {
+            repo.set_site_state(domain, s)?;
+        }
+        for i in 0..3 {
+            let page = format!("https://{domain}/story/{}", i + 1);
+            repo.add_canary(domain, &page, None, now - days(i as i64 + 1))?;
+        }
+        let ids: Vec<i64> = repo.list_canaries_for(domain)?.into_iter().map(|c| c.id).collect();
+        for (id, ok) in ids.into_iter().zip([fails == 0, false, false]) {
+            repo.record_canary_result(id, ok, if ok { "ok" } else { "no video found on the page" })?;
+        }
+    }
+
+    // Recipes: an admin one with approvals, a model one still untried, a player one.
+    let make = |scope: ScopeKind, key: &str, family: Option<&str>, json: &str, origin: Origin| -> Result<NewRecipe> {
+        let r = omni_browser::recipe::Recipe::from_json(json).map_err(|e| anyhow::anyhow!("seed recipe: {e}"))?;
+        Ok(NewRecipe {
+            scope_kind: scope,
+            scope_key: key.to_string(),
+            family: family.map(str::to_string),
+            hash: omni_browser::recipe::scope_hash(scope.as_str(), key, &r),
+            steps_hash: omni_browser::recipe::steps_hash(&r),
+            recipe_json: r.canonical_json(),
+            dsl_version: r.dsl_version,
+            origin,
+        })
+    };
+    let attr = r#"{"dsl_version":1,"steps":[{"op":"attr","css":"video","attr":"data-src"},{"op":"abs","from":0},{"op":"media","from":1,"referer":"page"}]}"#;
+    let other = r#"{"dsl_version":1,"steps":[{"op":"attr","css":"div.player","attr":"data-video"},{"op":"abs","from":0},{"op":"media","from":1,"referer":"page"}]}"#;
+    let mut ids = Vec::new();
+    for new in [
+        make(ScopeKind::Site, "broken.dev-seed.example", Some("jwplayer"), attr, Origin::Admin)?,
+        make(ScopeKind::Site, "slow.dev-seed.example", None, other, Origin::Llm)?,
+        make(ScopeKind::Player, "jwplayer", Some("jwplayer"), attr, Origin::Admin)?,
+    ] {
+        match repo.insert_recipe(&new, now)? {
+            InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) | InsertOutcome::Revived(id) => ids.push(id),
+            other => println!("A seed recipe was not stored: {other:?}"),
+        }
+    }
+    if let [first, second, ..] = ids[..] {
+        repo.recipe_event(first, "broken.dev-seed.example", Event::Approval, now - days(5))?;
+        repo.recipe_event(first, "broken.dev-seed.example", Event::Approval, now - days(2))?;
+        repo.recipe_event(first, "calm.dev-seed.example", Event::AutoDelivered, now - days(1))?;
+        repo.recipe_event(second, "slow.dev-seed.example", Event::CanaryFail, now - days(1))?;
+    }
+
+    // Repair attempts (hold and shadow) on the broken site and the slow one.
+    let candidates = |url: &str, length_ok: bool| {
+        serde_json::json!([{
+            "url": url, "origin": "recipe:attr", "duration_secs": 62.0,
+            "checks": [
+                {"name": "probe", "ok": true, "detail": "62 δλ, 720p (cdn.dev-seed.example)"},
+                {"name": "length", "ok": length_ok, "detail": "x"},
+            ],
+        }])
+        .to_string()
+    };
+    let nonce = now.timestamp_nanos_opt().unwrap_or_default();
+    // (domain, mode, outcome, decision, image distance, length ok, expected secs, ms, hours ago)
+    let runs: [(&str, &str, &str, Option<&str>, Option<i64>, bool, Option<f64>, i64, i64); 7] = [
+        ("broken.dev-seed.example", "hold", "held", Some("approved"), Some(3), true, Some(62.0), 41_000, 30),
+        ("broken.dev-seed.example", "hold", "held", Some("rejected"), Some(31), false, Some(180.0), 52_000, 72),
+        ("broken.dev-seed.example", "hold", "held", None, Some(8), true, Some(61.0), 38_000, 2),
+        ("broken.dev-seed.example", "hold", "nothing_verified", None, None, false, None, 90_000, 120),
+        ("slow.dev-seed.example", "shadow", "shadow_found", None, None, true, Some(62.0), 33_000, 48),
+        ("slow.dev-seed.example", "hold", "held", Some("expired"), None, false, None, 47_000, 200),
+        ("calm.dev-seed.example", "hold", "exhausted", None, None, false, None, 120_000, 400),
+    ];
+    for (i, (domain, mode, outcome, decision, distance, length_ok, expected, ms, ago)) in runs.into_iter().enumerate() {
+        let mut new = omni_core::models::NewJob::new(format!("attachment://dev-seed/{nonce}/{i}"), format!("{}_DEVSEED_TEST", i + 1), "DEVSEED".to_string());
+        new.keyword = "DEVSEED".into();
+        new.status = JobStatus::ManualDownload;
+        let job = repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+        let at = now - hours(ago);
+        let attempt = repo.start_attempt(job, mode, at)?;
+        let url = format!("https://cdn.dev-seed.example/v/{i}.mp4");
+        let found = outcome == "held" || outcome == "shadow_found";
+        let end = omni_core::repository::AttemptEnd {
+            rung: Some("recipes".into()),
+            outcome: Some(outcome.into()),
+            domain: Some(domain.into()),
+            candidates_json: found.then(|| candidates(&url, length_ok)),
+            held_url: (outcome == "held").then(|| url.clone()),
+            expected_secs: expected,
+            duration_ms: Some(ms),
+            llm_calls: i64::from(i % 3 == 0),
+            tokens_in: if i % 3 == 0 { 1800 } else { 0 },
+            tokens_out: if i % 3 == 0 { 120 } else { 0 },
+            ..Default::default()
+        };
+        repo.finish_attempt(attempt, &end, at + chrono::Duration::milliseconds(ms))?;
+        repo.dev_decide_attempt(attempt, decision, distance)?;
+    }
+    repo.record_selfheal("broken.dev-seed.example", "nothing", None, None, 2, None, now - hours(20))?;
+    repo.record_selfheal("broken.dev-seed.example", "found", Some("0123456789abcdef0123456789abcdef"), Some("llm"), 2, None, now - hours(44))?;
     Ok(())
 }
 
@@ -780,6 +908,16 @@ async fn main() -> Result<()> {
                 chrono::Utc::now() - chrono::Duration::hours(hours_ago),
             )?;
             println!("Added a {outcome} self-heal report for {domain}.");
+        }
+        #[cfg(debug_assertions)]
+        Some(Commands::DevSeedRepair) => {
+            let config_given = std::env::args().any(|a| a == "-c" || a == "--config" || a.starts_with("--config="));
+            let config = AppConfig::load_from_file(&paths.config)
+                .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
+            let db_path = paths.resolve(&config.database_path);
+            dev_hold_guard(&paths, config_given, &db_path)?;
+            dev_seed_repair(&Repository::new(&db_path)?)?;
+            println!("Seeded invented sites, recipes and repair attempts.");
         }
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)
@@ -1116,7 +1254,16 @@ async fn run_daemon(
     let live_llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
     // Jobs a worker is still busy with: a retry from MCR waits for them.
     let busy_jobs = omni_core::busy::BusyJobs::new();
+    // Site canaries (plan P10.4): shared by the nightly check, the workers'
+    // daytime trigger and the admin's «Run now», so only one runs at a time.
+    let canary_env = Arc::new(canary::CanaryEnv::new(
+        repo.clone(),
+        health.clone(),
+        bin_dir.clone(),
+        config.ytdl_channel.clone(),
+    ));
     let web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
+        .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
         .with_llm(live_llm.clone())
@@ -1190,15 +1337,6 @@ async fn run_daemon(
         });
     }
 
-
-    // Site canaries (plan P10.4): shared by the nightly check and the
-    // workers' daytime trigger, so only one runs at a time.
-    let canary_env = Arc::new(canary::CanaryEnv::new(
-        repo.clone(),
-        health.clone(),
-        bin_dir.clone(),
-        config.ytdl_channel.clone(),
-    ));
 
     // 3. Maintenance scheduler (plan P6.6).
     //

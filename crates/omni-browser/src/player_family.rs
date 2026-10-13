@@ -25,6 +25,11 @@ const FAMILIES: &[(&str, &[&str])] = &[
     ("hlsjs", &["hls.js", "hls.min.js"]),
 ];
 
+/// The names of the known families, for checking a recipe's player scope.
+pub fn family_names() -> impl Iterator<Item = &'static str> {
+    FAMILIES.iter().map(|(name, _)| *name)
+}
+
 /// `sig` in `hay`. A file name ending in `.js` must end there: `video.js` is not
 /// `video.json`.
 fn has_signature(hay: &str, sig: &str) -> bool {
