@@ -1078,7 +1078,9 @@ async fn run_daemon(
     tokio::fs::create_dir_all(&bin_dir).await?;
 
     info!("Initializing SQLite database at: {:?}", db_path);
-    let repo = Repository::new(&db_path)?;
+    // One live-update bus: the repository announces job changes on it, the web server streams it (P1.10).
+    let events = omni_core::events::EventBus::new();
+    let repo = Repository::new(&db_path)?.with_events(events.clone());
     // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them.
     if let Some(r) = &log_redactions {
         r.extend(repo.cookie_values());
@@ -1288,7 +1290,8 @@ async fn run_daemon(
         .with_health(health.clone())
         .with_llm(live_llm.clone())
         .with_busy_jobs(busy_jobs.clone())
-        .with_temp_dir(temp_path.clone());
+        .with_temp_dir(temp_path.clone())
+        .with_events(events.clone());
     if let Some(r) = &log_redactions {
         web_state = web_state.with_redactions(r.clone());
     }

@@ -20,7 +20,7 @@ import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/s
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=10';
+} from '/static/desk.js?v=11';
 
 /* ------------------------------------------------------------------ *
  * State

@@ -373,11 +373,51 @@ pub enum CancelOutcome {
     NotCancellable,
 }
 
+/// The stage clock of a leased job, as the new `stage_timings_json` text: the
+/// existing object with the milliseconds since `stage_started_at` added to the
+/// key of the current stage (repeats of a stage sum). `None` when there is
+/// nothing to write: no such leased job, no start time, or no stage. Malformed
+/// stored JSON starts a fresh object, since a stage change must not fail over
+/// it. Negative elapsed time (a clock step) counts as 0.
+fn stage_timings_for(
+    conn: &rusqlite::Connection,
+    guard: &str,
+    args: impl rusqlite::Params,
+    at: chrono::DateTime<Utc>,
+) -> Result<Option<String>> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            &format!("SELECT stage, stage_started_at, stage_timings_json FROM queue WHERE {guard}"),
+            args,
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((Some(stage), Some(started), existing)) = row else {
+        return Ok(None);
+    };
+    let Some(started) = timestamps::parse(&started) else {
+        return Ok(None);
+    };
+    if stage.is_empty() {
+        return Ok(None);
+    }
+    let ms = (at - started).num_milliseconds().max(0);
+    let mut map = match existing.as_deref().map(serde_json::from_str::<serde_json::Value>) {
+        Some(Ok(serde_json::Value::Object(m))) => m,
+        _ => serde_json::Map::new(),
+    };
+    let prev = map.get(&stage).and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    map.insert(stage, serde_json::Value::from(prev.saturating_add(ms)));
+    Ok(Some(serde_json::Value::Object(map).to_string()))
+}
+
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
     /// Used for the pre-migration backup; `None` for in-memory test databases.
     db_path: Option<Arc<Path>>,
+    /// Live-update bus; `None` in tests and tools that nobody watches.
+    events: Option<crate::events::EventBus>,
 }
 
 impl Repository {
@@ -397,9 +437,16 @@ impl Repository {
         let repo = Self {
             pool: Arc::new(pool),
             db_path: Some(Arc::from(path.to_path_buf())),
+            events: None,
         };
         repo.run_migrations()?;
         Ok(repo)
+    }
+
+    /// Announce job changes on `bus` after they are written (P1.10).
+    pub fn with_events(mut self, bus: crate::events::EventBus) -> Self {
+        self.events = Some(bus);
+        self
     }
 
     fn run_migrations(&self) -> Result<()> {
@@ -706,13 +753,31 @@ impl Repository {
         error_message: Option<&str>,
         file_path: Option<&str>,
     ) -> Result<bool> {
-        let conn = self.pool.get()?;
-        let now = timestamps::now_string();
+        self.finish_at(job_id, owner, status, error_code, error_message, file_path, Utc::now())
+    }
+
+    /// `finish` with the clock passed in; the time the last stage took is
+    /// added to `stage_timings_json` in the same transaction.
+    fn finish_at(
+        &self,
+        job_id: i64,
+        owner: &str,
+        status: JobStatus,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+        file_path: Option<&str>,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = timestamps::format(at);
+        let timings = stage_timings_for(&tx, "id = ? AND lease_owner = ?", params![job_id, owner], at)?;
         let delivered = matches!(status, JobStatus::Completed);
-        let changed = conn.execute(
+        let changed = tx.execute(
             r#"
             UPDATE queue
             SET status = ?,
+                stage_timings_json = COALESCE(?, stage_timings_json),
                 stage = CASE WHEN ? = 'COMPLETED' THEN 'DONE' ELSE stage END,
                 lease_owner = NULL,
                 lease_expires_at = NULL,
@@ -727,6 +792,7 @@ impl Repository {
             "#,
             params![
                 status.as_str(),
+                timings,
                 status.as_str(),
                 error_code,
                 error_message,
@@ -741,6 +807,7 @@ impl Repository {
                 owner
             ],
         )?;
+        tx.commit()?;
         if changed == 1 {
             let level = if matches!(status, JobStatus::Completed | JobStatus::AwaitingApproval) { "INFO" } else { "ERROR" };
             self.record_event(
@@ -752,6 +819,10 @@ impl Repository {
                     None => format!("Finished as {}", status.as_str()),
                 },
             )?;
+            if let Some(bus) = &self.events {
+                let done = delivered;
+                bus.job(job_id, status.as_str(), done.then_some("DONE"), done.then_some(100.0));
+            }
         }
         Ok(changed == 1)
     }
@@ -1008,18 +1079,39 @@ impl Repository {
 
     /// Move a leased job to the next stage and reset the stage clock.
     pub fn set_stage(&self, job_id: i64, owner: &str, stage: JobStage) -> Result<bool> {
-        let conn = self.pool.get()?;
-        let now = timestamps::now_string();
-        let changed = conn.execute(
-            "UPDATE queue SET stage = ?, stage_started_at = ?, updated_at = ?
+        self.set_stage_at(job_id, owner, stage, Utc::now())
+    }
+
+    /// `set_stage` with the clock passed in. The time the stage being left took
+    /// is added to `stage_timings_json` in the same transaction; a refused move
+    /// (lease lost) writes nothing.
+    pub fn set_stage_at(&self, job_id: i64, owner: &str, stage: JobStage, at: chrono::DateTime<Utc>) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = timestamps::format(at);
+        let timings = stage_timings_for(
+            &tx,
+            "id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![job_id, owner],
+            at,
+        )?;
+        let changed = tx.execute(
+            "UPDATE queue SET stage = ?, stage_started_at = ?, updated_at = ?,
+                 stage_timings_json = COALESCE(?, stage_timings_json)
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
-            params![stage.as_str(), now, now, job_id, owner],
+            params![stage.as_str(), now, now, timings, job_id, owner],
         )?;
         if changed == 1 {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, ?, 'INFO', ?)",
                 params![job_id, now, stage.as_str(), format!("Stage {}", stage.as_str())],
             )?;
+        }
+        tx.commit()?;
+        if changed == 1 {
+            if let Some(bus) = &self.events {
+                bus.job(job_id, "RUNNING", Some(stage.as_str()), None);
+            }
         }
         Ok(changed == 1)
     }
@@ -1598,6 +1690,17 @@ impl Repository {
             "UPDATE queue SET progress = ?, speed = ?, eta = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
             params![progress, speed, eta, id],
         )?;
+        if let Some(bus) = &self.events {
+            // The status and stage are looked up only when the throttle lets an event through.
+            bus.job_progress(id, progress, speed, eta, || {
+                let row = conn
+                    .query_row("SELECT status, stage FROM queue WHERE id = ?", params![id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
+                    .optional();
+                row.ok().flatten()
+            });
+        }
         Ok(())
     }
 
@@ -3790,18 +3893,25 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::now_string();
+        let timings = stage_timings_for(
+            &tx,
+            "id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![job_id, owner],
+            Utc::now(),
+        )?;
         let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'COMPLETED', stage = 'DONE', lease_owner = NULL, lease_expires_at = NULL,
                 error_code = NULL, error_message = NULL, progress = 100.0,
-                completed_at = ?, delivered_at = ?, updated_at = ?
+                completed_at = ?, delivered_at = ?, updated_at = ?,
+                stage_timings_json = COALESCE(?, stage_timings_json)
             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'
               AND file_path IS NOT NULL AND file_path != ''
               AND file_path = (SELECT delivered_path FROM held_outputs
                                WHERE job_id = queue.id AND decision = 'approved')
             "#,
-            params![now, now, now, job_id, owner],
+            params![now, now, now, timings, job_id, owner],
         )?;
         if n != 1 {
             return Ok(false);
@@ -3815,6 +3925,9 @@ impl Repository {
             params![job_id, now],
         )?;
         tx.commit()?;
+        if let Some(bus) = &self.events {
+            bus.job(job_id, "COMPLETED", Some("DONE"), Some(100.0));
+        }
         Ok(true)
     }
 
@@ -5845,6 +5958,127 @@ mod tests {
         assert_eq!(find(&repo)?.len(), 2);
 
         assert!(repo.set_journalist_aliases("NOBODY", &["X".into()]).is_err());
+        Ok(())
+    }
+
+    /// A leased job whose stage clock is set by hand: `(repo, id, owner)`.
+    fn leased_at(stage: &str, started: Option<chrono::DateTime<Utc>>) -> Result<(Repository, i64, &'static str, NamedTempFile)> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.add_job(
+            "https://example.org/clip", "1_TESTER_CLIP", "TESTER", "CLIP", "1", 10,
+            JobStatus::Pending, None, None, None,
+        )?;
+        let owner = "test-host:1:0";
+        repo.lease_job(owner, 120)?.expect("leased");
+        repo.pool.get()?.execute(
+            "UPDATE queue SET stage = ?, stage_started_at = ? WHERE id = ?",
+            params![stage, started.map(timestamps::format), id],
+        )?;
+        Ok((repo, id, owner, temp_db))
+    }
+
+    fn timings_of(repo: &Repository, id: i64) -> Option<serde_json::Value> {
+        repo.get_job(id).unwrap().unwrap().stage_timings_json.map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    fn t0() -> chrono::DateTime<Utc> {
+        timestamps::parse("2026-01-01T10:00:00.000Z").unwrap()
+    }
+
+    #[test]
+    fn stage_timings_accumulate_per_stage_with_exact_clock() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        // DOWNLOAD ran 1.5 s, then PROBE.
+        assert!(repo.set_stage_at(id, owner, JobStage::Probe, t0() + Duration::milliseconds(1500))?);
+        assert_eq!(timings_of(&repo, id), Some(serde_json::json!({"DOWNLOAD": 1500})));
+        // PROBE 500 ms, back to DOWNLOAD (a retry inside the job), 2 s there.
+        assert!(repo.set_stage_at(id, owner, JobStage::Download, t0() + Duration::milliseconds(2000))?);
+        assert!(repo.set_stage_at(id, owner, JobStage::Probe, t0() + Duration::milliseconds(4000))?);
+        assert_eq!(
+            timings_of(&repo, id),
+            Some(serde_json::json!({"DOWNLOAD": 3500, "PROBE": 500}))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refused_set_stage_writes_nothing_and_right_owner_does() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        let later = t0() + Duration::seconds(9);
+        assert!(!repo.set_stage_at(id, "someone-else", JobStage::Probe, later)?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.stage, JobStage::Download);
+        assert_eq!(job.stage_timings_json, None, "a refused move records no time");
+        assert_eq!(job.stage_started_at, Some(t0()), "and does not restart the clock");
+        // Negative control: the lease holder does write.
+        assert!(repo.set_stage_at(id, owner, JobStage::Probe, later)?);
+        assert_eq!(timings_of(&repo, id), Some(serde_json::json!({"DOWNLOAD": 9000})));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_timings_restart_and_the_stage_change_still_succeeds() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        repo.pool.get()?.execute("UPDATE queue SET stage_timings_json = '{not json' WHERE id = ?", params![id])?;
+        assert!(repo.set_stage_at(id, owner, JobStage::Probe, t0() + Duration::seconds(2))?);
+        assert_eq!(repo.get_job(id)?.unwrap().stage, JobStage::Probe);
+        assert_eq!(timings_of(&repo, id), Some(serde_json::json!({"DOWNLOAD": 2000})));
+        Ok(())
+    }
+
+    #[test]
+    fn null_stage_start_adds_no_key_and_negative_elapsed_is_zero() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", None)?;
+        assert!(repo.set_stage_at(id, owner, JobStage::Probe, t0())?);
+        assert_eq!(repo.get_job(id)?.unwrap().stage, JobStage::Probe);
+        assert_eq!(timings_of(&repo, id), None);
+        // The clock stepped back: PROBE started at t0, "now" is earlier.
+        assert!(repo.set_stage_at(id, owner, JobStage::Transcode, t0() - Duration::seconds(30))?);
+        assert_eq!(timings_of(&repo, id), Some(serde_json::json!({"PROBE": 0})));
+        Ok(())
+    }
+
+    #[test]
+    fn finish_adds_the_last_stage_and_a_refused_finish_writes_nothing() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("TRANSCODE", Some(t0()))?;
+        let end = t0() + Duration::milliseconds(7250);
+        assert!(!repo.finish_at(id, "someone-else", JobStatus::Failed, None, None, None, end)?);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.stage_timings_json, None);
+        assert!(repo.finish_at(id, owner, JobStatus::Completed, None, None, None, end)?);
+        assert_eq!(timings_of(&repo, id), Some(serde_json::json!({"TRANSCODE": 7250})));
+        Ok(())
+    }
+
+    #[test]
+    fn repository_announces_stage_finish_and_throttled_progress() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        let bus = crate::events::EventBus::new();
+        let mut rx = bus.subscribe();
+        let repo = repo.with_events(bus);
+        let next = |rx: &mut tokio::sync::broadcast::Receiver<String>| -> serde_json::Value {
+            serde_json::from_str(&rx.try_recv().expect("an event")).unwrap()
+        };
+        repo.set_stage(id, owner, JobStage::Probe)?;
+        let v = next(&mut rx);
+        assert_eq!((v["type"].as_str(), v["id"].as_i64(), v["stage"].as_str()), (Some("job"), Some(id), Some("PROBE")));
+        assert_eq!(v["status"], "RUNNING");
+        repo.update_job_progress(id, 10.0, "x", "--")?;
+        repo.update_job_progress(id, 11.0, "x", "--")?;
+        let v = next(&mut rx);
+        assert_eq!(v["progress"], 10.0);
+        assert_eq!(v["speed"], "x");
+        assert_eq!(v["eta"], "--");
+        assert_eq!(v["stage"], "PROBE");
+        assert!(rx.try_recv().is_err(), "second tick inside a second is dropped");
+        // A refused move announces nothing.
+        assert!(!repo.set_stage(id, "someone-else", JobStage::Transcode)?);
+        assert!(rx.try_recv().is_err());
+        repo.finish(id, owner, JobStatus::Completed, None, None, None)?;
+        let v = next(&mut rx);
+        assert_eq!((v["status"].as_str(), v["stage"].as_str(), v["progress"].as_f64()), (Some("COMPLETED"), Some("DONE"), Some(100.0)));
         Ok(())
     }
 

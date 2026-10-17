@@ -13,17 +13,17 @@
  */
 
 import {
-  api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref, icon,
+  api, el, render, toast, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
 import {
   stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
-  redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
+  redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=10';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=16';
+} from '/static/desk.js?v=11';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=17';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=10';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=5';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=6';
 
 let journalists = [];
 
@@ -427,6 +427,10 @@ const queueOffer = (id, offer) => deskQueueOffer(id, offer, refresh);
  * Live queue
  * ------------------------------------------------------------------ */
 
+/** The waiting and running cards on screen, by job id: a live `job` event
+ *  redraws just its card (P1.10). Rebuilt by every loadQueue. */
+const liveCards = new Map();
+
 async function loadQueue() {
   let data;
   try {
@@ -439,7 +443,14 @@ async function loadQueue() {
     render('queue-cards', el('div', { class: 'card center' },
       'Δεν περιμένει τίποτα. Οι νέοι σύνδεσμοι από email εμφανίζονται εδώ αυτόματα.'));
   } else {
-    render('queue-cards', jobs.map((j) => (j.status === 'PENDING' || j.status === 'RUNNING' ? activeCard(j) : deliveredCard(j))));
+    liveCards.clear();
+    const cards = jobs.map((j) => {
+      if (j.status !== 'PENDING' && j.status !== 'RUNNING') return deliveredCard(j);
+      const node = activeCard(j);
+      liveCards.set(j.id, { job: j, node });
+      return node;
+    });
+    render('queue-cards', cards);
   }
   pager('queue-pager', pages.live, data.total || 0, loadQueue);
 }
@@ -1035,4 +1046,46 @@ initNotify(document.querySelector('.topbar-status'), (id) => {
 }, () => switchTab('review'));
 loadFilters();
 switchTab(currentTab);
-live(() => { refresh(); loadStatus(); });
+
+/* Live updates (P1.10). The server streams one JSON event per change; a job
+ * event redraws that job's card, anything else (or anything unreadable)
+ * reloads the open list, at most once a second. The 5 s poll stays underneath,
+ * always. */
+const reloadAll = () => { refresh(); loadStatus(); };
+let reloadTimer = null;
+function reloadSoon() {
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(() => { reloadTimer = null; reloadAll(); }, 1000);
+}
+
+function onLiveMessage(message) {
+  let ev = null;
+  try { ev = JSON.parse(message.data); } catch { /* not JSON: reload */ }
+  if (!ev || ev.type !== 'job' || typeof ev.id !== 'number') { reloadSoon(); return; }
+  const entry = currentTab === 'queue' ? liveCards.get(ev.id) : null;
+  const knownStage = entry ? entry.job.stage : seenStage.get(ev.id);
+  if (typeof ev.stage === 'string' && ev.status === 'RUNNING') seenStage.set(ev.id, ev.stage);
+  else seenStage.delete(ev.id);
+  if (entry && entry.node.isConnected && applyJobEvent(entry.job, ev)) {
+    const node = activeCard(entry.job);
+    entry.node.replaceWith(node);
+    entry.node = node;
+    return;
+  }
+  // A progress tick for a card that is not on screen: the 5 s poll covers it.
+  if (ev.status === 'RUNNING' && typeof ev.stage === 'string' && ev.stage === knownStage) return;
+  reloadSoon();
+}
+
+// The stage each running job was last seen in, to tell a progress tick from a stage change.
+const seenStage = new Map();
+
+let liveSource = null;
+try {
+  liveSource = new EventSource('/api/events');
+  liveSource.onmessage = onLiveMessage;
+} catch { /* polling alone */ }
+// Events are an accelerator; the poll stays the source of truth (new, requeued
+// and reaped jobs and health changes send none), so it never depends on the stream.
+setInterval(reloadAll, 5000);
+reloadAll();
