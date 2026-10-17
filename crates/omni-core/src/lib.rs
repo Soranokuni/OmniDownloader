@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod busy;
 pub mod config;
 pub mod events;

@@ -766,6 +766,29 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // The end-to-end benchmark (P6.4): admin only.
+    ("GET", "/api/admin/benchmarks", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/benchmarks/run", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // ReachedNoFile: the handler answers 404 for a run that does not exist.
+    ("GET", "/api/admin/benchmarks/runs/1", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, ReachedNoFile),
+        ]),
     // The admin's Test URL (P10.15b): a dry run, admin only.
     ("GET", "/api/admin/test-url", &[
             (Anonymous, Denied),

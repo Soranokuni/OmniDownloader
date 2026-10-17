@@ -328,7 +328,7 @@ impl Downloader {
         }
         let args = Self::build_args(url, output_dir, &opts);
 
-        info!("Job #{job_id}: downloading {url}");
+        info!("Job #{job_id}: downloading {}", omni_core::cookies::host_and_path(url));
 
         // yt-dlp prints the final path on stdout as well as progress lines, so
         // both are collected from the same stream.
