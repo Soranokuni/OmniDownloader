@@ -411,6 +411,17 @@ fn stage_timings_for(
     Ok(Some(serde_json::Value::Object(map).to_string()))
 }
 
+/// What [`Repository::cancel_own_pending`] did. A job that is not the
+/// caller's is `NotFound`, the same as one that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnCancelOutcome {
+    Cancelled,
+    /// No such job, or it belongs to someone else.
+    NotFound,
+    /// The caller's own job, but no longer waiting.
+    NotCancellable,
+}
+
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
@@ -2075,6 +2086,57 @@ impl Repository {
             Some((status, stage)) if status == "RUNNING" && matches!(stage.as_str(), "DELIVER" | "ARCHIVE" | "DONE") => CancelOutcome::TooLate,
             _ => CancelOutcome::NotCancellable,
         })
+    }
+
+    /// A journalist cancels one of their own videos while it still waits
+    /// (P7.3). One guarded UPDATE: ownership and PENDING are checked in the
+    /// same statement that changes the row, so nothing can slip in between.
+    pub fn cancel_own_pending(&self, id: i64, user_id: i64) -> Result<OwnCancelOutcome> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            r#"
+            UPDATE queue
+            SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                completed_at = ?, updated_at = ?
+            WHERE id = ? AND submitted_by_user_id = ? AND status = 'PENDING'
+            "#,
+            params![now, now, id, user_id],
+        )?;
+        if n > 0 {
+            return Ok(OwnCancelOutcome::Cancelled);
+        }
+        let owned: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM queue WHERE id = ? AND submitted_by_user_id = ?",
+                params![id, user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(if owned.is_some() { OwnCancelOutcome::NotCancellable } else { OwnCancelOutcome::NotFound })
+    }
+
+    /// The account's "notify me on completion" choice; `None` for no such user.
+    pub fn get_notify_on_completion(&self, user_id: i64) -> Result<Option<bool>> {
+        let conn = self.pool.get()?;
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT notify_on_completion FROM users WHERE id = ?",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.map(|n| n != 0))
+    }
+
+    /// Store the choice for this account only; `false` when there is no such user.
+    pub fn set_notify_on_completion(&self, user_id: i64, on: bool) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE users SET notify_on_completion = ? WHERE id = ?",
+            params![on as i64, user_id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn delete_job(&self, id: i64) -> Result<()> {
@@ -6390,4 +6452,101 @@ fn replace_memberships(conn: &rusqlite::Connection, surname: &str, codes: &[Stri
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod own_job_tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn job_for(repo: &Repository, user: i64, tag: &str) -> Result<i64> {
+        repo.add_job(
+            &format!("https://example.test/video/{tag}"),
+            &format!("1_TESTER_{tag}"),
+            "TESTER",
+            tag,
+            "1",
+            0,
+            JobStatus::Pending,
+            Some(user),
+            None,
+            None,
+        )
+    }
+
+    fn status_of(repo: &Repository, id: i64) -> String {
+        let conn = repo.pool.get().unwrap();
+        conn.query_row("SELECT status FROM queue WHERE id = ?", params![id], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn cancel_own_pending_refuses_another_users_job_and_leaves_it_pending() -> Result<()> {
+        let db = NamedTempFile::new()?;
+        let repo = Repository::new(db.path())?;
+        let a = repo.create_user("a@example.test", "pw", UserRole::User, "A Tester", Some("TESTERA"))?;
+        let b = repo.create_user("b@example.test", "pw", UserRole::User, "B Tester", Some("TESTERB"))?;
+        let job = job_for(&repo, a, "ONE")?;
+
+        assert_eq!(repo.cancel_own_pending(job, b)?, OwnCancelOutcome::NotFound);
+        assert_eq!(status_of(&repo, job), "PENDING");
+        assert_eq!(repo.cancel_own_pending(9999, a)?, OwnCancelOutcome::NotFound);
+        assert_eq!(repo.cancel_own_pending(job, a)?, OwnCancelOutcome::Cancelled);
+        assert_eq!(status_of(&repo, job), "CANCELLED");
+        // Already cancelled: own job, no longer waiting.
+        assert_eq!(repo.cancel_own_pending(job, a)?, OwnCancelOutcome::NotCancellable);
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_own_pending_refuses_running_and_completed() -> Result<()> {
+        let db = NamedTempFile::new()?;
+        let repo = Repository::new(db.path())?;
+        let a = repo.create_user("a@example.test", "pw", UserRole::User, "A Tester", Some("TESTERA"))?;
+        for (tag, status) in [("RUN", "RUNNING"), ("DONE", "COMPLETED")] {
+            let job = job_for(&repo, a, tag)?;
+            repo.pool.get()?.execute("UPDATE queue SET status = ? WHERE id = ?", params![status, job])?;
+            assert_eq!(repo.cancel_own_pending(job, a)?, OwnCancelOutcome::NotCancellable);
+            assert_eq!(status_of(&repo, job), status);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn notify_preference_is_per_user_and_defaults_off() -> Result<()> {
+        let db = NamedTempFile::new()?;
+        let repo = Repository::new(db.path())?;
+        let a = repo.create_user("a@example.test", "pw", UserRole::User, "A Tester", None)?;
+        let b = repo.create_user("b@example.test", "pw", UserRole::User, "B Tester", None)?;
+        assert_eq!(repo.get_notify_on_completion(a)?, Some(false));
+        assert!(repo.set_notify_on_completion(a, true)?);
+        assert_eq!(repo.get_notify_on_completion(a)?, Some(true));
+        assert_eq!(repo.get_notify_on_completion(b)?, Some(false));
+        assert_eq!(repo.get_notify_on_completion(424242)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn notify_column_is_added_with_default_zero_to_existing_users() -> Result<()> {
+        // A database that stopped just before the notify migration, with a user already in it.
+        let mut conn = rusqlite::Connection::open_in_memory()?;
+        migrations::current_version(&conn)?;
+        let notify_v = migrations::MIGRATIONS.iter().find(|(_, sql)| sql.contains("notify_on_completion")).map(|(v, _)| *v).expect("the notify migration exists");
+        for (v, sql) in migrations::MIGRATIONS.iter().filter(|(v, _)| *v < notify_v) {
+            conn.execute_batch(sql)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, 'x')",
+                params![v],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO users (email, password_hash, role, full_name, is_active) VALUES ('old@example.test','h','user','Old',1)",
+            [],
+        )?;
+        migrations::apply(&mut conn, None)?;
+        let n: i64 = conn.query_row(
+            "SELECT notify_on_completion FROM users WHERE email='old@example.test'", [], |r| r.get(0))?;
+        assert_eq!(n, 0);
+        assert_eq!(migrations::current_version(&conn)?, migrations::target_version());
+        Ok(())
+    }
 }

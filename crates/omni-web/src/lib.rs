@@ -8,6 +8,7 @@ pub mod repair_card;
 pub mod routes;
 pub mod server;
 pub mod state;
+pub mod user_jobs;
 
 pub use server::WebServer;
 pub use state::AppState;
