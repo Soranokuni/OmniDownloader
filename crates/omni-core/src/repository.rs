@@ -1586,6 +1586,11 @@ impl Repository {
 
         let (mut requeued, mut review) = (0usize, 0usize);
         for (id, attempts, max_attempts) in expired {
+            // Already in the watchfolder: finishing it is the only safe
+            // recovery, a requeue would put a second copy on air.
+            if Self::recover_if_delivered(&tx, id, &now)? {
+                continue;
+            }
             if attempts < max_attempts {
                 tx.execute(
                     "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
@@ -1632,7 +1637,7 @@ impl Repository {
     /// Only this host's jobs are touched, so two daemons sharing a database
     /// never steal each other's work.
     pub fn recover_on_startup(&self, hostname: &str) -> Result<usize> {
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
         let now = timestamps::now_string();
         let prefix = format!("{hostname}:%");
 
@@ -1643,26 +1648,63 @@ impl Repository {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
+        let mut requeued = 0usize;
         for id in &ids {
-            conn.execute(
+            // Each job's change and its event land together or not at all.
+            let tx = conn.transaction()?;
+            if Self::recover_if_delivered(&tx, *id, &now)? {
+                tx.commit()?;
+                continue;
+            }
+            requeued += 1;
+            tx.execute(
                 "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
                  lease_expires_at=NULL, progress=0.0, speed='0 Mbps', eta='--:--', updated_at=?
                  WHERE id=?",
                 params![now, id],
             )?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
                 params![id, now, "Recovered after daemon restart; requeued"],
             )?;
+            tx.commit()?;
         }
         if !ids.is_empty() {
             self.log_audit(
                 "WARN",
                 "QUEUE",
-                &format!("Recovered {} orphaned job(s) after restart", ids.len()),
+                &format!("Recovered {} orphaned job(s) after restart ({requeued} requeued)", ids.len()),
             )?;
         }
-        Ok(ids.len())
+        Ok(requeued)
+    }
+
+    /// A RUNNING job whose video is provably in the watchfolder is finished as
+    /// COMPLETED instead of requeued (plan P1.7): a requeue would deliver it a
+    /// second time as `_1`. Provable means stage ARCHIVE alone: a lease always
+    /// resets the stage to EXTRACT, and the engine enters ARCHIVE only after the
+    /// watchfolder rename and the recorded file, so ARCHIVE can only mean this
+    /// run delivered. A DELIVER row is not recovered even with a `file_path`
+    /// (it may be stale from an earlier attempt, and losing a video is worse
+    /// than a duplicate); it requeues as ever. A job whose held output is
+    /// approved keeps its own idempotent re-delivery. `delivered_at` is left
+    /// as it is: the moment of delivery is not known. The update and its event
+    /// are one transaction when `conn` is one.
+    fn recover_if_delivered(conn: &rusqlite::Connection, id: i64, now: &str) -> Result<bool> {
+        let changed = conn.execute(
+            "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
+             lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL, updated_at=?
+             WHERE id=? AND status='RUNNING' AND stage = 'ARCHIVE'
+               AND NOT EXISTS (SELECT 1 FROM held_outputs h WHERE h.job_id = queue.id AND h.decision = 'approved')",
+            params![now, now, id],
+        )?;
+        if changed == 1 {
+            conn.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
+                params![id, now, "RECOVERED_AFTER_DELIVERY: the video was already in the watchfolder; finished, not requeued"],
+            )?;
+        }
+        Ok(changed == 1)
     }
 
     pub fn update_job_status(&self, id: i64, status: JobStatus, error_message: Option<&str>, file_path: Option<&str>, duration: Option<f64>) -> Result<()> {
