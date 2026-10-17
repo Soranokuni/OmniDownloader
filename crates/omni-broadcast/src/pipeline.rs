@@ -89,6 +89,20 @@ impl Drop for LoginSiteGuard {
     }
 }
 
+/// Hands back a job's download slot when dropped, panic unwinding included
+/// (see [`BroadcastEngine::download_slot_guard`]).
+pub struct DownloadSlotGuard {
+    slots: Arc<Mutex<HashMap<(i64, String), OwnedSemaphorePermit>>>,
+    job_id: i64,
+    owner: String,
+}
+
+impl Drop for DownloadSlotGuard {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap_or_else(|p| p.into_inner()).remove(&(self.job_id, self.owner.clone()));
+    }
+}
+
 #[derive(Clone)]
 pub struct BroadcastEngine {
     repo: Repository,
@@ -103,8 +117,10 @@ pub struct BroadcastEngine {
     /// downloading hands back its download slot and waits here, and the
     /// next download starts instead of sitting behind someone's encode.
     encoder_slots: Arc<Semaphore>,
-    /// The download slot each job holds until it reaches the encoder.
-    download_slots: Arc<Mutex<HashMap<i64, OwnedSemaphorePermit>>>,
+    /// The download slot each job holds until it reaches the encoder, keyed by
+    /// job and lease owner: a worker whose lease was reaped must not hand
+    /// back the slot of the worker that leased the job again.
+    download_slots: Arc<Mutex<HashMap<(i64, String), OwnedSemaphorePermit>>>,
     /// The address of a video the page of job N embeds on another site, so the
     /// job's yt-dlp runs also carry that site's cookie jar (P3.5). The job's own
     /// address, and every other argument of its download, are unchanged.
@@ -123,8 +139,8 @@ impl BroadcastEngine {
     /// Give the engine the download slot job `job_id` was leased under; it
     /// is released when the job starts waiting for an encoder, or by
     /// [`Self::release_download_slot`] when the job ends before that.
-    pub fn hold_download_slot(&self, job_id: i64, permit: OwnedSemaphorePermit) {
-        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, permit);
+    pub fn hold_download_slot(&self, job_id: i64, owner: &str, permit: OwnedSemaphorePermit) {
+        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).insert((job_id, owner.to_string()), permit);
     }
 
     /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
@@ -133,14 +149,19 @@ impl BroadcastEngine {
         LoginSiteGuard { sites: self.login_sites.clone(), job_id }
     }
 
+    /// Hands back the slot of (`job_id`, `owner`) when dropped, even if the worker panics.
+    pub fn download_slot_guard(&self, job_id: i64, owner: &str) -> DownloadSlotGuard {
+        DownloadSlotGuard { slots: self.download_slots.clone(), job_id, owner: owner.to_string() }
+    }
+
     /// Hand back job `job_id`'s download slot, if it still holds one.
-    pub fn release_download_slot(&self, job_id: i64) {
-        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).remove(&job_id);
+    pub fn release_download_slot(&self, job_id: i64, owner: &str) {
+        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).remove(&(job_id, owner.to_string()));
     }
 
     /// Whether job `job_id` still holds its download slot.
-    pub fn holds_download_slot(&self, job_id: i64) -> bool {
-        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&job_id)
+    pub fn holds_download_slot(&self, job_id: i64, owner: &str) -> bool {
+        self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&(job_id, owner.to_string()))
     }
 
     /// The encoder held-video previews use; asked of ffmpeg once, then kept.
@@ -420,14 +441,14 @@ impl BroadcastEngine {
         // 2. Transcode stage (Sony XDCAM HD422 PAL 1080i50)
         if let Err(e) = self.enter_stage(job_id, owner, JobStage::Transcode, &job_temp).await {
             // Not ours any more: the next download must not wait on this slot.
-            self.release_download_slot(job_id);
+            self.release_download_slot(job_id, owner);
             return Err(e);
         }
 
         // The source is on disk: let the next download start, then wait for
         // an encoder (plan P1.13). Held until the encode ends; rewrap and
         // delivery are disk-bound and do not need it.
-        self.release_download_slot(job_id);
+        self.release_download_slot(job_id, owner);
         let encoder = match self.encoder_slots.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -813,7 +834,7 @@ impl BroadcastEngine {
         let job_id = job.id;
         let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
         // A deliver-only job has no use for the slot it was leased under.
-        self.release_download_slot(job_id);
+        self.release_download_slot(job_id, owner);
 
         // Delivered by an earlier run of this approval, then the worker died.
         if let (Some(done), Some(at)) = (held.delivered_path.as_deref(), job.file_path.as_deref()) {

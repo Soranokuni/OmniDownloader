@@ -1670,9 +1670,11 @@ async fn run_daemon(
                 let _busy = busy_guard;
                 let job_id = job.id;
                 let (job_slot, download_slot) = permit;
-                if let Some(download_slot) = download_slot {
-                    eng.hold_download_slot(job_id, download_slot);
-                }
+                // Handed back on every exit, a panic in run_job included.
+                let _slot_guard = download_slot.map(|slot| {
+                    eng.hold_download_slot(job_id, &owner, slot);
+                    eng.download_slot_guard(job_id, &owner)
+                });
 
                 // Keep the lease alive while we work. If it stops succeeding we
                 // have lost the job -- the reaper requeued it, or an operator
@@ -1723,8 +1725,6 @@ async fn run_daemon(
                     );
                 }
 
-                // A job that ended before reaching the encoder still holds it.
-                eng.release_download_slot(job_id);
                 drop(job_slot);
             });
         }

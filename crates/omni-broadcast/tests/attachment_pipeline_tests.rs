@@ -98,7 +98,7 @@ async fn a_downloaded_job_frees_its_download_slot_and_queues_for_the_encoder() {
         queue_attachment_as(&r, Some(&source), &format!("attachment://m1@example.gr/{n}"), slug);
         let owner = format!("test:1:{n}");
         let job = r.repo.lease_job(&owner, 180).unwrap().expect("released job is leasable");
-        r.engine.hold_download_slot(job.id, downloads.clone().acquire_owned().await.unwrap());
+        r.engine.hold_download_slot(job.id, &owner, downloads.clone().acquire_owned().await.unwrap());
         leased.push((job, owner));
     }
     // Both sources are on disk before either starts, so they reach the
@@ -119,7 +119,7 @@ async fn a_downloaded_job_frees_its_download_slot_and_queues_for_the_encoder() {
     }
 
     assert_eq!(downloads.available_permits(), 2, "a finished job kept its download slot");
-    assert!(ids.iter().all(|id| !r.engine.holds_download_slot(*id)));
+    assert!(ids.iter().enumerate().all(|(i, id)| !r.engine.holds_download_slot(*id, &format!("test:1:{}", i + 1))));
     let waited = ids
         .iter()
         .filter(|id| {
