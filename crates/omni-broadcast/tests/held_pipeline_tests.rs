@@ -304,7 +304,7 @@ async fn a_deliver_only_job_hands_back_its_download_slot_and_needs_no_encoder() 
     let (job, held) = approved(&r).await;
     // The worker leased it under a download slot; nothing is downloaded.
     let downloads = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    r.engine.hold_download_slot(job.id, downloads.clone().acquire_owned().await.unwrap());
+    r.engine.hold_download_slot(job.id, "w2", downloads.clone().acquire_owned().await.unwrap());
     // Every encoder slot is taken: delivery must not wait for one.
     let engine = r.engine.clone().with_encoder_slots(1);
     let _only_encoder = engine.encoder_slots().try_acquire_owned().expect("the one encoder slot");
@@ -315,7 +315,7 @@ async fn a_deliver_only_job_hands_back_its_download_slot_and_needs_no_encoder() 
         .expect("delivery waited")
         .expect("delivers");
 
-    assert!(!engine.holds_download_slot(job.id), "the download slot was kept");
+    assert!(!engine.holds_download_slot(job.id, "w2"), "the download slot was kept");
     assert_eq!(downloads.available_permits(), 1);
     assert_eq!(watchfolder_files(&r).len(), 1);
 }
