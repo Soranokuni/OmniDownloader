@@ -707,6 +707,52 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE users ADD COLUMN notify_on_completion INTEGER NOT NULL DEFAULT 0;
         "#,
     ),
+    (
+        28,
+        // The end-to-end benchmark (P6.4): the stored 65-link corpus, one row per run and one
+        // per target of a run. A result keeps the host of the stream it found, never the address.
+        r#"
+        CREATE TABLE IF NOT EXISTS benchmark_targets (
+            id       INTEGER PRIMARY KEY,
+            idx      INTEGER NOT NULL UNIQUE,
+            url      TEXT NOT NULL,
+            domain   TEXT NOT NULL,
+            category TEXT NOT NULL,
+            friction TEXT NOT NULL,
+            expected TEXT NOT NULL CHECK (expected IN ('pass','expected_fail')),
+            note     TEXT
+        );
+        CREATE TABLE IF NOT EXISTS benchmark_runs (
+            id           INTEGER PRIMARY KEY,
+            started_at   TEXT NOT NULL,
+            finished_at  TEXT,
+            heartbeat_at TEXT NOT NULL,
+            owner        TEXT NOT NULL CHECK (owner IN ('daemon','cli')),
+            paused       INTEGER NOT NULL DEFAULT 0,
+            mode         TEXT NOT NULL CHECK (mode IN ('extract','full')),
+            state        TEXT NOT NULL CHECK (state IN ('running','done','failed','abandoned')),
+            params_json  TEXT NOT NULL,
+            summary_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_benchmark_runs_state ON benchmark_runs(state, mode);
+        CREATE TABLE IF NOT EXISTS benchmark_results (
+            run_id        INTEGER NOT NULL REFERENCES benchmark_runs(id) ON DELETE CASCADE,
+            target_id     INTEGER NOT NULL REFERENCES benchmark_targets(id),
+            extract_ok    INTEGER,
+            extract_ms    INTEGER,
+            method        TEXT,
+            candidates    INTEGER,
+            download_ok   INTEGER,
+            download_ms   INTEGER,
+            transcode_ms  INTEGER,
+            verify_ok     INTEGER,
+            total_ms      INTEGER,
+            error_code    TEXT,
+            stream_host   TEXT,
+            PRIMARY KEY (run_id, target_id)
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

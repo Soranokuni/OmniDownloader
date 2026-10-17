@@ -5529,6 +5529,249 @@ mod recipe_sql {
     }
 }
 
+// ---------------------------------------------------------------- benchmark (P6.4)
+
+/// What asking to start a benchmark run got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchStart {
+    /// The run was created, `running`.
+    Started(i64),
+    /// This run is still going; only one at a time.
+    Busy(i64),
+}
+
+fn bench_target(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::benchmark::TargetRow> {
+    let expected: String = r.get(6)?;
+    Ok(crate::benchmark::TargetRow {
+        id: r.get(0)?,
+        idx: r.get(1)?,
+        url: r.get(2)?,
+        domain: r.get(3)?,
+        category: r.get(4)?,
+        friction: r.get(5)?,
+        expected: crate::benchmark::Expected::parse(&expected).unwrap_or(crate::benchmark::Expected::Pass),
+        note: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+    })
+}
+
+fn bench_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::benchmark::RunRow> {
+    let mode: String = r.get(5)?;
+    Ok(crate::benchmark::RunRow {
+        id: r.get(0)?,
+        started_at: timestamps::parse_opt(r.get(1)?),
+        finished_at: timestamps::parse_opt(r.get(2)?),
+        heartbeat_at: timestamps::parse_opt(r.get(3)?),
+        paused: r.get::<_, i64>(4)? != 0,
+        mode: crate::benchmark::Mode::parse(&mode).unwrap_or(crate::benchmark::Mode::Extract),
+        state: r.get(6)?,
+        params_json: r.get(7)?,
+        summary_json: r.get(8)?,
+        owner: r.get(9)?,
+    })
+}
+
+const BENCH_RUN_COLUMNS: &str = "id, started_at, finished_at, heartbeat_at, paused, mode, state, params_json, summary_json, owner";
+
+impl Repository {
+    /// Store the corpus: one row per link, replacing the text of a row that exists
+    /// (the number is the key), so running it again changes nothing.
+    pub fn seed_benchmark_targets(&self) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        for row in crate::benchmark::CORPUS {
+            tx.execute(
+                "INSERT INTO benchmark_targets (idx, url, domain, category, friction, expected, note)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(idx) DO UPDATE SET url = excluded.url, domain = excluded.domain,
+                   category = excluded.category, friction = excluded.friction,
+                   expected = excluded.expected, note = excluded.note",
+                params![row.idx, row.url, row.domain, row.category, row.friction, row.expected.as_str(), row.note],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn benchmark_targets(&self) -> Result<Vec<crate::benchmark::TargetRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, idx, url, domain, category, friction, expected, note FROM benchmark_targets ORDER BY idx",
+        )?;
+        let rows = stmt.query_map([], bench_target)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Open a run, unless one is going. A `running` run older than `stale_after` was
+    /// left by a process that died: it is marked `abandoned` first and does not block.
+    pub fn begin_benchmark_run(
+        &self,
+        mode: crate::benchmark::Mode,
+        params_json: &str,
+        now: chrono::DateTime<Utc>,
+        stale_after: Duration,
+        owner: &str,
+    ) -> Result<BenchStart> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE benchmark_runs SET state = 'abandoned', finished_at = ? WHERE state = 'running' AND heartbeat_at < ?",
+            params![timestamps::format(now), timestamps::format(now - stale_after)],
+        )?;
+        let running: Option<i64> = tx
+            .query_row("SELECT id FROM benchmark_runs WHERE state = 'running' ORDER BY id LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = running {
+            return Ok(BenchStart::Busy(id));
+        }
+        tx.execute(
+            "INSERT INTO benchmark_runs (started_at, heartbeat_at, mode, state, params_json, owner) VALUES (?, ?, ?, 'running', ?, ?)",
+            params![timestamps::format(now), timestamps::format(now), mode.as_str(), params_json, owner],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(BenchStart::Started(id))
+    }
+
+    /// The run is alive: written at start, after each target and while it waits.
+    /// A run whose heartbeat stops is abandoned after the stale limit.
+    pub fn benchmark_heartbeat(&self, run_id: i64, paused: bool, now: chrono::DateTime<Utc>) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE benchmark_runs SET heartbeat_at = ?, paused = ? WHERE id = ? AND state = 'running'",
+            params![timestamps::format(now), paused as i64, run_id],
+        )?;
+        Ok(())
+    }
+
+    /// At daemon start-up: every `running` run the daemon owned died with the previous
+    /// process, whatever its heartbeat says; a command-line run (another process, perhaps
+    /// alive) is abandoned only when its heartbeat is older than `cli_stale_after`.
+    /// The number of runs still running afterwards.
+    pub fn abandon_stale_benchmark_runs(&self, now: chrono::DateTime<Utc>, cli_stale_after: Duration) -> Result<usize> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE benchmark_runs SET state = 'abandoned', finished_at = ?
+             WHERE state = 'running' AND (owner = 'daemon' OR heartbeat_at < ?)",
+            params![timestamps::format(now), timestamps::format(now - cli_stale_after)],
+        )?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM benchmark_runs WHERE state = 'running'", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Benchmark runs that are `running` now.
+    pub fn benchmark_running_count(&self) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM benchmark_runs WHERE state = 'running'", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// One target's outcome; a second write for the same target replaces the first.
+    pub fn record_benchmark_result(&self, r: &crate::benchmark::ResultRow) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO benchmark_results
+               (run_id, target_id, extract_ok, extract_ms, method, candidates, download_ok, download_ms,
+                transcode_ms, verify_ok, total_ms, error_code, stream_host)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                r.run_id,
+                r.target_id,
+                r.extract_ok,
+                r.extract_ms,
+                r.method,
+                r.candidates,
+                r.download_ok,
+                r.download_ms,
+                r.transcode_ms,
+                r.verify_ok,
+                r.total_ms,
+                r.error_code,
+                r.stream_host
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// End a run that is still `running`: `done` or `failed`, with its summary.
+    /// A run already marked `abandoned` stays so.
+    pub fn finish_benchmark_run(
+        &self,
+        run_id: i64,
+        state: &str,
+        summary_json: Option<&str>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE benchmark_runs SET state = ?, finished_at = ?, summary_json = ? WHERE id = ? AND state = 'running'",
+            params![state, timestamps::format(now), summary_json, run_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The runs, newest first.
+    pub fn benchmark_runs(&self, limit: usize) -> Result<Vec<crate::benchmark::RunRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(&format!("SELECT {BENCH_RUN_COLUMNS} FROM benchmark_runs ORDER BY id DESC LIMIT ?"))?;
+        let rows = stmt.query_map(params![limit as i64], bench_run)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn benchmark_run(&self, id: i64) -> Result<Option<crate::benchmark::RunRow>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(&format!("SELECT {BENCH_RUN_COLUMNS} FROM benchmark_runs WHERE id = ?"), params![id], bench_run)
+            .optional()?)
+    }
+
+    /// The latest finished (`done`) run of `mode` before run `before_id`: what a
+    /// report is compared with. A run of the other mode is never returned.
+    pub fn previous_benchmark_run(
+        &self,
+        mode: crate::benchmark::Mode,
+        before_id: i64,
+    ) -> Result<Option<crate::benchmark::RunRow>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {BENCH_RUN_COLUMNS} FROM benchmark_runs
+                     WHERE state = 'done' AND mode = ? AND id < ? ORDER BY id DESC LIMIT 1"
+                ),
+                params![mode.as_str(), before_id],
+                bench_run,
+            )
+            .optional()?)
+    }
+
+    pub fn benchmark_results(&self, run_id: i64) -> Result<Vec<crate::benchmark::ResultRow>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, target_id, extract_ok, extract_ms, method, candidates, download_ok, download_ms,
+                    transcode_ms, verify_ok, total_ms, error_code, stream_host
+             FROM benchmark_results WHERE run_id = ? ORDER BY target_id",
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok(crate::benchmark::ResultRow {
+                run_id: r.get(0)?,
+                target_id: r.get(1)?,
+                extract_ok: r.get(2)?,
+                extract_ms: r.get(3)?,
+                method: r.get(4)?,
+                candidates: r.get(5)?,
+                download_ok: r.get(6)?,
+                download_ms: r.get(7)?,
+                transcode_ms: r.get(8)?,
+                verify_ok: r.get(9)?,
+                total_ms: r.get(10)?,
+                error_code: r.get(11)?,
+                stream_host: r.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
 // ---------------------------------------------------------------- cookie jars (P3.5)
 
 impl Repository {

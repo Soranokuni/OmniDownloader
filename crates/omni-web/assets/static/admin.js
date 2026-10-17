@@ -5,7 +5,7 @@
  * to `innerHTML`; here they are text nodes.
  */
 
-import { api, el, render, toast, fmtTime, logout } from '/static/app.js?v=6';
+import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=6';
 
 /* ------------------------------------------------------------------ *
  * Dependencies
@@ -1481,6 +1481,181 @@ fileInput.addEventListener('change', async () => {
   } catch (e) { showTaxonomy(e.message, false); }
 });
 
+/* ------------------------------------------------------------------ *
+ * Benchmarks (plan P6.4): the stored 65-link corpus, run on demand
+ * ------------------------------------------------------------------ */
+
+// The run whose report is open; the newest one until the admin picks another.
+let benchSelected = null;
+let benchBusy = false;
+const benchResult = document.getElementById('bench-result');
+
+function showBench(message, ok) {
+  benchResult.textContent = message;
+  benchResult.className = ok ? 'note ok' : 'note bad';
+}
+
+const benchSecs = (ms) => (ms === null || ms === undefined ? '' : (ms / 1000).toFixed(1));
+const benchPct = (v) => (v === null || v === undefined ? '' : `${v.toFixed(1)} %`);
+const benchYes = (v) => (v === null || v === undefined ? '' : v ? 'yes' : 'NO');
+
+function benchVerdict(pass) {
+  if (pass === true) return el('span', { class: 'badge ok' }, 'PASS');
+  if (pass === false) return el('span', { class: 'badge bad' }, 'FAIL');
+  return el('span', { class: 'badge' }, 'n/a');
+}
+
+function benchList(indices) {
+  return indices && indices.length ? indices.map((i) => `#${i}`).join(', ') : 'none';
+}
+
+function benchTable(head, rows) {
+  return el('div', { class: 'card flush' },
+    el('table', {},
+      el('thead', {}, el('tr', {}, head.map((h) => el('th', {}, h)))),
+      el('tbody', {}, rows.map((cells) => el('tr', {}, cells.map((c) => el('td', {}, c)))))));
+}
+
+function renderBenchReport(report) {
+  const { run, summary, deltas, targets } = report;
+  const parts = [
+    el('h3', { class: 'card-title', style: 'font-size:0.95rem' },
+      `Run ${run.id} (${run.mode === 'full' ? 'full' : 'extraction only'}) `, benchVerdict(summary.pass)),
+    el('p', { class: 'note' },
+      `${run.state}. Started ${fmtTime(run.started_at)}, finished ${fmtTime(run.finished_at)}. ` +
+      `${summary.targets_run} targets run, ${summary.counted} counted (the rest are expected to fail).`),
+    benchTable(['Threshold', 'Limit', 'Measured', 'Result'], summary.checks.map((c) => [
+      c.name,
+      `${c.op} ${c.limit}${c.unit ? ` ${c.unit}` : ''}`,
+      c.value === null || c.value === undefined ? '' : `${c.value.toFixed(1)}${c.unit ? ` ${c.unit}` : ''}`,
+      benchVerdict(c.pass),
+    ])),
+  ];
+  const signed = (v, unit) => (v === null || v === undefined ? 'n/a' : `${v > 0 ? '+' : ''}${v.toFixed(1)}${unit}`);
+  if (deltas) {
+    parts.push(el('p', { class: 'note' },
+      `Against run ${deltas.previous_run_id} (the last finished ${run.mode} run): ` +
+      `extraction ${signed(deltas.extract_pct, ' points')}, delivery ${signed(deltas.delivery_pct, ' points')}, ` +
+      `mean extraction ${signed(deltas.mean_extract_ms === null ? null : deltas.mean_extract_ms / 1000, ' s')}, ` +
+      `compliance failures ${deltas.compliance_fails === null ? 'n/a' : (deltas.compliance_fails > 0 ? '+' : '') + deltas.compliance_fails}. ` +
+      `Newly failing: ${benchList(deltas.regressions)}. Newly working: ${benchList(deltas.fixes)}.`));
+  } else {
+    parts.push(el('p', { class: 'note' }, `No earlier finished ${run.mode} run to compare with.`));
+  }
+  const t = summary.timings;
+  parts.push(
+    el('h4', { class: 'note strong' }, 'Mean seconds per stage'),
+    benchTable(['Extract', 'Download', 'Transcode + rewrap', 'Per target'], [[
+      benchSecs(t.extract_mean_ms), benchSecs(t.download_mean_ms), benchSecs(t.transcode_mean_ms), benchSecs(t.total_mean_ms),
+    ]]),
+    el('h4', { class: 'note strong' }, 'By domain'),
+    benchTable(['Domain', 'Targets', 'Extracted', 'Delivery-equivalent', 'Mean extract (s)'], summary.by_domain.map((d) => [
+      d.domain, String(d.targets), String(d.extract_ok), String(d.delivery_ok), benchSecs(d.mean_extract_ms),
+    ])),
+    summary.skipped && summary.skipped.length
+      ? el('p', { class: 'note' }, `Skipped, the source is over ten minutes (not counted in the delivery rate): ${benchList(summary.skipped)}.`)
+      : null,
+    el('h4', { class: 'note strong' }, 'By target'),
+    benchTable(
+      ['#', 'Domain', 'Category', 'Expected', 'Extract', 's', 'Method', 'Streams', 'Download', 's', 'Transcode s', 'Verify', 'Total s', 'Error', 'Stream host'],
+      targets.map((l) => [
+        String(l.idx), l.domain, l.category, l.expected === 'expected_fail' ? 'expected fail' : 'pass',
+        benchYes(l.extract_ok), benchSecs(l.extract_ms), l.method || '', l.candidates === null || l.candidates === undefined ? '' : String(l.candidates),
+        benchYes(l.download_ok), benchSecs(l.download_ms), benchSecs(l.transcode_ms), benchYes(l.verify_ok), benchSecs(l.total_ms),
+        l.skipped ? 'SOURCE_TOO_LONG (skipped)' : (l.error_code || ''), l.stream_host || '',
+      ])),
+  );
+  render('bench-report', parts);
+}
+
+async function loadBenchReport(id) {
+  try {
+    renderBenchReport(await api(`/api/admin/benchmarks/runs/${id}`));
+    return true;
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') showBench(e.message, false);
+    return false;
+  }
+}
+
+async function loadBenchmarks() {
+  if (benchBusy) return;
+  benchBusy = true;
+  try {
+    let data;
+    try {
+      data = await api('/api/admin/benchmarks');
+    } catch (e) {
+      if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+      return;
+    }
+    document.getElementById('bench-start').disabled = !data.can_start;
+    document.getElementById('bench-parallel').max = String(data.max_parallel);
+    const runs = data.runs || [];
+    if (runs.length === 0) {
+      render('bench-runs', el('tr', {}, el('td', { colspan: '9', class: 'empty' }, 'No run yet.')));
+      render('bench-report', []);
+      render('bench-progress', []);
+      return;
+    }
+    render('bench-runs', runs.map((r) => {
+      const open = el('button', { class: 'btn', type: 'button' }, 'Report');
+      open.addEventListener('click', () => { benchSelected = r.id; loadBenchmarks(); });
+      return el('tr', {},
+        el('td', { class: 'strong' }, String(r.id)),
+        el('td', {}, r.mode === 'full' ? 'full' : 'extraction'),
+        el('td', {}, el('span', { class: r.state === 'done' ? 'badge ok' : r.state === 'running' ? 'badge' : 'badge bad' }, r.state === 'running' && r.paused ? 'paused for on-air jobs' : r.state)),
+        el('td', {}, fmtTime(r.started_at)),
+        el('td', { class: 'right' }, r.targets_run === null || r.targets_run === undefined ? '' : String(r.targets_run)),
+        el('td', { class: 'right' }, benchPct(r.extract_pct)),
+        el('td', { class: 'right' }, benchPct(r.delivery_pct)),
+        el('td', {}, r.state === 'done' ? benchVerdict(r.pass) : ''),
+        el('td', {}, open));
+    }));
+    // Progress of the run that is going: results are stored as each target finishes.
+    const going = runs.find((r) => r.state === 'running');
+    if (going) {
+      const of = going.params && going.params.targets ? going.params.targets.length : 0;
+      try {
+        const current = await api(`/api/admin/benchmarks/runs/${going.id}`);
+        render('bench-progress', el('span', {}, `Run ${going.id} is going: ${current.summary.targets_run} of ${of} targets done.${going.paused ? ' Paused for on-air jobs; it goes on when none is running.' : ''}`));
+      } catch { /* the next event tries again */ }
+    } else {
+      render('bench-progress', []);
+    }
+    if (benchSelected === null || !runs.some((r) => r.id === benchSelected)) benchSelected = runs[0].id;
+    await loadBenchReport(benchSelected);
+  } finally {
+    benchBusy = false;
+  }
+}
+
+document.getElementById('bench-refresh').addEventListener('click', loadBenchmarks);
+document.getElementById('bench-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = document.getElementById('bench-start');
+  button.disabled = true;
+  try {
+    const out = await api('/api/admin/benchmarks/run', {
+      method: 'POST',
+      body: {
+        mode: document.getElementById('bench-mode').value,
+        targets: document.getElementById('bench-targets').value.trim(),
+        parallel: Number(document.getElementById('bench-parallel').value) || 2,
+        force: document.getElementById('bench-force').checked,
+      },
+    });
+    benchSelected = out.run_id;
+    showBench(`Run ${out.run_id} started: ${out.targets} targets, ${out.parallel} at once.`, true);
+  } catch (e) {
+    // 409 carries the reason (a job is running, or a run is going).
+    showBench(e.message, false);
+  } finally {
+    button.disabled = false;
+  }
+  loadBenchmarks();
+});
+
 document.getElementById('logout-btn').addEventListener('click', logout);
 
 loadDependencies();
@@ -1491,6 +1666,8 @@ loadSites();
 loadRecipes();
 loadReport();
 loadCookies();
+// The card refetches on every event of the server (a target finished), and every 20 s regardless.
+live(loadBenchmarks, 20000);
 loadTestUrl();
 loadUsers();
 loadTaxonomy();

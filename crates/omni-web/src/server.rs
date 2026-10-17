@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::admin_bench;
 use crate::admin_cookies;
 use crate::admin_sites;
 use crate::assets::serve_static;
@@ -125,6 +126,9 @@ impl WebServer {
             .route("/api/admin/cookies", get(admin_cookies::api_admin_cookies).post(admin_cookies::api_admin_cookies_put))
             .route("/api/admin/cookies/:domain/delete", post(admin_cookies::api_admin_cookies_delete))
             .route("/api/admin/cookies/:domain/test", post(admin_cookies::api_admin_cookies_test))
+            .route("/api/admin/benchmarks", get(admin_bench::api_admin_benchmarks))
+            .route("/api/admin/benchmarks/run", post(admin_bench::api_admin_benchmark_run))
+            .route("/api/admin/benchmarks/runs/:id", get(admin_bench::api_admin_benchmark_report))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))

@@ -53,6 +53,34 @@ pub trait CookieTester: Send + Sync {
     fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> CookieTestFuture<'a>;
 }
 
+/// What the Benchmarks card's «Start» asks for (P6.4).
+pub struct BenchRequest {
+    pub mode: omni_core::benchmark::Mode,
+    /// Target numbers, already checked against the corpus.
+    pub targets: Vec<i64>,
+    pub parallel: u32,
+    /// Run although a job is running.
+    pub force: bool,
+    /// Called when a target is done and when the run ends; the card refetches.
+    pub notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Why a benchmark run did not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BenchStartError {
+    /// A job is running, or another run is; the reason is short and names no address.
+    Refused(String),
+    /// Anything else (the database); the reason is logged, not shown.
+    Failed,
+}
+
+/// Starts a benchmark run in the background and returns its id. The daemon
+/// implements it (it knows where the tools are); the web crate cannot see the
+/// runner. Never waits for the run.
+pub trait BenchmarkStarter: Send + Sync {
+    fn start(&self, request: BenchRequest) -> Result<i64, BenchStartError>;
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Repository,
@@ -99,6 +127,8 @@ pub struct AppState {
     pub url_tester: Option<Arc<dyn UrlTester>>,
     /// The cookie-jar tester behind the Cookies card (P3.5); `None` in tests that have none.
     pub cookie_tester: Option<Arc<dyn CookieTester>>,
+    /// The benchmark runner behind the Benchmarks card (P6.4); `None` in tests that have none.
+    pub benchmark_starter: Option<Arc<dyn BenchmarkStarter>>,
     /// The log redactor: an uploaded jar's values join it at once (P3.5).
     pub redactions: Option<omni_core::logging::Redactions>,
 }
@@ -135,6 +165,7 @@ impl AppState {
             site_runner: None,
             url_tester: None,
             cookie_tester: None,
+            benchmark_starter: None,
             redactions: None,
         }
     }
@@ -160,6 +191,12 @@ impl AppState {
     /// The cookie-jar tester for the Cookies card's «Test».
     pub fn with_cookie_tester(mut self, tester: Arc<dyn CookieTester>) -> Self {
         self.cookie_tester = Some(tester);
+        self
+    }
+
+    /// The benchmark runner for the Benchmarks card.
+    pub fn with_benchmark_starter(mut self, starter: Arc<dyn BenchmarkStarter>) -> Self {
+        self.benchmark_starter = Some(starter);
         self
     }
 

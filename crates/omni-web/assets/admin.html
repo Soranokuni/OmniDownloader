@@ -263,6 +263,47 @@
       <p id="cookies-result" class="note" style="white-space:pre-line"></p>
     </section>
 
+    <section class="card stack" id="benchmarks">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Benchmarks</h2>
+        <button class="btn" type="button" id="bench-refresh">Refresh</button>
+      </div>
+      <p class="note">
+        Runs the stored 65-link corpus through the same tools as a job and reports how many links
+        work, how long each step takes and how that differs from the last run of the same kind.
+        «Extraction only» looks for the video and downloads nothing. «Full» also downloads,
+        transcodes, rewraps and runs the compliance check, in a scratch folder: no job is
+        queued, nothing is delivered to the watchfolder or archived. A run is refused while a job
+        is running unless you tick the box, and only one run goes at a time.
+      </p>
+      <form id="bench-form" class="stack">
+        <div class="row tight">
+          <select id="bench-mode">
+            <option value="extract">Extraction only</option>
+            <option value="full">Full (download, transcode, verify)</option>
+          </select>
+          <input type="text" id="bench-targets" class="mono" value="1-65" placeholder="Targets: 1-65 or 1-5,9" autocomplete="off" aria-label="Targets">
+          <input type="number" id="bench-parallel" min="1" max="4" value="2" aria-label="Targets at once" title="Targets at once (1 to 4)">
+          <label class="row tight"><input type="checkbox" id="bench-force"> Run although a job is running</label>
+          <button class="btn btn-primary" type="submit" id="bench-start">Start</button>
+        </div>
+      </form>
+      <p id="bench-result" class="note"></p>
+      <p id="bench-progress" class="note"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Run</th><th>Mode</th><th>State</th><th>Started</th><th class="right">Targets</th>
+              <th class="right">Extraction</th><th class="right">Delivery</th><th>Thresholds</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="bench-runs"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div id="bench-report" class="stack"></div>
+    </section>
+
     <section class="card">
       <div class="section-head" style="margin-bottom:12px">
         <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
@@ -602,6 +643,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=19"></script>
+<script type="module" src="/static/admin.js?v=20"></script>
 </body>
 </html>

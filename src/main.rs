@@ -26,6 +26,7 @@ use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
+mod benchmark;
 mod canary;
 mod repair;
 mod selfcheck;
@@ -99,6 +100,11 @@ enum Commands {
     /// Check the browser and every self-check link now, and print the
     /// results (the same check that runs every morning; nothing is downloaded)
     Selfcheck,
+    /// Run the stored 65-link benchmark, list its runs, or print a report
+    Benchmark {
+        #[command(subcommand)]
+        action: benchmark::BenchAction,
+    },
     /// Test headless browser stream sniffing on a target URL
     BrowserTest {
         /// URL to navigate and extract video stream from
@@ -856,6 +862,12 @@ async fn main() -> Result<()> {
             }
             println!("{} of {} links work.", links.len() - failing, links.len());
         }
+        Some(Commands::Benchmark { action }) => {
+            // Exit code 2: the run finished but a threshold failed.
+            if !benchmark::cli(&paths, action).await? {
+                std::process::exit(2);
+            }
+        }
         Some(Commands::BrowserTest { url }) => {
             println!("Testing stream sniffer on URL: {}", url);
             match StreamSniffer::extract_media_bundle(&url, 25).await {
@@ -1157,6 +1169,17 @@ async fn run_daemon(
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
     info!("  yt-dlp:       {:?}", ytdl_path);
 
+    // The benchmark (P6.4) runs the same tools beside the workers, never through them.
+    let bench_tools = benchmark::Tools {
+        ytdl: ytdl_path.clone(),
+        ffmpeg: ffmpeg_path.clone(),
+        ffprobe: ffprobe_path.clone(),
+        bmxtranswrap: bmxtranswrap_path.clone(),
+    };
+    benchmark::startup_sweep(&repo, paths);
+    if let Err(e) = repo.seed_benchmark_targets() {
+        warn!("Benchmark corpus not stored: {e:#}");
+    }
     let repair_ffprobe = ffprobe_path.clone();
     let repair_ffmpeg = ffmpeg_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
@@ -1286,6 +1309,12 @@ async fn run_daemon(
             temp_path: temp_path.clone(),
         }))
         .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
+        .with_benchmark_starter(Arc::new(benchmark::Starter::new(Arc::new(benchmark::Benchmark::new(
+            repo.clone(),
+            paths.clone(),
+            Arc::new(benchmark::RealStages::new(repo.clone(), bench_tools, paths.benchmark_temp())),
+            "daemon",
+        ).with_gate(update_gate.clone())))))
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
         .with_llm(live_llm.clone())
@@ -1379,6 +1408,7 @@ async fn run_daemon(
         let ctx = MaintenanceContext {
             bin_dir: bin_dir.clone(),
             temp_path: temp_path.clone(),
+            paths: paths.clone(),
             ytdl_channel: config.ytdl_channel.clone(),
             ytdl_enabled: config.ytdl_auto_update_nightly,
             adblock_enabled: config.adblock_auto_update_nightly,
@@ -3108,6 +3138,7 @@ impl omni_web::state::CookieTester for CookieJarTester {
 struct MaintenanceContext {
     bin_dir: PathBuf,
     temp_path: PathBuf,
+    paths: AppPaths,
     ytdl_channel: String,
     ytdl_enabled: bool,
     adblock_enabled: bool,
@@ -3353,6 +3384,8 @@ async fn run_one_task(
                 info!("Retention: removed {removed} saved email attachment(s)");
             }
             sweep_evidence(repo, &ctx.temp_path.join("evidence"), ctx.evidence_days, ctx.evidence_max_bytes);
+            // A benchmark killed mid-run leaves cookie copies behind; nothing running, nothing kept.
+            benchmark::sweep_idle_scratch(repo, &ctx.paths);
             Ok(TaskOutcome::Ok)
         }
 
