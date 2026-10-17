@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — Systems Administration</title>
-<link rel="stylesheet" href="/static/app.css?v=8">
+<link rel="stylesheet" href="/static/app.css?v=11">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -80,6 +80,21 @@
   </div>
 
   <div class="stack" style="grid-column:span 2">
+    <section class="card stack" id="selfheal">
+      <h2 class="card-title" style="border:none;margin:0;padding:0">Self-heal</h2>
+      <p class="note">
+        When a news site's recent articles stop giving video, the system tries its known
+        ways of finding the video on those articles overnight (nothing is downloaded).
+        A way that works again is used for the next job, which still waits for MCR's
+        approval. The last 30 days:
+      </p>
+      <div class="card flush">
+        <table>
+          <thead><tr><th>Site</th><th>When</th><th>Result</th><th>Method</th><th class="right">Pages</th></tr></thead>
+          <tbody id="selfheal-body"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
     <section class="card stack" id="selfcheck">
       <div class="section-head">
         <h2 class="card-title" style="border:none;margin:0;padding:0">Self-check</h2>
@@ -111,6 +126,182 @@
         Use links that will stay online (an official account's video, not a breaking-news
         post that may be deleted). Keep at least one per kind of link the newsroom sends.
       </p>
+    </section>
+
+    <section class="card stack" id="sites">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Sites</h2>
+        <button class="btn" type="button" id="sites-refresh">Refresh</button>
+      </div>
+      <p class="note">
+        A site turns degraded when its jobs start failing and broken when its recent
+        articles (the canaries) confirm it. «Run now» checks one site's canaries in the
+        background and, if the site is broken and repair is on, looks for a new way to
+        find its video. Press Refresh to see the result.
+      </p>
+      <p id="sites-note" class="note"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr><th>Site</th><th>State</th><th>Recent success</th><th>Last success</th><th>Last code</th><th>Model paused until</th><th>Canaries ok</th><th class="right"></th></tr>
+          </thead>
+          <tbody id="sites-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="row"><button class="btn" type="button" id="sites-more" hidden>Show more</button></div>
+    </section>
+
+    <section class="card stack" id="recipes">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Recipes</h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="recipes-refresh">Refresh</button>
+          <button class="btn" type="button" id="recipes-export">Export recipes.json</button>
+        </div>
+      </div>
+      <p class="note">
+        A recipe is a short list of steps that finds the video on a page. The program ships
+        a few; the model writes others, and you can import more. A recipe suspended on a
+        site is not tried there until two canary checks in a row pass; a retired one never
+        comes back. An imported recipe is a candidate: the videos it finds still wait for
+        MCR's approval.
+      </p>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="recipes-retired" style="width:auto">
+        <span>Show retired recipes</span>
+      </label>
+      <div id="recipes-list" class="stack"></div>
+      <div class="row"><button class="btn" type="button" id="recipes-more" hidden>Show more</button></div>
+      <h3 class="card-title" style="font-size:0.95rem">Import recipes</h3>
+      <textarea id="recipes-import-text" rows="5" class="mono" placeholder='Paste the contents of a recipes.json file: {"recipes":[…]}'></textarea>
+      <div class="row tight">
+        <button class="btn" type="button" id="recipes-import-btn">Import</button>
+        <input type="file" id="recipes-import-file" accept="application/json,.json" hidden>
+        <button class="btn" type="button" id="recipes-import-pick">Choose a file…</button>
+      </div>
+      <p id="recipes-result" class="note" style="white-space:pre-line"></p>
+    </section>
+
+    <section class="card stack" id="repair-report">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Repair report (30 days)</h2>
+        <button class="btn" type="button" id="report-refresh">Refresh</button>
+      </div>
+      <p id="report-note" class="note"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Site</th><th class="right">Runs</th><th class="right">Next choices</th><th class="right">Found</th><th class="right">Held</th>
+              <th class="right">Approved</th><th class="right">Wrong video</th><th class="right">Rejected, other</th><th class="right">Expired</th>
+              <th class="right">Page stated a length</th><th class="right">Picture matched</th><th class="right">Model calls</th>
+              <th class="right">Median time</th><th class="right">Self-heal found</th>
+            </tr>
+          </thead>
+          <tbody id="report-body"><tr><td colspan="14" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card stack" id="test-url">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Test URL</h2>
+      </div>
+      <p class="note">
+        Paste an article address to see what the program would do with it, without downloading,
+        queuing or delivering anything: first what yt-dlp and the page sniffer say, and when
+        both fail, what the repair ladder would try, with every candidate and its checks. It
+        takes up to three minutes, and one test runs at a time.
+      </p>
+      <form id="test-url-form" class="row">
+        <input type="url" id="test-url-input" class="grow" placeholder="https://… an article page" required>
+        <button class="btn btn-primary" type="submit" id="test-url-run">Run</button>
+      </form>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="test-url-llm" style="width:auto">
+        <span id="test-url-llm-label">Use the model</span>
+      </label>
+      <p id="test-url-progress" class="note"></p>
+      <div id="test-url-result" class="stack"></div>
+    </section>
+
+    <section class="card stack" id="cookies">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Cookies</h2>
+        <button class="btn" type="button" id="cookies-refresh">Refresh</button>
+      </div>
+      <p class="note">
+        Some sites (X, Facebook, Instagram) show a video only to a logged-in account. Export
+        the station account's cookies as a Netscape <span class="mono">cookies.txt</span> from a
+        browser that is logged in, and upload them here, one file per site. They are encrypted
+        on this machine and are never shown again. Only the lines of that site are kept. Use
+        «Test» with a public link of the site to check that they still log in; it is repeated
+        every night, and the Cookies health line turns amber when they are about to expire
+        or stop working.
+      </p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Site</th><th class="right">Cookies</th><th>Earliest expiry</th><th>Uploaded</th>
+              <th>Last test</th><th>Test link</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="cookies-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <h3 class="card-title" style="font-size:0.95rem">Upload cookies</h3>
+      <form id="cookies-form" class="stack">
+        <div class="row tight">
+          <input type="text" id="cookies-domain" class="grow" placeholder="Site, for example x.com" autocomplete="off" required>
+          <input type="file" id="cookies-file" accept=".txt,text/plain" hidden>
+          <button class="btn" type="button" id="cookies-pick">Choose cookies.txt…</button>
+          <button class="btn btn-primary" type="submit" id="cookies-upload">Upload</button>
+        </div>
+        <p id="cookies-file-note" class="note"></p>
+      </form>
+      <p id="cookies-result" class="note" style="white-space:pre-line"></p>
+    </section>
+
+    <section class="card stack" id="benchmarks">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0">Benchmarks</h2>
+        <button class="btn" type="button" id="bench-refresh">Refresh</button>
+      </div>
+      <p class="note">
+        Runs the stored 65-link corpus through the same tools as a job and reports how many links
+        work, how long each step takes and how that differs from the last run of the same kind.
+        «Extraction only» looks for the video and downloads nothing. «Full» also downloads,
+        transcodes, rewraps and runs the compliance check, in a scratch folder: no job is
+        queued, nothing is delivered to the watchfolder or archived. A run is refused while a job
+        is running unless you tick the box, and only one run goes at a time.
+      </p>
+      <form id="bench-form" class="stack">
+        <div class="row tight">
+          <select id="bench-mode">
+            <option value="extract">Extraction only</option>
+            <option value="full">Full (download, transcode, verify)</option>
+          </select>
+          <input type="text" id="bench-targets" class="mono" value="1-65" placeholder="Targets: 1-65 or 1-5,9" autocomplete="off" aria-label="Targets">
+          <input type="number" id="bench-parallel" min="1" max="4" value="2" aria-label="Targets at once" title="Targets at once (1 to 4)">
+          <label class="row tight"><input type="checkbox" id="bench-force"> Run although a job is running</label>
+          <button class="btn btn-primary" type="submit" id="bench-start">Start</button>
+        </div>
+      </form>
+      <p id="bench-result" class="note"></p>
+      <p id="bench-progress" class="note"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th>Run</th><th>Mode</th><th>State</th><th>Started</th><th class="right">Targets</th>
+              <th class="right">Extraction</th><th class="right">Delivery</th><th>Thresholds</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="bench-runs"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div id="bench-report" class="stack"></div>
     </section>
 
     <section class="card">
@@ -452,6 +643,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=11"></script>
+<script type="module" src="/static/admin.js?v=20"></script>
 </body>
 </html>

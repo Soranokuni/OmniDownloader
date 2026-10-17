@@ -116,6 +116,33 @@ async fn system_status_follows_the_real_check_rather_than_a_literal() -> Result<
 }
 
 #[tokio::test]
+async fn system_status_lists_only_sites_that_are_not_healthy() -> Result<()> {
+    use omni_core::site_health::SiteOutcome;
+    let app = build()?;
+
+    let (_, body) = app.get("/api/system/status", true).await?;
+    assert_eq!(body["sites"], serde_json::json!([]));
+
+    for _ in 0..6 {
+        app.repo.record_site_outcome("news.example", SiteOutcome::Success)?;
+    }
+    app.repo.record_site_outcome("fine.example", SiteOutcome::Success)?;
+    for _ in 0..3 {
+        app.repo
+            .record_site_outcome("news.example", SiteOutcome::SiteFailure("NO_STREAM_FOUND".into()))?;
+    }
+    let (_, body) = app.get("/api/system/status", true).await?;
+    let sites = body["sites"].as_array().expect("sites array");
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0]["domain"], "news.example");
+    assert_eq!(sites[0]["state"], "degraded");
+    assert_eq!(sites[0]["consecutive_fail"], 3);
+    assert_eq!(sites[0]["last_code"], "NO_STREAM_FOUND");
+    assert!(sites[0]["state_since"].is_string());
+    Ok(())
+}
+
+#[tokio::test]
 async fn system_status_reports_the_queue_without_loading_the_archive() -> Result<()> {
     let app = build()?;
 
@@ -255,5 +282,26 @@ async fn the_detailed_status_is_not_public() -> Result<()> {
         .oneshot(Request::builder().uri("/api/health").body(Body::empty())?)
         .await?;
     assert_eq!(res.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn system_status_lists_the_last_24_hours_of_self_heal_with_hosts_only() -> Result<()> {
+    use chrono::{Duration, Utc};
+    let app = build()?;
+    let (_, body) = app.get("/api/system/status", true).await?;
+    assert_eq!(body["selfheal"], serde_json::json!([]));
+
+    let now = Utc::now();
+    app.repo.record_selfheal("old.example", "found", Some("aa"), Some("llm"), 2, None, now - Duration::hours(30))?;
+    app.repo.record_selfheal("news.example", "found", Some("0123abcd"), Some("admin"), 3, None, now - Duration::hours(2))?;
+    let (_, body) = app.get("/api/system/status", true).await?;
+    let rows = body["selfheal"].as_array().expect("selfheal array");
+    assert_eq!(rows.len(), 1, "{rows:?}: the 30-hour-old run is out");
+    assert_eq!(rows[0]["domain"], "news.example");
+    assert_eq!(rows[0]["outcome"], "found");
+    assert_eq!(rows[0]["origin"], "admin");
+    assert!(rows[0]["at"].is_string());
+    assert!(rows[0].get("recipe_hash").is_none(), "the desk gets no hash or page address: {rows:?}");
     Ok(())
 }

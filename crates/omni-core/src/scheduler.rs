@@ -177,6 +177,13 @@ pub fn default_tasks() -> Vec<TaskSpec> {
             jitter: Duration::ZERO,
         },
         TaskSpec {
+            name: "cookie_test",
+            description: "Test each cookie jar against its last sample link, so an expired login is seen before a journalist needs it",
+            // After the self-check (05:15) has used the same yt-dlp.
+            cadence: Cadence::DailyAt { hour: 5, minute: 30 },
+            jitter: Duration::ZERO,
+        },
+        TaskSpec {
             name: "vacuum",
             description: "Compact the database",
             cadence: Cadence::EveryNDaysAt {
@@ -271,6 +278,15 @@ mod tests {
         slots.sort();
         slots.dedup();
         assert_eq!(slots.len(), tasks.len(), "two tasks share a slot");
+    }
+
+    #[test]
+    fn the_cookie_test_has_its_own_slot() {
+        let tasks = default_tasks();
+        let t = tasks.iter().find(|t| t.name == "cookie_test").expect("cookie_test task");
+        let Cadence::DailyAt { hour, minute } = t.cadence else { panic!("daily") };
+        let others = tasks.iter().filter(|o| o.name != "cookie_test").filter(|o| matches!(o.cadence, Cadence::DailyAt { hour: h, minute: m } if (h, m) == (hour, minute)));
+        assert_eq!(others.count(), 0, "another task shares the cookie test slot");
     }
 
     #[test]

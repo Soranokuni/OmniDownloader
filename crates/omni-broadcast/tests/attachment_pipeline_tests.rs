@@ -36,7 +36,8 @@ fn rig(ffmpeg: PathBuf, ffprobe: PathBuf, bmx: PathBuf) -> Rig {
         bmx,
         root.join("temp"),
         root.join("watchfolder"),
-    );
+    )
+    .with_archive(Some(omni_core::archive::ArchiveSettings::new(root.join("archive"), 14)));
     Rig { _dir: dir, root, repo, engine }
 }
 
@@ -98,7 +99,7 @@ async fn a_downloaded_job_frees_its_download_slot_and_queues_for_the_encoder() {
         queue_attachment_as(&r, Some(&source), &format!("attachment://m1@example.gr/{n}"), slug);
         let owner = format!("test:1:{n}");
         let job = r.repo.lease_job(&owner, 180).unwrap().expect("released job is leasable");
-        r.engine.hold_download_slot(job.id, downloads.clone().acquire_owned().await.unwrap());
+        r.engine.hold_download_slot(job.id, &owner, downloads.clone().acquire_owned().await.unwrap());
         leased.push((job, owner));
     }
     // Both sources are on disk before either starts, so they reach the
@@ -119,7 +120,7 @@ async fn a_downloaded_job_frees_its_download_slot_and_queues_for_the_encoder() {
     }
 
     assert_eq!(downloads.available_permits(), 2, "a finished job kept its download slot");
-    assert!(ids.iter().all(|id| !r.engine.holds_download_slot(*id)));
+    assert!(ids.iter().enumerate().all(|(i, id)| !r.engine.holds_download_slot(*id, &format!("test:1:{}", i + 1))));
     let waited = ids
         .iter()
         .filter(|id| {
@@ -156,6 +157,11 @@ async fn an_attached_video_is_built_from_its_saved_file() {
     // The saved attachment survives the workspace cleanup: a re-run (or the
     // archive) still has its source.
     assert!(source.exists(), "the pipeline deleted the email attachment");
+    // Archived (copied, not moved), and the job's workspace is gone (P1.7).
+    assert!(!r.root.join("temp").join("jobs").join(id.to_string()).exists(), "the job workspace was left behind");
+    let day = omni_core::archive::day_dir(&r.root.join("archive"), chrono::Local::now().date_naive());
+    assert!(day.join(format!("{id}_1_DIMITRIOU_LIMANI.mp4")).is_file(), "no archived copy of the attachment");
+    assert!(day.join(format!("{id}_1_DIMITRIOU_LIMANI.json")).is_file(), "no sidecar");
 }
 
 #[tokio::test]

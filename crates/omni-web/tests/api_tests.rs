@@ -36,9 +36,14 @@ struct App {
 
 impl App {
     fn new() -> Result<Self> {
+        Self::with_repair_mode(omni_core::config::RepairMode::Hold)
+    }
+
+    fn with_repair_mode(mode: omni_core::config::RepairMode) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        config.repair.mode = mode;
 
         let mcr_id = repo.create_user(
             "desk@station.gr",
@@ -70,7 +75,8 @@ impl App {
         let admin_token = omni_core::auth::generate_session_token();
         repo.create_session(admin_id, &admin_token, 1)?;
 
-        let state = AppState::new(repo.clone(), config, dir.path().join("config.json"));
+        let state = AppState::new(repo.clone(), config, dir.path().join("config.json"))
+            .with_temp_dir(dir.path().join("temp"));
         let busy = state.busy_jobs.clone();
         let router = WebServer::build_router(state);
 
@@ -878,5 +884,613 @@ async fn mcr_can_hide_old_review_videos_and_show_them_again() -> Result<()> {
     let (_, page) = app.send("GET", "/api/jobs?view=review&hidden=1", &app.mcr_token, None).await?;
     assert_eq!(page["total"], 1, "{page}");
     assert!(page["jobs"][0]["cleared_at"].is_string(), "the card can say it is hidden: {page}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_self_check_panel_lists_thirty_days_of_self_heal() -> Result<()> {
+    let app = App::new()?;
+    let (_, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    assert_eq!(json["selfheal"], json!([]));
+
+    let now = chrono::Utc::now();
+    app.repo.record_selfheal("old.example", "nothing", None, None, 0, None, now - chrono::Duration::days(31))?;
+    app.repo.record_selfheal("news.example", "found", Some("0123abcd"), Some("llm"), 3, None, now - chrono::Duration::days(3))?;
+    let (_, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    let rows = json["selfheal"].as_array().expect("selfheal array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0]["domain"].as_str(), rows[0]["outcome"].as_str(), rows[0]["origin"].as_str()), (Some("news.example"), Some("found"), Some("llm")));
+    assert_eq!(rows[0]["pages"], 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_self_check_panel_lists_the_site_canaries() -> Result<()> {
+    let app = App::new()?;
+    let (status, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["canaries"], json!([]));
+
+    app.repo.add_canary("news.example", "https://news.example/a", None, chrono::Utc::now())?;
+    let id = app.repo.list_canaries()?[0].id;
+    app.repo.record_canary_result(id, false, "no video found on the page")?;
+    let (_, json) = app.send("GET", "/api/admin/selfcheck", &app.admin_token, None).await?;
+    let rows = json["canaries"].as_array().expect("canaries array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["domain"], "news.example");
+    assert_eq!(rows[0]["url"], "https://news.example/a");
+    assert_eq!(rows[0]["last_ok"], false);
+    assert_eq!(rows[0]["last_detail"], "no video found on the page");
+    assert!(rows[0]["last_checked_at"].is_string());
+    // The existing fields are still there.
+    assert!(json["links"].is_array());
+    Ok(())
+}
+
+// ---- videos held for approval (P10.5) ----
+
+const HELD_SHA: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+/// A job held for approval, with a file in its held directory.
+fn held_job(app: &App, n: u32) -> Result<i64> {
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new(&format!("https://example.gr/h{n}"), &format!("{n}_NIKOLAOU_HELD"), "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("clip.mxf"), b"abc")?;
+    assert!(app.repo.hold_output(
+        id,
+        "test-worker",
+        &dir.join("clip.mxf").to_string_lossy(),
+        3,
+        HELD_SHA,
+        Some(2.0),
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    )?);
+    assert!(app.repo.finish(id, "test-worker", JobStatus::AwaitingApproval, None, None, None)?);
+    Ok(id)
+}
+
+#[tokio::test]
+async fn the_approval_view_lists_only_held_jobs_with_their_held_block() -> Result<()> {
+    let app = App::new()?;
+    let held = held_job(&app, 1)?;
+    // A job in review must not show up in the approval view.
+    let other = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/r1", "2_NIKOLAOU_REVIEW", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    app.repo.finish(other, "test-worker", JobStatus::RequiresReview, Some("E_TEST"), Some("why"), None)?;
+
+    let (status, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["total"], 1, "{page}");
+    assert_eq!(page["jobs"][0]["id"], held, "{page}");
+    assert_eq!(page["jobs"][0]["held"]["sha256"], HELD_SHA, "{page}");
+    assert_eq!(page["counts"]["approval"], 1, "{page}");
+    assert_eq!(page["counts"]["review"], 1, "{page}");
+
+    // The review list does not contain the held job.
+    let (_, review) = app.send("GET", "/api/jobs?view=review", &app.mcr_token, None).await?;
+    assert_eq!(review["total"], 1, "{review}");
+    assert_eq!(review["jobs"][0]["id"], other, "{review}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_desk_sees_the_held_file_and_approves_exactly_that_sha() -> Result<()> {
+    let app = App::new()?;
+    let id = held_job(&app, 1)?;
+
+    let (status, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let held = &json["job"]["held"];
+    assert_eq!(held["sha256"], HELD_SHA, "{json}");
+    assert_eq!(held["bytes"], 3);
+    assert!(held["expires_at"].is_string() && held["created_at"].is_string(), "{held}");
+
+    // The wrong file, and a malformed hash, change nothing.
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": "0".repeat(64) })))
+        .await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"]["code"], "NOT_HELD");
+    let (status, _) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": "xyz" })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA.to_uppercase() })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
+    assert!(app.repo.approved_held(id)?.is_some());
+
+    // Once decided, the job JSON carries no held block and a second approval is a 409.
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert!(json["job"]["held"].is_null(), "{json}");
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/approve"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA })))
+        .await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NOT_HELD")), "{json}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejecting_sends_the_job_to_review_and_deletes_the_held_file() -> Result<()> {
+    let app = App::new()?;
+    let id = held_job(&app, 1)?;
+    let held_dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    assert!(held_dir.exists());
+
+    // An unknown reason and an over-long note are refused before anything changes.
+    let (status, _) = app
+        .send("POST", &format!("/api/jobs/{id}/reject"), &app.mcr_token, Some(json!({ "reason": "because" })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{id}/reject"),
+            &app.mcr_token,
+            Some(json!({ "reason": "other", "note": "x".repeat(301) })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+    assert!(held_dir.exists());
+
+    let (status, json) = app
+        .send(
+            "POST",
+            &format!("/api/jobs/{id}/reject"),
+            &app.mcr_token,
+            Some(json!({ "reason": "wrong_video", "note": "άλλο θέμα" })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let job = app.repo.get_job(id)?.unwrap();
+    assert_eq!(job.status, JobStatus::RequiresReview);
+    assert_eq!(job.error_code.as_deref(), Some("REJECTED_BY_MCR"));
+    assert!(job.error_message.as_deref().unwrap().contains("άλλο θέμα"));
+    assert!(!held_dir.exists(), "the held directory must be removed");
+    assert_eq!(app.repo.get_held(id)?.unwrap().reason.as_deref(), Some("wrong_video"));
+
+    // A job that is not held: 409 NOT_HELD, nothing touched.
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{id}/reject"), &app.mcr_token, Some(json!({ "reason": "other" })))
+        .await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NOT_HELD")), "{json}");
+    Ok(())
+}
+
+// ---- preview of a held video (P10.6) ----
+
+impl App {
+    /// A GET with optional extra headers; the status, headers and raw body.
+    async fn get_raw(&self, uri: &str, token: &str, headers: &[(&str, &str)]) -> Result<(StatusCode, axum::http::HeaderMap, Vec<u8>)> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", format!("omni_session={token}"))
+            .header("host", "mcr.local");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let res = self
+            .router
+            .clone()
+            .layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap()))
+            .oneshot(builder.body(Body::empty())?)
+            .await?;
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res.into_body().collect().await?.to_bytes().to_vec();
+        Ok((status, headers, bytes))
+    }
+}
+
+/// A held job whose directory also holds a 1000-byte "preview.mp4" and a contact sheet.
+fn held_job_with_preview(app: &App) -> Result<(i64, std::path::PathBuf)> {
+    let id = held_job(app, 1)?;
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("_preview.mp4"), &data)?;
+    std::fs::write(dir.join("_contact.jpg"), b"jpegbytes")?;
+    Ok((id, dir))
+}
+
+#[tokio::test]
+async fn the_desk_seeks_in_the_preview_with_a_range_request() -> Result<()> {
+    let app = App::new()?;
+    let (id, _dir) = held_job_with_preview(&app)?;
+
+    let (status, headers, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[("range", "bytes=0-99")]).await?;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(headers["content-range"], "bytes 0-99/1000");
+    assert_eq!(body.len(), 100);
+    assert_eq!(headers["content-type"], "video/mp4");
+    assert_eq!(headers["cache-control"], "no-store");
+
+    let (status, headers, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[("range", "bytes=900-")]).await?;
+    assert_eq!((status, body.len()), (StatusCode::PARTIAL_CONTENT, 100));
+    assert_eq!(headers["content-range"], "bytes 900-999/1000");
+
+    let (status, _, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!((status, body.len()), (StatusCode::OK, 1000));
+
+    let (status, headers, body) = app.get_raw(&format!("/api/jobs/{id}/preview/contact"), &app.mcr_token, &[]).await?;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, b"jpegbytes".as_slice()));
+    assert_eq!(headers["content-type"], "image/jpeg");
+
+    // No article picture yet: 404, not an empty 200.
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{id}/preview/article"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The job JSON says what is there.
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(
+        json["job"]["held"]["preview"],
+        json!({ "video": true, "audio_only": false, "contact": true, "article": false, "frame": false }),
+        "{json}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_audio_only_preview_is_served_as_audio() -> Result<()> {
+    let app = App::new()?;
+    let (id, dir) = held_job_with_preview(&app)?;
+    std::fs::remove_file(dir.join("_preview.mp4"))?;
+    std::fs::write(dir.join("_preview.m4a"), b"audio")?;
+    let (status, headers, _) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "audio/mp4");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["held"]["preview"]["audio_only"], true, "{json}");
+    assert_eq!(json["job"]["held"]["preview"]["video"], false, "{json}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn there_is_no_preview_without_a_live_held_row_and_the_request_picks_no_file() -> Result<()> {
+    let app = App::new()?;
+    // A job with no held row at all, though a file sits where one would be.
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/p9", "9_NIKOLAOU_NOROW", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("_preview.mp4"), b"x")?;
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let app = App::new()?;
+    // A delivered video no longer has a preview, even if its files linger.
+    let (held_id, held_dir) = held_job_with_preview(&app)?;
+    let sha = app.repo.waiting_held(held_id)?.unwrap().sha256;
+    assert!(app.repo.approve_held(held_id, &sha, "desk")?);
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{held_id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::OK, "an approved video still waits for delivery");
+    let job = app.repo.lease_job("w2", 180)?.expect("approved job is leased");
+    assert_eq!(job.id, held_id);
+    assert!(app.repo.record_held_delivery(held_id, "w2", "C:/watch/x.mxf", 2.0)?);
+    assert!(app.repo.finish_held_delivery(held_id, "w2")?);
+    assert_eq!(app.repo.get_held(held_id)?.unwrap().decision.as_deref(), Some("delivered"));
+    assert!(held_dir.join("_preview.mp4").is_file());
+    let (status, _, _) = app.get_raw(&format!("/api/jobs/{held_id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Only the three fixed names are routes: nothing in the request names a file.
+    {
+        let app2 = App::new()?;
+        let r = held_job_with_preview(&app2)?;
+        for uri in [
+            format!("/api/jobs/{}/preview/..%2F{}.mxf", r.0, "1_NIKOLAOU_HELD"),
+            format!("/api/jobs/{}/preview/_preview.mp4", r.0),
+            format!("/api/jobs/{}/preview/../preview/video/x", r.0),
+            format!("/api/jobs/{}/preview/clip.mxf", r.0),
+        ] {
+            let (status, _, body) = app2.get_raw(&uri, &app2.mcr_token, &[]).await?;
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+                "{uri} -> {status}"
+            );
+            assert!(body != b"abc", "{uri} served the held MXF");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_held_row_outside_the_jobs_held_directory_serves_no_preview() -> Result<()> {
+    let app = App::new()?;
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://example.gr/e1", "1_NIKOLAOU_ELSEWHERE", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let elsewhere = app._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere)?;
+    std::fs::write(elsewhere.join("clip.mxf"), b"abc")?;
+    std::fs::write(elsewhere.join("_preview.mp4"), b"secret")?;
+    assert!(app.repo.hold_output(
+        id,
+        "test-worker",
+        &elsewhere.join("clip.mxf").to_string_lossy(),
+        3,
+        HELD_SHA,
+        Some(2.0),
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    )?);
+    let (status, _, body) = app.get_raw(&format!("/api/jobs/{id}/preview/video"), &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_ne!(body, b"secret");
+    Ok(())
+}
+
+// ---- the approval card's evidence (P10.11b) ----
+
+#[tokio::test]
+async fn the_closest_frame_is_served_to_mcr_only_when_it_exists() -> Result<()> {
+    let app = App::new()?;
+    let (id, dir) = held_job_with_preview(&app)?;
+    let uri = format!("/api/jobs/{id}/preview/frame");
+
+    let (status, _, _) = app.get_raw(&uri, &app.mcr_token, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no frame yet: 404, not an empty 200");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["held"]["preview"]["frame"], false, "{json}");
+
+    std::fs::write(dir.join("_frame.jpg"), b"framebytes")?;
+    let (status, headers, body) = app.get_raw(&uri, &app.mcr_token, &[]).await?;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, b"framebytes".as_slice()));
+    assert_eq!(headers["content-type"], "image/jpeg");
+    assert_eq!(headers["cache-control"], "no-store");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["held"]["preview"]["frame"], true, "{json}");
+
+    // Who may ask is the MATRIX row of the route.
+    Ok(())
+}
+
+/// A held job whose repair attempt is on record: found by an admin recipe that
+/// MCR approved twice, the held candidate the second one, a picture compared.
+fn held_repaired_job(app: &App) -> Result<i64> {
+    use omni_core::recipe_score::{Event, NewRecipe, Origin, ScopeKind};
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://news.example.gr/story/1", "1_NIKOLAOU_REPAIR", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let now = chrono::Utc::now();
+    let recipe = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: "example.gr".into(),
+        family: None,
+        recipe_json: "{}".into(),
+        hash: "h-admin-1".into(),
+        steps_hash: "s-admin-1".into(),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let rid = match app.repo.insert_recipe(&recipe, now)? {
+        omni_core::recipe_score::InsertOutcome::Inserted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    app.repo.recipe_event(rid, "example.gr", Event::Approval, now)?;
+    app.repo.recipe_event(rid, "example.gr", Event::Approval, now)?;
+    // Approvals on another domain must not count.
+    app.repo.recipe_event(rid, "other.example", Event::Approval, now)?;
+
+    let attempt = app.repo.start_attempt(id, "hold", now)?;
+    let list = json!([
+        {"url": "https://cdn.news.example.gr/first.mp4", "duration_secs": 30.0, "checks": [{"name": "probe", "ok": false, "detail": "x"}]},
+        {"url": "https://cdn.news.example.gr/second.mp4", "duration_secs": 118.0, "checks": [
+            {"name": "egress", "ok": true, "detail": "Δημόσιος κόμβος"},
+            {"name": "length", "ok": true, "detail": "Ταιριάζει με τα 120 δλ της σελίδας"}
+        ]}
+    ]);
+    let end = omni_core::repository::AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        recipe_id: Some(rid),
+        recipe_hash: Some("h-admin-1".into()),
+        domain: Some("example.gr".into()),
+        candidates_json: Some(list.to_string()),
+        held_url: Some("https://cdn.news.example.gr/second.mp4?sig=abc".into()),
+        next_index: 1,
+        expected_secs: Some(120.0),
+        ..Default::default()
+    };
+    app.repo.finish_attempt(attempt, &end, now)?;
+    assert!(app.repo.record_card_evidence(attempt, id, "test-worker", Some(4), Some(7.0), Some("img.news.example.gr"))?);
+
+    let dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("clip.mxf"), b"abc")?;
+    assert!(app.repo.hold_output(id, "test-worker", &dir.join("clip.mxf").to_string_lossy(), 3, HELD_SHA, Some(118.0), now + chrono::Duration::hours(24))?);
+    assert!(app.repo.finish(id, "test-worker", JobStatus::AwaitingApproval, None, None, None)?);
+    Ok(id)
+}
+
+#[tokio::test]
+async fn the_approval_view_carries_the_repair_card_of_the_held_candidate() -> Result<()> {
+    let app = App::new()?;
+    let id = held_repaired_job(&app)?;
+    let (status, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let r = &page["jobs"][0]["repair"];
+    assert_eq!(page["jobs"][0]["id"], id);
+    assert_eq!(r["found"], "recipe", "{page}");
+    assert_eq!(r["recipe_approvals"], 2, "only this domain's approvals count: {page}");
+    assert_eq!(r["source_host"], "cdn.news.example.gr");
+    assert_eq!((r["duration_secs"].as_f64(), r["expected_secs"].as_f64()), (Some(118.0), Some(120.0)));
+    let names: Vec<&str> = r["checks"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["egress", "length"], "the held candidate's checks, not the first one's");
+    assert_eq!(r["short_clip"], false);
+    assert_eq!(r["image"], json!({ "distance": 4, "frame_secs": 7.0, "match": true }), "{page}");
+    assert!(!r.to_string().contains("sig=abc") && !r.to_string().contains("second.mp4"), "hosts only: {r}");
+    // The single-job view the mail panel uses says the same.
+    let (_, one) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(one["job"]["repair"], *r);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_held_job_without_a_repair_attempt_has_a_null_repair() -> Result<()> {
+    let app = App::new()?;
+    held_job(&app, 1)?;
+    let (_, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(page["total"], 1, "{page}");
+    assert!(page["jobs"][0]["repair"].is_null(), "{page}");
+    assert!(page["jobs"][0]["held"].is_object());
+    Ok(())
+}
+
+// ---- «Επόμενη επιλογή» (P10.13) ----
+
+/// A held job (see `held_job`) whose repair attempt verified `urls` and held `urls[index]`.
+fn held_with_candidates(app: &App, n: u32, urls: &[&str], index: usize) -> Result<i64> {
+    let id = held_job(app, n)?;
+    let now = chrono::Utc::now();
+    let attempt = app.repo.start_attempt(id, "hold", now)?;
+    let list: Vec<serde_json::Value> =
+        urls.iter().map(|u| json!({"url": u, "origin": "recipe:abcd1234", "duration_secs": 60.0, "checks": []})).collect();
+    let end = omni_core::repository::AttemptEnd {
+        rung: Some("recipes".into()),
+        outcome: Some("held".into()),
+        domain: Some("example.gr".into()),
+        candidates_json: Some(serde_json::Value::Array(list).to_string()),
+        held_url: Some(urls[index].to_string()),
+        next_index: index as i64,
+        ..Default::default()
+    };
+    app.repo.finish_attempt(attempt, &end, now)?;
+    Ok(id)
+}
+
+const NEXT_URLS: [&str; 3] = [
+    "https://cdn.news.example.gr/a.mp4",
+    "https://cdn.news.example.gr/b.mp4",
+    "https://cdn.news.example.gr/c.mp4",
+];
+
+#[tokio::test]
+async fn the_repair_card_says_how_many_next_choices_are_left() -> Result<()> {
+    let app = App::new()?;
+    held_with_candidates(&app, 1, &NEXT_URLS, 0)?;
+    let (_, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+    assert_eq!(page["jobs"][0]["repair"]["next_left"], 2, "{page}");
+    let last = held_with_candidates(&app, 2, &NEXT_URLS, 2)?;
+    let (_, one) = app.send("GET", &format!("/api/jobs/{last}"), &app.mcr_token, None).await?;
+    assert_eq!(one["job"]["repair"]["next_left"], 0, "the last candidate has nothing after it: {one}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_choice_needs_the_held_file_and_a_verified_candidate_after_it() -> Result<()> {
+    let app = App::new()?;
+    let id = held_with_candidates(&app, 1, &NEXT_URLS, 0)?;
+    let last = held_with_candidates(&app, 2, &NEXT_URLS, 2)?;
+    let held_dir = omni_core::held::held_dir(&app._dir.path().join("temp"), id);
+    let post = |sha: String| {
+        let uri = format!("/api/jobs/{id}/next");
+        let token = app.mcr_token.clone();
+        let app = &app;
+        async move { app.send("POST", &uri, &token, Some(json!({ "sha256": sha }))).await }
+    };
+
+    // A malformed or other file's SHA: nothing changes.
+    let (status, _) = post("xyz".into()).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, json) = post("0".repeat(64)).await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NO_NEXT")), "{json}");
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+    assert!(held_dir.exists());
+
+    let (status, json) = post(HELD_SHA.to_uppercase()).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["index"], 1);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::Pending);
+    assert!(!held_dir.exists(), "the rejected file goes now");
+    let attempt = app.repo.latest_attempt(id)?.unwrap();
+    assert_eq!((attempt.rung.as_deref(), attempt.outcome.as_deref(), attempt.next_index), (Some("next"), None, 1));
+    // The job is not held any more: a second press is a 409.
+    let (status, _) = post(HELD_SHA.to_string()).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Nothing left after the last candidate: 409, the video stays held.
+    let (status, json) = app
+        .send("POST", &format!("/api/jobs/{last}/next"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA })))
+        .await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NO_NEXT")), "{json}");
+    assert_eq!(app.repo.get_job(last)?.unwrap().status, JobStatus::AwaitingApproval);
+    assert!(app.repo.waiting_held(last)?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_choice_is_only_for_hold_mode() -> Result<()> {
+    for mode in [omni_core::config::RepairMode::Off, omni_core::config::RepairMode::Shadow] {
+        let app = App::with_repair_mode(mode)?;
+        let id = held_with_candidates(&app, 1, &NEXT_URLS, 0)?;
+        let (_, page) = app.send("GET", "/api/jobs?view=approval", &app.mcr_token, None).await?;
+        assert_eq!(page["jobs"][0]["repair"]["next_left"], 0, "{mode:?}: the button is hidden: {page}");
+        let (status, json) = app
+            .send("POST", &format!("/api/jobs/{id}/next"), &app.mcr_token, Some(json!({ "sha256": HELD_SHA })))
+            .await?;
+        assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("REPAIR_OFF")), "{mode:?}: {json}");
+        assert!(json["error"]["message"].as_str().unwrap().contains("απενεργοποιημένη"));
+        assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval, "{mode:?}: nothing changed");
+        assert!(app.repo.waiting_held(id)?.is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_mcr_form_keeps_the_journalist_identity_and_the_slug_matches_the_stored_fields() -> Result<()> {
+    let app = App::new()?;
+    let (status, json) = app
+        .send(
+            "POST",
+            "/api/jobs",
+            &app.mcr_token,
+            Some(json!({
+                "url": "https://example.test/slug/1",
+                "keyword": "fire-in-the-hills",
+                "journalist": "Papa-Daki",
+                "index_str": "2-B"
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let job = app.repo.get_job(json["job_id"].as_i64().unwrap())?.unwrap();
+    // The identity is what the roster knows, as at base.
+    assert_eq!(job.journalist, "PAPA-DAKI");
+    // The invariant the article code (`house_slug`) relies on.
+    assert_eq!(job.slug, format!("{}_{}_{}", job.index_str, job.journalist, job.keyword));
+    assert_eq!(job.slug, "2-B_PAPA-DAKI_FIRE-IN-THE-HILLS");
     Ok(())
 }

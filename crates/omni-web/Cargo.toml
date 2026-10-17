@@ -29,6 +29,7 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 

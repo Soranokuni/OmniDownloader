@@ -298,6 +298,45 @@ pub fn check_disks(health: &HealthState, watchfolder: &Path, temp_dir: &Path) ->
     state != Health::Down
 }
 
+/// The `archive` check (plan P1.7): amber when the archive was refused for
+/// overlapping the watchfolder, or, when it sits on a volume of its own
+/// (`separate`: not temp's, not the watchfolder's), when that volume is
+/// under [`LOW_DISK_GB`]. Never red: a full archive disk costs old sources,
+/// not jobs. Gone when there is nothing to report. `archive_free` is the free
+/// bytes of the archive's volume.
+pub fn check_archive(
+    health: &HealthState,
+    archive: &crate::archive::ArchiveSettings,
+    separate: bool,
+    archive_free: Option<u64>,
+) {
+    if archive.conflict {
+        health.set_if_changed(
+            checks::ARCHIVE,
+            Check::degraded(format!(
+                "Ο φάκελος αρχειοθέτησης ({}) και ο φάκελος παράδοσης περιέχει ο ένας τον άλλον:                  η αρχειοθέτηση είναι απενεργοποιημένη. Ορίστε άλλον φάκελο στο archive.path.",
+                archive.root.display()
+            )),
+        );
+        return;
+    }
+    match archive_free {
+        Some(free) if separate && (archive.enabled || archive.root.is_dir()) => {
+            let free_gb = free as f64 / BYTES_PER_GB;
+            let detail = format!("δίσκος αρχειοθέτησης: {free_gb:.0} GB ελεύθερα");
+            health.set_if_changed(
+                checks::ARCHIVE,
+                if free_gb < LOW_DISK_GB {
+                    Check::degraded(format!("λίγος χώρος — {detail}; οι παλαιότερες ημέρες διαγράφονται πρώτες"))
+                } else {
+                    Check::ok(detail)
+                },
+            );
+        }
+        _ => health.remove(checks::ARCHIVE),
+    }
+}
+
 /// Bytes a finished file takes per second of programme: 50 Mbps video, eight
 /// 24-bit 48 kHz PCM tracks (9.2 Mbps) and MXF overhead. Measured: a 60 s
 /// clip is 450 MB.
@@ -339,6 +378,27 @@ mod tests {
         assert!(check_disks(&health, d.path(), d.path()));
         let c = health.get(checks::DISK).expect("recorded");
         assert!(c.detail.unwrap_or_default().contains("temp:"));
+    }
+
+    #[test]
+    fn the_archive_volume_is_its_own_amber_line_only_when_it_is_separate_and_low() {
+        use crate::archive::ArchiveSettings;
+        use crate::health::Health;
+        let gb = |n: f64| (n * BYTES_PER_GB) as u64;
+        let a = ArchiveSettings::new(std::path::PathBuf::from("archive"), 14);
+        let health = HealthState::new();
+        check_archive(&health, &a, true, Some(gb(100.0)));
+        assert_eq!(health.get(checks::ARCHIVE).unwrap().state, Health::Ok);
+        check_archive(&health, &a, true, Some(gb(3.0)));
+        assert_eq!(health.get(checks::ARCHIVE).unwrap().state, Health::Degraded, "low archive volume is amber, never red");
+        // Same volume as temp: the disk check covers it, no line of its own.
+        check_archive(&health, &a, false, Some(gb(3.0)));
+        assert!(health.get(checks::ARCHIVE).is_none());
+        // Refused for overlapping the watchfolder: amber whatever the space.
+        let mut bad = a.clone();
+        bad.conflict = true;
+        check_archive(&health, &bad, false, Some(gb(500.0)));
+        assert_eq!(health.get(checks::ARCHIVE).unwrap().state, Health::Degraded);
     }
 
     #[test]

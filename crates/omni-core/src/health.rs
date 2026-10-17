@@ -141,6 +141,14 @@ pub mod checks {
     pub const DENO: &str = "deno";
     /// The first-run Admin / Admin account still logs in.
     pub const ACCOUNTS: &str = "accounts";
+    /// News sites that stopped giving video (plan P10.3).
+    pub const SITES: &str = "sites";
+    /// Cookie jars for login-walled sites: expiring, failing or untested (plan P3.5).
+    pub const COOKIES: &str = "cookies";
+    /// `data\` and `temp\` restricted to SYSTEM, Administrators and the service account (P3.5).
+    pub const LOCKDOWN: &str = "lockdown";
+    /// The source archive: refused for overlapping the watchfolder, or short of space on its own volume (P1.7).
+    pub const ARCHIVE: &str = "archive";
 }
 
 impl Default for HealthState {

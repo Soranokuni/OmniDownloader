@@ -434,6 +434,325 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
             ('Link with "-ΒΙΝΤΕΟ" glued on by the sender', 'https://www.news247.gr/kosmos/rosia-apo-agnosti-pnevmonia-o-thanatos-tis-erevnitrias-ti-leei-gia-tin-panoli-o-pou/-ΒΙΝΤΕΟ');
         "#,
     ),
+    (
+        15,
+        // Page evidence of failed news-page jobs (P10.1): one capped JSON
+        // file per job under temp/evidence; the row is what retention walks.
+        r#"
+        CREATE TABLE IF NOT EXISTS job_evidence (
+            job_id     INTEGER PRIMARY KEY,
+            path       TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        16,
+        // Per news site: has it started failing (P10.3)? `recent` is the last
+        // 20 outcomes as '1'/'0'; `llm_breaker_until` is for a later item.
+        r#"
+        CREATE TABLE IF NOT EXISTS site_stats (
+            domain            TEXT PRIMARY KEY,
+            recent            TEXT NOT NULL DEFAULT '',
+            consecutive_fail  INTEGER NOT NULL DEFAULT 0,
+            last_ok_at        TEXT,
+            last_fail_at      TEXT,
+            last_code         TEXT,
+            state             TEXT NOT NULL DEFAULT 'healthy',
+            state_since       TEXT,
+            llm_breaker_until TEXT,
+            updated_at        TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        17,
+        // Recent known-good article links per frequent news site, re-checked
+        // each night and when a site starts failing (P10.4). Not
+        // `selfcheck_links`: that list also decides whether a yt-dlp update
+        // is kept. `added_at` is when the job that proved the link finished.
+        r#"
+        CREATE TABLE IF NOT EXISTS site_canaries (
+            id              INTEGER PRIMARY KEY,
+            domain          TEXT NOT NULL,
+            url             TEXT NOT NULL UNIQUE,
+            job_id          INTEGER,
+            added_at        TEXT NOT NULL,
+            last_checked_at TEXT,
+            last_ok         INTEGER,
+            last_detail     TEXT,
+            fail_count      INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_site_canaries_domain ON site_canaries(domain);
+        "#,
+    ),
+    (
+        18,
+        // A finished video held back from the watchfolder until MCR approves
+        // it (P10.5), bound to its SHA-256. `decision`: NULL (waiting) |
+        // approved | rejected | expired | superseded | delivered.
+        r#"
+        CREATE TABLE IF NOT EXISTS held_outputs (
+            job_id     INTEGER PRIMARY KEY,
+            path       TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            sha256     TEXT NOT NULL,
+            duration   REAL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            decision   TEXT,
+            decided_by TEXT,
+            decided_at TEXT,
+            reason     TEXT,
+            delivered_path TEXT
+        );
+        "#,
+    ),
+    (
+        19,
+        // Learned page recipes (P10.10), bounded and scored per site. `hash`
+        // is scope + recipe; `steps_hash` is the steps alone, so one set of
+        // steps can be shared by every site that uses the same video player.
+        // A tombstone keeps a recipe MCR rejected from coming back.
+        r#"
+        CREATE TABLE IF NOT EXISTS recipes (
+            id             INTEGER PRIMARY KEY,
+            hash           TEXT NOT NULL UNIQUE,
+            steps_hash     TEXT NOT NULL,
+            scope_kind     TEXT NOT NULL,
+            scope_key      TEXT NOT NULL,
+            family         TEXT,
+            recipe_json    TEXT NOT NULL,
+            dsl_version    INTEGER NOT NULL,
+            origin         TEXT NOT NULL,
+            state          TEXT NOT NULL,
+            created_at     TEXT NOT NULL,
+            retired_at     TEXT,
+            retired_reason TEXT,
+            revived_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipes_scope ON recipes(scope_kind, scope_key);
+        CREATE INDEX IF NOT EXISTS idx_recipes_steps ON recipes(steps_hash);
+        CREATE TABLE IF NOT EXISTS recipe_sites (
+            recipe_id        INTEGER NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+            domain           TEXT NOT NULL,
+            alpha            REAL NOT NULL DEFAULT 1,
+            beta             REAL NOT NULL DEFAULT 1,
+            scored_at        TEXT NOT NULL,
+            created_at       TEXT NOT NULL,
+            approvals        INTEGER NOT NULL DEFAULT 0,
+            rejections       INTEGER NOT NULL DEFAULT 0,
+            uses             INTEGER NOT NULL DEFAULT 0,
+            consecutive_fail INTEGER NOT NULL DEFAULT 0,
+            pass_streak      INTEGER NOT NULL DEFAULT 0,
+            state            TEXT NOT NULL DEFAULT 'candidate',
+            suspended_reason TEXT,
+            suspended_at     TEXT,
+            last_used_at     TEXT,
+            last_ok_at       TEXT,
+            PRIMARY KEY (recipe_id, domain)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipe_sites_domain ON recipe_sites(domain);
+        CREATE TABLE IF NOT EXISTS recipe_tombstones (
+            hash   TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            at     TEXT NOT NULL,
+            steps_hash TEXT,
+            scope_kind TEXT,
+            scope_key  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS recipe_bars (
+            steps_hash TEXT NOT NULL,
+            domain     TEXT NOT NULL,
+            at         TEXT NOT NULL,
+            PRIMARY KEY (steps_hash, domain)
+        );
+        "#,
+    ),
+    (
+        20,
+        // One row per run of the repair ladder on a job (P10.11a): what it
+        // tried, the verified candidates in rank order (`candidates_json`,
+        // at most 32 KiB), and the full hash of the recipe behind the top
+        // candidate so MCR's decision can find it. `held_url` is the exact
+        // address that was held, `next_index` its place in the list, and
+        // `mcr_decision` (approved | rejected | expired) is what the desk
+        // later decided about it. Goes with its job and after 90 days.
+        r#"
+        CREATE TABLE IF NOT EXISTS repair_attempts (
+            id              INTEGER PRIMARY KEY,
+            job_id          INTEGER NOT NULL REFERENCES queue(id) ON DELETE CASCADE,
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT,
+            mode            TEXT NOT NULL,
+            rung            TEXT,
+            outcome         TEXT,
+            recipe_hash     TEXT,
+            recipe_id       INTEGER,
+            domain          TEXT,
+            llm_calls       INTEGER NOT NULL DEFAULT 0,
+            tokens_in       INTEGER NOT NULL DEFAULT 0,
+            tokens_out      INTEGER NOT NULL DEFAULT 0,
+            candidates_json TEXT,
+            next_index      INTEGER NOT NULL DEFAULT 0,
+            duration_ms     INTEGER,
+            held_url        TEXT,
+            mcr_decision    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_repair_attempts_job ON repair_attempts(job_id);
+        "#,
+    ),
+    (
+        21,
+        // What the approval card shows next to a held repaired video
+        // (P10.11b): how far the article's picture is from the closest frame
+        // of the preview (a dHash distance; NULL = no article picture or no
+        // comparison), the time of that frame, the host the picture came from,
+        // and the length the page itself stated for its video.
+        r#"
+        ALTER TABLE repair_attempts ADD COLUMN image_distance   INTEGER;
+        ALTER TABLE repair_attempts ADD COLUMN image_frame_secs REAL;
+        ALTER TABLE repair_attempts ADD COLUMN image_host       TEXT;
+        ALTER TABLE repair_attempts ADD COLUMN expected_secs    REAL;
+        "#,
+    ),
+    (
+        22,
+        // The LLM rung's limits (P10.12): calls and tokens per local day (the
+        // daily cap lives here, so it holds across restarts and jobs), and the
+        // page bundles sent in the last 24 h (the same bundle is not sent twice).
+        r#"
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            day        TEXT PRIMARY KEY,
+            calls      INTEGER NOT NULL DEFAULT 0,
+            tokens_in  INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS repair_llm_sent (
+            hash   TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            at     TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        23,
+        // Videos MCR called «Λάθος βίντεο» (P10.13): per page domain, the
+        // host and path (no scheme, query or fragment) of the address, kept
+        // 30 days (`until`), at most 50 per domain. The repair ladder drops
+        // any candidate with such a pattern before the gate.
+        r#"
+        CREATE TABLE IF NOT EXISTS repair_skips (
+            domain  TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            until   TEXT NOT NULL,
+            PRIMARY KEY (domain, pattern)
+        );
+        "#,
+    ),
+    (
+        24,
+        // What the overnight self-heal found per broken site (P10.14): one row
+        // per run, a host and a recipe hash only (no page address). Kept 30
+        // days, at most 500 rows; MCR's morning line and the admin card read it.
+        r#"
+        CREATE TABLE IF NOT EXISTS selfheal_reports (
+            id          INTEGER PRIMARY KEY,
+            domain      TEXT NOT NULL,
+            at          TEXT NOT NULL,
+            outcome     TEXT NOT NULL,
+            recipe_hash TEXT,
+            origin      TEXT,
+            pages       INTEGER NOT NULL DEFAULT 0,
+            detail      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_selfheal_reports_at ON selfheal_reports(at);
+        "#,
+    ),
+    (
+        25,
+        // Why MCR rejected a held video (P10.15a): `wrong_video` or another
+        // reason, written with the decision, so the repair report counts each
+        // rejection by its own reason. Rows from before have none (count as other).
+        r#"
+        ALTER TABLE repair_attempts ADD COLUMN mcr_reason TEXT;
+        "#,
+    ),
+    (
+        26,
+        // Cookie jars for login-walled sites (P3.5). `sealed` is the Netscape text
+        // under machine-scope DPAPI; every other column is safe to show. One jar per
+        // registrable domain (x.com also serves twitter.com).
+        r#"
+        CREATE TABLE IF NOT EXISTS cookie_jars (
+            domain           TEXT PRIMARY KEY,
+            sealed           BLOB NOT NULL,
+            cookie_count     INTEGER NOT NULL,
+            expires_min      TEXT,
+            updated_at       TEXT NOT NULL,
+            updated_by       TEXT NOT NULL,
+            last_test_at     TEXT,
+            last_test_ok     INTEGER,
+            last_test_detail TEXT,
+            last_sample_url  TEXT
+        );
+        "#,
+    ),
+    (
+        27,
+        // The journalist's own "tell me when it is delivered" choice (P7.3). Only
+        // stored here; sending is a later item.
+        r#"
+        ALTER TABLE users ADD COLUMN notify_on_completion INTEGER NOT NULL DEFAULT 0;
+        "#,
+    ),
+    (
+        28,
+        // The end-to-end benchmark (P6.4): the stored 65-link corpus, one row per run and one
+        // per target of a run. A result keeps the host of the stream it found, never the address.
+        r#"
+        CREATE TABLE IF NOT EXISTS benchmark_targets (
+            id       INTEGER PRIMARY KEY,
+            idx      INTEGER NOT NULL UNIQUE,
+            url      TEXT NOT NULL,
+            domain   TEXT NOT NULL,
+            category TEXT NOT NULL,
+            friction TEXT NOT NULL,
+            expected TEXT NOT NULL CHECK (expected IN ('pass','expected_fail')),
+            note     TEXT
+        );
+        CREATE TABLE IF NOT EXISTS benchmark_runs (
+            id           INTEGER PRIMARY KEY,
+            started_at   TEXT NOT NULL,
+            finished_at  TEXT,
+            heartbeat_at TEXT NOT NULL,
+            owner        TEXT NOT NULL CHECK (owner IN ('daemon','cli')),
+            paused       INTEGER NOT NULL DEFAULT 0,
+            mode         TEXT NOT NULL CHECK (mode IN ('extract','full')),
+            state        TEXT NOT NULL CHECK (state IN ('running','done','failed','abandoned')),
+            params_json  TEXT NOT NULL,
+            summary_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_benchmark_runs_state ON benchmark_runs(state, mode);
+        CREATE TABLE IF NOT EXISTS benchmark_results (
+            run_id        INTEGER NOT NULL REFERENCES benchmark_runs(id) ON DELETE CASCADE,
+            target_id     INTEGER NOT NULL REFERENCES benchmark_targets(id),
+            extract_ok    INTEGER,
+            extract_ms    INTEGER,
+            method        TEXT,
+            candidates    INTEGER,
+            download_ok   INTEGER,
+            download_ms   INTEGER,
+            transcode_ms  INTEGER,
+            verify_ok     INTEGER,
+            total_ms      INTEGER,
+            error_code    TEXT,
+            stream_host   TEXT,
+            PRIMARY KEY (run_id, target_id)
+        );
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -596,6 +915,428 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(applied as usize, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn migration_15_creates_job_evidence() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('job_evidence')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in ["job_id", "path", "bytes", "created_at"] {
+            assert!(columns.iter().any(|x| x == c), "job_evidence.{c} missing: {columns:?}");
+        }
+        assert!(target_version() >= 15);
+    }
+
+    #[test]
+    fn migration_16_creates_site_stats() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('site_stats')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in [
+            "domain", "recent", "consecutive_fail", "last_ok_at", "last_fail_at", "last_code",
+            "state", "state_since", "llm_breaker_until", "updated_at",
+        ] {
+            assert!(columns.iter().any(|x| x == c), "site_stats.{c} missing: {columns:?}");
+        }
+        assert!(target_version() >= 16);
+    }
+
+    #[test]
+    fn migration_17_creates_site_canaries() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('site_canaries')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in [
+            "id", "domain", "url", "job_id", "added_at", "last_checked_at", "last_ok",
+            "last_detail", "fail_count",
+        ] {
+            assert!(columns.iter().any(|x| x == c), "site_canaries.{c} missing: {columns:?}");
+        }
+        conn.execute(
+            "INSERT INTO site_canaries (domain, url, added_at) VALUES ('a.example', 'https://a.example/1', 'x')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO site_canaries (domain, url, added_at) VALUES ('a.example', 'https://a.example/1', 'x')",
+                [],
+            )
+            .is_err(),
+            "url must be unique"
+        );
+        assert!(target_version() >= 17);
+    }
+
+    #[test]
+    fn migration_18_creates_held_outputs() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply(&mut conn, None).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('held_outputs')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for c in [
+            "job_id", "path", "bytes", "sha256", "duration", "created_at", "expires_at",
+            "decision", "decided_by", "decided_at", "reason", "delivered_path",
+        ] {
+            assert!(columns.iter().any(|x| x == c), "held_outputs.{c} missing: {columns:?}");
+        }
+        assert!(target_version() >= 18);
+    }
+
+    fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// A database at version 18 keeps its rows when 19 is applied, the recipe
+    /// tables appear, and deleting a recipe takes its site rows with it.
+    #[test]
+    fn migration_19_adds_recipe_tables_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 18) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 18);
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');
+             INSERT INTO site_stats (domain, state, state_since, updated_at) VALUES ('a.example', 'healthy', 'x', 'x');
+             INSERT INTO held_outputs (job_id, path, bytes, sha256, created_at, expires_at)
+                VALUES (5, 'p', 1, 'abc', 'x', 'y');",
+        )
+        .unwrap();
+        for t in ["recipes", "recipe_sites", "recipe_tombstones"] {
+            assert!(columns_of(&conn, t).is_empty(), "{t} exists before 19");
+        }
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 19);
+
+        let count = |t: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!((count("queue"), count("site_stats"), count("held_outputs")), (1, 1, 1));
+        for (t, cols) in [
+            (
+                "recipes",
+                &["id", "hash", "steps_hash", "scope_kind", "scope_key", "family", "recipe_json", "dsl_version",
+                  "origin", "state", "created_at", "retired_at", "retired_reason", "revived_at"][..],
+            ),
+            (
+                "recipe_sites",
+                &["recipe_id", "domain", "alpha", "beta", "scored_at", "created_at", "approvals", "rejections",
+                  "uses", "consecutive_fail", "pass_streak", "state", "suspended_reason", "suspended_at",
+                  "last_used_at", "last_ok_at"][..],
+            ),
+            ("recipe_tombstones", &["hash", "reason", "at", "steps_hash", "scope_kind", "scope_key"][..]),
+            ("recipe_bars", &["steps_hash", "domain", "at"][..]),
+        ] {
+            let have = columns_of(&conn, t);
+            for c in cols {
+                assert!(have.iter().any(|x| x == c), "{t}.{c} missing: {have:?}");
+            }
+        }
+
+        conn.execute_batch(
+            "INSERT INTO recipes (id, hash, steps_hash, scope_kind, scope_key, recipe_json, dsl_version, origin, state, created_at)
+                VALUES (1, 'h1', 's1', 'site', 'a.example', '{}', 1, 'llm', 'candidate', 'x');
+             INSERT INTO recipe_sites (recipe_id, domain, scored_at, created_at) VALUES (1, 'a.example', 'x', 'x');",
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO recipes (hash, steps_hash, scope_kind, scope_key, recipe_json, dsl_version, origin, state, created_at)
+                 VALUES ('h1', 's1', 'site', 'b.example', '{}', 1, 'llm', 'candidate', 'x')",
+                [],
+            )
+            .is_err(),
+            "hash must be unique"
+        );
+        assert!(
+            conn.execute("INSERT INTO recipe_sites (recipe_id, domain, scored_at, created_at) VALUES (99, 'x', 'x', 'x')", [])
+                .is_err(),
+            "a site row needs its recipe"
+        );
+        assert_eq!(count("recipe_sites"), 1);
+        conn.execute("DELETE FROM recipes WHERE id = 1", []).unwrap();
+        assert_eq!(count("recipe_sites"), 0, "ON DELETE CASCADE must remove the site rows");
+    }
+
+    /// A database at version 19 keeps its rows when 20 is applied; the attempts
+    /// table appears and goes with its job.
+    #[test]
+    fn migration_20_adds_repair_attempts_and_deletes_with_the_job() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 19) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 19);
+        conn.execute_batch("INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');")
+            .unwrap();
+        assert!(columns_of(&conn, "repair_attempts").is_empty(), "the table exists before 20");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 20);
+        let have = columns_of(&conn, "repair_attempts");
+        for c in [
+            "id", "job_id", "started_at", "finished_at", "mode", "rung", "outcome", "recipe_hash", "recipe_id", "domain",
+            "llm_calls", "tokens_in", "tokens_out", "candidates_json", "next_index", "duration_ms", "held_url", "mcr_decision",
+        ] {
+            assert!(have.iter().any(|x| x == c), "repair_attempts.{c} missing: {have:?}");
+        }
+        let count = |t: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("queue"), 1, "existing job rows must survive");
+        conn.execute("INSERT INTO repair_attempts (job_id, started_at, mode) VALUES (5, 'x', 'hold')", []).unwrap();
+        assert!(
+            conn.execute("INSERT INTO repair_attempts (job_id, started_at, mode) VALUES (99, 'x', 'hold')", []).is_err(),
+            "an attempt needs its job"
+        );
+        let (llm, next): (i64, i64) = conn
+            .query_row("SELECT llm_calls, next_index FROM repair_attempts", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((llm, next), (0, 0));
+        conn.execute("DELETE FROM queue WHERE id = 5", []).unwrap();
+        assert_eq!(count("repair_attempts"), 0, "the attempts go with their job");
+    }
+
+    /// A database at version 20 with an attempt row keeps it when 21 is
+    /// applied; the image columns appear empty (no comparison made).
+    #[test]
+    fn migration_21_adds_the_card_evidence_columns_and_keeps_the_attempt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 20) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 20);
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');
+             INSERT INTO repair_attempts (job_id, started_at, mode, outcome, held_url) VALUES (5, 'x', 'hold', 'held', 'https://cdn.a.example/v.mp4');",
+        )
+        .unwrap();
+        for c in ["image_distance", "image_frame_secs", "image_host", "expected_secs"] {
+            assert!(!columns_of(&conn, "repair_attempts").iter().any(|x| x == c), "{c} must not exist before 21");
+        }
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 21);
+        let have = columns_of(&conn, "repair_attempts");
+        for c in ["image_distance", "image_frame_secs", "image_host", "expected_secs"] {
+            assert!(have.iter().any(|x| x == c), "repair_attempts.{c} missing: {have:?}");
+        }
+        let (outcome, url, dist, secs, host, exp): (String, String, Option<i64>, Option<f64>, Option<String>, Option<f64>) = conn
+            .query_row(
+                "SELECT outcome, held_url, image_distance, image_frame_secs, image_host, expected_secs FROM repair_attempts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!((outcome.as_str(), url.as_str()), ("held", "https://cdn.a.example/v.mp4"), "the row survives");
+        assert_eq!((dist, secs, host, exp), (None, None, None, None), "NULL means no comparison");
+    }
+
+    /// A database at version 21 keeps its rows when 22 is applied; the two
+    /// LLM-limit tables appear empty.
+    #[test]
+    fn migration_22_adds_the_llm_limit_tables_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 21) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 21);
+        conn.execute_batch("INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');")
+            .unwrap();
+        assert!(columns_of(&conn, "llm_usage").is_empty(), "the table exists before 22");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 22);
+        for (table, cols) in [
+            ("llm_usage", vec!["day", "calls", "tokens_in", "tokens_out"]),
+            ("repair_llm_sent", vec!["hash", "domain", "at"]),
+        ] {
+            let have = columns_of(&conn, table);
+            for c in cols {
+                assert!(have.iter().any(|x| x == c), "{table}.{c} missing: {have:?}");
+            }
+        }
+        let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 1, "existing job rows must survive");
+        conn.execute("INSERT INTO llm_usage (day) VALUES ('2026-10-12')", []).unwrap();
+        let calls: i64 = conn.query_row("SELECT calls FROM llm_usage", [], |r| r.get(0)).unwrap();
+        assert_eq!(calls, 0);
+        assert!(conn.execute("INSERT INTO llm_usage (day) VALUES ('2026-10-12')", []).is_err(), "one row per day");
+    }
+
+    /// A database at version 22 keeps its rows when 23 is applied; the skip
+    /// table appears empty, one row per (domain, pattern).
+    #[test]
+    fn migration_23_adds_the_repair_skips_table_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 22) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 22);
+        conn.execute_batch("INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');")
+            .unwrap();
+        assert!(columns_of(&conn, "repair_skips").is_empty(), "the table exists before 23");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 23);
+        let have = columns_of(&conn, "repair_skips");
+        for c in ["domain", "pattern", "until"] {
+            assert!(have.iter().any(|x| x == c), "repair_skips.{c} missing: {have:?}");
+        }
+        let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(jobs, 1, "existing job rows must survive");
+        conn.execute("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'x')", [])
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'y')", []).is_err(),
+            "one row per domain and pattern"
+        );
+    }
+
+    /// A database at version 23 keeps its rows when 24 is applied; the self-heal
+    /// report table appears empty, with a null-able recipe hash and origin.
+    #[test]
+    fn migration_24_adds_the_selfheal_reports_table_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 23) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert_eq!(current_version(&conn).unwrap(), 23);
+        conn.execute_batch("INSERT INTO repair_skips (domain, pattern, until) VALUES ('a.example', 'cdn.a.example/v.mp4', 'x');")
+            .unwrap();
+        assert!(columns_of(&conn, "selfheal_reports").is_empty(), "the table exists before 24");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 24);
+        let have = columns_of(&conn, "selfheal_reports");
+        for c in ["id", "domain", "at", "outcome", "recipe_hash", "origin", "pages", "detail"] {
+            assert!(have.iter().any(|x| x == c), "selfheal_reports.{c} missing: {have:?}");
+        }
+        let skips: i64 = conn.query_row("SELECT COUNT(*) FROM repair_skips", [], |r| r.get(0)).unwrap();
+        assert_eq!(skips, 1, "existing rows must survive");
+        conn.execute("INSERT INTO selfheal_reports (domain, at, outcome) VALUES ('a.example', 'x', 'nothing')", []).unwrap();
+        let pages: i64 = conn.query_row("SELECT pages FROM selfheal_reports", [], |r| r.get(0)).unwrap();
+        assert_eq!(pages, 0, "pages defaults to 0");
+    }
+
+    #[test]
+    fn migration_25_adds_the_mcr_reason_column_and_keeps_the_attempt() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 24) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/x', '1_A_B', 'PENDING');
+             INSERT INTO repair_attempts (job_id, started_at, mode, outcome, mcr_decision) VALUES (5, 'x', 'hold', 'held', 'rejected');",
+        )
+        .unwrap();
+        assert!(!columns_of(&conn, "repair_attempts").iter().any(|x| x == "mcr_reason"), "not before 25");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 25);
+        assert!(columns_of(&conn, "repair_attempts").iter().any(|x| x == "mcr_reason"));
+        let (decision, reason): (String, Option<String>) = conn
+            .query_row("SELECT mcr_decision, mcr_reason FROM repair_attempts", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((decision.as_str(), reason), ("rejected", None), "an old row keeps its decision and has no reason");
+    }
+
+    #[test]
+    fn migration_26_creates_cookie_jars_without_touching_old_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 25) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert!(conn.prepare("SELECT 1 FROM cookie_jars").is_err(), "not before 26");
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 26);
+        let columns = columns_of(&conn, "cookie_jars");
+        for c in ["domain", "sealed", "cookie_count", "expires_min", "updated_at", "updated_by", "last_test_at", "last_test_ok", "last_test_detail", "last_sample_url"] {
+            assert!(columns.iter().any(|x| x == c), "cookie_jars.{c} missing: {columns:?}");
+        }
     }
 
     #[test]

@@ -436,6 +436,153 @@ impl Default for LlmConfig {
     }
 }
 
+/// What the daemon does with the page evidence of a failed job (plan P10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RepairMode {
+    /// No diagnostic re-sniff and no repair ladder; a failed job's reason may still be more exact.
+    #[default]
+    Off,
+    /// The diagnostic re-sniff runs and failure reasons are exact; the repair ladder only records what it would have used and changes nothing.
+    Shadow,
+    /// Hold the job for MCR when the decision says so.
+    Hold,
+}
+
+/// Page evidence and repair (`repair` in config.json). Old files without the
+/// section load with these defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairConfig {
+    #[serde(default)]
+    pub mode: RepairMode,
+    /// Evidence files older than this are deleted by the retention task.
+    #[serde(default = "default_evidence_days")]
+    pub evidence_days: i64,
+    /// Total size of the evidence folder; the oldest go first above it.
+    #[serde(default = "default_evidence_max_mb")]
+    pub evidence_max_mb: u64,
+    /// A video held for approval is dropped after this many hours (P10.5).
+    #[serde(default = "default_hold_hours")]
+    pub hold_hours: i64,
+    /// All videos waiting for approval together may not exceed this; a new
+    /// hold over it fails with LOW_DISK and is retried.
+    #[serde(default = "default_held_max_gb")]
+    pub held_max_gb: u64,
+    /// Seconds the repair ladder may spend finding and checking a video
+    /// before the download itself (P10.11a).
+    #[serde(default = "default_repair_budget_secs")]
+    pub budget_secs: u64,
+    /// The LLM rung of the repair ladder (P10.12): off by default. It runs only
+    /// when this is on AND `llm_model` is set; it never uses the mail model.
+    /// Endpoint, key and auth are the `llm` section's.
+    #[serde(default)]
+    pub llm_enabled: bool,
+    /// The model the repair rung asks (for example a paid Gemini Flash).
+    #[serde(default)]
+    pub llm_model: Option<String>,
+    /// Seconds one model call may take.
+    #[serde(default = "default_repair_llm_timeout_secs")]
+    pub llm_timeout_secs: u64,
+    /// Tokens one answer may use, thinking included.
+    #[serde(default = "default_repair_llm_max_tokens")]
+    pub llm_max_tokens: u32,
+    /// `reasoning_effort` sent with the call; `null` leaves it to `llm.disable_thinking`.
+    #[serde(default = "default_repair_llm_effort")]
+    pub llm_reasoning_effort: Option<String>,
+    /// Model calls the rung may make per local day, over all jobs.
+    #[serde(default = "default_repair_llm_calls_per_day")]
+    pub llm_max_calls_per_day: u32,
+}
+
+fn default_repair_llm_timeout_secs() -> u64 {
+    60
+}
+
+fn default_repair_llm_max_tokens() -> u32 {
+    4000
+}
+
+fn default_repair_llm_effort() -> Option<String> {
+    Some("medium".into())
+}
+
+fn default_repair_llm_calls_per_day() -> u32 {
+    15
+}
+
+fn default_repair_budget_secs() -> u64 {
+    180
+}
+
+fn default_hold_hours() -> i64 {
+    24
+}
+
+fn default_held_max_gb() -> u64 {
+    20
+}
+
+fn default_evidence_days() -> i64 {
+    14
+}
+
+fn default_evidence_max_mb() -> u64 {
+    200
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self {
+            mode: RepairMode::Off,
+            evidence_days: default_evidence_days(),
+            evidence_max_mb: default_evidence_max_mb(),
+            hold_hours: default_hold_hours(),
+            held_max_gb: default_held_max_gb(),
+            budget_secs: default_repair_budget_secs(),
+            llm_enabled: false,
+            llm_model: None,
+            llm_timeout_secs: default_repair_llm_timeout_secs(),
+            llm_max_tokens: default_repair_llm_max_tokens(),
+            llm_reasoning_effort: default_repair_llm_effort(),
+            llm_max_calls_per_day: default_repair_llm_calls_per_day(),
+        }
+    }
+}
+
+/// The delivered source archive (plan P1.7): after a video is in the
+/// watchfolder its downloaded source is kept under
+/// `{path}/YYYY/MM/DD/` for `retention_days`, with a JSON sidecar, instead
+/// of being deleted with the job workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whole days a day directory is kept, counted by its date.
+    #[serde(default = "default_archive_days")]
+    pub retention_days: i64,
+    /// Relative paths resolve against the install directory.
+    #[serde(default = "default_archive_path")]
+    pub path: String,
+}
+
+fn default_archive_days() -> i64 {
+    14
+}
+
+fn default_archive_path() -> String {
+    "archive".to_string()
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_archive_days(),
+            path: default_archive_path(),
+        }
+    }
+}
+
 /// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
@@ -588,6 +735,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub llm: LlmConfig,
 
+    /// Page evidence of failed jobs and the repair mode (plan P10.1).
+    #[serde(default)]
+    pub repair: RepairConfig,
+
+    /// Delivered sources kept for a while after air (plan P1.7).
+    #[serde(default)]
+    pub archive: ArchiveConfig,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -682,6 +837,8 @@ impl Default for AppConfig {
             ollama_endpoint: default_ollama_endpoint(),
             ollama_model: default_ollama_model(),
             llm: LlmConfig::default(),
+            repair: RepairConfig::default(),
+            archive: ArchiveConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -852,6 +1009,50 @@ mod tests {
     use super::*;
     use crate::secrets::{keys, SecretStore};
     use tempfile::TempDir;
+
+    #[test]
+    fn a_config_without_archive_keeps_sources_14_days_in_archive() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(old.archive.enabled);
+        assert_eq!(old.archive.retention_days, 14);
+        assert_eq!(old.archive.path, "archive");
+        let partial: AppConfig = serde_json::from_str(r#"{"archive":{"enabled":false}}"#).unwrap();
+        assert!(!partial.archive.enabled);
+        assert_eq!(partial.archive.retention_days, 14);
+        assert_eq!(partial.archive.path, "archive");
+    }
+
+    #[test]
+    fn repair_section_defaults_and_parses() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.repair.mode, RepairMode::Off);
+        assert_eq!(old.repair.evidence_days, 14);
+        assert_eq!(old.repair.evidence_max_mb, 200);
+        assert_eq!(old.repair.hold_hours, 24);
+        assert_eq!(old.repair.held_max_gb, 20);
+        let set: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"shadow","evidence_days":3}}"#).unwrap();
+        assert_eq!(set.repair.mode, RepairMode::Shadow);
+        assert_eq!(set.repair.evidence_days, 3);
+        assert_eq!(set.repair.evidence_max_mb, 200);
+    }
+
+    #[test]
+    fn the_repair_model_rung_is_off_by_default_and_needs_a_model_name() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        let r = &old.repair;
+        assert!(!r.llm_enabled && r.llm_model.is_none(), "off, and no model fallback");
+        assert_eq!((r.llm_timeout_secs, r.llm_max_tokens, r.llm_max_calls_per_day), (60, 4000, 15));
+        assert_eq!(r.llm_reasoning_effort.as_deref(), Some("medium"));
+        let set: AppConfig = serde_json::from_str(
+            r#"{"repair":{"llm_enabled":true,"llm_model":"model-x","llm_reasoning_effort":null,"llm_max_calls_per_day":5}}"#,
+        )
+        .unwrap();
+        assert!(set.repair.llm_enabled);
+        assert_eq!(set.repair.llm_model.as_deref(), Some("model-x"));
+        assert_eq!(set.repair.llm_reasoning_effort, None);
+        assert_eq!(set.repair.llm_max_calls_per_day, 5);
+        assert_eq!(set.repair.llm_timeout_secs, 60);
+    }
 
     #[test]
     fn secrets_never_reach_config_json() {

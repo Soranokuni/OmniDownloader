@@ -379,12 +379,134 @@ pub struct JobsQuery {
 
 /// A job as the MCR desk shows it: the row, plus what its error code means
 /// and what to do about it, in the operators' language.
-fn job_for_desk(job: &omni_core::models::Job) -> serde_json::Value {
+fn job_for_desk(repo: &omni_core::repository::Repository, job: &omni_core::models::Job) -> serde_json::Value {
     let mut v = serde_json::to_value(job).unwrap_or_default();
     if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
-        v["hint"] = serde_json::Value::String(code.hint_el().to_string());
+        // A login wall names the site and says whether its cookies are there (P3.5).
+        v["hint"] = serde_json::Value::String(omni_broadcast::errors::hint_for_job(code, &job.url, repo));
     }
     v
+}
+
+/// What the desk needs to approve a held video: the file's SHA-256 (sent
+/// back with the approval), its size and its deadline. `null` unless a video
+/// is waiting for this job (P10.5).
+fn held_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+    if job.status != JobStatus::AwaitingApproval {
+        return serde_json::Value::Null;
+    }
+    match state.repo.waiting_held(job.id) {
+        Ok(Some(h)) => serde_json::json!({
+            "sha256": h.sha256,
+            "bytes": h.bytes,
+            "duration": h.duration,
+            "created_at": h.created_at.map(omni_core::timestamps::format),
+            "expires_at": h.expires_at.map(omni_core::timestamps::format),
+            "preview": std::path::Path::new(&h.path).parent().map(preview_flags),
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Which preview files this held video has (P10.6), so the desk knows what to
+/// show; the files live next to the held MXF, under fixed names.
+fn preview_flags(dir: &std::path::Path) -> serde_json::Value {
+    use omni_broadcast::preview::{ARTICLE_FILE, AUDIO_FILE, CONTACT_FILE, FRAME_FILE, VIDEO_FILE};
+    let has = |name: &str| dir.join(name).is_file();
+    serde_json::json!({
+        "video": has(VIDEO_FILE),
+        "audio_only": !has(VIDEO_FILE) && has(AUDIO_FILE),
+        "contact": has(CONTACT_FILE),
+        "article": has(ARTICLE_FILE),
+        "frame": has(FRAME_FILE),
+    })
+}
+
+/// Whether the live config lets MCR ask for the next verified candidate (`repair.mode = hold`).
+async fn next_choice_allowed(state: &AppState) -> bool {
+    state.config.read().await.repair.mode == omni_core::config::RepairMode::Hold
+}
+
+/// How a repaired video was found and why it can be trusted (P10.11b), for the
+/// approval card: `null` unless this job's latest held repair attempt exists.
+fn repair_for_desk(state: &AppState, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
+    if job.status != JobStatus::AwaitingApproval {
+        return serde_json::Value::Null;
+    }
+    let Ok(Some(attempt)) = state.repo.latest_held_attempt(job.id) else {
+        return serde_json::Value::Null;
+    };
+    let origin = attempt.recipe_id.and_then(|id| state.repo.recipe_origin(id).ok().flatten());
+    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
+        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
+        _ => 0,
+    };
+    // `next_ok`: only `hold` mode lets MCR walk the verified list (P10.13); the handler read the live mode.
+    let next_left = if next_ok { state.repo.next_left(job.id, chrono::Utc::now()).unwrap_or(0) } else { 0 };
+    crate::repair_card::build(&attempt, origin.as_deref(), approvals)
+        .map(|card| crate::repair_card::with_next_left(card, next_left))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The directory a job's preview files are in: the parent of the held row's
+/// file, while the video waits or is approved and not yet delivered. Never
+/// built from the request.
+fn preview_dir(state: &AppState, job_id: i64) -> Option<std::path::PathBuf> {
+    let row = state.repo.get_held(job_id).ok()??;
+    if !matches!(row.decision.as_deref(), None | Some("approved")) {
+        return None;
+    }
+    let dir = std::path::Path::new(&row.path).parent()?.to_path_buf();
+    match &state.temp_dir {
+        Some(temp) if dir != omni_core::held::held_dir(temp, job_id) => None,
+        _ => Some(dir),
+    }
+}
+
+/// Serve one fixed preview file with Range support, so the desk can seek.
+async fn serve_preview(state: &AppState, job_id: i64, names: &[(&str, &'static str)], req: Request) -> Response {
+    let Some(dir) = preview_dir(state, job_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    for (name, mime) in names {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let mut svc = tower_http::services::ServeFile::new(path);
+        return match tower::Service::call(&mut svc, req).await {
+            Ok(res) => {
+                let mut res = res.map(axum::body::Body::new);
+                let h = res.headers_mut();
+                h.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static(mime));
+                h.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
+                res
+            }
+            Err(never) => match never {},
+        };
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// `GET /api/jobs/:id/preview/video`: the 540p preview (or the audio-only one).
+pub async fn api_preview_video(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    use omni_broadcast::preview::{AUDIO_FILE, VIDEO_FILE};
+    serve_preview(&state, id, &[(VIDEO_FILE, "video/mp4"), (AUDIO_FILE, "audio/mp4")], req).await
+}
+
+/// `GET /api/jobs/:id/preview/contact`: the contact sheet.
+pub async fn api_preview_contact(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    serve_preview(&state, id, &[(omni_broadcast::preview::CONTACT_FILE, "image/jpeg")], req).await
+}
+
+/// `GET /api/jobs/:id/preview/article`: the article's picture, when one was kept.
+pub async fn api_preview_article(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    serve_preview(&state, id, &[(omni_broadcast::preview::ARTICLE_FILE, "image/jpeg")], req).await
+}
+
+/// `GET /api/jobs/:id/preview/frame`: the preview frame closest to the article picture.
+pub async fn api_preview_frame(RequireMcr(_p): RequireMcr, AxumPath(id): AxumPath<i64>, State(state): State<AppState>, req: Request) -> Response {
+    serve_preview(&state, id, &[(omni_broadcast::preview::FRAME_FILE, "image/jpeg")], req).await
 }
 
 pub async fn api_get_jobs(
@@ -413,11 +535,14 @@ pub async fn api_get_jobs(
         } else {
             Default::default()
         };
+        let next_ok = next_choice_allowed(&state).await;
         let jobs: Vec<serde_json::Value> = page
             .jobs
             .iter()
             .map(|j| {
-                let mut v = job_for_desk(j);
+                let mut v = job_for_desk(&state.repo, j);
+                v["held"] = held_for_desk(&state, j);
+                v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -450,19 +575,6 @@ pub async fn api_get_jobs(
     Ok(Json(serde_json::json!({ "jobs": jobs })))
 }
 
-/// A journalist's own jobs. Separate from `/api/jobs?my=true` so the user panel
-/// needs no MCR access at all.
-pub async fn api_get_my_jobs(
-    RequireUser(user): RequireUser,
-    State(state): State<AppState>,
-) -> JsonResult {
-    let jobs = state
-        .repo
-        .get_user_jobs(user.id)
-        .map_err(internal_error("Could not read your jobs."))?;
-    Ok(Json(serde_json::json!({ "jobs": jobs })))
-}
-
 pub async fn api_get_job(
     RequireMcr(_): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
@@ -478,7 +590,10 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
-    Ok(Json(serde_json::json!({ "job": job_for_desk(&job), "events": events })))
+    let mut desk_job = job_for_desk(&state.repo, &job);
+    desk_job["held"] = held_for_desk(&state, &job);
+    desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
+    Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
 }
 
 #[derive(Deserialize)]
@@ -539,7 +654,7 @@ pub async fn api_create_job(
         })?
         .job_id();
 
-    state.broadcast_event("job_created");
+    state.broadcast_job_event("job_created", job_id);
     Ok(Json(
         serde_json::json!({ "status": "ok", "job_id": job_id, "slug": slug }),
     ))
@@ -550,7 +665,7 @@ pub async fn api_create_job(
 /// `javascript:` and `data:` links are the interesting ones: they are harmless
 /// to yt-dlp but become live code the moment a panel renders one as an `href`.
 /// Rejecting them at the door is cheaper than trusting every future renderer.
-fn is_submittable_url(url: &str) -> bool {
+pub(crate) fn is_submittable_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     (lower.starts_with("http://") || lower.starts_with("https://"))
         && url.len() <= 2048
@@ -563,7 +678,7 @@ fn is_submittable_url(url: &str) -> bool {
 /// are constrained to `[A-Z0-9-]` — not as an XSS defence (the panels escape
 /// separately) but because a slug is a filename and a filename with a quote,
 /// a slash or a NUL in it is a delivery failure at best.
-fn sanitize_token(raw: &str, fallback: &str) -> String {
+pub(crate) fn sanitize_token(raw: &str, fallback: &str) -> String {
     // Greek typed in the form ("Σεισμός") becomes the house Latin form
     // (ELOT 743, as the email parser makes keywords), not a row of dashes.
     let latin = omni_core::translit::translit(raw.trim());
@@ -621,7 +736,7 @@ pub async fn api_override_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: URL overridden"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -657,7 +772,7 @@ pub async fn api_rename_job(
         .repo
         .record_event(job_id, "INFO", None, &format!("Renamed by {who}: {old} → {new}"));
     audit_action(&state, &principal, &format!("Job #{job_id}: renamed {old} → {new}"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok", "slug": new, "keyword": keyword })))
 }
 
@@ -743,7 +858,7 @@ pub async fn api_queue_offer(
         &format!("Offered video queued by MCR as {index} (job #{}): {}", result.job_id(), payload.url.trim()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: offered video queued as job #{}", result.job_id()));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok", "job_id": result.job_id(), "index_str": index })))
 }
 
@@ -771,8 +886,140 @@ pub async fn api_retry_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// The video is not waiting for a decision (P10.5): never held, decided
+/// already, a different file than the one named, or expired.
+fn not_held() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "NOT_HELD",
+        "Αυτό το βίντεο δεν περιμένει έγκριση: αποφασίστηκε ήδη, έληξε, ή το αρχείο άλλαξε. Ανανεώστε τη λίστα.",
+    )
+}
+
+#[derive(Deserialize)]
+pub struct ApprovePayload {
+    /// The SHA-256 the desk was shown: the approval is for exactly that file.
+    sha256: String,
+}
+
+/// MCR approves the video a job held back; the job goes back to the queue
+/// and the worker that takes it delivers exactly the file with this SHA-256.
+pub async fn api_approve_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<ApprovePayload>,
+) -> JsonResult {
+    let sha = payload.sha256.trim().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("Λάθος αποτύπωμα αρχείου (SHA-256)."));
+    }
+    let approved = state
+        .repo
+        .approve_held(job_id, &sha, &principal.audit_label())
+        .map_err(internal_error("Could not approve the video."))?;
+    if !approved {
+        return Err(not_held());
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: held video approved (sha256 {sha})"));
+    state.broadcast_job_event("job_updated", job_id);
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+pub struct RejectPayload {
+    reason: String,
+    note: Option<String>,
+}
+
+/// The job's message for a rejection: what MCR said, in the desk's language.
+fn rejection_message(reason: &str, note: Option<&str>) -> Option<String> {
+    let base = match reason {
+        "wrong_video" => "Το MCR απέρριψε το βίντεο: δεν είναι το σωστό.",
+        "not_usable" => "Το MCR απέρριψε το βίντεο: δεν είναι αξιοποιήσιμο.",
+        "other" => "Το MCR απέρριψε το βίντεο.",
+        _ => return None,
+    };
+    let note: String = note
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let note = note.trim();
+    Some(if note.is_empty() { base.to_string() } else { format!("{base} Σημείωση: {note}") })
+}
+
+/// MCR rejects the video a job held back: the job goes to review, the file
+/// is deleted.
+pub async fn api_reject_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<RejectPayload>,
+) -> JsonResult {
+    if payload.note.as_deref().is_some_and(|n| n.chars().count() > 300) {
+        return Err(ApiError::bad_request("Η σημείωση μπορεί να έχει έως 300 χαρακτήρες."));
+    }
+    let Some(message) = rejection_message(&payload.reason, payload.note.as_deref()) else {
+        return Err(ApiError::bad_request("Άγνωστος λόγος απόρριψης."));
+    };
+    let rejected = state
+        .repo
+        .reject_held(job_id, &payload.reason, &message, &principal.audit_label())
+        .map_err(internal_error("Could not reject the video."))?;
+    if !rejected {
+        return Err(not_held());
+    }
+    // The file goes now; if that fails the sweep tries again.
+    if let Some(temp) = state.temp_dir.clone() {
+        let _ = tokio::task::spawn_blocking(move || omni_core::held::remove_held_dir(&temp, job_id)).await;
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected ({})", payload.reason));
+    state.broadcast_job_event("job_updated", job_id);
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// MCR's «Επόμενη επιλογή» (P10.13): the held video is the wrong one, and the
+/// next candidate the repair already verified is downloaded and held for approval.
+/// The file goes now, like a rejection; the page is not searched again.
+pub async fn api_next_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+    Json(payload): Json<ApprovePayload>,
+) -> JsonResult {
+    let sha = payload.sha256.trim().to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("Λάθος αποτύπωμα αρχείου (SHA-256)."));
+    }
+    if state.config.read().await.repair.mode != omni_core::config::RepairMode::Hold {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "REPAIR_OFF",
+            "Η αυτόματη επισκευή είναι απενεργοποιημένη· η επόμενη επιλογή δεν είναι διαθέσιμη.",
+        ));
+    }
+    let index = state
+        .repo
+        .next_candidate(job_id, &sha, &principal.audit_label(), chrono::Utc::now())
+        .map_err(internal_error("Could not choose the next video."))?;
+    let Some(index) = index else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "NO_NEXT",
+            "Δεν υπάρχει άλλη επαληθευμένη επιλογή, ή το βίντεο δεν περιμένει πια έγκριση. Ανανεώστε τη λίστα.",
+        ));
+    };
+    if let Some(temp) = state.temp_dir.clone() {
+        let _ = tokio::task::spawn_blocking(move || omni_core::held::remove_held_dir(&temp, job_id)).await;
+    }
+    audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected (wrong video); next choice #{}", index + 1));
+    state.broadcast_job_event("job_updated", job_id);
+    Ok(Json(serde_json::json!({ "status": "ok", "index": index })))
 }
 
 /// Take every delivered job off the live queue. Nothing is deleted.
@@ -832,7 +1079,7 @@ pub async fn api_redownload_job(
         &format!("Download again requested by {}", principal.audit_label()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: download again"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -860,7 +1107,7 @@ pub async fn api_mark_done_job(
         &format!("Finished as COMPLETED_MANUAL: put into Dalet by hand by {}", principal.audit_label()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: marked as put into Dalet by hand"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -898,7 +1145,7 @@ pub async fn api_cancel_job(
         .repo
         .record_event(job_id, "WARN", None, &format!("Cancelled by {}", principal.audit_label()));
     audit_action(&state, &principal, &format!("Job #{job_id}: cancelled"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -914,7 +1161,7 @@ pub async fn api_discard_job(
     state.busy_jobs.cancel(job_id);
 
     audit_action(&state, &principal, &format!("Job #{job_id}: discarded"));
-    state.broadcast_event("job_deleted");
+    state.broadcast_job_event("job_deleted", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1543,9 +1790,43 @@ pub async fn api_admin_selfcheck(RequireAdmin(_): RequireAdmin, State(state): St
         .repo
         .list_selfcheck_links()
         .map_err(internal_error("Could not read the self-check links."))?;
+    // The recent known-good articles per news site (plan P10.4).
+    let canaries: Vec<serde_json::Value> = state
+        .repo
+        .list_canaries()
+        .map_err(internal_error("Could not read the site canaries."))?
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "domain": c.domain,
+                "url": c.url,
+                "last_ok": c.last_ok,
+                "last_checked_at": c.last_checked_at,
+                "last_detail": c.last_detail,
+            })
+        })
+        .collect();
+    // The overnight self-heal runs of the last 30 days (plan P10.14).
+    let selfheal: Vec<serde_json::Value> = state
+        .repo
+        .selfheal_since(chrono::Utc::now() - chrono::Duration::days(omni_core::repository::SELFHEAL_KEEP_DAYS))
+        .map_err(internal_error("Could not read the self-heal reports."))?
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "domain": r.domain,
+                "at": r.at,
+                "outcome": r.outcome,
+                "origin": r.origin,
+                "pages": r.pages,
+            })
+        })
+        .collect();
     let checks = state.health.all();
     Ok(Json(serde_json::json!({
         "links": links,
+        "canaries": canaries,
+        "selfheal": selfheal,
         "summary": checks.get(omni_core::health::checks::SELFCHECK),
         "browser": checks.get(omni_core::health::checks::BROWSER),
     })))
@@ -1733,10 +2014,35 @@ pub async fn api_system_status(
 
     let checks = state.health.all();
 
+    // Sites that stopped giving video (P10.3); `null` when the query failed.
+    let sites = state.repo.list_sites_not_healthy().ok().map(|rows| {
+        rows.into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "domain": r.domain,
+                    "state": r.state.as_str(),
+                    "consecutive_fail": r.consecutive_fail,
+                    "state_since": r.state_since,
+                    "last_code": r.last_code,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // What last night's self-heal found (P10.14); `null` when the query failed.
+    // A host, the time, the outcome and the kind of recipe: never a page address.
+    let selfheal = state.repo.selfheal_since(chrono::Utc::now() - chrono::Duration::hours(24)).ok().map(|rows| {
+        rows.into_iter()
+            .map(|r| serde_json::json!({ "domain": r.domain, "at": r.at, "outcome": r.outcome, "origin": r.origin }))
+            .collect::<Vec<_>>()
+    });
+
     Json(serde_json::json!({
         "status": state.health.overall().as_str(),
         "checks": checks,
         "queue": queue,
+        "sites": sites,
+        "selfheal": selfheal,
         "disk": {
             "watchfolder": disk_of(&watchfolder),
             "temp": disk_of(&temp_path),
@@ -2002,12 +2308,15 @@ pub async fn api_get_mail_view(
     let by_id: HashMap<i64, &omni_core::models::Job> = jobs.iter().map(|j| (j.id, j)).collect();
     // The Email tab's cards say the place in the queue too (plan P7.19).
     let positions = state.repo.pending_positions().unwrap_or_default();
+    let next_ok = next_choice_allowed(&state).await;
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
-                let mut v = job_for_desk(j);
+                let mut v = job_for_desk(&state.repo, j);
+                v["held"] = held_for_desk(&state, j);
+                v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -2144,7 +2453,7 @@ pub async fn api_mail_queue_link(
         );
     }
     audit_action(&state, &principal, &format!("Job #{job_id}: queued from the email '{subject}'"));
-    state.broadcast_event("job_created");
+    state.broadcast_job_event("job_created", job_id);
     Ok(Json(serde_json::json!({
         "status": "ok",
         "job_id": job_id,
@@ -2575,13 +2884,18 @@ pub async fn api_setup_state(State(state): State<AppState>, req: Request) -> Jso
 // Real-Time Server-Sent Events (SSE)
 // ==========================================
 
+/// The text of one stream item. A desk that fell behind lost events: it is told so
+/// and reloads, instead of silently showing a stale card.
+fn sse_payload(msg: Result<String, tokio_stream::wrappers::errors::BroadcastStreamRecvError>) -> String {
+    msg.unwrap_or_else(|_| r#"{"type":"lagged"}"#.to_string())
+}
+
 pub async fn api_events(
     RequireMcr(_): RequireMcr,
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.event_tx.subscribe();
-    let stream =
-        BroadcastStream::new(rx).filter_map(|msg| msg.ok().map(|txt| Ok(Event::default().data(txt))));
+    let rx = state.events.subscribe();
+    let stream = BroadcastStream::new(rx).map(|msg| Ok(Event::default().data(sse_payload(msg))));
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
@@ -2599,6 +2913,14 @@ pub fn parse_ip(s: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lagged_stream_item_becomes_a_lagged_event() {
+        use tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged;
+        let v: serde_json::Value = serde_json::from_str(&sse_payload(Err(Lagged(7)))).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "lagged"}));
+        assert_eq!(sse_payload(Ok("{\"type\":\"x\"}".into())), "{\"type\":\"x\"}");
+    }
 
     #[test]
     fn slug_tokens_are_reduced_to_filename_safe_text() {

@@ -1,0 +1,20 @@
+<!doctype html><html lang="el"><head><meta charset="utf-8"><title>Δοκιμαστικό άρθρο</title>
+<style>#consent{position:fixed;inset:0;background:#000c;z-index:99}</style></head><body>
+<h1>Άρθρο πίσω από συναίνεση</h1>
+<div id="player-slot"></div>
+<div id="consent"><p>Εφευρεμένη ειδοποίηση cookies.</p>
+<button id="consent-accept-all" type="button">Αποδοχή όλων</button></div>
+<script>
+// The player is only built once consent is given.
+document.getElementById('consent-accept-all').addEventListener('click', function () {
+  document.getElementById('consent').remove();
+  var v = document.createElement('video');
+  v.controls = true;
+  var s = document.createElement('source');
+  s.src = '{{BASE}}/media/consent/master.m3u8';
+  s.type = 'application/x-mpegURL';
+  v.appendChild(s);
+  document.getElementById('player-slot').appendChild(v);
+});
+</script>
+</body></html>

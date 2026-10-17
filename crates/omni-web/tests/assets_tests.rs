@@ -371,3 +371,55 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
         .collect();
     assert_eq!(versions.len(), 1, "pages import different app.js versions: {versions:?}");
 }
+
+/// P1.10: the desk's live job events. One URL per ES module (two versions of a
+/// module load twice), and the desk no longer refetches everything per event.
+#[test]
+fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
+    let assets = all_assets();
+    for (module, version) in [("desk.js", 11), ("inbox.js", 17), ("approval.js", 6), ("mcr.js", 42)] {
+        let needle = format!("/static/{module}?v=");
+        let mut found = std::collections::BTreeSet::new();
+        for s in assets.values() {
+            for (i, _) in s.match_indices(needle.as_str()) {
+                let rest = &s[i + needle.len()..];
+                let n = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                found.insert(rest[..n].to_string());
+            }
+        }
+        assert_eq!(found, [version.to_string()].into(), "{module} is imported under different versions");
+    }
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    assert!(mcr.contains("applyJobEvent"), "mcr.js does not apply job events in place");
+    assert!(mcr.contains("new EventSource('/api/events')"), "mcr.js opens no stream of its own");
+    assert!(!mcr.contains("live(() =>"), "mcr.js still refetches everything per event");
+    // Events are an accelerator: the 5 s poll must not depend on the stream, or new, requeued
+    // and reaped jobs and health changes (which send no event) would lag.
+    assert!(mcr.contains("setInterval(reloadAll, 5000)"), "the unconditional 5 s poll is gone");
+    assert!(!mcr.contains("readyState"), "the poll is gated on the stream state");
+    // The module ends with the top-level poll and nothing after it: a leftover
+    // `}, 5000);` from an old wrapper is a SyntaxError that kills the whole desk.
+    let tail: Vec<&str> = mcr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        tail[tail.len() - 2..],
+        ["setInterval(reloadAll, 5000);", "reloadAll();"],
+        "mcr.js must end with the unconditional poll"
+    );
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
+    let assets = all_assets();
+    let page = assets.get("user.html").expect("user.html shipped");
+    assert!(page.contains("/static/user.js?v=7"), "user.html does not import user.js?v=7");
+    assert!(!page.contains("/static/user.js?v=6"), "user.html still imports the old user.js");
+
+    let js = assets.get("static/user.js").expect("user.js shipped");
+    let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
+    let code = code.join("\n");
+    // The MCR route answers 403 to a plain user; the panel must not post there.
+    assert!(!code.contains("'/api/jobs'"), "user.js posts to the MCR-only /api/jobs");
+    assert!(code.contains("/api/user/jobs"));
+    assert!(code.contains("/api/user/prefs"));
+    assert!(!code.contains("innerHTML"));
+}

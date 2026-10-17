@@ -13,16 +13,17 @@
  */
 
 import {
-  api, el, render, live, toast, fmtTime, fmtDuration, logout, safeHref, icon,
+  api, el, render, toast, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
 import {
   stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
-  redownloadJob as deskRedownload, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
+  redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=8';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=14';
-import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=8';
+} from '/static/desk.js?v=11';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=17';
+import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=10';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=6';
 
 let journalists = [];
 
@@ -53,6 +54,10 @@ function switchTab(name) {
     if (section) section.hidden = tab !== name;
   }
   document.body.classList.toggle('desk-wide', name === 'email');
+  // A held video keeps playing behind a hidden tab otherwise.
+  if (name !== 'review') {
+    for (const m of document.querySelectorAll('#approval-section video, #approval-section audio')) m.pause();
+  }
   if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
   if (name === 'journalists') loadJournalists();
   refresh();
@@ -74,6 +79,12 @@ for (const button of document.querySelectorAll('.tab[data-tab]')) {
     document.getElementById(`tabbtn-${TABS[to]}`)?.focus();
   });
 }
+
+// The Email tab's «Για έγκριση» chip: open the review tab at that card.
+window.addEventListener('desk:approval', (ev) => {
+  switchTab('review');
+  focusApproval(ev.detail.id);
+});
 
 // A link or back/forward that changes only the hash. switchTab's replaceState
 // does not fire this, so there is no loop.
@@ -190,7 +201,7 @@ async function loadStatusOnce() {
 
   const queue = data.queue;
   document.getElementById('queue-status').textContent = queue
-    ? `Ουρά: ${queue.pending} σε αναμονή · ${queue.running} σε εξέλιξη`
+    ? `Ουρά: ${queue.pending} σε αναμονή · ${queue.running} σε εξέλιξη${queue.approval > 0 ? ` · Για έγκριση ${queue.approval}` : ''}`
     : 'Ουρά: —';
   const tempFree = data.disk?.temp?.free_gb;
   document.getElementById('temp-status').textContent =
@@ -229,7 +240,25 @@ async function loadStatusOnce() {
       }),
     ));
   }
+  renderSelfheal(data.selfheal);
   watchStatus(data);
+}
+
+// One line per site the overnight self-heal found a new way for in the last 24 h
+// (P10.14). A line only: a broken site is the banner's, never a chime. The
+// video it finds still waits for MCR's approval.
+function renderSelfheal(list) {
+  const box = document.getElementById('selfheal-lines');
+  const found = new Set((Array.isArray(list) ? list : []).filter((r) => r.outcome === 'found').map((r) => r.domain));
+  if (found.size === 0) {
+    box.hidden = true;
+    render(box);
+    return;
+  }
+  box.hidden = false;
+  render(box, el('div', { class: 'card' },
+    ...[...found].map((domain) => el('div', {}, `${domain}: η σελίδα άλλαξε· βρέθηκε νέος τρόπος (θα ζητηθεί έγκριση)`)),
+  ));
 }
 
 function label(check) {
@@ -256,6 +285,7 @@ function setStatus(prefix, text, dotClass, title) {
 const pages = {
   live: { page: 1, perPage: 15 },
   review: { page: 1, perPage: 20 },
+  approval: { page: 1, perPage: 100 },
   completed: { page: 1, perPage: 25 },
 };
 
@@ -274,7 +304,8 @@ function showCounts(counts) {
     b.textContent = String(n || 0);
   };
   set('queue-count', counts.active);
-  set('review-count', counts.review);
+  // Held videos wait for a person too, so they count on the same tab.
+  set('review-count', (counts.review || 0) + (counts.approval || 0));
   // The Completed badge is today's deliveries; the total is in the tooltip.
   set('completed-count', counts.completed_today);
   document.getElementById('completed-count').title = `Σήμερα · σύνολο ${counts.completed || 0}`;
@@ -396,6 +427,10 @@ const queueOffer = (id, offer) => deskQueueOffer(id, offer, refresh);
  * Live queue
  * ------------------------------------------------------------------ */
 
+/** The waiting and running cards on screen, by job id: a live `job` event
+ *  redraws just its card (P1.10). Rebuilt by every loadQueue. */
+const liveCards = new Map();
+
 async function loadQueue() {
   let data;
   try {
@@ -408,7 +443,14 @@ async function loadQueue() {
     render('queue-cards', el('div', { class: 'card center' },
       'Δεν περιμένει τίποτα. Οι νέοι σύνδεσμοι από email εμφανίζονται εδώ αυτόματα.'));
   } else {
-    render('queue-cards', jobs.map((j) => (j.status === 'PENDING' || j.status === 'RUNNING' ? activeCard(j) : deliveredCard(j))));
+    liveCards.clear();
+    const cards = jobs.map((j) => {
+      if (j.status !== 'PENDING' && j.status !== 'RUNNING') return deliveredCard(j);
+      const node = activeCard(j);
+      liveCards.set(j.id, { job: j, node });
+      return node;
+    });
+    render('queue-cards', cards);
   }
   pager('queue-pager', pages.live, data.total || 0, loadQueue);
 }
@@ -574,7 +616,20 @@ function withDayHeadings(jobs, card) {
   return out;
 }
 
+/* The held videos (P10.7): fetched with every review refresh, but their cards
+ * are reconciled by job id (approval.js), never rebuilt. A failed fetch leaves
+ * the cards as they are. */
+async function loadApproval() {
+  try {
+    const data = await fetchPage('approval');
+    syncApproval(document.getElementById('approval-section'), data.jobs || [], {
+      mailLink, historyPanel, markDone: (job) => deskMarkDone(job, refresh), refresh,
+    });
+  } catch (e) { failed(e); }
+}
+
 async function loadReview() {
+  await loadApproval();
   let data;
   try {
     const extra = {};
@@ -587,7 +642,7 @@ async function loadReview() {
   showCounts(data.counts);
   const jobs = data.jobs || [];
   // Forget the history of jobs that left the page; keep the rest.
-  const here = new Set(jobs.map((j) => j.id));
+  const here = new Set([...jobs.map((j) => j.id), ...approvalIds()]);
   for (const id of [...historyState.keys(), ...historyBox.keys(), ...historyOpen, ...historyTech]) {
     if (here.has(id)) continue;
     historyState.delete(id); historyBox.delete(id); historyOpen.delete(id); historyTech.delete(id);
@@ -991,4 +1046,46 @@ initNotify(document.querySelector('.topbar-status'), (id) => {
 }, () => switchTab('review'));
 loadFilters();
 switchTab(currentTab);
-live(() => { refresh(); loadStatus(); });
+
+/* Live updates (P1.10). The server streams one JSON event per change; a job
+ * event redraws that job's card, anything else (or anything unreadable)
+ * reloads the open list, at most once a second. The 5 s poll stays underneath,
+ * always. */
+const reloadAll = () => { refresh(); loadStatus(); };
+let reloadTimer = null;
+function reloadSoon() {
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(() => { reloadTimer = null; reloadAll(); }, 1000);
+}
+
+function onLiveMessage(message) {
+  let ev = null;
+  try { ev = JSON.parse(message.data); } catch { /* not JSON: reload */ }
+  if (!ev || ev.type !== 'job' || typeof ev.id !== 'number') { reloadSoon(); return; }
+  const entry = currentTab === 'queue' ? liveCards.get(ev.id) : null;
+  const knownStage = entry ? entry.job.stage : seenStage.get(ev.id);
+  if (typeof ev.stage === 'string' && ev.status === 'RUNNING') seenStage.set(ev.id, ev.stage);
+  else seenStage.delete(ev.id);
+  if (entry && entry.node.isConnected && applyJobEvent(entry.job, ev)) {
+    const node = activeCard(entry.job);
+    entry.node.replaceWith(node);
+    entry.node = node;
+    return;
+  }
+  // A progress tick for a card that is not on screen: the 5 s poll covers it.
+  if (ev.status === 'RUNNING' && typeof ev.stage === 'string' && ev.stage === knownStage) return;
+  reloadSoon();
+}
+
+// The stage each running job was last seen in, to tell a progress tick from a stage change.
+const seenStage = new Map();
+
+let liveSource = null;
+try {
+  liveSource = new EventSource('/api/events');
+  liveSource.onmessage = onLiveMessage;
+} catch { /* polling alone */ }
+// Events are an accelerator; the poll stays the source of truth (new, requeued
+// and reaped jobs and health changes send none), so it never depends on the stream.
+setInterval(reloadAll, 5000);
+reloadAll();

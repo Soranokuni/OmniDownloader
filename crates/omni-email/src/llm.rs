@@ -57,6 +57,9 @@ pub struct LlmClient {
     auth: LlmAuth,
     api_key: String,
     disable_thinking: bool,
+    /// An explicit `reasoning_effort` (the repair rung: "medium"); sent instead
+    /// of the "none" `disable_thinking` asks for.
+    reasoning_effort: Option<String>,
     /// The server refused `response_format: json_schema`: use `json_object`.
     no_json_schema: AtomicBool,
     /// …and refused `json_object` too: no `response_format` at all (the
@@ -79,6 +82,13 @@ impl std::fmt::Debug for LlmClient {
             .field("auth", &self.auth)
             .finish_non_exhaustive()
     }
+}
+
+/// The tokens one completion used, as the provider reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 /// Strip a Markdown code fence some models wrap JSON in.
@@ -195,12 +205,21 @@ impl LlmClient {
             auth: cfg.auth,
             api_key: cfg.api_key.trim().to_string(),
             disable_thinking: cfg.disable_thinking,
+            reasoning_effort: None,
             no_json_schema: AtomicBool::new(false),
             no_response_format: AtomicBool::new(false),
             no_reasoning_param: AtomicBool::new(false),
             no_temperature: AtomicBool::new(false),
             use_max_completion_tokens: AtomicBool::new(false),
         }
+    }
+
+    /// Send this `reasoning_effort` (when not blank) instead of the one
+    /// `disable_thinking` implies. A server that refuses the field still gets
+    /// the request again without it.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        self
     }
 
     pub fn endpoint(&self) -> &str {
@@ -267,6 +286,18 @@ impl LlmClient {
         schema: &serde_json::Value,
         max_tokens: u32,
     ) -> Result<serde_json::Value> {
+        Ok(self.chat_json_usage(system, user, schema, max_tokens).await?.0)
+    }
+
+    /// [`Self::chat_json`], and the tokens the provider says it counted
+    /// (0 when the answer carries no `usage`).
+    pub async fn chat_json_usage(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &serde_json::Value,
+        max_tokens: u32,
+    ) -> Result<(serde_json::Value, Usage)> {
         for _attempt in 0..6 {
             let mut payload = serde_json::json!({
                 "model": self.model,
@@ -276,9 +307,13 @@ impl LlmClient {
                 ],
                 "stream": false,
             });
-            let sent_reasoning = self.disable_thinking && !self.no_reasoning_param.load(Ordering::Relaxed);
-            if sent_reasoning {
-                payload["reasoning_effort"] = serde_json::json!("none");
+            let effort = match &self.reasoning_effort {
+                Some(e) => Some(e.as_str()),
+                None => self.disable_thinking.then_some("none"),
+            };
+            let sent_reasoning = effort.is_some() && !self.no_reasoning_param.load(Ordering::Relaxed);
+            if let (true, Some(e)) = (sent_reasoning, effort) {
+                payload["reasoning_effort"] = serde_json::json!(e);
             }
             let sent_temperature = !self.no_temperature.load(Ordering::Relaxed);
             if sent_temperature {
@@ -344,7 +379,9 @@ impl LlmClient {
                 }
                 bail!("LLM answer is empty");
             }
-            return extract_json_object(&content);
+            let count = |p: &str| data.pointer(p).and_then(|v| v.as_u64()).map_or(0, |n| n.min(u64::from(u32::MAX)) as u32);
+            let usage = Usage { prompt_tokens: count("/usage/prompt_tokens"), completion_tokens: count("/usage/completion_tokens") };
+            return Ok((extract_json_object(&content)?, usage));
         }
         bail!("LLM at {} kept refusing the request", self.endpoint)
     }

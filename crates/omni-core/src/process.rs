@@ -54,6 +54,8 @@ pub struct RunOpts {
     pub cancel: Option<CancellationToken>,
     /// Working directory for the child.
     pub current_dir: Option<std::path::PathBuf>,
+    /// Run at below-normal CPU priority (background work next to a live ingest).
+    pub below_normal: bool,
 }
 
 impl RunOpts {
@@ -65,6 +67,7 @@ impl RunOpts {
             kill_tree: true,
             cancel: None,
             current_dir: None,
+            below_normal: false,
         }
     }
 
@@ -80,6 +83,13 @@ impl RunOpts {
 
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
+        self
+    }
+
+    /// Lower the child's CPU priority so it never competes with a transcode.
+    /// Windows only; a no-op elsewhere.
+    pub fn below_normal_priority(mut self) -> Self {
+        self.below_normal = true;
         self
     }
 
@@ -156,6 +166,7 @@ where
         kill_tree,
         cancel,
         current_dir,
+        below_normal,
     } = opts;
 
     let started = Instant::now();
@@ -174,7 +185,6 @@ where
 
     #[cfg(windows)]
     {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // Deliberately *not* CREATE_BREAKAWAY_FROM_JOB: when our own process is
         // already inside a job without JOB_OBJECT_LIMIT_BREAKAWAY_OK (a CI
         // agent, a terminal that groups its children, the SCM in some
@@ -182,7 +192,7 @@ where
         // ERROR_ACCESS_DENIED. Windows 8 and later nest job objects, so a plain
         // spawn can still be assigned to our kill-on-close job below.
         let _ = kill_tree;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(creation_flags(below_normal));
     }
 
     let mut child = cmd
@@ -308,6 +318,18 @@ where
     })
 }
 
+/// `CREATE_NO_WINDOW`, plus `BELOW_NORMAL_PRIORITY_CLASS` when asked.
+#[cfg(any(windows, test))]
+fn creation_flags(below_normal: bool) -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    if below_normal {
+        CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+    } else {
+        CREATE_NO_WINDOW
+    }
+}
+
 /// Await a pipe-drain task, abandoning it if an orphan is holding the pipe open.
 async fn join_bounded(
     task: tokio::task::JoinHandle<String>,
@@ -421,6 +443,13 @@ mod tests {
         } else {
             vec!["-c".into(), format!("sleep {secs}")]
         }
+    }
+
+    #[test]
+    fn below_normal_priority_composes_the_creation_flags() {
+        assert_eq!(creation_flags(false), 0x0800_0000);
+        assert_eq!(creation_flags(true), 0x0800_4000);
+        assert!(RunOpts::new(Duration::from_secs(1)).below_normal_priority().below_normal);
     }
 
     #[tokio::test]

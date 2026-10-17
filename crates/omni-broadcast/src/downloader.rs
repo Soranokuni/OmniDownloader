@@ -46,6 +46,9 @@ pub struct DownloadOpts<'a> {
     pub cookie_header: Option<&'a str>,
     /// Netscape cookie jar for this domain (plan P3.5).
     pub cookie_jar: Option<&'a Path>,
+    /// The jar's values: yt-dlp quotes a line it rejects, so every error text of a
+    /// run that had a jar is scrubbed of them.
+    pub cookie_values: &'a [String],
     /// Skip TLS verification. Off by default (defect D-17): a station that
     /// ingests whatever a MITM hands it is not a station with working ingest.
     pub insecure_tls: bool,
@@ -65,6 +68,7 @@ impl Default for DownloadOpts<'_> {
             user_agent: None,
             cookie_header: None,
             cookie_jar: None,
+            cookie_values: &[],
             insecure_tls: false,
             max_height: 1080,
             concurrent_fragments: 4,
@@ -143,6 +147,28 @@ pub struct Downloader {
     ytdl_path: PathBuf,
     /// `deno.exe` next to yt-dlp, when it is there.
     deno: Option<PathBuf>,
+    /// The site's cookie jar file for the probes of this value (P3.5); a
+    /// download takes its own from `DownloadOpts::cookie_jar`.
+    cookie_jar: Option<PathBuf>,
+    cookie_values: Vec<String>,
+}
+
+/// `line` without any of the jar's `values` (and without query strings, see
+/// [`omni_core::cookies::scrub_detail`]); unchanged when there is no jar.
+pub(crate) fn scrub_error(line: String, values: &[String]) -> String {
+    if values.is_empty() {
+        line
+    } else {
+        omni_core::cookies::scrub_detail(&line, values)
+    }
+}
+
+/// `--cookies <path>` when a jar is given.
+fn cookie_args(jar: Option<&Path>) -> Vec<String> {
+    match jar {
+        Some(p) => vec!["--cookies".into(), p.to_string_lossy().into_owned()],
+        None => Vec::new(),
+    }
 }
 
 /// `--js-runtimes deno:<path>`: yt-dlp only looks for Deno on PATH by
@@ -165,7 +191,21 @@ impl Downloader {
             .take(2)
             .map(|d| d.join("deno.exe"))
             .find(|p| p.is_file());
-        Self { ytdl_path, deno }
+        Self { ytdl_path, deno, cookie_jar: None, cookie_values: Vec::new() }
+    }
+
+    /// Probes made through this value carry the jar file (plan P3.5). The caller
+    /// keeps the file alive for the call and removes it after.
+    pub fn with_cookie_jar(mut self, jar: Option<&crate::cookie_file::CookieFile>) -> Self {
+        self.cookie_jar = jar.map(|j| j.path().to_path_buf());
+        self.cookie_values = jar.map(|j| j.values().to_vec()).unwrap_or_default();
+        self
+    }
+
+    /// A yt-dlp error line as it may be stored, logged or returned: with a jar
+    /// in play, without its values.
+    fn scrubbed(&self, line: String) -> String {
+        scrub_error(line, &self.cookie_values)
     }
 
     /// Build the yt-dlp argument vector.
@@ -209,6 +249,8 @@ impl Downloader {
             // Never resume a `.part` left by an earlier or cancelled run: the
             // same job may be retried with a different link (P1.15).
             "--no-continue".into(),
+            // The file keeps its download time, not the server's Last-Modified.
+            "--no-mtime".into(),
             // Nor take a complete `source.*` left in a kept workspace (a
             // restart or reap, then an override to a new link) as "already
             // downloaded": that would deliver the old link's video (P1.16).
@@ -286,7 +328,7 @@ impl Downloader {
         }
         let args = Self::build_args(url, output_dir, &opts);
 
-        info!("Job #{job_id}: downloading {url}");
+        info!("Job #{job_id}: downloading {}", omni_core::cookies::host_and_path(url));
 
         // yt-dlp prints the final path on stdout as well as progress lines, so
         // both are collected from the same stream.
@@ -306,6 +348,15 @@ impl Downloader {
             run_opts = run_opts.with_cancel(token);
         }
 
+        // The workspace is this job's own; a `source.*` left by an earlier
+        // owner must not be mistaken for this run's file by the fallback scan.
+        if let Err(e) = clear_stale_sources(output_dir).await {
+            return Err(DownloadError {
+                code: ErrorCode::PipelineFailed,
+                message: format!("could not clear a leftover source file in {output_dir:?}: {e}"),
+            }
+            .into());
+        }
         let outcome = run(&self.ytdl_path, &args, run_opts)
             .await
             .with_context(|| format!("Could not run yt-dlp at {:?}", self.ytdl_path))?;
@@ -320,7 +371,7 @@ impl Downloader {
             };
             return Err(DownloadError {
                 code,
-                message: first_error_line(&outcome.stderr_tail),
+                message: scrub_error(first_error_line(&outcome.stderr_tail), opts.cookie_values),
             }
             .into());
         }
@@ -329,14 +380,11 @@ impl Downloader {
         // directory scan only if that produced nothing usable, because a wrong
         // guess here feeds the wrong file to the transcoder.
         let candidates = printed_paths.lock().unwrap().clone();
-        for line in candidates.iter().rev() {
-            let p = PathBuf::from(line);
-            if p.is_file() {
-                return Ok(p);
-            }
+        if let Some(p) = printed_path_in_dir(&candidates, output_dir) {
+            return Ok(p);
         }
 
-        warn!("Job #{job_id}: yt-dlp did not print an output path; scanning {output_dir:?}");
+        warn!("Job #{job_id}: yt-dlp did not print a usable output path; scanning {output_dir:?}");
         find_downloaded_file(output_dir)
             .await
             .ok_or_else(|| anyhow!("yt-dlp reported success but produced no file in {output_dir:?}"))
@@ -417,11 +465,12 @@ impl Downloader {
         .map(|s| s.to_string())
         .collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
-            Ok(o) => Err(first_error_line(&o.stderr_tail)),
+            Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
     }
@@ -434,6 +483,7 @@ impl Downloader {
         let mut args: Vec<String> =
             ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()).collect();
         args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
             Ok(o) if o.success => PageScan { videos: parse_page_videos(&o.stdout), unsupported: false },
@@ -442,6 +492,118 @@ impl Downloader {
                 unsupported: crate::errors::classify_download_error(&o.stderr_tail) == ErrorCode::UnsupportedUrl,
             },
             _ => PageScan::default(),
+        }
+    }
+}
+
+/// What yt-dlp says about the video at a link, without downloading it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlatformInfo {
+    pub duration_secs: Option<f64>,
+    pub height: Option<u32>,
+    pub live: bool,
+}
+
+/// `--print "%(duration)s|%(height)s|%(is_live)s|%(live_status)s"`: the first
+/// non-empty line. A field yt-dlp does not know is `NA`.
+pub fn parse_platform_line(stdout: &str) -> Option<PlatformInfo> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let f: Vec<&str> = line.split('|').map(str::trim).collect();
+    if f.len() != 4 {
+        return None;
+    }
+    fn known(s: &str) -> Option<&str> {
+        (s != "NA" && !s.is_empty()).then_some(s)
+    }
+    Some(PlatformInfo {
+        duration_secs: known(f[0]).and_then(|s| s.parse::<f64>().ok()).filter(|d| d.is_finite()),
+        height: known(f[1]).and_then(|s| s.parse::<f64>().ok()).filter(|h| *h >= 0.0).map(|h| h as u32),
+        live: f[2] == "True" || matches!(f[3], "is_live" | "is_upcoming"),
+    })
+}
+
+impl Downloader {
+    /// Length, height and live flag of the video at `url` (a page or platform
+    /// link), without downloading it. `Err` is the one-line reason.
+    pub async fn probe_media(&self, url: &str, timeout: Duration) -> std::result::Result<PlatformInfo, String> {
+        let mut args: Vec<String> = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "15",
+            "--print",
+            "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_platform_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
+            Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
+            Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
+            Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
+        }
+    }
+}
+
+/// What yt-dlp says about a link, for the admin's Test URL (P10.15b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkInfo {
+    pub extractor: String,
+    pub title: Option<String>,
+    pub duration_secs: Option<f64>,
+    pub formats: usize,
+}
+
+/// `--print "%(extractor)s|%(duration)s|%(formats.:.format_id)j|%(title)s"`: the first
+/// non-empty line. The title is last, so a `|` in it stays in it.
+pub fn parse_info_line(stdout: &str) -> Option<LinkInfo> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let f: Vec<&str> = line.splitn(4, '|').collect();
+    if f.len() != 4 || f[0].is_empty() || f[0] == "NA" {
+        return None;
+    }
+    let known = |s: &str| (s != "NA" && !s.is_empty()).then(|| s.to_string());
+    Some(LinkInfo {
+        extractor: f[0].to_string(),
+        title: known(f[3].trim()).map(|t| t.chars().take(200).collect()),
+        duration_secs: known(f[1].trim()).and_then(|s| s.parse::<f64>().ok()).filter(|d| d.is_finite() && *d >= 0.0),
+        formats: serde_json::from_str::<Vec<serde_json::Value>>(f[2].trim()).map(|v| v.len()).unwrap_or(0),
+    })
+}
+
+impl Downloader {
+    /// Extractor, title, length and number of formats of the video at `url`, without
+    /// downloading it (`--simulate`). `Err` is the one-line reason.
+    pub async fn probe_info(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
+        let mut args: Vec<String> = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "15",
+            "--print",
+            "%(extractor)s|%(duration)s|%(formats.:.format_id)j|%(title)s",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => parse_info_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
+            Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
+            Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
+            Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
     }
 }
@@ -485,17 +647,63 @@ fn parse_progress(rest: &str) -> Option<DownloadProgress> {
     })
 }
 
-/// The largest complete file in the job's workspace.
+/// The last printed line that names a file inside `output_dir`. A path that
+/// resolves elsewhere is refused: it is not this run's download.
+fn printed_path_in_dir(lines: &[String], output_dir: &Path) -> Option<PathBuf> {
+    let root = output_dir.canonicalize();
+    lines.iter().rev().find_map(|line| {
+        let p = PathBuf::from(line);
+        if !p.is_file() {
+            return None;
+        }
+        let inside = match (p.canonicalize(), &root) {
+            (Ok(real), Ok(root)) => real.starts_with(root),
+            _ => lexically_directly_inside(&p, output_dir),
+        };
+        inside.then_some(p)
+    })
+}
+
+/// Fallback when a path cannot be canonicalised: absolute, and its parent is
+/// exactly `output_dir`.
+fn lexically_directly_inside(p: &Path, output_dir: &Path) -> bool {
+    p.is_absolute() && p.parent() == Some(output_dir)
+}
+
+/// Remove every `source.*` file left in `dir` by an earlier owner of the job,
+/// so the fallback scan can only ever see this run's output. A file that
+/// cannot be removed is an error: running on with it present is the bug.
+async fn clear_stale_sources(dir: &Path) -> std::io::Result<()> {
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_name().to_string_lossy().to_lowercase().starts_with("source.") {
+            continue;
+        }
+        if entry.metadata().await?.is_file() {
+            tokio::fs::remove_file(entry.path()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The largest complete `source.*` file in the job's workspace.
 ///
-/// Only used when yt-dlp printed no path. `.part` and `.ytdl` are in-progress
-/// artefacts; picking one would hand a truncated file to the transcoder.
+/// Only used when yt-dlp printed no path, after [`clear_stale_sources`] ran
+/// before the spawn. `.part*` and `.ytdl` are in-progress artefacts; picking
+/// one would hand a truncated file to the transcoder. No mtime test: yt-dlp may
+/// stamp a fresh file with the server's date.
 async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name.ends_with(".part") || name.ends_with(".ytdl") || name.ends_with(".tmp") {
+        if !name.starts_with("source.")
+            || name.contains(".part")
+            || name.ends_with(".ytdl")
+            || name.ends_with(".tmp")
+            || name.ends_with(".temp")
+        {
             continue;
         }
         let Ok(meta) = entry.metadata().await else {
@@ -512,7 +720,7 @@ async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The first `ERROR:` line, which is the one worth showing an operator.
-fn first_error_line(stderr: &str) -> String {
+pub(crate) fn first_error_line(stderr: &str) -> String {
     stderr
         .lines()
         .find(|l| l.trim_start().to_uppercase().starts_with("ERROR"))
@@ -527,6 +735,7 @@ fn first_error_line(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     fn args_for(opts: &DownloadOpts<'_>) -> Vec<String> {
         Downloader::build_args(
@@ -534,6 +743,16 @@ mod tests {
             Path::new("C:/temp/jobs/7"),
             opts,
         )
+    }
+
+    #[test]
+    fn the_info_line_gives_extractor_length_formats_and_a_title_with_bars() {
+        let i = parse_info_line("generic|93.5|[\"hls-720\",\"hls-480\"]|Ena | dyo\n").unwrap();
+        assert_eq!((i.extractor.as_str(), i.duration_secs, i.formats), ("generic", Some(93.5), 2));
+        assert_eq!(i.title.as_deref(), Some("Ena | dyo"));
+        let n = parse_info_line("youtube|NA|null|NA").unwrap();
+        assert_eq!((n.duration_secs, n.formats, n.title), (None, 0, None));
+        assert!(parse_info_line("").is_none() && parse_info_line("NA|1|[]|x").is_none());
     }
 
     #[test]
@@ -556,6 +775,12 @@ mod tests {
     fn a_stale_part_file_is_never_resumed() {
         let args = args_for(&DownloadOpts::default());
         assert!(args.iter().any(|a| a == "--no-continue"), "{args:?}");
+    }
+
+    #[test]
+    fn the_download_is_not_stamped_with_the_servers_date() {
+        let args = args_for(&DownloadOpts::default());
+        assert!(args.iter().any(|a| a == "--no-mtime"), "{args:?}");
     }
 
     #[test]
@@ -664,6 +889,37 @@ mod tests {
         let args = args_for(&DownloadOpts::default());
         let i = args.iter().position(|a| a == "--print").expect("--print");
         assert_eq!(args[i + 1], "after_move:filepath");
+    }
+
+    /// yt-dlp quotes a cookie line it rejects, value included, in its error text.
+    #[test]
+    fn an_error_of_a_run_that_had_a_jar_is_scrubbed_of_its_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar = crate::cookie_file::CookieFile::write(dir.path(), ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\tleaky-value-998877\n").unwrap();
+        let quoted = "ERROR: invalid Netscape format cookies file: '.x.com\tFALSE\t/\tTRUE\t0\tauth_token\tleaky-value-998877'".to_string();
+
+        let dl = Downloader::new("yt-dlp").with_cookie_jar(Some(&jar));
+        let out = dl.scrubbed(quoted.clone());
+        assert!(!out.contains("leaky-value-998877"), "{out}");
+        assert!(out.contains("invalid Netscape format"));
+        // The download path uses the same function with the values from its options.
+        assert!(!scrub_error(quoted.clone(), jar.values()).contains("leaky-value-998877"));
+        // Without a jar the line is left exactly as it was.
+        assert_eq!(Downloader::new("yt-dlp").scrubbed(quoted.clone()), quoted);
+    }
+
+    #[test]
+    fn without_a_jar_there_is_no_cookies_flag_and_with_one_it_is_passed_by_path() {
+        let url = "https://x.com/i/status/1";
+        let none = Downloader::build_args(url, Path::new("C:/temp/jobs/7"), &DownloadOpts::default());
+        assert!(!none.iter().any(|a| a == "--cookies"), "{none:?}");
+        let jar = PathBuf::from("C:/temp/jobs/7/cookies.txt");
+        let with = Downloader::build_args(url, Path::new("C:/temp/jobs/7"), &DownloadOpts { cookie_jar: Some(&jar), ..Default::default() });
+        let i = with.iter().position(|a| a == "--cookies").expect("--cookies");
+        assert_eq!(with[i + 1], jar.to_string_lossy());
+        assert_eq!(with.last().unwrap(), url, "the link stays last");
+        assert_eq!(cookie_args(Some(&jar)), vec!["--cookies".to_string(), jar.to_string_lossy().into_owned()]);
+        assert!(cookie_args(None).is_empty());
     }
 
     #[test]
@@ -778,6 +1034,82 @@ mod tests {
         assert_eq!(found.file_name().unwrap(), "source.mp4");
     }
 
+    #[tokio::test]
+    async fn leftovers_from_an_earlier_owner_are_cleared_before_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        // What a previous owner left behind: a bigger source and a delivered output.
+        tokio::fs::write(dir.path().join("source.webm"), vec![0u8; 900_000]).await.unwrap();
+        tokio::fs::write(dir.path().join("SOURCE.MP4"), vec![0u8; 800_000]).await.unwrap();
+        tokio::fs::write(dir.path().join("7_output.mxf"), vec![0u8; 950_000]).await.unwrap();
+
+        clear_stale_sources(dir.path()).await.unwrap();
+        // This run's file arrives (smaller than the stale ones).
+        tokio::fs::write(dir.path().join("source.mkv"), vec![0u8; 1000]).await.unwrap();
+
+        let found = find_downloaded_file(dir.path()).await.expect("the fresh file");
+        assert_eq!(found.file_name().unwrap(), "source.mkv");
+        // Only source.* is cleared; other files are left alone.
+        assert!(dir.path().join("7_output.mxf").exists());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_found_when_the_run_wrote_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("source.webm"), vec![0u8; 900_000]).await.unwrap();
+        tokio::fs::write(dir.path().join("7_output.mxf"), vec![0u8; 950_000]).await.unwrap();
+        clear_stale_sources(dir.path()).await.unwrap();
+        assert!(find_downloaded_file(dir.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_file_with_an_old_mtime_is_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.mp4");
+        std::fs::write(&path, vec![0u8; 1000]).unwrap();
+        // yt-dlp can stamp the server's Last-Modified on the download.
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_680_000_000);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+
+        let found = find_downloaded_file(dir.path()).await.expect("the file");
+        assert_eq!(found.file_name().unwrap(), "source.mp4");
+    }
+
+    #[test]
+    fn the_lexical_fallback_accepts_only_a_direct_child_of_the_output_dir() {
+        let root = if cfg!(windows) { Path::new(r"C:\jobs\7") } else { Path::new("/jobs/7") };
+        assert!(lexically_directly_inside(&root.join("source.mp4"), root));
+        assert!(!lexically_directly_inside(&root.join("sub").join("source.mp4"), root));
+        assert!(!lexically_directly_inside(&root.parent().unwrap().join("source.mp4"), root));
+        assert!(!lexically_directly_inside(Path::new("source.mp4"), root));
+    }
+
+    #[tokio::test]
+    async fn the_fallback_scan_ignores_fresh_partial_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("source.mp4.part"), vec![0u8; 1000]).await.unwrap();
+        tokio::fs::write(dir.path().join("source.mp4.part-Frag3"), vec![0u8; 1000]).await.unwrap();
+        tokio::fs::write(dir.path().join("source.mp4.ytdl"), vec![0u8; 1000]).await.unwrap();
+
+        assert!(find_downloaded_file(dir.path()).await.is_none());
+    }
+
+    #[test]
+    fn a_printed_path_outside_the_output_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("source.mp4");
+        std::fs::write(&outside, b"x").unwrap();
+        let inside = dir.path().join("source.mp4");
+        std::fs::write(&inside, b"x").unwrap();
+
+        let lines = vec![inside.display().to_string(), outside.display().to_string()];
+        // The last line is outside, so it is skipped and the inside one wins.
+        let got = printed_path_in_dir(&lines, dir.path()).expect("inside file");
+        assert_eq!(got.file_name().unwrap(), "source.mp4");
+        assert!(got.canonicalize().unwrap().starts_with(dir.path().canonicalize().unwrap()));
+        assert!(printed_path_in_dir(&lines[1..], dir.path()).is_none());
+    }
+
     #[test]
     fn the_operator_facing_message_is_the_error_line_not_the_last_line() {
         let stderr = "[youtube] Extracting URL\n\
@@ -786,5 +1118,22 @@ mod tests {
         let msg = first_error_line(stderr);
         assert!(msg.contains("Private video"), "{msg}");
         assert!(!msg.contains("Exiting with code"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod platform_probe_tests {
+    use super::*;
+
+    #[test]
+    fn platform_line_is_parsed() {
+        let p = parse_platform_line("154.5|720|False|not_live\n").unwrap();
+        assert_eq!((p.duration_secs, p.height, p.live), (Some(154.5), Some(720), false));
+        let p = parse_platform_line("NA|NA|True|is_live").unwrap();
+        assert_eq!((p.duration_secs, p.height, p.live), (None, None, true));
+        assert!(parse_platform_line("90|480|NA|is_upcoming").unwrap().live);
+        assert!(!parse_platform_line("90|480|NA|was_live").unwrap().live);
+        assert!(parse_platform_line("garbage").is_none());
+        assert!(parse_platform_line("").is_none());
     }
 }

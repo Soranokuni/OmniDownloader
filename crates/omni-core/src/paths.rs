@@ -80,6 +80,28 @@ impl AppPaths {
         self.temp.join("jobs").join(job_id.to_string())
     }
 
+    /// Where a finished video waits for MCR's approval (P10.5): one
+    /// directory per job, removed as a whole, never matched by prefix.
+    pub fn held(&self, job_id: i64) -> PathBuf {
+        self.temp.join("held").join(job_id.to_string())
+    }
+
+    /// Scratch space of one benchmark target (P6.4): `temp/benchmark/{run}/{idx}`,
+    /// removed as a whole when the target is done. Never a queue job's directory.
+    pub fn benchmark_target_temp(&self, run_id: i64, idx: i64) -> PathBuf {
+        self.benchmark_temp().join(run_id.to_string()).join(idx.to_string())
+    }
+
+    /// All benchmark scratch space; only one run exists at a time.
+    pub fn benchmark_temp(&self) -> PathBuf {
+        self.temp.join("benchmark")
+    }
+
+    /// Where a benchmark run's `report.json` and `report.md` are written.
+    pub fn benchmark_report_dir(&self, run_id: i64) -> PathBuf {
+        self.data.join("benchmarks").join(run_id.to_string())
+    }
+
     /// Create every directory the daemon writes to.
     ///
     /// Called once at start-up so a missing `logs/` does not surface later as a

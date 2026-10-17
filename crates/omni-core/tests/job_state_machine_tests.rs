@@ -563,3 +563,82 @@ fn a_job_can_be_marked_done_only_from_review_states() {
     assert_eq!(done.status, JobStatus::Completed);
     assert_eq!(done.file_path.as_deref(), Some("out.mxf"));
 }
+
+// ------------------------------------- crash after delivery (plan P1.7) --
+
+/// A leased job moved to `stage`, with `file` recorded as its delivered file.
+fn running_at(repo: &Repository, owner: &str, stage: JobStage, file: Option<&str>, lease_secs: i64) -> i64 {
+    let slug = format!("{}_MCR_X", owner.len());
+    let id = queue(repo, &format!("https://example.gr/{owner}"), &slug, "MCR").job_id();
+    repo.lease_job(owner, lease_secs).unwrap().unwrap();
+    assert!(repo.set_stage(id, owner, stage).unwrap());
+    if let Some(f) = file {
+        assert!(repo.set_delivered_file(id, owner, f, 12.0).unwrap());
+    }
+    id
+}
+
+#[test]
+fn restart_completes_a_job_that_crashed_in_the_archive_stage_instead_of_requeueing_it() {
+    let (_d, repo) = repo();
+    let archived = running_at(&repo, "mcr-pc:1:0", JobStage::Archive, Some("w/1_MCR_X.mxf"), 3600);
+    // Controls: still delivering, with or without a recorded file -> requeued.
+    let delivering = running_at(&repo, "mcr-pc:1:1", JobStage::Deliver, Some("w/2_MCR_X.mxf"), 3600);
+    let undelivered = running_at(&repo, "mcr-pc:1:2", JobStage::Deliver, None, 3600);
+
+    assert_eq!(repo.recover_on_startup("mcr-pc").unwrap(), 2, "only the two DELIVER jobs are requeued");
+
+    let job = repo.get_job(archived).unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
+    assert!(job.lease_owner.is_none());
+    assert!(repo.get_job_events(archived, 50).unwrap().iter().any(|e| e.message.starts_with("RECOVERED_AFTER_DELIVERY")));
+    for id in [delivering, undelivered] {
+        let job = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.stage, JobStage::Queued);
+    }
+}
+
+#[test]
+fn the_reaper_completes_a_job_that_died_in_the_archive_stage_instead_of_requeueing_it() {
+    let (_d, repo) = repo();
+    let archived = running_at(&repo, "hostA:1:0", JobStage::Archive, Some("w/1_MCR_X.mxf"), -1);
+    let delivering = running_at(&repo, "hostA:1:1", JobStage::Deliver, Some("w/2_MCR_X.mxf"), -1);
+
+    let (requeued, review) = repo.reap_expired_leases().unwrap();
+    assert_eq!((requeued, review), (1, 0));
+
+    assert_eq!(repo.get_job(archived).unwrap().unwrap().status, JobStatus::Completed);
+    assert_eq!(repo.get_job(delivering).unwrap().unwrap().status, JobStatus::Pending);
+}
+
+/// A job that went to air, was sent back by MCR for another run and then
+/// crashed while delivering the new file still carries the old `file_path`.
+/// It must be requeued: the new video never reached the watchfolder.
+fn stale_file_job(repo: &Repository, owner: &str, lease_secs: i64) -> i64 {
+    let id = queue(repo, "https://example.gr/stale", "9_MCR_STALE", "MCR").job_id();
+    repo.lease_job("hostA:9:0", 3600).unwrap().unwrap();
+    assert!(repo.set_delivered_file(id, "hostA:9:0", "w/9_MCR_STALE.mxf", 12.0).unwrap());
+    assert!(repo.finish(id, "hostA:9:0", JobStatus::RequiresReview, Some("X"), Some("sent back"), None).unwrap());
+    assert!(repo.retry_job(id, None).unwrap());
+    repo.lease_job(owner, lease_secs).unwrap().unwrap();
+    assert!(repo.set_stage(id, owner, JobStage::Deliver).unwrap());
+    assert!(repo.get_job(id).unwrap().unwrap().file_path.is_some(), "the old file_path is still there");
+    id
+}
+
+#[test]
+fn a_stale_file_path_from_an_earlier_run_does_not_make_a_delivering_job_complete_on_restart() {
+    let (_d, repo) = repo();
+    let id = stale_file_job(&repo, "mcr-pc:2:0", 3600);
+    assert_eq!(repo.recover_on_startup("mcr-pc").unwrap(), 1);
+    assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Pending, "the new video never aired");
+}
+
+#[test]
+fn a_stale_file_path_from_an_earlier_run_does_not_make_a_delivering_job_complete_in_the_reaper() {
+    let (_d, repo) = repo();
+    let id = stale_file_job(&repo, "hostB:2:0", -1);
+    assert_eq!(repo.reap_expired_leases().unwrap(), (1, 0));
+    assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Pending);
+}

@@ -234,6 +234,25 @@ pub fn registrable_domain(raw: &str) -> Option<String> {
     }
 }
 
+/// What MCR's «Λάθος βίντεο» remembers about a video's address (P10.13): the
+/// lowercased host (with a non-default port) and the path, no scheme, query
+/// or fragment, so a changed token does not bring the same wrong video back.
+/// `None` for anything that is not http(s) with a host.
+pub fn skip_pattern(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}{}", url.path()),
+        None => format!("{host}{}", url.path()),
+    })
+}
+
 /// Addresses `url` may have been before someone typed a word onto its end
 /// (plan P3.10): "…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", "…-sismos-ΤΩΡΑ", "…-NEW".
 ///
@@ -304,6 +323,23 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skip_pattern_is_host_port_and_path_only() {
+        assert_eq!(skip_pattern("https://CDN.News.Example/V/a.mp4?token=1#t=5").as_deref(), Some("cdn.news.example/V/a.mp4"));
+        assert_eq!(
+            skip_pattern("http://cdn.news.example/V/a.mp4?token=2"),
+            skip_pattern("https://cdn.news.example/V/a.mp4"),
+            "the scheme and the query are not part of it"
+        );
+        assert_eq!(skip_pattern("https://cdn.news.example:8443/a.mp4").as_deref(), Some("cdn.news.example:8443/a.mp4"));
+        assert_eq!(skip_pattern("https://cdn.news.example:443/a.mp4").as_deref(), Some("cdn.news.example/a.mp4"), "the default port is dropped");
+        assert_ne!(skip_pattern("https://cdn.news.example/a.mp4"), skip_pattern("https://cdn.news.example/b.mp4"));
+        assert_ne!(skip_pattern("https://cdn.news.example/a.mp4"), skip_pattern("https://other.example/a.mp4"));
+        assert_eq!(skip_pattern("ftp://cdn.news.example/a.mp4"), None);
+        assert_eq!(skip_pattern("attachment://x/1"), None);
+        assert_eq!(skip_pattern("not a url"), None);
+    }
 
     #[test]
     fn a_word_typed_onto_a_link_gives_the_address_without_it() {
