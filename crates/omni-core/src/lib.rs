@@ -1,5 +1,6 @@
 pub mod busy;
 pub mod config;
+pub mod events;
 pub mod cookies;
 pub mod models;
 pub mod net;

@@ -2,7 +2,7 @@ use omni_core::config::AppConfig;
 use omni_core::repository::Repository;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 
 use crate::ratelimit::LoginRateLimiter;
 
@@ -58,7 +58,8 @@ pub struct AppState {
     pub repo: Repository,
     pub config: Arc<RwLock<AppConfig>>,
     pub config_path: PathBuf,
-    pub event_tx: broadcast::Sender<String>,
+    /// Live-update bus shared with the worker side (P1.10); `/api/events` streams it.
+    pub events: omni_core::events::EventBus,
     /// Shared across every request, so the counters are global to the process
     /// rather than per connection.
     pub login_limiter: Arc<LoginRateLimiter>,
@@ -104,7 +105,6 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(repo: Repository, config: AppConfig, config_path: PathBuf) -> Self {
-        let (tx, _) = broadcast::channel(100);
         let limiter = LoginRateLimiter::new(
             config.security.login_rate_limit_per_5min,
             config.security.login_rate_limit_per_account_hour,
@@ -124,7 +124,7 @@ impl AppState {
             repo,
             config: Arc::new(RwLock::new(config)),
             config_path,
-            event_tx: tx,
+            events: omni_core::events::EventBus::new(),
             login_limiter: Arc::new(limiter),
             secrets: Arc::new(default_store),
             health: omni_core::health::HealthState::new(),
@@ -201,7 +201,38 @@ impl AppState {
         self
     }
 
+    /// Share the daemon's event bus, the one the repository announces on.
+    pub fn with_events(mut self, bus: omni_core::events::EventBus) -> Self {
+        self.events = bus;
+        self
+    }
+
+    /// Announce `{"type":"<event>"}` to the desks.
     pub fn broadcast_event(&self, event: &str) {
-        let _ = self.event_tx.send(event.to_string());
+        self.events.event(event, None);
+    }
+
+    /// Same, naming the job so the desk can update just that card.
+    pub fn broadcast_job_event(&self, event: &str, job_id: i64) {
+        self.events.event(event, Some(job_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_event_sends_typed_json_and_job_events_carry_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let state = AppState::new(repo, AppConfig::default(), dir.path().join("config.json"));
+        let mut rx = state.events.subscribe();
+        state.broadcast_event("x");
+        state.broadcast_job_event("job_updated", 12);
+        let a: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(a, serde_json::json!({"type": "x"}));
+        assert_eq!(b, serde_json::json!({"type": "job_updated", "id": 12}));
     }
 }

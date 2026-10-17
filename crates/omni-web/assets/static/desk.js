@@ -30,6 +30,26 @@ export function stageLine(job) {
   return step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ${text}` : text;
 }
 
+/** Apply a live `job` event to a job the desk already shows (P1.10). `true`
+ *  when the card can be redrawn in place: the job is waiting or running and
+ *  stays so. A finished or otherwise changed job returns `false`, and the
+ *  desk reloads the list instead, since a delivered card needs fields the
+ *  event does not carry. `null` stage or progress means "unchanged". */
+export function applyJobEvent(job, ev) {
+  if (!job || !ev || ev.type !== 'job') return false;
+  if (job.status !== 'PENDING' && job.status !== 'RUNNING') return false;
+  if (ev.status !== 'PENDING' && ev.status !== 'RUNNING') return false;
+  job.status = ev.status;
+  if (typeof ev.stage === 'string' && ev.stage !== job.stage) {
+    job.stage = ev.stage;
+    job.stage_started_at = new Date().toISOString();
+  }
+  if (typeof ev.progress === 'number') job.progress = ev.progress;
+  if (typeof ev.speed === 'string') job.speed = ev.speed;
+  if (typeof ev.eta === 'string') job.eta = ev.eta;
+  return true;
+}
+
 /* Time in the step, place in the queue, next retry (plan P7.19). The server
  * sends RFC 3339 UTC; a missing or unreadable time shows nothing. */
 const STEP_WARN_MIN = 20;

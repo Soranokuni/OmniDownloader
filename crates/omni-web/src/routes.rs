@@ -667,7 +667,7 @@ pub async fn api_create_job(
         })?
         .job_id();
 
-    state.broadcast_event("job_created");
+    state.broadcast_job_event("job_created", job_id);
     Ok(Json(
         serde_json::json!({ "status": "ok", "job_id": job_id, "slug": slug }),
     ))
@@ -749,7 +749,7 @@ pub async fn api_override_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: URL overridden"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -785,7 +785,7 @@ pub async fn api_rename_job(
         .repo
         .record_event(job_id, "INFO", None, &format!("Renamed by {who}: {old} → {new}"));
     audit_action(&state, &principal, &format!("Job #{job_id}: renamed {old} → {new}"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok", "slug": new, "keyword": keyword })))
 }
 
@@ -871,7 +871,7 @@ pub async fn api_queue_offer(
         &format!("Offered video queued by MCR as {index} (job #{}): {}", result.job_id(), payload.url.trim()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: offered video queued as job #{}", result.job_id()));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok", "job_id": result.job_id(), "index_str": index })))
 }
 
@@ -899,7 +899,7 @@ pub async fn api_retry_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -939,7 +939,7 @@ pub async fn api_approve_job(
         return Err(not_held());
     }
     audit_action(&state, &principal, &format!("Job #{job_id}: held video approved (sha256 {sha})"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -992,7 +992,7 @@ pub async fn api_reject_job(
         let _ = tokio::task::spawn_blocking(move || omni_core::held::remove_held_dir(&temp, job_id)).await;
     }
     audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected ({})", payload.reason));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1031,7 +1031,7 @@ pub async fn api_next_job(
         let _ = tokio::task::spawn_blocking(move || omni_core::held::remove_held_dir(&temp, job_id)).await;
     }
     audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected (wrong video); next choice #{}", index + 1));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok", "index": index })))
 }
 
@@ -1092,7 +1092,7 @@ pub async fn api_redownload_job(
         &format!("Download again requested by {}", principal.audit_label()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: download again"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1120,7 +1120,7 @@ pub async fn api_mark_done_job(
         &format!("Finished as COMPLETED_MANUAL: put into Dalet by hand by {}", principal.audit_label()),
     );
     audit_action(&state, &principal, &format!("Job #{job_id}: marked as put into Dalet by hand"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1158,7 +1158,7 @@ pub async fn api_cancel_job(
         .repo
         .record_event(job_id, "WARN", None, &format!("Cancelled by {}", principal.audit_label()));
     audit_action(&state, &principal, &format!("Job #{job_id}: cancelled"));
-    state.broadcast_event("job_updated");
+    state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1174,7 +1174,7 @@ pub async fn api_discard_job(
     state.busy_jobs.cancel(job_id);
 
     audit_action(&state, &principal, &format!("Job #{job_id}: discarded"));
-    state.broadcast_event("job_deleted");
+    state.broadcast_job_event("job_deleted", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -2466,7 +2466,7 @@ pub async fn api_mail_queue_link(
         );
     }
     audit_action(&state, &principal, &format!("Job #{job_id}: queued from the email '{subject}'"));
-    state.broadcast_event("job_created");
+    state.broadcast_job_event("job_created", job_id);
     Ok(Json(serde_json::json!({
         "status": "ok",
         "job_id": job_id,
@@ -2897,13 +2897,18 @@ pub async fn api_setup_state(State(state): State<AppState>, req: Request) -> Jso
 // Real-Time Server-Sent Events (SSE)
 // ==========================================
 
+/// The text of one stream item. A desk that fell behind lost events: it is told so
+/// and reloads, instead of silently showing a stale card.
+fn sse_payload(msg: Result<String, tokio_stream::wrappers::errors::BroadcastStreamRecvError>) -> String {
+    msg.unwrap_or_else(|_| r#"{"type":"lagged"}"#.to_string())
+}
+
 pub async fn api_events(
     RequireMcr(_): RequireMcr,
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.event_tx.subscribe();
-    let stream =
-        BroadcastStream::new(rx).filter_map(|msg| msg.ok().map(|txt| Ok(Event::default().data(txt))));
+    let rx = state.events.subscribe();
+    let stream = BroadcastStream::new(rx).map(|msg| Ok(Event::default().data(sse_payload(msg))));
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
@@ -2921,6 +2926,14 @@ pub fn parse_ip(s: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lagged_stream_item_becomes_a_lagged_event() {
+        use tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged;
+        let v: serde_json::Value = serde_json::from_str(&sse_payload(Err(Lagged(7)))).unwrap();
+        assert_eq!(v, serde_json::json!({"type": "lagged"}));
+        assert_eq!(sse_payload(Ok("{\"type\":\"x\"}".into())), "{\"type\":\"x\"}");
+    }
 
     #[test]
     fn slug_tokens_are_reduced_to_filename_safe_text() {
