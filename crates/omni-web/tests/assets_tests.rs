@@ -406,3 +406,20 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
         "mcr.js must end with the unconditional poll"
     );
 }
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
+    let assets = all_assets();
+    let page = assets.get("user.html").expect("user.html shipped");
+    assert!(page.contains("/static/user.js?v=7"), "user.html does not import user.js?v=7");
+    assert!(!page.contains("/static/user.js?v=6"), "user.html still imports the old user.js");
+
+    let js = assets.get("static/user.js").expect("user.js shipped");
+    let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
+    let code = code.join("\n");
+    // The MCR route answers 403 to a plain user; the panel must not post there.
+    assert!(!code.contains("'/api/jobs'"), "user.js posts to the MCR-only /api/jobs");
+    assert!(code.contains("/api/user/jobs"));
+    assert!(code.contains("/api/user/prefs"));
+    assert!(!code.contains("innerHTML"));
+}

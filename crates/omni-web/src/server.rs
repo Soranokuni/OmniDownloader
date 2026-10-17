@@ -11,6 +11,7 @@ use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, security_headers};
 use crate::routes::*;
 use crate::state::AppState;
+use crate::user_jobs;
 
 pub struct WebServer;
 
@@ -40,10 +41,13 @@ impl WebServer {
             .route("/api/setup", post(api_setup))
             // ---- Logged in (any role) ----
             .route("/user", get(view_user))
+            .route("/api/user/jobs", post(user_jobs::api_user_submit))
+            .route("/api/user/jobs/:id/cancel", post(user_jobs::api_user_cancel))
+            .route("/api/user/prefs", get(user_jobs::api_get_prefs).put(user_jobs::api_put_prefs))
             .route("/api/auth/me", get(api_me))
             .route("/api/auth/logout-all", post(api_logout_all))
             .route("/api/auth/password", post(api_change_password))
-            .route("/api/jobs/mine", get(api_get_my_jobs))
+            .route("/api/jobs/mine", get(user_jobs::api_get_my_jobs))
             // ---- MCR: admin, an MCR account, or an allowlisted client ----
             .route("/mcr", get(view_mcr))
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))

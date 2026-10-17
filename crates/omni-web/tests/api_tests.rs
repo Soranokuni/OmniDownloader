@@ -1468,3 +1468,29 @@ async fn the_next_choice_is_only_for_hold_mode() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn the_mcr_form_keeps_the_journalist_identity_and_the_slug_matches_the_stored_fields() -> Result<()> {
+    let app = App::new()?;
+    let (status, json) = app
+        .send(
+            "POST",
+            "/api/jobs",
+            &app.mcr_token,
+            Some(json!({
+                "url": "https://example.test/slug/1",
+                "keyword": "fire-in-the-hills",
+                "journalist": "Papa-Daki",
+                "index_str": "2-B"
+            })),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let job = app.repo.get_job(json["job_id"].as_i64().unwrap())?.unwrap();
+    // The identity is what the roster knows, as at base.
+    assert_eq!(job.journalist, "PAPA-DAKI");
+    // The invariant the article code (`house_slug`) relies on.
+    assert_eq!(job.slug, format!("{}_{}_{}", job.index_str, job.journalist, job.keyword));
+    assert_eq!(job.slug, "2-B_PAPA-DAKI_FIRE-IN-THE-HILLS");
+    Ok(())
+}

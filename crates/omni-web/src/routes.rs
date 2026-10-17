@@ -575,19 +575,6 @@ pub async fn api_get_jobs(
     Ok(Json(serde_json::json!({ "jobs": jobs })))
 }
 
-/// A journalist's own jobs. Separate from `/api/jobs?my=true` so the user panel
-/// needs no MCR access at all.
-pub async fn api_get_my_jobs(
-    RequireUser(user): RequireUser,
-    State(state): State<AppState>,
-) -> JsonResult {
-    let jobs = state
-        .repo
-        .get_user_jobs(user.id)
-        .map_err(internal_error("Could not read your jobs."))?;
-    Ok(Json(serde_json::json!({ "jobs": jobs })))
-}
-
 pub async fn api_get_job(
     RequireMcr(_): RequireMcr,
     AxumPath(job_id): AxumPath<i64>,
@@ -678,7 +665,7 @@ pub async fn api_create_job(
 /// `javascript:` and `data:` links are the interesting ones: they are harmless
 /// to yt-dlp but become live code the moment a panel renders one as an `href`.
 /// Rejecting them at the door is cheaper than trusting every future renderer.
-fn is_submittable_url(url: &str) -> bool {
+pub(crate) fn is_submittable_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     (lower.starts_with("http://") || lower.starts_with("https://"))
         && url.len() <= 2048
@@ -691,7 +678,7 @@ fn is_submittable_url(url: &str) -> bool {
 /// are constrained to `[A-Z0-9-]` — not as an XSS defence (the panels escape
 /// separately) but because a slug is a filename and a filename with a quote,
 /// a slash or a NUL in it is a delivery failure at best.
-fn sanitize_token(raw: &str, fallback: &str) -> String {
+pub(crate) fn sanitize_token(raw: &str, fallback: &str) -> String {
     // Greek typed in the form ("Σεισμός") becomes the house Latin form
     // (ELOT 743, as the email parser makes keywords), not a row of dashes.
     let latin = omni_core::translit::translit(raw.trim());

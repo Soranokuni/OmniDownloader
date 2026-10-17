@@ -546,6 +546,41 @@ const MATRIX: &[Row] = &[
         "/api/jobs/mine",
         &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached)],
     ),
+    // The journalist's own panel (P7.3). A plain user reaches all of it; MCR and
+    // admin accounts are accounts too. Cancel answers 404 for job 1 (not theirs, or
+    // already cancelled or discarded by an earlier row), so it is ReachedNoFile for all.
+    (
+        "POST",
+        "/api/user/jobs",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/user/jobs/1/cancel",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, ReachedNoFile),
+            (Mcr, ReachedNoFile),
+            (Admin, ReachedNoFile),
+        ],
+    ),
+    (
+        "GET",
+        "/api/user/prefs",
+        &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached), (Mcr, Reached)],
+    ),
+    (
+        "PUT",
+        "/api/user/prefs",
+        &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached), (Mcr, Reached)],
+    ),
     (
         "POST",
         "/api/auth/password",

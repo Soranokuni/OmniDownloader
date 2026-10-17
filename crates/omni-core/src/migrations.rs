@@ -699,6 +699,14 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        27,
+        // The journalist's own "tell me when it is delivered" choice (P7.3). Only
+        // stored here; sending is a later item.
+        r#"
+        ALTER TABLE users ADD COLUMN notify_on_completion INTEGER NOT NULL DEFAULT 0;
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.

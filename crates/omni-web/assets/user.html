@@ -31,10 +31,18 @@
   <section class="card">
     <h2 class="card-title">Αποστολή βίντεο</h2>
     <form id="submit-form" class="stack">
-      <div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="multi">
+        <label for="multi">Πολλοί σύνδεσμοι (ένας ανά γραμμή, έως 20)</label>
+      </div>
+      <div id="single-box">
         <label for="url">Σύνδεσμος του βίντεο ή του άρθρου</label>
         <input type="url" id="url" required
                placeholder="https://www.youtube.com/watch?v=… ή άρθρο ειδησεογραφικού site">
+      </div>
+      <div id="multi-box" hidden>
+        <label for="urls">Σύνδεσμοι, ένας ανά γραμμή (παίρνουν διαδοχικά 1A, 1B, 1C… στο όνομα)</label>
+        <textarea id="urls" rows="6" placeholder="https://…&#10;https://…"></textarea>
       </div>
       <div class="grid-2">
         <div>
@@ -55,7 +63,15 @@
         <label for="priority">Επείγον (μπαίνει πριν από τα άλλα)</label>
       </div>
       <button class="btn btn-primary btn-block" type="submit">Αποστολή</button>
+      <div id="submit-result" class="stack"></div>
     </form>
+  </section>
+
+  <section class="card">
+    <div class="checkbox-row">
+      <input type="checkbox" id="notify">
+      <label for="notify">Ειδοποίησέ με όταν ολοκληρωθεί ένα βίντεο μου</label>
+    </div>
   </section>
 
   <section class="stack">
@@ -91,6 +107,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/user.js?v=6"></script>
+<script type="module" src="/static/user.js?v=7"></script>
 </body>
 </html>

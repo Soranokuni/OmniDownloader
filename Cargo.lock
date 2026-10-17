@@ -1783,6 +1783,7 @@ dependencies = [
  "omni-browser",
  "omni-core",
  "omni-email",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",
