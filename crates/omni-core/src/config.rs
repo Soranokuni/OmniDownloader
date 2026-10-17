@@ -549,6 +549,40 @@ impl Default for RepairConfig {
     }
 }
 
+/// The delivered source archive (plan P1.7): after a video is in the
+/// watchfolder its downloaded source is kept under
+/// `{path}/YYYY/MM/DD/` for `retention_days`, with a JSON sidecar, instead
+/// of being deleted with the job workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whole days a day directory is kept, counted by its date.
+    #[serde(default = "default_archive_days")]
+    pub retention_days: i64,
+    /// Relative paths resolve against the install directory.
+    #[serde(default = "default_archive_path")]
+    pub path: String,
+}
+
+fn default_archive_days() -> i64 {
+    14
+}
+
+fn default_archive_path() -> String {
+    "archive".to_string()
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_archive_days(),
+            path: default_archive_path(),
+        }
+    }
+}
+
 /// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
@@ -705,6 +739,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub repair: RepairConfig,
 
+    /// Delivered sources kept for a while after air (plan P1.7).
+    #[serde(default)]
+    pub archive: ArchiveConfig,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -800,6 +838,7 @@ impl Default for AppConfig {
             ollama_model: default_ollama_model(),
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
+            archive: ArchiveConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -970,6 +1009,18 @@ mod tests {
     use super::*;
     use crate::secrets::{keys, SecretStore};
     use tempfile::TempDir;
+
+    #[test]
+    fn a_config_without_archive_keeps_sources_14_days_in_archive() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(old.archive.enabled);
+        assert_eq!(old.archive.retention_days, 14);
+        assert_eq!(old.archive.path, "archive");
+        let partial: AppConfig = serde_json::from_str(r#"{"archive":{"enabled":false}}"#).unwrap();
+        assert!(!partial.archive.enabled);
+        assert_eq!(partial.archive.retention_days, 14);
+        assert_eq!(partial.archive.path, "archive");
+    }
 
     #[test]
     fn repair_section_defaults_and_parses() {

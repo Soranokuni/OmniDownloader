@@ -36,7 +36,8 @@ fn rig(ffmpeg: PathBuf, ffprobe: PathBuf, bmx: PathBuf) -> Rig {
         bmx,
         root.join("temp"),
         root.join("watchfolder"),
-    );
+    )
+    .with_archive(Some(omni_core::archive::ArchiveSettings::new(root.join("archive"), 14)));
     Rig { _dir: dir, root, repo, engine }
 }
 
@@ -156,6 +157,11 @@ async fn an_attached_video_is_built_from_its_saved_file() {
     // The saved attachment survives the workspace cleanup: a re-run (or the
     // archive) still has its source.
     assert!(source.exists(), "the pipeline deleted the email attachment");
+    // Archived (copied, not moved), and the job's workspace is gone (P1.7).
+    assert!(!r.root.join("temp").join("jobs").join(id.to_string()).exists(), "the job workspace was left behind");
+    let day = omni_core::archive::day_dir(&r.root.join("archive"), chrono::Local::now().date_naive());
+    assert!(day.join(format!("{id}_1_DIMITRIOU_LIMANI.mp4")).is_file(), "no archived copy of the attachment");
+    assert!(day.join(format!("{id}_1_DIMITRIOU_LIMANI.json")).is_file(), "no sidecar");
 }
 
 #[tokio::test]

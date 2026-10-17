@@ -1180,6 +1180,19 @@ async fn run_daemon(
     if let Err(e) = repo.seed_benchmark_targets() {
         warn!("Benchmark corpus not stored: {e:#}");
     }
+    // Delivered sources kept for a while (P1.7); `None` when switched off.
+    let archive_settings = omni_core::archive::ArchiveSettings::from_config(&config.archive, paths, &watchfolder_path);
+    if archive_settings.conflict {
+        error!(
+            "Archive: {:?} and the watchfolder {:?} contain one another; the archive is OFF and nothing in it is purged",
+            archive_settings.root, watchfolder_path
+        );
+    }
+    // Whether the archive has a volume of its own (neither temp's nor the
+    // watchfolder's), and whether it shares temp's.
+    let archive_separate = !omni_core::archive::same_volume(&archive_settings.root, &temp_path)
+        && !omni_core::archive::same_volume(&archive_settings.root, &watchfolder_path);
+    let archive_shares_temp = omni_core::archive::same_volume(&archive_settings.root, &temp_path);
     let repair_ffprobe = ffprobe_path.clone();
     let repair_ffmpeg = ffmpeg_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
@@ -1192,7 +1205,8 @@ async fn run_daemon(
         temp_path.clone(),
         watchfolder_path.clone(),
     )
-    .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8)));
+    .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
+    .with_archive(Some(archive_settings.clone())));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -1210,6 +1224,12 @@ async fn run_daemon(
     // one outcome an operator cannot diagnose from the MCR desk.
     omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
     omni_core::selftest::check_default_admin(&repo, &health);
+    omni_core::selftest::check_archive(
+        &health,
+        &archive_settings,
+        archive_separate,
+        omni_core::selftest::disk_space(&archive_settings.root).map(|(free, _)| free),
+    );
 
     // Tools that start are not tools that make the file: an FFmpeg 9 build
     // answered `-version` and then rejected an output option, so every job
@@ -1414,6 +1434,7 @@ async fn run_daemon(
             adblock_enabled: config.adblock_auto_update_nightly,
             gate: update_gate.clone(),
             retention_days: config.retention_days.max(1),
+            archive: Some(archive_settings.clone()),
             mail_text_retention_days: config.mail_text_retention_days.max(1),
             health: health.clone(),
             canary: canary_env.clone(),
@@ -1543,6 +1564,7 @@ async fn run_daemon(
     let worker_health = health.clone();
     let worker_watchfolder = watchfolder_path.clone();
     let worker_temp = temp_path.clone();
+    let worker_archive = archive_settings.clone();
     // The LLM rung of the repair ladder (P10.12): both the switch and a model name,
     // never the mail model. Endpoint, key and auth are the `llm` section's.
     let repair_llm_cfg = repair::LlmCfg {
@@ -1618,6 +1640,31 @@ async fn run_daemon(
             // Under STOP_DISK_GB free, no new job starts (plan P1.4): the
             // `disk` check goes red and the queue waits until there is room
             // again, rather than every job failing in turn mid-encode.
+            // Short of room on the archive's own volume, or on temp's when they
+            // are the same, the oldest archived days go first (P1.7): a kept
+            // source must never be the reason a newsroom job waits. Runs with
+            // the archive switched off too, so old archives still give way.
+            if worker_archive.purges() {
+                let (a, temp) = (worker_archive.clone(), worker_temp.clone());
+                let low = (omni_core::selftest::LOW_DISK_GB * 1024.0 * 1024.0 * 1024.0) as u64;
+                let shares = archive_shares_temp;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let temp_free = || omni_core::selftest::disk_space(&temp).map(|(free, _)| free);
+                    omni_core::archive::relieve_low_disk(
+                        &a.root,
+                        low,
+                        || omni_core::selftest::disk_space(&a.root).map(|(free, _)| free),
+                        shares.then_some(&temp_free as &dyn Fn() -> Option<u64>),
+                    )
+                })
+                .await;
+            }
+            omni_core::selftest::check_archive(
+                &worker_health,
+                &worker_archive,
+                archive_separate,
+                omni_core::selftest::disk_space(&worker_archive.root).map(|(free, _)| free),
+            );
             if !omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp) {
                 drop(permit);
                 tokio::select! {
@@ -3144,6 +3191,7 @@ struct MaintenanceContext {
     adblock_enabled: bool,
     gate: UpdateGate,
     retention_days: i64,
+    archive: Option<omni_core::archive::ArchiveSettings>,
     mail_text_retention_days: i64,
     evidence_days: i64,
     evidence_max_bytes: u64,
@@ -3382,6 +3430,16 @@ async fn run_one_task(
             let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join("attachments"), ctx.retention_days).await;
             if removed > 0 {
                 info!("Retention: removed {removed} saved email attachment(s)");
+            }
+            // Delivered sources past their days (P1.7), by the date in the
+            // directory name.
+            if let Some(a) = ctx.archive.clone().filter(|a| a.purges()) {
+                let today = chrono::Local::now().date_naive();
+                match tokio::task::spawn_blocking(move || omni_core::archive::purge_expired(&a.root, today, a.retention_days)).await {
+                    Ok(n) if n > 0 => info!("Retention: removed {n} expired archive day(s)"),
+                    Ok(_) => {}
+                    Err(e) => warn!("Retention: archive not purged: {e}"),
+                }
             }
             sweep_evidence(repo, &ctx.temp_path.join("evidence"), ctx.evidence_days, ctx.evidence_max_bytes);
             // A benchmark killed mid-run leaves cookie copies behind; nothing running, nothing kept.

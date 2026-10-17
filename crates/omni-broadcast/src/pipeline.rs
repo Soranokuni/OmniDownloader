@@ -127,9 +127,19 @@ pub struct BroadcastEngine {
     login_sites: Arc<Mutex<HashMap<i64, String>>>,
     /// The H.264 encoder previews use, found on first use (P10.6).
     preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
+    /// Where a delivered job's source goes instead of the bin (P1.7); `None`
+    /// when the archive is switched off.
+    archive: Option<omni_core::archive::ArchiveSettings>,
 }
 
 impl BroadcastEngine {
+    /// Keep delivered sources as `settings` says (plan P1.7).
+    pub fn with_archive(mut self, settings: Option<omni_core::archive::ArchiveSettings>) -> Self {
+        // Only a usable archive is kept: off or overlapping the watchfolder means none.
+        self.archive = settings.filter(|s| s.writes());
+        self
+    }
+
     /// At most `n` encodes at once (at least one).
     pub fn with_encoder_slots(mut self, n: usize) -> Self {
         self.encoder_slots = Arc::new(Semaphore::new(n.max(1)));
@@ -195,6 +205,7 @@ impl BroadcastEngine {
             download_slots: Arc::new(Mutex::new(HashMap::new())),
             login_sites: Arc::new(Mutex::new(HashMap::new())),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
+            archive: None,
         }
     }
 
@@ -623,9 +634,6 @@ impl BroadcastEngine {
             }
         };
 
-        // Clean up remaining temp files for this job
-        WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
-
         if delivered.suffixed {
             // Two assets now share a slug in Dalet. Not a failure -- the file is
             // on air -- but an operator has to know which one is which.
@@ -649,6 +657,11 @@ impl BroadcastEngine {
             Ok(false) => warn!("Job #{job_id}: lease lost after delivery; the file {dest_str} is in the watchfolder"),
             Err(e) => warn!("Job #{job_id}: could not record the delivered file {dest_str}: {e:#}"),
         }
+
+        // 7. The file is on air and recorded: keep the source for the archive
+        // (P1.7), then remove the workspace. Never fails the job.
+        self.archive_then_clean(job_id, owner, Some(&downloaded_file), &job_temp, &delivered.filename).await;
+
         let _ = self.repo.log_audit(
             "SUCCESS",
             "INGEST",
@@ -957,6 +970,52 @@ impl BroadcastEngine {
         );
         info!("Job #{job_id} ({slug}) delivered after approval");
         Ok(())
+    }
+
+    /// After delivery: move the job's source into the archive with its
+    /// sidecar (when the archive is on and this worker still holds the lease),
+    /// then remove the job's workspace. Nothing here can fail or undo the
+    /// delivery: a failed archive is a warning and an `ARCHIVE_FAILED` event,
+    /// and the cleanup runs regardless. On a lost lease nothing is written.
+    pub async fn archive_then_clean(&self, job_id: i64, owner: &str, source: Option<&Path>, job_temp: &Path, delivered_filename: &str) {
+        if let (Some(settings), Some(source)) = (self.archive.clone(), source) {
+            match self.repo.set_stage(job_id, owner, JobStage::Archive) {
+                Ok(true) => {
+                    let outcome = match self.repo.get_job(job_id) {
+                        Ok(Some(row)) => {
+                            let (source, job_temp, name) = (source.to_path_buf(), job_temp.to_path_buf(), delivered_filename.to_string());
+                            let day = chrono::Local::now().date_naive();
+                            tokio::task::spawn_blocking(move || {
+                                omni_core::archive::archive_source(&settings.root, &row, &source, &job_temp, &name, day)
+                            })
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|r| r)
+                        }
+                        Ok(None) => Err(anyhow::anyhow!("the job row is gone")),
+                        Err(e) => Err(e),
+                    };
+                    match outcome {
+                        Ok(dest) => {
+                            info!("Job #{job_id}: source archived at {dest:?}");
+                            let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Archive), "Source archived");
+                        }
+                        Err(e) => {
+                            warn!("Job #{job_id}: could not archive the source: {e:#}");
+                            let _ = self.repo.record_event(
+                                job_id,
+                                "WARN",
+                                Some(JobStage::Archive),
+                                &format!("ARCHIVE_FAILED: {e:#}"),
+                            );
+                        }
+                    }
+                }
+                Ok(false) => warn!("Job #{job_id}: lease lost after delivery; the source is not archived"),
+                Err(e) => warn!("Job #{job_id}: could not enter the archive stage, the source is not archived: {e:#}"),
+            }
+        }
+        WatchfolderDelivery::cleanup_job_temp_files(job_temp).await;
     }
 
     /// The held file is not what was approved: stop, deliver nothing.

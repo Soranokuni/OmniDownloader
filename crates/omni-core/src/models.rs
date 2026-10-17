@@ -194,7 +194,10 @@ pub struct Job {
     pub not_before: Option<DateTime<Utc>>,
     /// Stable machine-readable failure reason; drives retries and MCR hints.
     pub error_code: Option<String>,
-    /// Downloaded source, kept for the archive and for re-runs.
+    /// The saved file of an emailed or uploaded video, kept for re-runs. A
+    /// downloaded source lives in `temp/jobs/{id}/` and is moved to the archive
+    /// after delivery (plan P1.7) or deleted with the workspace; attachments are
+    /// copied there and stay with their store.
     pub source_path: Option<String>,
     /// Compliance report from the pre-delivery gate (plan P1.6).
     pub compliance_json: Option<String>,

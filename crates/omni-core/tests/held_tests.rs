@@ -343,3 +343,31 @@ fn lease_job_by_id_takes_only_that_pending_job() -> Result<()> {
     assert_eq!(repo.get_job(other)?.unwrap().status, JobStatus::Cancelled);
     Ok(())
 }
+
+#[test]
+fn only_an_approved_hold_keeps_a_job_out_of_the_archive_stage_recovery() -> Result<()> {
+    use omni_core::models::JobStage;
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+
+    // Held, then superseded by a retry, then delivered the normal way and
+    // crashed in ARCHIVE: provably on air, so finished, not requeued.
+    let superseded = held(&repo, 1);
+    assert!(repo.retry_job(superseded, None)?);
+    let leased = repo.lease_job("w:1:0", 3600)?.expect("leased");
+    assert_eq!(leased.id, superseded);
+    assert!(repo.set_stage(superseded, "w:1:0", JobStage::Archive)?);
+
+    // An approved hold at ARCHIVE keeps its own idempotent re-delivery path.
+    let approved = held(&repo, 2);
+    assert!(repo.approve_held(approved, SHA, "mcr")?);
+    let leased = repo.lease_approved_held_job("w:1:1", 3600)?.expect("approved job leased");
+    assert_eq!(leased.id, approved);
+    assert!(repo.set_stage(approved, "w:1:1", JobStage::Archive)?);
+
+    repo.recover_on_startup("w")?;
+
+    assert_eq!(repo.get_job(superseded)?.unwrap().status, JobStatus::Completed);
+    assert_eq!(repo.get_job(approved)?.unwrap().status, JobStatus::Pending);
+    Ok(())
+}
