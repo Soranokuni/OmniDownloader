@@ -1,9 +1,15 @@
 pub mod article;
+pub mod cookie_file;
+pub mod card;
 pub mod delivery;
 pub mod errors;
+pub mod imagehash;
 pub mod downloader;
 pub mod pipeline;
+pub mod preview;
 pub mod probe;
+pub mod repair;
+pub mod repair_gate;
 pub mod verify;
 pub mod rewrapper;
 pub mod selftest;

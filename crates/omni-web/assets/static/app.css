@@ -589,6 +589,7 @@ body.desk-wide main { max-width: 1480px; }
 }
 .mail[data-state="active"]::before { background: var(--info); }
 .mail[data-state="attention"]::before { background: var(--warn); }
+.mail[data-state="approval"]::before { background: var(--busy); }
 .mail[data-state="failed"]::before { background: var(--bad); }
 .mail[data-state="done"]::before { background: rgba(52, 211, 153, 0.45); }
 .mail.open { border-color: rgba(34, 211, 238, 0.28); }
@@ -688,6 +689,7 @@ body.desk-wide main { max-width: 1480px; }
 .seg.ok { background: var(--ok); }
 .seg.warn { background: var(--warn); }
 .seg.bad { background: var(--bad); }
+.seg.approval { background: var(--busy); }
 .seg.run { background: rgba(96, 165, 250, 0.22); }
 .seg.run > i {
   position: absolute; left: 0; top: 0; bottom: 0;
@@ -819,6 +821,7 @@ body.desk-wide main { max-width: 1480px; }
 .tag.wait { background: #2a3346;     color: var(--text-dim); }
 .tag.warn { background: var(--warn); color: #241800; }
 .tag.bad  { background: var(--bad);  color: #2e0812; }
+.tag.approval { background: var(--busy); color: #1a0f3a; }
 .lnk.skip { color: var(--text-faint); background: transparent; border-style: dashed; border-color: #33405a; }
 .lnk.skip .tag { background: transparent; color: var(--text-faint); border: 1px dashed #3a4762; }
 .lnk.hl {
@@ -967,3 +970,31 @@ body.desk-wide main { max-width: 1480px; }
   .mail-x, .seg, .seg.run > i, .lnk, .jcard, .chev, .tag { transition: none; }
   .seg.run::after, .mail.arrived, .lnk.pulse, .jcard.pulse, .skipcard.pulse { animation: none; }
 }
+
+/* ---------- videos held for approval (plan P10.7) ---------- */
+
+.ap-card { scroll-margin-top: 76px; }
+.ap-card:focus { outline: none; }
+.ap-card.hl { box-shadow: 0 0 0 2px var(--accent); }
+.ap-title { margin: 0; font-size: 16px; }
+.ap-media { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.ap-video { width: 100%; max-width: 640px; background: #000; border-radius: 6px; }
+.ap-audio { width: 100%; max-width: 640px; }
+.ap-sheet { width: 100%; max-width: 640px; cursor: pointer; border-radius: 6px; border: 1px solid var(--line); }
+.ap-article { display: flex; flex-direction: column; gap: 4px; }
+.ap-article img { max-width: 320px; border-radius: 6px; border: 1px solid var(--line); }
+.ap-facts { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.ap-reject { gap: 8px; }
+.ap-reject input { flex: 1 1 220px; }
+.ap-pics { gap: 12px; align-items: flex-start; }
+.ap-figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.ap-figure img { max-width: 320px; width: 100%; border-radius: 6px; border: 1px solid var(--line); }
+.ap-figure img.ap-seek { cursor: pointer; }
+.ap-same { color: var(--ok); font-weight: 600; }
+.ap-checks { display: flex; flex-direction: column; gap: 4px; }
+.ap-checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.ap-checklist li { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.ap-mark { width: 1.2em; font-weight: 700; }
+.ap-ok .ap-mark { color: var(--ok); }
+.ap-bad .ap-mark { color: var(--bad); }
+.ap-warn { color: var(--warn); font-weight: 600; }

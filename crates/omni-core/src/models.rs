@@ -28,6 +28,9 @@ pub enum JobStatus {
     Cancelled,
     /// The operator dropped the file into Dalet themselves.
     CompletedManual,
+    /// The video is made and checked but held back; MCR approves or rejects
+    /// it (P10.5). Never leased, never delivered until approved.
+    AwaitingApproval,
 }
 
 impl JobStatus {
@@ -41,6 +44,7 @@ impl JobStatus {
             Self::ManualDownload => "MANUAL_DOWNLOAD",
             Self::Cancelled => "CANCELLED",
             Self::CompletedManual => "COMPLETED_MANUAL",
+            Self::AwaitingApproval => "AWAITING_APPROVAL",
         }
     }
 
@@ -60,6 +64,7 @@ impl JobStatus {
             "MANUAL_DOWNLOAD" => Self::ManualDownload,
             "CANCELLED" => Self::Cancelled,
             "COMPLETED_MANUAL" => Self::CompletedManual,
+            "AWAITING_APPROVAL" => Self::AwaitingApproval,
             // Legacy states from before the state machine; migration 2 rewrites
             // the rows, but a downgrade or an external tool could still write one.
             "EXTRACTING" | "DOWNLOADING" | "TRANSCODING" | "REWRAPPING" => Self::Running,
@@ -68,6 +73,8 @@ impl JobStatus {
     }
 
     /// Nothing further will happen to this job without an operator acting.
+    /// A held job is not terminal: its file is still in `temp/held` and the
+    /// approval, rejection or expiry sweep decides what becomes of it.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -187,7 +194,10 @@ pub struct Job {
     pub not_before: Option<DateTime<Utc>>,
     /// Stable machine-readable failure reason; drives retries and MCR hints.
     pub error_code: Option<String>,
-    /// Downloaded source, kept for the archive and for re-runs.
+    /// The saved file of an emailed or uploaded video, kept for re-runs. A
+    /// downloaded source lives in `temp/jobs/{id}/` and is moved to the archive
+    /// after delivery (plan P1.7) or deleted with the workspace; attachments are
+    /// copied there and stay with their store.
     pub source_path: Option<String>,
     /// Compliance report from the pre-delivery gate (plan P1.6).
     pub compliance_json: Option<String>,
@@ -290,6 +300,8 @@ pub enum JobsView {
     Live,
     /// Needs a person: review, file-locker downloads, failures.
     Review,
+    /// Videos held for MCR approval, oldest first (P10.7).
+    Approval,
     /// Every delivered job, cleared or not, newest first.
     Completed,
 }
@@ -330,6 +342,8 @@ pub struct JobCounts {
     pub review_hidden: i64,
     /// Delivered since local midnight on the server (P7.21).
     pub completed_today: i64,
+    /// Videos waiting for MCR approval (P10.7).
+    pub approval: i64,
 }
 
 /// What the `queue` health check looks at (plan P7.19).
@@ -354,6 +368,8 @@ pub struct QueueSummary {
     pub cancelled: i64,
     pub review: i64,
     pub manual: i64,
+    /// Made and checked, held for MCR's approval (P10.5).
+    pub approval: i64,
     pub completed: i64,
     pub failed: i64,
     pub total: i64,
@@ -473,6 +489,42 @@ impl Enqueued {
     pub fn is_new(&self) -> bool {
         matches!(self, Self::Created { .. })
     }
+}
+
+/// A recent known-good article link of a news site, re-checked as a canary
+/// (plan P10.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteCanary {
+    pub id: i64,
+    pub domain: String,
+    pub url: String,
+    pub job_id: Option<i64>,
+    /// When the job that proved the link finished.
+    pub added_at: Option<DateTime<Utc>>,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    /// `None` until first checked.
+    pub last_ok: Option<bool>,
+    pub last_detail: Option<String>,
+    pub fail_count: i64,
+}
+
+impl SiteCanary {
+    /// The page answered 404/410: kept as a marker so the link is not added
+    /// again, never checked.
+    pub fn is_gone(&self) -> bool {
+        self.last_ok == Some(false) && self.last_detail.as_deref() == Some(CANARY_GONE)
+    }
+}
+
+/// `last_detail` of a canary whose page is gone.
+pub const CANARY_GONE: &str = "gone";
+
+/// A completed job's page link: what the canary pool is drawn from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedPage {
+    pub job_id: i64,
+    pub url: String,
+    pub finished_at: DateTime<Utc>,
 }
 
 /// A link the nightly self-check tries (plan P6.7).

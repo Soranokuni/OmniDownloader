@@ -186,6 +186,9 @@ enum Expect {
     /// Reached the handler. The handler may still 400 on the empty `{}` body
     /// we send — that is fine and means the policy let it through.
     Reached,
+    /// Reached the handler, which answers 404 because there is nothing to
+    /// serve for job 1 (preview files, P10.6); the policy still let it in.
+    ReachedNoFile,
     /// Turned away: 401, 403 or (for pages) a redirect to /login.
     Denied,
     /// Route is not there for this caller at all.
@@ -202,6 +205,10 @@ fn assert_outcome(route: &str, caller: Caller, expected: Expect, actual: StatusC
                 | StatusCode::FORBIDDEN
                 | StatusCode::NOT_FOUND
                 | StatusCode::TEMPORARY_REDIRECT
+        ),
+        ReachedNoFile => !matches!(
+            actual,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::TEMPORARY_REDIRECT
         ),
         Denied => matches!(
             actual,
@@ -299,6 +306,42 @@ const MATRIX: &[Row] = &[
         "/api/jobs/1/retry",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),    // MCR desk (plan P7.1): download a delivered job again; clear the live list.
+    // A video held for approval (P10.5): MCR decides, nobody else.
+    (
+        "GET",
+        "/api/jobs/1/preview/video",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
+        "GET",
+        "/api/jobs/1/preview/contact",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
+        "GET",
+        "/api/jobs/1/preview/article",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
+        "GET",
+        "/api/jobs/1/preview/frame",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, ReachedNoFile)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/approve",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/reject",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/next",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
     (
         "POST",
         "/api/jobs/1/redownload",
@@ -503,6 +546,41 @@ const MATRIX: &[Row] = &[
         "/api/jobs/mine",
         &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached)],
     ),
+    // The journalist's own panel (P7.3). A plain user reaches all of it; MCR and
+    // admin accounts are accounts too. Cancel answers 404 for job 1 (not theirs, or
+    // already cancelled or discarded by an earlier row), so it is ReachedNoFile for all.
+    (
+        "POST",
+        "/api/user/jobs",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/user/jobs/1/cancel",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, ReachedNoFile),
+            (Mcr, ReachedNoFile),
+            (Admin, ReachedNoFile),
+        ],
+    ),
+    (
+        "GET",
+        "/api/user/prefs",
+        &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached), (Mcr, Reached)],
+    ),
+    (
+        "PUT",
+        "/api/user/prefs",
+        &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached), (Mcr, Reached)],
+    ),
     (
         "POST",
         "/api/auth/password",
@@ -602,6 +680,130 @@ const MATRIX: &[Row] = &[
         "/api/admin/selfcheck/links/1/delete",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
     ),
+    // Sites, recipes and the repair report (P10.15a): admin only.
+    ("GET", "/api/admin/sites", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/sites/news.example/check", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("GET", "/api/admin/recipes", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("GET", "/api/admin/recipes/export", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/recipes/import", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/recipes/1/suspend", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/recipes/1/retire", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("GET", "/api/admin/repair-report", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // Cookie jars for login-walled sites (P3.5): admin only.
+    ("GET", "/api/admin/cookies", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/cookies", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/cookies/x.com/delete", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/cookies/x.com/test", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // The end-to-end benchmark (P6.4): admin only.
+    ("GET", "/api/admin/benchmarks", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/benchmarks/run", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // ReachedNoFile: the handler answers 404 for a run that does not exist.
+    ("GET", "/api/admin/benchmarks/runs/1", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, ReachedNoFile),
+        ]),
+    // The admin's Test URL (P10.15b): a dry run, admin only.
+    ("GET", "/api/admin/test-url", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/test-url", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     (
         "GET",
         "/api/secrets",
@@ -937,6 +1139,44 @@ async fn w07_state_changing_requests_need_the_panel_marker_and_a_same_origin() -
     // GET is never blocked by the guard.
     let status = h.request("GET", "/api/jobs", Mcr).await;
     assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+/// Approving or rejecting a held video (P10.5) is a state-changing POST: the
+/// panel marker is required like on every other one.
+#[tokio::test]
+async fn approving_or_rejecting_a_held_video_needs_the_csrf_marker() -> Result<()> {
+    let h = Harness::new(true)?;
+    for uri in ["/api/jobs/1/approve", "/api/jobs/1/reject", "/api/jobs/1/next"] {
+        let send = |headers: &[(&str, &str)]| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("cookie", format!("omni_session={}", h.tokens.mcr))
+                .header("content-type", "application/json");
+            for (k, v) in headers {
+                builder = builder.header(*k, *v);
+            }
+            let req = builder.body(Body::from(r#"{"sha256":"x","reason":"other"}"#)).unwrap();
+            let router = h.router.clone().layer(MockConnectInfo(OUTSIDER.parse::<SocketAddr>().unwrap()));
+            async move { router.oneshot(req).await.unwrap().status() }
+        };
+        assert_eq!(
+            send(&[("host", "mcr.local"), ("origin", "https://evil.example")]).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: a cross-site post must be refused"
+        );
+        assert_eq!(
+            send(&[("host", "mcr.local"), ("origin", "http://mcr.local")]).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: no panel marker"
+        );
+        assert_ne!(
+            send(&[("x-omni-request", "1"), ("host", "mcr.local"), ("origin", "http://mcr.local")]).await,
+            StatusCode::FORBIDDEN,
+            "{uri}: the panel's own request must get through the guard"
+        );
+    }
     Ok(())
 }
 

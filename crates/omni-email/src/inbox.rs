@@ -32,6 +32,8 @@ pub enum EntryState {
     Failed,
     /// A video needs a person: review, a manual download, a failure.
     Attention,
+    /// A video is made and held for MCR's approval (P10.7); nothing else needs a person.
+    Approval,
     /// Waiting or being worked on.
     Active,
     /// Everything delivered (or discarded).
@@ -57,7 +59,7 @@ impl InboxFilter {
         match self {
             Self::All => true,
             Self::Active => state == EntryState::Active,
-            Self::Attention => matches!(state, EntryState::Attention | EntryState::Failed),
+            Self::Attention => matches!(state, EntryState::Attention | EntryState::Approval | EntryState::Failed),
             Self::Done => state == EntryState::Done,
             Self::Empty => state == EntryState::Empty,
         }
@@ -321,7 +323,7 @@ pub fn page_with_focus(
     for e in &matching {
         match e.state {
             EntryState::Active => counts.active += 1,
-            EntryState::Attention | EntryState::Failed => counts.attention += 1,
+            EntryState::Attention | EntryState::Approval | EntryState::Failed => counts.attention += 1,
             EntryState::Done => counts.done += 1,
             EntryState::Empty => counts.empty += 1,
         }
@@ -381,6 +383,8 @@ fn state_of(jobs: &[&InboxJobRow]) -> EntryState {
     // An unreadable status is shown as needing a person, never as done.
     if jobs.iter().any(|j| matches!(status(j), Some(RequiresReview | ManualDownload | Failed) | None)) {
         EntryState::Attention
+    } else if jobs.iter().any(|j| matches!(status(j), Some(AwaitingApproval))) {
+        EntryState::Approval
     } else if jobs.iter().any(|j| matches!(status(j), Some(Pending | Running))) {
         EntryState::Active
     } else if jobs.is_empty() {

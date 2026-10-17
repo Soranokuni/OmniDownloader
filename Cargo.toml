@@ -35,4 +35,27 @@ anyhow = "1.0"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+async-trait = "0.1"
 
+
+# The recipe interpreter parses whole pages; keep the HTML and regex engines
+# fast in debug test runs so the per-recipe time budget is meaningful.
+[profile.dev.package.html5ever]
+opt-level = 3
+[profile.dev.package.selectors]
+opt-level = 3
+[profile.dev.package.scraper]
+opt-level = 3
+[profile.dev.package.markup5ever]
+opt-level = 3
+[profile.dev.package.tendril]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.regex]
+opt-level = 3
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }

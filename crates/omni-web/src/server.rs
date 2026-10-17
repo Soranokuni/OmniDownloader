@@ -5,10 +5,14 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+use crate::admin_bench;
+use crate::admin_cookies;
+use crate::admin_sites;
 use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, security_headers};
 use crate::routes::*;
 use crate::state::AppState;
+use crate::user_jobs;
 
 pub struct WebServer;
 
@@ -38,10 +42,13 @@ impl WebServer {
             .route("/api/setup", post(api_setup))
             // ---- Logged in (any role) ----
             .route("/user", get(view_user))
+            .route("/api/user/jobs", post(user_jobs::api_user_submit))
+            .route("/api/user/jobs/:id/cancel", post(user_jobs::api_user_cancel))
+            .route("/api/user/prefs", get(user_jobs::api_get_prefs).put(user_jobs::api_put_prefs))
             .route("/api/auth/me", get(api_me))
             .route("/api/auth/logout-all", post(api_logout_all))
             .route("/api/auth/password", post(api_change_password))
-            .route("/api/jobs/mine", get(api_get_my_jobs))
+            .route("/api/jobs/mine", get(user_jobs::api_get_my_jobs))
             // ---- MCR: admin, an MCR account, or an allowlisted client ----
             .route("/mcr", get(view_mcr))
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))
@@ -49,6 +56,13 @@ impl WebServer {
             .route("/api/jobs/:id/override", post(api_override_job))
             .route("/api/jobs/:id/rename", post(api_rename_job))
             .route("/api/jobs/:id/retry", post(api_retry_job))
+            .route("/api/jobs/:id/approve", post(api_approve_job))
+            .route("/api/jobs/:id/reject", post(api_reject_job))
+            .route("/api/jobs/:id/next", post(api_next_job))
+            .route("/api/jobs/:id/preview/video", get(api_preview_video))
+            .route("/api/jobs/:id/preview/contact", get(api_preview_contact))
+            .route("/api/jobs/:id/preview/article", get(api_preview_article))
+            .route("/api/jobs/:id/preview/frame", get(api_preview_frame))
             .route("/api/jobs/:id/redownload", post(api_redownload_job))
             .route("/api/jobs/:id/mark-done", post(api_mark_done_job))
             .route("/api/jobs/:id/cancel", post(api_cancel_job))
@@ -100,6 +114,21 @@ impl WebServer {
             .route("/api/admin/selfcheck", get(api_admin_selfcheck))
             .route("/api/admin/selfcheck/links", post(api_admin_selfcheck_add))
             .route("/api/admin/selfcheck/links/:id/delete", post(api_admin_selfcheck_delete))
+            .route("/api/admin/sites", get(admin_sites::api_admin_sites))
+            .route("/api/admin/sites/:domain/check", post(admin_sites::api_admin_site_check))
+            .route("/api/admin/recipes", get(admin_sites::api_admin_recipes))
+            .route("/api/admin/recipes/export", get(admin_sites::api_admin_recipes_export))
+            .route("/api/admin/recipes/import", post(admin_sites::api_admin_recipes_import))
+            .route("/api/admin/recipes/:id/suspend", post(admin_sites::api_admin_recipe_suspend))
+            .route("/api/admin/recipes/:id/retire", post(admin_sites::api_admin_recipe_retire))
+            .route("/api/admin/repair-report", get(admin_sites::api_admin_repair_report))
+            .route("/api/admin/test-url", get(admin_sites::api_admin_test_url_info).post(admin_sites::api_admin_test_url))
+            .route("/api/admin/cookies", get(admin_cookies::api_admin_cookies).post(admin_cookies::api_admin_cookies_put))
+            .route("/api/admin/cookies/:domain/delete", post(admin_cookies::api_admin_cookies_delete))
+            .route("/api/admin/cookies/:domain/test", post(admin_cookies::api_admin_cookies_test))
+            .route("/api/admin/benchmarks", get(admin_bench::api_admin_benchmarks))
+            .route("/api/admin/benchmarks/run", post(admin_bench::api_admin_benchmark_run))
+            .route("/api/admin/benchmarks/runs/:id", get(admin_bench::api_admin_benchmark_report))
             .route("/api/secrets", get(api_secrets_status).post(api_secrets_set))
             .route("/api/system/logs", get(api_system_logs))
             .route("/api/system/test-email", post(api_test_email))

@@ -2,16 +2,92 @@ use omni_core::config::AppConfig;
 use omni_core::repository::Repository;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 
 use crate::ratelimit::LoginRateLimiter;
+
+/// What «Run now» on the admin's Sites card got (P10.15a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunNow {
+    /// The check runs in the background.
+    Started,
+    /// Another canary run, or the yt-dlp update, holds the lock.
+    Busy,
+    /// The site was started less than the cooldown ago; this many seconds remain.
+    Cooldown(u64),
+}
+
+/// Starts one canary check of a site (and the self-heal when it is broken and
+/// repair is on). The daemon implements it; the web crate cannot see the canary
+/// code. Never waits for the check.
+pub trait SiteRunner: Send + Sync {
+    fn run_now(&self, domain: &str) -> RunNow;
+}
+
+/// Why a Test URL run did not happen (P10.15b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestUrlError {
+    /// Another test is running; only one at a time in the process.
+    Busy,
+    /// The address may not be tested; the reason is short and names no path.
+    Refused(String),
+}
+
+pub type TestUrlFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, TestUrlError>> + Send + 'a>>;
+
+/// The admin's «Test URL»: a dry run of the normal path and the repair ladder
+/// on one address. The daemon implements it; the web crate cannot see the repair
+/// code. Nothing is downloaded, queued or delivered.
+pub trait UrlTester: Send + Sync {
+    fn test_url<'a>(&'a self, url: &'a str, use_llm: bool) -> TestUrlFuture<'a>;
+}
+
+pub type CookieTestFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(bool, String), String>> + Send + 'a>>;
+
+/// The admin's cookie-jar «Test» (P3.5): runs yt-dlp with the site's jar on a
+/// sample link and stores the outcome. The daemon implements it (it knows where
+/// yt-dlp is). `Ok((ok, detail))`; `Err` is a reason the test could not start.
+pub trait CookieTester: Send + Sync {
+    fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> CookieTestFuture<'a>;
+}
+
+/// What the Benchmarks card's «Start» asks for (P6.4).
+pub struct BenchRequest {
+    pub mode: omni_core::benchmark::Mode,
+    /// Target numbers, already checked against the corpus.
+    pub targets: Vec<i64>,
+    pub parallel: u32,
+    /// Run although a job is running.
+    pub force: bool,
+    /// Called when a target is done and when the run ends; the card refetches.
+    pub notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Why a benchmark run did not start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BenchStartError {
+    /// A job is running, or another run is; the reason is short and names no address.
+    Refused(String),
+    /// Anything else (the database); the reason is logged, not shown.
+    Failed,
+}
+
+/// Starts a benchmark run in the background and returns its id. The daemon
+/// implements it (it knows where the tools are); the web crate cannot see the
+/// runner. Never waits for the run.
+pub trait BenchmarkStarter: Send + Sync {
+    fn start(&self, request: BenchRequest) -> Result<i64, BenchStartError>;
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Repository,
     pub config: Arc<RwLock<AppConfig>>,
     pub config_path: PathBuf,
-    pub event_tx: broadcast::Sender<String>,
+    /// Live-update bus shared with the worker side (P1.10); `/api/events` streams it.
+    pub events: omni_core::events::EventBus,
     /// Shared across every request, so the counters are global to the process
     /// rather than per connection.
     pub login_limiter: Arc<LoginRateLimiter>,
@@ -41,11 +117,24 @@ pub struct AppState {
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
+    /// The daemon's temp directory, where `held/{id}` keeps a video waiting
+    /// for approval (P10.5). `None` in tests that have none: a rejection then
+    /// leaves the directory to the sweep.
+    pub temp_dir: Option<PathBuf>,
+    /// The canary runner behind «Run now» (P10.15a); `None` in tests that have none.
+    pub site_runner: Option<Arc<dyn SiteRunner>>,
+    /// The dry-run tester behind the admin's «Test URL» (P10.15b); `None` in tests that have none.
+    pub url_tester: Option<Arc<dyn UrlTester>>,
+    /// The cookie-jar tester behind the Cookies card (P3.5); `None` in tests that have none.
+    pub cookie_tester: Option<Arc<dyn CookieTester>>,
+    /// The benchmark runner behind the Benchmarks card (P6.4); `None` in tests that have none.
+    pub benchmark_starter: Option<Arc<dyn BenchmarkStarter>>,
+    /// The log redactor: an uploaded jar's values join it at once (P3.5).
+    pub redactions: Option<omni_core::logging::Redactions>,
 }
 
 impl AppState {
     pub fn new(repo: Repository, config: AppConfig, config_path: PathBuf) -> Self {
-        let (tx, _) = broadcast::channel(100);
         let limiter = LoginRateLimiter::new(
             config.security.login_rate_limit_per_5min,
             config.security.login_rate_limit_per_account_hour,
@@ -65,14 +154,56 @@ impl AppState {
             repo,
             config: Arc::new(RwLock::new(config)),
             config_path,
-            event_tx: tx,
+            events: omni_core::events::EventBus::new(),
             login_limiter: Arc::new(limiter),
             secrets: Arc::new(default_store),
             health: omni_core::health::HealthState::new(),
             tls_enabled,
             llm,
             busy_jobs: omni_core::busy::BusyJobs::new(),
+            temp_dir: None,
+            site_runner: None,
+            url_tester: None,
+            cookie_tester: None,
+            benchmark_starter: None,
+            redactions: None,
         }
+    }
+
+    /// Where held videos live, so a rejection can remove its file now.
+    pub fn with_temp_dir(mut self, temp_dir: PathBuf) -> Self {
+        self.temp_dir = Some(temp_dir);
+        self
+    }
+
+    /// The canary runner for the Sites card's «Run now».
+    pub fn with_site_runner(mut self, runner: Arc<dyn SiteRunner>) -> Self {
+        self.site_runner = Some(runner);
+        self
+    }
+
+    /// The dry-run tester for the admin's «Test URL».
+    pub fn with_url_tester(mut self, tester: Arc<dyn UrlTester>) -> Self {
+        self.url_tester = Some(tester);
+        self
+    }
+
+    /// The cookie-jar tester for the Cookies card's «Test».
+    pub fn with_cookie_tester(mut self, tester: Arc<dyn CookieTester>) -> Self {
+        self.cookie_tester = Some(tester);
+        self
+    }
+
+    /// The benchmark runner for the Benchmarks card.
+    pub fn with_benchmark_starter(mut self, starter: Arc<dyn BenchmarkStarter>) -> Self {
+        self.benchmark_starter = Some(starter);
+        self
+    }
+
+    /// The daemon's log redactor, so a jar uploaded while it runs is redacted at once.
+    pub fn with_redactions(mut self, redactions: omni_core::logging::Redactions) -> Self {
+        self.redactions = Some(redactions);
+        self
     }
 
     /// Share the daemon's health state, so the endpoints report what the
@@ -107,7 +238,38 @@ impl AppState {
         self
     }
 
+    /// Share the daemon's event bus, the one the repository announces on.
+    pub fn with_events(mut self, bus: omni_core::events::EventBus) -> Self {
+        self.events = bus;
+        self
+    }
+
+    /// Announce `{"type":"<event>"}` to the desks.
     pub fn broadcast_event(&self, event: &str) {
-        let _ = self.event_tx.send(event.to_string());
+        self.events.event(event, None);
+    }
+
+    /// Same, naming the job so the desk can update just that card.
+    pub fn broadcast_job_event(&self, event: &str, job_id: i64) {
+        self.events.event(event, Some(job_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_event_sends_typed_json_and_job_events_carry_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let state = AppState::new(repo, AppConfig::default(), dir.path().join("config.json"));
+        let mut rx = state.events.subscribe();
+        state.broadcast_event("x");
+        state.broadcast_job_event("job_updated", 12);
+        let a: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(a, serde_json::json!({"type": "x"}));
+        assert_eq!(b, serde_json::json!({"type": "job_updated", "id": 12}));
     }
 }

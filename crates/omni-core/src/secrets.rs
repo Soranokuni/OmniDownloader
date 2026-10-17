@@ -171,6 +171,17 @@ impl SecretStore {
     }
 }
 
+/// Seal `plaintext` with the same machine-scope DPAPI the secret store uses (cookie
+/// jars, plan P3.5). The blob opens only on this machine.
+pub fn seal_bytes(plaintext: &[u8]) -> Result<Vec<u8>> {
+    protect(plaintext).context("Failed sealing data")
+}
+
+/// Open a blob made by [`seal_bytes`].
+pub fn unseal_bytes(blob: &[u8]) -> Result<Vec<u8>> {
+    unprotect(blob).context("Failed unsealing data")
+}
+
 // ==========================================
 // Platform encryption
 // ==========================================
@@ -315,6 +326,13 @@ mod tests {
             !as_text.contains("s3cr3t-mailbox-pass"),
             "the secret is sitting in plaintext on disk"
         );
+    }
+
+    #[test]
+    fn sealed_bytes_round_trip_and_are_not_plaintext() {
+        let blob = seal_bytes(b"a cookie jar with a-known-value-123").unwrap();
+        assert!(!String::from_utf8_lossy(&blob).contains("a-known-value-123"));
+        assert_eq!(unseal_bytes(&blob).unwrap(), b"a cookie jar with a-known-value-123");
     }
 
     #[test]

@@ -1,0 +1,21 @@
+<!doctype html><html lang="el"><head><meta charset="utf-8"><title>Δοκιμαστικό άρθρο ειδήσεων</title></head><body>
+<header><nav><a href="/">Αρχική</a></nav></header>
+<article>
+<h1>Δοκιμαστικό άρθρο με βίντεο</h1>
+<p>Εφευρεμένο κείμενο για έλεγχο.</p>
+<div class="video-wrap"><div id="jw-player-1">Loading the player...</div></div>
+<script>
+// Same shape as a JW Player setup: the page asks for a playlist JSON,
+// the player then requests the HLS master named in it.
+// The player starts 2.5 s after load, as a lazily loaded library does.
+(function () { setTimeout(function () {
+  fetch('{{BASE}}/jw/playlist.json').then(function (r) { return r.json(); }).then(function (pl) {
+    var src = pl.playlist[0].sources[0].file;
+    document.getElementById('jw-player-1').textContent = pl.playlist[0].title;
+    fetch(src);
+  });
+  }, 2500);
+})();
+</script>
+</article>
+</body></html>
