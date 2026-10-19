@@ -211,3 +211,215 @@ async fn glomex_contextual_player_is_offered() {
         media.all_streams
     );
 }
+
+const GLOMEX_PLAYER: &str = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i-fixture00000001&playlistId=";
+
+/// P3.14, gazzetta.gr 2026-10-17: a contextual glomex playlist (a live match)
+/// was the primary while the article's own Facebook video was only a sibling,
+/// and a site widget's YouTube show was queued next to it.
+#[tokio::test]
+async fn contextual_glomex_and_sidebar_youtube_do_not_beat_the_articles_own_video() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_contextual_glomex.html")).await;
+    let fb = "https://www.facebook.com/examplepage/videos/4242424242/";
+    let cl = format!("{GLOMEX_PLAYER}cl-fixture0001");
+    let side = "https://www.youtube.com/watch?v=sIdEbAr0002";
+    let nav = "https://www.youtube.com/watch?v=sTuDiOsHoW1";
+    assert_eq!(media.primary_stream, fb, "all: {:?}", media.all_streams);
+    assert_eq!(media.meta[fb].in_article, Some(true));
+    assert!(media.meta[&cl].contextual, "meta: {:?}", media.meta);
+    assert!(!media.meta[fb].contextual);
+    assert_eq!(media.meta[side].in_article, Some(false));
+    assert_eq!(media.meta[nav].in_article, Some(false));
+    // Everything is still found: the planner decides what is offered.
+    let pos = |u: &str| media.all_streams.iter().position(|x| x == u);
+    assert!(pos(&cl).is_some() && pos(side).is_some(), "all: {:?}", media.all_streams);
+    assert!(pos(fb) < pos(&cl) && pos(fb) < pos(side), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// P3.14, the Montero article: the in-article X post is the primary, the
+/// related-videos YouTube is known to be outside the article.
+#[tokio::test]
+async fn an_in_article_x_post_is_primary_and_the_related_youtube_is_outside() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_x_and_sidebar_youtube.html")).await;
+    let x = "https://x.com/examplepage/status/1900000000000000077".to_string();
+    assert_eq!(media.primary_stream, x, "all: {:?}", media.all_streams);
+    assert_eq!(media.meta[&x].in_article, Some(true));
+    assert_eq!(media.meta["https://www.youtube.com/watch?v=sIdEbAr0003"].in_article, Some(false));
+    // A tweet in a sidebar that comes first in the document does not become the primary.
+    let side = "https://x.com/examplepage/status/1900000000000000078";
+    assert_eq!(media.meta[side].in_article, Some(false), "meta: {:?}", media.meta);
+    within_budget(took);
+}
+
+/// P3.14: the tweet section is read before YouTube, so a sidebar tweet used
+/// to beat the article's own YouTube video.
+#[tokio::test]
+async fn an_in_article_youtube_beats_a_sidebar_tweet() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_youtube_and_sidebar_x.html")).await;
+    let yt = "https://www.youtube.com/watch?v=aRtIcLeVid2";
+    assert_eq!(media.primary_stream, yt, "all: {:?}", media.all_streams);
+    assert_eq!(media.meta["https://x.com/examplepage/status/1900000000000000088"].in_article, Some(false));
+    within_budget(took);
+}
+
+/// Control: a contextual playlist that is the page's only video is still the
+/// primary, as before.
+#[tokio::test]
+async fn a_lone_contextual_glomex_player_is_still_the_primary() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/glomex_contextual_only.html")).await;
+    let cl = format!("{GLOMEX_PLAYER}cl-fixture0002");
+    assert_eq!(media.primary_stream, cl, "all: {:?}", media.all_streams);
+    assert!(media.meta[&cl].contextual);
+    within_budget(took);
+}
+
+/// Control (iefimerida / news247 shape): a glomex clip the article names is
+/// an ordinary primary, ahead of a sidebar embed.
+#[tokio::test]
+async fn a_concrete_glomex_clip_in_the_article_is_unchanged() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/glomex_concrete_clip.html")).await;
+    let clip = format!("{GLOMEX_PLAYER}v-fixtureclip01");
+    assert_eq!(media.primary_stream, clip, "all: {:?}", media.all_streams);
+    assert!(!media.meta[&clip].contextual);
+    assert_eq!(media.meta[&clip].in_article, Some(true));
+    within_budget(took);
+}
+
+fn yt(id: &str) -> String {
+    format!("https://www.youtube.com/watch?v={id}")
+}
+
+/// P3.14 control: no article element at all: nothing is classified, and the
+/// lead embed stays ahead of a network pre-roll as before.
+#[tokio::test]
+async fn a_page_without_an_article_element_is_not_classified() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/lead_video_no_article_element.html")).await;
+    assert_eq!(media.primary_stream, yt("lEaDvId0001"), "all: {:?}", media.all_streams);
+    assert_eq!(media.meta[&yt("lEaDvId0001")].in_article, None);
+    within_budget(took);
+}
+
+/// Teaser cards are `<article>` elements elsewhere on the page; the lead
+/// player outside them is unknown, not outside.
+#[tokio::test]
+async fn teaser_cards_elsewhere_do_not_make_the_lead_player_outside() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/lead_video_beside_teaser_cards.html")).await;
+    assert_eq!(media.primary_stream, yt("lEaDvId0002"), "all: {:?}", media.all_streams);
+    assert_eq!(media.meta[&yt("lEaDvId0002")].in_article, None);
+    within_budget(took);
+}
+
+/// A lead video in the story container's own header is in the article.
+#[tokio::test]
+async fn a_lead_video_in_the_articles_own_header_is_in_the_article() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/lead_video_in_article_header.html")).await;
+    assert_eq!(media.meta[&yt("hEaDeR00001")].in_article, Some(true), "meta: {:?}", media.meta);
+    within_budget(took);
+}
+
+/// A layout wrapper called "content-with-sidebar" around the article does not
+/// make its embed an outsider.
+#[tokio::test]
+async fn a_sidebar_named_layout_wrapper_above_the_article_does_not_count() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_in_sidebar_layout.html")).await;
+    assert_eq!(media.meta[&yt("lAyOuT00001")].in_article, Some(true), "meta: {:?}", media.meta);
+    within_budget(took);
+}
+
+/// The same video in a sidebar strip (earlier in the page) and in the article
+/// body is the article's.
+#[tokio::test]
+async fn a_video_repeated_in_a_sidebar_and_in_the_article_is_in_the_article() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_embed_repeated_in_sidebar.html")).await;
+    assert_eq!(media.meta[&yt("rEpEaT00001")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.all_streams.iter().filter(|u| **u == yt("rEpEaT00001")).count(), 1);
+    within_budget(took);
+}
+
+/// P3.14: only whole marker tokens make an embed an outsider; a state or
+/// category label does not, a comment always does, and a header outside any
+/// container is unknown.
+#[tokio::test]
+async fn marker_tokens_comments_and_headers_are_told_apart() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/placement_markers.html")).await;
+    let at = |id: &str| media.meta.get(&yt(id)).map(|m| m.in_article);
+    assert_eq!(at("cAtEgOrY001"), Some(Some(true)), "category-trending is a label: {:?}", media.meta);
+    assert_eq!(at("nOsIdEbAr01"), Some(Some(true)), "no-sidebar is a label: {:?}", media.meta);
+    assert_eq!(at("rElAtEd0001"), Some(Some(false)), "related-videos is a widget: {:?}", media.meta);
+    assert_eq!(at("cOmMeNt0001"), Some(Some(false)), "a commenter's link: {:?}", media.meta);
+    assert_eq!(at("hEaDoUt0001"), Some(None), "a header outside any container is unknown: {:?}", media.meta);
+    within_budget(took);
+}
+
+/// A bare `<article>` that is a card inside an `<aside>` is not the article;
+/// a real `<article>` in `<main>` under a `with-sidebar` wrapper is.
+#[tokio::test]
+async fn a_card_article_inside_an_aside_is_outside_a_real_article_under_a_layout_wrapper_is_not() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_card_in_aside.html")).await;
+    assert_eq!(media.meta[&yt("cArDvId0001")].in_article, Some(false), "meta: {:?}", media.meta);
+    assert_eq!(media.meta[&yt("rEaLaRt0001")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.primary_stream, yt("rEaLaRt0001"), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// gazzetta.gr waiter page (2026-10-17 re-run): the site's own show is a plain
+/// link in the page header, outside any container. It tied the article's
+/// Facebook video at 95 and, being found first, became the primary.
+#[tokio::test]
+async fn a_header_link_does_not_beat_the_articles_embedded_video() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_header_link_show.html")).await;
+    let fb = "https://www.facebook.com/examplepage/videos/4242424243/";
+    let show = yt("sTuDiOsHoW1");
+    assert_eq!(media.primary_stream, fb, "all: {:?}", media.all_streams);
+    assert!(media.meta[&show].link && media.meta[&show].in_article != Some(true), "meta: {:?}", media.meta);
+    assert!(!media.meta[fb].link);
+    let pos = |u: &str| media.all_streams.iter().position(|x| x == u);
+    assert!(pos(fb) < pos(&show), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// Control: a link inside the article body, with no embed, is the primary.
+#[tokio::test]
+async fn a_link_in_the_article_body_is_still_the_primary() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/link_in_article_body_only.html")).await;
+    assert_eq!(media.primary_stream, yt("bOdYlInK001"), "all: {:?}", media.all_streams);
+    assert_eq!(media.meta[&yt("bOdYlInK001")].in_article, Some(true));
+    within_budget(took);
+}
+
+/// Control: a page whose only candidate is a header link still yields it.
+#[tokio::test]
+async fn a_lone_header_link_is_still_the_primary() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/link_in_header_only.html")).await;
+    assert_eq!(media.primary_stream, yt("hEaDeRlNk01"), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// A header link (unknown placement) comes first on the page; the link in the
+/// article body is still found and is the primary.
+#[tokio::test]
+async fn a_body_link_is_found_after_a_header_link_and_wins() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/link_in_header_and_in_body.html")).await;
+    let (head, body) = (yt("sHoWhEaDer1"), yt("aRtIcLeLnk1"));
+    assert_eq!(media.primary_stream, body, "all: {:?}", media.all_streams);
+    assert_eq!(media.meta[&body].in_article, Some(true));
+    assert!(media.meta[&head].link && media.meta[&head].in_article != Some(true), "meta: {:?}", media.meta);
+    within_budget(took);
+}

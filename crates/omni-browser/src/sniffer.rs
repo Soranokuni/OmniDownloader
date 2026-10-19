@@ -9,7 +9,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParam
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,9 +161,76 @@ const LIVE_MAX_WAIT_MS: u32 = 8000;
 pub struct DiscoveredMedia {
     pub primary_stream: String,
     pub all_streams: Vec<String>,
+    /// What the page said about where each stream sits, keyed by the address
+    /// in `all_streams`; a stream not listed (a network capture) is unknown.
+    #[serde(default)]
+    pub meta: HashMap<String, StreamMeta>,
     pub user_agent: String,
     pub referer: String,
     pub cookies: Option<String>,
+}
+
+/// Where on the page a stream was found (P3.14). Only an embed read from the
+/// DOM knows; neither field is ever a reason to drop a stream, only to choose
+/// among them and to decide whether an article's other video is queued or
+/// offered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamMeta {
+    /// `Some(true)` inside the article's own content, `Some(false)` outside it
+    /// (navigation, sidebar, related widget, footer, a header outside the
+    /// article), `None` when the page does not say.
+    pub in_article: Option<bool>,
+    /// A glomex `cl-…` contextual list, which plays whatever glomex matches
+    /// to the page, not a video the article names. `auto` is an ordinary clip.
+    pub contextual: bool,
+    /// Found as a plain link (an `<a href>` to a platform video), not as an
+    /// embedded player, a video element or a network stream. A link counts
+    /// only inside the article body.
+    #[serde(default)]
+    pub link: bool,
+}
+
+impl StreamMeta {
+    /// Rank for choosing the primary, lower first: 0 for anything that is
+    /// not demoted (in the article, unknown, a network stream), 1 for a video
+    /// found outside the article, but only when `article_has_own` (some
+    /// non-contextual candidate is inside it), 2 for a contextual glomex
+    /// playlist (a live match, an unrelated reel), always last. Within a rank
+    /// the score decides.
+    pub fn rank(&self, article_has_own: bool) -> u8 {
+        if self.contextual {
+            2
+        } else if self.link && self.in_article != Some(true) {
+            // A link outside the article body (a site's own show in its
+            // header) is behind every embed and stream, whatever the score.
+            1
+        } else if self.in_article == Some(false) && article_has_own {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn merged(self, other: StreamMeta) -> StreamMeta {
+        StreamMeta {
+            in_article: match (self.in_article, other.in_article) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            contextual: self.contextual && other.contextual,
+            link: self.link && other.link,
+        }
+    }
+}
+
+/// Whether `url` is one the sniffer ranks below the page's own videos: a
+/// contextual list, a link outside the article body, or an embed outside the
+/// article while some video is inside it. Exactly the candidates [`final_candidates`]
+/// sorts behind the others, so `meta` and this agree.
+pub fn is_demoted(meta: &HashMap<String, StreamMeta>, url: &str) -> bool {
+    let article_has_own = meta.values().any(|m| m.in_article == Some(true) && !m.contextual);
+    meta.get(url).is_some_and(|m| m.rank(article_has_own) > 0)
 }
 
 /// A sniff's outcome together with what the browser saw (plan P10.1). The
@@ -646,6 +713,8 @@ impl StreamSniffer {
         // Thread-safe list of discovered stream candidates: (score, url)
         let candidates = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
         let candidates_clone = candidates.clone();
+        // Where the page put the streams its DOM named (P3.14), by address.
+        let dom_meta = Arc::new(Mutex::new(HashMap::<String, StreamMeta>::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = stop_flag.clone();
 
@@ -738,6 +807,58 @@ impl StreamSniffer {
             (() => {
                 const found = [];
 
+                // Where an element sits (P3.14). Walking up from the element to
+                // the nearest article container: an explicit outside marker
+                // (aside, nav, footer, a navigation/complementary role, a
+                // comment, a class or id token naming a related/recommended/
+                // sidebar/trending/most-read widget) met on the way makes it
+                // false; the container reached without one makes it true.
+                // Markers above the container (a layout wrapper called
+                // "with-sidebar") do not count. With no container at all it is
+                // false only if a marker is on the path, else null (the page
+                // does not say). A fixed script; only markup structure is
+                // read, nothing from it is run or spliced.
+                const ARTICLE_SEL = 'article, [itemprop="articleBody"], .article-body, .entry-content, .article__main, .article-main, .article-content, .post-content, .story-body';
+                const STRONG_SEL = '[itemprop="articleBody"], .article-body, .entry-content, .article__main, .article-main, .article-content, .post-content, .story-body';
+                const COMMENT_SEL = '.comment, .comment-body, .comments, #comments, [id^="comment-"]';
+                const OUTSIDE_TAGS = new Set(['ASIDE', 'NAV', 'FOOTER']);
+                // A whole class token (or the id): a marker word at its start or
+                // end between - or _, not a state or category label.
+                const MARKER_WORD = /(^|[-_])(related|recommend\w*|sidebar|trending|taboola|outbrain|more[-_]videos?|most[-_]read)($|[-_])/;
+                const NOT_A_MARKER = /^(category|tag|no|has|with)[-_]/;
+                const namedOutside = (a) => {
+                    const tokens = String(a.getAttribute('class') || '').split(/\s+/);
+                    tokens.push(a.getAttribute('id') || '');
+                    return tokens.some((t) => { t = t.toLowerCase(); return t && !NOT_A_MARKER.test(t) && MARKER_WORD.test(t); });
+                };
+                const inArticle = (el) => {
+                    try {
+                        let marker = false;
+                        for (let a = el.parentElement; a && a !== document.body && a !== document.documentElement; a = a.parentElement) {
+                            // A comment is never the article, even as an <article> element.
+                            if (a.matches(COMMENT_SEL)) { marker = true; continue; }
+                            if (a.matches(ARTICLE_SEL)) {
+                                if (marker) return false;
+                                // A bare <article> may be a card in a sidebar: tags and
+                                // roles above it can still say so (not class names).
+                                if (a.tagName !== 'ARTICLE' || a.matches(STRONG_SEL)) return true;
+                                for (let b = a.parentElement; b && b !== document.body && b !== document.documentElement; b = b.parentElement) {
+                                    const r = (b.getAttribute('role') || '').toLowerCase();
+                                    if (OUTSIDE_TAGS.has(b.tagName) || r === 'navigation' || r === 'complementary') return false;
+                                }
+                                return true;
+                            }
+                            const role = (a.getAttribute('role') || '').toLowerCase();
+                            if (OUTSIDE_TAGS.has(a.tagName) || role === 'navigation' || role === 'complementary' || namedOutside(a)) marker = true;
+                        }
+                        return marker ? false : null;
+                    } catch (e) { return null; }
+                };
+                const add = (item, el) => {
+                    item.in_article = el ? inArticle(el) : null;
+                    found.push(item);
+                };
+
                 // An AMP page carries its embeds as amp-iframe, which is read like an iframe:
                 // every `iframe[...]` selector below also matches `amp-iframe[...]`.
                 const qa = (sel) => Array.from(document.querySelectorAll(
@@ -756,18 +877,20 @@ impl StreamSniffer {
                 // first was ever seen). Keyed on the status id so the same
                 // post found as a blockquote link and as a rendered iframe
                 // counts once.
-                const tweetIds = new Set();
-                const addTweet = (id, url) => {
-                    if (!tweetIds.has(id)) { tweetIds.add(id); found.push({ type: 'twitter', url }); }
+                const tweetIds = new Map();
+                const addTweet = (id, url, el) => {
+                    const seen = tweetIds.get(id);
+                    if (!seen) { const item = { type: 'twitter', url }; tweetIds.set(id, item); add(item, el); }
+                    else if (seen.in_article !== true && inArticle(el) === true) seen.in_article = true;
                 };
                 for (const el of tweetNodes) {
                     const href = el.href || getSrc(el) || el.getAttribute('href') || '';
                     const m = href.match(/(https?:\/\/(?:twitter|x)\.com\/(?:#!\/)?[a-zA-Z0-9_]+\/status\/(\d+))/i);
-                    if (m) { addTweet(m[2], m[1].replace(/\/\/twitter\.com\//i, '//x.com/')); continue; }
+                    if (m) { addTweet(m[2], m[1].replace(/\/\/twitter\.com\//i, '//x.com/'), el); continue; }
                     const idMatch = href.match(/id=(\d{15,})/);
-                    if (idMatch) { addTweet(idMatch[1], 'https://x.com/i/status/' + idMatch[1]); continue; }
+                    if (idMatch) { addTweet(idMatch[1], 'https://x.com/i/status/' + idMatch[1], el); continue; }
                     const dataId = el.getAttribute('data-tweet-id');
-                    if (dataId) { addTweet(dataId, 'https://x.com/i/status/' + dataId); }
+                    if (dataId) { addTweet(dataId, 'https://x.com/i/status/' + dataId, el); }
                 }
 
                 // 2. Glomex player embeds (web components, divs, iframes)
@@ -778,15 +901,15 @@ impl StreamSniffer {
                     const pId = d.getAttribute('playlist-id') || d.getAttribute('data-playlist-id');
                     const iId = d.getAttribute('integration-id') || d.getAttribute('data-integration-id');
                     if (pId && iId) {
-                        found.push({ type: 'glomex', url: `https://player.glomex.com/integration/1/iframe-player.html?integrationId=${iId}&playlistId=${pId}` });
+                        add({ type: 'glomex', url: `https://player.glomex.com/integration/1/iframe-player.html?integrationId=${iId}&playlistId=${pId}` }, d);
                     } else if (pId) {
-                        found.push({ type: 'glomex', url: `https://player.glomex.com/integration/1/iframe-player.html?playlistId=${pId}` });
+                        add({ type: 'glomex', url: `https://player.glomex.com/integration/1/iframe-player.html?playlistId=${pId}` }, d);
                     }
                 }
                 const glomexIframes = Array.from(qa('iframe[src*="glomex.com"], iframe[data-src*="glomex.com"], iframe[data-lazy-src*="glomex.com"]'));
                 for (const f of glomexIframes) {
                     const src = getSrc(f);
-                    if (src) found.push({ type: 'glomex', url: src });
+                    if (src) add({ type: 'glomex', url: src }, f);
                 }
 
                 // 3. JWPlayer / JWPlatform embeds (Proto Thema, Antenna, Star, etc.)
@@ -795,12 +918,12 @@ impl StreamSniffer {
                 ));
                 for (const j of jwIframes) {
                     const src = getSrc(j);
-                    if (src) found.push({ type: 'jwplayer', url: src });
+                    if (src) add({ type: 'jwplayer', url: src }, j);
                 }
                 const jwDivs = Array.from(qa('[data-media-id], [data-jwplayer-id]'));
                 for (const jd of jwDivs) {
                     const mId = jd.getAttribute('data-media-id') || jd.getAttribute('data-jwplayer-id');
-                    if (mId) found.push({ type: 'jwplayer', url: `https://cdn.jwplayer.com/players/${mId}.html` });
+                    if (mId) add({ type: 'jwplayer', url: `https://cdn.jwplayer.com/players/${mId}.html` }, jd);
                 }
 
                 // 4. ERT WebTV / ERTFLIX player embeds
@@ -812,10 +935,10 @@ impl StreamSniffer {
                     const m = src.match(/[?&]f=([^&]+)/);
                     if (m) {
                         const relPath = decodeURIComponent(m[1]).replace(/^\/+/, '');
-                        found.push({
+                        add({
                             type: 'ert_hls',
                             url: `https://mediastream.ert.gr/vodedge/_definst_/mp4:dvrorigin/${relPath}/playlist.m3u8`
-                        });
+                        }, e);
                     }
                 }
 
@@ -825,7 +948,7 @@ impl StreamSniffer {
                 ));
                 for (const b of bcIframes) {
                     const src = getSrc(b);
-                    if (src) found.push({ type: 'brightcove', url: src });
+                    if (src) add({ type: 'brightcove', url: src }, b);
                 }
 
                 // 6. YouTube embeds (standard iframes, WP Rocket lazyload, ProtoThema custom plugins, explicit article links)
@@ -848,21 +971,31 @@ impl StreamSniffer {
                     // WP Rocket's lazy player carries the bare id.
                     const dataId = y.getAttribute('data-id') || '';
                     if (!id && y.classList.contains('rll-youtube-player') && /^[a-zA-Z0-9_-]{11}$/.test(dataId)) id = dataId;
-                    if (id) found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
+                    if (id) add({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id }, y);
                     const pluginAttr = y.getAttribute('data-plugin-youtube') || '';
                     const pm = pluginAttr.match(/"ID":\s*"([a-zA-Z0-9_-]{11})"/);
                     if (pm) {
-                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + pm[1] });
+                        add({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + pm[1] }, y);
                     }
                 }
 
                 const ytLinks = Array.from(qa('a[href*="youtube.com/watch"], a[href*="youtu.be/"]'));
+                // One link is enough, but not a menu's: a site's own show in
+                // its header comes first on every page. The first link that is
+                // not inside the article is kept as a fallback (offered, never
+                // preferred), and scanning goes on for one inside the article
+                // body, which ends it.
+                let fallbackLink = false;
                 for (const a of ytLinks) {
                     const id = ytId(a.href);
-                    if (id) {
-                        found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
-                        break;
+                    if (!id) continue;
+                    const inside = inArticle(a) === true;
+                    if (!inside) {
+                        if (fallbackLink) continue;
+                        fallbackLink = true;
                     }
+                    add({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id, link: true }, a);
+                    if (inside) break;
                 }
 
                 // 7. Facebook video & reel embeds (ERT News, Iefimerida, Protothema)
@@ -874,7 +1007,7 @@ impl StreamSniffer {
                     const m = src.match(/[?&]href=([^&]+)/);
                     if (m) {
                         const directUrl = decodeURIComponent(m[1]);
-                        found.push({ type: 'facebook', url: directUrl });
+                        add({ type: 'facebook', url: directUrl }, f);
                     }
                 }
 
@@ -885,7 +1018,7 @@ impl StreamSniffer {
                 for (const d of dmIframes) {
                     const src = getSrc(d);
                     const m = src.match(/embed\/video\/([a-zA-Z0-9]+)/);
-                    if (m) found.push({ type: 'dailymotion', url: 'https://www.dailymotion.com/video/' + m[1] });
+                    if (m) add({ type: 'dailymotion', url: 'https://www.dailymotion.com/video/' + m[1] }, d);
                 }
 
                 // 9. Vimeo embeds
@@ -894,13 +1027,13 @@ impl StreamSniffer {
                 ));
                 for (const v of vimIframes) {
                     const src = getSrc(v);
-                    if (src) found.push({ type: 'vimeo', url: src });
+                    if (src) add({ type: 'vimeo', url: src }, v);
                 }
 
                 // 10. TikTok embeds
                 const ttEmbeds = Array.from(qa('blockquote.tiktok-embed'));
                 for (const t of ttEmbeds) {
-                    if (t.getAttribute('cite')) found.push({ type: 'tiktok', url: t.getAttribute('cite') });
+                    if (t.getAttribute('cite')) add({ type: 'tiktok', url: t.getAttribute('cite') }, t);
                 }
 
                 // 10b. Instagram posts: the official blockquote, or the
@@ -916,13 +1049,13 @@ impl StreamSniffer {
                 ));
                 for (const n of igNodes) {
                     const u = igCanon(n.getAttribute('data-instgrm-permalink') || getSrc(n) || (n.querySelector('a') || {}).href);
-                    if (u) found.push({ type: 'instagram', url: u });
+                    if (u) add({ type: 'instagram', url: u }, n);
                 }
 
                 // 10c. Streamable players.
                 for (const f of Array.from(qa('iframe[src*="streamable.com"], iframe[data-src*="streamable.com"], iframe[data-lazy-src*="streamable.com"]'))) {
                     const m = getSrc(f).match(/streamable\.com\/(?:e|o|s)\/([A-Za-z0-9]+)/i);
-                    if (m) found.push({ type: 'streamable', url: 'https://streamable.com/' + m[1] });
+                    if (m) add({ type: 'streamable', url: 'https://streamable.com/' + m[1] }, f);
                 }
 
                 // 10d. A portal's own oEmbed proxy (iefimerida.gr:
@@ -933,7 +1066,7 @@ impl StreamSniffer {
                     try { inner = new URL(getSrc(f), location.href).searchParams.get('url'); } catch (e) {}
                     if (!inner || !/^https?:\/\//i.test(inner)) continue;
                     const ig = igCanon(inner);
-                    found.push({ type: 'oembed', url: ig || inner.replace(/[?&]utm_[^&#]*/g, '') });
+                    add({ type: 'oembed', url: ig || inner.replace(/[?&]utm_[^&#]*/g, '') }, f);
                 }
 
                 // 10e. AMP components. An id is checked before it is put into an address.
@@ -943,30 +1076,30 @@ impl StreamSniffer {
                 };
                 for (const n of qa('amp-youtube[data-videoid]')) {
                     const id = ampId(n.getAttribute('data-videoid'), 11);
-                    if (id && id.length === 11) found.push({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id });
+                    if (id && id.length === 11) add({ type: 'youtube', url: 'https://www.youtube.com/watch?v=' + id }, n);
                 }
                 for (const n of qa('amp-vimeo[data-videoid]')) {
                     const id = ampId(n.getAttribute('data-videoid'), 12);
-                    if (id && /^[0-9]+$/.test(id)) found.push({ type: 'vimeo', url: 'https://vimeo.com/' + id });
+                    if (id && /^[0-9]+$/.test(id)) add({ type: 'vimeo', url: 'https://vimeo.com/' + id }, n);
                 }
                 for (const n of qa('amp-dailymotion[data-videoid]')) {
                     const id = ampId(n.getAttribute('data-videoid'), 20);
-                    if (id && /^[A-Za-z0-9]+$/.test(id)) found.push({ type: 'dailymotion', url: 'https://www.dailymotion.com/video/' + id });
+                    if (id && /^[A-Za-z0-9]+$/.test(id)) add({ type: 'dailymotion', url: 'https://www.dailymotion.com/video/' + id }, n);
                 }
                 for (const n of qa('amp-twitter[data-tweetid]')) {
                     const id = ampId(n.getAttribute('data-tweetid'), 25);
-                    if (id && /^[0-9]+$/.test(id)) addTweet(id, 'https://x.com/i/status/' + id);
+                    if (id && /^[0-9]+$/.test(id)) addTweet(id, 'https://x.com/i/status/' + id, n);
                 }
                 for (const n of qa('amp-facebook[data-href]')) {
                     const h = n.getAttribute('data-href') || '';
                     const isVideoUrl = /^https?:\/\/(?:(?:www\.|m\.|web\.)?facebook\.com\/(?:[^?#]*\/videos\/|watch|reel)|fb\.watch\/)/i.test(h);
                     const declared = (n.getAttribute('data-embed-as') || '').toLowerCase() === 'video' && /^https?:\/\/(?:www\.|m\.|web\.)?facebook\.com\//i.test(h);
-                    if ((isVideoUrl || declared) && h.length <= 500) found.push({ type: 'facebook', url: h });
+                    if ((isVideoUrl || declared) && h.length <= 500) add({ type: 'facebook', url: h }, n);
                 }
                 for (const n of qa('amp-video source[src], amp-video[src]')) {
                     try {
                         const u = new URL(n.getAttribute('src') || '', location.href);
-                        if (u.protocol === 'http:' || u.protocol === 'https:') found.push({ type: 'source_src', url: u.href });
+                        if (u.protocol === 'http:' || u.protocol === 'https:') add({ type: 'source_src', url: u.href }, n);
                     } catch (e) {}
                 }
 
@@ -975,7 +1108,7 @@ impl StreamSniffer {
                 for (const el of videoElements) {
                     const src = getSrc(el);
                     if (src && src.startsWith('http')) {
-                        found.push({ type: 'source_src', url: src });
+                        add({ type: 'source_src', url: src }, el);
                     }
                 }
 
@@ -996,12 +1129,12 @@ impl StreamSniffer {
         // Where the page really is (after redirects): what a contextual glomex
         // player is matched against.
         let mut page_url = Self::current_page_url(&page, target_url).await;
-        let mut handled: HashSet<String> = HashSet::new();
+        let mut handled: HashMap<String, Option<String>> = HashMap::new();
         match page.evaluate(dom_embed_js).await {
             Ok(eval) => {
                 if let Some(arr) = eval.value().and_then(Value::as_array) {
                     info!("StreamSniffer: DOM embed inspection found {} raw elements", arr.len());
-                    Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
+                    Self::add_dom_items(arr, &candidates, &dom_meta, &mut handled, &page_url).await;
                 }
             }
             Err(e) => {
@@ -1065,7 +1198,7 @@ impl StreamSniffer {
                         let _ = page.evaluate(LAZY_SCROLL_JS).await;
                         if let Ok(eval) = page.evaluate(dom_embed_js).await {
                             if let Some(arr) = eval.value().and_then(Value::as_array) {
-                                Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
+                                Self::add_dom_items(arr, &candidates, &dom_meta, &mut handled, &page_url).await;
                             }
                         }
                         Some(())
@@ -1083,7 +1216,7 @@ impl StreamSniffer {
                 page_url = Self::current_page_url(&page, &page_url).await;
                 if let Ok(eval) = page.evaluate(dom_embed_js).await {
                     if let Some(arr) = eval.value().and_then(Value::as_array) {
-                        Self::add_dom_items(arr, &candidates, &mut handled, &page_url).await;
+                        Self::add_dom_items(arr, &candidates, &dom_meta, &mut handled, &page_url).await;
                     }
                 }
             }
@@ -1118,7 +1251,7 @@ impl StreamSniffer {
         });
 
         // 10. Compile all streams and primary stream
-        let sorted_candidates = final_candidates(candidates.lock().await.clone());
+        let (sorted_candidates, meta) = final_candidates(candidates.lock().await.clone(), &*dom_meta.lock().await);
 
         // What the browser saw goes in whether or not a stream was found: a
         // found stream can still fail downstream (HTTP 403).
@@ -1140,6 +1273,7 @@ impl StreamSniffer {
             Ok(DiscoveredMedia {
                 primary_stream: best_url.clone(),
                 all_streams: all_urls,
+                meta,
                 user_agent,
                 referer: target_url.to_string(),
                 cookies,
@@ -1264,19 +1398,33 @@ impl StreamSniffer {
     async fn add_dom_items(
         items: &[Value],
         candidates: &Mutex<Vec<(u32, String)>>,
-        handled: &mut HashSet<String>,
+        meta: &Mutex<HashMap<String, StreamMeta>>,
+        handled: &mut HashMap<String, Option<String>>,
         page_url: &str,
     ) {
         for obj in items.iter().filter_map(Value::as_object) {
             let Some(raw) = obj.get("url").and_then(Value::as_str) else {
                 continue;
             };
-            if !handled.insert(raw.to_string()) {
+            let in_article = obj.get("in_article").and_then(Value::as_bool);
+            let link = obj.get("link").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(known) = handled.get(raw) {
+                // The same address seen again, perhaps inside the article after
+                // a sidebar strip: the better placement wins, whatever came first.
+                if let Some(url) = known {
+                    let mut m = meta.lock().await;
+                    if let Some(old) = m.get(url).copied() {
+                        m.insert(url.clone(), old.merged(StreamMeta { in_article, contextual: old.contextual, link }));
+                    }
+                }
                 continue;
             }
+            handled.insert(raw.to_string(), None);
             let embed_type = obj.get("type").and_then(Value::as_str).unwrap_or("embed");
 
+            let mut contextual = false;
             let (score, url) = if let Some(embed) = glomex::parse_embed(raw) {
+                contextual = embed.is_contextual_list();
                 match glomex::resolve(&embed, page_url).await {
                     Ok(glomex::Resolved::Embed(u)) => (95, u),
                     Ok(glomex::Resolved::Empty) => {
@@ -1298,6 +1446,13 @@ impl StreamSniffer {
             };
 
             if score > 0 {
+                handled.insert(raw.to_string(), Some(url.clone()));
+                let seen = StreamMeta { in_article, contextual, link };
+                {
+                    let mut m = meta.lock().await;
+                    let merged = m.get(&url).map_or(seen, |old| old.merged(seen));
+                    m.insert(url.clone(), merged);
+                }
                 let mut list = candidates.lock().await;
                 if !list.iter().any(|(_, u)| *u == url) {
                     info!("StreamSniffer: Identified DOM embedded media [{embed_type}] (score: {score}): {}", log_addr(&url));
@@ -1440,17 +1595,41 @@ fn live_outcomes_ok(actions: &[LiveAction], outcomes: &[String]) -> bool {
 /// that is also found as its player: the player URL gives yt-dlp the clip's
 /// best rendition and its title, and the copy would be offered to MCR as a
 /// second video.
-fn final_candidates(mut list: Vec<(u32, String)>) -> Vec<(u32, String)> {
+///
+/// Best first is by score, except that a contextual glomex playlist is
+/// always last and, when some candidate is inside the article, one found
+/// outside it comes after those ([`StreamMeta::rank`], P3.14). An unknown
+/// placement (no article on the page, a network stream) is never demoted. A
+/// page with nothing else still returns a demoted one as its first. Also returns the
+/// [`StreamMeta`] of every candidate that has one. The network sees the
+/// stream a contextual player plays under its clip id, not the playlist's, so
+/// a glomex CDN stream is contextual too while such a player is on the page.
+fn final_candidates(
+    mut list: Vec<(u32, String)>,
+    dom_meta: &HashMap<String, StreamMeta>,
+) -> (Vec<(u32, String)>, HashMap<String, StreamMeta>) {
     let embedded: HashSet<String> = list
         .iter()
         .filter_map(|(_, u)| glomex::parse_embed(u))
         .map(|e| e.playlist_id)
         .collect();
     list.retain(|(_, u)| glomex::clip_id_of_stream(u).map_or(true, |clip| !embedded.contains(&clip)));
-    // Stable: among equal scores the one found first stays first.
-    list.sort_by(|a, b| b.0.cmp(&a.0));
-    list
-
+    let contextual_player = list.iter().any(|(_, u)| dom_meta.get(u).is_some_and(|m| m.contextual));
+    let mut meta = HashMap::new();
+    for (_, u) in &list {
+        let mut m = dom_meta.get(u).copied();
+        if contextual_player && glomex::clip_id_of_stream(u).is_some() {
+            m = Some(StreamMeta { contextual: true, ..m.unwrap_or_default() });
+        }
+        if let Some(m) = m {
+            meta.insert(u.clone(), m);
+        }
+    }
+    // Stable: among equal ranks and scores the one found first stays first.
+    let article_has_own = meta.values().any(|m| m.in_article == Some(true) && !m.contextual);
+    let rank = |u: &str| meta.get(u).map_or(0, |m| m.rank(article_has_own));
+    list.sort_by(|a, b| rank(&a.1).cmp(&rank(&b.1)).then(b.0.cmp(&a.0)));
+    (list, meta)
 }
 
 #[cfg(test)]
@@ -1759,8 +1938,149 @@ mod tests {
         let stream = "https://video-cdn-jwt-new.mes.glomex.cloud/v2/77a350/v-dlso19wczcdl/eyJ0.eyJl.-wps/stream.mp4";
         let other = "https://video-cdn-jwt-new.mes.glomex.cloud/v2/77a350/v-another/eyJ0.eyJl.-wps/stream.mp4";
         let tiktok = "https://www.tiktok.com/@someone/video/7690626350159318305";
-        let out = final_candidates(vec![(80, stream.into()), (95, player.into()), (80, other.into()), (95, tiktok.into())]);
+        let (out, _) = final_candidates(
+            vec![(80, stream.into()), (95, player.into()), (80, other.into()), (95, tiktok.into())],
+            &HashMap::new(),
+        );
         let urls: Vec<&str> = out.iter().map(|(_, u)| u.as_str()).collect();
         assert_eq!(urls, vec![player, tiktok, other]);
+    }
+
+    /// P3.14: the order the primary is chosen in.
+    #[test]
+    fn a_contextual_playlist_and_an_out_of_article_embed_rank_below_the_articles_own() {
+        let fb = "https://www.facebook.com/someone/videos/1/";
+        let yt = "https://www.youtube.com/watch?v=sIdEbAr0001";
+        let cl = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=cl-abc";
+        let m = |in_article, contextual| StreamMeta { in_article, contextual, ..Default::default() };
+        let dom: HashMap<String, StreamMeta> =
+            [(fb.to_string(), m(Some(true), false)), (yt.to_string(), m(Some(false), false)), (cl.to_string(), m(Some(true), true))].into();
+        // Found in the order the page lists them: glomex, widget, article video.
+        let (out, meta) = final_candidates(vec![(95, cl.into()), (95, yt.into()), (95, fb.into())], &dom);
+        let urls: Vec<&str> = out.iter().map(|(_, u)| u.as_str()).collect();
+        assert_eq!(urls, vec![fb, yt, cl]);
+        assert_eq!(meta[cl].rank(true), 2);
+        // A lower score does not put a widget's video ahead of the article's own.
+        let (out, _) = final_candidates(vec![(95, yt.into()), (40, fb.into())], &dom);
+        assert_eq!(out[0].1, fb);
+        // The control: alone, the contextual playlist is still the primary.
+        let (out, _) = final_candidates(vec![(95, cl.into())], &dom);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, cl);
+    }
+
+    #[test]
+    fn the_stream_a_contextual_player_plays_is_contextual_too() {
+        let cl = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=cl-abc";
+        let cdn = "https://video-cdn-jwt-new.mes.glomex.cloud/v2/77a350/v-live0000001/eyJ0.eyJl.-wps/master.m3u8";
+        let x = "https://x.com/i/status/1900000000000000001";
+        let dom: HashMap<String, StreamMeta> =
+            [(cl.to_string(), StreamMeta { in_article: Some(true), contextual: true, ..Default::default() })].into();
+        let (out, meta) = final_candidates(vec![(100, cdn.into()), (95, cl.into()), (95, x.into())], &dom);
+        assert_eq!(out[0].1, x, "{out:?}");
+        assert!(meta[cdn].contextual);
+        // Without a contextual player on the page the same stream is just a stream.
+        let (out, meta) = final_candidates(vec![(100, cdn.into()), (95, x.into())], &HashMap::new());
+        assert_eq!(out[0].1, cdn);
+        assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn an_outside_embed_is_demoted_only_below_in_article_ones_never_below_unknowns_alone() {
+        let yt = "https://www.youtube.com/watch?v=sIdEbAr0001";
+        let preroll = "https://cdn.news.example/preroll.mp4";
+        let dom: HashMap<String, StreamMeta> =
+            [(yt.to_string(), StreamMeta { in_article: Some(false), contextual: false, ..Default::default() })].into();
+        // Nothing in the article to prefer: the score decides, as before.
+        let (out, _) = final_candidates(vec![(95, yt.into()), (40, preroll.into())], &dom);
+        assert_eq!(out[0].1, yt);
+        let (out, _) = final_candidates(vec![(100, preroll.into()), (95, yt.into())], &dom);
+        assert_eq!(out[0].1, preroll);
+        // An unknown placement is not "outside".
+        let dom: HashMap<String, StreamMeta> = [(yt.to_string(), StreamMeta::default())].into();
+        let (out, _) = final_candidates(vec![(95, yt.into()), (40, preroll.into())], &dom);
+        assert_eq!(out[0].1, yt);
+    }
+
+    /// An `auto` glomex player resolves to the article's own clip (neakriti.gr):
+    /// neither the clip's player URL nor its CDN stream is contextual or
+    /// demoted, and the order is the plain score order.
+    #[test]
+    fn a_resolved_auto_glomex_clip_is_an_ordinary_candidate() {
+        let embed = glomex::GlomexEmbed { integration_id: Some("i1".into()), playlist_id: "auto".into() };
+        assert!(!embed.is_contextual_list());
+        // What `add_dom_items` stores for it: the resolved clip's player URL.
+        let clip = glomex::GlomexEmbed { integration_id: Some("i1".into()), playlist_id: "v-dlso19wczcdl".into() }.embed_url();
+        let cdn = "https://video-cdn-jwt-new.mes.glomex.cloud/v2/77a350/v-another0001/eyJ0.eyJl.-wps/master.m3u8";
+        let yt = "https://www.youtube.com/watch?v=aRtIcLeVid1";
+        let contextual = embed.is_contextual_list();
+        let dom: HashMap<String, StreamMeta> = [
+            (clip.clone(), StreamMeta { in_article: Some(true), contextual, ..Default::default() }),
+            (yt.to_string(), StreamMeta { in_article: Some(true), contextual: false, ..Default::default() }),
+        ]
+        .into();
+        let (out, meta) = final_candidates(vec![(95, clip.clone()), (100, cdn.into()), (95, yt.into())], &dom);
+        let urls: Vec<&str> = out.iter().map(|(_, u)| u.as_str()).collect();
+        assert_eq!(urls, vec![cdn, clip.as_str(), yt]);
+        assert!(meta.values().all(|m| !m.contextual), "{meta:?}");
+    }
+
+    /// P3.14: a platform link in the page header is behind every embed and
+    /// stream, but a lone one is still the primary and one in the article body is ordinary.
+    #[test]
+    fn a_link_outside_the_article_body_ranks_behind_embeds_but_a_lone_one_stays() {
+        let show = "https://www.youtube.com/watch?v=sTuDiOsHoW1";
+        let fb = "https://www.facebook.com/examplepage/videos/4242424242/";
+        let link = |in_article| StreamMeta { in_article, link: true, ..Default::default() };
+        let dom: HashMap<String, StreamMeta> = [(show.to_string(), link(None))].into();
+        let (out, _) = final_candidates(vec![(95, show.into()), (95, fb.into())], &dom);
+        assert_eq!(out[0].1, fb);
+        let (out, _) = final_candidates(vec![(95, show.into())], &dom);
+        assert_eq!(out[0].1, show);
+        // Inside the article body a link is as good as an embed (page order).
+        let dom: HashMap<String, StreamMeta> = [(show.to_string(), link(Some(true)))].into();
+        let (out, _) = final_candidates(vec![(95, show.into()), (95, fb.into())], &dom);
+        assert_eq!(out[0].1, show);
+    }
+
+    /// `is_demoted` is true exactly for the candidates `final_candidates`
+    /// sorts behind the page's non-demoted ones.
+    #[test]
+    fn is_demoted_agrees_with_what_final_candidates_puts_behind() {
+        let fb = "https://www.facebook.com/someone/videos/1/";
+        let yt_out = "https://www.youtube.com/watch?v=sIdEbAr0001";
+        let cl = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=cl-abc";
+        let link = "https://www.youtube.com/watch?v=sTuDiOsHoW1";
+        let net = "https://cdn.news.example/master.m3u8";
+        let m = |in_article, contextual, link| StreamMeta { in_article, contextual, link };
+        let all: Vec<(u32, String)> = vec![
+            (95, cl.into()), (95, link.into()), (95, yt_out.into()), (100, net.into()), (95, fb.into()),
+        ];
+        // An in-article video exists: contextual, outside embed and outside link are demoted.
+        let dom: HashMap<String, StreamMeta> = [
+            (fb.to_string(), m(Some(true), false, false)),
+            (yt_out.to_string(), m(Some(false), false, false)),
+            (cl.to_string(), m(Some(true), true, false)),
+            (link.to_string(), m(None, false, true)),
+        ]
+        .into();
+        let (out, meta) = final_candidates(all.clone(), &dom);
+        let flags: Vec<bool> = out.iter().map(|(_, u)| is_demoted(&meta, u)).collect();
+        // Demoted ones are all after the non-demoted ones, and only the right ones are.
+        assert_eq!(flags, vec![false, false, true, true, true], "{out:?}");
+        assert!(!is_demoted(&meta, fb) && !is_demoted(&meta, net));
+        assert!(is_demoted(&meta, yt_out) && is_demoted(&meta, cl) && is_demoted(&meta, link));
+        // Nothing in the article: an outside embed is not demoted (the score decides); a contextual list and an outside link still are.
+        let dom: HashMap<String, StreamMeta> = [
+            (yt_out.to_string(), m(Some(false), false, false)),
+            (cl.to_string(), m(None, true, false)),
+            (link.to_string(), m(Some(false), false, true)),
+        ]
+        .into();
+        let (out, meta) = final_candidates(all, &dom);
+        assert!(!is_demoted(&meta, yt_out) && !is_demoted(&meta, net));
+        assert!(is_demoted(&meta, cl) && is_demoted(&meta, link));
+        let flags: Vec<bool> = out.iter().map(|(_, u)| is_demoted(&meta, u)).collect();
+        assert_eq!(flags, vec![false, false, false, true, true], "{out:?}");
     }
 }
