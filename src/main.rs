@@ -2091,6 +2091,10 @@ async fn run_job(
     let mut known_unsupported = false;
     // How many videos yt-dlp's page scan named (P10.2).
     let mut scanned_videos = 0usize;
+    // Every video of the page's scan was live (P1.18); and the ones queued as
+    // this job's siblings, which a later sniff must not take as its own.
+    let mut all_live_scan = false;
+    let mut scan_siblings: Vec<String> = Vec::new();
     // An embedded video on another site, whose cookie jar this job also carries (P3.5).
     let mut login_site: Option<String> = None;
 
@@ -2116,23 +2120,69 @@ async fn run_job(
     if is_web && page_referer.is_none() && !omni_broadcast::downloader::is_video_platform(&orig_url) {
         let scan = engine.page_videos(&orig_url).await;
         known_unsupported = scan.unsupported;
-        let videos = scan.videos;
+        let mut videos = scan.videos;
         scanned_videos = videos.len();
         if videos.len() > 1 {
-            info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
-            repo.record_event(
-                job_id,
-                "INFO",
-                Some(JobStage::Extract),
-                &format!("The page holds {} videos; this job downloads the first: {}", videos.len(), videos[0]),
-            )?;
-            if !still_ours(repo, job_id, owner) {
-                warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+            // yt-dlp's page scan says nothing about where on the page a video
+            // sat, so the placement rule (R2) is the sniffer's alone; here only
+            // a glomex contextual list is known (held), and live videos are
+            // skipped: one chosen or queued as a sibling would air twice once
+            // the sniffer ran for the failed job (P1.18).
+            let (cands, scan_meta) = page_scan_cands(&videos);
+            let choice = omni_broadcast::downloader::choose_primary(&cands, omni_broadcast::downloader::MAX_LIVE_PROBES, |u| {
+                let cancel = &cancel;
+                async move {
+                    tokio::select! {
+                        i = engine.video_length(&u) => i.map(|i| i.live),
+                        _ = cancel.cancelled() => None,
+                    }
+                }
+            })
+            .await;
+            if cancel.is_cancelled() {
                 return Ok(());
             }
-            omni_broadcast::article::queue_article_siblings(repo, owner, &mut job, &videos[0], &videos);
-            job.url = videos[0].clone();
-            page_referer = Some(orig_url.clone());
+            use omni_broadcast::downloader::Choice;
+            let (first, live) = match choice {
+                Choice::Primary { url, live } => (Some(url), live),
+                Choice::AllLive { live } => (None, live),
+                Choice::Nothing => (None, Vec::new()),
+            };
+            for l in &live {
+                info!("Job #{job_id}: {} is live; not taken", omni_core::cookies::host_and_path(l));
+                repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Live stream skipped: {l}"))?;
+            }
+            videos.retain(|u| !live.contains(u));
+            match first {
+                None => {
+                    all_live_scan = true;
+                    videos.clear();
+                }
+                Some(first) => {
+                    info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
+                    repo.record_event(
+                        job_id,
+                        "INFO",
+                        Some(JobStage::Extract),
+                        &format!("The page holds {} videos; this job downloads the first: {}", videos.len(), first),
+                    )?;
+                    if !still_ours(repo, job_id, owner) {
+                        warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+                        return Ok(());
+                    }
+                    let facts = article_facts(engine, &job, &first, &videos, &scan_meta, &cancel).await;
+                    let count = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
+                    scan_siblings =
+                        omni_broadcast::article::plan_article_videos_facts(&job.url, &first, &videos, &job.index_str, count, &facts)
+                            .siblings
+                            .into_iter()
+                            .map(|(u, _)| u)
+                            .collect();
+                    omni_broadcast::article::queue_article_siblings(repo, owner, &mut job, &first, &videos, &facts);
+                    job.url = first;
+                    page_referer = Some(orig_url.clone());
+                }
+            }
         } else if videos.len() == 1 && other_site(&orig_url, &videos[0]) {
             // The article's one video is another site's (an X post, say): that site's
             // cookie jar joins the job's, and its name is in the login hint. The
@@ -2145,7 +2195,11 @@ async fn run_job(
         return Ok(());
     }
     let _login_guard = login_site.as_deref().map(|v| engine.set_login_site(job_id, v));
-    let mut process_result = if known_unsupported {
+    let mut process_result = if all_live_scan {
+        repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
+        Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
+            .context(ErrorCode::LiveStream.as_str()))
+    } else if known_unsupported {
         repo.record_event(
             job_id,
             "INFO",
@@ -2181,6 +2235,10 @@ async fn run_job(
     // What the browser saw, kept for a job that ends without a video (P10.1).
     let mut snapshot: Option<omni_browser::PageSnapshot> = None;
     let mut sniffed_streams: Vec<String> = Vec::new();
+    // Every video the sniffer found is already queued as this job's sibling: the
+    // job ends as NO_STREAM_FOUND for that reason, without the page assessment or
+    // the repair ladder (they would look for, and could repair into, a second copy).
+    let mut siblings_hold_the_rest = false;
     // The referer the sniffed stream was tried with (the repair ladder does not retry it).
     let mut sniff_referer: Option<String> = None;
     let sniff = match &process_result {
@@ -2212,10 +2270,14 @@ async fn run_job(
                 // video, and sent the job to review while its two real
                 // videos were delivered as siblings (P3.13). Ask yt-dlp
                 // about each post first; keep the ones it cannot rule out.
-                let streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams, &cancel).await;
+                let mut streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams, &cancel).await;
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
+                // Not one already queued as this job's sibling: it would air twice.
+                let before_queued = streams.len();
+                streams = omni_broadcast::article::without_queued(&streams, &scan_siblings);
+                let queued_emptied = before_queued > 0 && streams.is_empty();
                 // Only what is left after the photo-only posts are dropped
                 // says the page has a video.
                 sniffed_streams = streams.clone();
@@ -2224,6 +2286,55 @@ async fn run_job(
                 } else {
                     streams.first().cloned()
                 };
+                // The job's video among the candidates, in the sniffer's rank
+                // order: the page's own first, a held one (outside the article,
+                // a link outside its body, a contextual list) only when no
+                // other exists, and a live platform video never (P1.18). With
+                // nothing live this is the first candidate, as the ranking
+                // already made it.
+                let mut all_live = false;
+                let mut primary = primary;
+                if primary.is_some() {
+                    let cands: Vec<omni_broadcast::downloader::Cand> = streams
+                        .iter()
+                        .map(|u| omni_broadcast::downloader::Cand {
+                            url: u.clone(),
+                            held: omni_browser::sniffer::is_demoted(&bundle.meta, u),
+                            probe_able: omni_broadcast::downloader::is_video_platform(u),
+                        })
+                        .collect();
+                    let choice = omni_broadcast::downloader::choose_primary(&cands, omni_broadcast::downloader::MAX_LIVE_PROBES, |u| {
+                        let cancel = &cancel;
+                        async move {
+                            tokio::select! {
+                                i = engine.video_length(&u) => i.map(|i| i.live),
+                                _ = cancel.cancelled() => None,
+                            }
+                        }
+                    })
+                    .await;
+                    use omni_broadcast::downloader::Choice;
+                    let live = match choice {
+                        Choice::Primary { url, live } => {
+                            primary = Some(url);
+                            live
+                        }
+                        Choice::AllLive { live } => {
+                            all_live = true;
+                            primary = None;
+                            live
+                        }
+                        Choice::Nothing => Vec::new(),
+                    };
+                    for l in &live {
+                        info!("Job #{job_id}: {} is live; not taken", omni_core::cookies::host_and_path(l));
+                        repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Live stream skipped: {l}"))?;
+                    }
+                    streams.retain(|u| !live.contains(u));
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                }
                 match primary {
                     Some(primary) => {
                         info!("Job #{job_id}: sniffer found {primary}");
@@ -2233,7 +2344,12 @@ async fn run_job(
                             warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
                             return Ok(());
                         }
-                        omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams);
+                        let facts = article_facts(engine, &retry_job, &primary, &streams, &bundle.meta, &cancel).await;
+                        if !still_ours(repo, job_id, owner) {
+                            warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
+                            return Ok(());
+                        }
+                        omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams, &facts);
                         retry_job.url = primary;
                         sniff_referer = Some(bundle.referer.clone());
                         if !repo.set_stage(job_id, owner, JobStage::Download)? {
@@ -2251,6 +2367,25 @@ async fn run_job(
                                 omni_broadcast::pipeline::DeliveryMode::Deliver,
                             )
                             .await;
+                    }
+                    None if all_live => {
+                        repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
+                        process_result = Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
+                            .context(ErrorCode::LiveStream.as_str()));
+                    }
+                    None if queued_emptied => {
+                        siblings_hold_the_rest = true;
+                        repo.record_event(
+                            job_id,
+                            "ERROR",
+                            Some(JobStage::Extract),
+                            "The page's remaining videos are already queued as this job's siblings",
+                        )?;
+                        process_result = Err(anyhow::anyhow!(
+                            "{}: the page's remaining videos are already queued as siblings",
+                            ErrorCode::NoStreamFound.as_str()
+                        )
+                        .context(ErrorCode::NoStreamFound.as_str()));
                     }
                     None => {
                         repo.record_event(
@@ -2352,6 +2487,7 @@ async fn run_job(
                 if is_web
                     && matches!(code, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
                     && !omni_broadcast::downloader::is_video_platform(&orig_url)
+                    && !siblings_hold_the_rest
                 {
                     let page = FailedPage {
                         url: &orig_url,
@@ -2383,7 +2519,12 @@ async fn run_job(
                 // the repair ladder (P10.11a). Only here, only for a web page,
                 // only with repair on; a held video waits for MCR.
                 let tried = repair::Tried::of(&job, &orig_url, page_referer.as_deref(), &sniffed_streams, sniff_referer.as_deref());
-                if let Some(ladder) = repair::after_failure(repair, &job, owner, &orig_url, code, &snapshot, tried, &cancel).await {
+                let ladder = if siblings_hold_the_rest {
+                    None
+                } else {
+                    repair::after_failure(repair, &job, owner, &orig_url, code, &snapshot, tried, &cancel).await
+                };
+                if let Some(ladder) = ladder {
                     match &ladder {
                         repair::LadderResult::ShadowFound { verified } => {
                             info!("Job #{job_id}: repair (shadow) verified {} video(s); the job ends as before", verified.len())
@@ -2664,6 +2805,69 @@ async fn save_page_evidence(
     if let Err(e) = repo.record_evidence(job_id, &path.to_string_lossy(), bytes) {
         warn!("Job #{job_id}: page evidence not recorded: {e:#}");
     }
+}
+
+/// What is known about the article's other videos before they are queued
+/// (P3.14): where on the page each sat and whether it was a contextual
+/// playlist (from the sniffer; nothing for yt-dlp's own page scan), and the
+/// length of each one that would be queued, asked of yt-dlp without
+/// downloading. At most `MAX_AUTO_SIBLINGS` probes plus one for each sibling
+/// held back (its replacement is asked too), 15 s each, one after another. A length that cannot be had stays unknown and plans as before
+/// (queued). Nothing is probed when the journalist asked for a count: they
+/// chose those videos.
+async fn article_facts(
+    engine: &BroadcastEngine,
+    job: &omni_core::models::Job,
+    primary: &str,
+    streams: &[String],
+    meta: &std::collections::HashMap<String, omni_browser::sniffer::StreamMeta>,
+    cancel: &CancellationToken,
+) -> omni_broadcast::article::Facts {
+    use omni_broadcast::article::{facts_from_placement, probe_siblings, Probed};
+    let mut facts = facts_from_placement(
+        streams.iter().filter_map(|u| meta.get(u).map(|m| (u.as_str(), m.in_article, m.contextual))),
+    );
+    for u in streams {
+        if meta.get(u).is_some_and(|m| m.link) {
+            if let Some(f) = facts.get_mut(&omni_broadcast::article::facts_key(u)) {
+                f.link = true;
+            }
+        }
+    }
+    let count = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
+    probe_siblings(&job.url, primary, streams, &job.index_str, count, &mut facts, |url| async move {
+        let info = tokio::select! {
+            i = engine.video_length(&url) => i,
+            _ = cancel.cancelled() => None,
+        };
+        info.map(|i| Probed { duration_secs: i.duration_secs, live: i.live })
+    })
+    .await;
+    facts
+}
+
+/// The candidates of yt-dlp's page scan for [`omni_broadcast::downloader::choose_primary`],
+/// in page order, and the meta that marks the glomex contextual lists (`cl-…`)
+/// among them. A contextual list is held: never the job's video while another
+/// is on the page. Nothing else is known to be held here (P3.14).
+fn page_scan_cands(
+    videos: &[String],
+) -> (Vec<omni_broadcast::downloader::Cand>, std::collections::HashMap<String, omni_browser::sniffer::StreamMeta>) {
+    let contextual = |u: &str| omni_browser::glomex::parse_embed(u).is_some_and(|e| e.is_contextual_list());
+    let cands = videos
+        .iter()
+        .map(|u| omni_broadcast::downloader::Cand {
+            url: u.clone(),
+            held: contextual(u),
+            probe_able: omni_broadcast::downloader::is_video_platform(u),
+        })
+        .collect();
+    let meta = videos
+        .iter()
+        .filter(|u| contextual(u))
+        .map(|u| (u.clone(), omni_browser::sniffer::StreamMeta { in_article: None, contextual: true, link: false }))
+        .collect();
+    (cands, meta)
 }
 
 /// `streams` without the social posts yt-dlp says have no video, in page
@@ -3649,6 +3853,37 @@ fn sweep_evidence_with(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_page_scan_never_picks_a_contextual_list_or_a_live_video() {
+        use omni_broadcast::downloader::{choose_primary, Choice};
+        let cl = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=cl-abc".to_string();
+        let live = "https://www.youtube.com/watch?v=liveliveli1".to_string();
+        let x = "https://x.com/i/status/2".to_string();
+        let run = |videos: Vec<String>, live: String| async move {
+            let (cands, meta) = page_scan_cands(&videos);
+            let l = live.clone();
+            (choose_primary(&cands, 3, move |u| {
+                let is = u == l;
+                async move { Some(is) }
+            })
+            .await, meta)
+        };
+        // [cl-, LIVE youtube, x post] -> the x post.
+        let (c, meta) = run(vec![cl.clone(), live.clone(), x.clone()], live.clone()).await;
+        assert!(matches!(c, Choice::Primary { ref url, .. } if *url == x), "{c:?}");
+        assert!(meta[&cl].contextual && meta.len() == 1);
+        // [LIVE youtube, cl-] -> all live, not the cl- list.
+        let (c, _) = run(vec![live.clone(), cl.clone()], live.clone()).await;
+        assert!(matches!(c, Choice::AllLive { .. }), "{c:?}");
+        // Nothing live: the first non-contextual, as before; a concrete clip keeps its place.
+        let clip = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=v-abc".to_string();
+        let (c, meta) = run(vec![clip.clone(), x.clone()], String::new()).await;
+        assert!(matches!(c, Choice::Primary { ref url, .. } if *url == clip), "{c:?}");
+        assert!(meta.is_empty());
+        let (c, _) = run(vec![cl.clone(), x.clone()], String::new()).await;
+        assert!(matches!(c, Choice::Primary { ref url, .. } if *url == x), "{c:?}");
+    }
+
     #[test]
     fn a_single_video_on_another_site_names_that_site_and_leaves_the_job_alone() {
         assert!(other_site("https://www.news.example/story/1", "https://x.com/a/status/1"));
