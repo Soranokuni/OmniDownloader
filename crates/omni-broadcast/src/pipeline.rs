@@ -283,6 +283,24 @@ impl BroadcastEngine {
         probed.ok()
     }
 
+    /// What yt-dlp says about one of the sniffer's candidates without downloading it (P3.15):
+    /// live, gone, readable or unknown, asked with the sniffer's referer, user agent and cookies.
+    pub async fn probe_candidate(
+        &self,
+        url: &str,
+        referer: Option<&str>,
+        user_agent: Option<&str>,
+        cookies: Option<&str>,
+    ) -> crate::downloader::Probe {
+        let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
+        let probed = Downloader::new(&self.ytdl_path)
+            .with_cookie_jar(jar.as_ref())
+            .probe_candidate(url, referer, user_agent, cookies, std::time::Duration::from_secs(15))
+            .await;
+        drop(jar);
+        probed
+    }
+
     pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
         self.process_job_with_context(job, owner, None, None, None).await
     }

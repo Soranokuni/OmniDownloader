@@ -25,6 +25,8 @@ pub const MAX_BODY_BYTES: usize = 1 << 20;
 pub const MAX_IMAGE_BYTES: usize = 2 << 20;
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECTS: usize = 3;
+const FINAL_URL_REDIRECTS: usize = 10;
+const FINAL_URL_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -154,6 +156,46 @@ impl HttpFetcher {
     pub async fn get_image_bytes(&self, url: &str, deadline: Instant) -> Result<Vec<u8>> {
         let deadline = deadline.min(Instant::now() + IMAGE_TIMEOUT);
         self.get_capped(url, deadline, MAX_IMAGE_BYTES, IMAGE_TIMEOUT).await
+    }
+
+    /// Where `url` really is after its redirects (P3.15): one GET per hop under the address
+    /// rule, at most 10 redirects and `FINAL_URL_TIMEOUT` in all, the body never read. The
+    /// answer's status does not matter; only the address the chain ends on.
+    pub async fn final_url(&self, url: &str) -> Result<String> {
+        let deadline = Instant::now() + FINAL_URL_TIMEOUT;
+        let mut current = url.to_string();
+        for _hop in 0..=FINAL_URL_REDIRECTS {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("no time left");
+            }
+            let (target, host, port) = check_target(&current).map_err(|e| anyhow!("lookup refused: {e}"))?;
+            let addrs = tokio::time::timeout(left, self.resolve(&host, port))
+                .await
+                .map_err(|_| anyhow!("{host}: no time left to resolve"))??;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("no time left");
+            }
+            let mut builder = reqwest::Client::builder().redirect(Policy::none()).timeout(left).user_agent(USER_AGENT);
+            if host.parse::<std::net::IpAddr>().is_err() {
+                builder = builder.resolve_to_addrs(&host, &addrs);
+            }
+            let strip = |e: reqwest::Error| anyhow!("{host}: {}", e.without_url());
+            let resp = builder.build().map_err(strip)?.get(target.clone()).send().await.map_err(strip)?;
+            if !resp.status().is_redirection() {
+                return Ok(target.to_string());
+            }
+            let next = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|l| target.join(l).ok())
+                .ok_or_else(|| anyhow!("redirect without a usable address"))?;
+            debug!(host = %host, "page lookup redirected");
+            current = next.to_string();
+        }
+        bail!("too many redirects")
     }
 }
 

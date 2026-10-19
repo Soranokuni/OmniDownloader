@@ -138,12 +138,46 @@ pub struct Cand {
     pub probe_able: bool,
 }
 
-/// The outcome of [`choose_primary`]; `live` are the candidates found live.
+/// The candidates of a sniff for [`choose_primary`], in the sniffer's rank order. Every kind is
+/// probe-able here (a raw stream or a player page can be gone as well as a platform post);
+/// `held` says which are outside the article's own content.
+pub fn sniffed_cands(streams: &[String], held: impl Fn(&str) -> bool) -> Vec<Cand> {
+    streams.iter().map(|u| Cand { url: u.clone(), held: held(u), probe_able: true }).collect()
+}
+
+/// What a probe says about one candidate (P3.14, P3.15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// A live or upcoming stream: never taken.
+    Live,
+    /// The candidate is gone (see [`is_dead_candidate`]): never taken.
+    Dead(ErrorCode),
+    /// yt-dlp reads it.
+    Ok,
+    /// Timeout, a retryable or other failure, no answer: the candidate stays in play.
+    Unknown,
+}
+
+impl Probe {
+    /// From a length probe (`probe_media`), which knows live but not dead.
+    pub fn from_length(info: Option<PlatformInfo>) -> Self {
+        match info {
+            Some(i) if i.live => Probe::Live,
+            Some(_) => Probe::Ok,
+            None => Probe::Unknown,
+        }
+    }
+}
+
+/// The outcome of [`choose_primary`]; `live` and `dead` are the candidates found so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-    Primary { url: String, live: Vec<String> },
-    /// Every candidate of the tier in play is a live platform video.
+    Primary { url: String, live: Vec<String>, dead: Vec<String> },
+    /// Every candidate of the tier in play is a live video.
     AllLive { live: Vec<String> },
+    /// Every candidate of the tier in play is known dead, or dead or live with none readable:
+    /// `code` is the first dead one's.
+    AllDead { code: ErrorCode, live: Vec<String> },
     /// There was no candidate.
     Nothing,
 }
@@ -154,35 +188,49 @@ pub enum Choice {
 /// held one is never a fallback for them. With none of the own, the held ones
 /// are walked, which is how a page whose only video is held still yields it.
 /// In the walk a probe-able candidate is asked (at most `max_probes` asks in
-/// all), a live one is skipped, and the first that is not live, not asked, or
-/// of unknown state wins. A tier whose every candidate is known live is
-/// `AllLive`. One candidate is never asked: there is nothing to choose, and the
-/// download's own filter and empty-result probe handle it.
-pub async fn choose_primary<F, Fut>(cands: &[Cand], max_probes: usize, mut is_live: F) -> Choice
+/// all); a live or dead one is skipped, and the first that is readable, unknown,
+/// or not asked wins. A tier whose every candidate is known live is `AllLive`;
+/// one with every candidate known dead, or dead and live with none readable, is
+/// `AllDead` with the first dead code. One candidate is never asked: there is
+/// nothing to choose, and the download itself decides.
+pub async fn choose_primary<F, Fut>(cands: &[Cand], max_probes: usize, mut probe: F) -> Choice
 where
     F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = Option<bool>>,
+    Fut: std::future::Future<Output = Probe>,
 {
     match cands {
         [] => return Choice::Nothing,
-        [only] => return Choice::Primary { url: only.url.clone(), live: Vec::new() },
+        [only] => return Choice::Primary { url: only.url.clone(), live: Vec::new(), dead: Vec::new() },
         _ => {}
     }
     let own: Vec<&Cand> = cands.iter().filter(|c| !c.held).collect();
     let tier: Vec<&Cand> = if own.is_empty() { cands.iter().collect() } else { own };
     let mut live = Vec::new();
+    let mut dead: Vec<String> = Vec::new();
+    let mut first_dead: Option<ErrorCode> = None;
     let mut asked = 0usize;
     for c in tier {
         if c.probe_able && asked < max_probes {
             asked += 1;
-            if is_live(c.url.clone()).await == Some(true) {
-                live.push(c.url.clone());
-                continue;
+            match probe(c.url.clone()).await {
+                Probe::Live => {
+                    live.push(c.url.clone());
+                    continue;
+                }
+                Probe::Dead(code) => {
+                    first_dead.get_or_insert(code);
+                    dead.push(c.url.clone());
+                    continue;
+                }
+                Probe::Ok | Probe::Unknown => {}
             }
         }
-        return Choice::Primary { url: c.url.clone(), live };
+        return Choice::Primary { url: c.url.clone(), live, dead };
     }
-    Choice::AllLive { live }
+    match first_dead {
+        Some(code) => Choice::AllDead { code, live },
+        None => Choice::AllLive { live },
+    }
 }
 
 /// Whether `url` is on YouTube.
@@ -603,10 +651,21 @@ impl Downloader {
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
         match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
-            Ok(o) if o.success => PageScan { videos: parse_page_videos(&o.stdout), unsupported: false },
+            Ok(o) if o.success => {
+                let json = serde_json::from_str::<serde_json::Value>(&o.stdout).ok();
+                let why = json.as_ref().and_then(|v| generic_why(v, url));
+                PageScan {
+                    videos: parse_page_videos(&o.stdout),
+                    unsupported: false,
+                    generic_only: why.is_some(),
+                    hand_off_only: why == Some(GenericWhy::HandOff),
+                    webpage_url: json.as_ref().and_then(|v| v.get("webpage_url")).and_then(|v| v.as_str()).map(str::to_string),
+                }
+            }
             Ok(o) if !o.timed_out => PageScan {
                 videos: Vec::new(),
                 unsupported: crate::errors::classify_download_error(&o.stderr_tail) == ErrorCode::UnsupportedUrl,
+                ..Default::default()
             },
             _ => PageScan::default(),
         }
@@ -665,6 +724,62 @@ impl Downloader {
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
             Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
+        }
+    }
+}
+
+impl Downloader {
+    /// What yt-dlp says about one of the sniffer's candidates, without downloading it (P3.15):
+    /// live, gone (a dead-candidate code from its error), readable, or unknown. The sniffer's
+    /// referer, user agent and cookies go along for a stream that is not a platform's, as in the
+    /// download itself.
+    pub async fn probe_candidate(
+        &self,
+        url: &str,
+        referer: Option<&str>,
+        user_agent: Option<&str>,
+        cookie_header: Option<&str>,
+        timeout: Duration,
+    ) -> Probe {
+        let mut args: Vec<String> = [
+            "--simulate",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "15",
+            "--print",
+            "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        if !is_video_platform(url) {
+            if let Some(r) = referer {
+                args.push("--referer".into());
+                args.push(r.to_string());
+            }
+            if let Some(ua) = user_agent {
+                args.push("--user-agent".into());
+                args.push(ua.to_string());
+            }
+            if let Some(c) = cookie_header {
+                args.push("--add-header".into());
+                args.push(format!("Cookie: {c}"));
+            }
+        }
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+            Ok(o) if o.success => Probe::from_length(parse_platform_line(&o.stdout)),
+            Ok(o) if o.timed_out => Probe::Unknown,
+            Ok(o) => {
+                let code = crate::errors::classify_download_error(&o.stderr_tail);
+                if is_dead_candidate(code) { Probe::Dead(code) } else { Probe::Unknown }
+            }
+            Err(_) => Probe::Unknown,
         }
     }
 }
@@ -734,6 +849,158 @@ pub struct PageScan {
     /// attempt would only read the page again to say the same, so the
     /// caller can go straight to the sniffer.
     pub unsupported: bool,
+    /// yt-dlp reaches the page's video only through its generic page scan (P3.15):
+    /// see [`generic_only`]. Never set with `unsupported`, or when the scan failed.
+    pub generic_only: bool,
+    /// `generic_only` fired only because the scan's `webpage_url` is on another site (a
+    /// hand-off to an embed's extractor), not because the generic or html5 extractor
+    /// answered. A redirect to a post looks the same, so the caller checks where the page
+    /// really is ([`first_attempt_resolved`]).
+    pub hand_off_only: bool,
+    /// The scan's own `webpage_url`.
+    pub webpage_url: Option<String>,
+}
+
+/// Why [`generic_why`] says a page is read only generically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericWhy {
+    /// The generic or html5 extractor answered (or a `webpage_url` no dedicated extractor of an
+    /// http page would report).
+    Extractor,
+    /// `webpage_url` is on another registrable domain than the page's.
+    HandOff,
+}
+
+/// Whether a `--flat-playlist -J` result of `page_url` came from yt-dlp's generic
+/// scan rather than an extractor for the page's own site: the generic or html5
+/// extractor itself (a site-wide promo `<video>` is taken before the article's
+/// player), or a hand-off from it to another site's extractor (the first YouTube
+/// embed of the page, with no idea where on the page it sat). A dedicated
+/// extractor on the page's own registrable domain is not.
+pub fn generic_only(scan: &serde_json::Value, page_url: &str) -> bool {
+    generic_why(scan, page_url).is_some()
+}
+
+/// Whether a failed download or probe says the candidate itself is gone, so another of the
+/// page's videos may be the right one (P3.15). Retryable codes, a login or geo wall and a live
+/// stream say nothing about the page's other videos.
+pub fn is_dead_candidate(code: ErrorCode) -> bool {
+    matches!(code, ErrorCode::PageNotFound | ErrorCode::PrivateOrRemoved | ErrorCode::UnsupportedUrl | ErrorCode::NoStreamFound)
+}
+
+/// Whether the browser's final page address is a video platform's (a meta refresh or script
+/// redirect to a post): the browser's choice is not taken then, yt-dlp follows it (P3.15).
+pub fn landed_on_platform(final_url: Option<&str>) -> bool {
+    final_url.is_some_and(is_video_platform)
+}
+
+/// Whether the scan shows the page address is itself a media file or stream (a direct
+/// `.mp4` or `.m3u8`): yt-dlp's generic extractor reads it as a video of its own, and the
+/// browser has no page to choose from.
+fn direct_media(scan: &serde_json::Value, page_url: &str) -> bool {
+    if scan.get("direct").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    if scan.get("webpage_url").and_then(|v| v.as_str()) != Some(page_url) {
+        return false;
+    }
+    let path = page_url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    [".m3u8", ".mpd", ".mp4", ".m4v", ".mov", ".webm", ".ts", ".mkv"].iter().any(|e| path.ends_with(e))
+}
+
+/// [`generic_only`], with the reason it fired. A direct media address is never generic only.
+/// Known limit: a dedicated extractor that itself delegates to another domain's extractor
+/// (its `webpage_url` off the page's site) reads as a hand-off; the redirect check in
+/// [`first_attempt_resolved`] is the only guard.
+pub fn generic_why(scan: &serde_json::Value, page_url: &str) -> Option<GenericWhy> {
+    if direct_media(scan, page_url) {
+        return None;
+    }
+    let named = |key: &str, names: &[&str]| {
+        scan.get(key).and_then(|v| v.as_str()).is_some_and(|s| names.iter().any(|n| s.eq_ignore_ascii_case(n)))
+    };
+    if named("extractor_key", &["generic", "html5mediaembed"]) || named("extractor", &["generic", "html5"]) {
+        return Some(GenericWhy::Extractor);
+    }
+    let landed = scan.get("webpage_url").and_then(|v| v.as_str())?;
+    // A dedicated extractor called on an http page never reports a webpage_url that is not
+    // http(s) (an id such as `kaltura:...`): that came from a hand-off.
+    if !(landed.starts_with("http://") || landed.starts_with("https://")) {
+        return Some(GenericWhy::Extractor);
+    }
+    match (omni_core::urlnorm::registrable_domain(page_url), omni_core::urlnorm::registrable_domain(landed)) {
+        (Some(page), Some(landed)) if page != landed => Some(GenericWhy::HandOff),
+        _ => None,
+    }
+}
+
+/// Who takes a web page's first attempt (P3.15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstAttempt {
+    /// yt-dlp downloads the page (or its page-scan pick), as before.
+    YtDlp,
+    /// yt-dlp has no extractor for the page: straight to the browser.
+    SnifferOnly,
+    /// yt-dlp reads the page only generically: the browser chooses the video,
+    /// and yt-dlp's own pick is the fallback when it finds none.
+    SnifferFirst,
+}
+
+/// [`first_attempt`], for a hand-off that only the cross-domain rule flagged: a shortener or
+/// redirect to a platform post (bit.ly to a YouTube watch page) looks the same as a news
+/// page's embed, and yt-dlp downloads the post itself, so `final_url` (where `page_url` really
+/// ends up after redirects) decides. A final address that is a video platform or on the scan's
+/// own `webpage_url` domain is a redirect to the post: yt-dlp. No answer: yt-dlp. A page that
+/// stays on another, non-platform site: the browser.
+pub async fn first_attempt_resolved<F, Fut>(
+    site_api_hit: bool,
+    is_platform: bool,
+    is_sibling: bool,
+    scan: &PageScan,
+    page_url: &str,
+    final_url: F,
+) -> FirstAttempt
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    let first = first_attempt(site_api_hit, is_platform, is_sibling, scan);
+    if first != FirstAttempt::SnifferFirst || !scan.hand_off_only {
+        return first;
+    }
+    let Some(landed) = final_url(page_url.to_string()).await else {
+        return FirstAttempt::YtDlp;
+    };
+    if is_video_platform(&landed) {
+        return FirstAttempt::YtDlp;
+    }
+    let same_as_scan = match (
+        omni_core::urlnorm::registrable_domain(&landed),
+        scan.webpage_url.as_deref().and_then(omni_core::urlnorm::registrable_domain),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if same_as_scan {
+        FirstAttempt::YtDlp
+    } else {
+        FirstAttempt::SnifferFirst
+    }
+}
+
+/// The first attempt for a page. A link the site's API named, a video platform's own, or an
+/// article sibling's (its parent already chose the address) never goes to the sniffer first;
+/// otherwise the page scan decides.
+pub fn first_attempt(site_api_hit: bool, is_platform: bool, is_sibling: bool, scan: &PageScan) -> FirstAttempt {
+    if site_api_hit || is_platform {
+        FirstAttempt::YtDlp
+    } else if scan.unsupported {
+        FirstAttempt::SnifferOnly
+    } else if scan.generic_only && !is_sibling {
+        FirstAttempt::SnifferFirst
+    } else {
+        FirstAttempt::YtDlp
+    }
 }
 
 /// `downloaded total speed eta`, with `NA` for values yt-dlp does not know yet.
@@ -853,6 +1120,136 @@ pub(crate) fn first_error_line(stderr: &str) -> String {
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    fn scan_json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn a_page_read_by_the_html5_extractor_is_generic_only() {
+        let v = scan_json(r#"{"_type":"video","extractor":"html5","extractor_key":"HTML5MediaEmbed","webpage_url":"https://www.example-news.gr/article/1"}"#);
+        assert!(generic_only(&v, "https://www.example-news.gr/article/1"));
+    }
+
+    #[test]
+    fn a_youtube_hand_off_from_a_news_page_is_generic_only() {
+        let v = scan_json(r#"{"_type":"video","extractor":"youtube","extractor_key":"Youtube","webpage_url":"https://www.youtube.com/watch?v=abcdefghijk"}"#);
+        assert!(generic_only(&v, "https://www.example-news.gr/story"));
+    }
+
+    #[test]
+    fn an_embed_extractor_on_another_domain_is_generic_only() {
+        let v = scan_json(r#"{"_type":"video","extractor":"ertwebtv:embed","extractor_key":"ERTWebtvEmbed","webpage_url":"https://www.ert.gr/webtv/x"}"#);
+        assert!(generic_only(&v, "https://www.ertnews.gr/video/x"));
+    }
+
+    #[test]
+    fn a_generic_playlist_is_generic_only() {
+        let v = scan_json(r#"{"_type":"playlist","extractor":"generic","extractor_key":"Generic","webpage_url":"https://www.example-news.gr/a","entries":[{"url":"https://streamable.com/aaaa"}]}"#);
+        assert!(generic_only(&v, "https://www.example-news.gr/a"));
+    }
+
+    #[test]
+    fn a_direct_media_address_is_not_generic_only() {
+        let direct = scan_json(r#"{"_type":"video","extractor":"generic","extractor_key":"Generic","direct":true,"webpage_url":"https://media.example-news.gr/clip.mp4","ext":"mp4"}"#);
+        assert!(!generic_only(&direct, "https://media.example-news.gr/clip.mp4"));
+        let stream = scan_json(r#"{"_type":"video","extractor":"generic","extractor_key":"Generic","webpage_url":"https://streams.example.test/x/index.M3U8?t=1"}"#);
+        assert!(!generic_only(&stream, "https://streams.example.test/x/index.M3U8?t=1"));
+        // A media extension on a different address than the page is not the page itself.
+        let hand = scan_json(r#"{"extractor":"generic","extractor_key":"Generic","webpage_url":"https://x.example.test/a.mp4"}"#);
+        assert!(generic_only(&hand, "https://www.example-news.gr/article"));
+        // The html5 article control.
+        let html5 = scan_json(r#"{"extractor":"html5","extractor_key":"HTML5MediaEmbed","webpage_url":"https://www.example-news.gr/article"}"#);
+        assert!(generic_only(&html5, "https://www.example-news.gr/article"));
+    }
+
+    #[test]
+    fn an_article_sibling_is_never_sent_to_the_browser_first() {
+        let generic = PageScan { generic_only: true, ..Default::default() };
+        assert_eq!(first_attempt(false, false, false, &generic), FirstAttempt::SnifferFirst);
+        assert_eq!(first_attempt(false, false, true, &generic), FirstAttempt::YtDlp);
+    }
+
+    #[test]
+    fn a_dedicated_extractor_of_the_pages_own_site_is_not_generic_only() {
+        let v = scan_json(r#"{"_type":"video","extractor":"example:article","extractor_key":"ExampleArticle","webpage_url":"https://www.example-news.gr/video/7"}"#);
+        assert!(!generic_only(&v, "https://example-news.gr/video/7?x=1"));
+        let y = scan_json(r#"{"_type":"video","extractor":"youtube","extractor_key":"Youtube","webpage_url":"https://www.youtube.com/watch?v=abcdefghijk"}"#);
+        assert!(!generic_only(&y, "https://www.youtube.com/watch?v=abcdefghijk"));
+        assert!(!generic_only(&scan_json("{}"), "https://www.example-news.gr/a"));
+    }
+
+    #[test]
+    fn a_webpage_url_that_is_not_http_is_generic_only_as_an_extractor_result() {
+        let v = scan_json(r#"{"_type":"video","extractor":"kaltura","extractor_key":"Kaltura","webpage_url":"kaltura:1234:0_abcd"}"#);
+        assert_eq!(generic_why(&v, "https://www.example-news.gr/a"), Some(GenericWhy::Extractor));
+        let h = scan_json(r#"{"extractor":"youtube","webpage_url":"https://www.youtube.com/watch?v=abcdefghijk"}"#);
+        assert_eq!(generic_why(&h, "https://www.example-news.gr/a"), Some(GenericWhy::HandOff));
+    }
+
+    fn hand_off_scan() -> PageScan {
+        PageScan {
+            generic_only: true,
+            hand_off_only: true,
+            webpage_url: Some("https://www.youtube.com/watch?v=abcdefghijk".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_platform_post_stays_with_yt_dlp() {
+        let got = first_attempt_resolved(false, false, false, &hand_off_scan(), "https://short.example/x", |_| async {
+            Some("https://www.youtube.com/watch?v=abcdefghijk".to_string())
+        })
+        .await;
+        assert_eq!(got, FirstAttempt::YtDlp);
+        // A redirect to the scan's own site that is not a known platform.
+        let mut other = hand_off_scan();
+        other.webpage_url = Some("https://clips.example.org/v/1".into());
+        let got = first_attempt_resolved(false, false, false, &other, "https://short.example/x", |_| async {
+            Some("https://clips.example.org/v/1?x=2".to_string())
+        })
+        .await;
+        assert_eq!(got, FirstAttempt::YtDlp);
+    }
+
+    #[tokio::test]
+    async fn a_news_page_that_stays_on_its_site_with_an_embed_hand_off_goes_to_the_browser() {
+        let got = first_attempt_resolved(false, false, false, &hand_off_scan(), "https://www.example-news.gr/a", |_| async {
+            Some("https://www.example-news.gr/a".to_string())
+        })
+        .await;
+        assert_eq!(got, FirstAttempt::SnifferFirst);
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_fails_keeps_yt_dlp() {
+        let got = first_attempt_resolved(false, false, false, &hand_off_scan(), "https://short.example/x", |_| async { None }).await;
+        assert_eq!(got, FirstAttempt::YtDlp);
+    }
+
+    #[tokio::test]
+    async fn an_html5_result_goes_to_the_browser_without_asking_where_the_page_is() {
+        let scan = PageScan { generic_only: true, ..Default::default() };
+        let got = first_attempt_resolved(false, false, false, &scan, "https://www.example-news.gr/a", |_| async {
+            panic!("an extractor result needs no redirect check")
+        })
+        .await;
+        assert_eq!(got, FirstAttempt::SnifferFirst);
+    }
+
+    #[test]
+    fn the_first_attempt_goes_to_the_browser_only_for_a_generic_only_page() {
+        let generic = PageScan { generic_only: true, ..Default::default() };
+        let dedicated = PageScan::default();
+        let unsupported = PageScan { unsupported: true, ..Default::default() };
+        assert_eq!(first_attempt(false, false, false, &generic), FirstAttempt::SnifferFirst);
+        assert_eq!(first_attempt(false, false, false, &dedicated), FirstAttempt::YtDlp);
+        assert_eq!(first_attempt(false, false, false, &unsupported), FirstAttempt::SnifferOnly);
+        // The site API named the video, or it is a platform link: never the browser first.
+        assert_eq!(first_attempt(true, false, false, &generic), FirstAttempt::YtDlp);
+        assert_eq!(first_attempt(false, true, false, &generic), FirstAttempt::YtDlp);
+    }
 
     fn args_for(opts: &DownloadOpts<'_>) -> Vec<String> {
         Downloader::build_args(
@@ -1294,7 +1691,7 @@ mod platform_probe_tests {
         let live: Vec<String> = live.iter().map(|s| s.to_string()).collect();
         choose_primary(cands, max, |u| {
             let l = live.contains(&u);
-            async move { Some(l) }
+            async move { if l { Probe::Live } else { Probe::Ok } }
         })
         .await
     }
@@ -1302,15 +1699,15 @@ mod platform_probe_tests {
     #[tokio::test]
     async fn nothing_live_the_first_own_candidate_wins_as_before() {
         let c = [cand(X_POST, false), cand(YT_LIVE, false), cand(CL, true)];
-        assert_eq!(choose(&c, 3, &[]).await, Choice::Primary { url: X_POST.into(), live: vec![] });
-        assert_eq!(choose_primary(&[], 3, |_| async { None }).await, Choice::Nothing);
+        assert_eq!(choose(&c, 3, &[]).await, Choice::Primary { url: X_POST.into(), live: vec![], dead: vec![] });
+        assert_eq!(choose_primary(&[], 3, |_| async { Probe::Unknown }).await, Choice::Nothing);
     }
 
     #[tokio::test]
     async fn a_live_own_candidate_is_skipped_for_the_next_own_one() {
         // Page scan: [glomex cl-, a LIVE youtube, an x post]: the x post, not the live one.
         let c = [cand(CL, true), cand(YT_LIVE, false), cand(X_POST, false)];
-        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::Primary { url: X_POST.into(), live: vec![YT_LIVE.into()] });
+        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::Primary { url: X_POST.into(), live: vec![YT_LIVE.into()], dead: vec![] });
     }
 
     #[tokio::test]
@@ -1328,12 +1725,12 @@ mod platform_probe_tests {
     async fn a_page_with_only_held_candidates_takes_the_first_that_is_not_live() {
         let side = "https://www.youtube.com/watch?v=sIdEbAr0001";
         let c = [cand(YT_LIVE, true), cand(side, true), cand(CL, true)];
-        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::Primary { url: side.into(), live: vec![YT_LIVE.into()] });
+        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::Primary { url: side.into(), live: vec![YT_LIVE.into()], dead: vec![] });
         let c = [cand(YT_LIVE, true), cand(YT_LIVE2, true)];
         assert!(matches!(choose(&c, 3, &[YT_LIVE, YT_LIVE2]).await, Choice::AllLive { .. }));
         // Today's behaviour: a lone held candidate stays the primary, unasked.
         let c = [cand(CL, true)];
-        assert_eq!(choose_primary(&c, 3, |_| async { panic!("not asked") }).await, Choice::Primary { url: CL.into(), live: vec![] });
+        assert_eq!(choose_primary(&c, 3, |_| async { panic!("not asked") }).await, Choice::Primary { url: CL.into(), live: vec![], dead: vec![] });
     }
 
     #[tokio::test]
@@ -1342,19 +1739,133 @@ mod platform_probe_tests {
         let n = std::cell::Cell::new(0);
         let r = choose_primary(&c, MAX_LIVE_PROBES, |_| {
             n.set(n.get() + 1);
-            async { Some(true) }
+            async { Probe::Live }
         })
         .await;
         assert_eq!(n.get(), MAX_LIVE_PROBES);
         assert!(matches!(r, Choice::Primary { ref url, .. } if *url == c[3].url), "the fourth is taken unasked: {r:?}");
         // Unknown answer keeps the candidate.
         let two = [cand(X_POST, false), cand(YT_LIVE, false)];
-        assert_eq!(choose_primary(&two, 3, |_| async { None }).await, Choice::Primary { url: X_POST.into(), live: vec![] });
+        assert_eq!(choose_primary(&two, 3, |_| async { Probe::Unknown }).await, Choice::Primary { url: X_POST.into(), live: vec![], dead: vec![] });
         // A raw stream is taken without a question.
         let raw = [cand("https://cdn.example.com/a.m3u8", false), cand(YT_LIVE, false)];
         assert_eq!(
             choose_primary(&raw, 3, |_| async { panic!("raw streams are not asked") }).await,
-            Choice::Primary { url: raw[0].url.clone(), live: vec![] }
+            Choice::Primary { url: raw[0].url.clone(), live: vec![], dead: vec![] }
         );
     }
+
+    const JW: &str = "https://cdn.example-player.test/players/clip-1.html";
+    const YT: &str = "https://www.youtube.com/watch?v=abcdefghijk";
+    const MP4: &str = "https://cdn.example-news.test/2012/clip-720.mp4";
+    const MP4_B: &str = "https://cdn.example-news.test/brightcove/clip-16x9.mp4";
+
+    fn all_probed(url: &str, held: bool) -> Cand {
+        Cand { url: url.to_string(), held, probe_able: true }
+    }
+
+    /// A prober that answers from a table; an address not in it is readable.
+    async fn ask(cands: &[Cand], max: usize, answers: &[(&str, Probe)]) -> Choice {
+        let table: Vec<(String, Probe)> = answers.iter().map(|(u, p)| (u.to_string(), *p)).collect();
+        choose_primary(cands, max, |u| {
+            let p = table.iter().find(|(k, _)| *k == u).map(|(_, p)| *p).unwrap_or(Probe::Ok);
+            async move { p }
+        })
+        .await
+    }
+
+    #[test]
+    fn only_the_four_gone_codes_are_dead_candidates() {
+        use ErrorCode::*;
+        for dead in [PageNotFound, PrivateOrRemoved, UnsupportedUrl, NoStreamFound] {
+            assert!(is_dead_candidate(dead), "{dead}");
+        }
+        for other in [
+            Http403,
+            Network,
+            LoginRequired,
+            GeoBlocked,
+            LiveStream,
+            DownloadTimeout,
+            ExtractTimeout,
+            ProbeFailed,
+            TranscodeFailed,
+            ComplianceFailed,
+            DeliveryFailed,
+            LowDisk,
+            PipelineFailed,
+        ] {
+            assert!(!is_dead_candidate(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn every_sniffed_candidate_is_probe_able_and_held_follows_the_rule() {
+        let streams = vec![JW.to_string(), YT.to_string(), MP4.to_string()];
+        let c = sniffed_cands(&streams, |u| u == YT);
+        assert!(c.iter().all(|c| c.probe_able), "a raw stream or player page is asked too");
+        assert_eq!(c.iter().map(|c| c.held).collect::<Vec<_>>(), [false, true, false]);
+        assert_eq!(c[2].url, MP4);
+    }
+
+    #[tokio::test]
+    async fn a_dead_player_page_and_a_dead_post_are_skipped_for_the_stream_that_plays() {
+        // The Guardian shape: [player page 404, YouTube unavailable, mp4 reads].
+        let c = [all_probed(JW, false), all_probed(YT, false), all_probed(MP4, false), all_probed(MP4_B, false)];
+        let got = ask(&c, MAX_LIVE_PROBES, &[(JW, Probe::Dead(ErrorCode::PageNotFound)), (YT, Probe::Dead(ErrorCode::PrivateOrRemoved))]).await;
+        assert_eq!(got, Choice::Primary { url: MP4.into(), live: vec![], dead: vec![JW.into(), YT.into()] });
+    }
+
+    #[tokio::test]
+    async fn a_held_candidate_is_never_taken_when_every_own_one_is_dead() {
+        let c = [all_probed(JW, false), all_probed(YT, true), all_probed(MP4, true)];
+        let got = ask(&c, 3, &[(JW, Probe::Dead(ErrorCode::PageNotFound))]).await;
+        // One own candidate is the whole tier: dead, so nothing, and not a held one.
+        assert_eq!(got, Choice::AllDead { code: ErrorCode::PageNotFound, live: vec![] });
+        let two = [all_probed(JW, false), all_probed(MP4_B, false), all_probed(YT, true)];
+        assert!(matches!(
+            ask(&two, 3, &[(JW, Probe::Dead(ErrorCode::PageNotFound)), (MP4_B, Probe::Dead(ErrorCode::UnsupportedUrl))]).await,
+            Choice::AllDead { code: ErrorCode::PageNotFound, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn at_most_three_candidates_are_asked_and_an_unknown_answer_keeps_the_candidate() {
+        let urls: Vec<String> = (1..=5).map(|i| format!("https://cdn.example-news.test/v{i}.mp4")).collect();
+        let c: Vec<Cand> = urls.iter().map(|u| all_probed(u, false)).collect();
+        let asked = std::cell::Cell::new(0);
+        let got = choose_primary(&c, MAX_LIVE_PROBES, |_| {
+            asked.set(asked.get() + 1);
+            async { Probe::Dead(ErrorCode::PageNotFound) }
+        })
+        .await;
+        assert_eq!(asked.get(), 3);
+        assert!(matches!(got, Choice::Primary { ref url, .. } if *url == urls[3]), "the fourth is taken unasked: {got:?}");
+        let two = [all_probed(JW, false), all_probed(MP4, false)];
+        assert_eq!(
+            ask(&two, 3, &[(JW, Probe::Unknown)]).await,
+            Choice::Primary { url: JW.into(), live: vec![], dead: vec![] }
+        );
+        // A lone candidate is never asked: its download decides.
+        let lone = [all_probed(JW, false)];
+        assert_eq!(
+            choose_primary(&lone, 3, |_| async { panic!("not asked") }).await,
+            Choice::Primary { url: JW.into(), live: vec![], dead: vec![] }
+        );
+    }
+
+    #[tokio::test]
+    async fn every_candidate_dead_is_all_dead_with_the_first_code_and_a_live_mix_follows_the_same_rule() {
+        let c = [all_probed(JW, false), all_probed(YT, false), all_probed(MP4, false)];
+        let dead = |code| Probe::Dead(code);
+        let got = ask(&c, 3, &[(JW, dead(ErrorCode::NoStreamFound)), (YT, dead(ErrorCode::PrivateOrRemoved)), (MP4, dead(ErrorCode::PageNotFound))]).await;
+        assert_eq!(got, Choice::AllDead { code: ErrorCode::NoStreamFound, live: vec![] });
+        // Dead and live with none readable: all dead (the first dead code), the live one listed.
+        let got = ask(&c, 3, &[(JW, Probe::Live), (YT, dead(ErrorCode::PrivateOrRemoved)), (MP4, dead(ErrorCode::PageNotFound))]).await;
+        assert_eq!(got, Choice::AllDead { code: ErrorCode::PrivateOrRemoved, live: vec![JW.into()] });
+        // Only live ones: all live, as before.
+        let got = ask(&c, 3, &[(JW, Probe::Live), (YT, Probe::Live), (MP4, Probe::Live)]).await;
+        assert!(matches!(got, Choice::AllLive { .. }));
+    }
+
 }
