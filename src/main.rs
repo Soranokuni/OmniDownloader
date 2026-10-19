@@ -1921,7 +1921,7 @@ async fn run_approved_delivery(
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
             let message = readable_cause(&e);
-            let diagnostic: String = format!("{e:#}").chars().take(8192).collect();
+            let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
             let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
             if code.is_retryable() && attempts < max_attempts {
                 // The approval stands: the next lease delivers the same file.
@@ -2465,7 +2465,7 @@ async fn run_job(
             // one line the MCR card shows; this is what an engineer needs an
             // hour later, and putting it on the job means it survives log
             // rotation and does not require finding the right file.
-            let diagnostic: String = format!("{e:#}").chars().take(8192).collect();
+            let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
             let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
 
             if code.is_retryable() && attempts < max_attempts {
@@ -2936,6 +2936,23 @@ fn lost_lease<T>(result: &anyhow::Result<T>) -> bool {
 
 /// The one readable line for a failure's `error_message` (P7.15): the root
 /// cause, without the code strings the pipeline wraps around it.
+/// The error chain for the job's DEBUG diagnostic, as `{e:#}` would print it,
+/// minus a bare code layer whose next layer already starts with that code: the
+/// pipeline adds `.context(code)` to a download error that names its code itself,
+/// which printed "LIVE_STREAM: LIVE_STREAM: …" (2026-10-19).
+fn diagnostic_chain(e: &anyhow::Error) -> String {
+    let parts: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+    let mut kept: Vec<&str> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let repeated = ErrorCode::from_code(part).is_some()
+            && parts.get(i + 1).is_some_and(|next| next.starts_with(part.as_str()));
+        if !repeated {
+            kept.push(part);
+        }
+    }
+    kept.join(": ")
+}
+
 fn readable_cause(e: &anyhow::Error) -> String {
     const CAP: usize = 300;
     const TAIL: &str = ". stderr tail: ";
@@ -4132,6 +4149,17 @@ mod tests {
         assert_eq!(near(27, true).state, Health::Degraded);
         assert_eq!(near(27, false).state, Health::Ok);
         assert_eq!(near(24, true).state, Health::Ok);
+    }
+
+    /// 2026-10-19: a live download's DEBUG line read "LIVE_STREAM: LIVE_STREAM: …".
+    #[test]
+    fn the_diagnostic_chain_names_a_code_once_and_keeps_every_other_layer() {
+        let e = anyhow::anyhow!("LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it").context("LIVE_STREAM");
+        assert_eq!(format!("{e:#}"), "LIVE_STREAM: LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
+        assert_eq!(diagnostic_chain(&e), "LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
+        // A code layer over a different message, and plain layers, all stay.
+        let e = anyhow::anyhow!("exited with 1. stderr tail: boom").context("transcode failed").context("TRANSCODE_FAILED");
+        assert_eq!(diagnostic_chain(&e), format!("{e:#}"));
     }
 
     /// Job #20 (2026-10-08): the card said PIPELINE_FAILED; the reason was only
