@@ -34,6 +34,7 @@ async fn handler(State((hits, port)): State<(Arc<Hits>, u16)>, Path(name): Path<
     let to = |p: &str| (StatusCode::FOUND, [(header::LOCATION, format!("http://{FAKE}:{port}/{p}"))]).into_response();
     match name.as_str() {
         "r0" => to("r1"),
+        "loop" => to("loop"),
         "r1" => to("r2"),
         "r2" => to("r3"),
         "r3" => to("ok"),
@@ -219,4 +220,30 @@ async fn a_slow_picture_takes_ten_seconds_at_most_whatever_deadline_is_left() {
     let took = started.elapsed();
     assert!(r.is_err());
     assert!(took >= Duration::from_secs(8) && took < Duration::from_secs(12), "took {took:?}");
+}
+
+#[tokio::test]
+async fn the_final_address_follows_redirects_past_the_fetch_limit_and_never_reaches_a_private_hop() {
+    let (addr, hits) = server().await;
+    let f = HttpFetcher::pinned_for_tests(FAKE, addr);
+    let base = format!("http://{FAKE}:{}", addr.port());
+    // Four hops (the fetch limit is three), ending on /ok.
+    assert_eq!(f.final_url(&format!("{base}/r0")).await.unwrap(), format!("{base}/ok"));
+    // A page that answers 404 is still where the chain ended.
+    assert_eq!(f.final_url(&format!("{base}/gone")).await.unwrap(), format!("{base}/gone"));
+    assert!(f.final_url(&format!("{base}/to-private")).await.is_err());
+    assert_eq!(hits.secret.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_redirect_loop_fails_at_the_eleventh_hop_and_a_slow_chain_ends_within_the_time_limit() {
+    let (addr, _hits) = server().await;
+    let f = HttpFetcher::pinned_for_tests(FAKE, addr);
+    let base = format!("http://{FAKE}:{}", addr.port());
+    let e = f.final_url(&format!("{base}/loop")).await.expect_err("a loop never ends");
+    assert!(e.to_string().contains("too many redirects"), "{e}");
+    // slow1 answers after 6 s with a redirect to a page that never answers.
+    let started = Instant::now();
+    assert!(f.final_url(&format!("{base}/slow1")).await.is_err());
+    assert!(started.elapsed() < Duration::from_secs(12), "took {:?}", started.elapsed());
 }
