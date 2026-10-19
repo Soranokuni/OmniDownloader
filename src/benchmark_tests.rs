@@ -623,3 +623,162 @@ async fn the_retention_sweep_removes_idle_scratch_and_spares_a_running_run() {
     assert!(!paths.benchmark_temp().exists());
     sweep_idle_scratch(&repo, &paths); // nothing there: no error
 }
+
+// ------------------------------------------------------------------ extraction order (P3.15)
+
+/// Extraction questions answered from a script, remembering the order they were asked in.
+struct Steps {
+    scan: PageScan,
+    sniff_finds: bool,
+    ytdlp_reads: bool,
+    /// Where the page ends up after redirects.
+    landed: Option<&'static str>,
+    /// The address the browser ends on.
+    sniff_ends_on: Option<&'static str>,
+    /// The browser's candidates (address, held); the default is one stream.
+    sniff_streams: Vec<(&'static str, bool)>,
+    /// What a probe says about an address; an address not here reads.
+    probes: Vec<(&'static str, Probe)>,
+    asked: Mutex<Vec<&'static str>>,
+}
+
+impl Steps {
+    fn new(scan: PageScan, sniff_finds: bool, ytdlp_reads: bool) -> Self {
+        Self { scan, sniff_finds, ytdlp_reads, landed: None, sniff_ends_on: None, sniff_streams: vec![(SECRET_STREAM, false)], probes: Vec::new(), asked: Mutex::new(Vec::new()) }
+    }
+
+    fn asked(&self) -> Vec<&'static str> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ExtractSteps for Steps {
+    async fn site_api(&self, _url: &str) -> Option<String> {
+        self.asked.lock().unwrap().push("site-api");
+        None
+    }
+    async fn final_url(&self, _url: &str) -> Option<String> {
+        self.asked.lock().unwrap().push("final-url");
+        self.landed.map(str::to_string)
+    }
+    async fn page_scan(&self, _url: &str) -> PageScan {
+        self.asked.lock().unwrap().push("scan");
+        self.scan.clone()
+    }
+    async fn ytdlp(&self, _url: &str) -> std::result::Result<Option<f64>, String> {
+        self.asked.lock().unwrap().push("yt-dlp");
+        if self.ytdlp_reads { Ok(Some(42.0)) } else { Err("ERROR: Unsupported URL".into()) }
+    }
+    async fn sniff(&self, _url: &str) -> Option<Sniff> {
+        self.asked.lock().unwrap().push("sniffer");
+        self.sniff_finds.then(|| Sniff {
+            streams: self.sniff_streams.iter().map(|(u, h)| (u.to_string(), *h)).collect(),
+            primary: self.sniff_streams[0].0.to_string(),
+            referer: "https://news.example/story".into(),
+            user_agent: "UA".into(),
+            cookies: None,
+            final_url: self.sniff_ends_on.map(str::to_string),
+        })
+    }
+    async fn probe(&self, candidate: &str, _session: &Sniff) -> Probe {
+        self.probes.iter().find(|(u, _)| *u == candidate).map(|(_, p)| *p).unwrap_or(Probe::Ok)
+    }
+}
+
+const ARTICLE: &str = "https://news.example/story";
+
+#[tokio::test]
+async fn a_generic_only_page_is_chosen_by_the_browser_and_yt_dlp_is_not_asked() {
+    let steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    let found = extract_with(&steps, ARTICLE).await.unwrap();
+    assert_eq!(found.method, "sniffer");
+    assert_eq!(steps.asked(), ["site-api", "scan", "sniffer"]);
+}
+
+#[tokio::test]
+async fn a_generic_only_page_falls_back_to_yt_dlp_only_when_the_browser_finds_nothing() {
+    let steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, false, true);
+    let found = extract_with(&steps, ARTICLE).await.unwrap();
+    assert_eq!((found.method.as_str(), found.duration_secs), ("yt-dlp", Some(42.0)));
+    assert_eq!(steps.asked(), ["site-api", "scan", "sniffer", "yt-dlp"]);
+}
+
+#[tokio::test]
+async fn a_generic_only_page_neither_reader_finds_fails_after_one_sniff() {
+    let steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, false, false);
+    assert!(extract_with(&steps, ARTICLE).await.is_err());
+    assert_eq!(steps.asked(), ["site-api", "scan", "sniffer", "yt-dlp"]);
+}
+
+#[tokio::test]
+async fn a_page_with_its_own_extractor_is_read_by_yt_dlp_first() {
+    let steps = Steps::new(PageScan::default(), true, true);
+    let found = extract_with(&steps, ARTICLE).await.unwrap();
+    assert_eq!(found.method, "yt-dlp");
+    assert_eq!(steps.asked(), ["site-api", "scan", "yt-dlp"]);
+}
+
+#[tokio::test]
+async fn a_page_yt_dlp_cannot_read_goes_to_the_browser_without_asking_yt_dlp() {
+    let steps = Steps::new(PageScan { unsupported: true, ..Default::default() }, true, false);
+    assert_eq!(extract_with(&steps, ARTICLE).await.unwrap().method, "sniffer");
+    assert_eq!(steps.asked(), ["site-api", "scan", "sniffer"]);
+}
+
+fn hand_off(webpage_url: &str) -> PageScan {
+    PageScan { generic_only: true, hand_off_only: true, webpage_url: Some(webpage_url.into()), ..Default::default() }
+}
+
+#[tokio::test]
+async fn a_redirect_to_a_platform_post_is_read_by_yt_dlp_not_the_browser() {
+    let mut steps = Steps::new(hand_off("https://www.youtube.com/watch?v=abcdefghijk"), true, true);
+    steps.landed = Some("https://www.youtube.com/watch?v=abcdefghijk");
+    assert_eq!(extract_with(&steps, "https://short.example/x").await.unwrap().method, "yt-dlp");
+    assert_eq!(steps.asked(), ["site-api", "scan", "final-url", "yt-dlp"]);
+}
+
+#[tokio::test]
+async fn a_hand_off_on_a_page_that_stays_on_its_site_is_chosen_by_the_browser() {
+    let mut steps = Steps::new(hand_off("https://www.youtube.com/watch?v=abcdefghijk"), true, true);
+    steps.landed = Some(ARTICLE);
+    assert_eq!(extract_with(&steps, ARTICLE).await.unwrap().method, "sniffer");
+    assert_eq!(steps.asked(), ["site-api", "scan", "final-url", "sniffer"]);
+}
+
+#[tokio::test]
+async fn a_hand_off_whose_page_address_cannot_be_told_stays_with_yt_dlp() {
+    let steps = Steps::new(hand_off("https://www.youtube.com/watch?v=abcdefghijk"), true, true);
+    assert_eq!(extract_with(&steps, ARTICLE).await.unwrap().method, "yt-dlp");
+}
+
+#[tokio::test]
+async fn a_browser_that_ended_on_a_platform_page_counts_as_finding_nothing_for_a_generic_only_page() {
+    let mut steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    steps.sniff_ends_on = Some("https://www.youtube.com/watch?v=abcdefghijk");
+    assert_eq!(extract_with(&steps, ARTICLE).await.unwrap().method, "yt-dlp");
+    assert_eq!(steps.asked(), ["site-api", "scan", "sniffer", "yt-dlp"]);
+    // The same landing for a page yt-dlp could not read keeps the browser's answer.
+    let mut other = Steps::new(PageScan { unsupported: true, ..Default::default() }, true, false);
+    other.sniff_ends_on = Some("https://www.youtube.com/watch?v=abcdefghijk");
+    assert_eq!(extract_with(&other, ARTICLE).await.unwrap().method, "sniffer");
+}
+
+#[tokio::test]
+async fn a_dead_first_candidate_is_skipped_for_the_stream_that_plays() {
+    const JW: &str = "https://cdn.example-player.test/players/clip-1.html";
+    const YT: &str = "https://www.youtube.com/watch?v=abcdefghijk";
+    const MP4: &str = "https://cdn.example-news.test/2012/clip-720.mp4";
+    // The Guardian shape: player page 404, YouTube unavailable, the mp4 reads.
+    let mut steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    steps.sniff_streams = vec![(JW, false), (YT, false), (MP4, false)];
+    steps.probes = vec![(JW, Probe::Dead(ErrorCode::PageNotFound)), (YT, Probe::Dead(ErrorCode::PrivateOrRemoved))];
+    let found = extract_with(&steps, ARTICLE).await.unwrap();
+    assert_eq!((found.method.as_str(), found.stream.as_str()), ("sniffer", MP4));
+    // Every candidate gone: the first one's code, and yt-dlp is not asked.
+    let mut all = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    all.sniff_streams = vec![(JW, false), (YT, false)];
+    all.probes = vec![(JW, Probe::Dead(ErrorCode::PageNotFound)), (YT, Probe::Dead(ErrorCode::PrivateOrRemoved))];
+    assert_eq!(extract_with(&all, ARTICLE).await.err().as_deref(), Some(ErrorCode::PageNotFound.as_str()));
+    assert_eq!(all.asked(), ["site-api", "scan", "sniffer"]);
+}

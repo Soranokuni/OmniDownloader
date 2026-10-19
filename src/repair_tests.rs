@@ -82,6 +82,10 @@ struct Fake {
     ytdl: Mutex<Option<std::result::Result<LinkInfo, String>>>,
     ytdl_hangs: bool,
     ytdl_calls: AtomicUsize,
+    /// What yt-dlp's page scan says (default: it has an extractor of its own).
+    scan: Mutex<omni_broadcast::downloader::PageScan>,
+    /// Where the page's address ends up after redirects (default: unknown).
+    final_url: Mutex<Option<String>>,
     sniff_seen: Mutex<Option<SniffSeen>>,
     site_api: Mutex<Option<std::result::Result<Option<String>, String>>>,
     site_api_calls: AtomicUsize,
@@ -185,6 +189,8 @@ impl Fake {
             ytdl: Mutex::new(None),
             ytdl_hangs: false,
             ytdl_calls: AtomicUsize::new(0),
+            scan: Mutex::new(Default::default()),
+            final_url: Mutex::new(None),
             sniff_seen: Mutex::new(None),
             site_api: Mutex::new(None),
             site_api_calls: AtomicUsize::new(0),
@@ -274,6 +280,12 @@ impl Env for Fake {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
         self.ytdl.lock().unwrap().clone().unwrap_or_else(|| Err("ERROR: Unsupported URL".to_string()))
+    }
+    async fn final_url(&self, _url: &str) -> Option<String> {
+        self.final_url.lock().unwrap().clone()
+    }
+    async fn page_scan(&self, _url: &str, _timeout: Duration) -> omni_broadcast::downloader::PageScan {
+        self.scan.lock().unwrap().clone()
     }
     async fn site_api(&self, _url: &str) -> std::result::Result<Option<String>, String> {
         self.site_api_calls.fetch_add(1, Ordering::SeqCst);

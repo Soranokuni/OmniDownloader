@@ -328,3 +328,69 @@ async fn a_page_that_is_not_found_is_not_sniffed_and_the_ladder_does_not_run() {
     assert_eq!(r.fake.sniff_calls.load(Ordering::SeqCst), 1);
     assert!(report.ladder.is_some());
 }
+
+#[tokio::test]
+async fn a_page_yt_dlp_reads_only_generically_is_sniffed_first_and_the_verdict_says_the_browser_chooses() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().generic_only = true;
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("generic")));
+    *r.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some("https://cdn.news.example.gr/v/a.m3u8".into()), streams: 2, ..Default::default() });
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("the browser choose"), "{}", report.verdict);
+    assert_eq!(r.fake.sniff_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(r.fake.ytdl_calls.load(Ordering::SeqCst), 0, "yt-dlp is asked only when the browser finds none");
+}
+
+#[tokio::test]
+async fn a_generic_only_page_the_browser_finds_nothing_on_falls_back_to_yt_dlp() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().generic_only = true;
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("generic")));
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("yt-dlp's own pick"), "{}", report.verdict);
+    assert_eq!((r.fake.sniff_calls.load(Ordering::SeqCst), r.fake.ytdl_calls.load(Ordering::SeqCst)), (1, 1));
+}
+
+#[tokio::test]
+async fn a_page_with_its_own_extractor_is_not_sniffed_when_yt_dlp_reads_it() {
+    let r = rig(RepairMode::Hold);
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("example:article")));
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("yt-dlp reads this link"), "{}", report.verdict);
+    assert_eq!(r.fake.sniff_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_redirect_to_a_platform_post_is_not_sniffed_first_in_the_dry_run() {
+    let r = rig(RepairMode::Hold);
+    {
+        let mut scan = r.fake.scan.lock().unwrap();
+        scan.generic_only = true;
+        scan.hand_off_only = true;
+        scan.webpage_url = Some("https://www.youtube.com/watch?v=abcdefghijk".into());
+    }
+    *r.fake.final_url.lock().unwrap() = Some("https://www.youtube.com/watch?v=abcdefghijk".into());
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("youtube")));
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("yt-dlp reads this link"), "{}", report.verdict);
+    assert_eq!(r.fake.sniff_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_browser_that_ended_on_a_platform_page_counts_as_finding_nothing_in_the_dry_run() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().generic_only = true;
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("youtube")));
+    let snapshot = omni_browser::PageSnapshot { final_url: Some("https://www.youtube.com/watch?v=abcdefghijk".into()), ..Default::default() };
+    *r.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some("https://cdn.news.example.gr/v/a.m3u8".into()), streams: 1, snapshot: Some(snapshot), ..Default::default() });
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("yt-dlp's own pick"), "{}", report.verdict);
+    assert_eq!(r.fake.ytdl_calls.load(Ordering::SeqCst), 1);
+    // The report's own lines agree with the verdict: no "finds a stream".
+    let sniff = report.normal.sniff.as_ref().expect("the sniff step ran");
+    assert!(!sniff.ok && sniff.stream.is_none());
+    let step = report.steps.iter().find(|s| s.name == "Sniffer").expect("a Sniffer step");
+    assert!(step.note.contains("video platform"), "{}", step.note);
+}

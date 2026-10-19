@@ -137,3 +137,28 @@ fn a_long_video_and_one_outside_the_article_are_offered_not_queued() {
     let urls: Vec<&str> = offered.iter().map(|o| o.url.as_str()).collect();
     assert_eq!(urls, vec![yt, X3]);
 }
+
+#[test]
+fn a_retry_never_takes_nor_requeues_a_video_a_previous_attempt_queued_as_a_sibling() {
+    use omni_broadcast::article::{queued_children, remaining_after_queued};
+    let (_dir, repo, mut job) = leased_article_job();
+    let all = vec![X1.to_string(), X2.to_string(), X3.to_string()];
+    // Attempt 1 took X1 and queued X2 and X3.
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all, &Default::default());
+    // One sibling has already ended: it still holds its video.
+    let ended = repo.get_all_jobs().unwrap().into_iter().find(|j| j.url == X3).unwrap();
+    repo.cancel_job(ended.id).unwrap();
+    assert_eq!(repo.get_job(ended.id).unwrap().unwrap().status, JobStatus::Cancelled);
+    let queued = queued_children(&repo.jobs_with_children(job.id).unwrap(), job.id);
+    assert_eq!(queued, vec![X2.to_string(), X3.to_string()], "the parent is not its own child");
+
+    // Order of yt-dlp's scan: the retry's pool is X1 alone.
+    assert_eq!(remaining_after_queued(&all, &queued), (vec![X1.to_string()], false));
+    // Order of the sniffer's ranking, which now puts a queued video first.
+    let ranked = vec![X2.to_string(), X1.to_string(), X3.to_string()];
+    assert_eq!(remaining_after_queued(&ranked, &queued), (vec![X1.to_string()], false));
+    // Every video queued: nothing is left to take, and that is said.
+    let only = vec![X3.to_string(), X2.to_string()];
+    assert_eq!(remaining_after_queued(&only, &queued), (Vec::<String>::new(), true));
+    assert_eq!(remaining_after_queued(&[], &queued), (Vec::<String>::new(), false));
+}

@@ -77,6 +77,37 @@ fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
     cancel.as_ref().is_some_and(|t| t.is_cancelled())
 }
 
+/// The code and the timeline line for a failed download. A [`DownloadError`]
+/// already shows its code, so its line is "CODE: message", never
+/// "CODE: CODE: message" (seen on the desk 2026-10-19).
+fn download_failure_text(e: &anyhow::Error) -> (ErrorCode, String) {
+    match e.downcast_ref::<DownloadError>() {
+        Some(d) => (d.code, format!("{}: {}", d.code, d.message)),
+        None => (ErrorCode::PipelineFailed, format!("{}: {e}", ErrorCode::PipelineFailed)),
+    }
+}
+
+#[cfg(test)]
+mod failure_text_tests {
+    use super::*;
+
+    #[test]
+    fn a_classified_download_failure_names_its_code_once() {
+        let e = anyhow::Error::new(DownloadError {
+            code: ErrorCode::LiveStream,
+            message: "the video is live or not yet started; yt-dlp skipped it".into(),
+        });
+        let (code, text) = download_failure_text(&e);
+        assert_eq!(code, ErrorCode::LiveStream);
+        assert_eq!(text, "LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
+
+        let plain = anyhow::anyhow!("yt-dlp could not start");
+        let (code, text) = download_failure_text(&plain);
+        assert_eq!(code, ErrorCode::PipelineFailed);
+        assert_eq!(text, format!("{}: yt-dlp could not start", ErrorCode::PipelineFailed));
+    }
+}
+
 /// Forgets a job's extra login site when dropped (see [`BroadcastEngine::set_login_site`]).
 pub struct LoginSiteGuard {
     sites: Arc<Mutex<HashMap<i64, String>>>,
@@ -250,6 +281,24 @@ impl BroadcastEngine {
             .await;
         drop(jar);
         probed.ok()
+    }
+
+    /// What yt-dlp says about one of the sniffer's candidates without downloading it (P3.15):
+    /// live, gone, readable or unknown, asked with the sniffer's referer, user agent and cookies.
+    pub async fn probe_candidate(
+        &self,
+        url: &str,
+        referer: Option<&str>,
+        user_agent: Option<&str>,
+        cookies: Option<&str>,
+    ) -> crate::downloader::Probe {
+        let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
+        let probed = Downloader::new(&self.ytdl_path)
+            .with_cookie_jar(jar.as_ref())
+            .probe_candidate(url, referer, user_agent, cookies, std::time::Duration::from_secs(15))
+            .await;
+        drop(jar);
+        probed
     }
 
     pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
@@ -429,11 +478,7 @@ impl BroadcastEngine {
                 // The downloader already classified the failure, so the pipeline
                 // does not have to re-read stderr to decide whether a retry could
                 // possibly help (plan P1.9).
-                let code = e
-                    .downcast_ref::<DownloadError>()
-                    .map(|d| d.code)
-                    .unwrap_or(ErrorCode::PipelineFailed);
-                let err_msg = format!("{code}: {e}");
+                let (code, err_msg) = download_failure_text(&e);
                 warn!("Job #{job_id}: {err_msg}");
                 let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Download), &err_msg);
                 let _ = self.repo.log_audit(
