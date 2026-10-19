@@ -1009,11 +1009,20 @@ mod tests {
         }
     }
 
-    fn repo() -> (Repository, TempDb) {
+    /// The guard comes first so a test binds it first and it drops last, after
+    /// the database is closed; Windows cannot delete a file that is still open.
+    fn repo() -> (TempDb, Repository) {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("omni-canary-test-{}-{n}.db", std::process::id()));
-        (Repository::new(&path).unwrap(), TempDb(path))
+        // Windows reuses process ids, and a database file that is still open when
+        // TempDb drops is not deleted: a pid-and-counter name reopened an older
+        // run's database, whose rows broke the counts (gate 2026-10-19). The
+        // clock makes every run's name its own.
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("omni-canary-test-{}-{n}-{nanos}.db", std::process::id()));
+        assert!(!path.exists(), "a fresh test database must not exist yet: {}", path.display());
+        let db = Repository::new(&path).unwrap();
+        (TempDb(path), db)
     }
 
     const OK200: u16 = 200;
@@ -1033,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_gone_article_is_marked_and_never_counts_as_failure() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         pool(&repo, &["https://news.example/live", "https://news.example/gone"]);
         // Newest is "gone" (404); the older one fails.
         let p = fake(&[("https://news.example/gone", 404), ("https://news.example/live", OK200)], &[]);
@@ -1058,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_answer_or_a_server_error_is_unknown_not_a_failure() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         pool(&repo, &["https://news.example/a", "https://news.example/b", "https://news.example/c"]);
         // a: no answer at all (not in the map); b: 503; c: 502.
         let p = fake(&[("https://news.example/b", 503), ("https://news.example/c", 502)], &[]);
@@ -1071,7 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_pass_stops_the_loop() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         pool(&repo, &["https://news.example/a", "https://news.example/b", "https://news.example/c"]);
         let all200: Vec<(&'static str, u16)> =
             ["a", "b", "c"].iter().map(|x| (&*Box::leak(format!("https://news.example/{x}").into_boxed_str()), OK200)).collect();
@@ -1091,7 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn all_live_canaries_failing_is_a_fail_with_the_last_detail() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         pool(&repo, &["https://news.example/a", "https://news.example/b"]);
         let p = fake(&[("https://news.example/a", OK200), ("https://news.example/b", OK200)], &[]);
         let check = check_site(&repo, &p, "news.example", soon()).await;
@@ -1101,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_check_past_its_deadline_decides_nothing() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         pool(&repo, &["https://news.example/a", "https://news.example/b"]);
         let p = fake(&[("https://news.example/a", OK200), ("https://news.example/b", OK200)], &[]);
         let past = Instant::now() - Duration::from_secs(1);
@@ -1111,7 +1120,7 @@ mod tests {
 
     #[test]
     fn a_degraded_site_is_confirmed_broken_and_a_pass_heals_it() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         let health = HealthState::new();
         for _ in 0..6 {
             repo.record_site_outcome("news.example", SiteOutcome::Success).unwrap();
@@ -1151,14 +1160,14 @@ mod tests {
         assert!(l.allow("a.example", t + Duration::from_secs(2 * 3600)), "after two hours again");
     }
 
-    fn env() -> (Arc<CanaryEnv>, TempDb) {
-        let (repo, db) = repo();
-        (Arc::new(CanaryEnv::new(repo, HealthState::new(), PathBuf::from("."), "stable".into())), db)
+    fn env() -> (TempDb, Arc<CanaryEnv>) {
+        let (db, repo) = repo();
+        (db, Arc::new(CanaryEnv::new(repo, HealthState::new(), PathBuf::from("."), "stable".into())))
     }
 
     #[tokio::test]
     async fn a_check_that_outlives_its_deadline_is_undecided_not_failed() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         pool(&repo, &["https://news.example/a"]);
         let mut p = fake(&[("https://news.example/a", OK200)], &[]);
         p.delay = Duration::from_secs(30);
@@ -1170,7 +1179,7 @@ mod tests {
 
     #[test]
     fn a_verdict_older_than_the_sites_latest_change_is_not_applied() {
-        let (repo, _f) = repo();
+        let (_f, repo) = repo();
         let health = HealthState::new();
         degrade(&repo, "news.example");
         let fail = SiteCheck::Fail("no video".into());
@@ -1189,7 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_update_task_waits_while_a_canary_run_holds_the_lock() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let held = env.lock_run().await; // a canary run is going
         let task = {
@@ -1217,7 +1226,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_nightly_pass_where_every_site_failed_changes_nothing_and_says_so() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         let mut statuses = Vec::new();
         for d in ["a.example", "b.example", "c.example"] {
             degrade(&env.repo, d);
@@ -1234,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_nightly_pass_that_is_not_an_outage_applies_each_verdict() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         let mut statuses = Vec::new();
         let mut ok = Vec::new();
         for d in ["a.example", "b.example", "c.example"] {
@@ -1253,7 +1262,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_daytime_trigger_spawns_once_when_free_and_never_while_a_run_holds_the_lock() {
-        let (env, _db) = env();
+        let (_db, env) = env();
 
         // Lock free: the trigger counts and spawns; a second one within 2 h does not.
         env.trigger("free.example");
@@ -1275,7 +1284,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_manual_check_confirms_a_degraded_site_broken_and_a_pass_restores_it() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         degrade(&env.repo, "news.example");
         pool(&env.repo, &["https://news.example/a"]);
         let failing = fake(&[("https://news.example/a", OK200)], &[("https://news.example/a", false)]);
@@ -1293,7 +1302,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_now_starts_when_the_lock_is_free_and_says_busy_while_a_run_holds_it() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         // A site with no canaries is undecided without any outside call.
         assert_eq!(env.run_now("quiet.example"), RunNow::Started);
         // The check holds the lock until it is done.
@@ -1309,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_now_from_the_panel_has_a_ten_minute_cooldown_per_site_and_a_refusal_does_not_start_it() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         let runner = AdminRunner::new(env.clone());
         // Refused while the lock is held: no cooldown starts.
         let held = env.lock_run().await;
@@ -1326,7 +1335,7 @@ mod tests {
     }
     #[tokio::test]
     async fn the_nightly_update_task_keeps_canary_runs_out_while_it_holds_the_lock() {
-        let (env, _db) = env();
+        let (_db, env) = env();
         let held = env.lock_run().await;
         assert!(env.run_lock.clone().try_lock_owned().is_err(), "a canary run cannot start under the swap");
         drop(held);
