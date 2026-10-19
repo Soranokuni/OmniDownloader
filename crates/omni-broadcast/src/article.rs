@@ -98,6 +98,21 @@ pub fn without_queued(streams: &[String], queued: &[String]) -> Vec<String> {
     streams.iter().filter(|u| !keys.contains(&facts_key(u))).cloned().collect()
 }
 
+/// `videos` without those already queued as siblings (dedup keys), and whether that left none
+/// of a non-empty list. A retry must neither take a video an earlier attempt queued as a
+/// sibling nor queue it again: it would air twice.
+pub fn remaining_after_queued(videos: &[String], queued: &[String]) -> (Vec<String>, bool) {
+    let left = without_queued(videos, queued);
+    let emptied = !videos.is_empty() && left.is_empty();
+    (left, emptied)
+}
+
+/// The addresses of `parent_id`'s children among `jobs` (the parent itself excluded), whatever
+/// state they are in: one that ended (completed, cancelled, in review) still holds its video.
+pub fn queued_children(jobs: &[omni_core::models::Job], parent_id: i64) -> Vec<String> {
+    jobs.iter().filter(|j| j.parent_job_id == Some(parent_id)).map(|j| j.url.clone()).collect()
+}
+
 /// The placement facts the sniffer gave, as `(address, in_article, contextual)`.
 pub fn facts_from_placement<'a>(placed: impl IntoIterator<Item = (&'a str, Option<bool>, bool)>) -> Facts {
     let mut facts = Facts::new();

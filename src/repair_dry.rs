@@ -206,12 +206,41 @@ impl Env for ProbeOnly {
     async fn ytdl_probe(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
         self.0.ytdl_probe(url, timeout).await
     }
+    async fn page_scan(&self, url: &str, timeout: Duration) -> omni_broadcast::downloader::PageScan {
+        self.0.page_scan(url, timeout).await
+    }
+    async fn final_url(&self, url: &str) -> Option<String> {
+        self.0.final_url(url).await
+    }
     async fn sniff(&self, url: &str, secs: u64) -> SniffSeen {
         self.0.sniff(url, secs).await
     }
     async fn download(&self, _: Job, _: &str, _: Option<String>, _: &CancellationToken, _: DeliveryMode) -> Result<RunOutcome> {
         Err(anyhow::anyhow!("a dry run never downloads"))
     }
+}
+
+/// One sniff of the page within what is left of the deadline, recorded in the report.
+async fn sniff_step(env: &Arc<dyn Env>, url: &str, deadline: Instant, steps: &mut Vec<Step>, normal: &mut Normal) -> SniffSeen {
+    let mut seen = SniffSeen { error: Some("no time left".into()), ..Default::default() };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if !left.is_zero() {
+        let t = Instant::now();
+        let secs = left.as_secs().clamp(1, SNIFF_SECS);
+        seen = tokio::time::timeout(Duration::from_secs(secs) + LIVE_LAUNCH_ALLOWANCE + GRACE, env.sniff(url, secs))
+            .await
+            .unwrap_or_else(|_| SniffSeen { error: Some("the browser did not answer in time".into()), ..Default::default() });
+        let sniff_ms = ms(t);
+        normal.sniff = Some(SniffResult {
+            ok: seen.stream.is_some(),
+            stream: seen.stream.as_deref().map(shown),
+            streams: seen.streams,
+            error: seen.error.as_deref().map(clip),
+            ms: sniff_ms,
+        });
+        steps.push(Step { name: "Sniffer".into(), ms: sniff_ms, note: if seen.stream.is_some() { "finds a stream".into() } else { "finds no stream".into() } });
+    }
+    seen
 }
 
 fn ms(since: Instant) -> u64 {
@@ -363,6 +392,49 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
         normal.site_api = Some(SiteApiResult { video, error, ms: api_ms });
     }
 
+    // 0b. yt-dlp's page scan, as the real job takes it for a page nothing named (P3.15): a page
+    // yt-dlp reaches only through its generic scan is read by the browser first.
+    let mut seen: Option<SniffSeen> = None;
+    if kind == JobKind::WebPage && probe_target == url && !left().is_zero() {
+        let t = Instant::now();
+        let cap = left().min(YTDL_MAX);
+        let scan = tokio::time::timeout(cap + GRACE, env.page_scan(url, cap)).await.unwrap_or_default();
+        let route = omni_broadcast::downloader::first_attempt_resolved(false, false, false, &scan, url, |u| {
+            let env = env.clone();
+            async move { tokio::time::timeout(Duration::from_secs(15), env.final_url(&u)).await.ok().flatten() }
+        })
+        .await;
+        steps.push(Step {
+            name: "Page scan".into(),
+            ms: ms(t),
+            note: if route == omni_broadcast::downloader::FirstAttempt::SnifferFirst { "yt-dlp reads the page only generically".into() } else { "yt-dlp has an extractor for it, or none".into() },
+        });
+        if route == omni_broadcast::downloader::FirstAttempt::SnifferFirst {
+            let mut first = sniff_step(&env, url, deadline, &mut steps, &mut normal).await;
+            // A browser that ended on a video platform's page is taken as finding nothing:
+            // yt-dlp follows that redirect and takes the post itself.
+            if omni_broadcast::downloader::landed_on_platform(first.snapshot.as_ref().and_then(|s| s.final_url.as_deref())) {
+                first.stream = None;
+                // The report must say what the real job does with it, not "finds a stream".
+                if let Some(s) = normal.sniff.as_mut() {
+                    s.ok = false;
+                    s.stream = None;
+                }
+                if let Some(step) = steps.last_mut().filter(|s| s.name == "Sniffer") {
+                    step.note = "ends on a video platform's page; counts as no stream".into();
+                }
+            }
+            if let Some(stream) = first.stream.as_deref() {
+                let verdict = format!(
+                    "yt-dlp reads this page only through its generic scan, which does not know where on the page each video sits, so the real job lets the browser choose: the sniffer's first choice is a stream on {}. Before downloading, the real job asks yt-dlp about its top choices and skips any that are gone or live, so it may take the next one; this test does not check that. yt-dlp's own pick is used only if the browser finds nothing (the dry run does not download).",
+                    shown(stream).split('/').next().unwrap_or("?")
+                );
+                return Ok(finish(started, host, use_llm, mode, steps, normal, None, verdict));
+            }
+            seen = Some(first);
+        }
+    }
+
     // 1. The normal path, first part: yt-dlp, `--simulate`.
     let t = Instant::now();
     let cap = left().min(YTDL_MAX);
@@ -378,12 +450,16 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
     });
     steps.push(Step { name: "yt-dlp probe".into(), ms: ytdl_ms, note: if ytdl_ok { "reads the link".into() } else { "fails".into() } });
     if ytdl_ok {
-        let verdict = "yt-dlp reads this link: the normal path would download it. The repair ladder would not run.".to_string();
+        let verdict = if seen.is_some() {
+            "The browser finds no video on this page, and yt-dlp reads it only generically: the normal path would download yt-dlp's own pick. The repair ladder would not run.".to_string()
+        } else {
+            "yt-dlp reads this link: the normal path would download it. The repair ladder would not run.".to_string()
+        };
         return Ok(finish(started, host, use_llm, mode, steps, normal, None, verdict));
     }
     // The real job sniffs only where that can help: not a page that does not exist, not YouTube,
     // not a platform post unless yt-dlp's failure leaves the sniffer a chance.
-    if !sniff_code.should_sniff(url) {
+    if seen.is_none() && !sniff_code.should_sniff(url) {
         let verdict = format!(
             "yt-dlp cannot read the link ({}), and the real job does not sniff it: a sniff cannot help here. The repair ladder runs only after a sniff that finds nothing, so it does not run either.",
             sniff_code.as_str()
@@ -391,24 +467,11 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
         return Ok(finish(started, host, use_llm, mode, steps, normal, None, verdict));
     }
 
-    // 2. One sniff of the page for a stream.
-    let mut seen = SniffSeen { error: Some("no time left".into()), ..Default::default() };
-    if !left().is_zero() {
-        let t = Instant::now();
-        let secs = left().as_secs().clamp(1, SNIFF_SECS);
-        seen = tokio::time::timeout(Duration::from_secs(secs) + LIVE_LAUNCH_ALLOWANCE + GRACE, env.sniff(url, secs))
-            .await
-            .unwrap_or_else(|_| SniffSeen { error: Some("the browser did not answer in time".into()), ..Default::default() });
-        let sniff_ms = ms(t);
-        normal.sniff = Some(SniffResult {
-            ok: seen.stream.is_some(),
-            stream: seen.stream.as_deref().map(shown),
-            streams: seen.streams,
-            error: seen.error.as_deref().map(clip),
-            ms: sniff_ms,
-        });
-        steps.push(Step { name: "Sniffer".into(), ms: sniff_ms, note: if seen.stream.is_some() { "finds a stream".into() } else { "finds no stream".into() } });
-    }
+    // 2. One sniff of the page for a stream (already done when the browser was asked first).
+    let mut seen = match seen {
+        Some(done) => done,
+        None => sniff_step(&env, url, deadline, &mut steps, &mut normal).await,
+    };
     if let Some(stream) = seen.stream.as_deref() {
         let verdict = format!(
             "yt-dlp cannot read the link, but the sniffer finds a stream ({}). The real job would download that stream, and would run the repair ladder only if that download failed (the dry run does not download, so it stops here). The real job also drops sniffed platform posts that turn out to have no video; this test does not check that.",

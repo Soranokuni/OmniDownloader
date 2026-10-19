@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use omni_broadcast::downloader::{DownloadError, DownloadOpts, Downloader};
+use omni_broadcast::downloader::{first_attempt_resolved, Choice, Probe, DownloadError, DownloadOpts, Downloader, FirstAttempt, PageScan};
 use omni_broadcast::errors::{classify_download_error, ErrorCode};
 use omni_broadcast::rewrapper::Rewrapper;
 use omni_broadcast::transcoder::Transcoder;
@@ -565,60 +565,199 @@ impl RealStages {
     }
 }
 
+// ------------------------------------------------------------------ extraction, as a job does it
+
+/// The four questions extraction asks, so the order they are asked in can be tested.
 #[async_trait]
-impl BenchStages for RealStages {
-    async fn extract(&self, target: &TargetRow) -> StageResult<Extracted> {
-        let url = target.url.as_str();
-        // The page's own API names the video (P3.8): no yt-dlp, no browser.
-        match omni_browser::pages::resolve(url).await {
-            Ok(Some(video)) => {
-                return Ok(Extracted {
-                    method: "site-api".into(),
-                    candidates: 1,
-                    duration_secs: None,
-                    stream: video,
-                    referer: Some(url.to_string()),
-                    user_agent: None,
-                    cookies: None,
-                })
-            }
-            Ok(None) => {}
-            Err(_) => {}
+trait ExtractSteps: Send + Sync {
+    /// The video the page's own API names (P3.8).
+    async fn site_api(&self, url: &str) -> Option<String>;
+    /// yt-dlp's page scan (`--flat-playlist -J`).
+    async fn page_scan(&self, url: &str) -> PageScan;
+    /// Where the page's address ends up after redirects, when that can be told.
+    async fn final_url(&self, url: &str) -> Option<String>;
+    /// yt-dlp's own extractors on the link: its length, or the reason it cannot.
+    async fn ytdlp(&self, url: &str) -> std::result::Result<Option<f64>, String>;
+    /// What the browser found on the page; `None` when it finds no stream.
+    async fn sniff(&self, url: &str) -> Option<Sniff>;
+    /// yt-dlp's say on one of the browser's candidates, with the browser's session.
+    async fn probe(&self, candidate: &str, session: &Sniff) -> Probe;
+}
+
+/// What a sniff found: its candidates in rank order (address, held), its own primary, the
+/// session the download uses, and the address the browser ended on.
+struct Sniff {
+    streams: Vec<(String, bool)>,
+    primary: String,
+    referer: String,
+    user_agent: String,
+    cookies: Option<String>,
+    final_url: Option<String>,
+}
+
+/// How the browser's step ended.
+enum SniffStep {
+    Found(Extracted),
+    /// No usable stream: yt-dlp may still be asked.
+    Nothing,
+    /// Every candidate is gone or live: the job ends with this code, yt-dlp is not asked.
+    Ended(ErrorCode),
+}
+
+/// The browser's step as `run_job` takes it (P3.15): every candidate is asked before the
+/// video is chosen, a gone or live one is skipped, and a page the browser ended on a video
+/// platform's page counts as finding nothing when the browser was asked first.
+async fn sniff_and_choose(steps: &dyn ExtractSteps, url: &str, sniff_first: bool) -> SniffStep {
+    let Some(s) = steps.sniff(url).await else { return SniffStep::Nothing };
+    if sniff_first && omni_broadcast::downloader::landed_on_platform(s.final_url.as_deref()) {
+        return SniffStep::Nothing;
+    }
+    let urls: Vec<String> = s.streams.iter().map(|(u, _)| u.clone()).collect();
+    let cands = omni_broadcast::downloader::sniffed_cands(&urls, |u| s.streams.iter().any(|(k, held)| k == u && *held));
+    let chosen = if cands.is_empty() {
+        Some(s.primary.clone())
+    } else {
+        let session = &s;
+        match omni_broadcast::downloader::choose_primary(&cands, omni_broadcast::downloader::MAX_LIVE_PROBES, |u| async move {
+            steps.probe(&u, session).await
+        })
+        .await
+        {
+            Choice::Primary { url, .. } => Some(url),
+            Choice::AllDead { code, .. } => return SniffStep::Ended(code),
+            Choice::AllLive { .. } => return SniffStep::Ended(ErrorCode::LiveStream),
+            Choice::Nothing => None,
         }
+    };
+    match chosen {
+        Some(stream) => SniffStep::Found(Extracted {
+            method: "sniffer".into(),
+            candidates: s.streams.len() as i64,
+            duration_secs: None,
+            stream,
+            referer: Some(s.referer.clone()),
+            user_agent: Some(s.user_agent.clone()),
+            cookies: s.cookies.clone(),
+        }),
+        None => SniffStep::Nothing,
+    }
+}
+
+/// What a job asks first: the site's API; then yt-dlp's page scan, which says whether yt-dlp
+/// reads the page only through its generic scan (P3.15). Then the browser chooses the video
+/// ("sniffer") and yt-dlp is asked only when it finds none; otherwise yt-dlp first and the
+/// browser for the pages it cannot read, as `run_job` does.
+async fn extract_with(steps: &dyn ExtractSteps, url: &str) -> StageResult<Extracted> {
+    if let Some(video) = steps.site_api(url).await {
+        return Ok(Extracted {
+            method: "site-api".into(),
+            candidates: 1,
+            duration_secs: None,
+            stream: video,
+            referer: Some(url.to_string()),
+            user_agent: None,
+            cookies: None,
+        });
+    }
+    let is_platform = omni_broadcast::downloader::is_video_platform(url);
+    let scan = if is_platform { PageScan::default() } else { steps.page_scan(url).await };
+    let route = first_attempt_resolved(false, is_platform, false, &scan, url, |u| async move { steps.final_url(&u).await }).await;
+    if route != FirstAttempt::YtDlp {
+        match sniff_and_choose(steps, url, route == FirstAttempt::SnifferFirst).await {
+            SniffStep::Found(found) => return Ok(found),
+            SniffStep::Ended(code) => return Err(code.as_str().to_string()),
+            SniffStep::Nothing => {}
+        }
+        if route == FirstAttempt::SnifferOnly {
+            return Err(ErrorCode::NoStreamFound.as_str().to_string());
+        }
+    }
+    let why = match steps.ytdlp(url).await {
+        Ok(duration_secs) => {
+            return Ok(Extracted {
+                method: "yt-dlp".into(),
+                candidates: 1,
+                duration_secs,
+                stream: url.to_string(),
+                referer: None,
+                user_agent: None,
+                cookies: None,
+            })
+        }
+        Err(reason) => classify_download_error(&reason),
+    };
+    // The browser, for the pages yt-dlp cannot read, as a job would; it already looked
+    // when it was asked first.
+    if route == FirstAttempt::SnifferFirst || !why.should_sniff(url) {
+        return Err(why.as_str().to_string());
+    }
+    match sniff_and_choose(steps, url, false).await {
+        SniffStep::Found(found) => Ok(found),
+        SniffStep::Ended(code) => Err(code.as_str().to_string()),
+        SniffStep::Nothing => Err(ErrorCode::NoStreamFound.as_str().to_string()),
+    }
+}
+
+#[async_trait]
+impl ExtractSteps for RealStages {
+    async fn site_api(&self, url: &str) -> Option<String> {
+        // A failed lookup just takes the usual way.
+        omni_browser::pages::resolve(url).await.ok().flatten()
+    }
+
+    async fn page_scan(&self, url: &str) -> PageScan {
+        let jar = omni_broadcast::cookie_file::for_url(&self.repo, url, &self.scratch, true);
+        let scan = Downloader::new(&self.tools.ytdl).with_cookie_jar(jar.as_ref()).page_videos(url, PROBE_TIMEOUT).await;
+        drop(jar);
+        scan
+    }
+
+    async fn final_url(&self, url: &str) -> Option<String> {
+        crate::repair::final_page_url(url).await
+    }
+
+    async fn ytdlp(&self, url: &str) -> std::result::Result<Option<f64>, String> {
         // yt-dlp's own extractors, with the site's cookie jar when there is one.
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, url, &self.scratch, true);
         let probed = Downloader::new(&self.tools.ytdl).with_cookie_jar(jar.as_ref()).probe_info(url, PROBE_TIMEOUT).await;
         drop(jar);
-        let why = match probed {
-            Ok(info) => {
-                return Ok(Extracted {
-                    method: "yt-dlp".into(),
-                    candidates: 1,
-                    duration_secs: info.duration_secs,
-                    stream: url.to_string(),
-                    referer: None,
-                    user_agent: None,
-                    cookies: None,
-                })
-            }
-            Err(reason) => classify_download_error(&reason),
-        };
-        // The browser, for the pages yt-dlp cannot read, as a job would.
-        if !why.should_sniff(url) {
-            return Err(why.as_str().to_string());
-        }
-        match omni_browser::sniffer::StreamSniffer::extract_media_bundle(url, SNIFF_SECS).await {
-            Ok(bundle) => Ok(Extracted {
-                method: "sniffer".into(),
-                candidates: bundle.all_streams.len() as i64,
-                duration_secs: None,
-                stream: bundle.primary_stream,
-                referer: Some(bundle.referer),
-                user_agent: Some(bundle.user_agent),
+        probed.map(|info| info.duration_secs)
+    }
+
+    async fn sniff(&self, url: &str) -> Option<Sniff> {
+        let sniffed = omni_browser::sniffer::StreamSniffer::extract_with_evidence(url, SNIFF_SECS).await;
+        match sniffed.media {
+            Ok(bundle) => Some(Sniff {
+                streams: bundle
+                    .all_streams
+                    .iter()
+                    .map(|u| (u.clone(), omni_browser::sniffer::is_demoted(&bundle.meta, u)))
+                    .collect(),
+                primary: bundle.primary_stream,
+                referer: bundle.referer,
+                user_agent: bundle.user_agent,
                 cookies: bundle.cookies,
+                final_url: sniffed.snapshot.final_url,
             }),
-            Err(_) => Err(ErrorCode::NoStreamFound.as_str().to_string()),
+            Err(_) => None,
         }
+    }
+
+    async fn probe(&self, candidate: &str, session: &Sniff) -> Probe {
+        let jar = omni_broadcast::cookie_file::for_url(&self.repo, candidate, &self.scratch, true);
+        let probed = Downloader::new(&self.tools.ytdl)
+            .with_cookie_jar(jar.as_ref())
+            .probe_candidate(candidate, Some(&session.referer), Some(&session.user_agent), session.cookies.as_deref(), PROBE_TIMEOUT.min(Duration::from_secs(15)))
+            .await;
+        drop(jar);
+        probed
+    }
+}
+
+#[async_trait]
+impl BenchStages for RealStages {
+    async fn extract(&self, target: &TargetRow) -> StageResult<Extracted> {
+        extract_with(self, target.url.as_str()).await
     }
 
     async fn download(&self, target: &TargetRow, found: &Extracted, dir: &Path) -> StageResult<PathBuf> {

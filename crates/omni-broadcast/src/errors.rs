@@ -313,6 +313,22 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     {
         return ErrorCode::GeoBlocked;
     }
+    // YouTube's temporary rate limit also says "Video unavailable. This content isn't
+    // available, try again later.": waiting helps, the video is not gone. A bot check or a login wall stays
+    // a login wall.
+    // Whole phrases only: a bare "rate-limit" also matches an article slug in the
+    // URL ("…/ecb-rate-limit-story"), which would hide UNSUPPORTED_URL or a 404.
+    if !(s.contains("sign in to confirm") || s.contains("login required") || s.contains("use --cookies"))
+        && (s.contains("try again later")
+            || s.contains("rate-limited by")
+            || s.contains("rate limited by")
+            || s.contains("rate-limit exceeded")
+            || s.contains("rate limit exceeded")
+            || s.contains("rate-limit reached")
+            || s.contains("rate limit reached"))
+    {
+        return ErrorCode::Network;
+    }
     // YouTube says "Video unavailable. …" for a removed video and "This video
     // is unavailable" for an id it does not know (a mistyped link).
     if s.contains("private video")
@@ -395,6 +411,29 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// YouTube's rate limit says "Video unavailable" too: it must wait, not read as a gone video.
+    #[test]
+    fn a_rate_limit_is_network_and_a_gone_video_still_is_not() {
+        let cases: &[(&str, ErrorCode)] = &[
+            ("ERROR: [youtube] abc: Video unavailable. This content isn't available, try again later.", ErrorCode::Network),
+            ("ERROR: [youtube] abc: The current session has been rate-limited by YouTube for up to an hour", ErrorCode::Network),
+            ("ERROR: [youtube] abc: Video unavailable", ErrorCode::PrivateOrRemoved),
+            ("ERROR: [youtube] abc: This video is unavailable", ErrorCode::PrivateOrRemoved),
+            ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", ErrorCode::PrivateOrRemoved),
+            ("ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies-from-browser", ErrorCode::LoginRequired),
+            ("ERROR: [twitter] 123: Rate limit exceeded", ErrorCode::Network),
+            // A slug that merely says "rate-limit" is not a rate limit.
+            ("ERROR: Unsupported URL: https://news.example/ecb-rate-limit-story", ErrorCode::UnsupportedUrl),
+            (
+                "ERROR: [generic] new-rate-limit-rules: Unable to download webpage: HTTP Error 404: Not Found",
+                ErrorCode::PageNotFound,
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(classify_download_error(text), *want, "{text}");
+        }
+    }
 
     /// Real yt-dlp messages. Getting these wrong means either an operator is
     /// told to wait for a video that will never come back, or a transient CDN

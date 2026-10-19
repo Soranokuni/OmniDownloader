@@ -295,6 +295,16 @@ pub trait Env: Send + Sync {
     async fn ytdl_probe(&self, _url: &str, _timeout: Duration) -> std::result::Result<LinkInfo, String> {
         Err("yt-dlp is not available here".to_string())
     }
+    /// yt-dlp's page scan (`--flat-playlist -J`), whose `generic_only` says the browser would choose
+    /// the video (P3.15). The default has no yt-dlp: nothing is generic only.
+    async fn page_scan(&self, _url: &str, _timeout: Duration) -> omni_broadcast::downloader::PageScan {
+        omni_broadcast::downloader::PageScan::default()
+    }
+    /// Where a page's address ends up after redirects (P3.15); `None` when that cannot be told.
+    /// The default cannot.
+    async fn final_url(&self, _url: &str) -> Option<String> {
+        None
+    }
     /// One sniff of a page for its streams (Test URL, P10.15b); read-only. The default sees nothing.
     async fn sniff(&self, _url: &str, _secs: u64) -> SniffSeen {
         SniffSeen::default()
@@ -417,6 +427,12 @@ impl Env for RealEnv {
     async fn ytdl_probe(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
         Downloader::new(&self.ytdl).probe_info(url, timeout).await
     }
+    async fn page_scan(&self, url: &str, timeout: Duration) -> omni_broadcast::downloader::PageScan {
+        Downloader::new(&self.ytdl).page_videos(url, timeout).await
+    }
+    async fn final_url(&self, url: &str) -> Option<String> {
+        final_page_url(url).await
+    }
     async fn sniff(&self, url: &str, secs: u64) -> SniffSeen {
         let url = url.to_string();
         let Some(s) = detached(async move { StreamSniffer::extract_with_evidence(&url, secs).await }).await else {
@@ -448,6 +464,19 @@ fn live_result(snap: PageSnapshot, diag: &omni_browser::evidence::Diagnostic, ac
         return None;
     }
     Some((snap, classify_live_run(actions, diag), diag.live_actions.clone()))
+}
+
+/// Where a page's address ends up after its redirects (P3.15): one bounded request, the body
+/// never read. `None` when it fails; the caller then does what it did before. Only host and
+/// path are logged.
+pub async fn final_page_url(url: &str) -> Option<String> {
+    match omni_browser::HttpFetcher::new().final_url(url).await {
+        Ok(found) => Some(found),
+        Err(e) => {
+            tracing::debug!(page = %omni_core::cookies::host_and_path(url), "page address lookup failed: {e:#}");
+            None
+        }
+    }
 }
 
 /// What kind of job this is, for [`omni_broadcast::repair::eligible`].
