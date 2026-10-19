@@ -97,6 +97,94 @@ const VIDEO_PLATFORMS: &[&str] = &[
     "streamable.com",
 ];
 
+/// The `--match-filters` expression that keeps live and upcoming videos out.
+/// Its skip message names it, which is how [`skipped_as_live`] recognises it.
+pub const LIVE_FILTER: &str = "!is_live & live_status!=?is_upcoming";
+
+/// Did yt-dlp skip the video because [`LIVE_FILTER`] did not pass? Without
+/// `--print` it says `[download] <title> does not pass filter (<filter>),
+/// skipping ..` on stdout; with our `--print` (which implies quiet) it says
+/// nothing, so this is only a secondary signal: see [`empty_download_is_live`].
+pub fn skipped_as_live(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.contains("does not pass filter") && l.contains(LIVE_FILTER))
+}
+
+/// yt-dlp exited 0 and produced no file. Was that the live filter skipping a
+/// live or upcoming video? Yes if its skip line is in `lines`, or if `probe`
+/// (yt-dlp's own `is_live` / `live_status` for the same address) says so. A
+/// probe that cannot answer says no, and the caller reports the plain
+/// "no file" error.
+pub async fn empty_download_is_live<F, Fut>(lines: &[String], probe: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    skipped_as_live(lines) || probe().await == Some(true)
+}
+
+/// How many candidates [`choose_primary`] asks about, at most.
+pub const MAX_LIVE_PROBES: usize = 3;
+
+/// One video the job might take as its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cand {
+    pub url: String,
+    /// Not the article's own: outside it, a link outside its body, a
+    /// contextual glomex playlist. Held candidates are only taken when no
+    /// other exists.
+    pub held: bool,
+    /// A platform video, whose live flag can be asked of yt-dlp. A raw
+    /// stream has none (the generic extractor sets no `is_live`).
+    pub probe_able: bool,
+}
+
+/// The outcome of [`choose_primary`]; `live` are the candidates found live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    Primary { url: String, live: Vec<String> },
+    /// Every candidate of the tier in play is a live platform video.
+    AllLive { live: Vec<String> },
+    /// There was no candidate.
+    Nothing,
+}
+
+/// The job's video among `cands` (in the order the caller ranks them).
+///
+/// Only the article's own candidates (`!held`) are walked while any exist; a
+/// held one is never a fallback for them. With none of the own, the held ones
+/// are walked, which is how a page whose only video is held still yields it.
+/// In the walk a probe-able candidate is asked (at most `max_probes` asks in
+/// all), a live one is skipped, and the first that is not live, not asked, or
+/// of unknown state wins. A tier whose every candidate is known live is
+/// `AllLive`. One candidate is never asked: there is nothing to choose, and the
+/// download's own filter and empty-result probe handle it.
+pub async fn choose_primary<F, Fut>(cands: &[Cand], max_probes: usize, mut is_live: F) -> Choice
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<bool>>,
+{
+    match cands {
+        [] => return Choice::Nothing,
+        [only] => return Choice::Primary { url: only.url.clone(), live: Vec::new() },
+        _ => {}
+    }
+    let own: Vec<&Cand> = cands.iter().filter(|c| !c.held).collect();
+    let tier: Vec<&Cand> = if own.is_empty() { cands.iter().collect() } else { own };
+    let mut live = Vec::new();
+    let mut asked = 0usize;
+    for c in tier {
+        if c.probe_able && asked < max_probes {
+            asked += 1;
+            if is_live(c.url.clone()).await == Some(true) {
+                live.push(c.url.clone());
+                continue;
+            }
+        }
+        return Choice::Primary { url: c.url.clone(), live };
+    }
+    Choice::AllLive { live }
+}
+
 /// Whether `url` is on YouTube.
 pub fn is_youtube(url: &str) -> bool {
     let host = host_of(url);
@@ -236,6 +324,14 @@ impl Downloader {
             // queued as their own jobs (`page_videos`).
             "--playlist-items".into(),
             "1".into(),
+            // A live or upcoming video is skipped, not recorded: yt-dlp
+            // downloads a live YouTube stream without error and the job sat in
+            // DOWNLOAD until the timeout (protothema, 2026-10-17). `?` lets a
+            // video whose live status is unknown (a plain mp4) through. A raw
+            // HLS/mp4 is never marked live by the generic extractor, so this
+            // does not guard those.
+            "--match-filters".into(),
+            LIVE_FILTER.into(),
             "--retries".into(),
             "5".into(),
             "--fragment-retries".into(),
@@ -383,11 +479,32 @@ impl Downloader {
         if let Some(p) = printed_path_in_dir(&candidates, output_dir) {
             return Ok(p);
         }
-
         warn!("Job #{job_id}: yt-dlp did not print a usable output path; scanning {output_dir:?}");
-        find_downloaded_file(output_dir)
-            .await
-            .ok_or_else(|| anyhow!("yt-dlp reported success but produced no file in {output_dir:?}"))
+        if let Some(p) = find_downloaded_file(output_dir).await {
+            return Ok(p);
+        }
+        // Exit 0 and nothing written is what the live filter leaves behind
+        // (`--print` keeps its skip message quiet): ask yt-dlp whether the
+        // video is live or upcoming. Same jar as the download; the probe takes
+        // no referer or user agent.
+        let prober = Downloader {
+            ytdl_path: self.ytdl_path.clone(),
+            deno: self.deno.clone(),
+            cookie_jar: opts.cookie_jar.map(Path::to_path_buf).or_else(|| self.cookie_jar.clone()),
+            cookie_values: opts.cookie_values.to_vec(),
+        };
+        let live = empty_download_is_live(&candidates, || async {
+            prober.probe_media(url, Duration::from_secs(15)).await.ok().map(|i| i.live)
+        })
+        .await;
+        if live {
+            return Err(DownloadError {
+                code: ErrorCode::LiveStream,
+                message: "the video is live or not yet started; yt-dlp skipped it".to_string(),
+            }
+            .into());
+        }
+        Err(anyhow!("yt-dlp reported success but produced no file in {output_dir:?}"))
     }
 }
 
@@ -1135,5 +1252,109 @@ mod platform_probe_tests {
         assert!(!parse_platform_line("90|480|NA|was_live").unwrap().live);
         assert!(parse_platform_line("garbage").is_none());
         assert!(parse_platform_line("").is_none());
+    }
+
+    #[test]
+    fn the_download_carries_the_live_filter_and_the_skip_message_is_recognised() {
+        let args = Downloader::build_args("https://www.youtube.com/watch?v=x", Path::new("out"), &DownloadOpts::default());
+        let i = args.iter().position(|a| a == "--match-filters").expect("filter present");
+        assert_eq!(args[i + 1], LIVE_FILTER);
+        // The real yt-dlp 2026.08.19 line, with our filter in it.
+        let real = format!("[download] Some title does not pass filter ({LIVE_FILTER}), skipping ..");
+        assert!(skipped_as_live(&[real]));
+        // Another filter's skip, or ordinary output, is not ours.
+        assert!(!skipped_as_live(&["[download] t does not pass filter (duration>5), skipping ..".to_string()]));
+        assert!(!skipped_as_live(&["[download] Destination: x.mp4".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn an_empty_exit_zero_download_is_live_when_the_probe_says_so() {
+        // The real shape (yt-dlp 2026.08.19 on a live YouTube): exit 0, no output, no file.
+        let nothing: Vec<String> = Vec::new();
+        assert!(empty_download_is_live(&nothing, || async { Some(true) }).await);
+        // Control: the probe says it is not live, or cannot say: the plain no-file error stands.
+        assert!(!empty_download_is_live(&nothing, || async { Some(false) }).await);
+        assert!(!empty_download_is_live(&nothing, || async { None }).await);
+        // The skip line alone is enough, without asking.
+        let line = format!("[download] t does not pass filter ({LIVE_FILTER}), skipping ..");
+        assert!(empty_download_is_live(&[line], || async { panic!("not needed") }).await);
+    }
+
+    fn cand(url: &str, held: bool) -> Cand {
+        Cand { url: url.to_string(), held, probe_able: is_video_platform(url) }
+    }
+
+    const YT_LIVE: &str = "https://www.youtube.com/watch?v=liveliveli1";
+    const YT_LIVE2: &str = "https://www.youtube.com/watch?v=liveliveli2";
+    const X_POST: &str = "https://x.com/i/status/2";
+    const CL: &str = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=cl-abc";
+
+    /// The prober of a test: these addresses are live.
+    async fn choose(cands: &[Cand], max: usize, live: &[&str]) -> Choice {
+        let live: Vec<String> = live.iter().map(|s| s.to_string()).collect();
+        choose_primary(cands, max, |u| {
+            let l = live.contains(&u);
+            async move { Some(l) }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn nothing_live_the_first_own_candidate_wins_as_before() {
+        let c = [cand(X_POST, false), cand(YT_LIVE, false), cand(CL, true)];
+        assert_eq!(choose(&c, 3, &[]).await, Choice::Primary { url: X_POST.into(), live: vec![] });
+        assert_eq!(choose_primary(&[], 3, |_| async { None }).await, Choice::Nothing);
+    }
+
+    #[tokio::test]
+    async fn a_live_own_candidate_is_skipped_for_the_next_own_one() {
+        // Page scan: [glomex cl-, a LIVE youtube, an x post]: the x post, not the live one.
+        let c = [cand(CL, true), cand(YT_LIVE, false), cand(X_POST, false)];
+        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::Primary { url: X_POST.into(), live: vec![YT_LIVE.into()] });
+    }
+
+    #[tokio::test]
+    async fn a_held_candidate_is_never_the_fallback_when_every_own_one_is_live() {
+        // [youtube LIVE, glomex cl-]: all live, NOT the cl- list.
+        let c = [cand(YT_LIVE, false), cand(CL, true)];
+        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::AllLive { live: vec![YT_LIVE.into()] });
+        // Sniff path: [in-article youtube LIVE, sidebar youtube, glomex cl-].
+        let side = "https://www.youtube.com/watch?v=sIdEbAr0001";
+        let c = [cand(YT_LIVE, false), cand(side, true), cand(CL, true)];
+        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::AllLive { live: vec![YT_LIVE.into()] });
+    }
+
+    #[tokio::test]
+    async fn a_page_with_only_held_candidates_takes_the_first_that_is_not_live() {
+        let side = "https://www.youtube.com/watch?v=sIdEbAr0001";
+        let c = [cand(YT_LIVE, true), cand(side, true), cand(CL, true)];
+        assert_eq!(choose(&c, 3, &[YT_LIVE]).await, Choice::Primary { url: side.into(), live: vec![YT_LIVE.into()] });
+        let c = [cand(YT_LIVE, true), cand(YT_LIVE2, true)];
+        assert!(matches!(choose(&c, 3, &[YT_LIVE, YT_LIVE2]).await, Choice::AllLive { .. }));
+        // Today's behaviour: a lone held candidate stays the primary, unasked.
+        let c = [cand(CL, true)];
+        assert_eq!(choose_primary(&c, 3, |_| async { panic!("not asked") }).await, Choice::Primary { url: CL.into(), live: vec![] });
+    }
+
+    #[tokio::test]
+    async fn the_probe_budget_is_respected_and_an_unknown_answer_or_a_raw_stream_is_kept() {
+        let c: Vec<Cand> = (1..=5).map(|i| cand(&format!("https://www.youtube.com/watch?v=liveliveli{i}"), false)).collect();
+        let n = std::cell::Cell::new(0);
+        let r = choose_primary(&c, MAX_LIVE_PROBES, |_| {
+            n.set(n.get() + 1);
+            async { Some(true) }
+        })
+        .await;
+        assert_eq!(n.get(), MAX_LIVE_PROBES);
+        assert!(matches!(r, Choice::Primary { ref url, .. } if *url == c[3].url), "the fourth is taken unasked: {r:?}");
+        // Unknown answer keeps the candidate.
+        let two = [cand(X_POST, false), cand(YT_LIVE, false)];
+        assert_eq!(choose_primary(&two, 3, |_| async { None }).await, Choice::Primary { url: X_POST.into(), live: vec![] });
+        // A raw stream is taken without a question.
+        let raw = [cand("https://cdn.example.com/a.m3u8", false), cand(YT_LIVE, false)];
+        assert_eq!(
+            choose_primary(&raw, 3, |_| async { panic!("raw streams are not asked") }).await,
+            Choice::Primary { url: raw[0].url.clone(), live: vec![] }
+        );
     }
 }

@@ -11,6 +11,15 @@
 //! Platform posts are what a journalist means when an article embeds them;
 //! raw streams on a news page are as often an ad or a "related story" reel,
 //! which is why a person decides those.
+//!
+//! Not every platform post on the page is the article's (P3.14, owner
+//! 2026-10-17): one found outside the article's own content (a sidebar, a
+//! "more videos" widget, the navigation), a glomex contextual playlist, and
+//! one known to run longer than [`MAX_SIBLING_SECS`] are **offered**, not
+//! queued. Neither limit applies to the job being processed or to a link the
+//! journalist sent, only to the article's other videos.
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +31,137 @@ pub const MAX_AUTO_SIBLINGS: usize = 5;
 
 /// At most this many offers are kept on a job.
 pub const MAX_OFFERED: usize = 10;
+
+/// An article's other video longer than this (seconds) is offered, not queued.
+/// Exactly this long still queues.
+pub const MAX_SIBLING_SECS: f64 = 600.0;
+
+/// What the sniffer and a probe know about one video of the page (P3.14).
+/// All unknown by default, which plans as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VideoFacts {
+    /// `Some(false)`: found outside the article's own content.
+    pub in_article: Option<bool>,
+    /// A glomex playlist the player fills from the page.
+    pub contextual: bool,
+    /// Found only as a plain link, not an embedded player (see `StreamMeta::link`).
+    pub link: bool,
+    /// Length in seconds when a probe could tell.
+    pub duration_secs: Option<f64>,
+    /// A live stream: no length, and never ends.
+    pub live: bool,
+}
+
+impl VideoFacts {
+    /// Why this video is not the article's own (a contextual playlist, found
+    /// outside its content). Holds even when the journalist asked for a count.
+    pub fn placement_hold(&self) -> Option<&'static str> {
+        if self.contextual {
+            Some("a contextual playlist, not a video the article names")
+        } else if self.in_article == Some(false) {
+            Some("found outside the article's own content")
+        } else if self.link && self.in_article != Some(true) {
+            Some("a link outside the article body, not an embedded video")
+        } else {
+            None
+        }
+    }
+
+    /// Why this video is offered to MCR instead of queued, if it is.
+    pub fn hold_reason(&self) -> Option<&'static str> {
+        if let Some(why) = self.placement_hold() {
+            Some(why)
+        } else if self.live {
+            Some("a live stream")
+        } else if self.duration_secs.is_some_and(|d| d > MAX_SIBLING_SECS) {
+            Some("longer than 10 minutes")
+        } else {
+            None
+        }
+    }
+}
+
+/// Facts by [`facts_key`] of the video's address.
+pub type Facts = HashMap<String, VideoFacts>;
+
+/// One video under two addresses is one video: the key facts are stored under.
+pub fn facts_key(url: &str) -> String {
+    omni_core::urlnorm::normalize(url)
+}
+
+/// `streams` without the videos already queued as siblings of this job
+/// (compared as dedup keys). A job that falls back to the sniffer after its
+/// first attempt must not take one of them as its own video: it would be
+/// delivered twice.
+pub fn without_queued(streams: &[String], queued: &[String]) -> Vec<String> {
+    let keys: Vec<String> = queued.iter().map(|u| facts_key(u)).collect();
+    streams.iter().filter(|u| !keys.contains(&facts_key(u))).cloned().collect()
+}
+
+/// The placement facts the sniffer gave, as `(address, in_article, contextual)`.
+pub fn facts_from_placement<'a>(placed: impl IntoIterator<Item = (&'a str, Option<bool>, bool)>) -> Facts {
+    let mut facts = Facts::new();
+    for (u, in_article, contextual) in placed {
+        facts
+            .entry(facts_key(u))
+            .and_modify(|f| {
+                // One video under two addresses, seen in two places: inside the
+                // article wins, and it is contextual only if every sighting was.
+                f.in_article = match (f.in_article, in_article) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                };
+                f.contextual &= contextual;
+            })
+            .or_insert(VideoFacts { in_article, contextual, ..Default::default() });
+    }
+    facts
+}
+
+/// What a probe said about one video's length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probed {
+    pub duration_secs: Option<f64>,
+    pub live: bool,
+}
+
+/// Ask `probe` about each video that would be queued as a sibling, and note
+/// the answers in `facts`. A sibling the answer holds back is replaced by the
+/// next one in line, which is asked in turn, so the probes are at most
+/// [`MAX_AUTO_SIBLINGS`] plus the videos held. An unknown answer (`None`)
+/// leaves the video queued. Not asked at all when the journalist gave a count
+/// (they chose those videos).
+pub async fn probe_siblings<F, Fut>(
+    page: &str,
+    primary: &str,
+    all: &[String],
+    index: &str,
+    max_videos: Option<usize>,
+    facts: &mut Facts,
+    mut probe: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Probed>>,
+{
+    if max_videos.is_some_and(|n| n > 0) {
+        return;
+    }
+    let mut asked: Vec<String> = Vec::new();
+    // Each round asks one new video, so this ends after the candidates run out.
+    for _ in 0..all.len() {
+        let plan = plan_article_videos_facts(page, primary, all, index, None, facts);
+        let Some((url, _)) = plan.siblings.into_iter().find(|(u, _)| !asked.contains(&facts_key(u))) else {
+            break;
+        };
+        asked.push(facts_key(&url));
+        if let Some(p) = probe(url.clone()).await {
+            let f = facts.entry(facts_key(&url)).or_default();
+            f.duration_secs = p.duration_secs;
+            f.live = p.live;
+        }
+    }
+}
 
 /// A video found in the article and left for MCR to queue
 /// (`queue.candidates_json`).
@@ -77,11 +217,7 @@ pub fn plan_article_videos(page: &str, primary: &str, all: &[String], index: &st
     plan_article_videos_limited(page, primary, all, index, None)
 }
 
-/// [`plan_article_videos`] for a journalist who asked for only the first
-/// `max_videos` ("ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ", plan P4.33): this job is the
-/// first, the next `max_videos - 1` in page order are queued whatever
-/// kind they are (the journalist chose them), and the rest are offered to
-/// MCR rather than dropped, in case the count was off.
+/// [`plan_article_videos_facts`] without any facts.
 pub fn plan_article_videos_limited(
     page: &str,
     primary: &str,
@@ -89,6 +225,30 @@ pub fn plan_article_videos_limited(
     index: &str,
     max_videos: Option<usize>,
 ) -> ArticlePlan {
+    plan_article_videos_facts(page, primary, all, index, max_videos, &Facts::new())
+}
+
+/// [`plan_article_videos`] for a journalist who asked for only the first
+/// `max_videos` ("ΓΙΑ ΠΛΑΝΑ: 2 ΠΡΩΤΑ ΒΙΝΤΕΟ", plan P4.33): this job is the
+/// first, the next `max_videos - 1` in page order are queued whatever
+/// kind they are (the journalist chose them), and the rest are offered to
+/// MCR rather than dropped, in case the count was off.
+///
+/// `facts` says which of `all` are outside the article, contextual, live or
+/// long (see [`VideoFacts::hold_reason`]); those are offered rather than
+/// queued. A count never overrides where a video sits (owner 2026-10-17): it
+/// is filled only from videos that are not outside the article or a
+/// contextual playlist, and those are offered. Length and live do not apply
+/// to a count: the journalist chose those videos.
+pub fn plan_article_videos_facts(
+    page: &str,
+    primary: &str,
+    all: &[String],
+    index: &str,
+    max_videos: Option<usize>,
+    facts: &Facts,
+) -> ArticlePlan {
+    let facts_of = |u: &str| facts.get(&facts_key(u)).copied().unwrap_or_default();
     if is_video_platform(page) {
         return ArticlePlan { primary_index: index.to_string(), siblings: Vec::new(), offered: Vec::new() };
     }
@@ -97,7 +257,7 @@ pub fn plan_article_videos_limited(
     // the primary was queued again as a sibling). Compared as dedup keys.
     let key = |u: &str| omni_core::urlnorm::normalize(u);
     let mut seen = vec![key(primary)];
-    let mut others = Vec::new();
+    let mut others: Vec<String> = Vec::new();
     for u in all {
         if !seen.contains(&key(u)) {
             seen.push(key(u));
@@ -107,7 +267,12 @@ pub fn plan_article_videos_limited(
     let (numeric, name) = suffixer(index);
 
     if let Some(max) = max_videos {
-        let wanted = max.max(1) - 1;
+        // Stable: page order within each group; the page's own fill the count.
+        let (own, foreign): (Vec<String>, Vec<String>) =
+            others.into_iter().partition(|u| facts_of(u).placement_hold().is_none());
+        let others: Vec<String> = own.into_iter().chain(foreign).collect();
+        let own_count = others.iter().take_while(|u| facts_of(u).placement_hold().is_none()).count();
+        let wanted = (max.max(1) - 1).min(own_count);
         let mut next = 1usize;
         let mut siblings = Vec::new();
         let mut offered = Vec::new();
@@ -131,8 +296,11 @@ pub fn plan_article_videos_limited(
     let mut next = 1usize;
     let mut siblings = Vec::new();
     let mut overflow = Vec::new();
+    let mut held = Vec::new();
     for u in platform {
-        if siblings.len() < MAX_AUTO_SIBLINGS {
+        if facts_of(&u).hold_reason().is_some() {
+            held.push(u);
+        } else if siblings.len() < MAX_AUTO_SIBLINGS {
             siblings.push((u, name(next)));
             next += 1;
         } else {
@@ -141,6 +309,7 @@ pub fn plan_article_videos_limited(
     }
     let offered = overflow
         .into_iter()
+        .chain(held)
         .chain(raw)
         .take(MAX_OFFERED)
         .map(|url| {
@@ -175,7 +344,8 @@ fn sibling_event(url: &str, index: &str, r: &omni_core::models::Enqueued) -> Str
     }
 }
 
-/// The article behind a job held more than one video (policy C above): queue the other platform posts as sibling jobs,
+/// The article behind a job held more than one video (policy C above): queue the other platform posts as sibling jobs
+/// (those `facts` do not hold back),
 /// offer the rest to MCR, and rename this job `1` → `1A` when it has siblings.
 ///
 /// Best effort: a failure here is logged and never stops this job's own video.
@@ -185,6 +355,7 @@ pub fn queue_article_siblings(
     job: &mut omni_core::models::Job,
     primary: &str,
     all_streams: &[String],
+    facts: &Facts,
 ) {
     // A job MCR cancelled (or another worker took) while its page was being
     // resolved must not put the article's other videos on air (plan P7.20).
@@ -200,7 +371,7 @@ pub fn queue_article_siblings(
         }
     }
     let max = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
-    let plan = plan_article_videos_limited(&job.url, primary, all_streams, &job.index_str, max);
+    let plan = plan_article_videos_facts(&job.url, primary, all_streams, &job.index_str, max, facts);
     if let Some(n) = max {
         let found = 1 + plan.siblings.len() + plan.offered.len();
         if found > n {
@@ -249,10 +420,22 @@ pub fn queue_article_siblings(
         match repo.enqueue(&sibling, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS) {
             Ok(r) => {
                 let line = sibling_event(url, index, &r);
-                tracing::info!("Job #{job_id}: {line}");
+                // The log gets host and path only; the job's timeline keeps the address.
+                tracing::info!("Job #{job_id}: {}", sibling_event(&omni_core::cookies::host_and_path(url), index, &r));
                 let _ = repo.record_event(job_id, "INFO", Some(omni_core::models::JobStage::Extract), &line);
             }
-            Err(e) => tracing::warn!("Job #{job_id}: could not queue article video {url}: {e:#}"),
+            Err(e) => tracing::warn!("Job #{job_id}: could not queue article video {}: {e:#}", omni_core::cookies::host_and_path(url)),
+        }
+    }
+
+    for o in &plan.offered {
+        if let Some(why) = facts.get(&facts_key(&o.url)).and_then(VideoFacts::hold_reason) {
+            let line = format!("Another video in this article is offered, not queued ({why}): {}", o.url);
+            tracing::info!(
+                "Job #{job_id}: Another video in this article is offered, not queued ({why}): {}",
+                omni_core::cookies::host_and_path(&o.url)
+            );
+            let _ = repo.record_event(job_id, "INFO", Some(omni_core::models::JobStage::Extract), &line);
         }
     }
 
@@ -403,6 +586,171 @@ mod tests {
         assert_eq!(p.siblings.len(), 1);
         assert!(p.offered.is_empty());
     }
+
+    fn facts(v: &[(&str, VideoFacts)]) -> Facts {
+        v.iter().map(|(u, f)| (facts_key(u), *f)).collect()
+    }
+
+    fn plan_with(f: &Facts, all: &[&str]) -> ArticlePlan {
+        plan_article_videos_facts(ARTICLE, all[0], &s(all), "1", None, f)
+    }
+
+    #[test]
+    fn a_sibling_longer_than_ten_minutes_is_offered_exactly_ten_is_queued() {
+        let long = VideoFacts { duration_secs: Some(601.0), ..Default::default() };
+        let edge = VideoFacts { duration_secs: Some(600.0), ..Default::default() };
+        let p = plan_with(&facts(&[(X2, long), (X3, edge)]), &[X1, X2, X3]);
+        assert_eq!(p.siblings, vec![(X3.to_string(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered, vec![Offered { url: X2.into(), index_str: "1C".into(), queued_job_id: None }]);
+        assert_eq!(p.primary_index, "1A");
+    }
+
+    #[test]
+    fn an_unknown_duration_queues_as_before_and_a_live_stream_is_offered() {
+        let p = plan_with(&facts(&[(X2, VideoFacts::default())]), &[X1, X2]);
+        assert_eq!(p.siblings.len(), 1);
+        let live = VideoFacts { live: true, ..Default::default() };
+        let p = plan_with(&facts(&[(X2, live)]), &[X1, X2]);
+        assert!(p.siblings.is_empty() && p.offered.len() == 1, "{p:?}");
+    }
+
+    #[test]
+    fn a_sibling_outside_the_article_or_a_contextual_playlist_is_offered() {
+        let outside = VideoFacts { in_article: Some(false), ..Default::default() };
+        let inside = VideoFacts { in_article: Some(true), ..Default::default() };
+        let ctx = VideoFacts { in_article: Some(true), contextual: true, ..Default::default() };
+        let glomex = "https://player.glomex.com/integration/1/iframe-player.html?playlistId=cl-abc";
+        let p = plan_with(&facts(&[(X2, outside), (X3, inside), (glomex, ctx)]), &[X1, X2, X3, glomex]);
+        assert_eq!(p.siblings, vec![(X3.to_string(), "1B".to_string())], "{p:?}");
+        let offered: Vec<&str> = p.offered.iter().map(|o| o.url.as_str()).collect();
+        assert_eq!(offered, vec![X2, glomex]);
+        // Unknown placement is not "outside": queued as before. A glomex
+        // player is not a platform post and is only ever offered.
+        let p = plan_with(&Facts::new(), &[X1, X2, glomex]);
+        assert_eq!(p.siblings, vec![(X2.to_string(), "1B".to_string())]);
+        assert_eq!(p.offered.len(), 1);
+    }
+
+    #[test]
+    fn facts_match_one_video_under_another_address() {
+        let long = VideoFacts { duration_secs: Some(4200.0), ..Default::default() };
+        let p = plan_with(&facts(&[("https://twitter.com/someone/status/2?s=20", long)]), &[X1, X2]);
+        assert!(p.siblings.is_empty() && p.offered.len() == 1, "{p:?}");
+    }
+
+    #[test]
+    fn a_count_is_filled_only_from_the_articles_own_videos() {
+        let outside = VideoFacts { in_article: Some(false), ..Default::default() };
+        let long = VideoFacts { duration_secs: Some(4200.0), ..Default::default() };
+        // The widget's video is listed second but is not one of "the first 2";
+        // a long video the journalist counted is still queued.
+        let f = facts(&[(X2, outside), (X3, long)]);
+        let p = plan_article_videos_facts(ARTICLE, X1, &s(&[X1, X2, X3]), "1", Some(2), &f);
+        assert_eq!(p.siblings, vec![(X3.to_string(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered.iter().map(|o| o.url.as_str()).collect::<Vec<_>>(), vec![X2]);
+
+        // The waiter page with a count of 2: the contextual playlist and the
+        // header-navigation show are offered, never queued, though the page
+        // has no other video to fill the count with.
+        let glomex = "https://player.glomex.com/integration/1/iframe-player.html?playlistId=cl-abc";
+        let ctx = VideoFacts { contextual: true, ..Default::default() };
+        let f = facts(&[(glomex, ctx), (X2, outside)]);
+        let p = plan_article_videos_facts(ARTICLE, X1, &s(&[X1, glomex, X2]), "1", Some(2), &f);
+        assert!(p.siblings.is_empty(), "{p:?}");
+        assert_eq!(p.primary_index, "1");
+        assert_eq!(p.offered.iter().map(|o| o.url.as_str()).collect::<Vec<_>>(), vec![glomex, X2]);
+
+        // A count larger than the page's own videos is not made up from the others.
+        let p = plan_article_videos_facts(ARTICLE, X1, &s(&[X1, X3, X2]), "1", Some(3), &facts(&[(X2, outside)]));
+        assert_eq!(p.siblings, vec![(X3.to_string(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered.len(), 1);
+    }
+
+    #[test]
+    fn placement_facts_are_found_by_the_address_the_planner_uses() {
+        let f = facts_from_placement([("https://twitter.com/someone/status/2?s=20", Some(false), false), (X3, Some(true), false)]);
+        let p = plan_with(&f, &[X1, X2, X3]);
+        assert_eq!(p.siblings, vec![(X3.to_string(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered[0].url, X2);
+        // The control: facts under a key that is not this video's change nothing.
+        let wrong = facts_from_placement([("https://x.com/i/status/999", Some(false), false)]);
+        assert_eq!(plan_with(&wrong, &[X1, X2, X3]).siblings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_held_sibling_is_replaced_by_the_next_and_that_one_is_probed_too() {
+        let urls: Vec<String> = (1..=8).map(|i| format!("https://x.com/i/status/{i}")).collect();
+        let long = urls[1].clone();
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let mut f = Facts::new();
+        probe_siblings(ARTICLE, &urls[0], &urls, "1", None, &mut f, |u| {
+            asked.borrow_mut().push(u.clone());
+            let answer = if u == long { Probed { duration_secs: Some(4200.0), live: false } } else { Probed { duration_secs: Some(30.0), live: false } };
+            async move { Some(answer) }
+        })
+        .await;
+        // 5 siblings at first (2..=6); #2 is long, so #7 is promoted and asked: 6 probes.
+        assert_eq!(asked.borrow().len(), MAX_AUTO_SIBLINGS + 1, "{:?}", asked.borrow());
+        assert!(asked.borrow().contains(&urls[6]));
+        assert!(!asked.borrow().contains(&urls[7]), "#8 stays an overflow offer, unasked");
+        let p = plan_article_videos_facts(ARTICLE, &urls[0], &urls, "1", None, &f);
+        assert!(p.siblings.iter().all(|(u, _)| *u != long) && p.siblings.len() == MAX_AUTO_SIBLINGS, "{p:?}");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_probed_for_a_count_and_an_unknown_answer_keeps_the_video() {
+        let urls = s(&[X1, X2, X3]);
+        let mut f = Facts::new();
+        let n = std::cell::Cell::new(0);
+        probe_siblings(ARTICLE, X1, &urls, "1", Some(2), &mut f, |_| {
+            n.set(n.get() + 1);
+            async { None }
+        })
+        .await;
+        assert_eq!(n.get(), 0);
+        probe_siblings(ARTICLE, X1, &urls, "1", None, &mut f, |_| {
+            n.set(n.get() + 1);
+            async { None }
+        })
+        .await;
+        assert_eq!(n.get(), 2);
+        assert_eq!(plan_article_videos_facts(ARTICLE, X1, &urls, "1", None, &f).siblings.len(), 2);
+    }
+
+    #[test]
+    fn two_sightings_of_one_video_merge_placement() {
+        let f = facts_from_placement([
+            ("https://twitter.com/someone/status/2?s=20", Some(false), true),
+            (X2, Some(true), false),
+        ]);
+        let v = f[&facts_key(X2)];
+        assert_eq!((v.in_article, v.contextual), (Some(true), false));
+        let f = facts_from_placement([(X2, Some(false), true), (X2, Some(false), true)]);
+        let v = f[&facts_key(X2)];
+        assert_eq!((v.in_article, v.contextual), (Some(false), true));
+        let f = facts_from_placement([(X2, Some(false), false), (X2, None, false)]);
+        assert_eq!(f[&facts_key(X2)].in_article, None);
+    }
+
+    #[test]
+    fn a_link_outside_the_article_body_is_offered_one_inside_is_queued() {
+        let mut f = Facts::new();
+        f.insert(facts_key(X2), VideoFacts { link: true, in_article: None, ..Default::default() });
+        f.insert(facts_key(X3), VideoFacts { link: true, in_article: Some(true), ..Default::default() });
+        let p = plan_with(&f, &[X1, X2, X3]);
+        assert_eq!(p.siblings, vec![(X3.to_string(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered[0].url, X2);
+    }
+
+
+    #[test]
+    fn a_video_already_queued_as_a_sibling_is_not_taken_again() {
+        let left = without_queued(&s(&[X2, X3]), &s(&["https://twitter.com/someone/status/2?s=20"]));
+        assert_eq!(left, vec![X3.to_string()]);
+        assert_eq!(without_queued(&s(&[X2]), &[]), vec![X2.to_string()]);
+        assert!(without_queued(&s(&[X2]), &s(&[X2])).is_empty());
+    }
+
 
     #[test]
     fn only_house_slugs_are_renamed() {

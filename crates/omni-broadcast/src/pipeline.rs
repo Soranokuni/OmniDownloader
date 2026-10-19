@@ -239,6 +239,19 @@ impl BroadcastEngine {
         }
     }
 
+    /// Length and live flag of the video at `url`, as yt-dlp's own extractor
+    /// sees them without downloading (P3.14). `None` when it could not say
+    /// (network, login, timeout): the caller treats the length as unknown.
+    pub async fn video_length(&self, url: &str) -> Option<crate::downloader::PlatformInfo> {
+        let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
+        let probed = Downloader::new(&self.ytdl_path)
+            .with_cookie_jar(jar.as_ref())
+            .probe_media(url, std::time::Duration::from_secs(15))
+            .await;
+        drop(jar);
+        probed.ok()
+    }
+
     pub async fn process_job(&self, job: Job, owner: &str) -> Result<()> {
         self.process_job_with_context(job, owner, None, None, None).await
     }

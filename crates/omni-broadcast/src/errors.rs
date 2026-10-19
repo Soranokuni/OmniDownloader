@@ -242,6 +242,11 @@ impl ErrorCode {
     /// 2026-10-06 "found" a video id read out of a `/ServiceLogin` link,
     /// which then failed under a misleading error.
     pub fn should_sniff(&self, url: &str) -> bool {
+        // A live video is live in the browser too: the sniffer would only find
+        // the same stream, or a sibling that is already its own job (P1.18).
+        if *self == Self::LiveStream {
+            return false;
+        }
         // A page that does not exist has no player to find.
         if *self == Self::PageNotFound || crate::downloader::is_youtube(url) {
             return false;
@@ -321,6 +326,7 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
         return ErrorCode::PrivateOrRemoved;
     }
     if s.contains("is a live event")
+        || (s.contains("does not pass filter") && s.contains("is_live"))
         || s.contains("live stream")
         || s.contains("this live event will begin")
         || s.contains("premieres in")
@@ -583,6 +589,24 @@ mod tests {
         ] {
             assert!(!terminal.is_retryable(), "{terminal} should not retry");
         }
+    }
+
+    #[test]
+    fn a_live_stream_is_never_sniffed_and_other_codes_on_an_article_are_as_before() {
+        let article = "https://www.portal.example/story/1";
+        assert!(!ErrorCode::LiveStream.should_sniff(article));
+        assert!(!ErrorCode::LiveStream.should_sniff("https://x.com/i/status/1"));
+        for code in [ErrorCode::UnsupportedUrl, ErrorCode::PrivateOrRemoved, ErrorCode::LoginRequired, ErrorCode::Http403] {
+            assert!(code.should_sniff(article), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_video_skipped_by_the_live_filter_is_a_live_stream() {
+        // yt-dlp 2026.08.19 prints this on stdout and exits 0 with no file.
+        let line = "[download] Some title does not pass filter (!is_live & live_status!=?is_upcoming), skipping ..";
+        assert_eq!(classify_download_error(line), ErrorCode::LiveStream);
+        assert_ne!(classify_download_error("[download] t does not pass filter (duration>5), skipping .."), ErrorCode::LiveStream);
     }
 
     #[test]

@@ -33,6 +33,15 @@ impl GlomexEmbed {
         self.playlist_id.eq_ignore_ascii_case("auto")
     }
 
+    /// A contextual list `cl-…`: what it plays is whatever glomex matches to
+    /// the page, often a live match or an unrelated reel (gazzetta.gr,
+    /// 2026-10-17). Not `auto`: glomex resolves that to the article's own
+    /// clip (neakriti.gr), which is an ordinary video. Unlike
+    /// [`Self::is_contextual`], a `cl-` list is still handed to yt-dlp as it is.
+    pub fn is_contextual_list(&self) -> bool {
+        self.playlist_id.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("cl-"))
+    }
+
     /// The form yt-dlp's `glomex:embed` extractor accepts.
     pub fn embed_url(&self) -> String {
         match &self.integration_id {
@@ -201,6 +210,18 @@ mod tests {
         assert_eq!(parse_embed("https://www.neakriti.gr/?playlistId=v-1"), None);
         // Markup values go into a URL: nothing but an id passes.
         assert_eq!(parse_embed("https://player.glomex.com/x.html?playlistId=v-1%26a%3Db").map(|e| e.playlist_id), None);
+    }
+
+    #[test]
+    fn only_a_cl_playlist_is_a_contextual_list_not_auto_and_not_a_clip() {
+        let embed = |p: &str| GlomexEmbed { integration_id: None, playlist_id: p.into() };
+        assert!(embed("cl-c60pvrmedpab").is_contextual_list());
+        assert!(embed("CL-abc").is_contextual_list());
+        assert!(!embed("auto").is_contextual_list());
+        assert!(!embed("v-dlrkzeilzsqx").is_contextual_list());
+        assert!(!embed("cl").is_contextual_list());
+        // A cl- list is still handed to yt-dlp as it is.
+        assert!(!embed("cl-c60pvrmedpab").is_contextual());
     }
 
     #[test]

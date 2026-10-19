@@ -28,7 +28,7 @@ fn platform_videos_become_sibling_jobs_and_raw_streams_are_offered() {
     let (_dir, repo, mut job) = leased_article_job();
     let all = vec![X1.to_string(), X2.to_string(), RAW.to_string(), X3.to_string()];
 
-    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all);
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all, &Default::default());
 
     // The job being processed is renamed 1 -> 1A, in the row and in memory
     // (the pipeline delivers under the in-memory slug).
@@ -61,12 +61,12 @@ fn platform_videos_become_sibling_jobs_and_raw_streams_are_offered() {
 fn a_retried_article_does_not_queue_its_siblings_twice() {
     let (_dir, repo, mut job) = leased_article_job();
     let all = vec![X1.to_string(), X2.to_string()];
-    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all);
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all, &Default::default());
     let before = repo.get_all_jobs().unwrap().len();
 
     // Second sniff of the same article (a retry): the sibling is already queued.
     let mut again = repo.get_job(job.id).unwrap().unwrap();
-    queue_article_siblings(&repo, "host:1:1", &mut again, X1, &all);
+    queue_article_siblings(&repo, "host:1:1", &mut again, X1, &all, &Default::default());
     assert_eq!(repo.get_all_jobs().unwrap().len(), before);
 }
 
@@ -75,7 +75,7 @@ fn a_hand_set_slug_is_never_renamed() {
     let (_dir, repo, mut job) = leased_article_job();
     // MCR renamed it by hand before it ran.
     job.slug = "SPECIAL_REPORT".into();
-    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &[X1.to_string(), X2.to_string()]);
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &[X1.to_string(), X2.to_string()], &Default::default());
     assert_eq!(job.slug, "SPECIAL_REPORT");
     assert_eq!(job.index_str, "1");
 }
@@ -83,7 +83,7 @@ fn a_hand_set_slug_is_never_renamed() {
 #[test]
 fn a_single_video_article_is_left_exactly_as_it_was() {
     let (_dir, repo, mut job) = leased_article_job();
-    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &[X1.to_string()]);
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &[X1.to_string()], &Default::default());
     assert_eq!(job.slug, "1_MCR_SEISMOS");
     assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
     assert!(repo.get_job(job.id).unwrap().unwrap().candidates_json.is_none());
@@ -97,7 +97,7 @@ fn a_cancelled_article_job_queues_no_siblings() {
     assert_eq!(repo.cancel_job(job.id).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
     let all = vec![X1.to_string(), X2.to_string(), RAW.to_string()];
 
-    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all);
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all, &Default::default());
 
     let jobs = repo.get_all_jobs().unwrap();
     assert_eq!(jobs.len(), 1, "siblings were queued for a cancelled job: {jobs:?}");
@@ -109,7 +109,31 @@ fn a_job_another_worker_holds_queues_no_siblings() {
     let (_dir, repo, mut job) = leased_article_job();
     let all = vec![X1.to_string(), X2.to_string()];
 
-    queue_article_siblings(&repo, "host:1:OTHER", &mut job, X1, &all);
+    queue_article_siblings(&repo, "host:1:OTHER", &mut job, X1, &all, &Default::default());
 
     assert_eq!(repo.get_all_jobs().unwrap().len(), 1);
+}
+
+/// P3.14: a 70-minute studio show from a site widget and a clip found outside
+/// the article are offered on the job, not queued; the article's own 8 s post
+/// is queued. Without the facts all three would be queued.
+#[test]
+fn a_long_video_and_one_outside_the_article_are_offered_not_queued() {
+    use omni_broadcast::article::{facts_key, Facts, VideoFacts};
+    let (_dir, repo, mut job) = leased_article_job();
+    let yt = "https://www.youtube.com/watch?v=sTuDiOsHoW1";
+    let all = vec![X1.to_string(), X2.to_string(), yt.to_string(), X3.to_string()];
+    let mut facts = Facts::new();
+    facts.insert(facts_key(X2), VideoFacts { duration_secs: Some(8.0), ..Default::default() });
+    facts.insert(facts_key(yt), VideoFacts { duration_secs: Some(4200.0), ..Default::default() });
+    facts.insert(facts_key(X3), VideoFacts { in_article: Some(false), ..Default::default() });
+
+    queue_article_siblings(&repo, "host:1:1", &mut job, X1, &all, &facts);
+
+    let queued: Vec<String> = repo.get_all_jobs().unwrap().into_iter().filter(|j| j.id != job.id).map(|j| j.url).collect();
+    assert_eq!(queued, vec![X2.to_string()]);
+    let row = repo.get_job(job.id).unwrap().unwrap();
+    let offered: Vec<Offered> = serde_json::from_str(row.candidates_json.as_deref().unwrap()).unwrap();
+    let urls: Vec<&str> = offered.iter().map(|o| o.url.as_str()).collect();
+    assert_eq!(urls, vec![yt, X3]);
 }
