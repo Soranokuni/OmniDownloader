@@ -221,7 +221,14 @@ impl Env for ProbeOnly {
 }
 
 /// One sniff of the page within what is left of the deadline, recorded in the report.
-async fn sniff_step(env: &Arc<dyn Env>, url: &str, deadline: Instant, steps: &mut Vec<Step>, normal: &mut Normal) -> SniffSeen {
+async fn sniff_step(
+    env: &Arc<dyn Env>,
+    repo: &Repository,
+    url: &str,
+    deadline: Instant,
+    steps: &mut Vec<Step>,
+    normal: &mut Normal,
+) -> (SniffSeen, Vec<omni_core::site_videos::Furniture>) {
     let mut seen = SniffSeen { error: Some("no time left".into()), ..Default::default() };
     let left = deadline.saturating_duration_since(Instant::now());
     if !left.is_zero() {
@@ -240,7 +247,58 @@ async fn sniff_step(env: &Arc<dyn Env>, url: &str, deadline: Instant, steps: &mu
         });
         steps.push(Step { name: "Sniffer".into(), ms: sniff_ms, note: if seen.stream.is_some() { "finds a stream".into() } else { "finds no stream".into() } });
     }
-    seen
+    let furniture = without_site_furniture(repo, url, &mut seen, normal, steps);
+    (seen, furniture)
+}
+
+/// What the real job does with the sniff's streams before it chooses (P3.16): a video the site
+/// shows on several of its articles is never the job's. Read only: the memory is a job's to fill,
+/// not the Test URL's. The page counts as one of the articles. When nothing but such videos is
+/// left the sniff is shown as finding no stream.
+fn without_site_furniture(
+    repo: &Repository,
+    url: &str,
+    seen: &mut SniffSeen,
+    normal: &mut Normal,
+    steps: &mut Vec<Step>,
+) -> Vec<omni_core::site_videos::Furniture> {
+    let all: Vec<String> = if seen.all.is_empty() { seen.stream.iter().cloned().collect() } else { seen.all.clone() };
+    if all.is_empty() {
+        return Vec::new();
+    }
+    let wide = crate::site_memory::recall(repo, url, Some(&seen.snapshot.clone().unwrap_or_else(|| PageSnapshot::new(url))), &all);
+    let (kept, furniture) = omni_core::site_videos::split_site_wide(&all, &wide);
+    if furniture.is_empty() {
+        return furniture;
+    }
+    // Furniture took the article's own video and no own one is left: a held video is not the article's.
+    let held = seen.held.clone();
+    let (kept, dropped_held) = crate::site_memory::leave_nothing_held(furniture.iter().any(|f| !held.contains(&f.url)), kept, |u| held.iter().any(|h| h == u));
+    seen.refused = dropped_held;
+    if seen.stream.as_ref().is_some_and(|s| !kept.contains(s)) {
+        seen.stream = kept.first().cloned();
+    }
+    if let Some(s) = normal.sniff.as_mut() {
+        s.ok = seen.stream.is_some();
+        s.stream = seen.stream.as_deref().map(shown);
+    }
+    if let Some(step) = steps.last_mut().filter(|s| s.name == "Sniffer") {
+        step.note = format!(
+            "{}; {} video(s) are ones the site shows on its other articles and are left out",
+            if seen.stream.is_some() { "finds a stream" } else { "finds no stream" },
+            furniture.len()
+        );
+    }
+    furniture
+}
+
+/// The verdict for a page yt-dlp could not read and whose browser then finds only the site's furniture:
+/// the real job ends without a video (yt-dlp has already failed, so there is no pick to fall back to).
+fn furniture_verdict(furniture: &[omni_core::site_videos::Furniture]) -> String {
+    format!(
+        "The only videos the browser finds on this page ({}) are ones the site shows on its other articles this week. The real job takes none of them: it ends as NO_STREAM_FOUND and offers them to MCR.",
+        furniture.iter().map(|f| shown(&f.url).split('/').next().unwrap_or("?").to_string()).collect::<Vec<_>>().join(", ")
+    )
 }
 
 fn ms(since: Instant) -> u64 {
@@ -395,6 +453,12 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
     // 0b. yt-dlp's page scan, as the real job takes it for a page nothing named (P3.15): a page
     // yt-dlp reaches only through its generic scan is read by the browser first.
     let mut seen: Option<SniffSeen> = None;
+    // The scan's own media addresses (what yt-dlp's pick would download), and the site's furniture the browser found.
+    let mut scan_media: Vec<String> = Vec::new();
+    // The scan's several videos, when it found more than one (the job's multi-video pick).
+    let mut scan_videos: Vec<String> = Vec::new();
+    let mut scan_webpage: Option<String> = None;
+    let mut furniture_seen: Vec<omni_core::site_videos::Furniture> = Vec::new();
     if kind == JobKind::WebPage && probe_target == url && !left().is_zero() {
         let t = Instant::now();
         let cap = left().min(YTDL_MAX);
@@ -404,13 +468,16 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
             async move { tokio::time::timeout(Duration::from_secs(15), env.final_url(&u)).await.ok().flatten() }
         })
         .await;
+        scan_media = scan.media_urls.clone();
+        scan_videos = scan.videos.clone();
+        scan_webpage = scan.webpage_url.clone();
         steps.push(Step {
             name: "Page scan".into(),
             ms: ms(t),
             note: if route == omni_broadcast::downloader::FirstAttempt::SnifferFirst { "yt-dlp reads the page only generically".into() } else { "yt-dlp has an extractor for it, or none".into() },
         });
         if route == omni_broadcast::downloader::FirstAttempt::SnifferFirst {
-            let mut first = sniff_step(&env, url, deadline, &mut steps, &mut normal).await;
+            let (mut first, furniture) = sniff_step(&env, &dry.repo, url, deadline, &mut steps, &mut normal).await;
             // A browser that ended on a video platform's page is taken as finding nothing:
             // yt-dlp follows that redirect and takes the post itself.
             if omni_broadcast::downloader::landed_on_platform(first.snapshot.as_ref().and_then(|s| s.final_url.as_deref())) {
@@ -424,6 +491,9 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
                     step.note = "ends on a video platform's page; counts as no stream".into();
                 }
             }
+            // Nothing but the site's furniture is as good as nothing found: yt-dlp's own pick is asked next,
+            // and refused if it is the same promo (P3.16).
+            furniture_seen = furniture;
             if let Some(stream) = first.stream.as_deref() {
                 let verdict = format!(
                     "yt-dlp reads this page only through its generic scan, which does not know where on the page each video sits, so the real job lets the browser choose: the sniffer's first choice is a stream on {}. Before downloading, the real job asks yt-dlp about its top choices and skips any that are gone or live, so it may take the next one; this test does not check that. yt-dlp's own pick is used only if the browser finds nothing (the dry run does not download).",
@@ -442,15 +512,37 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
         .await
         .unwrap_or_else(|_| Err("yt-dlp did not answer in time".to_string()));
     let ytdl_ms = ms(t);
-    let ytdl_ok = probed.is_ok();
-    let sniff_code = probed.as_ref().err().map(|e| omni_broadcast::errors::classify_download_error(e)).unwrap_or(ErrorCode::UnsupportedUrl);
+    // yt-dlp's own pick is a video the site shows on its other articles: the real job does not
+    // download it, and goes on to the browser as after any failed download (P3.16).
+    let pick_is_furniture = probed.is_ok()
+        && !(scan_media.is_empty() && scan_videos.is_empty())
+        && {
+            // Looked up as the job does: under the asked site, yt-dlp's page and where the browser ended; held videos
+            // the browser's screen left out are refused too.
+            let ended = seen.as_ref().and_then(|s| s.snapshot.as_ref()).and_then(|s| s.final_url.as_deref());
+            let refused = seen.as_ref().map(|s| s.refused.clone()).unwrap_or_default();
+            crate::site_memory::guard_scan(&dry.repo, url, scan_webpage.as_deref(), ended, scan_videos.clone(), &scan_media, &refused).only_furniture
+        };
+    let ytdl_ok = probed.is_ok() && !pick_is_furniture;
+    let sniff_code = if pick_is_furniture {
+        ErrorCode::NoStreamFound
+    } else {
+        probed.as_ref().err().map(|e| omni_broadcast::errors::classify_download_error(e)).unwrap_or(ErrorCode::UnsupportedUrl)
+    };
     normal.ytdlp = Some(match probed {
         Ok(i) => YtdlpResult { ok: true, extractor: Some(i.extractor), title: i.title, duration_secs: i.duration_secs, formats: i.formats, error: None, ms: ytdl_ms },
         Err(e) => YtdlpResult { ok: false, extractor: None, title: None, duration_secs: None, formats: 0, error: Some(clip(&e)), ms: ytdl_ms },
     });
-    steps.push(Step { name: "yt-dlp probe".into(), ms: ytdl_ms, note: if ytdl_ok { "reads the link".into() } else { "fails".into() } });
+    steps.push(Step { name: "yt-dlp probe".into(), ms: ytdl_ms, note: if ytdl_ok { "reads the link".into() } else if pick_is_furniture { "reads the link, but its pick is a video the site shows on its other articles".into() } else { "fails".into() } });
+    if pick_is_furniture && seen.is_some() {
+        // The browser, asked first, found nothing, and yt-dlp's own pick is the site's furniture.
+        let verdict = "The browser finds no video on this page, and yt-dlp's own pick is a video the site shows on its other articles this week: the real job takes none of them and ends as NO_STREAM_FOUND.".to_string();
+        return Ok(finish(started, host, use_llm, mode, steps, normal, None, verdict));
+    }
     if ytdl_ok {
-        let verdict = if seen.is_some() {
+        let verdict = if seen.is_some() && !furniture_seen.is_empty() {
+            "The only videos the browser finds on this page are ones the site shows on its other articles this week, so it takes none of them: the normal path would download yt-dlp's own pick (which is not one of them). The repair ladder would not run.".to_string()
+        } else if seen.is_some() {
             "The browser finds no video on this page, and yt-dlp reads it only generically: the normal path would download yt-dlp's own pick. The repair ladder would not run.".to_string()
         } else {
             "yt-dlp reads this link: the normal path would download it. The repair ladder would not run.".to_string()
@@ -470,8 +562,16 @@ pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instan
     // 2. One sniff of the page for a stream (already done when the browser was asked first).
     let mut seen = match seen {
         Some(done) => done,
-        None => sniff_step(&env, url, deadline, &mut steps, &mut normal).await,
+        None => {
+            let (done, furniture) = sniff_step(&env, &dry.repo, url, deadline, &mut steps, &mut normal).await;
+            furniture_seen = furniture;
+            done
+        }
     };
+    if seen.stream.is_none() && !furniture_seen.is_empty() && seen.error.is_none() {
+        let verdict = furniture_verdict(&furniture_seen);
+        return Ok(finish(started, host, use_llm, mode, steps, normal, None, verdict));
+    }
     if let Some(stream) = seen.stream.as_deref() {
         let verdict = format!(
             "yt-dlp cannot read the link, but the sniffer finds a stream ({}). The real job would download that stream, and would run the repair ladder only if that download failed (the dry run does not download, so it stops here). The real job also drops sniffed platform posts that turn out to have no video; this test does not check that.",
