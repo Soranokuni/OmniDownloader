@@ -129,6 +129,8 @@ pub mod checks {
     pub const MAIL: &str = "mail";
     pub const LLM: &str = "llm";
     pub const TOOLS: &str = "tools";
+    /// ffmpeg, ffprobe and bmxtranswrap are the pinned builds (P9.3).
+    pub const PINNED_TOOLS: &str = "pinned_tools";
     /// The toolchain made a compliant RDD9 file at start-up.
     pub const ENCODER: &str = "encoder";
     pub const WATCHFOLDER: &str = "watchfolder";

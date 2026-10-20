@@ -131,6 +131,22 @@ pub struct AppState {
     pub benchmark_starter: Option<Arc<dyn BenchmarkStarter>>,
     /// The log redactor: an uploaded jar's values join it at once (P3.5).
     pub redactions: Option<omni_core::logging::Redactions>,
+    /// The update gate the worker pool holds a pass on; a tool swap waits for it to drain (P9.3).
+    pub update_gate: omni_core::update_gate::UpdateGate,
+    /// The one running tool install, how each ended, and the hash cache (P9.3).
+    pub tool_installer: omni_core::dependencies::ToolInstaller,
+    /// Where pinned archives come from; HTTP in the daemon, bytes in tests.
+    pub tool_fetcher: Arc<dyn omni_core::dependencies::Fetcher>,
+    /// The daemon's `bin/`, anchored to the install dir; `None` in tests, where the config dir is used.
+    pub bin_dir: Option<PathBuf>,
+    /// Tools that were not in `bin/` when the daemon started: it cached a fallback path for them,
+    /// so a new install is only used after a restart.
+    pub tools_missing_at_start: Arc<Vec<String>>,
+    /// Tool paths `config.json` set, as the daemon resolved them at start-up (name -> path).
+    pub tool_overrides: Arc<std::collections::HashMap<String, PathBuf>>,
+    /// The canary run lock: a canary's yt-dlp starts without a gate pass, so a yt-dlp or
+    /// Deno swap holds it too, as the nightly task does. `None` in tests that have none.
+    pub canary_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl AppState {
@@ -167,6 +183,13 @@ impl AppState {
             cookie_tester: None,
             benchmark_starter: None,
             redactions: None,
+            update_gate: omni_core::update_gate::UpdateGate::new(),
+            tool_installer: omni_core::dependencies::ToolInstaller::new(),
+            tool_fetcher: Arc::new(omni_core::dependencies::HttpFetcher),
+            bin_dir: None,
+            tools_missing_at_start: Arc::new(Vec::new()),
+            tool_overrides: Arc::new(std::collections::HashMap::new()),
+            canary_lock: None,
         }
     }
 
@@ -197,6 +220,43 @@ impl AppState {
     /// The benchmark runner for the Benchmarks card.
     pub fn with_benchmark_starter(mut self, starter: Arc<dyn BenchmarkStarter>) -> Self {
         self.benchmark_starter = Some(starter);
+        self
+    }
+
+    /// Share the worker pool's update gate, so a tool swap waits for running jobs.
+    pub fn with_update_gate(mut self, gate: omni_core::update_gate::UpdateGate) -> Self {
+        self.update_gate = gate;
+        self
+    }
+
+    /// The daemon's `bin/` directory and the tools it found missing at start-up.
+    pub fn with_tool_dirs(mut self, bin_dir: PathBuf, missing_at_start: Vec<String>) -> Self {
+        self.bin_dir = Some(bin_dir);
+        self.tools_missing_at_start = Arc::new(missing_at_start);
+        self
+    }
+
+    /// The tool paths `config.json` sets, which the daemon runs instead of `bin/`.
+    pub fn with_tool_overrides(mut self, overrides: Vec<(String, PathBuf)>) -> Self {
+        self.tool_overrides = Arc::new(overrides.into_iter().collect());
+        self
+    }
+
+    /// Share the daemon's install state, so its hash cache and the health line serve both.
+    pub fn with_tool_installer(mut self, installer: omni_core::dependencies::ToolInstaller) -> Self {
+        self.tool_installer = installer;
+        self
+    }
+
+    /// The canary run lock a yt-dlp or Deno swap must hold.
+    pub fn with_canary_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.canary_lock = Some(lock);
+        self
+    }
+
+    /// Replace where pinned archives are fetched from (tests).
+    pub fn with_tool_fetcher(mut self, fetcher: Arc<dyn omni_core::dependencies::Fetcher>) -> Self {
+        self.tool_fetcher = fetcher;
         self
     }
 

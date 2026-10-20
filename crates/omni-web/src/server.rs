@@ -8,6 +8,7 @@ use tracing::info;
 use crate::admin_bench;
 use crate::admin_cookies;
 use crate::admin_sites;
+use crate::admin_tools;
 use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, security_headers};
 use crate::routes::*;
@@ -97,6 +98,8 @@ impl WebServer {
             .route("/api/admin/purge", post(api_admin_purge))
             .route("/api/admin/vacuum", post(api_admin_vacuum))
             .route("/api/admin/dependencies", get(api_admin_dependencies))
+            .route("/api/admin/tools", get(admin_tools::api_admin_tools))
+            .route("/api/admin/tools/:name/install", post(admin_tools::api_admin_tool_install))
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))
             .route("/api/admin/rollback-ytdl", post(api_admin_rollback_ytdl))
             .route("/api/admin/maintenance", get(api_admin_maintenance))

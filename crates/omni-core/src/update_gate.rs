@@ -31,6 +31,9 @@ struct Inner {
     pending: AtomicBool,
     /// Signalled whenever `active` reaches zero.
     drained: Notify,
+    /// Held while one swapper (nightly task, admin install, legacy route) works,
+    /// so a second cannot reopen the gate under the first.
+    swap: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Shared handle. Cheap to clone.
@@ -108,6 +111,62 @@ impl UpdateGate {
     /// Let workers start leasing again.
     pub fn resume(&self) {
         self.inner.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Become the only swapper. Waits for the one that is working; does not
+    /// pause anything yet, so a swapper can download and stage first (staging
+    /// folders are shared, and this is what keeps two apart).
+    pub async fn lock_swaps(&self) -> SwapGuard {
+        let lock = self.inner.swap.clone().lock_owned().await;
+        SwapGuard {
+            gate: self.clone(),
+            paused: false,
+            _lock: lock,
+        }
+    }
+
+    /// [`Self::lock_swaps`] and drain in one. `None`: jobs are still running
+    /// after `timeout`; the gate is open again and nothing may be swapped.
+    pub async fn begin_swap(&self, timeout: Duration) -> Option<SwapGuard> {
+        let mut guard = self.lock_swaps().await;
+        guard.drain(timeout).await.then_some(guard)
+    }
+}
+
+/// The right to swap a binary: exclusive among swappers, and while it has
+/// drained the pool, downloads are held back. Dropping it - on success, error,
+/// early return or panic - reopens the gate.
+pub struct SwapGuard {
+    gate: UpdateGate,
+    paused: bool,
+    // Dropped after `drop` has resumed the gate, so the next swapper's pause is not undone.
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SwapGuard {
+    /// Stop new work and wait for running jobs, up to `timeout`. `false`: the
+    /// pool did not drain, the gate is reopened, and the caller must not swap.
+    pub async fn drain(&mut self, timeout: Duration) -> bool {
+        self.paused = true;
+        let drained = self.gate.pause_and_drain(timeout).await;
+        if !drained {
+            self.gate.resume();
+            self.paused = false;
+        }
+        drained
+    }
+
+    /// Jobs still holding a pass.
+    pub fn active(&self) -> usize {
+        self.gate.active()
+    }
+}
+
+impl Drop for SwapGuard {
+    fn drop(&mut self) {
+        if self.paused {
+            self.gate.resume();
+        }
     }
 }
 
@@ -227,6 +286,65 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
+
+    #[tokio::test]
+    async fn a_second_swapper_waits_and_the_gate_stays_paused_until_it_is_done() {
+        let gate = UpdateGate::new();
+        let first = gate.begin_swap(Duration::from_secs(1)).await.expect("idle pool drains");
+        assert!(gate.is_paused());
+
+        let g2 = gate.clone();
+        let second = tokio::spawn(async move {
+            let guard = g2.begin_swap(Duration::from_secs(1)).await.expect("drains");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(g2.is_paused(), "the first swapper's release must not reopen the gate under the second");
+            drop(guard);
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished(), "the second swapper ran while the first held the lock");
+        drop(first);
+        second.await.unwrap();
+        assert!(!gate.is_paused(), "the last guard reopens the gate");
+    }
+
+    #[tokio::test]
+    async fn swappers_never_interleave() {
+        let gate = UpdateGate::new();
+        let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let mut tasks = Vec::new();
+        for (start, end) in [("a-start", "a-end"), ("b-start", "b-end"), ("c-start", "c-end")] {
+            let (g, l) = (gate.clone(), log.clone());
+            tasks.push(tokio::spawn(async move {
+                let _swap = g.begin_swap(Duration::from_secs(1)).await.unwrap();
+                l.lock().unwrap().push(start);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                l.lock().unwrap().push(end);
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let log = log.lock().unwrap().clone();
+        for pair in log.chunks(2) {
+            assert_eq!(pair[0].trim_end_matches("-start"), pair[1].trim_end_matches("-end"), "interleaved: {log:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_swap_guard_resumes_the_gate_and_a_failed_drain_leaves_it_open() {
+        let gate = UpdateGate::new();
+        {
+            let _swap = gate.begin_swap(Duration::from_secs(1)).await.unwrap();
+            assert!(gate.is_paused());
+        }
+        assert!(!gate.is_paused());
+
+        let _job = gate.try_enter().unwrap();
+        assert!(gate.begin_swap(Duration::from_millis(50)).await.is_none());
+        assert!(!gate.is_paused(), "no drain, no pause");
+        // And the lock is free again.
+        assert!(tokio::time::timeout(Duration::from_millis(200), gate.lock_swaps()).await.is_ok());
+    }
     #[test]
     fn jitter_stays_inside_its_window() {
         for _ in 0..200 {
