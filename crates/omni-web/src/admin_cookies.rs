@@ -18,6 +18,18 @@ use crate::state::AppState;
 
 type JsonResult = Result<Json<Value>, ApiError>;
 
+/// The start of the command an operator runs at the server's desktop to sign
+/// in to a site (P3.17), for PowerShell (the call operator is needed to run a
+/// quoted path); the panel appends the domain.
+pub fn signin_command_prefix(exe: &std::path::Path) -> String {
+    format!("& \"{}\" cookies sign-in", exe.display())
+}
+
+/// The same command for cmd.exe, which has no call operator.
+pub fn signin_command_prefix_cmd(exe: &std::path::Path) -> String {
+    format!("\"{}\" cookies sign-in", exe.display())
+}
+
 /// The domain as the panel sends it, as a jar domain (`twitter.com` is kept as `x.com`).
 fn jar_domain(raw: &str) -> Result<String, ApiError> {
     let d = cookies::canonical_jar_domain(raw.trim());
@@ -62,6 +74,8 @@ pub async fn api_admin_cookies(RequireAdmin(_): RequireAdmin, State(state): Stat
         "max_jars": MAX_JARS,
         "max_kib": cookies::MAX_JAR_BYTES / 1024,
         "can_test": state.cookie_tester.is_some(),
+        "signin_command_prefix": std::env::current_exe().ok().map(|p| signin_command_prefix(&p)),
+        "signin_command_prefix_cmd": std::env::current_exe().ok().map(|p| signin_command_prefix_cmd(&p)),
     })))
 }
 
@@ -158,5 +172,17 @@ pub async fn api_admin_cookies_test(
     match result {
         Ok((ok, detail)) => Ok(Json(json!({ "ok": ok, "detail": detail }))),
         Err(why) => Err(ApiError::bad_request(why)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sign_in_command_runs_in_powershell_and_in_cmd() {
+        let exe = std::path::Path::new(r"C:\Program Files\Omni\omni-ingest.exe");
+        assert_eq!(signin_command_prefix(exe), r#"& "C:\Program Files\Omni\omni-ingest.exe" cookies sign-in"#);
+        assert_eq!(signin_command_prefix_cmd(exe), r#""C:\Program Files\Omni\omni-ingest.exe" cookies sign-in"#);
     }
 }

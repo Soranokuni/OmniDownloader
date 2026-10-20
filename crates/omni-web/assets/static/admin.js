@@ -931,6 +931,53 @@ async function deleteCookies(jar) {
   loadCookies();
 }
 
+// Sites whose login is captured by `omni-ingest cookies sign-in <site>` (P3.17).
+const SIGNIN_SITES = ['youtube.com', 'x.com', 'facebook.com', 'instagram.com'];
+
+function copyText(text, button) {
+  const done = () => { button.textContent = 'Copied'; setTimeout(() => { button.textContent = 'Copy'; }, 1500); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, () => toast('Could not copy; select the command and copy it.', 'bad'));
+    return;
+  }
+  // The panel is usually plain HTTP on the LAN, where the clipboard API is not offered.
+  const box = el('textarea', { readonly: '', style: 'position:fixed;left:-9999px' }, text);
+  document.body.appendChild(box);
+  box.select();
+  try { document.execCommand('copy'); done(); } catch (e) { toast('Could not copy; select the command and copy it.', 'bad'); }
+  box.remove();
+}
+
+function signinStatus(jar) {
+  if (!jar) return el('span', { class: 'badge' }, 'no cookies');
+  const bits = [`${jar.cookie_count} cookies`, `${jar.updated_by} · ${fmtTime(jar.updated_at)}`,
+    jar.expires_min ? `expires ${fmtTime(jar.expires_min)}` : 'session only'];
+  return el('span', {}, cookieTestBadge(jar), ' ', el('span', { class: 'note' }, bits.join(' · ')));
+}
+
+function renderSignin(data) {
+  const jars = data.jars || [];
+  const prefix = data.signin_command_prefix;
+  const prefixCmd = data.signin_command_prefix_cmd;
+  render('cookies-signin',
+    el('p', { class: 'note' }, 'Εκτελέστε την εντολή στο γραφείο (desktop) του server, από τον χειριστή, σε παράθυρο εντολών που άνοιξε «Εκτέλεση ως διαχειριστής»· χρησιμοποιεί ξεχωριστό προφίλ browser, όχι το δικό σας.'),
+    el('p', { class: 'note' }, 'Run it on the server desktop, by the operator, in a prompt opened "as Administrator". It uses a separate browser profile, not yours.'),
+    ...SIGNIN_SITES.map((domain) => {
+      const jar = jars.find((j) => j.domain === domain);
+      const command = prefix ? `${prefix} ${domain}` : `& ".\\omni-ingest.exe" cookies sign-in ${domain}`;
+      const commandCmd = prefixCmd ? `${prefixCmd} ${domain}` : `omni-ingest.exe cookies sign-in ${domain}`;
+      const row = (label, text) => {
+        const copy = el('button', { class: 'btn', type: 'button' }, 'Copy');
+        copy.addEventListener('click', () => copyText(text, copy));
+        return el('div', { class: 'row tight' }, el('span', { class: 'note' }, label), el('code', { class: 'mono grow' }, text), copy);
+      };
+      return el('div', { class: 'stack' },
+        el('div', { class: 'row tight' }, el('span', { class: 'mono strong' }, domain), signinStatus(jar)),
+        row('PowerShell', command),
+        row('cmd', commandCmd));
+    }));
+}
+
 async function loadCookies() {
   let data;
   try {
@@ -939,6 +986,7 @@ async function loadCookies() {
     if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
     return;
   }
+  renderSignin(data);
   const jars = data.jars || [];
   if (jars.length === 0) {
     render('cookies-body', el('tr', {}, el('td', { colspan: '7', class: 'empty' }, 'No cookies uploaded.')));

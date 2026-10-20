@@ -272,7 +272,7 @@ pub fn login_hint_el(domain: &str, jar_exists: bool) -> String {
     if jar_exists {
         format!("Τα cookies για {domain} έληξαν· ανεβάστε νέα")
     } else {
-        format!("Χρειάζονται cookies για {domain}: Διαχείριση → Cookies")
+        format!("Χρειάζονται cookies για {domain}: Διαχείριση → Cookies → Σύνδεση")
     }
 }
 
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn the_login_hint_names_the_site_and_says_whether_a_jar_exists() {
-        assert_eq!(login_hint_el("x.com", false), "Χρειάζονται cookies για x.com: Διαχείριση → Cookies");
+        assert_eq!(login_hint_el("x.com", false), "Χρειάζονται cookies για x.com: Διαχείριση → Cookies → Σύνδεση");
         assert_eq!(login_hint_el("x.com", true), "Τα cookies για x.com έληξαν· ανεβάστε νέα");
 
         let dir = tempfile::tempdir().unwrap();
