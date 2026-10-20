@@ -11,7 +11,71 @@ import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=
  * Dependencies
  * ------------------------------------------------------------------ */
 
+let toolsTimer = null;
+
+const megabytes = (n) => `${Math.round((n || 0) / 1048576)} MB`;
+
+function toolRow(tool, busy) {
+  const pin = tool.matches_pin === true ? 'pinned build'
+    : (tool.installed && tool.matches_pin === false ? 'not the pinned build' : null);
+  const label = tool.action === 'install' ? 'Install' : 'Repair';
+  const lines = [
+    el('div', { class: 'spec-row' },
+      el('span', {}, tool.name),
+      el('span', { class: tool.installed && tool.action !== 'repair' ? 'badge ok' : 'badge bad' },
+        tool.installed ? (tool.version || 'does not run') : 'missing'),
+      pin ? el('span', { class: 'note' }, pin) : null,
+      tool.action
+        ? el('button', {
+            class: 'btn', type: 'button', disabled: busy,
+            onclick: () => installTool(tool.name, label),
+          }, label)
+        : null),
+  ];
+  if (tool.note) lines.push(el('p', { class: 'note' }, tool.note));
+  if (tool.running) {
+    const r = tool.running;
+    const sized = r.bytes_total > 0 && r.stage === 'downloading'
+      ? ` ${megabytes(r.bytes_done)} of ${megabytes(r.bytes_total)}` : '';
+    lines.push(el('p', { class: 'note' }, `${r.stage}…${sized}`));
+  } else if (tool.last_result) {
+    lines.push(el('p', { class: tool.last_result.ok ? 'note ok' : 'note bad' }, tool.last_result.message));
+  }
+  return el('div', { class: 'stack' }, lines);
+}
+
+async function loadTools() {
+  clearTimeout(toolsTimer);
+  let data;
+  try {
+    data = await api('/api/admin/tools');
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    render('dependencies', el('p', { class: 'note' }, 'No toolchain information.'));
+    return;
+  }
+  const tools = data.tools || [];
+  const busy = Boolean(data.running_tool);
+  render('dependencies', tools.map((tool) => toolRow(tool, busy)));
+  // Polled only while an install runs.
+  if (busy) toolsTimer = setTimeout(loadTools, 2000);
+}
+
+async function installTool(name, label) {
+  if (!confirm(`${label} ${name}? Jobs wait while the file is swapped.`)) return;
+  try {
+    await api(`/api/admin/tools/${encodeURIComponent(name)}/install`, { method: 'POST' });
+    toast(`${label} of ${name} started.`, 'ok');
+  } catch (e) {
+    toast(e.message, 'bad');
+  }
+  loadTools();
+}
+
 async function loadDependencies() {
+  // The toolchain rows (with Install / Repair) come from /api/admin/tools.
+  loadTools();
+
   let data;
   try {
     data = await api('/api/admin/dependencies');
@@ -34,18 +98,6 @@ async function loadDependencies() {
     note.className = 'note';
   }
 
-  // `dependencies` is a list of {name, installed, path, version} -- iterating
-  // it as an object gave every row an array index for a name.
-  const tools = data.dependencies || [];
-  if (tools.length === 0) {
-    render('dependencies', el('p', { class: 'note' }, 'No toolchain information.'));
-    return;
-  }
-  render('dependencies', tools.map((tool) => el('div', { class: 'spec-row' },
-    el('span', {}, tool.name),
-    el('span', { class: tool.installed ? 'badge ok' : 'badge bad' },
-      tool.installed ? (tool.version || 'present') : 'missing'),
-  )));
 }
 
 document.getElementById('ytdl-update').addEventListener('click', async (event) => {

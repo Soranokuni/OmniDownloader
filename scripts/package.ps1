@@ -73,6 +73,7 @@ try {
     }
     $deno = Join-Path $root 'bin\deno.exe'
     if (Test-Path $deno) { Copy-Item $deno (Join-Path $stage 'bin') }
+    else { Write-Warning "No deno.exe in bin\: YouTube downloads fail until the service downloads it" }
 
     if ($IncludeRoster) {
         New-Item -ItemType Directory -Force (Join-Path $stage 'data') | Out-Null

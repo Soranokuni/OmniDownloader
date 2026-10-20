@@ -1663,11 +1663,8 @@ pub async fn api_admin_dependencies(
     RequireAdmin(_): RequireAdmin,
     State(state): State<AppState>,
 ) -> JsonResult {
-    let (bin_dir, channel) = {
-        let cfg = state.config.read().await;
-        (cfg.bin_dir.clone(), cfg.ytdl_channel.clone())
-    };
-    let dep_mgr = DependencyManager::new(&bin_dir);
+    let channel = state.config.read().await.ytdl_channel.clone();
+    let dep_mgr = DependencyManager::new(crate::admin_tools::tool_bin_dir(&state).await);
     let scan = dep_mgr.scan();
     let (update_avail, remote_ver, local_ver) = dep_mgr
         .check_ytdl_update(&channel)
@@ -1686,18 +1683,29 @@ pub async fn api_admin_update_ytdl(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
 ) -> JsonResult {
-    let (channel, bin_dir) = {
-        let cfg = state.config.read().await;
-        (cfg.ytdl_channel.clone(), cfg.bin_dir.clone())
-    };
-    let dep_mgr = DependencyManager::new(&bin_dir);
-    let path = dep_mgr
-        .download_ytdl(&channel)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = ?e, "yt-dlp update failed");
-            ApiError::internal("yt-dlp update failed; see the log for detail.")
-        })?;
+    let channel = state.config.read().await.ytdl_channel.clone();
+    let dep_mgr = DependencyManager::new(crate::admin_tools::tool_bin_dir(&state).await);
+    // The same swap lock as the nightly task and the toolchain card: stage under it, pause
+    // only around the rename, and no other swapper can reopen the gate meanwhile.
+    let mut locks = crate::admin_tools::lock_swaps(&state).await;
+    dep_mgr.stage_ytdl(&channel).await.map_err(|e| {
+        tracing::error!(error = ?e, "yt-dlp update failed");
+        ApiError::internal("yt-dlp update failed; see the log for detail.")
+    })?;
+    if !locks.swap.drain(crate::admin_tools::LEGACY_DRAIN).await {
+        dep_mgr.discard_staged_ytdl();
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "BUSY",
+            "Jobs are still running; try again when they have finished.",
+        ));
+    }
+    let path = dep_mgr.apply_staged_ytdl().map_err(|e| {
+        dep_mgr.discard_staged_ytdl();
+        tracing::error!(error = ?e, "yt-dlp update failed");
+        ApiError::internal("yt-dlp update failed; see the log for detail.")
+    })?;
+    drop(locks);
     let _ = state.repo.log_audit(
         "INFO",
         "ADMIN",
@@ -1717,8 +1725,15 @@ pub async fn api_admin_rollback_ytdl(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
 ) -> JsonResult {
-    let bin_dir = { state.config.read().await.bin_dir.clone() };
-    let dep_mgr = DependencyManager::new(&bin_dir);
+    let dep_mgr = DependencyManager::new(crate::admin_tools::tool_bin_dir(&state).await);
+    let mut locks = crate::admin_tools::lock_swaps(&state).await;
+    if !locks.swap.drain(crate::admin_tools::LEGACY_DRAIN).await {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "BUSY",
+            "Jobs are still running; try again when they have finished.",
+        ));
+    }
     let path = dep_mgr.rollback_ytdl().map_err(|e| {
         tracing::error!(error = ?e, "yt-dlp rollback failed");
         ApiError::bad_request(e.to_string())
