@@ -394,3 +394,169 @@ async fn a_browser_that_ended_on_a_platform_page_counts_as_finding_nothing_in_th
     let step = report.steps.iter().find(|s| s.name == "Sniffer").expect("a Sniffer step");
     assert!(step.note.contains("video platform"), "{}", step.note);
 }
+
+// ------------------------------------------------------------------ site furniture (P3.16)
+
+const PROMO: &str = "https://cdn.news.example.gr/promo/hor.mp4";
+const REAL: &str = "https://cdn.news.example.gr/clips/real-1.mp4";
+
+/// An earlier article of the same site showed `video`.
+fn seen_on_another_article(r: &Rig, video: &str) {
+    let key = omni_core::site_videos::page_key("https://news.example.gr/story/2", None, None).unwrap();
+    r.repo.record_site_videos(&key.domain, &key.identities, &omni_core::site_videos::hashes_of(&[video.to_string()]), Utc::now()).unwrap();
+}
+
+fn site_rows(r: &Rig) -> i64 {
+    rusqlite::Connection::open(r._dir.0.join("omni.db")).unwrap().query_row("SELECT COUNT(*) FROM site_videos", [], |row| row.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn the_dry_run_leaves_out_a_video_the_site_shows_on_its_other_articles_and_records_nothing() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().generic_only = true;
+    seen_on_another_article(&r, PROMO);
+    *r.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some(PROMO.into()), streams: 2, all: vec![PROMO.into(), REAL.into()], ..Default::default() });
+    let before = site_rows(&r);
+    let report = dry(&r, false).await;
+    let sniff = report.normal.sniff.as_ref().expect("sniffed");
+    assert_eq!(sniff.stream.as_deref(), Some("cdn.news.example.gr/clips/real-1.mp4"), "the article's own clip is chosen, not the promo");
+    assert!(report.steps.iter().any(|s| s.name == "Sniffer" && s.note.contains("other articles")));
+    assert!(report.verdict.contains("the browser choose"), "{}", report.verdict);
+    assert_eq!(site_rows(&r), before, "a dry run only reads the memory");
+}
+
+#[tokio::test]
+async fn a_page_whose_only_video_is_site_furniture_falls_to_yt_dlps_pick_unless_that_is_furniture_too() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().generic_only = true;
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("generic")));
+    seen_on_another_article(&r, PROMO);
+    *r.fake.sniff_seen.lock().unwrap() = Some(SniffSeen { stream: Some(PROMO.into()), streams: 1, all: vec![PROMO.into()], ..Default::default() });
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("other articles") && report.verdict.contains("yt-dlp's own pick"), "{}", report.verdict);
+    assert!(!report.verdict.contains("NO_STREAM_FOUND"), "{}", report.verdict);
+    assert!(!report.normal.sniff.as_ref().unwrap().ok);
+    assert_eq!(r.fake.ytdl_calls.load(Ordering::SeqCst), 1, "the browser took nothing: yt-dlp's pick is asked, as in a job");
+    assert!(report.ladder.is_none());
+
+    // Its pick is the same promo: refused, the job ends as NO_STREAM_FOUND.
+    let same = rig(RepairMode::Hold);
+    same.fake.scan.lock().unwrap().generic_only = true;
+    same.fake.scan.lock().unwrap().media_urls = vec![PROMO.to_string()];
+    *same.fake.ytdl.lock().unwrap() = Some(Ok(link("html5")));
+    seen_on_another_article(&same, PROMO);
+    *same.fake.sniff_seen.lock().unwrap() = Some(SniffSeen { stream: Some(PROMO.into()), streams: 1, all: vec![PROMO.into()], ..Default::default() });
+    let report = dry(&same, false).await;
+    assert!(report.verdict.contains("NO_STREAM_FOUND"), "{}", report.verdict);
+
+    // Control: a first sighting (nothing remembered) is the browser's choice as before.
+    let fresh = rig(RepairMode::Hold);
+    fresh.fake.scan.lock().unwrap().generic_only = true;
+    *fresh.fake.sniff_seen.lock().unwrap() = Some(SniffSeen { stream: Some(PROMO.into()), streams: 1, all: vec![PROMO.into()], ..Default::default() });
+    let report = dry(&fresh, false).await;
+    assert!(report.verdict.contains("the browser choose"), "{}", report.verdict);
+    assert!(report.normal.sniff.as_ref().unwrap().ok);
+}
+
+#[tokio::test]
+async fn a_yt_dlp_pick_that_is_site_furniture_is_not_the_normal_path() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().media_urls = vec![PROMO.to_string()];
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("html5")));
+    // yt-dlp's own look at the page has no snapshot: only articles already remembered count, so two of them.
+    seen_on_another_article(&r, PROMO);
+    let key = omni_core::site_videos::page_key("https://news.example.gr/story/3", None, None).unwrap();
+    r.repo.record_site_videos(&key.domain, &key.identities, &omni_core::site_videos::hashes_of(&[PROMO.to_string()]), Utc::now()).unwrap();
+    let report = dry(&r, false).await;
+    assert!(!report.verdict.contains("yt-dlp reads this link: the normal path would download it"), "{}", report.verdict);
+    assert_eq!(r.fake.sniff_calls.load(Ordering::SeqCst), 1, "after the refused pick the real job asks the browser");
+    // Control: no memory, yt-dlp's pick is the normal path.
+    let fresh = rig(RepairMode::Hold);
+    fresh.fake.scan.lock().unwrap().media_urls = vec![PROMO.to_string()];
+    *fresh.fake.ytdl.lock().unwrap() = Some(Ok(link("html5")));
+    let report = dry(&fresh, false).await;
+    assert!(report.verdict.contains("yt-dlp reads this link"), "{}", report.verdict);
+    assert_eq!(fresh.fake.sniff_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A scan of several videos (yt-dlp's multi-video pick) that are all the site's furniture is not
+/// the normal path either: the real job refuses every one of them.
+#[tokio::test]
+async fn a_scan_of_several_videos_that_are_all_site_furniture_is_not_the_normal_path() {
+    const PROMO2: &str = "https://media.news.example.gr/second-promo.mp4";
+    let remember_on_two_articles = |r: &Rig, video: &str, salt: &str| {
+        for n in ["3", "4"] {
+            let key = omni_core::site_videos::page_key(&format!("https://news.example.gr/story/{n}{salt}"), None, None).unwrap();
+            r.repo
+                .record_site_videos(&key.domain, &key.identities, &omni_core::site_videos::hashes_of(&[video.to_string()]), Utc::now())
+                .unwrap();
+        }
+    };
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().videos = vec![PROMO.to_string(), PROMO2.to_string()];
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("generic")));
+    remember_on_two_articles(&r, PROMO, "a");
+    remember_on_two_articles(&r, PROMO2, "b");
+    let report = dry(&r, false).await;
+    assert!(!report.verdict.contains("yt-dlp reads this link: the normal path would download it"), "{}", report.verdict);
+    // Control: the same scan with nothing remembered is the normal path.
+    let fresh = rig(RepairMode::Hold);
+    fresh.fake.scan.lock().unwrap().videos = vec![PROMO.to_string(), PROMO2.to_string()];
+    *fresh.fake.ytdl.lock().unwrap() = Some(Ok(link("generic")));
+    let report = dry(&fresh, false).await;
+    assert!(report.verdict.contains("yt-dlp reads this link"), "{}", report.verdict);
+}
+
+#[tokio::test]
+async fn a_held_video_is_not_presented_as_what_the_real_job_would_download() {
+    let r = rig(RepairMode::Hold);
+    r.fake.scan.lock().unwrap().generic_only = true;
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("generic")));
+    seen_on_another_article(&r, PROMO);
+    // The article's own video is furniture; what is left is a rail video the page placed outside it.
+    *r.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some(PROMO.into()), streams: 2, all: vec![PROMO.into(), REAL.into()], held: vec![REAL.into()], ..Default::default() });
+    let report = dry(&r, false).await;
+    let sniff = report.normal.sniff.as_ref().unwrap();
+    assert!(!sniff.ok && sniff.stream.is_none(), "the rail video is not the article's");
+    assert!(!report.verdict.contains("the browser choose"), "{}", report.verdict);
+    assert!(report.verdict.contains("other articles"), "{}", report.verdict);
+    // Control: the same page with the video not held keeps it.
+    let fresh = rig(RepairMode::Hold);
+    fresh.fake.scan.lock().unwrap().generic_only = true;
+    seen_on_another_article(&fresh, PROMO);
+    *fresh.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some(PROMO.into()), streams: 2, all: vec![PROMO.into(), REAL.into()], ..Default::default() });
+    let report = dry(&fresh, false).await;
+    assert!(report.normal.sniff.as_ref().unwrap().ok);
+}
+
+#[tokio::test]
+async fn a_held_video_the_screen_left_out_is_not_yt_dlps_pick_in_the_dry_run() {
+    let r = rig(RepairMode::Hold);
+    {
+        let mut scan = r.fake.scan.lock().unwrap();
+        scan.generic_only = true;
+        scan.media_urls = vec![REAL.to_string()];
+    }
+    *r.fake.ytdl.lock().unwrap() = Some(Ok(link("html5")));
+    seen_on_another_article(&r, PROMO);
+    *r.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some(PROMO.into()), streams: 2, all: vec![PROMO.into(), REAL.into()], held: vec![REAL.into()], ..Default::default() });
+    let report = dry(&r, false).await;
+    assert!(report.verdict.contains("NO_STREAM_FOUND"), "yt-dlp's pick is the refused rail video: {}", report.verdict);
+    // Control: not held, so yt-dlp's pick is the real video and is taken.
+    let fresh = rig(RepairMode::Hold);
+    {
+        let mut scan = fresh.fake.scan.lock().unwrap();
+        scan.generic_only = true;
+        scan.media_urls = vec![REAL.to_string()];
+    }
+    *fresh.fake.ytdl.lock().unwrap() = Some(Ok(link("html5")));
+    seen_on_another_article(&fresh, PROMO);
+    *fresh.fake.sniff_seen.lock().unwrap() =
+        Some(SniffSeen { stream: Some(PROMO.into()), streams: 2, all: vec![PROMO.into(), REAL.into()], ..Default::default() });
+    let report = dry(&fresh, false).await;
+    assert!(!report.verdict.contains("NO_STREAM_FOUND"), "{}", report.verdict);
+}

@@ -30,6 +30,7 @@ mod benchmark;
 mod canary;
 mod repair;
 mod selfcheck;
+mod site_memory;
 
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
@@ -1310,12 +1311,10 @@ async fn run_daemon(
     let busy_jobs = omni_core::busy::BusyJobs::new();
     // Site canaries (plan P10.4): shared by the nightly check, the workers'
     // daytime trigger and the admin's «Run now», so only one runs at a time.
-    let canary_env = Arc::new(canary::CanaryEnv::new(
-        repo.clone(),
-        health.clone(),
-        bin_dir.clone(),
-        config.ytdl_channel.clone(),
-    ));
+    let canary_env = Arc::new(
+        canary::CanaryEnv::new(repo.clone(), health.clone(), bin_dir.clone(), config.ytdl_channel.clone())
+            .with_scratch(temp_path.clone()),
+    );
     // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
     let url_tester = Arc::new(repair::AdminTester::new());
     omni_core::cookies::refresh_health(&repo, &health);
@@ -2099,6 +2098,13 @@ async fn run_job(
     };
     // Every video the page offers is already queued as this job's sibling.
     let mut siblings_hold_the_rest = false;
+    // What the page showed was only the site's furniture (P3.16): the pick yt-dlp made first was refused,
+    // the one it made after the browser was refused (`Some`), and the addresses taken out, for the repair ladder.
+    let mut pick_refused = false;
+    let mut fallback_refused: Option<bool> = None;
+    let mut furniture_urls: Vec<String> = Vec::new();
+    // Held videos left out when furniture took the article's own: yt-dlp's pick after the browser may not take them.
+    let mut refused_held: Vec<String> = Vec::new();
     // An embedded video on another site, whose cookie jar this job also carries (P3.5).
     let mut login_site: Option<String> = None;
     let mut _login_guard: Option<omni_broadcast::pipeline::LoginSiteGuard> = None;
@@ -2162,12 +2168,14 @@ async fn run_job(
         Err(anyhow::anyhow!("{}: yt-dlp reads the page only generically", ErrorCode::UnsupportedUrl.as_str())
             .context(ErrorCode::UnsupportedUrl.as_str()))
     } else {
-        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone()).await? {
+        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), None, &[]).await? {
             None => return Ok(()),
             Some(a) => {
                 page_referer = a.page_referer;
                 scan_siblings.extend(a.scan_siblings);
                 siblings_hold_the_rest = a.siblings_hold_the_rest;
+                pick_refused = a.only_furniture;
+                furniture_urls.extend(a.furniture_urls);
                 login_site = a.login_site;
                 _login_guard = a.login_guard;
                 a.result
@@ -2243,13 +2251,34 @@ async fn run_job(
                 // video, and sent the job to review while its two real
                 // videos were delivered as siblings (P3.13). Ask yt-dlp
                 // about each post first; keep the ones it cannot rule out.
-                let mut streams = without_videoless_posts(repo, engine, job_id, &bundle.all_streams, &cancel).await;
+                // Every video the browser saw is remembered for this article of the site,
+                // then the ones the site shows on its other articles too (a promo, a show, a
+                // recommendation) leave the candidates: never the job's video, never queued,
+                // only offered (P3.16). An article's sibling job holds a stream or post, not
+                // a page of the site.
+                let site_memory::SniffScreen { pool, furniture, removed_own } = site_memory::screen_sniff(
+                    repo,
+                    &orig_url,
+                    snapshot.as_ref(),
+                    &bundle.all_streams,
+                    job.parent_job_id.is_some(),
+                    |u| omni_browser::sniffer::is_demoted(&bundle.meta, u),
+                );
+                furniture_urls.extend(furniture.iter().map(|f| f.url.clone()));
+                let mut streams = without_videoless_posts(repo, engine, job_id, &pool, &cancel).await;
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
                 // Not one already queued as this job's sibling: it would air twice.
                 let (left, queued_emptied) = omni_broadcast::article::remaining_after_queued(&streams, &scan_siblings);
                 streams = left;
+                // Furniture took the article's own video and no own one is left: a rail or header video is not
+                // the article's either (P3.16).
+                let (left, dropped_held) =
+                    site_memory::leave_nothing_held(removed_own, streams, |u| omni_browser::sniffer::is_demoted(&bundle.meta, u));
+                streams = left;
+                furniture_urls.extend(dropped_held.iter().cloned());
+                refused_held.extend(dropped_held);
                 // Only what is left after the photo-only posts are dropped
                 // says the page has a video.
                 sniffed_streams = streams.clone();
@@ -2319,6 +2348,12 @@ async fn run_job(
                         return Ok(());
                     }
                 }
+                // The site's furniture is offered to MCR whatever the job takes; when the job
+                // queues the article's siblings they write the offered list first, so then
+                // it is done after them.
+                if primary.is_none() {
+                    omni_broadcast::article::offer_site_wide(repo, &job, &furniture);
+                }
                 match primary {
                     Some(primary) => {
                         // Found: no fallback even when this download fails. yt-dlp's own pick is
@@ -2341,6 +2376,7 @@ async fn run_job(
                             return Ok(());
                         }
                         omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams, &facts);
+                        omni_broadcast::article::offer_site_wide(repo, &retry_job, &furniture);
                         retry_job.url = primary;
                         sniff_referer = Some(bundle.referer.clone());
                         if !repo.set_stage(job_id, owner, JobStage::Download)? {
@@ -2391,6 +2427,23 @@ async fn run_job(
                         )?;
                         process_result = Err(anyhow::anyhow!(
                             "{}: the page's remaining videos are already queued as siblings",
+                            ErrorCode::NoStreamFound.as_str()
+                        )
+                        .context(ErrorCode::NoStreamFound.as_str()));
+                    }
+                    None if site_memory::ends_on_furniture(&furniture, &streams) => {
+                        // What the page showed is the site's own furniture (P3.16): no video for
+                        // this job. yt-dlp's own pick is asked next (it is refused if it is the same
+                        // promo), and a failure after that is assessed and repaired as any other.
+                        sniff_end = SniffEnd::SiteWide;
+                        repo.record_event(
+                            job_id,
+                            "ERROR",
+                            Some(JobStage::Extract),
+                            "The only videos on this page are ones the site shows on its other articles",
+                        )?;
+                        process_result = Err(anyhow::anyhow!(
+                            "{}: the only videos on the page are ones the site shows on its other articles",
                             ErrorCode::NoStreamFound.as_str()
                         )
                         .context(ErrorCode::NoStreamFound.as_str()));
@@ -2447,11 +2500,13 @@ async fn run_job(
         // The login guard is the attempt's to make again; two for one job would drop the new one.
         _login_guard = None;
         let scan = deferred_scan.take().unwrap_or_default();
-        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone()).await? {
+        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), snapshot.as_ref().and_then(|s| s.final_url.as_deref()), &refused_held).await? {
             None => return Ok(()),
             Some(a) => {
                 page_referer = a.page_referer;
                 siblings_hold_the_rest = a.siblings_hold_the_rest;
+                fallback_refused = Some(a.only_furniture);
+                furniture_urls.extend(a.furniture_urls);
                 login_site = a.login_site;
                 _login_guard = a.login_guard;
                 process_result = a.result;
@@ -2564,7 +2619,7 @@ async fn run_job(
                 let ladder = if siblings_hold_the_rest {
                     None
                 } else {
-                    repair::after_failure(repair, &job, owner, &orig_url, code, &snapshot, tried, &cancel).await
+                    repair::after_failure_with(repair, &job, owner, &orig_url, code, &snapshot, tried, furniture_urls.clone(), &cancel).await
                 };
                 if let Some(ladder) = ladder {
                     match &ladder {
@@ -2624,10 +2679,7 @@ async fn run_job(
                 // codes that say something about the site, not this page.
                 // A repair that ran out of time counts as the unresolved video it was.
                 let site_code = repair::site_code(code);
-                if done
-                    && !cancel.is_cancelled()
-                    && job.parent_job_id.is_none()
-                    && omni_core::site_health::counts_against_site(site_code.as_str())
+                if site_failure_counts(done, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
                 {
                     let noted = note_site_outcome(
                         repo,
@@ -2746,6 +2798,10 @@ enum SniffEnd {
     AllDead,
     /// What it found is already queued as this job's siblings.
     SiblingsHoldTheRest,
+    /// Every video it found is one the site shows on its other articles (P3.16), or only held ones
+    /// were left once those were out: none is the job's. yt-dlp's own pick is asked next, and refused
+    /// if it is one of them (`guard_scan`).
+    SiteWide,
     Cancelled,
     LeaseLost,
     /// The browser ended on a video platform's page (a meta refresh or script redirect): yt-dlp
@@ -2764,10 +2820,11 @@ fn sniff_result_end(sniff_first: bool, media_ok: bool, final_url: Option<&str>) 
 }
 
 /// Whether yt-dlp's own pick is tried after the sniffer, asked first, ended as `end`: only when
-/// it found no usable video. Never after a live stream, siblings that hold the rest, a video
+/// it found no usable video (its only videos were the site's furniture: yt-dlp's pick is asked, and
+/// refused if it is one of them). Never after a live stream, siblings that hold the rest, a video
 /// it did choose, a cancel or a lost lease.
 fn falls_back_to_ytdlp(sniff_first: bool, end: SniffEnd) -> bool {
-    sniff_first && matches!(end, SniffEnd::Error | SniffEnd::PostsHaveNoVideo | SniffEnd::LandedOnPlatform)
+    sniff_first && matches!(end, SniffEnd::Error | SniffEnd::PostsHaveNoVideo | SniffEnd::LandedOnPlatform | SniffEnd::SiteWide)
 }
 
 /// What yt-dlp's attempt at a web page left: its result, and what the page scan
@@ -2778,6 +2835,10 @@ struct YtdlpAttempt {
     scan_siblings: Vec<String>,
     /// Every video of the page's scan is already queued as a sibling: nothing was downloaded.
     siblings_hold_the_rest: bool,
+    /// The page's only videos are the site's furniture (P3.16): not a failure of the site.
+    only_furniture: bool,
+    /// What was taken out of the scan as the site's furniture.
+    furniture_urls: Vec<String>,
     login_site: Option<String>,
     login_guard: Option<omni_broadcast::pipeline::LoginSiteGuard>,
 }
@@ -2797,6 +2858,10 @@ async fn ytdlp_attempt(
     queued: &[String],
     scan: omni_broadcast::downloader::PageScan,
     page_referer: Option<String>,
+    // Where the browser ended, when it looked at the page first (its site is looked up too).
+    browser_final: Option<&str>,
+    // Held videos the browser's look took out (furniture removed the article's own): not yt-dlp's pick either.
+    refused: &[String],
 ) -> Result<Option<YtdlpAttempt>> {
     let job_id = job.id;
     let mut page_referer = page_referer;
@@ -2809,6 +2874,15 @@ async fn ytdlp_attempt(
     let scan_count = scan.videos.len();
     // Videos an earlier attempt queued as siblings are neither taken nor queued again.
     let (mut videos, held_by_siblings) = omni_broadcast::article::remaining_after_queued(&scan.videos, queued);
+    // A video the site shows on its other articles too is never yt-dlp's pick (P3.16): out of the
+    // multi-video choice, and a single result whose media is one is not downloaded. Read only: the
+    // browser's sightings are what is remembered.
+    let mut furniture: Vec<omni_core::site_videos::Furniture> = Vec::new();
+    let mut only_furniture = false;
+    if job.parent_job_id.is_none() && page_referer.is_none() {
+        let guard = site_memory::guard_scan(repo, orig_url, scan.webpage_url.as_deref(), browser_final, std::mem::take(&mut videos), &scan.media_urls, refused);
+        (videos, furniture, only_furniture) = (guard.videos, guard.furniture, guard.only_furniture);
+    }
     if scan_count > 1 && !videos.is_empty() {
         // yt-dlp's page scan says nothing about where on the page a video
         // sat, so the placement rule (R2) is the sniffer's alone; here only
@@ -2882,8 +2956,22 @@ async fn ytdlp_attempt(
         warn!("Job #{job_id}: no longer ours; not downloading");
         return Ok(None);
     }
+    // After the article's siblings were queued, which write the offered list first.
+    omni_broadcast::article::offer_site_wide(repo, job, &furniture);
     let login_guard = login_site.as_deref().map(|v| engine.set_login_site(job_id, v));
-    let result = if all_live_scan {
+    let result = if only_furniture && !all_live_scan && !held_by_siblings {
+        repo.record_event(
+            job_id,
+            "ERROR",
+            Some(JobStage::Extract),
+            "The only videos on this page are ones the site shows on its other articles",
+        )?;
+        Err(anyhow::anyhow!(
+            "{}: the only videos on the page are ones the site shows on its other articles",
+            ErrorCode::NoStreamFound.as_str()
+        )
+        .context(ErrorCode::NoStreamFound.as_str()))
+    } else if all_live_scan {
         repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
         Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
             .context(ErrorCode::LiveStream.as_str()))
@@ -2922,7 +3010,10 @@ async fn ytdlp_attempt(
         result,
         page_referer,
         scan_siblings,
+        // Nothing is left to assess or repair into: the page's videos are queued, or are the site's furniture.
         siblings_hold_the_rest: held_by_siblings,
+        only_furniture,
+        furniture_urls: furniture.iter().map(|f| f.url.clone()).collect(),
         login_site,
         login_guard,
     }))
@@ -3869,6 +3960,12 @@ async fn run_one_task(
                 Ok(_) => {}
                 Err(e) => warn!("Retention: login records not purged: {e:#}"),
             }
+            // Which videos the browser saw on which article (P3.16): the week that counts, twice over.
+            match repo.purge_site_videos(chrono::Utc::now() - chrono::Duration::days(omni_core::site_videos::SITE_VIDEOS_KEEP_DAYS)) {
+                Ok(n) if n > 0 => info!("Retention: removed {n} old site video sighting(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("Retention: site video sightings not purged: {e:#}"),
+            }
 
             // The text of handled mail (plan P7.6): the MCR mail view needs it
             // for a few weeks, nobody needs it for ever. Sender, subject and
@@ -4694,6 +4791,7 @@ mod sniff_fallback_tests {
         assert!(falls_back_to_ytdlp(true, SniffEnd::Error));
         assert!(falls_back_to_ytdlp(true, SniffEnd::PostsHaveNoVideo));
         assert!(falls_back_to_ytdlp(true, SniffEnd::LandedOnPlatform));
+        assert!(falls_back_to_ytdlp(true, SniffEnd::SiteWide), "yt-dlp's pick may be another video; guard_scan blocks a furniture one");
         for end in [
             SniffEnd::Found,
             SniffEnd::AllLive,
@@ -4711,5 +4809,89 @@ mod sniff_fallback_tests {
     fn a_page_the_browser_was_not_asked_first_never_falls_back() {
         assert!(!falls_back_to_ytdlp(false, SniffEnd::Error));
         assert!(!falls_back_to_ytdlp(false, SniffEnd::PostsHaveNoVideo));
+    }
+}
+
+/// Whether a failed job's end is written to its site's health (P10.3): only a finished,
+/// uncancelled job of its own page, with a code that says something about the site. A page whose
+/// only videos are the site's furniture (P3.16) fails the job but says nothing about the site.
+fn site_failure_counts(done: bool, cancelled: bool, is_child: bool, furniture_only: bool, code: &str) -> bool {
+    done && !cancelled && !is_child && !furniture_only && omni_core::site_health::counts_against_site(code)
+}
+
+#[cfg(test)]
+mod site_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_furniture_only_ending_is_not_a_site_failure_but_a_real_no_stream_found_is() {
+        assert!(site_failure_counts(true, false, false, false, "NO_STREAM_FOUND"), "control: counts as before");
+        assert!(!site_failure_counts(true, false, false, true, "NO_STREAM_FOUND"));
+    }
+
+    #[test]
+    fn the_furniture_ending_leaves_the_stored_site_health_unchanged() {
+        let (_d, repo) = crate::site_memory::tests::repo();
+        let health = HealthState::new();
+        let url = "https://www.news.example/a/story-1";
+        // As the end of run_job does it: only what site_failure_counts allows is recorded.
+        for furniture_only in [true, false] {
+            if site_failure_counts(true, false, false, furniture_only, "NO_STREAM_FOUND") {
+                note_site_outcome(&repo, &health, 1, url, SiteOutcome::SiteFailure("NO_STREAM_FOUND".into()));
+            }
+            let row = repo.get_site("news.example").unwrap();
+            if furniture_only {
+                assert!(row.is_none(), "nothing recorded for the site");
+            } else {
+                assert_eq!(row.unwrap().consecutive_fail, 1, "a real NO_STREAM_FOUND still counts");
+            }
+        }
+    }
+}
+
+/// Whether a failed job ended for lack of a video only because the page's videos are the site's
+/// furniture (P3.16), which says nothing about the site: `pick_refused` is yt-dlp's first pick refused
+/// as furniture (the route where yt-dlp goes first), `sniff` how the browser's look ended, and
+/// `fallback_refused` whether yt-dlp's pick after the browser was refused (`None`: not made).
+fn furniture_only_end(pick_refused: bool, sniff: SniffEnd, fallback_refused: Option<bool>) -> bool {
+    match sniff {
+        SniffEnd::SiteWide => fallback_refused.unwrap_or(true),
+        SniffEnd::Error | SniffEnd::PostsHaveNoVideo | SniffEnd::LandedOnPlatform => fallback_refused.unwrap_or(pick_refused),
+        SniffEnd::NotRun => pick_refused,
+        SniffEnd::Found
+        | SniffEnd::AllLive
+        | SniffEnd::AllDead
+        | SniffEnd::SiblingsHoldTheRest
+        | SniffEnd::Cancelled
+        | SniffEnd::LeaseLost => false,
+    }
+}
+
+#[cfg(test)]
+mod furniture_end_tests {
+    use super::*;
+
+    #[test]
+    fn the_browser_first_route_ends_on_furniture_unless_yt_dlps_own_pick_is_another_video() {
+        assert!(furniture_only_end(false, SniffEnd::SiteWide, None), "no pick was made after the browser");
+        assert!(furniture_only_end(false, SniffEnd::SiteWide, Some(true)), "the pick was the same promo");
+        assert!(!furniture_only_end(false, SniffEnd::SiteWide, Some(false)), "another video that then failed is a real failure");
+        assert!(furniture_only_end(false, SniffEnd::Error, Some(true)), "browser found nothing, pick refused");
+        assert!(!furniture_only_end(false, SniffEnd::Error, Some(false)));
+    }
+
+    #[test]
+    fn the_yt_dlp_first_route_keeps_a_refused_pick_through_a_sniff_that_finds_nothing() {
+        for end in [SniffEnd::Error, SniffEnd::PostsHaveNoVideo, SniffEnd::SiteWide, SniffEnd::NotRun] {
+            assert!(furniture_only_end(true, end, None), "{end:?}");
+            assert!(!furniture_only_end(false, end, None) || end == SniffEnd::SiteWide, "{end:?}: no refused pick, a real failure");
+        }
+    }
+
+    #[test]
+    fn a_sniff_that_chose_a_video_or_ended_for_another_reason_is_a_real_ending() {
+        for end in [SniffEnd::Found, SniffEnd::AllLive, SniffEnd::AllDead, SniffEnd::SiblingsHoldTheRest, SniffEnd::Cancelled, SniffEnd::LeaseLost] {
+            assert!(!furniture_only_end(true, end, Some(true)), "{end:?}");
+        }
     }
 }

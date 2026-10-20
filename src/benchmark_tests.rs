@@ -639,12 +639,14 @@ struct Steps {
     sniff_streams: Vec<(&'static str, bool)>,
     /// What a probe says about an address; an address not here reads.
     probes: Vec<(&'static str, Probe)>,
+    /// Addresses the site shows on several of its articles (P3.16).
+    furniture: Vec<&'static str>,
     asked: Mutex<Vec<&'static str>>,
 }
 
 impl Steps {
     fn new(scan: PageScan, sniff_finds: bool, ytdlp_reads: bool) -> Self {
-        Self { scan, sniff_finds, ytdlp_reads, landed: None, sniff_ends_on: None, sniff_streams: vec![(SECRET_STREAM, false)], probes: Vec::new(), asked: Mutex::new(Vec::new()) }
+        Self { scan, sniff_finds, ytdlp_reads, landed: None, sniff_ends_on: None, sniff_streams: vec![(SECRET_STREAM, false)], probes: Vec::new(), furniture: Vec::new(), asked: Mutex::new(Vec::new()) }
     }
 
     fn asked(&self) -> Vec<&'static str> {
@@ -679,10 +681,14 @@ impl ExtractSteps for Steps {
             user_agent: "UA".into(),
             cookies: None,
             final_url: self.sniff_ends_on.map(str::to_string),
+            canonical: None,
         })
     }
     async fn probe(&self, candidate: &str, _session: &Sniff) -> Probe {
         self.probes.iter().find(|(u, _)| *u == candidate).map(|(_, p)| *p).unwrap_or(Probe::Ok)
+    }
+    async fn site_wide(&self, _page: &str, urls: &[String], _seen: Option<&Sniff>) -> std::collections::HashMap<String, usize> {
+        urls.iter().filter(|u| self.furniture.contains(&u.as_str())).map(|u| (omni_core::site_videos::video_hash(u), 2)).collect()
     }
 }
 
@@ -781,4 +787,106 @@ async fn a_dead_first_candidate_is_skipped_for_the_stream_that_plays() {
     all.probes = vec![(JW, Probe::Dead(ErrorCode::PageNotFound)), (YT, Probe::Dead(ErrorCode::PrivateOrRemoved))];
     assert_eq!(extract_with(&all, ARTICLE).await.err().as_deref(), Some(ErrorCode::PageNotFound.as_str()));
     assert_eq!(all.asked(), ["site-api", "scan", "sniffer"]);
+}
+
+// ------------------------------------------------------------------ site furniture (P3.16)
+
+const PROMO: &str = "https://media.example-news.test/promo-hor.mp4";
+const CLIP: &str = "https://media.example-news.test/clips/real-1.mp4";
+
+#[tokio::test]
+async fn a_video_the_site_shows_on_its_other_articles_is_not_the_extracted_video() {
+    let mut steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    steps.sniff_streams = vec![(PROMO, false), (CLIP, false)];
+    steps.furniture = vec![PROMO];
+    let found = extract_with(&steps, ARTICLE).await.unwrap();
+    assert_eq!((found.method.as_str(), found.stream.as_str()), ("sniffer", CLIP));
+    // Control: the same page with no memory takes the browser's first choice.
+    let mut fresh = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    fresh.sniff_streams = vec![(PROMO, false), (CLIP, false)];
+    assert_eq!(extract_with(&fresh, ARTICLE).await.unwrap().stream, PROMO);
+}
+
+#[tokio::test]
+async fn a_page_whose_only_video_is_site_furniture_falls_to_yt_dlps_pick_and_refuses_it_if_it_is_furniture_too() {
+    // The browser took nothing: yt-dlp's own pick is asked, as in a job.
+    let mut steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, true);
+    steps.sniff_streams = vec![(PROMO, false)];
+    steps.furniture = vec![PROMO];
+    assert_eq!(extract_with(&steps, ARTICLE).await.unwrap().method, "yt-dlp");
+    assert_eq!(steps.asked(), ["site-api", "scan", "sniffer", "yt-dlp"]);
+    // Its pick is the same promo: nothing is taken, and yt-dlp is not asked.
+    let scan = PageScan { generic_only: true, media_urls: vec![PROMO.to_string()], ..Default::default() };
+    let mut same = Steps::new(scan, true, true);
+    same.sniff_streams = vec![(PROMO, false)];
+    same.furniture = vec![PROMO];
+    assert_eq!(extract_with(&same, ARTICLE).await.err().as_deref(), Some(ErrorCode::NoStreamFound.as_str()));
+    assert!(!same.asked().contains(&"yt-dlp"), "{:?}", same.asked());
+}
+
+#[tokio::test]
+async fn furniture_taking_the_articles_own_video_does_not_hand_the_page_to_a_held_one() {
+    let mut steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, false);
+    steps.sniff_streams = vec![(PROMO, false), (CLIP, true)];
+    steps.furniture = vec![PROMO];
+    assert!(extract_with(&steps, ARTICLE).await.is_err(), "the held clip is not taken");
+    // Control: a page with only a held candidate keeps taking it.
+    let mut only_held = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, false);
+    only_held.sniff_streams = vec![(CLIP, true)];
+    assert_eq!(extract_with(&only_held, ARTICLE).await.unwrap().stream, CLIP);
+}
+
+#[tokio::test]
+async fn a_yt_dlp_pick_that_is_site_furniture_is_not_taken() {
+    let scan = PageScan { media_urls: vec![PROMO.to_string()], ..Default::default() };
+    let mut steps = Steps::new(scan.clone(), true, true);
+    steps.sniff_streams = vec![(CLIP, false)];
+    steps.furniture = vec![PROMO];
+    let found = extract_with(&steps, ARTICLE).await.unwrap();
+    assert_eq!((found.method.as_str(), found.stream.as_str()), ("sniffer", CLIP), "the browser is asked after yt-dlp's pick is refused");
+    assert!(!steps.asked().contains(&"yt-dlp"), "{:?}", steps.asked());
+    // Control: a first sighting is yt-dlp's to download.
+    let fresh = Steps::new(scan, true, true);
+    assert_eq!(extract_with(&fresh, ARTICLE).await.unwrap().method, "yt-dlp");
+}
+
+#[test]
+fn the_real_lookup_reads_the_memory_and_never_writes_it() {
+    let root = Root::new();
+    let repo = Repository::new(root.0.join("omni.db")).unwrap();
+    let stages = RealStages::new(repo.clone(), Tools { ytdl: PathBuf::new(), ffmpeg: PathBuf::new(), ffprobe: PathBuf::new(), bmxtranswrap: PathBuf::new() }, root.0.join("scratch"));
+    let page = "https://www.example-news.test/a/story-1";
+    let key = omni_core::site_videos::page_key("https://www.example-news.test/a/story-2", None, None).unwrap();
+    let promo = vec![PROMO.to_string()];
+    repo.record_site_videos(&key.domain, &key.identities, &omni_core::site_videos::hashes_of(&promo), chrono::Utc::now()).unwrap();
+    let rows = || -> i64 {
+        rusqlite::Connection::open(root.0.join("omni.db")).unwrap().query_row("SELECT COUNT(*) FROM site_videos", [], |r| r.get(0)).unwrap()
+    };
+    let snapshot_seen = Sniff { streams: Vec::new(), primary: String::new(), referer: String::new(), user_agent: String::new(), cookies: None, final_url: None, canonical: None };
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let wide = rt.block_on(stages.site_wide(page, &promo, Some(&snapshot_seen)));
+    assert_eq!(wide.len(), 1, "one stored article and this one: furniture");
+    assert_eq!(rt.block_on(stages.site_wide(page, &promo, None)).len(), 1, "the page counts as an article with or without the browser's look");
+    assert_eq!(rows(), 1, "the benchmark records nothing");
+}
+
+#[tokio::test]
+async fn a_gone_own_video_does_not_hand_the_page_to_a_held_one_either() {
+    const POST: &str = "https://x.com/someone/status/42";
+    let mut steps = Steps::new(PageScan { generic_only: true, ..Default::default() }, true, false);
+    steps.sniff_streams = vec![(PROMO, false), (POST, false), (CLIP, true)];
+    steps.furniture = vec![PROMO];
+    steps.probes = vec![(POST, Probe::Dead(ErrorCode::PageNotFound))];
+    assert_eq!(extract_with(&steps, ARTICLE).await.err().as_deref(), Some(ErrorCode::PageNotFound.as_str()), "the own video's code, not the rail clip");
+}
+
+#[tokio::test]
+async fn a_held_video_left_out_is_not_yt_dlps_pick_after_the_browser() {
+    // Scan names the held rail clip as its single pick; the browser's own video is furniture.
+    let scan = PageScan { generic_only: true, media_urls: vec![CLIP.to_string()], ..Default::default() };
+    let mut steps = Steps::new(scan, true, true);
+    steps.sniff_streams = vec![(PROMO, false), (CLIP, true)];
+    steps.furniture = vec![PROMO];
+    assert_eq!(extract_with(&steps, ARTICLE).await.err().as_deref(), Some(ErrorCode::NoStreamFound.as_str()));
+    assert!(!steps.asked().contains(&"yt-dlp"), "{:?}", steps.asked());
 }

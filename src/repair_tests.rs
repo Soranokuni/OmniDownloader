@@ -2061,3 +2061,19 @@ async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
 
 #[path = "repair_dry_tests.rs"]
 mod dry_run_tests;
+
+/// P3.16: the addresses the page showed that are the site's furniture are dropped from the
+/// candidates as MCR's rejected ones are, so no recipe holds the promo.
+#[tokio::test]
+async fn a_video_that_is_the_sites_furniture_is_not_held_by_the_ladder() {
+    let r = rig(RepairMode::Hold);
+    let cancel = CancellationToken::new();
+    let got = crate::repair::after_failure_with(&r.ctx, &r.job, OWNER, PAGE, ErrorCode::VideoUnresolved, &Some(triple(A, A, A)), vec![], vec![A.to_string()], &cancel).await;
+    assert!(matches!(got, Some(LadderResult::NothingVerified)), "{got:?}");
+    assert!(held_urls(&r).is_empty(), "the promo was not downloaded");
+    // Control: the same page with nothing taken out holds it.
+    let r = rig(RepairMode::Hold);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let got = crate::repair::after_failure_with(&r.ctx, &r.job, OWNER, PAGE, ErrorCode::VideoUnresolved, &Some(triple(A, A, A)), vec![], Vec::new(), &cancel).await;
+    assert!(matches!(got, Some(LadderResult::Held { .. })), "{got:?}");
+}

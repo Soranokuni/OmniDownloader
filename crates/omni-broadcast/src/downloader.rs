@@ -660,6 +660,7 @@ impl Downloader {
                     generic_only: why.is_some(),
                     hand_off_only: why == Some(GenericWhy::HandOff),
                     webpage_url: json.as_ref().and_then(|v| v.get("webpage_url")).and_then(|v| v.as_str()).map(str::to_string),
+                    media_urls: json.as_ref().map(|v| parse_scan_media_urls(v, url)).unwrap_or_default(),
                 }
             }
             Ok(o) if !o.timed_out => PageScan {
@@ -859,6 +860,44 @@ pub struct PageScan {
     pub hand_off_only: bool,
     /// The scan's own `webpage_url`.
     pub webpage_url: Option<String>,
+    /// The address(es) of the one video the scan read, when it is not a playlist (P3.16):
+    /// its media `url`, its formats' and the scan's `webpage_url` when that is another address
+    /// than the page. What yt-dlp's own pick would download, for the site-wide check.
+    pub media_urls: Vec<String>,
+}
+
+/// At most this many format addresses of a single-video scan are kept.
+const MAX_SCAN_MEDIA_URLS: usize = 8;
+
+/// The addresses a single-video `-J` result names (see [`PageScan::media_urls`]); empty for a
+/// playlist, whose entries are the page's videos.
+pub fn parse_scan_media_urls(scan: &serde_json::Value, page_url: &str) -> Vec<String> {
+    if scan.get("_type").and_then(|t| t.as_str()) == Some("playlist") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    // The scan's `webpage_url` first and outside the cap: for a hand-off it is the form the browser
+    // records (a `watch?v=` address), and a long format list must not crowd it out.
+    if let Some(w) = scan.get("webpage_url").and_then(|u| u.as_str()) {
+        if (w.starts_with("https://") || w.starts_with("http://")) && omni_core::urlnorm::normalize(w) != omni_core::urlnorm::normalize(page_url) {
+            out.push(w.to_string());
+        }
+    }
+    let reserved = out.len();
+    let mut add = |u: &str| {
+        if (u.starts_with("https://") || u.starts_with("http://")) && out.len() < reserved + MAX_SCAN_MEDIA_URLS && !out.iter().any(|o| o == u) {
+            out.push(u.to_string());
+        }
+    };
+    if let Some(u) = scan.get("url").and_then(|u| u.as_str()) {
+        add(u);
+    }
+    for f in scan.get("formats").and_then(|f| f.as_array()).into_iter().flatten() {
+        if let Some(u) = f.get("url").and_then(|u| u.as_str()) {
+            add(u);
+        }
+    }
+    out
 }
 
 /// Why [`generic_why`] says a page is read only generically.
@@ -1161,6 +1200,33 @@ mod tests {
         // The html5 article control.
         let html5 = scan_json(r#"{"extractor":"html5","extractor_key":"HTML5MediaEmbed","webpage_url":"https://www.example-news.gr/article"}"#);
         assert!(generic_only(&html5, "https://www.example-news.gr/article"));
+    }
+
+    #[test]
+    fn a_single_video_scan_names_the_addresses_yt_dlp_would_download() {
+        let page = "https://www.example-news.gr/article";
+        let html5 = scan_json(
+            r#"{"extractor":"html5","webpage_url":"https://www.example-news.gr/article","url":"https://media.example-news.gr/promo.mp4","formats":[{"url":"https://media.example-news.gr/promo-hd.mp4"},{"url":"https://media.example-news.gr/promo.mp4"},{"url":"blob:x"}]}"#,
+        );
+        assert_eq!(
+            parse_scan_media_urls(&html5, page),
+            ["https://media.example-news.gr/promo.mp4", "https://media.example-news.gr/promo-hd.mp4"]
+        );
+        // The webpage address leads and is never crowded out by a long format list.
+        let many: Vec<String> = (0..12).map(|i| format!(r#"{{"url":"https://cdn.example-news.gr/f{i}.m3u8"}}"#)).collect();
+        let long = scan_json(&format!(
+            r#"{{"extractor":"youtube","webpage_url":"https://www.youtube.com/watch?v=xZf1yNC3YDQ","formats":[{}]}}"#,
+            many.join(",")
+        ));
+        let got = parse_scan_media_urls(&long, page);
+        assert_eq!(got[0], "https://www.youtube.com/watch?v=xZf1yNC3YDQ");
+        assert_eq!(got.len(), 1 + MAX_SCAN_MEDIA_URLS, "the formats are capped, the webpage address is not counted");
+        // A hand-off names the other site's address; the page's own address is not a video.
+        let hand = scan_json(r#"{"extractor":"youtube","webpage_url":"https://www.youtube.com/watch?v=abcdefghijk"}"#);
+        assert_eq!(parse_scan_media_urls(&hand, page), ["https://www.youtube.com/watch?v=abcdefghijk"]);
+        // A playlist's entries are the page's videos, not a single pick.
+        let list = scan_json(r#"{"_type":"playlist","webpage_url":"https://x.example/","entries":[{"url":"https://x.example/a.mp4"}]}"#);
+        assert!(parse_scan_media_urls(&list, page).is_empty());
     }
 
     #[test]

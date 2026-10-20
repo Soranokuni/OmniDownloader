@@ -387,6 +387,11 @@ pub fn queue_article_siblings(
     }
     let max = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
     let plan = plan_article_videos_facts(&job.url, primary, all_streams, &job.index_str, max, facts);
+    // An offer from an earlier look that is now this job's video or a sibling is not an offer any more.
+    let taken: Vec<String> = std::iter::once(primary.to_string()).chain(plan.siblings.iter().map(|(u, _)| u.clone())).collect();
+    drop_offers(repo, job.id, &taken);
+    let used_now: Vec<String> = std::iter::once(plan.primary_index.clone()).chain(plan.siblings.iter().map(|(_, i)| i.clone())).collect();
+    renumber_offers(repo, job.id, &job.index_str, &used_now);
     if let Some(n) = max {
         let found = 1 + plan.siblings.len() + plan.offered.len();
         if found > n {
@@ -455,18 +460,150 @@ pub fn queue_article_siblings(
     }
 
     if !plan.offered.is_empty() {
-        match serde_json::to_string(&plan.offered) {
+        // Merged into what is stored (a retry plans the same ones again, and the site's furniture may
+        // already be offered): none twice, none dropped.
+        let added = merge_offers(repo, job_id, &plan.offered);
+        if !added.is_empty() {
+            let _ = repo.record_event(
+                job_id,
+                "INFO",
+                Some(omni_core::models::JobStage::Extract),
+                &format!("{} more video(s) in this article offered to MCR", added.len()),
+            );
+        }
+    }
+}
+
+/// The offered list stored on a job (`queue.candidates_json`).
+fn stored_offers(repo: &omni_core::repository::Repository, job_id: i64) -> Vec<Offered> {
+    match repo.get_job(job_id) {
+        Ok(Some(j)) => j.candidates_json.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The index a job had before it was split into `1A`, `1B`, ...: its leading number, else itself.
+fn base_index(index: &str) -> String {
+    let digits: String = index.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { index.to_string() } else { digits }
+}
+
+/// Give a stored offer a new index when it equals one the job's plan now uses (the primary's, or a
+/// sibling's about to be queued): an earlier look numbered its offers from the same start.
+fn renumber_offers(repo: &omni_core::repository::Repository, job_id: i64, index: &str, taken: &[String]) {
+    let mut list = stored_offers(repo, job_id);
+    // An offer MCR already queued keeps its label: its child job carries that index.
+    let movable = |o: &Offered| o.queued_job_id.is_none() && taken.contains(&o.index_str);
+    if !list.iter().any(movable) {
+        return;
+    }
+    let base = base_index(index);
+    let (_, name) = suffixer(&base);
+    let mut used: Vec<String> = taken.to_vec();
+    used.extend(list.iter().map(|o| o.index_str.clone()));
+    if let Ok(jobs) = repo.jobs_with_children(job_id) {
+        used.extend(jobs.iter().map(|j| j.index_str.clone()));
+    }
+    for o in list.iter_mut().filter(|o| movable(o)) {
+        if let Some(free) = (1..1000).map(&name).find(|n| !used.contains(n)) {
+            used.push(free.clone());
+            o.index_str = free;
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&list) {
+        let _ = repo.set_candidates(job_id, Some(&json));
+    }
+}
+
+/// Take from the job's offered list what is now the job's own video or a queued sibling (a retry
+/// where an old offer became the primary must not leave it clickable).
+fn drop_offers(repo: &omni_core::repository::Repository, job_id: i64, urls: &[String]) {
+    let list = stored_offers(repo, job_id);
+    let keys: Vec<String> = urls.iter().map(|u| omni_core::urlnorm::normalize(u)).collect();
+    let kept: Vec<&Offered> = list.iter().filter(|o| !keys.contains(&omni_core::urlnorm::normalize(&o.url))).collect();
+    if kept.len() == list.len() {
+        return;
+    }
+    let json = if kept.is_empty() { None } else { serde_json::to_string(&kept).ok() };
+    let _ = repo.set_candidates(job_id, json.as_deref());
+}
+
+/// Add `new` to the job's offered list: the list kept, an address already in it (compared as
+/// dedup keys) not added again, at most [`MAX_OFFERED`] in all. Returns the entries actually added.
+fn merge_offers(repo: &omni_core::repository::Repository, job_id: i64, new: &[Offered]) -> Vec<Offered> {
+    let mut list = stored_offers(repo, job_id);
+    // Indexes already taken: by stored offers, by the job and by its queued siblings. Two paths number
+    // their offers from the same start, so an incoming one whose index is taken gets the next free one.
+    let mut used: Vec<String> = list.iter().map(|o| o.index_str.clone()).collect();
+    let mut base = String::new();
+    if let Ok(jobs) = repo.jobs_with_children(job_id) {
+        used.extend(jobs.iter().map(|j| j.index_str.clone()));
+        base = jobs.iter().find(|j| j.id == job_id).map(|j| base_index(&j.index_str)).unwrap_or_default();
+    }
+    let mut added = Vec::new();
+    for o in new {
+        let key = omni_core::urlnorm::normalize(&o.url);
+        if list.len() >= MAX_OFFERED || list.iter().any(|e| omni_core::urlnorm::normalize(&e.url) == key) {
+            continue;
+        }
+        let mut o = o.clone();
+        if used.contains(&o.index_str) && !base.is_empty() {
+            let (_, name) = suffixer(&base);
+            if let Some(free) = (1..1000).map(&name).find(|n| !used.contains(n)) {
+                o.index_str = free;
+            }
+        }
+        used.push(o.index_str.clone());
+        list.push(o.clone());
+        added.push(o);
+    }
+    if !added.is_empty() {
+        match serde_json::to_string(&list) {
             Ok(json) => {
                 let _ = repo.set_candidates(job_id, Some(&json));
-                let _ = repo.record_event(
-                    job_id,
-                    "INFO",
-                    Some(omni_core::models::JobStage::Extract),
-                    &format!("{} more video(s) in this article offered to MCR", plan.offered.len()),
-                );
             }
             Err(e) => tracing::warn!("Job #{job_id}: could not store offered videos: {e}"),
         }
+    }
+    added
+}
+
+/// The timeline line for a video the site shows on its other articles too (P3.16).
+pub fn site_wide_line(url: &str, other_articles: usize) -> String {
+    format!("Video not taken, shown on {other_articles} other articles of this site this week: {url}")
+}
+
+/// Offer to MCR the videos this page shares with other articles of its site
+/// (site furniture, P3.16): never the job's video and never queued. Each is
+/// added to the job's offered list (after what the article's own siblings left
+/// there, none twice, at most [`MAX_OFFERED`]) with a WARN event saying on how
+/// many other articles it was seen. A video already offered (by an earlier look
+/// or retry) is neither added nor said again. Best effort, like [`queue_article_siblings`].
+pub fn offer_site_wide(repo: &omni_core::repository::Repository, job: &omni_core::models::Job, furniture: &[omni_core::site_videos::Furniture]) {
+    if furniture.is_empty() {
+        return;
+    }
+    let job_id = job.id;
+    // What was queued as this job's sibling, or is the job's own video, is not offered.
+    let children: Vec<String> = repo.jobs_with_children(job_id).map(|j| j.into_iter().map(|c| c.url).collect()).unwrap_or_default();
+    drop_offers(repo, job_id, &children);
+    let existing = stored_offers(repo, job_id);
+    let queued = repo.jobs_with_children(job_id).map(|j| j.len().saturating_sub(1)).unwrap_or(0);
+    let base = base_index(&job.index_str);
+    let (_, name) = suffixer(&base);
+    let mut new: Vec<Offered> = Vec::new();
+    for f in furniture {
+        let key = omni_core::urlnorm::normalize(&f.url);
+        let queued_already = children.iter().any(|c| omni_core::urlnorm::normalize(c) == key);
+        if queued_already || existing.iter().any(|o| omni_core::urlnorm::normalize(&o.url) == key) {
+            continue;
+        }
+        new.push(Offered { url: f.url.clone(), index_str: name(queued + existing.len() + new.len() + 1), queued_job_id: None });
+    }
+    for o in merge_offers(repo, job_id, &new) {
+        let others = furniture.iter().find(|f| f.url == o.url).map(|f| f.other_articles).unwrap_or(1);
+        tracing::info!("Job #{job_id}: {}", site_wide_line(&omni_core::cookies::host_and_path(&o.url), others));
+        let _ = repo.record_event(job_id, "WARN", Some(omni_core::models::JobStage::Extract), &site_wide_line(&o.url, others));
     }
 }
 
