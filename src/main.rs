@@ -1169,6 +1169,10 @@ async fn run_daemon(
     info!("  ffprobe:      {:?}", ffprobe_path);
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
     info!("  yt-dlp:       {:?}", ytdl_path);
+    match deno_banner_line(&dep_mgr) {
+        (true, line) => info!("{line}"),
+        (false, line) => warn!("{line}"),
+    }
 
     // The benchmark (P6.4) runs the same tools beside the workers, never through them.
     let bench_tools = benchmark::Tools {
@@ -3517,6 +3521,15 @@ async fn nightly_ytdl_update(
 
 /// Report Deno's state, and install it when it is missing and automatic
 /// updates are on. Returns whether a working Deno is in place.
+/// The banner's Deno line (P6.8b): yt-dlp needs Deno for YouTube, and a banner
+/// without it made a present `bin/deno.exe` look missing. `true` = found.
+fn deno_banner_line(dep_mgr: &DependencyManager) -> (bool, String) {
+    match dep_mgr.deno_version() {
+        Some(v) => (true, format!("  deno:         {:?} ({v})", dep_mgr.deno_live())),
+        None => (false, format!("  deno:         missing from {:?}: YouTube downloads fail", dep_mgr.get_bin_dir())),
+    }
+}
+
 async fn ensure_deno(dep_mgr: &DependencyManager, health: &HealthState, auto: bool) -> bool {
     use omni_core::health::{checks, Check};
     if let Some(v) = dep_mgr.deno_version() {
@@ -4208,6 +4221,15 @@ fn sweep_evidence_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_banner_names_deno_even_when_it_is_missing() {
+        // An empty bin dir that need not exist: nothing is written.
+        let dir = std::env::temp_dir().join(format!("omni-p68b-{}", std::process::id()));
+        let (found, line) = super::deno_banner_line(&omni_core::dependencies::DependencyManager::new(&dir));
+        assert!(!found);
+        assert!(line.contains("deno:") && line.contains("missing"), "{line}");
+    }
+
     #[tokio::test]
     async fn the_page_scan_never_picks_a_contextual_list_or_a_live_video() {
         use omni_broadcast::downloader::{choose_primary, Choice, Probe};
