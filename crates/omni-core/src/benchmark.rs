@@ -285,8 +285,10 @@ pub const EXTRACT_MIN_PCT: f64 = 95.0;
 pub const DELIVERY_MIN_PCT: f64 = 90.0;
 /// Failed compliance checks allowed in a full run.
 pub const MAX_COMPLIANCE_FAILS: usize = 0;
-/// The mean time to find a video, at most.
-pub const MEAN_EXTRACT_MAX_MS: f64 = 12_000.0;
+/// The mean time to find a video, at most. 20 s since news pages go to the browser first
+/// and their top candidates are checked before anything is queued (P3.15/P3.16; owner
+/// 2026-10-20: the 45 news links measured 16.6 s against the earlier 12 s).
+pub const MEAN_EXTRACT_MAX_MS: f64 = 20_000.0;
 
 pub fn extract_rate_passes(pct: f64) -> bool {
     pct >= EXTRACT_MIN_PCT
@@ -835,13 +837,15 @@ mod tests {
     }
 
     #[test]
-    fn mean_extraction_threshold_boundary_is_12_seconds() {
-        assert!(mean_extract_passes(12_000.0));
-        assert!(!mean_extract_passes(12_100.0));
-        let slow = [found(1, 12_100)];
+    fn mean_extraction_threshold_boundary_is_20_seconds() {
+        assert!(mean_extract_passes(20_000.0));
+        assert!(!mean_extract_passes(20_100.0));
+        // The browser-first news run of 2026-10-20 (16.6 s) passes.
+        assert!(mean_extract_passes(16_600.0));
+        let slow = [found(1, 20_100)];
         let s = summarize(Mode::Extract, &slow);
         assert_eq!(s.checks[3].pass, Some(false));
-        let ok = [found(1, 12_000)];
+        let ok = [found(1, 20_000)];
         assert_eq!(summarize(Mode::Extract, &ok).checks[3].pass, Some(true));
     }
 
