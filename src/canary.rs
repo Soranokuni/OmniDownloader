@@ -216,6 +216,9 @@ pub(crate) trait SiteProbe {
 
 pub(crate) struct LiveProbe {
     pub ytdl: PathBuf,
+    /// Where what the browser sees is remembered for the site (P3.16).
+    pub repo: Repository,
+    pub scratch: PathBuf,
 }
 
 impl SiteProbe for LiveProbe {
@@ -223,7 +226,7 @@ impl SiteProbe for LiveProbe {
         omni_browser::pages::page_status(url).await
     }
     async fn check_link(&self, url: &str) -> LinkOutcome {
-        crate::selfcheck::check_link(&self.ytdl, url).await
+        crate::selfcheck::check_link_recording(&self.ytdl, &self.repo, &self.scratch, url).await
     }
     async fn browser_works(&self, health: &HealthState) -> bool {
         crate::selfcheck::check_browser(health).await
@@ -272,6 +275,10 @@ pub(crate) async fn check_site(
             info!("Canary: out of time while checking {domain}");
             break;
         };
+        if outcome.inconclusive {
+            info!("Canary: the only videos of an article of {domain} are the site's own furniture; undecided");
+            continue;
+        }
         if let Err(e) = repo.record_canary_result(canary.id, outcome.ok, &outcome.detail) {
             warn!("Canary: result for {domain} not stored: {e:#}");
         }
@@ -364,6 +371,8 @@ pub struct CanaryEnv {
     pub repo: Repository,
     pub health: HealthState,
     pub bin_dir: PathBuf,
+    /// Where a run's copy of a site's cookie jar is written (the install's temp directory).
+    pub scratch: PathBuf,
     pub channel: String,
     /// One canary run at a time, process-wide. The 03:00 yt-dlp task holds
     /// it for its whole run too: a canary's yt-dlp has no gate pass.
@@ -386,6 +395,7 @@ impl CanaryEnv {
         Self {
             repo,
             health,
+            scratch: bin_dir.join("..").join("temp"),
             bin_dir,
             channel,
             run_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -430,6 +440,12 @@ impl CanaryEnv {
         self.outage.store(on, Ordering::SeqCst);
     }
 
+    /// Where the cookie jars of a run are written; the daemon gives its temp directory.
+    pub fn with_scratch(mut self, scratch: PathBuf) -> Self {
+        self.scratch = scratch;
+        self
+    }
+
     /// Give the self-heal the repair ladder's world. Once; later calls change nothing.
     pub fn set_heal(&self, ctx: Arc<crate::repair::RepairCtx>) {
         let _ = self.heal.set(ctx);
@@ -456,7 +472,7 @@ impl CanaryEnv {
         let domain = domain.to_string();
         tokio::spawn(async move {
             let _guard = guard;
-            let probe = LiveProbe { ytdl: env.ytdl() };
+            let probe = env.live_probe();
             let check = check_domain(&env, &probe, &domain, Instant::now() + NIGHTLY_BUDGET).await;
             let broken = settle(&env, &domain, &check, Utc::now()).await;
             // Confirmed broken in the daytime: try to find a way before a journalist's job needs it.
@@ -479,7 +495,7 @@ impl CanaryEnv {
         let domain = domain.to_string();
         tokio::spawn(async move {
             let _guard = guard;
-            let probe = LiveProbe { ytdl: env.ytdl() };
+            let probe = env.live_probe();
             manual_check(&env, &probe, &domain).await;
         });
         RunNow::Started
@@ -487,6 +503,11 @@ impl CanaryEnv {
 
     fn ytdl(&self) -> PathBuf {
         DependencyManager::new(&self.bin_dir).ytdl_live()
+    }
+
+    /// The real outside world for a check, with the memory of what the browser sees on a site's pages.
+    fn live_probe(&self) -> LiveProbe {
+        LiveProbe { ytdl: self.ytdl(), repo: self.repo.clone(), scratch: self.scratch.clone() }
     }
 }
 
@@ -603,7 +624,7 @@ async fn announce_newer_ytdl(env: &CanaryEnv) {
 /// everything failed can be recognised as an outage. Returns (checked,
 /// skipped).
 pub async fn nightly(env: &CanaryEnv) -> (usize, usize) {
-    let probe = LiveProbe { ytdl: env.ytdl() };
+    let probe = env.live_probe();
     nightly_with(env, &probe).await
 }
 
@@ -977,7 +998,7 @@ mod tests {
                 tokio::time::sleep(self.delay).await;
             }
             let ok = *self.ok.get(url).unwrap_or(&false);
-            LinkOutcome { ok, detail: if ok { "found it".into() } else { format!("no video at {url}") } }
+            LinkOutcome { inconclusive: url.contains("furniture"), ok, detail: if ok { "found it".into() } else { format!("no video at {url}") } }
         }
         async fn browser_works(&self, _health: &HealthState) -> bool {
             true
@@ -1106,6 +1127,24 @@ mod tests {
         let check = check_site(&repo, &p, "news.example", soon()).await;
         // The last one asked is the oldest.
         assert_eq!(check, SiteCheck::Fail("no video at https://news.example/a".into()));
+    }
+
+    #[tokio::test]
+    async fn a_page_whose_only_videos_are_site_furniture_is_undecided_not_failed() {
+        let (_f, repo) = repo();
+        let page = "https://news.example/furniture-only";
+        pool(&repo, &[page]);
+        let p = fake(&[(page, OK200)], &[]);
+        assert_eq!(check_site(&repo, &p, "news.example", soon()).await, SiteCheck::Unknown);
+        let rows = repo.list_canaries_for("news.example").unwrap();
+        assert!(rows.iter().all(|c| c.last_ok.is_none()), "no result is stored, so no failure is counted");
+        assert_eq!(p.asked.lock().unwrap().len(), 1, "it was asked");
+
+        // Control: a page with no video at all still fails as before.
+        let (_f2, repo2) = self::repo();
+        pool(&repo2, &["https://news.example/a"]);
+        let p2 = fake(&[("https://news.example/a", OK200)], &[]);
+        assert!(matches!(check_site(&repo2, &p2, "news.example", soon()).await, SiteCheck::Fail(_)));
     }
 
     #[tokio::test]
