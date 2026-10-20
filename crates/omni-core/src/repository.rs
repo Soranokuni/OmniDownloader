@@ -429,6 +429,9 @@ pub struct Repository {
     db_path: Option<Arc<Path>>,
     /// Live-update bus; `None` in tests and tools that nobody watches.
     events: Option<crate::events::EventBus>,
+    /// The log redactor: every cookie jar read joins it, so a jar written by
+    /// another process (the sign-in command) is redacted from its first use.
+    redactions: Option<crate::logging::Redactions>,
 }
 
 impl Repository {
@@ -449,6 +452,7 @@ impl Repository {
             pool: Arc::new(pool),
             db_path: Some(Arc::from(path.to_path_buf())),
             events: None,
+            redactions: None,
         };
         repo.run_migrations()?;
         Ok(repo)
@@ -457,6 +461,12 @@ impl Repository {
     /// Announce job changes on `bus` after they are written (P1.10).
     pub fn with_events(mut self, bus: crate::events::EventBus) -> Self {
         self.events = Some(bus);
+        self
+    }
+
+    /// Register the values of every cookie jar this repository opens with `r`.
+    pub fn with_cookie_redactions(mut self, r: crate::logging::Redactions) -> Self {
+        self.redactions = Some(r);
         self
     }
 
@@ -5992,7 +6002,12 @@ impl Repository {
             .optional()?;
         let Some(sealed) = sealed else { return Ok(None) };
         let plain = crate::secrets::unseal_bytes(&sealed).context("Could not open the cookie jar")?;
-        Ok(Some(String::from_utf8(plain).context("The cookie jar is not text")?))
+        let text = String::from_utf8(plain).context("The cookie jar is not text")?;
+        // Before the text goes anywhere: registering a value twice changes nothing.
+        if let Some(r) = &self.redactions {
+            r.extend(crate::cookies::values_of(&text));
+        }
+        Ok(Some(text))
     }
 
     /// Whether a jar exists for `domain`, without opening it.

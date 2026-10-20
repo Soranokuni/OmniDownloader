@@ -24,6 +24,8 @@ pub struct BrowserSession {
     pub browser: Browser,
     handler: tokio::task::JoinHandle<()>,
     profile: PathBuf,
+    /// A persistent profile (the sign-in profile) is never removed.
+    keep_profile: bool,
 }
 
 impl BrowserSession {
@@ -38,6 +40,9 @@ impl BrowserSession {
         }
         let _ = tokio::time::timeout(Duration::from_secs(10), self.browser.wait()).await;
         self.handler.abort();
+        if self.keep_profile {
+            return;
+        }
         // Chrome's helper processes let go of the profile a moment after the
         // main process exits.
         for _ in 0..10 {
@@ -53,7 +58,9 @@ impl BrowserSession {
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         self.handler.abort();
-        let _ = std::fs::remove_dir_all(&self.profile);
+        if !self.keep_profile {
+            let _ = std::fs::remove_dir_all(&self.profile);
+        }
     }
 }
 
@@ -130,6 +137,18 @@ pub fn desktop_user_agent(edge: bool, major: u32) -> String {
     }
 }
 
+/// The flags every headless launch (sniffer and cookie export) adds to chromiumoxide's.
+pub fn headless_args(edge: bool, major: u32) -> Vec<String> {
+    vec![
+        "--headless=new".to_string(),
+        "--disable-gpu".to_string(),
+        "--mute-audio".to_string(),
+        "--no-sandbox".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        format!("--user-agent={}", desktop_user_agent(edge, major)),
+    ]
+}
+
 impl HeadlessBrowserManager {
     pub fn find_system_browser() -> Option<PathBuf> {
         let candidates = [
@@ -154,10 +173,20 @@ impl HeadlessBrowserManager {
         let profile = unique_profile_dir(&root);
         std::fs::create_dir_all(&profile)
             .with_context(|| format!("Failed creating browser profile {profile:?}"))?;
+        Self::launch_in(Self::find_system_browser(), profile, false).await
+    }
 
+    /// Launch headless on a persistent profile (the sign-in profile) with the
+    /// debugging port, to read its cookies. The profile is kept on shutdown.
+    pub async fn launch_persistent(exe: &Path, profile: &Path) -> Result<BrowserSession> {
+        std::fs::create_dir_all(profile)
+            .with_context(|| format!("Failed creating browser profile {profile:?}"))?;
+        Self::launch_in(Some(exe.to_path_buf()), profile.to_path_buf(), true).await
+    }
+
+    async fn launch_in(exe: Option<PathBuf>, profile: PathBuf, keep_profile: bool) -> Result<BrowserSession> {
         let mut builder = BrowserConfig::builder().user_data_dir(&profile);
 
-        let exe = Self::find_system_browser();
         if let Some(edge_or_chrome) = &exe {
             info!("Found host system browser for CDP automation: {:?}", edge_or_chrome);
             builder = builder.chrome_executable(edge_or_chrome);
@@ -171,19 +200,16 @@ impl HeadlessBrowserManager {
         let major = exe.as_deref().and_then(installed_major_version).unwrap_or(FALLBACK_MAJOR);
 
         let config = builder
-            .arg("--headless=new")
-            .arg("--disable-gpu")
-            .arg("--mute-audio")
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage")
-            .arg(format!("--user-agent={}", desktop_user_agent(edge, major)))
+            .args(headless_args(edge, major))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building BrowserConfig: {}", e))?;
 
         let (browser, mut handler) = match Browser::launch(config).await {
             Ok(launched) => launched,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&profile);
+                if !keep_profile {
+                    let _ = std::fs::remove_dir_all(&profile);
+                }
                 return Err(e).context("Failed launching Chromium via CDP");
             }
         };
@@ -194,7 +220,7 @@ impl HeadlessBrowserManager {
             }
         });
 
-        Ok(BrowserSession { browser, handler, profile })
+        Ok(BrowserSession { browser, handler, profile, keep_profile })
     }
 }
 
@@ -210,6 +236,21 @@ mod tests {
         let chrome = desktop_user_agent(false, 141);
         assert!(chrome.contains("Chrome/141.0.0.0 Safari/537.36") && !chrome.contains("Headless") && !chrome.contains("Edg/"), "{chrome}");
         assert!(desktop_user_agent(true, 141).ends_with(" Edg/141.0.0.0"));
+    }
+
+    #[test]
+    fn the_sniffer_launch_flags_are_unchanged() {
+        assert_eq!(
+            headless_args(true, 141),
+            [
+                "--headless=new",
+                "--disable-gpu",
+                "--mute-audio",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
+            ]
+        );
     }
 
     #[test]

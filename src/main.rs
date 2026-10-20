@@ -28,6 +28,7 @@ use omni_web::state::AppState;
 
 mod benchmark;
 mod canary;
+mod cookies_cli;
 mod repair;
 mod selfcheck;
 mod site_memory;
@@ -105,6 +106,12 @@ enum Commands {
     Benchmark {
         #[command(subcommand)]
         action: benchmark::BenchAction,
+    },
+    /// Cookie jars for login-walled sites: sign in at this PC's desktop
+    /// (YouTube, X, Facebook, Instagram), or list the stored jars
+    Cookies {
+        #[command(subcommand)]
+        action: cookies_cli::CookiesAction,
     },
     /// Test headless browser stream sniffing on a target URL
     BrowserTest {
@@ -863,6 +870,7 @@ async fn main() -> Result<()> {
             }
             println!("{} of {} links work.", links.len() - failing, links.len());
         }
+        Some(Commands::Cookies { action }) => cookies_cli::run(&paths, action).await?,
         Some(Commands::Benchmark { action }) => {
             // Exit code 2: the run finished but a threshold failed.
             if !benchmark::cli(&paths, action).await? {
@@ -1093,9 +1101,11 @@ async fn run_daemon(
     info!("Initializing SQLite database at: {:?}", db_path);
     // One live-update bus: the repository announces job changes on it, the web server streams it (P1.10).
     let events = omni_core::events::EventBus::new();
-    let repo = Repository::new(&db_path)?.with_events(events.clone());
-    // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them.
+    let mut repo = Repository::new(&db_path)?.with_events(events.clone());
+    // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them,
+    // and every later read of a jar registers its values again (a jar the sign-in command stored).
     if let Some(r) = &log_redactions {
+        repo = repo.with_cookie_redactions(r.clone());
         r.extend(repo.cookie_values());
     }
     // A brand-new installation starts with Admin / Admin (owner's decision,
@@ -1449,10 +1459,12 @@ async fn run_daemon(
             // A minute is fine: these tasks are nightly, and the cost of a tick
             // is one indexed query against four rows.
             let mut tick = tokio::time::interval(Duration::from_secs(60));
+            let mut jars_seen = None;
             loop {
                 tokio::select! {
                     _ = sched_rx.recv() => break,
                     _ = tick.tick() => {
+                        omni_core::cookies::refresh_health_if_changed(&repo_sched, &ctx.health, &mut jars_seen);
                         run_due_tasks(&repo_sched, &specs, &ctx).await;
                     }
                 }
@@ -3881,9 +3893,9 @@ async fn run_one_task(
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
             let (mut tested, mut failing) = (0usize, Vec::<String>::new());
             for jar in &jars {
-                let Some(url) = jar.last_sample_url.as_deref() else { continue };
+                let Some(url) = omni_core::cookies::sample_url_for(&jar.domain, jar.last_sample_url.as_deref()) else { continue };
                 tested += 1;
-                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, url).await {
+                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, &url).await {
                     Ok(t) if t.ok => {}
                     Ok(_) => failing.push(jar.domain.clone()),
                     Err(why) => {
