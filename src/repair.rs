@@ -325,6 +325,12 @@ pub trait Env: Send + Sync {
 pub struct SniffSeen {
     pub stream: Option<String>,
     pub streams: usize,
+    /// Every stream the browser saw, `stream` among them (P3.16: the Test URL leaves out the site's furniture).
+    pub all: Vec<String>,
+    /// Which of `all` the page placed outside the article (a rail, a header, a contextual list).
+    pub held: Vec<String>,
+    /// Held videos the Test URL's screen left out because furniture took the article's own (yt-dlp's pick may not take them).
+    pub refused: Vec<String>,
     pub error: Option<String>,
     pub snapshot: Option<PageSnapshot>,
 }
@@ -439,7 +445,10 @@ impl Env for RealEnv {
             return SniffSeen { error: Some("the browser run ended abnormally".into()), ..Default::default() };
         };
         match s.media {
-            Ok(m) => SniffSeen { stream: Some(m.primary_stream), streams: m.all_streams.len(), error: None, snapshot: Some(s.snapshot) },
+            Ok(m) => {
+                let held = m.all_streams.iter().filter(|u| omni_browser::sniffer::is_demoted(&m.meta, u)).cloned().collect();
+                SniffSeen { stream: Some(m.primary_stream), streams: m.all_streams.len(), all: m.all_streams, held, refused: Vec::new(), error: None, snapshot: Some(s.snapshot) }
+            }
             Err(e) => SniffSeen { error: Some(format!("{e:#}").chars().take(200).collect()), snapshot: Some(s.snapshot), ..Default::default() },
         }
     }
@@ -541,6 +550,7 @@ fn rejected_before(repo: &Repository, job: &Job) -> Option<Vec<String>> {
 /// ended in failure with `code`. `None` (and nothing touched, nothing
 /// recorded) unless the failure is an unresolved video on a web page, repair
 /// is on, and MCR has not already rejected this video.
+#[cfg(test)]
 pub async fn after_failure(
     ctx: &RepairCtx,
     job: &Job,
@@ -549,6 +559,22 @@ pub async fn after_failure(
     code: ErrorCode,
     snapshot: &Option<PageSnapshot>,
     tried: Vec<Tried>,
+    cancel: &CancellationToken,
+) -> Option<LadderResult> {
+    after_failure_with(ctx, job, owner, orig_url, code, snapshot, tried, Vec::new(), cancel).await
+}
+
+/// [`after_failure`], also told which addresses the page showed that are the site's furniture
+/// (P3.16): they are dropped from the candidates as MCR's rejected ones are, so no recipe holds the promo.
+pub async fn after_failure_with(
+    ctx: &RepairCtx,
+    job: &Job,
+    owner: &str,
+    orig_url: &str,
+    code: ErrorCode,
+    snapshot: &Option<PageSnapshot>,
+    tried: Vec<Tried>,
+    furniture: Vec<String>,
     cancel: &CancellationToken,
 ) -> Option<LadderResult> {
     // The model breaker (P10.12) closes only the model rung, inside the ladder:
@@ -563,7 +589,9 @@ pub async fn after_failure(
     {
         return None;
     }
-    let prior = Prior { tried, rejected_by_mcr: rejected_before(&ctx.repo, job)?, skips: skips_of_site(&ctx.repo, job, orig_url)? };
+    let mut rejected_by_mcr = rejected_before(&ctx.repo, job)?;
+    rejected_by_mcr.extend(furniture);
+    let prior = Prior { tried, rejected_by_mcr, skips: skips_of_site(&ctx.repo, job, orig_url)? };
     Some(run(ctx, job, owner, orig_url, snapshot.clone(), &prior, cancel).await)
 }
 

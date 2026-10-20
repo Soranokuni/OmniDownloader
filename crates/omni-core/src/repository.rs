@@ -2852,6 +2852,131 @@ impl Repository {
         Ok(n)
     }
 
+    /// Note that an article of `domain` showed these videos (P3.16). `identities` are the hashes of
+    /// every address the article is known by, the address asked for first. They are aliases of one
+    /// article: the one an alias already belongs to (a short link first, the direct link later, or the
+    /// other way round), else a new one named after the first. When the aliases belong to two
+    /// articles stored so far, these are one article and are merged. Hashes only. Seeing the same
+    /// video on the same article again moves its `seen_at`, so it is one sighting.
+    pub fn record_site_videos(
+        &self,
+        domain: &str,
+        identities: &[String],
+        video_hashes: &[String],
+        at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let Some(first) = identities.first() else { return Ok(()) };
+        if video_hashes.is_empty() {
+            return Ok(());
+        }
+        let domain = domain.trim().to_lowercase();
+        let seen = timestamps::format(at);
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut known: Vec<String> = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT article_id FROM site_video_pages WHERE page_hash = ?")?;
+            for id in identities {
+                if let Some(a) = stmt.query_row(params![id], |r| r.get::<_, String>(0)).optional()? {
+                    if !known.contains(&a) {
+                        known.push(a);
+                    }
+                }
+            }
+        }
+        let article = known.first().cloned().unwrap_or_else(|| first.clone());
+        for other in known.iter().skip(1) {
+            // The other article's sightings move to the survivor; where both saw a video the newer sighting stays.
+            tx.execute(
+                "INSERT INTO site_videos (domain, video_hash, article_id, seen_at)
+                 SELECT domain, video_hash, ?, seen_at FROM site_videos WHERE article_id = ? 
+                 ON CONFLICT(domain, video_hash, article_id) DO UPDATE SET seen_at = MAX(seen_at, excluded.seen_at)",
+                params![article, other],
+            )?;
+            tx.execute("DELETE FROM site_videos WHERE article_id = ?", params![other])?;
+            tx.execute("UPDATE site_video_pages SET article_id = ? WHERE article_id = ?", params![article, other])?;
+        }
+        {
+            let mut alias = tx.prepare(
+                "INSERT INTO site_video_pages (domain, page_hash, article_id, seen_at) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(page_hash) DO UPDATE SET seen_at = excluded.seen_at",
+            )?;
+            for id in identities {
+                alias.execute(params![domain, id, article, seen])?;
+            }
+            let mut sight = tx.prepare(
+                "INSERT INTO site_videos (domain, video_hash, article_id, seen_at) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(domain, video_hash, article_id) DO UPDATE SET seen_at = excluded.seen_at",
+            )?;
+            for v in video_hashes {
+                sight.execute(params![domain, v, article, seen])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Of `video_hashes`, those seen on at least `SITE_WIDE_MIN_ARTICLES`
+    /// different articles of `domain` since `since`, with that number of
+    /// articles. `this_article` is every identity of the article being asked about
+    /// (see `PageKey::identities`): the articles those addresses belong to are not
+    /// other articles, and the article itself counts as one, stored or not. Empty:
+    /// only the stored articles count.
+    pub fn site_wide(
+        &self,
+        domain: &str,
+        video_hashes: &[String],
+        since: chrono::DateTime<Utc>,
+        this_article: &[String],
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        let mut out = std::collections::HashMap::new();
+        if video_hashes.is_empty() {
+            return Ok(out);
+        }
+        let domain = domain.trim().to_lowercase();
+        let since = timestamps::format(since);
+        let conn = self.pool.get()?;
+        let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = conn.prepare("SELECT article_id FROM site_video_pages WHERE page_hash = ?")?;
+            for id in this_article {
+                if let Some(a) = stmt.query_row(params![id], |r| r.get::<_, String>(0)).optional()? {
+                    mine.insert(a);
+                }
+            }
+        }
+        let mut stmt = conn
+            .prepare("SELECT article_id FROM site_videos WHERE domain = ? AND video_hash = ? AND seen_at >= ?")?;
+        for v in video_hashes {
+            let mut pages: std::collections::HashSet<String> = stmt
+                .query_map(params![domain, v, since], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut n = {
+                pages.retain(|a| !mine.contains(a));
+                pages.len()
+            };
+            if !this_article.is_empty() {
+                n += 1;
+            }
+            if n >= crate::site_videos::SITE_WIDE_MIN_ARTICLES {
+                out.insert(v.clone(), n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete sightings last seen before `before`, and the aliases of articles with no sighting
+    /// left. Returns the sightings removed. Retention.
+    pub fn purge_site_videos(&self, before: chrono::DateTime<Utc>) -> Result<usize> {
+        let conn = self.pool.get()?;
+        let n = conn.execute("DELETE FROM site_videos WHERE seen_at < ?", params![timestamps::format(before)])?;
+        conn.execute(
+            "DELETE FROM site_video_pages WHERE article_id NOT IN (SELECT DISTINCT article_id FROM site_videos)",
+            [],
+        )?;
+        Ok(n)
+    }
+
     /// Clear a site's run of failures after a canary passed (plan P10.4).
     pub fn reset_site_failures(&self, domain: &str) -> Result<()> {
         let conn = self.pool.get()?;

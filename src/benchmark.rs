@@ -582,6 +582,11 @@ trait ExtractSteps: Send + Sync {
     async fn sniff(&self, url: &str) -> Option<Sniff>;
     /// yt-dlp's say on one of the browser's candidates, with the browser's session.
     async fn probe(&self, candidate: &str, session: &Sniff) -> Probe;
+    /// Which of `urls` the site shows on several of its articles (P3.16), video hash to the number of
+    /// articles. Read only: the benchmark never records. `seen` is the browser's look at the page.
+    async fn site_wide(&self, _page: &str, _urls: &[String], _seen: Option<&Sniff>) -> std::collections::HashMap<String, usize> {
+        std::collections::HashMap::new()
+    }
 }
 
 /// What a sniff found: its candidates in rank order (address, held), its own primary, the
@@ -593,6 +598,8 @@ struct Sniff {
     user_agent: String,
     cookies: Option<String>,
     final_url: Option<String>,
+    /// The page's own canonical address, for its identity among the site's articles (P3.16).
+    canonical: Option<String>,
 }
 
 /// How the browser's step ended.
@@ -607,12 +614,25 @@ enum SniffStep {
 /// The browser's step as `run_job` takes it (P3.15): every candidate is asked before the
 /// video is chosen, a gone or live one is skipped, and a page the browser ended on a video
 /// platform's page counts as finding nothing when the browser was asked first.
-async fn sniff_and_choose(steps: &dyn ExtractSteps, url: &str, sniff_first: bool) -> SniffStep {
+async fn sniff_and_choose(steps: &dyn ExtractSteps, url: &str, sniff_first: bool, refused: &mut Vec<String>) -> SniffStep {
     let Some(s) = steps.sniff(url).await else { return SniffStep::Nothing };
     if sniff_first && omni_broadcast::downloader::landed_on_platform(s.final_url.as_deref()) {
         return SniffStep::Nothing;
     }
-    let urls: Vec<String> = s.streams.iter().map(|(u, _)| u.clone()).collect();
+    let all: Vec<String> = s.streams.iter().map(|(u, _)| u.clone()).collect();
+    // A video the site shows on its other articles is never the job's: read from the memory a job
+    // fills, not added to it (P3.16).
+    let wide = steps.site_wide(url, &all, Some(&s)).await;
+    let (urls, furniture) = omni_core::site_videos::split_site_wide(&all, &wide);
+    let held = |u: &str| s.streams.iter().any(|(k, h)| k == u && *h);
+    // Furniture took the article's own video and no own one is left: none is taken for the article's.
+    let (urls, dropped_held) = crate::site_memory::leave_nothing_held(furniture.iter().any(|f| !held(&f.url)), urls, held);
+    // yt-dlp's own pick afterwards may not take the held ones this left out either.
+    refused.extend(dropped_held);
+    if urls.is_empty() && !furniture.is_empty() {
+        // The browser took nothing: yt-dlp's own pick is asked next, and refused if it is furniture too, as in a job.
+        return SniffStep::Nothing;
+    }
     let cands = omni_broadcast::downloader::sniffed_cands(&urls, |u| s.streams.iter().any(|(k, held)| k == u && *held));
     let chosen = if cands.is_empty() {
         Some(s.primary.clone())
@@ -659,11 +679,12 @@ async fn extract_with(steps: &dyn ExtractSteps, url: &str) -> StageResult<Extrac
             cookies: None,
         });
     }
+    let mut refused: Vec<String> = Vec::new();
     let is_platform = omni_broadcast::downloader::is_video_platform(url);
     let scan = if is_platform { PageScan::default() } else { steps.page_scan(url).await };
     let route = first_attempt_resolved(false, is_platform, false, &scan, url, |u| async move { steps.final_url(&u).await }).await;
     if route != FirstAttempt::YtDlp {
-        match sniff_and_choose(steps, url, route == FirstAttempt::SnifferFirst).await {
+        match sniff_and_choose(steps, url, route == FirstAttempt::SnifferFirst, &mut refused).await {
             SniffStep::Found(found) => return Ok(found),
             SniffStep::Ended(code) => return Err(code.as_str().to_string()),
             SniffStep::Nothing => {}
@@ -672,26 +693,33 @@ async fn extract_with(steps: &dyn ExtractSteps, url: &str) -> StageResult<Extrac
             return Err(ErrorCode::NoStreamFound.as_str().to_string());
         }
     }
-    let why = match steps.ytdlp(url).await {
-        Ok(duration_secs) => {
-            return Ok(Extracted {
-                method: "yt-dlp".into(),
-                candidates: 1,
-                duration_secs,
-                stream: url.to_string(),
-                referer: None,
-                user_agent: None,
-                cookies: None,
-            })
+    // yt-dlp's own pick is a video the site shows on its other articles: not taken, as in a job (P3.16).
+    let refused_media = scan.media_urls.iter().any(|m| refused.iter().any(|r| omni_core::site_videos::video_key(r) == omni_core::site_videos::video_key(m)));
+    let pick_is_furniture = !scan.media_urls.is_empty() && (refused_media || !steps.site_wide(url, &scan.media_urls, None).await.is_empty());
+    let why = if pick_is_furniture {
+        ErrorCode::NoStreamFound
+    } else {
+        match steps.ytdlp(url).await {
+            Ok(duration_secs) => {
+                return Ok(Extracted {
+                    method: "yt-dlp".into(),
+                    candidates: 1,
+                    duration_secs,
+                    stream: url.to_string(),
+                    referer: None,
+                    user_agent: None,
+                    cookies: None,
+                })
+            }
+            Err(reason) => classify_download_error(&reason),
         }
-        Err(reason) => classify_download_error(&reason),
     };
     // The browser, for the pages yt-dlp cannot read, as a job would; it already looked
     // when it was asked first.
     if route == FirstAttempt::SnifferFirst || !why.should_sniff(url) {
         return Err(why.as_str().to_string());
     }
-    match sniff_and_choose(steps, url, false).await {
+    match sniff_and_choose(steps, url, false, &mut refused).await {
         SniffStep::Found(found) => Ok(found),
         SniffStep::Ended(code) => Err(code.as_str().to_string()),
         SniffStep::Nothing => Err(ErrorCode::NoStreamFound.as_str().to_string()),
@@ -738,9 +766,20 @@ impl ExtractSteps for RealStages {
                 user_agent: bundle.user_agent,
                 cookies: bundle.cookies,
                 final_url: sniffed.snapshot.final_url,
+                canonical: sniffed.snapshot.canonical,
             }),
             Err(_) => None,
         }
+    }
+
+    async fn site_wide(&self, page: &str, urls: &[String], seen: Option<&Sniff>) -> std::collections::HashMap<String, usize> {
+        let snapshot = seen.map(|s| {
+            let mut snap = omni_browser::PageSnapshot::new(page);
+            snap.final_url = s.final_url.clone();
+            snap.canonical = s.canonical.clone();
+            snap
+        });
+        crate::site_memory::recall(&self.repo, page, snapshot.as_ref(), urls)
     }
 
     async fn probe(&self, candidate: &str, session: &Sniff) -> Probe {

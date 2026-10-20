@@ -753,6 +753,29 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         );
         "#,
     ),
+    (
+        29,
+        // Site furniture (P3.16): which videos the browser saw on which article of a site. An
+        // article is known by several addresses (a short link, the address it ended on, its
+        // canonical), all aliases of one article id. Hashes only; a stream address may carry a token.
+        r#"
+        CREATE TABLE IF NOT EXISTS site_video_pages (
+            domain     TEXT NOT NULL,
+            page_hash  TEXT PRIMARY KEY,
+            article_id TEXT NOT NULL,
+            seen_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_site_video_pages_article ON site_video_pages(article_id);
+        CREATE TABLE IF NOT EXISTS site_videos (
+            domain     TEXT NOT NULL,
+            video_hash TEXT NOT NULL,
+            article_id TEXT NOT NULL,
+            seen_at    TEXT NOT NULL,
+            PRIMARY KEY (domain, video_hash, article_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_site_videos_seen ON site_videos(domain, video_hash, seen_at);
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
