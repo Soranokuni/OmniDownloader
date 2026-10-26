@@ -44,6 +44,11 @@ try {
     foreach ($f in 'Install.cmd', 'Uninstall.cmd', 'README.txt') {
         Copy-Item (Join-Path $PSScriptRoot "package\$f") $stage
     }
+    # The operator and administrator guides travel with every release.
+    New-Item -ItemType Directory -Force (Join-Path $stage 'docs') | Out-Null
+    foreach ($f in 'USER_GUIDE.md', 'ADMIN_GUIDE.md') {
+        Copy-Item (Join-Path $root "docs\$f") (Join-Path $stage 'docs')
+    }
 
     # Broadcast tools: required.
     foreach ($t in 'ffmpeg.exe', 'ffprobe.exe', 'bmxtranswrap.exe') {

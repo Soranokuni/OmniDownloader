@@ -10,6 +10,20 @@ Pure Rust, one `omni-ingest.exe`, runs as a Windows service.
 
 ---
 
+## Documentation
+
+- **[User Guide](docs/USER_GUIDE.md)**: the MCR desk and the journalist
+  panel, job states, approvals, what to do when a job stops.
+- **[Administrator Guide](docs/ADMIN_GUIDE.md)**: installing and upgrading,
+  configuration, the toolchain, cookies, health lines, scheduled maintenance,
+  the command line, error codes, troubleshooting.
+
+Quick start for a station: build or download a release, run `Install.cmd`,
+open `http://<pc>:8080/admin`, sign in as `Admin` / `Admin` and replace that
+account at once. The Administrator Guide covers the rest.
+
+---
+
 ## The problem this solves
 
 A journalist emails a numbered rundown: ten stories, each with a link to a
@@ -222,14 +236,25 @@ cargo build --release
 cargo test --workspace
 ```
 
-The four external tools are **not** in this repository (214 MB). Place them in
-`bin/` before running the pipeline:
+The external tools are **not** in this repository. They live in `bin/`; a
+running daemon installs or repairs them from **Admin → Toolchain**, and
+`scripts\package.ps1` copies them into a release:
 
-| Tool | Source |
-|---|---|
-| `ffmpeg.exe`, `ffprobe.exe` | any recent FFmpeg build with `mpeg2video` and `mxf` |
-| `bmxtranswrap.exe` | [bmx](https://github.com/bbc/bmx) (BBC) |
-| `yt-dlp.exe` | [yt-dlp](https://github.com/yt-dlp/yt-dlp) releases |
+| Tool | Version | Source |
+|---|---|---|
+| `ffmpeg.exe`, `ffprobe.exe` | 9.0.2, pinned by SHA-256 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) full build |
+| `bmxtranswrap.exe` | 1.6.0, pinned by SHA-256 | [bmx](https://github.com/bbc/bmx) (BBC) |
+| `yt-dlp.exe` | latest stable, verified nightly update | [yt-dlp](https://github.com/yt-dlp/yt-dlp) releases |
+| `deno.exe` | latest | [Deno](https://github.com/denoland/deno) (yt-dlp needs it for YouTube) |
+
+The encoder and wrapper are pinned on purpose: the broadcast output was
+validated with those exact builds, and they are never upgraded on their own.
+
+To build a release folder and zip under `dist\`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
+```
 
 ## Running
 
@@ -383,8 +408,9 @@ base URL it was saved with.
 |---|---|
 | `config.json` | deployment-specific; `config.example.json` ships the shape |
 | `data/secrets.bin` | encrypted credential store, tied to the machine |
-| `data/journalists.seed.json` | real staff names and work addresses |
-| `data/omni.db*` | the live queue and archive |
+| `data/journalists.seed.json`, `data/taxonomy.json` | real staff names and work addresses |
+| `data/omni.db*`, `data/backups/` | the live queue and archive |
+| `data/signin-profile/` | the browser profile holding live site logins |
 | `bin/`, `temp/`, `logs/`, `archive/`, `watchfolder/` | runtime state and vendored binaries |
 
 ## Licence
