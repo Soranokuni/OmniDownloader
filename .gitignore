@@ -3,18 +3,17 @@
 **/*.rs.bk
 *.pdb
 
-# ---- External tool binaries (214 MB; fetched by scripts/fetch_tools.ps1) ----
+# ---- External tool binaries (~800 MB; installed by Admin -> Toolchain) ----
 /bin/
 /dist/
 
-# ---- Runtime state: databases, WAL, backups ----
-/data/omni.db
-/data/omni.db-shm
-/data/omni.db-wal
-/data/backups/
-/data/adblock/
-/data/benchmarks/
-/data/secrets.bin
+# ---- Runtime state ----
+# Everything the daemon writes under data/: the database, its WAL and
+# backups, the sealed secret store, adblock lists, benchmark runs and the
+# sign-in browser profile (data/signin-profile holds live site logins).
+# Only the invented example seeds are tracked.
+/data/*
+!/data/*.example.json
 
 # ---- Runtime working directories ----
 /temp/
@@ -91,8 +90,8 @@ taxonomy.json
 # These are how the work gets done, not part of what ships. They name internal
 # defect ids, the station's own conventions and the order the hardening is being
 # carried out in; none of that is useful to someone reading the repository, and
-# some of it would go stale the moment it was published. README.md is the one
-# Markdown file that is deliberately tracked.
+# some of it would go stale the moment it was published. README.md and the
+# guides under docs/ are the Markdown files that are deliberately tracked.
 /AGENTS.md
 /CLAUDE.md
 /SKILL.md
@@ -105,3 +104,10 @@ taxonomy.json
 /.github/copilot-instructions.md
 /.windsurfrules
 /.aider*
+
+# ---- Leftovers from merges, patches and crash dumps ----
+*.orig
+*.rej
+*.patch
+*.dmp
+.DS_Store
