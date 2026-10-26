@@ -2302,7 +2302,7 @@ async fn probe_page(
         )
         .await;
         let spent = u32::try_from(stats.calls).unwrap_or(u32::MAX);
-        let _ = llm_left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(spent)));
+        let _ = llm_left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(spent)));
         if stats.calls > 0 {
             info!("Self-heal: {domain}: model rung, {} round(s), {} call(s)", stats.rounds, stats.calls);
         }
