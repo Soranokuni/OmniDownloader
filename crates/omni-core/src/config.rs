@@ -777,7 +777,7 @@ fn default_db_path() -> String {
     "data/omni.db".to_string()
 }
 fn default_watchfolder() -> String {
-    "C:/Users/Shado/Videos/test".to_string()
+    "watchfolder".to_string()
 }
 fn default_temp_path() -> String {
     "temp".to_string()

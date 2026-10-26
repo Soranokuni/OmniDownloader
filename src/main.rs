@@ -35,7 +35,7 @@ mod site_memory;
 
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
-#[command(author = "Alex Fountas <afountas@cretetv.gr>")]
+#[command(author = "Alex Fountas")]
 #[command(version = "1.0.0")]
 #[command(about = "Unified Broadcast-Grade Media Ingest Engine & Windows Service")]
 struct Cli {

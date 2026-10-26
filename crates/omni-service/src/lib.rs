@@ -452,7 +452,7 @@ mod tests {
             );
         }
 
-        for name in [r"CRETETV\svc_omni", r".\omniservice", "svc_omni@cretetv.gr"] {
+        for name in [r"NEWSROOM\svc_omni", r".\omniservice", "svc_omni@example.org"] {
             assert!(
                 !ServiceAccount::is_passwordless_builtin(name),
                 "{name} is a real account and does need a password"
