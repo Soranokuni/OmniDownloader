@@ -1,6 +1,7 @@
 pub mod admin_bench;
 pub mod admin_cookies;
 pub mod admin_sites;
+pub mod admin_tools;
 pub mod assets;
 pub mod auth;
 pub mod middleware;

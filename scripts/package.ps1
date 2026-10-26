@@ -44,6 +44,11 @@ try {
     foreach ($f in 'Install.cmd', 'Uninstall.cmd', 'README.txt') {
         Copy-Item (Join-Path $PSScriptRoot "package\$f") $stage
     }
+    # The operator and administrator guides travel with every release.
+    New-Item -ItemType Directory -Force (Join-Path $stage 'docs') | Out-Null
+    foreach ($f in 'USER_GUIDE.md', 'ADMIN_GUIDE.md') {
+        Copy-Item (Join-Path $root "docs\$f") (Join-Path $stage 'docs')
+    }
 
     # Broadcast tools: required.
     foreach ($t in 'ffmpeg.exe', 'ffprobe.exe', 'bmxtranswrap.exe') {
@@ -73,6 +78,7 @@ try {
     }
     $deno = Join-Path $root 'bin\deno.exe'
     if (Test-Path $deno) { Copy-Item $deno (Join-Path $stage 'bin') }
+    else { Write-Warning "No deno.exe in bin\: YouTube downloads fail until the service downloads it" }
 
     if ($IncludeRoster) {
         New-Item -ItemType Directory -Force (Join-Path $stage 'data') | Out-Null

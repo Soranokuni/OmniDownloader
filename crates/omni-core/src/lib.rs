@@ -27,3 +27,4 @@ pub mod update_gate;
 pub mod urlnorm;
 pub mod auth;
 pub mod dependencies;
+pub mod toolpins;

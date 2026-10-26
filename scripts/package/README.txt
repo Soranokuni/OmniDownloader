@@ -47,6 +47,10 @@ CHECK
   SHA256SUMS.txt lists every file's checksum.
   Logs: C:\OmniIngest\logs   Health: http://127.0.0.1:8080/api/health
 
+GUIDES
+  docs\USER_GUIDE.md    the MCR desk and the journalist panel
+  docs\ADMIN_GUIDE.md   configuration, cookies, toolchain, troubleshooting
+
 ---------------------------------------------------------------------------
 
 ΕΓΚΑΤΑΣΤΑΣΗ

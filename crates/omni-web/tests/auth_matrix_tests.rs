@@ -644,6 +644,30 @@ const MATRIX: &[Row] = &[
         "/api/admin/rollback-ytdl",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied)],
     ),
+    // The toolchain card's Install / Repair (P9.3): admin only. An unknown
+    // tool name keeps the admin's request from starting a download here (400).
+    (
+        "GET",
+        "/api/admin/tools",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ],
+    ),
+    (
+        "POST",
+        "/api/admin/tools/nosuchtool/install",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ],
+    ),
     (
         "GET",
         "/api/admin/maintenance",

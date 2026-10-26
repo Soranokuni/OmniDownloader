@@ -28,6 +28,7 @@ use omni_web::state::AppState;
 
 mod benchmark;
 mod canary;
+mod cookies_cli;
 mod repair;
 mod selfcheck;
 mod site_memory;
@@ -105,6 +106,12 @@ enum Commands {
     Benchmark {
         #[command(subcommand)]
         action: benchmark::BenchAction,
+    },
+    /// Cookie jars for login-walled sites: sign in at this PC's desktop
+    /// (YouTube, X, Facebook, Instagram), or list the stored jars
+    Cookies {
+        #[command(subcommand)]
+        action: cookies_cli::CookiesAction,
     },
     /// Test headless browser stream sniffing on a target URL
     BrowserTest {
@@ -863,6 +870,7 @@ async fn main() -> Result<()> {
             }
             println!("{} of {} links work.", links.len() - failing, links.len());
         }
+        Some(Commands::Cookies { action }) => cookies_cli::run(&paths, action).await?,
         Some(Commands::Benchmark { action }) => {
             // Exit code 2: the run finished but a threshold failed.
             if !benchmark::cli(&paths, action).await? {
@@ -1093,9 +1101,11 @@ async fn run_daemon(
     info!("Initializing SQLite database at: {:?}", db_path);
     // One live-update bus: the repository announces job changes on it, the web server streams it (P1.10).
     let events = omni_core::events::EventBus::new();
-    let repo = Repository::new(&db_path)?.with_events(events.clone());
-    // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them.
+    let mut repo = Repository::new(&db_path)?.with_events(events.clone());
+    // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them,
+    // and every later read of a jar registers its values again (a jar the sign-in command stored).
     if let Some(r) = &log_redactions {
+        repo = repo.with_cookie_redactions(r.clone());
         r.extend(repo.cookie_values());
     }
     // A brand-new installation starts with Admin / Admin (owner's decision,
@@ -1136,6 +1146,9 @@ async fn run_daemon(
 
     // Dependency manager and tool paths
     let dep_mgr = DependencyManager::new(&bin_dir);
+    // A swap that died part-way is finished forward when its staged files match the pin, else
+    // discarded; a .prev is never put back (P9.3).
+    dep_mgr.recover_interrupted_swaps();
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
@@ -1163,12 +1176,39 @@ async fn run_daemon(
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("yt-dlp"))
         .unwrap_or_else(|| PathBuf::from("yt-dlp.exe"));
+    // Tools that were not in bin/ now: the paths above are fixed for this run, so
+    // an install from the admin panel is only used after a restart (P9.3).
+    let tools_missing_at_start: Vec<String> = [
+        ("ffmpeg", config.ffmpeg_path.is_none() && !bin_dir.join("ffmpeg.exe").is_file()),
+        ("ffprobe", config.ffprobe_path.is_none() && !bin_dir.join("ffprobe.exe").is_file()),
+        ("bmxtranswrap", config.bmxtranswrap_path.is_none() && !bin_dir.join("bmxtranswrap.exe").is_file()),
+        ("yt-dlp", config.ytdl_path.is_none() && !dep_mgr.ytdl_live().is_file()),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(name, _)| name.to_string())
+    .collect();
+
+    // The paths config.json sets: what the daemon runs, whatever bin/ holds.
+    let tool_overrides: Vec<(String, PathBuf)> = [
+        ("ffmpeg", &config.ffmpeg_path),
+        ("ffprobe", &config.ffprobe_path),
+        ("bmxtranswrap", &config.bmxtranswrap_path),
+        ("yt-dlp", &config.ytdl_path),
+    ]
+    .into_iter()
+    .filter_map(|(name, p)| p.as_ref().map(|p| (name.to_string(), PathBuf::from(p))))
+    .collect();
 
     info!("Broadcast Toolchain:");
     info!("  ffmpeg:       {:?}", ffmpeg_path);
     info!("  ffprobe:      {:?}", ffprobe_path);
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
     info!("  yt-dlp:       {:?}", ytdl_path);
+    match deno_banner_line(&dep_mgr) {
+        (true, line) => info!("{line}"),
+        (false, line) => warn!("{line}"),
+    }
 
     // The benchmark (P6.4) runs the same tools beside the workers, never through them.
     let bench_tools = benchmark::Tools {
@@ -1320,6 +1360,15 @@ async fn run_daemon(
     omni_core::cookies::refresh_health(&repo, &health);
     // Only the Windows service locks its folders; a console run would lock the developer out.
     lock_down_install(service_shutdown_rx.is_some(), &[paths.data.clone(), temp_path.clone()], &health).await;
+    // The «pinned tools» health line; the panel's installs refresh it and share the hash cache.
+    let tool_installer = omni_core::dependencies::ToolInstaller::new();
+    {
+        let override_map: std::collections::HashMap<String, PathBuf> = tool_overrides.iter().cloned().collect();
+        let (mgr, st) = (DependencyManager::new(&bin_dir), tool_installer.clone());
+        if let Ok(check) = tokio::task::spawn_blocking(move || mgr.pinned_tools_check(&st, &override_map)).await {
+            health.set(omni_core::health::checks::PINNED_TOOLS, check);
+        }
+    }
     let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_url_tester(url_tester.clone())
         .with_cookie_tester(Arc::new(CookieJarTester {
@@ -1338,6 +1387,11 @@ async fn run_daemon(
         .with_health(health.clone())
         .with_llm(live_llm.clone())
         .with_busy_jobs(busy_jobs.clone())
+        .with_update_gate(update_gate.clone())
+        .with_tool_dirs(bin_dir.clone(), tools_missing_at_start)
+        .with_tool_overrides(tool_overrides)
+        .with_tool_installer(tool_installer)
+        .with_canary_lock(canary_env.run_lock_handle())
         .with_temp_dir(temp_path.clone())
         .with_events(events.clone());
     if let Some(r) = &log_redactions {
@@ -1445,10 +1499,12 @@ async fn run_daemon(
             // A minute is fine: these tasks are nightly, and the cost of a tick
             // is one indexed query against four rows.
             let mut tick = tokio::time::interval(Duration::from_secs(60));
+            let mut jars_seen = None;
             loop {
                 tokio::select! {
                     _ = sched_rx.recv() => break,
                     _ = tick.tick() => {
+                        omni_core::cookies::refresh_health_if_changed(&repo_sched, &ctx.health, &mut jars_seen);
                         run_due_tasks(&repo_sched, &specs, &ctx).await;
                     }
                 }
@@ -3420,6 +3476,9 @@ async fn nightly_ytdl_update(
 
     info!("Running scheduled nightly yt-dlp update check...");
 
+    // The one swapper at a time (the admin's Install, the legacy routes, Deno): staging
+    // shares `yt-dlp.staged`, and the gate has one flag.
+    let mut swap = gate.lock_swaps().await;
     let staged = match dep_mgr.stage_ytdl(channel).await {
         Ok(s) => s,
         Err(e) => {
@@ -3450,12 +3509,11 @@ async fn nightly_ytdl_update(
 
     // Up to ten minutes for in-flight downloads. Longer than any sane clip and
     // shorter than the gap to the next bulletin.
-    if !gate.pause_and_drain(Duration::from_secs(600)).await {
-        gate.resume();
+    if !swap.drain(Duration::from_secs(600)).await {
         warn!(
             "yt-dlp update postponed: {} download(s) still running after 10 minutes. The \
              verified build stays staged and will be applied on the next attempt.",
-            gate.active()
+            swap.active()
         );
         // Skipped, not failed: nothing is wrong, the pipeline was simply busy,
         // and an operator reading the maintenance panel should not be sent
@@ -3467,7 +3525,6 @@ async fn nightly_ytdl_update(
     let installed = match outcome {
         Ok(path) => path,
         Err(e) => {
-            gate.resume();
             warn!("Nightly yt-dlp update failed to install: {e:#}");
             let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
             return TaskOutcome::Failed;
@@ -3480,7 +3537,7 @@ async fn nightly_ytdl_update(
     // the release broke it: the old build goes back and this one is marked
     // rejected. A link both fail is the site, not the update.
     let verdict = verify_ytdl_update(dep_mgr, &installed, repo).await;
-    gate.resume();
+    drop(swap);
     match verdict {
         UpdateVerdict::Kept { checked } => {
             info!("Nightly yt-dlp updated to {:?} ({checked} self-check link(s) still work)", installed);
@@ -3517,6 +3574,15 @@ async fn nightly_ytdl_update(
 
 /// Report Deno's state, and install it when it is missing and automatic
 /// updates are on. Returns whether a working Deno is in place.
+/// The banner's Deno line (P6.8b): yt-dlp needs Deno for YouTube, and a banner
+/// without it made a present `bin/deno.exe` look missing. `true` = found.
+fn deno_banner_line(dep_mgr: &DependencyManager) -> (bool, String) {
+    match dep_mgr.deno_version() {
+        Some(v) => (true, format!("  deno:         {:?} ({v})", dep_mgr.deno_live())),
+        None => (false, format!("  deno:         missing from {:?}: YouTube downloads fail", dep_mgr.get_bin_dir())),
+    }
+}
+
 async fn ensure_deno(dep_mgr: &DependencyManager, health: &HealthState, auto: bool) -> bool {
     use omni_core::health::{checks, Check};
     if let Some(v) = dep_mgr.deno_version() {
@@ -3561,6 +3627,7 @@ async fn nightly_deno_update(
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
     let Some(installed) = dep_mgr.deno_version() else {
+        let _swap = gate.lock_swaps().await;
         return if ensure_deno(dep_mgr, health, true).await { TaskOutcome::Ok } else { TaskOutcome::Failed };
     };
     let latest = match dep_mgr.latest_deno_tag().await {
@@ -3573,18 +3640,29 @@ async fn nightly_deno_update(
     if latest.trim_start_matches('v') == installed {
         return TaskOutcome::Ok;
     }
-    if !gate.pause_and_drain(Duration::from_secs(600)).await {
-        gate.resume();
+    // Download first; pause only around the rename.
+    let mut swap = gate.lock_swaps().await;
+    let new_version = match dep_mgr.stage_deno().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Deno update not installed: {e:#}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
+            return TaskOutcome::Failed;
+        }
+    };
+    if !swap.drain(Duration::from_secs(600)).await {
+        dep_mgr.discard_staged_deno();
         return TaskOutcome::Skipped;
     }
-    let result = dep_mgr.install_deno().await;
+    let result = dep_mgr.apply_staged_deno(&new_version);
     let outcome = match result {
         Err(e) => {
+            dep_mgr.discard_staged_deno();
             warn!("Deno update not installed: {e:#}");
             let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
             TaskOutcome::Failed
         }
-        Ok(new_version) => {
+        Ok(()) => {
             let worked: Vec<omni_core::models::SelfcheckLink> = repo
                 .list_selfcheck_links()
                 .unwrap_or_default()
@@ -3612,7 +3690,7 @@ async fn nightly_deno_update(
             }
         }
     };
-    gate.resume();
+    drop(swap);
     if let Some(v) = dep_mgr.deno_version() {
         health.set(omni_core::health::checks::DENO, omni_core::health::Check::ok(format!("Deno {v}")));
     }
@@ -3868,9 +3946,9 @@ async fn run_one_task(
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
             let (mut tested, mut failing) = (0usize, Vec::<String>::new());
             for jar in &jars {
-                let Some(url) = jar.last_sample_url.as_deref() else { continue };
+                let Some(url) = omni_core::cookies::sample_url_for(&jar.domain, jar.last_sample_url.as_deref()) else { continue };
                 tested += 1;
-                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, url).await {
+                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, &url).await {
                     Ok(t) if t.ok => {}
                     Ok(_) => failing.push(jar.domain.clone()),
                     Err(why) => {
@@ -4208,6 +4286,15 @@ fn sweep_evidence_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_banner_names_deno_even_when_it_is_missing() {
+        // An empty bin dir that need not exist: nothing is written.
+        let dir = std::env::temp_dir().join(format!("omni-p68b-{}", std::process::id()));
+        let (found, line) = super::deno_banner_line(&omni_core::dependencies::DependencyManager::new(&dir));
+        assert!(!found);
+        assert!(line.contains("deno:") && line.contains("missing"), "{line}");
+    }
+
     #[tokio::test]
     async fn the_page_scan_never_picks_a_contextual_list_or_a_live_video() {
         use omni_broadcast::downloader::{choose_primary, Choice, Probe};

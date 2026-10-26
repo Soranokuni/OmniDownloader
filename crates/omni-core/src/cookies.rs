@@ -30,17 +30,33 @@ const MAX_DETAIL_CHARS: usize = 200;
 pub fn jar_covers(jar_domain: &str) -> &'static [&'static str] {
     match jar_domain {
         "x.com" | "twitter.com" => &["x.com", "twitter.com"],
+        "youtube.com" | "youtu.be" | "youtube-nocookie.com" => &["youtube.com", "youtu.be"],
         _ => &[],
     }
 }
 
-/// The jar a link on `registrable` belongs to: `twitter.com` is kept in the `x.com` jar.
+/// A public video that needs no login to read, for testing a YouTube jar
+/// nightly when no sample link was stored (the first YouTube upload).
+pub const YOUTUBE_SAMPLE_URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
+
+/// The sample link the nightly test uses for a jar: the stored one, or for
+/// YouTube the fixed public video.
+pub fn sample_url_for(domain: &str, stored: Option<&str>) -> Option<String> {
+    match stored {
+        Some(u) if !u.trim().is_empty() => Some(u.to_string()),
+        _ if domain == "youtube.com" => Some(YOUTUBE_SAMPLE_URL.to_string()),
+        _ => None,
+    }
+}
+
+/// The jar a link on `registrable` belongs to: `twitter.com` is kept in the
+/// `x.com` jar, `youtu.be` and the embed domain in the `youtube.com` jar.
 pub fn canonical_jar_domain(registrable: &str) -> String {
     let d = registrable.trim().to_ascii_lowercase();
-    if d == "twitter.com" {
-        "x.com".to_string()
-    } else {
-        d
+    match d.as_str() {
+        "twitter.com" => "x.com".to_string(),
+        "youtu.be" | "youtube-nocookie.com" => "youtube.com".to_string(),
+        _ => d,
     }
 }
 
@@ -123,11 +139,12 @@ pub fn parse_netscape(domain: &str, raw: &str) -> Result<ParsedJar, CookieError>
 /// The cookies whose expiry says when the login ends, per site. Everything
 /// else in a jar (analytics, consent, preferences) expires on its own schedule
 /// and says nothing about whether the account still gets in.
-fn login_cookie_names(jar_domain: &str) -> &'static [&'static str] {
+pub fn login_cookie_names(jar_domain: &str) -> &'static [&'static str] {
     match jar_domain {
         "x.com" | "twitter.com" => &["auth_token", "ct0"],
         "facebook.com" => &["c_user", "xs"],
         "instagram.com" => &["sessionid"],
+        "youtube.com" => &["__Secure-3PSID", "SID", "LOGIN_INFO"],
         _ => &[],
     }
 }
@@ -324,10 +341,53 @@ pub fn refresh_health(repo: &crate::repository::Repository, health: &crate::heal
     }
 }
 
+/// What the «Cookies» line was last computed from: the jar count and the newest `updated_at`.
+pub type JarsSeen = Option<(usize, Option<DateTime<Utc>>)>;
+
+/// [`refresh_health`] only when the stored jars changed since `seen`: a jar the
+/// sign-in command wrote from another process shows on the line without a restart.
+/// One indexed query per call.
+pub fn refresh_health_if_changed(repo: &crate::repository::Repository, health: &crate::health::HealthState, seen: &mut JarsSeen) {
+    let Ok(jars) = repo.list_cookie_jars() else { return };
+    let now_seen = Some((jars.len(), jars.iter().filter_map(|j| j.updated_at).max()));
+    if *seen != now_seen {
+        *seen = now_seen;
+        health.set(crate::health::checks::COOKIES, health_check(&jars, Utc::now()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn a_jar_written_by_another_process_is_redacted_and_shown_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let redactions = crate::logging::Redactions::new(vec![]);
+        let repo = crate::repository::Repository::new(dir.path().join("omni.db")).unwrap().with_cookie_redactions(redactions.clone());
+        let health = crate::health::HealthState::new();
+        let mut seen = None;
+        refresh_health_if_changed(&repo, &health, &mut seen);
+        assert!(health.get(crate::health::checks::COOKIES).unwrap().detail.unwrap().contains("No cookie jars"));
+
+        // The sign-in command: a second handle on the same database, with no redactor.
+        let cli = crate::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let raw = format!(".youtube.com	TRUE	/	TRUE	1893456000	SID	{VALUE_A}
+");
+        let jar = parse_netscape("youtube.com", &raw).unwrap();
+        cli.put_cookie_jar("youtube.com", &jar, "sign-in (test)", Utc::now()).unwrap();
+        assert_eq!(redactions.apply(VALUE_A), VALUE_A, "not known before the jar is used");
+
+        // First use by the daemon.
+        assert!(repo.cookie_jar_text("youtube.com").unwrap().is_some());
+        assert_eq!(redactions.apply(&format!("sent {VALUE_A} out")), "sent *** out");
+        repo.cookie_jar_text("youtube.com").unwrap(); // twice is harmless
+        assert_eq!(redactions.apply(VALUE_A), "***");
+
+        refresh_health_if_changed(&repo, &health, &mut seen);
+        assert!(health.get(crate::health::checks::COOKIES).unwrap().detail.unwrap().contains("1 cookie jar"));
+    }
 
     const VALUE_A: &str = "tok-secret-value-AAA111";
     const VALUE_B: &str = "tok-secret-value-BBB222";
@@ -402,6 +462,49 @@ mod tests {
         assert_eq!(parse_netscape_at("news.example", &other, now).unwrap().expires_min.unwrap().timestamp(), t + 10 * 86400);
         let no_login = format!("{}{}", line("_ga", t + 3600), line("guest_id", t + 40 * 86400));
         assert_eq!(parse_netscape_at("x.com", &no_login, now).unwrap().expires_min.unwrap().timestamp(), t + 40 * 86400);
+    }
+
+    #[test]
+    fn youtube_links_of_every_shape_use_the_one_jar() {
+        for u in [
+            "https://youtu.be/xyz",
+            "https://m.youtube.com/watch?v=xyz",
+            "https://music.youtube.com/watch?v=xyz",
+            "https://www.youtube.com/watch?v=xyz",
+            "https://www.youtube-nocookie.com/embed/xyz",
+        ] {
+            assert_eq!(jar_domain_for_url(u).as_deref(), Some("youtube.com"), "{u}");
+        }
+        assert_eq!(canonical_jar_domain("youtu.be"), "youtube.com");
+        assert_eq!(canonical_jar_domain("youtube-nocookie.com"), "youtube.com");
+        assert_eq!(jar_covers("youtube.com"), ["youtube.com", "youtu.be"]);
+        assert_eq!(jar_domain_for_url("https://twitter.com/a/status/1").as_deref(), Some("x.com"));
+        assert_eq!(jar_domain_for_url("https://x.com/a/status/1").as_deref(), Some("x.com"));
+        assert_eq!(jar_domain_for_url("https://www.facebook.com/a").as_deref(), Some("facebook.com"));
+        // A youtu.be cookie line belongs to the youtube.com jar.
+        assert!(domain_belongs(".youtu.be", "youtube.com"));
+        assert!(!domain_belongs(".notyoutube.com", "youtube.com"));
+    }
+
+    #[test]
+    fn the_youtube_expiry_is_the_login_cookies() {
+        assert_eq!(login_cookie_names("youtube.com"), ["__Secure-3PSID", "SID", "LOGIN_INFO"]);
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let t = now.timestamp();
+        let line = |n: &str, e: i64| format!(".youtube.com	TRUE	/	TRUE	{e}	{n}	value-123456
+");
+        let raw = format!("{}{}{}", line("VISITOR_INFO1_LIVE", t + 2 * 86400), line("SID", t + 400 * 86400), line("LOGIN_INFO", t + 380 * 86400));
+        let p = parse_netscape_at("youtube.com", &raw, now).unwrap();
+        assert_eq!(p.expires_min.unwrap().timestamp(), t + 380 * 86400);
+    }
+
+    #[test]
+    fn the_nightly_sample_falls_back_for_youtube_only() {
+        assert_eq!(sample_url_for("youtube.com", None).as_deref(), Some(YOUTUBE_SAMPLE_URL));
+        assert_eq!(sample_url_for("youtube.com", Some("")).as_deref(), Some(YOUTUBE_SAMPLE_URL));
+        assert_eq!(sample_url_for("youtube.com", Some("https://www.youtube.com/watch?v=abc")).as_deref(), Some("https://www.youtube.com/watch?v=abc"));
+        assert_eq!(sample_url_for("x.com", None), None);
+        assert!(validate_sample_url("youtube.com", YOUTUBE_SAMPLE_URL).is_ok());
     }
 
     #[test]

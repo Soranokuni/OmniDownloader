@@ -451,6 +451,11 @@ impl CanaryEnv {
         let _ = self.heal.set(ctx);
     }
 
+    /// The run lock itself, for the web crate's yt-dlp and Deno installs (P9.3).
+    pub fn run_lock_handle(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.run_lock.clone()
+    }
+
     /// Wait for any canary run to end and keep new ones out while held.
     pub async fn lock_run(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.run_lock.clone().lock_owned().await
