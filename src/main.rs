@@ -1703,6 +1703,7 @@ async fn run_daemon(
             budget: Duration::from_secs(config.repair.budget_secs),
             hold_hours: config.repair.hold_hours,
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
+            auto_deliver_after_approvals: config.repair.auto_deliver_after_approvals.max(0),
             llm: repair_llm_cfg,
         },
         env: Arc::new(repair_env),
@@ -1992,6 +1993,14 @@ fn hostname_for_lease() -> String {
 /// better to stop than to queue or deliver for a job MCR may have cancelled.
 fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
     repo.owns_lease(job_id, owner).unwrap_or(false)
+}
+
+/// A repaired video a trusted recipe delivered without approval (P10.16a): the
+/// pipeline has put it in the watchfolder; the worker holding the lease completes
+/// the job with that file, as it does for any delivery.
+fn finish_delivered(repo: &Repository, job_id: i64, owner: &str) -> Result<bool> {
+    let delivered = repo.get_job(job_id)?.and_then(|j| j.file_path).filter(|p| !p.is_empty());
+    repo.finish(job_id, owner, JobStatus::Completed, None, None, delivered.as_deref())
 }
 
 /// The run holding the lease parks the job for MCR's approval (P10.5): not
@@ -2742,6 +2751,9 @@ async fn run_job(
                         repair::LadderResult::Held { recipe_hash } => {
                             info!("Job #{job_id}: a repaired video is held for MCR (recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
                         }
+                        repair::LadderResult::Delivered { recipe_hash } => {
+                            info!("Job #{job_id}: a repaired video was delivered without approval (trusted recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
+                        }
                         _ => {}
                     }
                     match repair::disposition(&ladder, repair_mode, repair.cfg.budget) {
@@ -2753,6 +2765,11 @@ async fn run_job(
                             }
                             // Waiting, not failed: no site-health record.
                             finish_held(repo, job_id, owner)?;
+                            return Ok(());
+                        }
+                        repair::Disposition::Delivered => {
+                            // Delivered by the pipeline; the worker completes the job. No failure is recorded.
+                            finish_delivered(repo, job_id, owner)?;
                             return Ok(());
                         }
                         repair::Disposition::Lost => {

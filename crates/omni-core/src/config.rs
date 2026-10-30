@@ -492,6 +492,15 @@ pub struct RepairConfig {
     /// Model calls the rung may make per local day, over all jobs.
     #[serde(default = "default_repair_llm_calls_per_day")]
     pub llm_max_calls_per_day: u32,
+    /// A recipe MCR approved this many times on a site, with no rejection there,
+    /// delivers its video without waiting for MCR (P10.16a). 0 = never; a
+    /// negative value reads as 0.
+    #[serde(default = "default_auto_deliver_after_approvals")]
+    pub auto_deliver_after_approvals: i64,
+}
+
+fn default_auto_deliver_after_approvals() -> i64 {
+    5
 }
 
 fn default_repair_llm_timeout_secs() -> u64 {
@@ -545,6 +554,7 @@ impl Default for RepairConfig {
             llm_max_tokens: default_repair_llm_max_tokens(),
             llm_reasoning_effort: default_repair_llm_effort(),
             llm_max_calls_per_day: default_repair_llm_calls_per_day(),
+            auto_deliver_after_approvals: default_auto_deliver_after_approvals(),
         }
     }
 }
@@ -1034,6 +1044,17 @@ mod tests {
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);
         assert_eq!(set.repair.evidence_max_mb, 200);
+    }
+
+    #[test]
+    fn auto_delivery_after_five_approvals_by_default_and_zero_means_never() {
+        let old: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"hold"}}"#).unwrap();
+        assert_eq!(old.repair.auto_deliver_after_approvals, 5, "a missing key is the owner's 5");
+        assert_eq!(AppConfig::default().repair.auto_deliver_after_approvals, 5);
+        let never: AppConfig = serde_json::from_str(r#"{"repair":{"auto_deliver_after_approvals":0}}"#).unwrap();
+        assert_eq!(never.repair.auto_deliver_after_approvals, 0);
+        let three: AppConfig = serde_json::from_str(r#"{"repair":{"auto_deliver_after_approvals":3}}"#).unwrap();
+        assert_eq!(three.repair.auto_deliver_after_approvals, 3);
     }
 
     #[test]

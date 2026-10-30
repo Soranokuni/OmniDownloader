@@ -155,6 +155,8 @@ pub struct SiteReport {
     /// Ended with a held video or, in shadow mode, one that would have been held.
     pub found: i64,
     pub held: i64,
+    /// Delivered without approval by a trusted recipe (P10.16a).
+    pub auto_delivered: i64,
     pub approved: i64,
     /// MCR's «Λάθος βίντεο».
     pub rejected_wrong_video: i64,
@@ -233,7 +235,7 @@ fn aggregate_report(rows: Vec<ReportRow>) -> Vec<SiteReport> {
         rep.tokens_in += r.tokens_in;
         rep.tokens_out += r.tokens_out;
         let outcome = r.outcome.as_deref();
-        let found = !next && matches!(outcome, Some("held" | "shadow_found"));
+        let found = !next && matches!(outcome, Some("held" | "shadow_found" | "auto_delivered"));
         if found {
             rep.found += 1;
             if r.expected_secs.is_some() {
@@ -245,6 +247,9 @@ fn aggregate_report(rows: Vec<ReportRow>) -> Vec<SiteReport> {
                     rep.image_matched += 1;
                 }
             }
+        }
+        if outcome == Some("auto_delivered") {
+            rep.auto_delivered += 1;
         }
         if outcome == Some("held") {
             rep.held += 1;
@@ -1335,6 +1340,48 @@ impl Repository {
         Ok(n.unwrap_or(0))
     }
 
+    /// May a video this recipe found on `domain` skip MCR's approval (P10.16a)?
+    /// Only when `min_approvals > 0`, the recipe is that exact one (ids are
+    /// reused, so the hash must match), is not retired, and on this domain is
+    /// Active with at least `min_approvals` MCR approvals, no rejection ever (the
+    /// site row's count, and no attempt of this recipe there that MCR rejected for
+    /// any reason: «Δεν είναι αξιοποιήσιμο» and «Άλλο» end the trust too) and its
+    /// steps not barred there.
+    /// Whether MCR pressed «Νέα λήψη» on this job after a trusted recipe delivered it:
+    /// its next run is held whatever the trust, so the same video cannot go on air twice
+    /// unapproved (P10.16).
+    pub fn job_auto_delivery_superseded(&self, job_id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM repair_attempts WHERE job_id = ? AND outcome = 'auto_delivered' AND mcr_decision = 'superseded')",
+            params![job_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn recipe_trusted_on(&self, recipe_id: i64, recipe_hash: &str, domain: &str, min_approvals: i64) -> Result<bool> {
+        if min_approvals <= 0 || recipe_hash.is_empty() || domain.is_empty() {
+            return Ok(false);
+        }
+        let steps_hash: Option<String> = {
+            let conn = self.pool.get()?;
+            conn.query_row(
+                "SELECT r.steps_hash FROM recipes r JOIN recipe_sites s ON s.recipe_id = r.id
+                 WHERE r.id = ? AND r.hash = ? AND r.state <> 'retired' AND s.domain = ?
+                   AND s.state = 'active' AND s.approvals >= ? AND s.rejections = 0
+                   AND NOT EXISTS (SELECT 1 FROM repair_attempts a WHERE a.recipe_id = r.id AND a.recipe_hash = r.hash
+                                   AND a.domain = s.domain AND a.mcr_decision = 'rejected')",
+                params![recipe_id, recipe_hash, domain, min_approvals],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        match steps_hash {
+            Some(steps) => Ok(!self.recipe_steps_barred(&steps, domain)?),
+            None => Ok(false),
+        }
+    }
+
     /// The recipe's own full hash, or `None` when it is gone.
     pub fn recipe_hash_of(&self, recipe_id: i64) -> Result<Option<String>> {
         let conn = self.pool.get()?;
@@ -2022,8 +2069,9 @@ impl Repository {
     /// still there (`_2`), never over it. `false` if the job is not a
     /// delivered one.
     pub fn redownload_job(&self, id: i64) -> Result<bool> {
-        let conn = self.pool.get()?;
-        let n = conn.execute(
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
@@ -2035,6 +2083,15 @@ impl Repository {
             "#,
             params![timestamps::now_string(), id],
         )?;
+        if n > 0 {
+            // The delivered file this run made is no longer this job's: no «Λάθος βίντεο» for it (P10.16a).
+            tx.execute(
+                "UPDATE repair_attempts SET mcr_decision = 'superseded'
+                 WHERE job_id = ? AND outcome = 'auto_delivered' AND mcr_decision IS NULL",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -4353,6 +4410,53 @@ impl Repository {
         Ok(Some(index))
     }
 
+    /// MCR's «Λάθος βίντεο» on a video that was delivered without approval
+    /// (P10.16a): the recipe that found it is rejected on that site (trust gone,
+    /// recipe suspended there, steps barred) and the address is skipped for 30
+    /// days, exactly as for a held video, plus a job event. Never touches the
+    /// watchfolder. The attempt's `mcr_decision` makes it once-only. One transaction.
+    pub fn wrong_video_after_auto_delivery(&self, job_id: i64, by: &str, now: chrono::DateTime<Utc>) -> Result<WrongVideoOutcome> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt: Option<(i64, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT id, recipe_id, recipe_hash, domain, held_url, outcome, mcr_decision FROM repair_attempts
+                 WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()?;
+        let Some((id, recipe_id, recipe_hash, domain, held_url, outcome, decision)) = attempt else {
+            return Ok(WrongVideoOutcome::NotAutoDelivered);
+        };
+        if outcome.as_deref() != Some("auto_delivered") || decision.as_deref() == Some("superseded") {
+            return Ok(WrongVideoOutcome::NotAutoDelivered);
+        }
+        if decision.is_some() {
+            return Ok(WrongVideoOutcome::AlreadyDone);
+        }
+        tx.execute(
+            "UPDATE repair_attempts SET mcr_decision = 'rejected', mcr_reason = 'wrong_video' WHERE id = ?",
+            params![id],
+        )?;
+        if let (Some(recipe_id), Some(domain)) = (recipe_id, domain.as_deref()) {
+            recipe_sql::learn_from_mcr(&tx, recipe_id, recipe_hash.as_deref(), domain, false, now)?;
+            if let Some(pattern) = held_url.as_deref().and_then(crate::urlnorm::skip_pattern) {
+                write_skip(&tx, domain, &pattern, now)?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
+            params![
+                job_id,
+                timestamps::format(now),
+                format!("Λάθος βίντεο (από {by}): η συνταγή χάνει την εμπιστοσύνη της στο site· το αρχείο είναι ήδη στο Dalet")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(WrongVideoOutcome::Recorded)
+    }
+
     /// How many verified candidates MCR could still ask for after the held one
     /// of this job (the count behind «Επόμενη επιλογή (n)»).
     pub fn next_left(&self, job_id: i64, now: chrono::DateTime<Utc>) -> Result<usize> {
@@ -5124,6 +5228,25 @@ mod recipe_sql {
     /// suspends the recipe and bars its steps) and, for a recipe the model
     /// wrote that MCR never approved anywhere, a tombstone so it cannot come
     /// back. A recipe that is gone teaches nothing (the decision still stands).
+    /// A held video MCR rejected for a reason other than «Λάθος βίντεο» teaches the
+    /// recipe nothing, but it still counts against its trust on that site (P10.16):
+    /// kept on the site row, so it outlives the attempt (job deleted, 90-day purge)
+    /// and travels with a promotion. No suspension, no bar.
+    pub(super) fn count_rejection(conn: &Connection, recipe_id: i64, recipe_hash: Option<&str>, domain: &str) -> Result<()> {
+        if domain.is_empty() {
+            return Ok(());
+        }
+        let Some(head) = head_by_id(conn, recipe_id)? else { return Ok(()) };
+        if recipe_hash != Some(head.hash.as_str()) {
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE recipe_sites SET rejections = rejections + 1 WHERE recipe_id = ? AND domain = ?",
+            params![recipe_id, domain],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn learn_from_mcr(
         conn: &Connection,
         recipe_id: i64,
@@ -6656,6 +6779,17 @@ fn rejected_urls_in(conn: &rusqlite::Connection, job_id: i64) -> Result<Vec<Stri
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// What «Λάθος βίντεο» on an auto-delivered video did (P10.16a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrongVideoOutcome {
+    Recorded,
+    /// Pressed before: nothing changed.
+    AlreadyDone,
+    /// The job's latest repair attempt did not deliver without approval, or its file was
+    /// replaced by a new download.
+    NotAutoDelivered,
+}
+
 /// What a decision teaches the recipe store (P10.13).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Learn {
@@ -6723,6 +6857,11 @@ fn note_mcr_decision(
         params![decision, reason, hold.id],
     )?;
     if learn == Learn::Nothing {
+        if decision == "rejected" {
+            if let (Some(recipe_id), Some(domain)) = (hold.recipe_id, hold.domain.as_deref()) {
+                recipe_sql::count_rejection(tx, recipe_id, hold.recipe_hash.as_deref(), domain)?;
+            }
+        }
         return Ok(Some(hold));
     }
     if let (Some(recipe_id), Some(domain)) = (hold.recipe_id, hold.domain.as_deref()) {

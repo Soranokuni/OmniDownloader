@@ -430,6 +430,9 @@ async fn next_choice_allowed(state: &AppState) -> bool {
 /// How a repaired video was found and why it can be trusted (P10.11b), for the
 /// approval card: `null` unless this job's latest held repair attempt exists.
 fn repair_for_desk(state: &AppState, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
+    if job.status == JobStatus::Completed {
+        return auto_delivered_for_desk(state, job);
+    }
     if job.status != JobStatus::AwaitingApproval {
         return serde_json::Value::Null;
     }
@@ -446,6 +449,22 @@ fn repair_for_desk(state: &AppState, job: &omni_core::models::Job, next_ok: bool
     crate::repair_card::build(&attempt, origin.as_deref(), approvals)
         .map(|card| crate::repair_card::with_next_left(card, next_left))
         .unwrap_or(serde_json::Value::Null)
+}
+
+/// The Completed card's provenance of a video a trusted recipe delivered without
+/// approval (P10.16a): `null` for every other completed job.
+fn auto_delivered_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+    let Ok(Some(attempt)) = state.repo.latest_attempt(job.id) else {
+        return serde_json::Value::Null;
+    };
+    if attempt.outcome.as_deref() != Some("auto_delivered") {
+        return serde_json::Value::Null;
+    }
+    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
+        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
+        _ => 0,
+    };
+    crate::repair_card::build_auto_delivered(&attempt, approvals).unwrap_or(serde_json::Value::Null)
 }
 
 /// The directory a job's preview files are in: the parent of the held row's
@@ -981,6 +1000,35 @@ pub async fn api_reject_job(
     audit_action(&state, &principal, &format!("Job #{job_id}: held video rejected ({})", payload.reason));
     state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// «Λάθος βίντεο» on a video a trusted recipe delivered without approval
+/// (P10.16a): the recipe is rejected on that site (trust revoked at once) and the
+/// address skipped, as for a held video. The file is already in the watchfolder and
+/// is never touched here; MCR removes it from Dalet. Pressing again changes nothing.
+pub async fn api_wrong_video(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    use omni_core::repository::WrongVideoOutcome;
+    let outcome = state
+        .repo
+        .wrong_video_after_auto_delivery(job_id, &principal.audit_label(), chrono::Utc::now())
+        .map_err(internal_error("Could not record the wrong video."))?;
+    match outcome {
+        WrongVideoOutcome::NotAutoDelivered => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "NOT_AUTO_DELIVERED",
+            "Αυτό το βίντεο δεν παραδόθηκε αυτόματα από έμπιστη συνταγή.",
+        )),
+        WrongVideoOutcome::AlreadyDone => Ok(Json(serde_json::json!({ "status": "ok", "already": true }))),
+        WrongVideoOutcome::Recorded => {
+            audit_action(&state, &principal, &format!("Job #{job_id}: auto-delivered video called a wrong video"));
+            state.broadcast_job_event("job_updated", job_id);
+            Ok(Json(serde_json::json!({ "status": "ok", "already": false })))
+        }
+    }
 }
 
 /// MCR's «Επόμενη επιλογή» (P10.13): the held video is the wrong one, and the

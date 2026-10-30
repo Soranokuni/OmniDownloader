@@ -204,11 +204,28 @@ evidence and try saved recipes, a live page load and (optionally) a model.
 |---|---|
 | `off` (default) | behaves exactly as without repair |
 | `shadow` | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. |
-| `hold` | repair runs; a video it finds waits for MCR approval (**always**), and is deleted if not approved within `hold_hours` (24) |
+| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24); the one exception is a trusted recipe (below) |
 
 Optional model rung: `repair.llm_enabled = true` with an explicit
 `repair.llm_model`; at most `llm_max_calls_per_day` (15) calls. Make one
 call by hand first with **Admin → Test URL** and **Use the model**.
+
+**Trusted recipes deliver on their own.** `repair.auto_deliver_after_approvals`
+(default **5**, `0` = never) lets a recipe that MCR approved that many times
+on a site, with **no** rejection there, deliver its video straight to the
+watchfolder instead of waiting for approval. The recipe must still be active
+on that site and unchanged; a recipe the model wrote counts the same way (it
+needs 5 real MCR approvals first), and a video the model found itself is always
+held. **Any** MCR rejection of that recipe's video on that site ends the trust at once
+(«Λάθος βίντεο», «Δεν είναι αξιοποιήσιμο» or «Άλλο»); «Λάθος βίντεο» also
+suspends the recipe there, and its videos wait for MCR again. MCR's «Επόμενη
+επιλογή» is always held, whatever the trust. The delivery is the
+normal atomic one; the job log says «Παραδόθηκε χωρίς έγκριση» and **Admin →
+Repair report** counts them per site (*Auto-delivered*). Trust is checked when
+the repair starts: a job of the same recipe that is already downloading when
+MCR rejects another one still goes to Dalet, so check the next few minutes of
+deliveries from that site after a rejection. Set `0` to go back to
+"nothing repaired reaches Dalet without MCR".
 
 ### 5.6 Secrets
 

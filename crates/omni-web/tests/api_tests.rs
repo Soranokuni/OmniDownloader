@@ -1494,3 +1494,103 @@ async fn the_mcr_form_keeps_the_journalist_identity_and_the_slug_matches_the_sto
     assert_eq!(job.slug, "2-B_PAPA-DAKI_FIRE-IN-THE-HILLS");
     Ok(())
 }
+
+// ---- «Λάθος βίντεο» on a video delivered without approval (P10.16a) ----
+
+/// A COMPLETED job whose latest repair attempt delivered without approval from a recipe
+/// with 5 approvals on `news.example`, and the file it left in a stand-in watchfolder.
+fn auto_delivered_job(app: &App, outcome: &str) -> Result<(i64, i64, String, std::path::PathBuf)> {
+    use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, ScopeKind};
+    let recipe = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: "news.example".into(),
+        family: None,
+        recipe_json: "{}".into(),
+        hash: format!("hash-{outcome}"),
+        steps_hash: format!("steps-{outcome}"),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let InsertOutcome::Inserted(rid) = app.repo.insert_recipe(&recipe, chrono::Utc::now())? else { panic!("recipe not stored") };
+    for _ in 0..5 {
+        app.repo.recipe_event(rid, "news.example", Event::Approval, chrono::Utc::now())?;
+    }
+    let id = app
+        .repo
+        .enqueue(
+            &omni_core::models::NewJob::new("https://news.example/story-1", "1_NIKOLAOU_AUTO", "NIKOLAOU"),
+            omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+        )?
+        .job_id();
+    app.repo.lease_job("test-worker", 180)?.expect("pending job leases");
+    let at = app.repo.start_attempt(id, "hold", chrono::Utc::now())?;
+    app.repo.finish_attempt(
+        at,
+        &omni_core::repository::AttemptEnd {
+            rung: Some("recipes".into()),
+            outcome: Some(outcome.into()),
+            recipe_id: Some(rid),
+            recipe_hash: Some(recipe.hash.clone()),
+            domain: Some("news.example".into()),
+            held_url: Some("https://cdn.news.example/v/a.mp4?token=abc".into()),
+            ..Default::default()
+        },
+        chrono::Utc::now(),
+    )?;
+    let file = app._dir.path().join("watch").join("1_NIKOLAOU_AUTO.mxf");
+    std::fs::create_dir_all(file.parent().unwrap())?;
+    std::fs::write(&file, b"on air")?;
+    assert!(app.repo.finish(id, "test-worker", JobStatus::Completed, None, None, Some(&file.to_string_lossy()))?);
+    Ok((id, rid, recipe.hash, file))
+}
+
+#[tokio::test]
+async fn wrong_video_revokes_the_trust_once_and_never_touches_the_delivered_file() -> Result<()> {
+    let app = App::new()?;
+    let (id, rid, hash, file) = auto_delivered_job(&app, "auto_delivered")?;
+
+    // The card says so before MCR presses anything.
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    let card = &json["job"]["repair"];
+    assert_eq!((card["auto_delivered"].clone(), card["recipe_approvals"].clone(), card["wrong_video"].clone()), (json!(true), json!(5), json!(false)), "{json}");
+    assert_eq!(card["source_host"], "cdn.news.example");
+    assert!(app.repo.recipe_trusted_on(rid, &hash, "news.example", 5)?);
+
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/wrong-video"), &app.mcr_token, None).await?;
+    assert_eq!((status, json["already"].clone()), (StatusCode::OK, json!(false)), "{json}");
+    assert!(!app.repo.recipe_trusted_on(rid, &hash, "news.example", 5)?, "trust is gone at once");
+    assert_eq!(std::fs::read(&file)?, b"on air", "the delivered file is untouched");
+    let job = app.repo.get_job(id)?.unwrap();
+    assert_eq!(job.status, JobStatus::Completed);
+    assert_eq!(job.file_path.as_deref(), Some(file.to_string_lossy().as_ref()));
+    assert!(app.repo.get_recent_audit_logs(5)?.iter().any(|a| a.message.contains(&format!("Job #{id}")) && a.message.contains("wrong video")));
+    assert!(app.repo.get_job_events(id, 50)?.iter().any(|e| e.message.contains("Dalet")));
+
+    // Pressed again, nothing more happens; the card now says it was pressed.
+    let events_before = app.repo.get_job_events(id, 50)?.len();
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/wrong-video"), &app.admin_token, None).await?;
+    assert_eq!((status, json["already"].clone()), (StatusCode::OK, json!(true)), "{json}");
+    assert_eq!(app.repo.get_job_events(id, 50)?.len(), events_before);
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["repair"]["wrong_video"], true, "{json}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wrong_video_on_a_job_nobody_delivered_automatically_is_a_conflict() -> Result<()> {
+    let app = App::new()?;
+    let (id, rid, hash, file) = auto_delivered_job(&app, "held")?;
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/wrong-video"), &app.mcr_token, None).await?;
+    assert_eq!((status, json["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("NOT_AUTO_DELIVERED")), "{json}");
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert!(json["job"]["repair"].is_null(), "no auto-delivery card: {json}");
+    assert!(app.repo.recipe_trusted_on(rid, &hash, "news.example", 5)?, "nothing was learned");
+    assert_eq!(std::fs::read(&file)?, b"on air");
+    // A job that does not exist.
+    let (status, _) = app.send("POST", "/api/jobs/9999/wrong-video", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // A plain user is refused.
+    let (status, _) = app.send("POST", &format!("/api/jobs/{id}/wrong-video"), &app.user_token, None).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    Ok(())
+}

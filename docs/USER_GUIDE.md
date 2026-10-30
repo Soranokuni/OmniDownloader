@@ -200,12 +200,22 @@ step).
 ### 4.5 Approvals
 
 When the normal route fails on a news page, the system may find the video by
-another way (the "repair" route). **Such a video is never delivered on its
-own**: it appears under «Για έγκριση» in the «Χρειάζονται έλεγχο» tab.
+another way (the "repair" route). **Such a video is not delivered on its
+own** (one exception, below): it appears under «Για έγκριση» in the «Χρειάζονται έλεγχο» tab.
 
 - **«Έγκριση → Dalet»** — it is the right video: deliver it.
 - **«Απόρριψη…»** — it is the wrong one: give a short reason and confirm with
   **«Απόρριψη»**. The reason teaches the system what not to pick again.
+
+**A recipe MCR has approved five times on a site (and never rejected there) may
+deliver on its own.** Its card is then not under «Για έγκριση» but with the
+delivered videos, marked «Αυτόματη παράδοση — έμπιστη συνταγή (N εγκρίσεις)».
+If that video was the wrong one, press **«Λάθος βίντεο»** on the card: the
+recipe loses its trust on that site at once and its next videos wait for you
+again. (Rejecting any video of that recipe on that site, with «Λάθος βίντεο»,
+«Δεν είναι αξιοποιήσιμο» or «Άλλο», ends its trust too; «Επόμενη επιλογή» is
+always held for you.) A new download of the job removes the button, and its video then waits for your approval again. **The file is already in Dalet: remove it from there yourself**; the
+button never touches it. Pressing it twice does nothing more.
 
 ### 4.6 Adding a link by hand
 

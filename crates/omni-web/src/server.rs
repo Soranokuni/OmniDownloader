@@ -59,6 +59,7 @@ impl WebServer {
             .route("/api/jobs/:id/retry", post(api_retry_job))
             .route("/api/jobs/:id/approve", post(api_approve_job))
             .route("/api/jobs/:id/reject", post(api_reject_job))
+            .route("/api/jobs/:id/wrong-video", post(api_wrong_video))
             .route("/api/jobs/:id/next", post(api_next_job))
             .route("/api/jobs/:id/preview/video", get(api_preview_video))
             .route("/api/jobs/:id/preview/contact", get(api_preview_contact))

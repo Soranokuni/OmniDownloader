@@ -19,11 +19,11 @@ import {
   stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
-  canRename, renameJob as deskRename, timelineNode,
-} from '/static/desk.js?v=11';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=17';
+  canRename, renameJob as deskRename, timelineNode, autoDeliveredNode,
+} from '/static/desk.js?v=12';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=18';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=10';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=6';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=7';
 
 let journalists = [];
 
@@ -524,6 +524,7 @@ function deliveredCard(job) {
         el('button', { class: 'btn', type: 'button', onClick: () => redownload(job) }, 'Νέα λήψη'),
       ),
     ),
+    autoDeliveredNode(job, refresh),
   );
 }
 
@@ -895,6 +896,7 @@ function completedRow(job) {
           : null),
       el('div', { class: 'note mono', title: job.url, style: 'max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, job.url),
       mailLink(job),
+      autoDeliveredNode(job, refresh),
     ),
     el('td', {}, el('span', { class: 'badge info' }, job.journalist)),
     el('td', { title: job.group_code ? groupName(job.group_code) : '' }, job.group_code || '—'),

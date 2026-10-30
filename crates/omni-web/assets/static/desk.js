@@ -280,6 +280,38 @@ export async function markDoneJob(job, after) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
+/** MCR says a video that a trusted recipe delivered without approval was the wrong one (P10.16a):
+ *  the recipe loses its trust on that site. The file is already in Dalet and is never touched. */
+export async function wrongVideoJob(job, after) {
+  const name = deliveredName(job);
+  if (!confirm(
+    `Το ${name} είναι λάθος βίντεο;\n\n` +
+    'Η συνταγή που το βρήκε χάνει την εμπιστοσύνη της σε αυτό το site και τα επόμενα βίντεό της θα περιμένουν έγκριση. ' +
+    'Το αρχείο είναι ήδη στο Dalet· αφαιρέστε το από εκεί.',
+  )) return;
+  try {
+    await api(`/api/jobs/${job.id}/wrong-video`, { method: 'POST' });
+    toast(`Καταγράφηκε: λάθος βίντεο. Το αρχείο είναι ήδη στο Dalet· αφαιρέστε το από εκεί.`, 'ok');
+    after();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+/** The note of a delivery that skipped MCR's approval, with "Λάθος βίντεο" while MCR has not pressed it; null for other jobs. */
+export function autoDeliveredNode(job, after) {
+  const repair = job && job.repair;
+  if (!repair || repair.auto_delivered !== true) return null;
+  const n = Number(repair.recipe_approvals) || 0;
+  return el('div', { class: 'jc-found auto-delivered' },
+    el('span', {}, `Αυτόματη παράδοση — έμπιστη συνταγή (${n} εγκρίσεις)`),
+    repair.wrong_video
+      ? el('span', { class: 'badge bad', style: 'margin-left:8px' }, 'Λάθος βίντεο — η εμπιστοσύνη αφαιρέθηκε')
+      : el('button', {
+        class: 'btn btn-danger', type: 'button', style: 'margin-left:8px',
+        title: 'Το βίντεο που παραδόθηκε χωρίς έγκριση ήταν λάθος',
+        onClick: () => wrongVideoJob(job, after),
+      }, 'Λάθος βίντεο'));
+}
+
 /** Queue one of the videos the sniffer found in a job's article. */
 export async function queueOffer(jobId, offer, after) {
   try {

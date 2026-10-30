@@ -10,7 +10,7 @@
  */
 
 import { api, el, fmtDuration, safeHref, toast } from '/static/app.js?v=6';
-import { fileName, clock } from '/static/desk.js?v=11';
+import { fileName, clock } from '/static/desk.js?v=12';
 
 const cards = new Map(); // job id -> { node, job, expiry }
 let wantedFocus = null;

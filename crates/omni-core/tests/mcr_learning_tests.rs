@@ -392,3 +392,29 @@ fn a_rejection_stores_its_reason_with_the_decision_and_approval_and_expiry_store
     assert_eq!(reason_of(c), (Some("expired".into()), None));
     Ok(())
 }
+
+#[test]
+fn a_not_usable_rejection_ends_trust_on_the_site_and_outlives_the_deleted_job() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("trusted", Origin::Admin);
+    for n in 0..5 {
+        let id = r.held(10 + n, Some((rid, &hash)), &[A], 0);
+        assert!(r.repo.approve_held(id, &sha(), "desk")?);
+    }
+    assert!(r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?);
+
+    let id = r.held(20, Some((rid, &hash)), &[B], 0);
+    assert!(r.repo.reject_held(id, "not_usable", "teaser", "desk")?);
+    let (state, approvals, rejections, reason) = r.site(rid).unwrap();
+    assert_eq!((state.as_str(), approvals, rejections, reason), ("active", 5, 1, None), "counted, not suspended");
+    assert!(!r.barred("steps-trusted"), "not barred");
+    assert!(r.skips().is_empty(), "no skip");
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?);
+
+    // MCR removes the job (its attempts go with it): the rejection stays on the site row.
+    r.repo.delete_job(id)?;
+    let attempts: i64 = r.raw().query_row("SELECT COUNT(*) FROM repair_attempts WHERE job_id = ?", params![id], |x| x.get(0))?;
+    assert_eq!(attempts, 0);
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "trust does not come back");
+    Ok(())
+}

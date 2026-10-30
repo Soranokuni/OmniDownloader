@@ -354,7 +354,7 @@ struct Rig {
 }
 
 fn cfg(mode: RepairMode, budget: Duration) -> RepairCfg {
-    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, llm: LlmCfg::default() }
+    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default() }
 }
 
 fn leased_job(repo: &Repository) -> Job {
@@ -2076,4 +2076,171 @@ async fn a_video_that_is_the_sites_furniture_is_not_held_by_the_ladder() {
     r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
     let got = crate::repair::after_failure_with(&r.ctx, &r.job, OWNER, PAGE, ErrorCode::VideoUnresolved, &Some(triple(A, A, A)), vec![], Vec::new(), &cancel).await;
     assert!(matches!(got, Some(LadderResult::Held { .. })), "{got:?}");
+}
+
+// ---------------------------------------------------------------- P10.16a: trusted recipes deliver
+
+/// The shipped recipe that finds `A` on the page, with `approvals` MCR approvals on the site.
+fn trusted_rig(approvals: usize, auto: i64) -> (Rig, i64) {
+    let mut r = rig(RepairMode::Hold);
+    r.ctx.cfg.auto_deliver_after_approvals = auto;
+    let hash = shipped_hash("next_data_media");
+    let id = r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap().into_iter().find(|x| x.hash == hash).expect("shipped recipe").id;
+    for _ in 0..approvals {
+        r.repo.recipe_event(id, DOMAIN, Event::Approval, Utc::now()).unwrap();
+    }
+    (r, id)
+}
+
+/// (approvals, rejections, uses) of the recipe on the page's domain.
+fn site_counts(r: &Rig, id: i64) -> (i64, i64, i64) {
+    let conn = rusqlite::Connection::open(r._dir.0.join("omni.db")).unwrap();
+    conn.query_row(
+        "SELECT approvals, rejections, uses FROM recipe_sites WHERE recipe_id = ? AND domain = ?",
+        rusqlite::params![id, DOMAIN],
+        |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
+    )
+    .unwrap()
+}
+
+fn hold_mode() -> DeliveryMode {
+    DeliveryMode::Hold { hold_hours: 24, held_max_bytes: 20 << 30 }
+}
+
+#[test]
+fn the_mode_is_deliver_only_for_a_stored_recipe_that_earned_it() {
+    let (r, id) = trusted_rig(5, 5);
+    let hash = shipped_hash("next_data_media");
+    assert_eq!(mode_for(&r.ctx, DOMAIN, Some((id, &hash))), (DeliveryMode::Deliver, Some(5)));
+    // The same recipe on another site, or with another hash behind the id, or no recipe at all.
+    assert_eq!(mode_for(&r.ctx, "other.example", Some((id, &hash))), (hold_mode(), None));
+    assert_eq!(mode_for(&r.ctx, DOMAIN, Some((id, "not-its-hash"))), (hold_mode(), None));
+    assert_eq!(mode_for(&r.ctx, DOMAIN, Some((0, ""))), (hold_mode(), None));
+    assert_eq!(mode_for(&r.ctx, DOMAIN, None), (hold_mode(), None));
+    // 4 approvals are not enough.
+    let (r4, id4) = trusted_rig(4, 5);
+    assert_eq!(mode_for(&r4.ctx, DOMAIN, Some((id4, &hash))), (hold_mode(), None));
+    // 0 means never, however many approvals; a negative value reads as 0.
+    let (r0, id0) = trusted_rig(10, 0);
+    assert_eq!(mode_for(&r0.ctx, DOMAIN, Some((id0, &hash))), (hold_mode(), None));
+    let (rn, idn) = trusted_rig(10, -3);
+    assert_eq!(mode_for(&rn.ctx, DOMAIN, Some((idn, &hash))), (hold_mode(), None));
+    // One rejection ends it.
+    r.repo.recipe_event(id, DOMAIN, Event::Rejection, Utc::now()).unwrap();
+    assert_eq!(mode_for(&r.ctx, DOMAIN, Some((id, &hash))), (hold_mode(), None));
+}
+
+#[tokio::test]
+async fn a_trusted_recipe_delivers_through_the_pipeline_and_scores_a_use_not_an_approval() {
+    let (r, id) = trusted_rig(5, 5);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Delivered));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    let LadderResult::Delivered { recipe_hash } = res else { panic!("expected Delivered, got {res:?}") };
+    assert_eq!(recipe_hash, shipped_hash("next_data_media"));
+    assert_eq!(disposition(&LadderResult::Delivered { recipe_hash }, RepairMode::Hold, Duration::from_secs(60)), Disposition::Delivered);
+    let d = r.fake.downloads();
+    assert_eq!((d.len(), d[0].0.as_str(), d[0].2), (1, A, DeliveryMode::Deliver), "the unchanged pipeline, asked to deliver");
+    assert_eq!(site_counts(&r, id), (5, 0, 6), "a use: approvals unchanged, uses + 1");
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!((at.outcome.as_deref(), at.recipe_id, at.domain.as_deref()), (Some("auto_delivered"), Some(id), Some(DOMAIN)));
+    assert_eq!(at.held_url.as_deref(), Some(A));
+    assert!(at.mcr_decision.is_none());
+    let ev = events(&r);
+    assert!(ev.iter().any(|m| m.starts_with("Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή (5 εγκρίσεις στο site)")), "{ev:?}");
+    assert!(r.repo.get_recent_audit_logs(5).unwrap().iter().any(|a| a.message.contains("delivered without approval")), "an audit row");
+    // The ladder never sets a status: the worker does.
+    assert_eq!(r.repo.get_job(r.job.id).unwrap().unwrap().status, JobStatus::Running);
+}
+
+#[tokio::test]
+async fn a_recipe_one_approval_short_or_switched_off_is_still_held() {
+    for (approvals, auto) in [(4, 5), (10, 0), (10, -1)] {
+        let (r, id) = trusted_rig(approvals, auto);
+        r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+        let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+        assert!(matches!(res, LadderResult::Held { .. }), "{approvals} approvals, auto {auto}: {res:?}");
+        assert_eq!(r.fake.downloads()[0].2, hold_mode());
+        assert_eq!(site_counts(&r, id).2, approvals as i64, "no AutoDelivered use was scored");
+        assert!(!events(&r).iter().any(|m| m.contains("χωρίς έγκριση")));
+    }
+}
+
+#[tokio::test]
+async fn a_new_download_after_an_automatic_delivery_is_held_even_for_a_trusted_recipe() {
+    let (r, id) = trusted_rig(5, 5);
+    // The job was delivered by the trusted recipe, then MCR pressed «Νέα λήψη».
+    let at = r.repo.start_attempt(r.job.id, "hold", Utc::now()).unwrap();
+    let end = omni_core::repository::AttemptEnd {
+        outcome: Some("auto_delivered".into()),
+        recipe_id: Some(id),
+        recipe_hash: Some(shipped_hash("next_data_media")),
+        domain: Some(DOMAIN.into()),
+        held_url: Some(A.into()),
+        ..Default::default()
+    };
+    r.repo.finish_attempt(at, &end, Utc::now()).unwrap();
+    let conn = rusqlite::Connection::open(r._dir.0.join("omni.db")).unwrap();
+    conn.execute("UPDATE repair_attempts SET mcr_decision = 'superseded' WHERE id = ?", rusqlite::params![at]).unwrap();
+
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.downloads()[0].2, hold_mode(), "the same video waits for MCR this time");
+    assert_eq!(site_counts(&r, id), (5, 0, 5), "no AutoDelivered use was scored");
+}
+
+#[tokio::test]
+async fn a_recipe_with_a_rejection_on_the_site_is_held() {
+    let (r, id) = trusted_rig(5, 5);
+    r.repo.recipe_event(id, DOMAIN, Event::Rejection, Utc::now()).unwrap();
+    // Suspended there it is not offered at all: nothing is found, nothing delivered.
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(!matches!(res, LadderResult::Delivered { .. }), "{res:?}");
+    assert!(r.fake.downloads().iter().all(|d| d.2 != DeliveryMode::Deliver));
+}
+
+/// Recipes with the ids and hashes the next-choice rig's candidates name, so id 2 can be trusted.
+fn next_recipes(n: &NextRig, approvals_of_two: usize) {
+    for i in 1..=3i64 {
+        let new = omni_core::recipe_score::NewRecipe {
+            scope_kind: omni_core::recipe_score::ScopeKind::Site,
+            scope_key: DOMAIN.into(),
+            family: None,
+            recipe_json: "{}".into(),
+            hash: format!("{i:064}"),
+            steps_hash: format!("steps-{i}"),
+            dsl_version: 1,
+            origin: Origin::Admin,
+        };
+        let got = n.repo.insert_recipe(&new, Utc::now()).unwrap();
+        assert_eq!(got, InsertOutcome::Inserted(i));
+    }
+    for _ in 0..approvals_of_two {
+        n.repo.recipe_event(2, DOMAIN, Event::Approval, Utc::now()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_next_choice_of_a_trusted_recipe_is_still_held() {
+    // MCR is reviewing this job: even a recipe with 5 approvals does not skip the hold here.
+    let n = next_rig();
+    next_recipes(&n, 5);
+    let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+    n.run(env.clone(), n.lease()).await;
+    let d = env.downloads.lock().unwrap().clone();
+    assert_eq!((d.len(), d[0].0.as_str(), d[0].2), (1, B, hold_mode()));
+    assert_eq!(n.repo.get_job(n.job_id).unwrap().unwrap().status, JobStatus::AwaitingApproval);
+    let at = n.repo.latest_attempt(n.job_id).unwrap().unwrap();
+    assert_eq!(at.outcome.as_deref(), Some("held"));
+    assert_eq!(n.repo.recipe_site_approvals(2, DOMAIN).unwrap(), 5, "no use was scored");
+}
+
+#[tokio::test]
+async fn the_next_choice_of_a_recipe_with_four_approvals_is_held_as_before() {
+    let n = next_rig();
+    next_recipes(&n, 4);
+    let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+    n.run(env.clone(), n.lease()).await;
+    assert_eq!(env.downloads.lock().unwrap()[0].2, hold_mode());
+    assert_eq!(n.repo.get_job(n.job_id).unwrap().unwrap().status, JobStatus::AwaitingApproval);
 }
