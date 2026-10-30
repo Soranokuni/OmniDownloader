@@ -103,7 +103,12 @@ installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build.
 
 The encoder is pinned on purpose: the broadcast output was validated with
-that exact build.
+that exact build. The service never uses an ffmpeg, ffprobe or bmxtranswrap
+found on the system PATH. If one is missing from `bin\` at start-up, the
+service downloads the pinned build (up to 3 minutes, smallest first). If that
+fails, the queue is held, the `pinned_tools` health line says which tool is
+missing, and **Admin → Toolchain → Install** followed by a service restart
+fixes it.
 
 ---
 
@@ -320,7 +325,7 @@ Green = ok, amber = degraded, red = down.
 | `mail` | the mailbox cannot be read |
 | `llm` | the LLM endpoint does not answer (amber; jobs are unaffected) |
 | `tools` | a tool is missing (red) |
-| `pinned_tools` | a tool is not the pinned build: **Admin → Toolchain → Repair** |
+| `pinned_tools` | a tool is missing or not the pinned build: **Admin → Toolchain → Install / Repair**, then restart the service if it was missing |
 | `encoder` | the encoder self-test failed |
 | `watchfolder` | the watchfolder is not writable (red) |
 | `browser` | no Edge/Chrome usable |

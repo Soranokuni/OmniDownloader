@@ -80,6 +80,23 @@ impl DependencyManager {
     }
 
     pub fn find_binary(&self, name: &str) -> Option<PathBuf> {
+        self.find_binary_with(name, which)
+    }
+
+    /// Where a tool is taken to be when `find_binary` found nothing: for a pinned tool the
+    /// absolute `bin/<exe>` (absent, so running it fails loudly), never a bare name that
+    /// Windows would resolve through the CWD, System32 or PATH (P9.6); otherwise the bare name.
+    pub fn unresolved_path(&self, name: &str) -> PathBuf {
+        let exe_name = if name.ends_with(".exe") { name.to_string() } else { format!("{name}.exe") };
+        if crate::toolpins::pin_for(&exe_name).is_some() {
+            self.bin_dir.join(exe_name)
+        } else {
+            PathBuf::from(exe_name)
+        }
+    }
+
+    /// `find_binary` with the PATH lookup injected (tests never touch the PATH variable).
+    fn find_binary_with(&self, name: &str, lookup: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
         if name.trim_end_matches(".exe") == "yt-dlp" && self.ytdl_is_folder_build() {
             return Some(self.ytdl_live());
         }
@@ -91,13 +108,13 @@ impl DependencyManager {
         let candidate = self.bin_dir.join(&exe_name);
         if candidate.exists() {
             Some(candidate)
-        } else if crate::toolpins::pin_for(&exe_name).is_some() && self.bin_dir.join(format!("{exe_name}.prev")).is_file() {
-            // A pinned tool that was removed after a swap: missing, not the previous build and
-            // not whatever PATH has. The pinned hash is the only authority (P9.3).
+        } else if crate::toolpins::pin_for(&exe_name).is_some() {
+            // A pinned tool is `bin/` or missing: never the previous build (`.prev`) and never
+            // whatever PATH has. The pinned hash is the only authority (P9.3, P9.6).
             None
         } else {
             // Check system PATH
-            which(&exe_name)
+            lookup(&exe_name)
         }
     }
 
@@ -925,6 +942,20 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
+/// Removes a staged folder when dropped while still armed (a cancelled download).
+struct StagedGuard<'a> {
+    dir: PathBuf,
+    armed: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for StagedGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 /// What a pinned install did.
 #[derive(Debug, Clone)]
 pub struct PinnedOutcome {
@@ -1094,6 +1125,67 @@ impl DependencyManager {
         completed
     }
 
+    /// At start-up: the pins to install, smallest download first so a slow link still gets
+    /// the small tools. A pin is pending when a member is missing from `bin/` and that member
+    /// is not set by `config.json` (an override wins and is never touched). A pin is skipped
+    /// when every missing member is overridden, or when an override points into `bin/` itself
+    /// (installing would swap that very file). A wrong hash on a present file is the health
+    /// line's business, not this one's.
+    pub fn pending_pins(&self, overrides: &HashMap<String, PathBuf>) -> Vec<ToolPin> {
+        self.pending_pins_for(crate::toolpins::PINS, overrides)
+    }
+
+    fn pending_pins_for(&self, pins: &[ToolPin], overrides: &HashMap<String, PathBuf>) -> Vec<ToolPin> {
+        let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        let bin = norm(&self.bin_dir);
+        let mut out: Vec<ToolPin> = pins
+            .iter()
+            .filter(|pin| {
+                let tool_of = |m: &crate::toolpins::PinMember| m.exe.trim_end_matches(".exe").to_string();
+                let into_bin = pin
+                    .members
+                    .iter()
+                    .any(|m| overrides.get(&tool_of(m)).and_then(|p| p.parent()).is_some_and(|d| norm(d) == bin));
+                let missing_unset = pin
+                    .members
+                    .iter()
+                    .any(|m| !self.bin_dir.join(m.exe).exists() && !overrides.contains_key(&tool_of(m)));
+                missing_unset && !into_bin
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| p.size);
+        out
+    }
+
+    /// Install every pending pin in turn (see `pending_pins`); one result per pin tried.
+    pub async fn install_missing_pins(
+        &self,
+        overrides: &HashMap<String, PathBuf>,
+        fetcher: &dyn Fetcher,
+        gate: &UpdateGate,
+        drain: Duration,
+        st: &ToolInstaller,
+    ) -> Vec<(String, Result<PinnedOutcome>)> {
+        self.install_missing_pins_for(crate::toolpins::PINS, overrides, fetcher, gate, drain, st).await
+    }
+
+    async fn install_missing_pins_for(
+        &self,
+        pins: &[ToolPin],
+        overrides: &HashMap<String, PathBuf>,
+        fetcher: &dyn Fetcher,
+        gate: &UpdateGate,
+        drain: Duration,
+        st: &ToolInstaller,
+    ) -> Vec<(String, Result<PinnedOutcome>)> {
+        let mut out = Vec::new();
+        for pin in self.pending_pins_for(pins, overrides) {
+            out.push((pin.tool.to_string(), self.install_pinned(&pin, fetcher, gate, drain, st).await));
+        }
+        out
+    }
+
     /// The «pinned tools» health line: amber while a pinned tool in `bin/` (or the file
     /// `config.json` points to instead) is missing or is not the pinned build. The hash
     /// cache keeps this cheap to repeat. Blocking.
@@ -1114,6 +1206,9 @@ impl DependencyManager {
                     continue;
                 }
                 bad.push(match over {
+                    None if !path.exists() => {
+                        format!("{tool} is missing from bin/: Admin \u{2192} Toolchain \u{2192} Install, then restart the service")
+                    }
                     None => format!("{tool} is not the pinned build: Admin \u{2192} Tools \u{2192} Repair"),
                     Some(p) => format!(
                         "{tool} is not the pinned build (set in config.json: {}; that file is what runs): Admin \u{2192} Tools \u{2192} Repair changes only the copy in bin/",
@@ -1274,7 +1369,11 @@ impl DependencyManager {
         }
         let staged = self.staged_dir(pin);
         let _ = std::fs::remove_dir_all(&staged);
-        let result = self.install_staged(pin, fetcher, gate, drain, st, &staged).await;
+        // A cancelled install (the start-up time limit drops this future) must not leave the
+        // download behind; once the swap has begun the folder is recover_interrupted_swaps' evidence.
+        let armed = std::sync::atomic::AtomicBool::new(true);
+        let _guard = StagedGuard { dir: staged.clone(), armed: &armed };
+        let result = self.install_staged(pin, fetcher, gate, drain, st, &staged, &armed).await;
         let _ = std::fs::remove_dir_all(&staged);
         result
     }
@@ -1287,6 +1386,7 @@ impl DependencyManager {
         drain: Duration,
         st: &ToolInstaller,
         staged: &Path,
+        cancel_cleans: &std::sync::atomic::AtomicBool,
     ) -> Result<PinnedOutcome> {
         use sha2::{Digest, Sha256};
         if pin.needs_vcrt {
@@ -1354,6 +1454,8 @@ impl DependencyManager {
             anyhow::bail!("jobs still running; try again");
         };
         st.set_stage("installing");
+        // From here a dropped future must leave the staged folder for the next start to finish.
+        cancel_cleans.store(false, std::sync::atomic::Ordering::SeqCst);
         self.swap_in(pin, staged).await
     }
 
@@ -2249,10 +2351,200 @@ mod pinned_tests {
         let check = mgr.pinned_tools_check(&ToolInstaller::new(), &HashMap::new());
         assert_eq!(check.state, crate::health::Health::Degraded);
         assert!(
-            check.detail.as_deref().unwrap().contains("ffmpeg is not the pinned build: Admin \u{2192} Tools \u{2192} Repair"),
+            check.detail.as_deref().unwrap().contains("ffmpeg is missing from bin/: Admin \u{2192} Toolchain \u{2192} Install, then restart"),
             "{:?}",
             check.detail
         );
+    }
+
+    #[test]
+    fn a_pinned_tool_absent_from_bin_is_never_taken_from_path() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path().join("bin"));
+        let path_ffmpeg = |_: &str| Some(PathBuf::from(r"C:\somewhere\ffmpeg.exe"));
+        assert_eq!(mgr.find_binary_with("ffmpeg", path_ffmpeg), None);
+        assert_eq!(mgr.find_binary_with("ffprobe.exe", path_ffmpeg), None);
+        assert_eq!(mgr.find_binary_with("bmxtranswrap", path_ffmpeg), None);
+    }
+
+    #[test]
+    fn an_unresolved_pinned_tool_is_an_absolute_file_in_bin_and_others_stay_bare() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        assert_eq!(mgr.unresolved_path("ffmpeg"), bin.join("ffmpeg.exe"));
+        assert_eq!(mgr.unresolved_path("bmxtranswrap.exe"), bin.join("bmxtranswrap.exe"));
+        assert_eq!(mgr.unresolved_path("yt-dlp"), PathBuf::from("yt-dlp.exe"));
+    }
+
+    #[test]
+    fn a_tool_that_is_not_pinned_still_falls_back_to_path() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path().join("bin"));
+        let found = PathBuf::from(r"C:\somewhere\deno.exe");
+        let lookup = |n: &str| (n == "deno.exe").then(|| found.clone());
+        assert_eq!(mgr.find_binary_with("deno", lookup), Some(found.clone()));
+        assert_eq!(mgr.find_binary_with("some-other-tool", |_| None), None);
+    }
+
+    #[test]
+    fn a_pinned_tool_present_in_bin_is_that_file() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        std::fs::write(bin.join("ffmpeg.exe"), b"x").unwrap();
+        let elsewhere = |_: &str| Some(PathBuf::from(r"C:\somewhere\ffmpeg.exe"));
+        assert_eq!(mgr.find_binary_with("ffmpeg", elsewhere), Some(bin.join("ffmpeg.exe")));
+    }
+
+    #[tokio::test]
+    async fn a_missing_pin_is_installed_once_and_a_present_one_is_not_fetched_again() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("pkg/bin/fake.exe", b"pinned build")]);
+        let pin = pin_for_test(&archive, &[("fake.exe", "bin/fake.exe", b"pinned build")], false);
+        let fetcher = FakeFetcher::new(archive);
+        let (gate, st) = (UpdateGate::new(), ToolInstaller::new());
+        let pins = std::slice::from_ref(&pin);
+
+        let out = mgr.install_missing_pins_for(pins, &HashMap::new(), &fetcher, &gate, DRAIN, &st).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "faketool");
+        assert!(!out[0].1.as_ref().unwrap().already);
+        assert_eq!(std::fs::read(bin.join("fake.exe")).unwrap(), b"pinned build");
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+
+        let out = mgr.install_missing_pins_for(pins, &HashMap::new(), &fetcher, &gate, DRAIN, &st).await;
+        assert!(out.is_empty());
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "nothing fetched the second time");
+    }
+
+    #[tokio::test]
+    async fn an_overridden_pin_is_neither_fetched_nor_reported() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("pkg/bin/fake.exe", b"pinned build")]);
+        let pin = pin_for_test(&archive, &[("fake.exe", "bin/fake.exe", b"pinned build")], false);
+        let fetcher = FakeFetcher::new(archive);
+        let overridden: HashMap<String, PathBuf> = [("fake".to_string(), dir.path().join("elsewhere").join("fake.exe"))].into_iter().collect();
+
+        let out = mgr
+            .install_missing_pins_for(std::slice::from_ref(&pin), &overridden, &fetcher, &UpdateGate::new(), DRAIN, &ToolInstaller::new())
+            .await;
+        assert!(out.is_empty());
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert!(files_in(&bin).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_up_install_reports_the_error_and_leaves_nothing_behind() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("pkg/bin/fake.exe", b"pinned build")]);
+        let pin = pin_for_test(&archive, &[("fake.exe", "bin/fake.exe", b"pinned build")], false);
+        // Right size, wrong content: the member is not the validated binary.
+        let wrong = zip_of(&[("pkg/bin/fake.exe", b"other build!")]);
+        let mut pin = pin;
+        pin.size = wrong.len() as u64;
+        let fetcher = FakeFetcher::new(wrong);
+
+        let out = mgr
+            .install_missing_pins_for(std::slice::from_ref(&pin), &HashMap::new(), &fetcher, &UpdateGate::new(), DRAIN, &ToolInstaller::new())
+            .await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_err());
+        assert!(files_in(&bin).is_empty(), "no file, no staged folder: {:?}", files_in(&bin));
+    }
+
+    struct HangingFetcher;
+
+    impl Fetcher for HangingFetcher {
+        fn fetch<'a>(&'a self, _url: &'a str, sink: &'a mut (dyn FnMut(&[u8]) -> Result<()> + Send)) -> FetchFuture<'a> {
+            Box::pin(async move {
+                sink(b"first bytes")?;
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_install_leaves_no_staged_folder() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("pkg/bin/fake.exe", b"pinned build")]);
+        let pin = pin_for_test(&archive, &[("fake.exe", "bin/fake.exe", b"pinned build")], false);
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(300),
+            mgr.install_pinned(&pin, &HangingFetcher, &UpdateGate::new(), DRAIN, &ToolInstaller::new()),
+        )
+        .await;
+        assert!(timed_out.is_err(), "the fetch never finishes, so the limit fires");
+        assert!(files_in(&bin).is_empty(), "the download was cleaned up: {:?}", files_in(&bin));
+    }
+
+    #[test]
+    fn pending_pins_come_smallest_first() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path().join("bin"));
+        let big = pin_for_test(&zip_of(&[("a", &[7u8; 4000])]), &[("big.exe", "big.exe", b"b")], false);
+        let small = pin_for_test(&zip_of(&[("a", b"s")]), &[("small.exe", "small.exe", b"s")], false);
+        let pending = mgr.pending_pins_for(&[big.clone(), small.clone()], &HashMap::new());
+        assert_eq!(pending.iter().map(|p| p.size).collect::<Vec<_>>(), vec![small.size, big.size]);
+    }
+
+    #[test]
+    fn an_override_skips_a_pin_only_when_it_covers_every_missing_member() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("x", b"x")]);
+        let pin = pin_for_test(&archive, &[("fake.exe", "fake.exe", b"a"), ("fakeprobe.exe", "fakeprobe.exe", b"b")], false);
+        let pins = std::slice::from_ref(&pin);
+        let elsewhere = |n: &str| dir.path().join("other").join(n);
+        let one: HashMap<String, PathBuf> = [("fake".to_string(), elsewhere("fake.exe"))].into_iter().collect();
+        assert_eq!(mgr.pending_pins_for(pins, &one).len(), 1, "fakeprobe is missing and not overridden");
+
+        let both: HashMap<String, PathBuf> =
+            [("fake".to_string(), elsewhere("fake.exe")), ("fakeprobe".to_string(), elsewhere("fakeprobe.exe"))].into_iter().collect();
+        assert!(mgr.pending_pins_for(pins, &both).is_empty());
+
+        // An override into bin/ itself: the install would swap that file, so it is left alone.
+        let into_bin: HashMap<String, PathBuf> = [("fake".to_string(), bin.join("fake.exe"))].into_iter().collect();
+        assert!(mgr.pending_pins_for(pins, &into_bin).is_empty());
+
+        // The other member present: nothing missing, nothing pending.
+        std::fs::write(bin.join("fake.exe"), b"a").unwrap();
+        std::fs::write(bin.join("fakeprobe.exe"), b"b").unwrap();
+        assert!(mgr.pending_pins_for(pins, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn the_health_line_tells_a_missing_file_from_a_wrong_one() {
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("x", b"x")]);
+        let pin = pin_for_test(
+            &archive,
+            &[("fake.exe", "bin/fake.exe", b"pinned"), ("fakeprobe.exe", "bin/fakeprobe.exe", b"pinned probe")],
+            false,
+        );
+        std::fs::write(bin.join("fake.exe"), b"not pinned").unwrap();
+        let check = mgr.pinned_tools_check_for(std::slice::from_ref(&pin), &ToolInstaller::new(), &HashMap::new());
+        let detail = check.detail.unwrap();
+        assert!(detail.contains("fake is not the pinned build"), "{detail}");
+        assert!(
+            detail.contains("fakeprobe is missing from bin/: Admin \u{2192} Toolchain \u{2192} Install, then restart the service"),
+            "{detail}"
+        );
+        assert!(!detail.contains("fakeprobe is not the pinned build"), "{detail}");
+        assert!(!detail.contains("fake is missing"), "{detail}");
     }
 
     /// Two members: `fake.exe` already finished, `fakeprobe.exe` not (the crash fell between them).
@@ -2298,7 +2590,7 @@ mod pinned_tests {
         assert!(bin.join("fakeprobe.exe.prev").is_file());
         let check = mgr.pinned_tools_check_for(std::slice::from_ref(&pin), &ToolInstaller::new(), &HashMap::new());
         assert_eq!(check.state, crate::health::Health::Degraded);
-        assert!(check.detail.as_deref().unwrap().contains("fakeprobe is not the pinned build"), "{:?}", check.detail);
+        assert!(check.detail.as_deref().unwrap().contains("fakeprobe is missing from bin/"), "{:?}", check.detail);
     }
 
     #[test]
@@ -2329,7 +2621,7 @@ mod pinned_tests {
         let detail = check.detail.unwrap();
         assert!(detail.contains("ffmpeg is not the pinned build: Admin \u{2192} Tools \u{2192} Repair"), "{detail}");
         assert!(detail.contains("ffprobe is not the pinned build (set in config.json: "), "{detail}");
-        assert!(detail.contains("bmxtranswrap is not the pinned build"), "{detail}");
+        assert!(detail.contains("bmxtranswrap is missing from bin/"), "{detail}");
 
         // A pinned file is green.
         let archive = zip_of(&[("x", b"x")]);

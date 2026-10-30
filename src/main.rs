@@ -434,7 +434,7 @@ async fn dev_hold(
             .as_ref()
             .map(PathBuf::from)
             .or_else(|| deps.find_binary(name))
-            .unwrap_or_else(|| PathBuf::from(format!("{name}.exe")))
+            .unwrap_or_else(|| deps.unresolved_path(name))
     };
     let ffmpeg = tool(&config.ffmpeg_path, "ffmpeg");
     let engine = BroadcastEngine::new(
@@ -1050,7 +1050,7 @@ async fn main() -> Result<()> {
 
 async fn run_daemon(
     paths: &AppPaths,
-    service_shutdown_rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    mut service_shutdown_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     log_redactions: Option<Redactions>,
 ) -> Result<()> {
 
@@ -1149,6 +1149,68 @@ async fn run_daemon(
     // A swap that died part-way is finished forward when its staged files match the pin, else
     // discarded; a .prev is never put back (P9.3).
     dep_mgr.recover_interrupted_swaps();
+
+    // Keeps the nightly tool update from swapping yt-dlp.exe out from under a
+    // running download (plan P2.9, defect D-16).
+    let update_gate = UpdateGate::new();
+    // Shared with the admin panel's installs and the «pinned tools» health line.
+    let tool_installer = omni_core::dependencies::ToolInstaller::new();
+
+    // A pinned tool missing from bin/ is installed at its pinned SHA-256 now, or the queue is
+    // held (the encoder self-test fails on the absent file): never whatever is on PATH (P9.6).
+    // One 180 s budget for all (the upgrade installer's /api/health wait is 4 minutes), smallest
+    // download first; each result is logged and audited as it arrives. A service Stop during
+    // this wait ends start-up at once.
+    {
+        let overrides: std::collections::HashMap<String, PathBuf> = [
+            ("ffmpeg", &config.ffmpeg_path),
+            ("ffprobe", &config.ffprobe_path),
+            ("bmxtranswrap", &config.bmxtranswrap_path),
+        ]
+        .into_iter()
+        .filter_map(|(n, p)| p.as_ref().map(|p| (n.to_string(), PathBuf::from(p))))
+        .collect();
+        let install = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+            for pin in dep_mgr.pending_pins(&overrides) {
+                let tool = pin.tool;
+                let attempt = tokio::time::timeout_at(
+                    deadline,
+                    dep_mgr.install_pinned(&pin, &omni_core::dependencies::HttpFetcher, &update_gate, Duration::from_secs(1), &tool_installer),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(out)) => {
+                        info!("Start-up install of pinned {tool}: {}", out.message);
+                        let _ = repo.log_audit("INFO", "TOOLS", &format!("Pinned {tool} was missing at start-up and was installed: {}", out.message));
+                    }
+                    Ok(Err(e)) => {
+                        error!("Start-up install of pinned {tool} failed: {e:#}");
+                        let _ = repo.log_audit("ERROR", "TOOLS", &format!("Pinned {tool} is missing and its install failed; the queue is held: {e:#}"));
+                    }
+                    Err(_) => {
+                        error!("Start-up install of pinned {tool} did not finish in the 180 s budget");
+                        let _ = repo.log_audit("ERROR", "TOOLS", &format!("Pinned {tool} is missing and its install did not finish in the 180 s start-up budget; the queue is held"));
+                    }
+                }
+            }
+        };
+        let stop = async {
+            match service_shutdown_rx.as_mut() {
+                Some(rx) => {
+                    rx.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = install => {}
+            _ = stop => {
+                info!("Windows Service Control Manager shutdown requested during the start-up tool install.");
+                return Ok(());
+            }
+        }
+    }
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
@@ -1157,19 +1219,19 @@ async fn run_daemon(
         .as_ref()
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("ffmpeg"))
-        .unwrap_or_else(|| PathBuf::from("ffmpeg.exe"));
+        .unwrap_or_else(|| dep_mgr.unresolved_path("ffmpeg"));
     let ffprobe_path = config
         .ffprobe_path
         .as_ref()
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("ffprobe"))
-        .unwrap_or_else(|| PathBuf::from("ffprobe.exe"));
+        .unwrap_or_else(|| dep_mgr.unresolved_path("ffprobe"));
     let bmxtranswrap_path = config
         .bmxtranswrap_path
         .as_ref()
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("bmxtranswrap"))
-        .unwrap_or_else(|| PathBuf::from("bmxtranswrap.exe"));
+        .unwrap_or_else(|| dep_mgr.unresolved_path("bmxtranswrap"));
     let ytdl_path = config
         .ytdl_path
         .as_ref()
@@ -1250,10 +1312,6 @@ async fn run_daemon(
     .with_archive(Some(archive_settings.clone())));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
-
-    // Keeps the nightly tool update from swapping yt-dlp.exe out from under a
-    // running download (plan P2.9, defect D-16).
-    let update_gate = UpdateGate::new();
 
     // Live subsystem health, shared with the web panels (plan P6.2, W-09).
     let health = HealthState::new();
@@ -1361,7 +1419,6 @@ async fn run_daemon(
     // Only the Windows service locks its folders; a console run would lock the developer out.
     lock_down_install(service_shutdown_rx.is_some(), &[paths.data.clone(), temp_path.clone()], &health).await;
     // The «pinned tools» health line; the panel's installs refresh it and share the hash cache.
-    let tool_installer = omni_core::dependencies::ToolInstaller::new();
     {
         let override_map: std::collections::HashMap<String, PathBuf> = tool_overrides.iter().cloned().collect();
         let (mgr, st) = (DependencyManager::new(&bin_dir), tool_installer.clone());

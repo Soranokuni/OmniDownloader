@@ -885,7 +885,7 @@ pub enum BenchAction {
 }
 
 fn tool(configured: &Option<String>, name: &str, deps: &omni_core::dependencies::DependencyManager, fallback: &str) -> PathBuf {
-    configured.as_ref().map(PathBuf::from).or_else(|| deps.find_binary(name)).unwrap_or_else(|| PathBuf::from(fallback))
+    configured.as_ref().map(PathBuf::from).or_else(|| deps.find_binary(name)).unwrap_or_else(|| deps.unresolved_path(fallback))
 }
 
 /// `omni-ingest benchmark ...`. The result is whether the run's thresholds all passed
