@@ -122,6 +122,9 @@ struct Inner {
     checks: RwLock<BTreeMap<String, Check>>,
     started: Instant,
     started_at: DateTime<Utc>,
+    /// The last mail poll that succeeded. Kept apart from the `mail` check,
+    /// whose `last_ok` deliberately does not move while the state is unchanged.
+    mail_polled_at: RwLock<Option<DateTime<Utc>>>,
 }
 
 /// Well-known check names, so the panel and the writers cannot drift apart.
@@ -166,6 +169,7 @@ impl HealthState {
                 checks: RwLock::new(BTreeMap::new()),
                 started: Instant::now(),
                 started_at: Utc::now(),
+                mail_polled_at: RwLock::new(None),
             }),
         }
     }
@@ -192,6 +196,18 @@ impl HealthState {
             }
             guard.insert(name.to_string(), check);
         }
+    }
+
+    /// A mail poll just succeeded (every poll, unlike the `mail` check).
+    pub fn note_mail_poll(&self) {
+        if let Ok(mut guard) = self.inner.mail_polled_at.write() {
+            *guard = Some(Utc::now());
+        }
+    }
+
+    /// When the last mail poll succeeded; `None` if none has since start-up.
+    pub fn last_mail_poll(&self) -> Option<DateTime<Utc>> {
+        self.inner.mail_polled_at.read().ok().and_then(|g| *g)
     }
 
     /// Forget a check that no longer applies (the first-run account, once
@@ -307,6 +323,21 @@ mod tests {
         // A genuine change does replace it.
         h.set_if_changed(checks::MAIL, Check::degraded("authentication failed"));
         assert_eq!(h.get(checks::MAIL).unwrap().state, Health::Degraded);
+    }
+
+    #[test]
+    fn every_successful_mail_poll_moves_the_poll_time_but_not_the_check() {
+        let h = HealthState::new();
+        assert_eq!(h.last_mail_poll(), None);
+        h.set_if_changed(checks::MAIL, Check::ok("polled"));
+        let ok = h.get(checks::MAIL).unwrap().last_ok.unwrap();
+        h.note_mail_poll();
+        let first = h.last_mail_poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.note_mail_poll();
+        h.set_if_changed(checks::MAIL, Check::ok("polled"));
+        assert!(h.last_mail_poll().unwrap() > first);
+        assert_eq!(h.get(checks::MAIL).unwrap().last_ok.unwrap(), ok);
     }
 
     #[test]

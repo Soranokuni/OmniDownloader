@@ -35,6 +35,8 @@ impl WebServer {
             .route("/", get(handle_root))
             .route("/login", get(view_login))
             .route("/api/health", get(api_health))
+            // Off by default (404); on, only `metrics.allow_networks` or an Admin session (P6.5).
+            .route("/metrics", get(crate::scrape::api_metrics))
             .route("/api/auth/login", post(api_login))
             .route("/api/auth/logout", post(api_logout))
             .route("/api/setup/state", get(api_setup_state))

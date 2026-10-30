@@ -378,6 +378,35 @@ pub enum CancelOutcome {
     NotCancellable,
 }
 
+/// One job reached a final status (plan P6.5). Called after the commit of a
+/// transition that really changed a row, never for a refused or no-op one.
+fn count_finished(status: JobStatus) {
+    metrics::counter!("omni_jobs_finished_total", "status" => status.as_str()).increment(1);
+}
+
+/// A stage that was just closed: the new `stage_timings_json` text, and what to
+/// report to the metrics once the transaction has committed.
+struct StageClose {
+    json: String,
+    stage: String,
+    ms: i64,
+}
+
+impl StageClose {
+    /// One `omni_stage_duration_seconds` sample (plan P6.5). The label is the
+    /// stage's fixed name; a stored value that is not a known stage is not reported.
+    fn observe(close: &Option<StageClose>) {
+        let Some(c) = close else { return };
+        let Some(stage) = JobStage::parse(&c.stage) else { return };
+        metrics::histogram!("omni_stage_duration_seconds", "stage" => stage.as_str().to_ascii_lowercase())
+            .record(c.ms as f64 / 1000.0);
+    }
+
+    fn json(close: &Option<StageClose>) -> Option<&str> {
+        close.as_ref().map(|c| c.json.as_str())
+    }
+}
+
 /// The stage clock of a leased job, as the new `stage_timings_json` text: the
 /// existing object with the milliseconds since `stage_started_at` added to the
 /// key of the current stage (repeats of a stage sum). `None` when there is
@@ -389,7 +418,7 @@ fn stage_timings_for(
     guard: &str,
     args: impl rusqlite::Params,
     at: chrono::DateTime<Utc>,
-) -> Result<Option<String>> {
+) -> Result<Option<StageClose>> {
     let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
             &format!("SELECT stage, stage_started_at, stage_timings_json FROM queue WHERE {guard}"),
@@ -412,8 +441,8 @@ fn stage_timings_for(
         _ => serde_json::Map::new(),
     };
     let prev = map.get(&stage).and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    map.insert(stage, serde_json::Value::from(prev.saturating_add(ms)));
-    Ok(Some(serde_json::Value::Object(map).to_string()))
+    map.insert(stage.clone(), serde_json::Value::from(prev.saturating_add(ms)));
+    Ok(Some(StageClose { json: serde_json::Value::Object(map).to_string(), stage, ms }))
 }
 
 /// What [`Repository::cancel_own_pending`] did. A job that is not the
@@ -797,7 +826,8 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::format(at);
-        let timings = stage_timings_for(&tx, "id = ? AND lease_owner = ?", params![job_id, owner], at)?;
+        let close = stage_timings_for(&tx, "id = ? AND lease_owner = ?", params![job_id, owner], at)?;
+        let timings = StageClose::json(&close);
         let delivered = matches!(status, JobStatus::Completed);
         let changed = tx.execute(
             r#"
@@ -835,6 +865,10 @@ impl Repository {
         )?;
         tx.commit()?;
         if changed == 1 {
+            StageClose::observe(&close);
+            if status.is_terminal() {
+                count_finished(status);
+            }
             let level = if matches!(status, JobStatus::Completed | JobStatus::AwaitingApproval) { "INFO" } else { "ERROR" };
             self.record_event(
                 job_id,
@@ -1115,12 +1149,13 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::format(at);
-        let timings = stage_timings_for(
+        let close = stage_timings_for(
             &tx,
             "id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![job_id, owner],
             at,
         )?;
+        let timings = StageClose::json(&close);
         let changed = tx.execute(
             "UPDATE queue SET stage = ?, stage_started_at = ?, updated_at = ?,
                  stage_timings_json = COALESCE(?, stage_timings_json)
@@ -1135,6 +1170,7 @@ impl Repository {
         }
         tx.commit()?;
         if changed == 1 {
+            StageClose::observe(&close);
             if let Some(bus) = &self.events {
                 bus.job(job_id, "RUNNING", Some(stage.as_str()), None);
             }
@@ -1642,10 +1678,13 @@ impl Repository {
         };
 
         let (mut requeued, mut review) = (0usize, 0usize);
+        // Counted once the transaction has committed.
+        let mut finished: Vec<JobStatus> = Vec::new();
         for (id, attempts, max_attempts) in expired {
             // Already in the watchfolder: finishing it is the only safe
             // recovery, a requeue would put a second copy on air.
             if Self::recover_if_delivered(&tx, id, &now)? {
+                finished.push(JobStatus::Completed);
                 continue;
             }
             if attempts < max_attempts {
@@ -1678,9 +1717,11 @@ impl Repository {
                     params![id, now, "Lease expired; attempts exhausted, sent to review"],
                 )?;
                 review += 1;
+                finished.push(JobStatus::RequiresReview);
             }
         }
         tx.commit()?;
+        finished.into_iter().for_each(count_finished);
         Ok((requeued, review))
     }
 
@@ -1711,6 +1752,7 @@ impl Repository {
             let tx = conn.transaction()?;
             if Self::recover_if_delivered(&tx, *id, &now)? {
                 tx.commit()?;
+                count_finished(JobStatus::Completed);
                 continue;
             }
             requeued += 1;
@@ -2008,6 +2050,23 @@ impl Repository {
         self.job_counts_since(local_midnight_utc())
     }
 
+    /// Jobs per status, every status present (0 when none), for `/metrics`.
+    /// A stored status this build does not know is not counted.
+    pub fn job_counts_by_status(&self) -> Result<Vec<(JobStatus, i64)>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM queue GROUP BY status")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(JobStatus::ALL
+            .iter()
+            .map(|s| {
+                let n = rows.iter().filter(|(name, _)| name == s.as_str()).map(|(_, n)| *n).sum();
+                (*s, n)
+            })
+            .collect())
+    }
+
     /// `job_counts` with the start of "today" given (UTC), so a test can pin it.
     pub fn job_counts_since(&self, day_start_utc: chrono::DateTime<Utc>) -> Result<crate::models::JobCounts> {
         let today_start = timestamps::format(day_start_utc);
@@ -2164,6 +2223,9 @@ impl Repository {
             "#,
             params![now, now, now, id],
         )?;
+        if n > 0 {
+            count_finished(JobStatus::CompletedManual);
+        }
         Ok(n > 0)
     }
 
@@ -2185,6 +2247,7 @@ impl Repository {
             params![now, now, id],
         )?;
         if n > 0 {
+            count_finished(JobStatus::Cancelled);
             self.log_audit("WARN", "QUEUE", &format!("Cancelled Job #{}", id))?;
             return Ok(CancelOutcome::Cancelled);
         }
@@ -2213,6 +2276,7 @@ impl Repository {
             params![now, now, id, user_id],
         )?;
         if n > 0 {
+            count_finished(JobStatus::Cancelled);
             return Ok(OwnCancelOutcome::Cancelled);
         }
         let owned: Option<i64> = conn
@@ -4189,12 +4253,13 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::now_string();
-        let timings = stage_timings_for(
+        let close = stage_timings_for(
             &tx,
             "id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![job_id, owner],
             Utc::now(),
         )?;
+        let timings = StageClose::json(&close);
         let n = tx.execute(
             r#"
             UPDATE queue
@@ -4221,6 +4286,8 @@ impl Repository {
             params![job_id, now],
         )?;
         tx.commit()?;
+        StageClose::observe(&close);
+        count_finished(JobStatus::Completed);
         if let Some(bus) = &self.events {
             bus.job(job_id, "COMPLETED", Some("DONE"), Some(100.0));
         }
@@ -4307,6 +4374,7 @@ impl Repository {
             params![job_id, now, format!("Rejected by {by} ({reason}): {message}")],
         )?;
         tx.commit()?;
+        count_finished(JobStatus::RequiresReview);
         Ok(true)
     }
 
@@ -4341,6 +4409,7 @@ impl Repository {
             params![job_id, at, "Nobody approved the held video in time; it was deleted"],
         )?;
         tx.commit()?;
+        count_finished(JobStatus::RequiresReview);
         Ok(true)
     }
 
@@ -6659,6 +6728,142 @@ mod tests {
         assert_eq!(job.stage_timings_json, None);
         assert!(repo.finish_at(id, owner, JobStatus::Completed, None, None, None, end)?);
         assert_eq!(timings_of(&repo, id), Some(serde_json::json!({"TRANSCODE": 7250})));
+        Ok(())
+    }
+
+    /// Run `f` against a private Prometheus recorder; the rendered text.
+    fn rendered_metrics(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    #[test]
+    fn a_closed_stage_records_one_histogram_sample_and_a_refused_move_none() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        let text = rendered_metrics(|| {
+            assert!(!repo.set_stage_at(id, "someone-else", JobStage::Probe, t0() + Duration::milliseconds(1500)).unwrap());
+            assert!(repo.set_stage_at(id, owner, JobStage::Probe, t0() + Duration::milliseconds(1500)).unwrap());
+        });
+        assert!(text.contains("omni_stage_duration_seconds_count{stage=\"download\"} 1"), "{text}");
+        assert!(text.contains("omni_stage_duration_seconds_sum{stage=\"download\"} 1.5"), "{text}");
+        assert!(!text.contains("probe"), "the stage entered is not closed yet: {text}");
+        Ok(())
+    }
+
+    #[test]
+    fn finishing_a_job_closes_its_last_stage_and_counts_the_terminal_status_once() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("TRANSCODE", Some(t0()))?;
+        let end = t0() + Duration::milliseconds(7250);
+        let text = rendered_metrics(|| {
+            assert!(!repo.finish_at(id, "someone-else", JobStatus::Failed, None, None, None, end).unwrap());
+            assert!(repo.finish_at(id, owner, JobStatus::Completed, None, None, None, end).unwrap());
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"COMPLETED\"} 1"), "{text}");
+        assert!(!text.contains("FAILED"), "a refused finish counted: {text}");
+        assert!(text.contains("omni_stage_duration_seconds_count{stage=\"transcode\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_reaper_giving_up_counts_a_review_but_a_requeue_counts_nothing() -> Result<()> {
+        let expire = |repo: &Repository, id: i64, attempts: i32, max: i32| {
+            repo.pool
+                .get()
+                .unwrap()
+                .execute(
+                    "UPDATE queue SET lease_expires_at = '2000-01-01T00:00:00.000Z', attempts = ?, max_attempts = ? WHERE id = ?",
+                    params![attempts, max, id],
+                )
+                .unwrap();
+        };
+        let (repo, id, _owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        expire(&repo, id, 1, 3);
+        let text = rendered_metrics(|| assert_eq!(repo.reap_expired_leases().unwrap(), (1, 0)));
+        assert!(!text.contains("omni_jobs_finished_total"), "a requeue is not a finish: {text}");
+
+        let (repo, id, _owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        expire(&repo, id, 3, 3);
+        let text = rendered_metrics(|| assert_eq!(repo.reap_expired_leases().unwrap(), (0, 1)));
+        assert!(text.contains("omni_jobs_finished_total{status=\"REQUIRES_REVIEW\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_reaper_recovery_of_a_delivered_job_counts_completed() -> Result<()> {
+        let (repo, id, _owner, _db) = leased_at("ARCHIVE", Some(t0()))?;
+        repo.pool.get()?.execute(
+            "UPDATE queue SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+            params![id],
+        )?;
+        let text = rendered_metrics(|| {
+            repo.reap_expired_leases().unwrap();
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"COMPLETED\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejecting_a_held_job_counts_once_and_a_refused_rejection_counts_nothing() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("VERIFY", Some(t0()))?;
+        assert!(repo.hold_output(id, owner, "held/x.mxf", 10, "sha", None, Utc::now() + Duration::hours(1))?);
+        assert!(repo.finish_at(id, owner, JobStatus::AwaitingApproval, None, None, None, t0())?);
+        let text = rendered_metrics(|| {
+            assert!(repo.reject_held(id, "other", "no", "desk").unwrap());
+            assert!(!repo.reject_held(id, "other", "again", "desk").unwrap());
+            assert!(!repo.expire_held(id, Utc::now()).unwrap());
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"REQUIRES_REVIEW\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_counts_once_and_a_refused_cancel_or_a_pending_requeue_counts_nothing() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.add_job("https://example.org/c", "1_T_C", "T", "C", "1", 10, JobStatus::Pending, None, None, None)?;
+        let text = rendered_metrics(|| {
+            assert_eq!(repo.cancel_job(id).unwrap(), CancelOutcome::Cancelled);
+            assert_eq!(repo.cancel_job(id).unwrap(), CancelOutcome::NotCancellable);
+            assert!(!repo.mark_completed_manually(999).unwrap());
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"CANCELLED\"} 1"), "{text}");
+        assert_eq!(text.matches("omni_jobs_finished_total{").count(), 1, "{text}");
+
+        let id2 = repo.add_job("https://example.org/d", "1_T_D", "T", "D", "1", 10, JobStatus::RequiresReview, None, None, None)?;
+        let text = rendered_metrics(|| assert!(repo.mark_completed_manually(id2).unwrap()));
+        assert!(text.contains("omni_jobs_finished_total{status=\"COMPLETED_MANUAL\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_job_is_not_counted_as_finished() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("VERIFY", Some(t0()))?;
+        let text = rendered_metrics(|| {
+            assert!(repo.finish_at(id, owner, JobStatus::AwaitingApproval, None, None, None, t0()).unwrap());
+        });
+        assert!(!text.contains("omni_jobs_finished_total"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn job_counts_by_status_lists_every_status_with_zero_for_absent_ones() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        for (n, status) in [("a", JobStatus::Pending), ("b", JobStatus::Pending), ("c", JobStatus::Failed)] {
+            repo.add_job(
+                &format!("https://example.org/{n}"), &format!("1_T_{n}"), "T", n, "1", 10,
+                status, None, None, None,
+            )?;
+        }
+        let counts = repo.job_counts_by_status()?;
+        assert_eq!(counts.len(), JobStatus::ALL.len());
+        let get = |s: JobStatus| counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n);
+        assert_eq!(get(JobStatus::Pending), Some(2));
+        assert_eq!(get(JobStatus::Failed), Some(1));
+        assert_eq!(get(JobStatus::AwaitingApproval), Some(0));
+        assert_eq!(get(JobStatus::Completed), Some(0));
         Ok(())
     }
 

@@ -8,6 +8,7 @@ pub mod middleware;
 pub mod ratelimit;
 pub mod repair_card;
 pub mod routes;
+pub mod scrape;
 pub mod server;
 pub mod state;
 pub mod user_jobs;

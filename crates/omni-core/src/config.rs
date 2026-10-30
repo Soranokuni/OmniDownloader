@@ -593,6 +593,38 @@ impl Default for ArchiveConfig {
     }
 }
 
+/// `GET /metrics` for a monitoring system (plan P6.5). Off by default: with it
+/// off the route is a 404 and no metric is recorded anywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Clients that may scrape without a session. An Admin session may always
+    /// scrape; `security.mcr_open_networks` grants nothing here.
+    #[serde(default = "default_metrics_networks")]
+    pub allow_networks: Vec<String>,
+}
+
+fn default_metrics_networks() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_networks: default_metrics_networks(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Parse [`Self::allow_networks`], dropping and logging bad entries.
+    pub fn networks(&self) -> crate::net::CidrSet {
+        crate::net::CidrSet::parse_lossy(&self.allow_networks)
+    }
+}
+
 /// Email parser tuning (plan P4.3; `parser` in the config v2 shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParserConfig {
@@ -753,6 +785,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub archive: ArchiveConfig,
 
+    /// The optional Prometheus endpoint (plan P6.5).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -849,6 +885,7 @@ impl Default for AppConfig {
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             archive: ArchiveConfig::default(),
+            metrics: MetricsConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -1030,6 +1067,22 @@ mod tests {
         assert!(!partial.archive.enabled);
         assert_eq!(partial.archive.retention_days, 14);
         assert_eq!(partial.archive.path, "archive");
+    }
+
+    #[test]
+    fn a_config_without_metrics_is_off_and_loopback_only() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!old.metrics.enabled);
+        assert_eq!(old.metrics.allow_networks, vec!["127.0.0.1/32", "::1/128"]);
+        let partial: AppConfig = serde_json::from_str(r#"{"metrics":{"enabled":true}}"#).unwrap();
+        assert!(partial.metrics.enabled);
+        assert_eq!(partial.metrics.allow_networks, vec!["127.0.0.1/32", "::1/128"]);
+        let own: AppConfig =
+            serde_json::from_str(r#"{"metrics":{"allow_networks":["10.1.2.0/24","junk"]}}"#).unwrap();
+        assert!(!own.metrics.enabled);
+        let nets = own.metrics.networks();
+        assert!(nets.contains("10.1.2.9".parse().unwrap()));
+        assert!(!nets.contains("127.0.0.1".parse().unwrap()), "a set list replaces the default");
     }
 
     #[test]

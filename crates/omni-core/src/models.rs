@@ -34,6 +34,19 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    /// Every status, for the metrics' per-status counts (a status with no job still gets a line).
+    pub const ALL: [JobStatus; 9] = [
+        Self::Pending,
+        Self::Running,
+        Self::Completed,
+        Self::Failed,
+        Self::RequiresReview,
+        Self::ManualDownload,
+        Self::Cancelled,
+        Self::CompletedManual,
+        Self::AwaitingApproval,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "PENDING",

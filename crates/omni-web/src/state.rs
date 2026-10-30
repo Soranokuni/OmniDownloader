@@ -81,6 +81,18 @@ pub trait BenchmarkStarter: Send + Sync {
     fn start(&self, request: BenchRequest) -> Result<i64, BenchStartError>;
 }
 
+/// Where `/metrics` reads its scrape-time numbers from (P6.5). The daemon
+/// anchors the paths to the install dir; none of them is ever printed.
+#[derive(Debug, Clone)]
+pub struct MetricsSources {
+    pub temp: PathBuf,
+    pub watchfolder: PathBuf,
+    /// `None` when the archive is off: the series is left out.
+    pub archive: Option<PathBuf>,
+    /// The configured number of workers.
+    pub workers_max: usize,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Repository,
@@ -147,6 +159,11 @@ pub struct AppState {
     /// The canary run lock: a canary's yt-dlp starts without a gate pass, so a yt-dlp or
     /// Deno swap holds it too, as the nightly task does. `None` in tests that have none.
     pub canary_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// The Prometheus recorder's handle behind `GET /metrics` (P6.5); `None` when
+    /// `metrics.enabled` is off, and the route is then a 404.
+    pub metrics: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    /// The paths and worker count the scrape reads; `None` in tests that have none.
+    pub metrics_sources: Option<Arc<MetricsSources>>,
 }
 
 impl AppState {
@@ -190,6 +207,8 @@ impl AppState {
             tools_missing_at_start: Arc::new(Vec::new()),
             tool_overrides: Arc::new(std::collections::HashMap::new()),
             canary_lock: None,
+            metrics: None,
+            metrics_sources: None,
         }
     }
 
@@ -251,6 +270,13 @@ impl AppState {
     /// The canary run lock a yt-dlp or Deno swap must hold.
     pub fn with_canary_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
         self.canary_lock = Some(lock);
+        self
+    }
+
+    /// Serve `GET /metrics` from this recorder's handle.
+    pub fn with_metrics(mut self, handle: metrics_exporter_prometheus::PrometheusHandle, sources: MetricsSources) -> Self {
+        self.metrics = Some(handle);
+        self.metrics_sources = Some(Arc::new(sources));
         self
     }
 

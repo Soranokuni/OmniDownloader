@@ -233,6 +233,20 @@ const MATRIX: &[Row] = &[
     // ---- Public ----
     ("GET", "/api/health", &[(Anonymous, Reached), (Admin, Reached)]),
     ("GET", "/login", &[(Anonymous, Reached)]),
+    // `metrics.enabled` is off in this matrix's config, so the route is not there for
+    // anyone, an Admin included; metrics_tests.rs covers it switched on (P6.5).
+    (
+        "GET",
+        "/metrics",
+        &[
+            (Anonymous, NotFound),
+            (AllowlistedIp, NotFound),
+            (Loopback, NotFound),
+            (Caller::User, NotFound),
+            (Mcr, NotFound),
+            (Admin, NotFound),
+        ],
+    ),
     ("GET", "/api/setup/state", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/login", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/logout", &[(Anonymous, Reached)]),

@@ -242,6 +242,46 @@ Secrets live only in `data\secrets.bin` (DPAPI). Manage them in
 They are never written to `config.json` or the logs. Keys only work on the
 PC they were saved on.
 
+### 5.7 Metrics for a monitoring system (`metrics`)
+
+Optional, **off by default**. Off, `GET /metrics` is a 404 like any unknown
+address and nothing is measured. Switch it on in `config.json` and restart:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `metrics.enabled` | `false` | serve `GET /metrics` in the Prometheus text format |
+| `metrics.allow_networks` | `["127.0.0.1/32", "::1/128"]` | clients that may scrape without signing in, e.g. `["10.20.5.10/32"]`; an invalid entry is logged and skipped |
+
+Who may scrape: a client in `metrics.allow_networks`, or an **Admin** session.
+Being on `security.mcr_open_networks`, or signed in as MCR or an ordinary user,
+does **not** allow it; those get 403. Behind a reverse proxy the same
+`trust_proxy_header` rules as everywhere else decide the client address.
+
+The text holds numbers only: no addresses, file names, paths, people or
+credentials. Example Prometheus job:
+
+```yaml
+scrape_configs:
+  - job_name: omni-ingest
+    metrics_path: /metrics
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["ingest-pc:8080"]
+```
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `omni_jobs` | gauge | `status` | jobs now in each status (every status, 0 when none) |
+| `omni_jobs_finished_total` | counter | `status` | jobs that reached a final status since the service started |
+| `omni_stage_duration_seconds` | histogram | `stage` | time a job spent in a stage (buckets 1 s to 30 min), since the service started |
+| `omni_mail_last_poll_age_seconds` | gauge | none | seconds since the last successful mail poll; absent until one has succeeded |
+| `omni_disk_free_bytes` | gauge | `volume` = `temp`, `watchfolder`, `archive` | free space on each volume |
+| `omni_workers_busy`, `omni_workers_max` | gauge | none | job runs in progress, and how many may run (downloads + encodes) |
+| `omni_health` | gauge | `check` | 0 ok, 1 degraded, 2 down, for each check on the Admin page |
+
+The counter and the histogram start from zero at each service start, which
+Prometheus handles as a counter reset.
+
 ---
 
 ## 6. The Admin page

@@ -1426,6 +1426,22 @@ async fn run_daemon(
             health.set(omni_core::health::checks::PINNED_TOOLS, check);
         }
     }
+    // The Prometheus recorder (P6.5): installed once, and only when switched on.
+    // Off, nothing is recorded and `/metrics` is a 404.
+    let metrics_handle = if config.metrics.enabled { install_metrics_recorder() } else { None };
+    if let Some(handle) = metrics_handle.clone() {
+        // Histograms need their housekeeping now and then, or they grow without bound.
+        let mut upkeep_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = upkeep_rx.recv() => break,
+                    _ = tick.tick() => handle.run_upkeep(),
+                }
+            }
+        });
+    }
     let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_url_tester(url_tester.clone())
         .with_cookie_tester(Arc::new(CookieJarTester {
@@ -1453,6 +1469,17 @@ async fn run_daemon(
         .with_events(events.clone());
     if let Some(r) = &log_redactions {
         web_state = web_state.with_redactions(r.clone());
+    }
+    if let Some(handle) = metrics_handle {
+        web_state = web_state.with_metrics(
+            handle,
+            omni_web::state::MetricsSources {
+                temp: temp_path.clone(),
+                watchfolder: watchfolder_path.clone(),
+                archive: archive_settings.purges().then(|| archive_settings.root.clone()),
+                workers_max: config.max_concurrent_downloads.clamp(1, 10) + config.max_concurrent_transcodes.clamp(1, 8),
+            },
+        );
     }
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
@@ -1959,6 +1986,32 @@ const QUEUE_SLOW_SECS: i64 = 30 * 60;
 /// Once degraded, the check recovers only when both measures are under this,
 /// so a backlog hovering near 30 min does not alarm on every edge.
 const QUEUE_RECOVER_SECS: i64 = 25 * 60;
+
+/// Install the global metrics recorder for `GET /metrics` (P6.5). A failure is
+/// logged and leaves the route a 404: the daemon runs the same without metrics.
+fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+    let builder = match PrometheusBuilder::new().set_buckets_for_metric(
+        Matcher::Full("omni_stage_duration_seconds".to_string()),
+        &[1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Metrics: bad histogram buckets, /metrics stays off: {e}");
+            return None;
+        }
+    };
+    match builder.install_recorder() {
+        Ok(handle) => {
+            info!("Metrics: GET /metrics is on");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!("Metrics: could not start the recorder, /metrics stays off: {e}");
+            None
+        }
+    }
+}
 
 /// The `queue` health check (plan P7.19). Never `down`: a slow queue is a warning.
 fn queue_check(w: &omni_core::models::QueueWatch, was_degraded: bool) -> omni_core::health::Check {

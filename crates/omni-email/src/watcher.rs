@@ -177,28 +177,37 @@ impl EmailWatcher {
                         continue;
                     }
 
-                    match self.poll_once().await {
-                        Err(e) => {
-                            error!("EmailWatcher error: {:#}", e);
-                            let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("Mail poll error: {}", short_reason(&e)));
-                            // The panel used to say "Mail: Active" through
-                            // exactly this (defect W-09). A short reason, not
-                            // the whole chain: this string is shown to an
-                            // operator, and it must not carry a credential.
-                            if let Some(check) = backoff.failed(&e, Instant::now()) {
-                                self.report_health(check.with_error(format!("{e:#}")));
-                            }
-                        }
-                        Ok(_) => {
-                            backoff.succeeded();
-                            self.report_health(Check::ok(format!(
-                                "polling {} every {}s",
-                                self.source.describe(),
-                                poll_interval.as_secs()
-                            )));
-                        }
-                    }
+                    self.poll_and_report(&mut backoff, poll_interval).await;
                 }
+            }
+        }
+    }
+
+    /// One poll of the loop and what it tells the health state.
+    async fn poll_and_report(&self, backoff: &mut Backoff, poll_interval: Duration) {
+        match self.poll_once().await {
+            Err(e) => {
+                error!("EmailWatcher error: {:#}", e);
+                let _ = self.repo.log_audit("ERROR", "EMAIL", &format!("Mail poll error: {}", short_reason(&e)));
+                // The panel used to say "Mail: Active" through
+                // exactly this (defect W-09). A short reason, not
+                // the whole chain: this string is shown to an
+                // operator, and it must not carry a credential.
+                if let Some(check) = backoff.failed(&e, Instant::now()) {
+                    self.report_health(check.with_error(format!("{e:#}")));
+                }
+            }
+            Ok(_) => {
+                backoff.succeeded();
+                // Every successful poll, for the metrics' "last poll age" (P6.5).
+                if let Some(h) = &self.health {
+                    h.note_mail_poll();
+                }
+                self.report_health(Check::ok(format!(
+                    "polling {} every {}s",
+                    self.source.describe(),
+                    poll_interval.as_secs()
+                )));
             }
         }
     }
@@ -726,6 +735,67 @@ impl Backoff {
 mod tests {
     use super::*;
     use omni_core::health::Health;
+
+    /// A mailbox that lists nothing, or fails to list.
+    struct ScriptedSource {
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSource for ScriptedSource {
+        fn describe(&self) -> String {
+            "scripted".into()
+        }
+        fn checkpoint_key(&self) -> String {
+            "scripted:test".into()
+        }
+        fn is_configured(&self) -> bool {
+            true
+        }
+        async fn list_changed(&self, _: DateTime<Utc>, _: usize) -> Result<Vec<MailHeader>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("cannot reach the mailbox");
+            }
+            Ok(Vec::new())
+        }
+        async fn fetch_mail(&self, id: &str) -> Result<InboundMail> {
+            anyhow::bail!("no mail {id}")
+        }
+        async fn mark_processed(&self, _: &str, _: MailOutcome) -> Result<()> {
+            Ok(())
+        }
+        async fn download_attachment(&self, _: &str, _: &str, _: &std::path::Path) -> Result<PathBuf> {
+            anyhow::bail!("none")
+        }
+        async fn reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> crate::source::MailHealth {
+            crate::source::MailHealth { ok: true, detail: "scripted".into() }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_poll_stamps_the_poll_time_and_a_failed_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let health = HealthState::new();
+        let source = Arc::new(ScriptedSource { fail: std::sync::atomic::AtomicBool::new(true) });
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo, source.clone()).with_health(health.clone());
+        let mut backoff = Backoff::default();
+        let every = Duration::from_secs(30);
+
+        watcher.poll_and_report(&mut backoff, every).await;
+        assert_eq!(health.last_mail_poll(), None, "a failed poll is not a poll");
+
+        source.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        watcher.poll_and_report(&mut backoff, every).await;
+        let first = health.last_mail_poll().expect("a successful poll stamps the time");
+
+        source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.poll_and_report(&mut backoff, every).await;
+        assert_eq!(health.last_mail_poll(), Some(first), "a failed poll leaves it as it was");
+    }
 
     #[test]
     fn backoff_escalates_and_honours_retry_after() {
