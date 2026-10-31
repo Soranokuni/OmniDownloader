@@ -965,3 +965,20 @@ async fn a_letters_only_stem_is_checked_by_rot13_and_a_hard_coded_name_is_discar
     assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
     assert!(llm_recipes(&r).is_empty(), "breaking-news is written into the pattern");
 }
+
+// ---- P10.16a: a video the model found is never trusted ----
+
+#[tokio::test]
+async fn a_model_found_video_is_held_even_when_every_stored_recipe_is_trusted_on_the_site() {
+    let r = llm_rig(RepairMode::Hold, MockModel::new(vec![ptr_answer("/video/src")]));
+    for rec in r.repo.recipes_for_site(DOMAIN, None, Utc::now()).unwrap() {
+        for _ in 0..5 {
+            r.repo.recipe_event(rec.id, DOMAIN, Event::Approval, Utc::now()).unwrap();
+        }
+    }
+    held_once(&r);
+    let res = go(&r, Some(llm_page("Invented story")), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    let d = r.fake.downloads();
+    assert_eq!((d[0].0.as_str(), d[0].2), (CLIP, DeliveryMode::Hold { hold_hours: 24, held_max_bytes: 20 << 30 }));
+}

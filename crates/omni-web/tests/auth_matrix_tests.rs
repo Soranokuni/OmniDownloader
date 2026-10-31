@@ -233,6 +233,20 @@ const MATRIX: &[Row] = &[
     // ---- Public ----
     ("GET", "/api/health", &[(Anonymous, Reached), (Admin, Reached)]),
     ("GET", "/login", &[(Anonymous, Reached)]),
+    // `metrics.enabled` is off in this matrix's config, so the route is not there for
+    // anyone, an Admin included; metrics_tests.rs covers it switched on (P6.5).
+    (
+        "GET",
+        "/metrics",
+        &[
+            (Anonymous, NotFound),
+            (AllowlistedIp, NotFound),
+            (Loopback, NotFound),
+            (Caller::User, NotFound),
+            (Mcr, NotFound),
+            (Admin, NotFound),
+        ],
+    ),
     ("GET", "/api/setup/state", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/login", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/logout", &[(Anonymous, Reached)]),
@@ -340,6 +354,11 @@ const MATRIX: &[Row] = &[
     (
         "POST",
         "/api/jobs/1/next",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    (
+        "POST",
+        "/api/jobs/1/wrong-video",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),
     (
@@ -1171,7 +1190,7 @@ async fn w07_state_changing_requests_need_the_panel_marker_and_a_same_origin() -
 #[tokio::test]
 async fn approving_or_rejecting_a_held_video_needs_the_csrf_marker() -> Result<()> {
     let h = Harness::new(true)?;
-    for uri in ["/api/jobs/1/approve", "/api/jobs/1/reject", "/api/jobs/1/next"] {
+    for uri in ["/api/jobs/1/approve", "/api/jobs/1/reject", "/api/jobs/1/next", "/api/jobs/1/wrong-video"] {
         let send = |headers: &[(&str, &str)]| {
             let mut builder = Request::builder()
                 .method("POST")

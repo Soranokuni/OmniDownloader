@@ -35,6 +35,8 @@ impl WebServer {
             .route("/", get(handle_root))
             .route("/login", get(view_login))
             .route("/api/health", get(api_health))
+            // Off by default (404); on, only `metrics.allow_networks` or an Admin session (P6.5).
+            .route("/metrics", get(crate::scrape::api_metrics))
             .route("/api/auth/login", post(api_login))
             .route("/api/auth/logout", post(api_logout))
             .route("/api/setup/state", get(api_setup_state))
@@ -59,6 +61,7 @@ impl WebServer {
             .route("/api/jobs/:id/retry", post(api_retry_job))
             .route("/api/jobs/:id/approve", post(api_approve_job))
             .route("/api/jobs/:id/reject", post(api_reject_job))
+            .route("/api/jobs/:id/wrong-video", post(api_wrong_video))
             .route("/api/jobs/:id/next", post(api_next_job))
             .route("/api/jobs/:id/preview/video", get(api_preview_video))
             .route("/api/jobs/:id/preview/contact", get(api_preview_contact))

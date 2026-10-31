@@ -377,7 +377,7 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 #[test]
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
-    for (module, version) in [("desk.js", 11), ("inbox.js", 17), ("approval.js", 6), ("mcr.js", 42)] {
+    for (module, version) in [("desk.js", 12), ("inbox.js", 18), ("approval.js", 7), ("mcr.js", 43)] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
         for s in assets.values() {

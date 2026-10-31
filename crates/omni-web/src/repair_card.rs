@@ -66,6 +66,25 @@ pub fn build(attempt: &RepairAttempt, origin: Option<&str>, approvals: i64) -> O
     }))
 }
 
+/// The Completed card's `repair` object for a video a trusted recipe delivered
+/// without approval (P10.16a): `null` for any other attempt. `approvals` is how
+/// many times MCR approved the recipe on the site; `wrong_video` says MCR already
+/// pressed «Λάθος βίντεο» (the button is then gone).
+pub fn build_auto_delivered(attempt: &RepairAttempt, approvals: i64) -> Option<Value> {
+    // A redownload replaced the file: nothing of this attempt is on air any more.
+    // 'auto_delivering' is the marker written before the delivery ran; the caller shows it only on a Completed job.
+    if !matches!(attempt.outcome.as_deref(), Some("auto_delivered" | "auto_delivering")) || attempt.mcr_decision.as_deref() == Some("superseded") {
+        return None;
+    }
+    let source_host = attempt.held_url.as_deref().and_then(|u| omni_core::net::parse_public_url(u).ok()).map(|(_, h)| h);
+    Some(json!({
+        "auto_delivered": true,
+        "recipe_approvals": approvals,
+        "source_host": source_host,
+        "wrong_video": attempt.mcr_decision.as_deref() == Some("rejected"),
+    }))
+}
+
 /// The card's `repair` object with how many verified candidates MCR could still
 /// ask for after this one («Επόμενη επιλογή (n)», P10.13).
 pub fn with_next_left(mut card: Value, next_left: usize) -> Value {
@@ -124,6 +143,24 @@ mod tests {
         assert_eq!(names, ["egress", "probe", "short"], "the checks of #2, after a fallback from #1");
         assert!(!v.to_string().contains("SECRET") && !v.to_string().contains("b.mp4"), "hosts only: {v}");
         assert_eq!(v["image"], Value::Null, "no article picture, no image block");
+    }
+
+    #[test]
+    fn an_auto_delivered_card_says_so_with_the_approvals_and_only_the_host() {
+        let mut a = attempt();
+        a.outcome = Some("auto_delivered".into());
+        let v = build_auto_delivered(&a, 6).unwrap();
+        assert_eq!((v["auto_delivered"].clone(), v["recipe_approvals"].clone(), v["wrong_video"].clone()), (json!(true), json!(6), json!(false)));
+        assert_eq!(v["source_host"], "cdn.news.example");
+        assert!(!v.to_string().contains("SECRET"));
+        a.mcr_decision = Some("rejected".into());
+        assert_eq!(build_auto_delivered(&a, 6).unwrap()["wrong_video"], true);
+        assert!(build(&a, None, 0).is_none(), "a delivered attempt is no approval card");
+        a.mcr_decision = Some("superseded".into());
+        assert!(build_auto_delivered(&a, 6).is_none(), "a redownload replaced the file: no card");
+        let mut held = attempt();
+        held.outcome = Some("held".into());
+        assert!(build_auto_delivered(&held, 6).is_none(), "a held one is no auto-delivery");
     }
 
     #[test]

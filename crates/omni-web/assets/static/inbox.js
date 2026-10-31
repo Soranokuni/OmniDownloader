@@ -20,7 +20,8 @@ import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/s
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-} from '/static/desk.js?v=11';
+  autoDeliveredNode,
+} from '/static/desk.js?v=12';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -773,7 +774,7 @@ function jobCard(j) {
 }
 
 const jobSig = (j) => JSON.stringify([j.status, j.stage, pct(j), j.speed, j.eta, j.error_code, j.hint, j.file_path,
-  j.completed_at, j.slug, j.index_str, j.attempts, j.url, j.place, j.max_videos, waitLine(j), j.status === 'RUNNING' && stepIsLong(j)]);
+  j.completed_at, j.slug, j.index_str, j.attempts, j.url, j.place, j.max_videos, waitLine(j), j.status === 'RUNNING' && stepIsLong(j), j.repair]);
 
 function paintJob(card, j, force) {
   const sel = !!selected && selected.job === j.id;
@@ -802,6 +803,8 @@ function paintJob(card, j, force) {
   if (origin) parts.push(origin);
   const limit = limitNote(j);
   if (limit) parts.push(el('div', { class: 'jc-found' }, limit));
+  const auto = autoDeliveredNode(j, afterAction);
+  if (auto) parts.push(auto);
   if (needsAttention(j) || sel) parts.push(moreNode(j, sel));
   card.replaceChildren(...parts);
 }

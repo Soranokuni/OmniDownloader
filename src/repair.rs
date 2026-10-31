@@ -6,7 +6,8 @@
 //! candidate with the repair gate, and then, by `repair.mode`, either only
 //! records what it would have used (shadow) or downloads the best verified
 //! candidate through the unchanged pipeline in `DeliveryMode::Hold`, so MCR
-//! approves it before anything reaches the watchfolder. Never creates a
+//! approves it before anything reaches the watchfolder (`DeliveryMode::Deliver`
+//! only for a recipe MCR has approved enough times on the site, P10.16a). Never creates a
 //! job, never sets a status (the worker does), writes nothing once the lease
 //! is gone, and spends a bounded time (`repair.budget_secs`) before the download.
 
@@ -74,6 +75,8 @@ const LLM_BREAKER_MISSES: u32 = 3;
 pub enum Disposition {
     /// A verified video is held: park the job for MCR, no site-health record.
     Held,
+    /// A trusted recipe's video was delivered without approval: complete the job.
+    Delivered,
     /// The job is no longer ours: write nothing more.
     Lost,
     /// End the job (REQUIRES_REVIEW) with this code and message instead of the one it had.
@@ -89,6 +92,7 @@ pub enum Disposition {
 pub fn disposition(result: &LadderResult, mode: RepairMode, budget: Duration) -> Disposition {
     match result {
         LadderResult::Held { .. } => Disposition::Held,
+        LadderResult::Delivered { .. } => Disposition::Delivered,
         LadderResult::Lost => Disposition::Lost,
         LadderResult::Exhausted if mode == RepairMode::Hold => Disposition::Finish {
             code: ErrorCode::RepairExhausted,
@@ -126,6 +130,8 @@ pub fn site_code(code: ErrorCode) -> ErrorCode {
 pub enum LadderResult {
     /// The best verified video was downloaded, checked and is held for MCR.
     Held { recipe_hash: String },
+    /// A recipe MCR trusts on this site found it: the video is in the watchfolder, unapproved (P10.16a).
+    Delivered { recipe_hash: String },
     /// Shadow mode: this is what would have been used. Nothing was downloaded.
     ShadowFound { verified: Vec<Verified> },
     /// No candidate passed the gate, or the downloads of those that did failed.
@@ -170,6 +176,8 @@ pub struct RepairCfg {
     pub budget: Duration,
     pub hold_hours: i64,
     pub held_max_bytes: u64,
+    /// MCR approvals of a recipe on a site after which its video skips the hold (0 = never).
+    pub auto_deliver_after_approvals: i64,
     pub llm: LlmCfg,
 }
 
@@ -1008,6 +1016,7 @@ pub async fn run(
     let result = ladder(ctx, job, owner, orig_url, snapshot, prior, cancel, started, attempt, &mut end).await;
     let outcome = match &result {
         LadderResult::Held { .. } => "held".to_string(),
+        LadderResult::Delivered { .. } => "auto_delivered".to_string(),
         LadderResult::ShadowFound { .. } => "shadow_found".to_string(),
         LadderResult::NothingVerified => end.outcome.take().unwrap_or_else(|| "nothing_verified".to_string()),
         LadderResult::Exhausted => "exhausted".to_string(),
@@ -1024,7 +1033,7 @@ pub async fn run(
     }
     // A model rung that found nothing is a miss; three on one site within 24 h
     // close the rung for it for 24 h (a canary pass or a new yt-dlp build reopens it).
-    let found = matches!(result, LadderResult::Held { .. } | LadderResult::ShadowFound { .. } | LadderResult::Lost);
+    let found = matches!(result, LadderResult::Held { .. } | LadderResult::Delivered { .. } | LadderResult::ShadowFound { .. } | LadderResult::Lost);
     if end.llm_calls > 0 && !found {
         if let Some(domain) = end.domain.as_deref() {
             let now = Utc::now();
@@ -1622,8 +1631,8 @@ async fn ladder(
         return LadderResult::ShadowFound { verified };
     }
 
-    // Hold: download the best one through the unchanged pipeline, held for MCR.
-    let mode = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
+    // Hold: download the best one through the unchanged pipeline, held for MCR
+    // (delivered at once only when a recipe MCR trusts on this site found it).
     let restore = |ctx: &RepairCtx| {
         let _ = ctx.repo.set_leased_extraction_method(job_id, owner, job.extraction_method.as_deref());
     };
@@ -1635,9 +1644,44 @@ async fn ladder(
             Some(l) => format!("repair:llm:{}", hash8(&l.hash)),
             None => format!("repair:recipe:{}", hash8(&recipe_hash)),
         };
+        // A video the model found is never trusted: only a stored recipe that has earned it.
+        // A job MCR sent back for a new download after an automatic delivery is held.
+        let resent = ctx.repo.job_auto_delivery_superseded(job_id).unwrap_or(true);
+        let trust_recipe = if from_llm.is_none() && !resent { Some((recipe_id, recipe_hash.as_str())) } else { None };
+        let (mut mode, trusted_approvals) = mode_for(ctx, &domain, trust_recipe);
+        // Before the pipeline can reach the watchfolder, the attempt says an automatic delivery
+        // is under way: a crash after the rename still leaves the marker for the recovery (P10.16b).
+        // Without the marker the video is held, never delivered unrecorded.
+        if matches!(mode, DeliveryMode::Deliver) {
+            let marked = match attempt {
+                Some(attempt_id) => ctx.repo.mark_attempt_auto_delivering(attempt_id, recipe_id, &recipe_hash, &domain, &v.candidate.url),
+                None => Err(anyhow::anyhow!("no repair attempt is open")),
+            };
+            if let Err(e) = marked {
+                warn!("Job #{job_id}: the automatic delivery could not be marked, the video is held: {e:#}");
+                mode = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
+            }
+        }
         let url = match hold_one(ctx, job, owner, &v.candidate.url, v.candidate.referer.clone(), &method, mode, cancel).await {
             HoldStep::Held { url } => url,
-            HoldStep::Skipped | HoldStep::Failed => continue,
+            HoldStep::Delivered { url } => {
+                let host = host_of(&v.candidate.url);
+                auto_delivered(ctx, job_id, recipe_id, &domain, trusted_approvals, &host, v.duration_secs);
+                end.recipe_id = Some(recipe_id);
+                end.recipe_hash = Some(recipe_hash.clone());
+                end.held_url = Some(url);
+                end.next_index = index as i64;
+                return LadderResult::Delivered { recipe_hash };
+            }
+            HoldStep::Skipped | HoldStep::Failed => {
+                // This candidate never reached the watchfolder: its marker must not outlive it.
+                if let (DeliveryMode::Deliver, Some(attempt_id)) = (mode, attempt) {
+                    if let Err(e) = ctx.repo.clear_attempt_auto_delivering(attempt_id) {
+                        warn!("Job #{job_id}: the automatic-delivery marker could not be cleared: {e:#}");
+                    }
+                }
+                continue;
+            }
             HoldStep::Lost => return LadderResult::Lost,
             HoldStep::Stop => return LadderResult::NothingVerified,
         };
@@ -1793,9 +1837,12 @@ async fn next_step(
         Some(("llm", h)) => format!("repair:llm:{}", tag(h)),
         _ => "repair:next".to_string(),
     };
+    // MCR is reviewing this job: a next choice is always held, whatever the recipe's trust (P10.16a).
     let mode = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
     let held_url = match hold_one(ctx, job, owner, url, referer, &method, mode, cancel).await {
         HoldStep::Held { url } => url,
+        // Hold never delivers: `hold_one` reports that as a stop.
+        HoldStep::Delivered { .. } => return NextResult::Failed,
         HoldStep::Lost => return NextResult::Lost,
         HoldStep::Skipped | HoldStep::Failed => {
             restore();
@@ -1824,10 +1871,49 @@ async fn next_step(
     NextResult::Held
 }
 
+/// The delivery mode for one repaired candidate and, when it skips the hold, the
+/// recipe's MCR approvals on the site (P10.16a). `Deliver` only for a stored recipe
+/// that `recipe_trusted_on` says MCR has approved enough times on `domain` with no
+/// rejection there; everything else, and any doubt, is held.
+fn mode_for(ctx: &RepairCtx, domain: &str, recipe: Option<(i64, &str)>) -> (DeliveryMode, Option<i64>) {
+    let hold = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
+    let min = ctx.cfg.auto_deliver_after_approvals.max(0);
+    let Some((id, hash)) = recipe.filter(|(id, hash)| *id != 0 && !hash.is_empty()) else { return (hold, None) };
+    match ctx.repo.recipe_trusted_on(id, hash, domain, min) {
+        Ok(true) => (DeliveryMode::Deliver, Some(ctx.repo.recipe_site_approvals(id, domain).unwrap_or(min))),
+        Ok(false) => (hold, None),
+        Err(e) => {
+            warn!("Recipe #{id}: trust on {domain} could not be read, the video is held: {e:#}");
+            (hold, None)
+        }
+    }
+}
+
+/// A trusted recipe's video is in the watchfolder: score the use (not an approval),
+/// and leave a job note and an audit row saying why MCR was not asked.
+fn auto_delivered(ctx: &RepairCtx, job_id: i64, recipe_id: i64, domain: &str, approvals: Option<i64>, host: &str, duration: f64) {
+    let n = approvals.unwrap_or(0);
+    if let Err(e) = ctx.repo.recipe_event(recipe_id, domain, Event::AutoDelivered, Utc::now()) {
+        warn!("Job #{job_id}: the automatic delivery could not be scored: {e:#}");
+    }
+    note(
+        ctx,
+        job_id,
+        "INFO",
+        &format!("Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή ({n} εγκρίσεις στο site) · {host} ({})", mm_ss(duration)),
+    );
+    if let Err(e) = ctx.repo.log_audit("INFO", "REPAIR", &format!("Job #{job_id}: delivered without approval by recipe #{recipe_id} on {domain} ({n} MCR approvals, no rejection)")) {
+        warn!("Job #{job_id}: the audit row could not be written: {e:#}");
+    }
+    info!("Job #{job_id}: delivered without approval, recipe #{recipe_id} is trusted on {domain} ({n} approvals)");
+}
+
 /// What one held download of a verified address came to.
 enum HoldStep {
     /// Held, from this address; the caller records it.
     Held { url: String },
+    /// Delivered to the watchfolder without approval (only in `DeliveryMode::Deliver`).
+    Delivered { url: String },
     /// Not tried: the address or its host is no longer one to use.
     Skipped,
     /// The download failed (noted on the job).
@@ -1889,6 +1975,7 @@ async fn hold_one(
     repaired.url = url.to_string();
     match ctx.env.download(repaired, owner, referer, cancel, mode).await {
         Ok(RunOutcome::Held) => HoldStep::Held { url: url.to_string() },
+        Ok(RunOutcome::Delivered) if mode == DeliveryMode::Deliver => HoldStep::Delivered { url: url.to_string() },
         Ok(RunOutcome::Delivered) => {
             // Hold never delivers; if it ever did, say so loudly and stop.
             warn!("Job #{job_id}: a held repair download reported a delivery; stopping the ladder");

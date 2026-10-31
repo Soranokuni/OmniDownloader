@@ -174,8 +174,8 @@ impl CidrSet {
                     tracing::warn!(
                         entry = %raw,
                         error = %err,
-                        "Ignoring invalid CIDR in security.mcr_open_networks; clients on that \
-                         network will have to log in"
+                        "Ignoring invalid CIDR in a network allowlist (security.mcr_open_networks, \
+                         security.trusted_proxies or metrics.allow_networks); that network is not allowed"
                     );
                 }
                 Self { blocks }

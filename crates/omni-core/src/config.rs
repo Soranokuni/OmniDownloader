@@ -492,6 +492,15 @@ pub struct RepairConfig {
     /// Model calls the rung may make per local day, over all jobs.
     #[serde(default = "default_repair_llm_calls_per_day")]
     pub llm_max_calls_per_day: u32,
+    /// A recipe MCR approved this many times on a site, with no rejection there,
+    /// delivers its video without waiting for MCR (P10.16a). 0 = never; a
+    /// negative value reads as 0.
+    #[serde(default = "default_auto_deliver_after_approvals")]
+    pub auto_deliver_after_approvals: i64,
+}
+
+fn default_auto_deliver_after_approvals() -> i64 {
+    5
 }
 
 fn default_repair_llm_timeout_secs() -> u64 {
@@ -545,6 +554,7 @@ impl Default for RepairConfig {
             llm_max_tokens: default_repair_llm_max_tokens(),
             llm_reasoning_effort: default_repair_llm_effort(),
             llm_max_calls_per_day: default_repair_llm_calls_per_day(),
+            auto_deliver_after_approvals: default_auto_deliver_after_approvals(),
         }
     }
 }
@@ -580,6 +590,38 @@ impl Default for ArchiveConfig {
             retention_days: default_archive_days(),
             path: default_archive_path(),
         }
+    }
+}
+
+/// `GET /metrics` for a monitoring system (plan P6.5). Off by default: with it
+/// off the route is a 404 and no metric is recorded anywhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Clients that may scrape without a session. An Admin session may always
+    /// scrape; `security.mcr_open_networks` grants nothing here.
+    #[serde(default = "default_metrics_networks")]
+    pub allow_networks: Vec<String>,
+}
+
+fn default_metrics_networks() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_networks: default_metrics_networks(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Parse [`Self::allow_networks`], dropping and logging bad entries.
+    pub fn networks(&self) -> crate::net::CidrSet {
+        crate::net::CidrSet::parse_lossy(&self.allow_networks)
     }
 }
 
@@ -743,6 +785,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub archive: ArchiveConfig,
 
+    /// The optional Prometheus endpoint (plan P6.5).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -839,6 +885,7 @@ impl Default for AppConfig {
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             archive: ArchiveConfig::default(),
+            metrics: MetricsConfig::default(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -1023,6 +1070,22 @@ mod tests {
     }
 
     #[test]
+    fn a_config_without_metrics_is_off_and_loopback_only() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!old.metrics.enabled);
+        assert_eq!(old.metrics.allow_networks, vec!["127.0.0.1/32", "::1/128"]);
+        let partial: AppConfig = serde_json::from_str(r#"{"metrics":{"enabled":true}}"#).unwrap();
+        assert!(partial.metrics.enabled);
+        assert_eq!(partial.metrics.allow_networks, vec!["127.0.0.1/32", "::1/128"]);
+        let own: AppConfig =
+            serde_json::from_str(r#"{"metrics":{"allow_networks":["10.1.2.0/24","junk"]}}"#).unwrap();
+        assert!(!own.metrics.enabled);
+        let nets = own.metrics.networks();
+        assert!(nets.contains("10.1.2.9".parse().unwrap()));
+        assert!(!nets.contains("127.0.0.1".parse().unwrap()), "a set list replaces the default");
+    }
+
+    #[test]
     fn repair_section_defaults_and_parses() {
         let old: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(old.repair.mode, RepairMode::Off);
@@ -1034,6 +1097,17 @@ mod tests {
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);
         assert_eq!(set.repair.evidence_max_mb, 200);
+    }
+
+    #[test]
+    fn auto_delivery_after_five_approvals_by_default_and_zero_means_never() {
+        let old: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"hold"}}"#).unwrap();
+        assert_eq!(old.repair.auto_deliver_after_approvals, 5, "a missing key is the owner's 5");
+        assert_eq!(AppConfig::default().repair.auto_deliver_after_approvals, 5);
+        let never: AppConfig = serde_json::from_str(r#"{"repair":{"auto_deliver_after_approvals":0}}"#).unwrap();
+        assert_eq!(never.repair.auto_deliver_after_approvals, 0);
+        let three: AppConfig = serde_json::from_str(r#"{"repair":{"auto_deliver_after_approvals":3}}"#).unwrap();
+        assert_eq!(three.repair.auto_deliver_after_approvals, 3);
     }
 
     #[test]

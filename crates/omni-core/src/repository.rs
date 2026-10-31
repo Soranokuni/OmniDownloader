@@ -37,6 +37,8 @@ pub struct EvidenceRow {
 
 /// Self-heal runs kept (P10.14).
 pub const SELFHEAL_MAX_ROWS: i64 = 500;
+/// Cap of `recipe_site_rejections` (one row per rejected recipe steps and site; the oldest go first).
+pub const REJECTIONS_MAX_ROWS: i64 = 20_000;
 /// Days a self-heal run is kept.
 pub const SELFHEAL_KEEP_DAYS: i64 = 30;
 
@@ -155,6 +157,8 @@ pub struct SiteReport {
     /// Ended with a held video or, in shadow mode, one that would have been held.
     pub found: i64,
     pub held: i64,
+    /// Delivered without approval by a trusted recipe (P10.16a).
+    pub auto_delivered: i64,
     pub approved: i64,
     /// MCR's «Λάθος βίντεο».
     pub rejected_wrong_video: i64,
@@ -233,7 +237,7 @@ fn aggregate_report(rows: Vec<ReportRow>) -> Vec<SiteReport> {
         rep.tokens_in += r.tokens_in;
         rep.tokens_out += r.tokens_out;
         let outcome = r.outcome.as_deref();
-        let found = !next && matches!(outcome, Some("held" | "shadow_found"));
+        let found = !next && matches!(outcome, Some("held" | "shadow_found" | "auto_delivered"));
         if found {
             rep.found += 1;
             if r.expected_secs.is_some() {
@@ -245,6 +249,9 @@ fn aggregate_report(rows: Vec<ReportRow>) -> Vec<SiteReport> {
                     rep.image_matched += 1;
                 }
             }
+        }
+        if outcome == Some("auto_delivered") {
+            rep.auto_delivered += 1;
         }
         if outcome == Some("held") {
             rep.held += 1;
@@ -373,6 +380,35 @@ pub enum CancelOutcome {
     NotCancellable,
 }
 
+/// One job reached a final status (plan P6.5). Called after the commit of a
+/// transition that really changed a row, never for a refused or no-op one.
+fn count_finished(status: JobStatus) {
+    metrics::counter!("omni_jobs_finished_total", "status" => status.as_str()).increment(1);
+}
+
+/// A stage that was just closed: the new `stage_timings_json` text, and what to
+/// report to the metrics once the transaction has committed.
+struct StageClose {
+    json: String,
+    stage: String,
+    ms: i64,
+}
+
+impl StageClose {
+    /// One `omni_stage_duration_seconds` sample (plan P6.5). The label is the
+    /// stage's fixed name; a stored value that is not a known stage is not reported.
+    fn observe(close: &Option<StageClose>) {
+        let Some(c) = close else { return };
+        let Some(stage) = JobStage::parse(&c.stage) else { return };
+        metrics::histogram!("omni_stage_duration_seconds", "stage" => stage.as_str().to_ascii_lowercase())
+            .record(c.ms as f64 / 1000.0);
+    }
+
+    fn json(close: &Option<StageClose>) -> Option<&str> {
+        close.as_ref().map(|c| c.json.as_str())
+    }
+}
+
 /// The stage clock of a leased job, as the new `stage_timings_json` text: the
 /// existing object with the milliseconds since `stage_started_at` added to the
 /// key of the current stage (repeats of a stage sum). `None` when there is
@@ -384,7 +420,7 @@ fn stage_timings_for(
     guard: &str,
     args: impl rusqlite::Params,
     at: chrono::DateTime<Utc>,
-) -> Result<Option<String>> {
+) -> Result<Option<StageClose>> {
     let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
             &format!("SELECT stage, stage_started_at, stage_timings_json FROM queue WHERE {guard}"),
@@ -407,8 +443,8 @@ fn stage_timings_for(
         _ => serde_json::Map::new(),
     };
     let prev = map.get(&stage).and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    map.insert(stage, serde_json::Value::from(prev.saturating_add(ms)));
-    Ok(Some(serde_json::Value::Object(map).to_string()))
+    map.insert(stage.clone(), serde_json::Value::from(prev.saturating_add(ms)));
+    Ok(Some(StageClose { json: serde_json::Value::Object(map).to_string(), stage, ms }))
 }
 
 /// What [`Repository::cancel_own_pending`] did. A job that is not the
@@ -792,7 +828,8 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::format(at);
-        let timings = stage_timings_for(&tx, "id = ? AND lease_owner = ?", params![job_id, owner], at)?;
+        let close = stage_timings_for(&tx, "id = ? AND lease_owner = ?", params![job_id, owner], at)?;
+        let timings = StageClose::json(&close);
         let delivered = matches!(status, JobStatus::Completed);
         let changed = tx.execute(
             r#"
@@ -830,6 +867,10 @@ impl Repository {
         )?;
         tx.commit()?;
         if changed == 1 {
+            StageClose::observe(&close);
+            if status.is_terminal() {
+                count_finished(status);
+            }
             let level = if matches!(status, JobStatus::Completed | JobStatus::AwaitingApproval) { "INFO" } else { "ERROR" };
             self.record_event(
                 job_id,
@@ -1006,6 +1047,12 @@ impl Repository {
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'EXTRACT', 'INFO', ?)",
             params![id, now, format!("Leased by {owner}")],
         )?;
+        // A new lease means the earlier run is over: an automatic-delivery marker it left
+        // (a run cancelled and killed, a failed finish_attempt) must never read as one (P10.16b).
+        tx.execute(
+            "UPDATE repair_attempts SET outcome = 'interrupted' WHERE job_id = ? AND outcome = 'auto_delivering'",
+            params![id],
+        )?;
         tx.commit()?;
 
         self.get_job(id)
@@ -1110,12 +1157,13 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::format(at);
-        let timings = stage_timings_for(
+        let close = stage_timings_for(
             &tx,
             "id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![job_id, owner],
             at,
         )?;
+        let timings = StageClose::json(&close);
         let changed = tx.execute(
             "UPDATE queue SET stage = ?, stage_started_at = ?, updated_at = ?,
                  stage_timings_json = COALESCE(?, stage_timings_json)
@@ -1130,6 +1178,7 @@ impl Repository {
         }
         tx.commit()?;
         if changed == 1 {
+            StageClose::observe(&close);
             if let Some(bus) = &self.events {
                 bus.job(job_id, "RUNNING", Some(stage.as_str()), None);
             }
@@ -1335,6 +1384,49 @@ impl Repository {
         Ok(n.unwrap_or(0))
     }
 
+    /// May a video this recipe found on `domain` skip MCR's approval (P10.16a)?
+    /// Only when `min_approvals > 0`, the recipe is that exact one (ids are
+    /// reused, so the hash must match), is not retired, and on this domain is
+    /// Active with at least `min_approvals` MCR approvals, no rejection ever (the
+    /// site row's count, and no attempt of this recipe there that MCR rejected for
+    /// any reason: «Δεν είναι αξιοποιήσιμο» and «Άλλο» end the trust too) and its
+    /// steps not barred there.
+    /// Whether MCR pressed «Νέα λήψη» on this job after a trusted recipe delivered it:
+    /// its next run is held whatever the trust, so the same video cannot go on air twice
+    /// unapproved (P10.16).
+    pub fn job_auto_delivery_superseded(&self, job_id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM repair_attempts WHERE job_id = ? AND outcome IN ('auto_delivered','auto_delivering') AND mcr_decision = 'superseded')",
+            params![job_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn recipe_trusted_on(&self, recipe_id: i64, recipe_hash: &str, domain: &str, min_approvals: i64) -> Result<bool> {
+        if min_approvals <= 0 || recipe_hash.is_empty() || domain.is_empty() {
+            return Ok(false);
+        }
+        let steps_hash: Option<String> = {
+            let conn = self.pool.get()?;
+            conn.query_row(
+                "SELECT r.steps_hash FROM recipes r JOIN recipe_sites s ON s.recipe_id = r.id
+                 WHERE r.id = ? AND r.hash = ? AND r.state <> 'retired' AND s.domain = ?
+                   AND s.state = 'active' AND s.approvals >= ? AND s.rejections = 0
+                   AND NOT EXISTS (SELECT 1 FROM repair_attempts a WHERE a.recipe_id = r.id AND a.recipe_hash = r.hash
+                                   AND a.domain = s.domain AND a.mcr_decision = 'rejected')
+                   AND NOT EXISTS (SELECT 1 FROM recipe_site_rejections x WHERE x.steps_hash = r.steps_hash AND x.domain = s.domain)",
+                params![recipe_id, recipe_hash, domain, min_approvals],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        match steps_hash {
+            Some(steps) => Ok(!self.recipe_steps_barred(&steps, domain)?),
+            None => Ok(false),
+        }
+    }
+
     /// The recipe's own full hash, or `None` when it is gone.
     pub fn recipe_hash_of(&self, recipe_id: i64) -> Result<Option<String>> {
         let conn = self.pool.get()?;
@@ -1487,11 +1579,38 @@ impl Repository {
     }
 
     /// Retention: attempts that started more than `days` days ago (their jobs'
-    /// own deletion removes the rest).
+    /// own deletion removes the rest). An automatic delivery of a job that still
+    /// exists stays (P10.16b): it carries the «Λάθος βίντεο» card and the «Νέα λήψη» guard.
     pub fn purge_repair_attempts(&self, days: i64) -> Result<usize> {
         let conn = self.pool.get()?;
         let cutoff = timestamps::format(Utc::now() - Duration::days(days));
-        Ok(conn.execute("DELETE FROM repair_attempts WHERE started_at < ?", params![cutoff])?)
+        Ok(conn.execute(
+            "DELETE FROM repair_attempts WHERE started_at < ?
+               AND NOT (COALESCE(outcome, '') IN ('auto_delivered','auto_delivering') AND EXISTS (SELECT 1 FROM queue q WHERE q.id = repair_attempts.job_id))",
+            params![cutoff],
+        )?)
+    }
+
+    /// The ladder is about to hand a trusted recipe's video to the delivery (P10.16b):
+    /// the open attempt says so first, so a crash after the watchfolder rename still
+    /// leaves the marker behind. `finish_attempt` overwrites it with the real outcome.
+    pub fn mark_attempt_auto_delivering(&self, attempt_id: i64, recipe_id: i64, recipe_hash: &str, domain: &str, held_url: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = 'auto_delivering', recipe_id = ?, recipe_hash = ?, domain = ?, held_url = ? WHERE id = ?",
+            params![recipe_id, recipe_hash, domain, held_url, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// The marked candidate did not reach the watchfolder: the attempt is open again.
+    pub fn clear_attempt_auto_delivering(&self, attempt_id: i64) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = NULL WHERE id = ? AND outcome = 'auto_delivering'",
+            params![attempt_id],
+        )?;
+        Ok(())
     }
 
     /// Store the videos offered to MCR for this job (`candidates_json`).
@@ -1595,10 +1714,13 @@ impl Repository {
         };
 
         let (mut requeued, mut review) = (0usize, 0usize);
+        // Counted once the transaction has committed.
+        let mut finished: Vec<JobStatus> = Vec::new();
         for (id, attempts, max_attempts) in expired {
             // Already in the watchfolder: finishing it is the only safe
             // recovery, a requeue would put a second copy on air.
             if Self::recover_if_delivered(&tx, id, &now)? {
+                finished.push(JobStatus::Completed);
                 continue;
             }
             if attempts < max_attempts {
@@ -1631,9 +1753,11 @@ impl Repository {
                     params![id, now, "Lease expired; attempts exhausted, sent to review"],
                 )?;
                 review += 1;
+                finished.push(JobStatus::RequiresReview);
             }
         }
         tx.commit()?;
+        finished.into_iter().for_each(count_finished);
         Ok((requeued, review))
     }
 
@@ -1664,6 +1788,7 @@ impl Repository {
             let tx = conn.transaction()?;
             if Self::recover_if_delivered(&tx, *id, &now)? {
                 tx.commit()?;
+                count_finished(JobStatus::Completed);
                 continue;
             }
             requeued += 1;
@@ -1713,7 +1838,51 @@ impl Repository {
                 "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
                 params![id, now, "RECOVERED_AFTER_DELIVERY: the video was already in the watchfolder; finished, not requeued"],
             )?;
+            // A trusted recipe's delivery that a crash cut short: the marker the ladder wrote
+            // before the pipeline ran becomes the outcome, and MCR is told (P10.16b).
+            let marked = conn.execute(
+                "UPDATE repair_attempts SET outcome = 'auto_delivered'
+                 WHERE id = (SELECT id FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1)
+                   AND outcome = 'auto_delivering'",
+                params![id],
+            )?;
+            if marked == 1 {
+                conn.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
+                    params![id, now, "Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή (ανάκτηση μετά από διακοπή)"],
+                )?;
+                conn.execute(
+                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
+                    params![format!("Job {id}: delivered without approval by a trusted recipe; recovered after an interruption"), now],
+                )?;
+            }
         }
+        // Any marker still left belongs to a run that stopped before ARCHIVE: it must never read
+        // as an automatic delivery later (P10.16b). At DELIVER the rename may already have
+        // happened (or ARCHIVE is off), so MCR is warned to look in the watchfolder.
+        if changed == 0 {
+            let at_deliver: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM queue q JOIN repair_attempts a ON a.job_id = q.id
+                     WHERE q.id = ? AND q.stage = 'DELIVER' AND a.outcome = 'auto_delivering')",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+            if at_deliver {
+                conn.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'WARN', ?)",
+                    params![id, now, "Διακοπή κατά την αυτόματη παράδοση χωρίς έγκριση: ελέγξτε αν το βίντεο είναι ήδη στο Dalet"],
+                )?;
+                conn.execute(
+                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
+                    params![format!("Job {id}: interrupted at DELIVER during a trusted recipe's delivery without approval; the video may already be in the watchfolder"), now],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = 'interrupted' WHERE job_id = ? AND outcome = 'auto_delivering'",
+            params![id],
+        )?;
         Ok(changed == 1)
     }
 
@@ -1961,6 +2130,23 @@ impl Repository {
         self.job_counts_since(local_midnight_utc())
     }
 
+    /// Jobs per status, every status present (0 when none), for `/metrics`.
+    /// A stored status this build does not know is not counted.
+    pub fn job_counts_by_status(&self) -> Result<Vec<(JobStatus, i64)>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM queue GROUP BY status")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(JobStatus::ALL
+            .iter()
+            .map(|s| {
+                let n = rows.iter().filter(|(name, _)| name == s.as_str()).map(|(_, n)| *n).sum();
+                (*s, n)
+            })
+            .collect())
+    }
+
     /// `job_counts` with the start of "today" given (UTC), so a test can pin it.
     pub fn job_counts_since(&self, day_start_utc: chrono::DateTime<Utc>) -> Result<crate::models::JobCounts> {
         let today_start = timestamps::format(day_start_utc);
@@ -2022,8 +2208,9 @@ impl Repository {
     /// still there (`_2`), never over it. `false` if the job is not a
     /// delivered one.
     pub fn redownload_job(&self, id: i64) -> Result<bool> {
-        let conn = self.pool.get()?;
-        let n = conn.execute(
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
@@ -2035,6 +2222,15 @@ impl Repository {
             "#,
             params![timestamps::now_string(), id],
         )?;
+        if n > 0 {
+            // The delivered file this run made is no longer this job's: no «Λάθος βίντεο» for it (P10.16a).
+            tx.execute(
+                "UPDATE repair_attempts SET mcr_decision = 'superseded'
+                 WHERE job_id = ? AND outcome IN ('auto_delivered','auto_delivering') AND mcr_decision IS NULL",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -2107,6 +2303,9 @@ impl Repository {
             "#,
             params![now, now, now, id],
         )?;
+        if n > 0 {
+            count_finished(JobStatus::CompletedManual);
+        }
         Ok(n > 0)
     }
 
@@ -2128,6 +2327,7 @@ impl Repository {
             params![now, now, id],
         )?;
         if n > 0 {
+            count_finished(JobStatus::Cancelled);
             self.log_audit("WARN", "QUEUE", &format!("Cancelled Job #{}", id))?;
             return Ok(CancelOutcome::Cancelled);
         }
@@ -2156,6 +2356,7 @@ impl Repository {
             params![now, now, id, user_id],
         )?;
         if n > 0 {
+            count_finished(JobStatus::Cancelled);
             return Ok(OwnCancelOutcome::Cancelled);
         }
         let owned: Option<i64> = conn
@@ -4132,12 +4333,13 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = timestamps::now_string();
-        let timings = stage_timings_for(
+        let close = stage_timings_for(
             &tx,
             "id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![job_id, owner],
             Utc::now(),
         )?;
+        let timings = StageClose::json(&close);
         let n = tx.execute(
             r#"
             UPDATE queue
@@ -4164,6 +4366,8 @@ impl Repository {
             params![job_id, now],
         )?;
         tx.commit()?;
+        StageClose::observe(&close);
+        count_finished(JobStatus::Completed);
         if let Some(bus) = &self.events {
             bus.job(job_id, "COMPLETED", Some("DONE"), Some(100.0));
         }
@@ -4250,6 +4454,7 @@ impl Repository {
             params![job_id, now, format!("Rejected by {by} ({reason}): {message}")],
         )?;
         tx.commit()?;
+        count_finished(JobStatus::RequiresReview);
         Ok(true)
     }
 
@@ -4284,6 +4489,7 @@ impl Repository {
             params![job_id, at, "Nobody approved the held video in time; it was deleted"],
         )?;
         tx.commit()?;
+        count_finished(JobStatus::RequiresReview);
         Ok(true)
     }
 
@@ -4351,6 +4557,65 @@ impl Repository {
         )?;
         tx.commit()?;
         Ok(Some(index))
+    }
+
+    /// MCR's «Λάθος βίντεο» on a video that was delivered without approval
+    /// (P10.16a): the recipe that found it is rejected on that site (trust gone,
+    /// recipe suspended there, steps barred) and the address is skipped for 30
+    /// days, exactly as for a held video, plus a job event. Never touches the
+    /// watchfolder. The attempt's `mcr_decision` makes it once-only. One transaction.
+    pub fn wrong_video_after_auto_delivery(&self, job_id: i64, by: &str, now: chrono::DateTime<Utc>) -> Result<WrongVideoOutcome> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let attempt: Option<(i64, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT id, recipe_id, recipe_hash, domain, held_url, outcome, mcr_decision FROM repair_attempts
+                 WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()?;
+        let Some((id, recipe_id, recipe_hash, domain, held_url, outcome, decision)) = attempt else {
+            return Ok(WrongVideoOutcome::NotAutoDelivered);
+        };
+        // 'auto_delivering' (written before the pipeline ran) counts once the job is COMPLETED.
+        let delivered = match outcome.as_deref() {
+            Some("auto_delivered") => true,
+            Some("auto_delivering") => tx
+                .query_row("SELECT status = 'COMPLETED' FROM queue WHERE id = ?", params![job_id], |r| r.get::<_, bool>(0))
+                .optional()?
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !delivered || decision.as_deref() == Some("superseded") {
+            return Ok(WrongVideoOutcome::NotAutoDelivered);
+        }
+        if decision.is_some() {
+            return Ok(WrongVideoOutcome::AlreadyDone);
+        }
+        tx.execute(
+            "UPDATE repair_attempts SET mcr_decision = 'rejected', mcr_reason = 'wrong_video' WHERE id = ?",
+            params![id],
+        )?;
+        if let Some(domain) = domain.as_deref() {
+            recipe_sql::record_rejection(&tx, recipe_hash.as_deref(), domain, now)?;
+        }
+        if let (Some(recipe_id), Some(domain)) = (recipe_id, domain.as_deref()) {
+            recipe_sql::learn_from_mcr(&tx, recipe_id, recipe_hash.as_deref(), domain, false, now)?;
+            if let Some(pattern) = held_url.as_deref().and_then(crate::urlnorm::skip_pattern) {
+                write_skip(&tx, domain, &pattern, now)?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'WARN', ?)",
+            params![
+                job_id,
+                timestamps::format(now),
+                format!("Λάθος βίντεο (από {by}): η συνταγή χάνει την εμπιστοσύνη της στο site· το αρχείο είναι ήδη στο Dalet")
+            ],
+        )?;
+        tx.commit()?;
+        Ok(WrongVideoOutcome::Recorded)
     }
 
     /// How many verified candidates MCR could still ask for after the held one
@@ -5124,6 +5389,44 @@ mod recipe_sql {
     /// suspends the recipe and bars its steps) and, for a recipe the model
     /// wrote that MCR never approved anywhere, a tombstone so it cannot come
     /// back. A recipe that is gone teaches nothing (the decision still stands).
+    /// An MCR rejection of a recipe's video on a site, for any reason (P10.16b), kept
+    /// for good per recipe steps and site: it outlives the attempt (job deleted, 90-day
+    /// purge), the site row, a retirement and a promotion (the player recipe keeps the
+    /// steps), so the recipe's trust there never comes back. The steps are found by the
+    /// attempt's recipe hash, from the recipe or, when it is gone, its tombstone. The
+    /// table is capped, the oldest `last_at` going first. Teaches the recipe nothing.
+    pub(super) fn record_rejection(conn: &Connection, recipe_hash: Option<&str>, domain: &str, now: DateTime<Utc>) -> Result<()> {
+        if domain.is_empty() {
+            return Ok(());
+        }
+        let steps: Option<String> = match recipe_hash {
+            Some(h) if !h.is_empty() => conn
+                .query_row("SELECT steps_hash FROM recipes WHERE hash = ?", params![h], |r| r.get(0))
+                .optional()?
+                .or(conn
+                    .query_row("SELECT steps_hash FROM recipe_tombstones WHERE hash = ?", params![h], |r| r.get::<_, Option<String>>(0))
+                    .optional()?
+                    .flatten()),
+            _ => None,
+        };
+        let Some(steps) = steps else {
+            tracing::warn!(domain, "MCR rejection of a video whose recipe steps are unknown: not remembered");
+            return Ok(());
+        };
+        let at = timestamps::format(now);
+        conn.execute(
+            "INSERT INTO recipe_site_rejections (steps_hash, domain, first_at, last_at, count) VALUES (?, ?, ?, ?, 1)
+             ON CONFLICT(steps_hash, domain) DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+            params![steps, domain, at, at],
+        )?;
+        conn.execute(
+            "DELETE FROM recipe_site_rejections WHERE rowid IN
+               (SELECT rowid FROM recipe_site_rejections ORDER BY last_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+            params![REJECTIONS_MAX_ROWS],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn learn_from_mcr(
         conn: &Connection,
         recipe_id: i64,
@@ -6539,6 +6842,142 @@ mod tests {
         Ok(())
     }
 
+    /// Run `f` against a private Prometheus recorder; the rendered text.
+    fn rendered_metrics(f: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, f);
+        handle.render()
+    }
+
+    #[test]
+    fn a_closed_stage_records_one_histogram_sample_and_a_refused_move_none() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        let text = rendered_metrics(|| {
+            assert!(!repo.set_stage_at(id, "someone-else", JobStage::Probe, t0() + Duration::milliseconds(1500)).unwrap());
+            assert!(repo.set_stage_at(id, owner, JobStage::Probe, t0() + Duration::milliseconds(1500)).unwrap());
+        });
+        assert!(text.contains("omni_stage_duration_seconds_count{stage=\"download\"} 1"), "{text}");
+        assert!(text.contains("omni_stage_duration_seconds_sum{stage=\"download\"} 1.5"), "{text}");
+        assert!(!text.contains("probe"), "the stage entered is not closed yet: {text}");
+        Ok(())
+    }
+
+    #[test]
+    fn finishing_a_job_closes_its_last_stage_and_counts_the_terminal_status_once() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("TRANSCODE", Some(t0()))?;
+        let end = t0() + Duration::milliseconds(7250);
+        let text = rendered_metrics(|| {
+            assert!(!repo.finish_at(id, "someone-else", JobStatus::Failed, None, None, None, end).unwrap());
+            assert!(repo.finish_at(id, owner, JobStatus::Completed, None, None, None, end).unwrap());
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"COMPLETED\"} 1"), "{text}");
+        assert!(!text.contains("FAILED"), "a refused finish counted: {text}");
+        assert!(text.contains("omni_stage_duration_seconds_count{stage=\"transcode\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_reaper_giving_up_counts_a_review_but_a_requeue_counts_nothing() -> Result<()> {
+        let expire = |repo: &Repository, id: i64, attempts: i32, max: i32| {
+            repo.pool
+                .get()
+                .unwrap()
+                .execute(
+                    "UPDATE queue SET lease_expires_at = '2000-01-01T00:00:00.000Z', attempts = ?, max_attempts = ? WHERE id = ?",
+                    params![attempts, max, id],
+                )
+                .unwrap();
+        };
+        let (repo, id, _owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        expire(&repo, id, 1, 3);
+        let text = rendered_metrics(|| assert_eq!(repo.reap_expired_leases().unwrap(), (1, 0)));
+        assert!(!text.contains("omni_jobs_finished_total"), "a requeue is not a finish: {text}");
+
+        let (repo, id, _owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
+        expire(&repo, id, 3, 3);
+        let text = rendered_metrics(|| assert_eq!(repo.reap_expired_leases().unwrap(), (0, 1)));
+        assert!(text.contains("omni_jobs_finished_total{status=\"REQUIRES_REVIEW\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_reaper_recovery_of_a_delivered_job_counts_completed() -> Result<()> {
+        let (repo, id, _owner, _db) = leased_at("ARCHIVE", Some(t0()))?;
+        repo.pool.get()?.execute(
+            "UPDATE queue SET lease_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+            params![id],
+        )?;
+        let text = rendered_metrics(|| {
+            repo.reap_expired_leases().unwrap();
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"COMPLETED\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejecting_a_held_job_counts_once_and_a_refused_rejection_counts_nothing() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("VERIFY", Some(t0()))?;
+        assert!(repo.hold_output(id, owner, "held/x.mxf", 10, "sha", None, Utc::now() + Duration::hours(1))?);
+        assert!(repo.finish_at(id, owner, JobStatus::AwaitingApproval, None, None, None, t0())?);
+        let text = rendered_metrics(|| {
+            assert!(repo.reject_held(id, "other", "no", "desk").unwrap());
+            assert!(!repo.reject_held(id, "other", "again", "desk").unwrap());
+            assert!(!repo.expire_held(id, Utc::now()).unwrap());
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"REQUIRES_REVIEW\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_counts_once_and_a_refused_cancel_or_a_pending_requeue_counts_nothing() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.add_job("https://example.org/c", "1_T_C", "T", "C", "1", 10, JobStatus::Pending, None, None, None)?;
+        let text = rendered_metrics(|| {
+            assert_eq!(repo.cancel_job(id).unwrap(), CancelOutcome::Cancelled);
+            assert_eq!(repo.cancel_job(id).unwrap(), CancelOutcome::NotCancellable);
+            assert!(!repo.mark_completed_manually(999).unwrap());
+        });
+        assert!(text.contains("omni_jobs_finished_total{status=\"CANCELLED\"} 1"), "{text}");
+        assert_eq!(text.matches("omni_jobs_finished_total{").count(), 1, "{text}");
+
+        let id2 = repo.add_job("https://example.org/d", "1_T_D", "T", "D", "1", 10, JobStatus::RequiresReview, None, None, None)?;
+        let text = rendered_metrics(|| assert!(repo.mark_completed_manually(id2).unwrap()));
+        assert!(text.contains("omni_jobs_finished_total{status=\"COMPLETED_MANUAL\"} 1"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_job_is_not_counted_as_finished() -> Result<()> {
+        let (repo, id, owner, _db) = leased_at("VERIFY", Some(t0()))?;
+        let text = rendered_metrics(|| {
+            assert!(repo.finish_at(id, owner, JobStatus::AwaitingApproval, None, None, None, t0()).unwrap());
+        });
+        assert!(!text.contains("omni_jobs_finished_total"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn job_counts_by_status_lists_every_status_with_zero_for_absent_ones() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        for (n, status) in [("a", JobStatus::Pending), ("b", JobStatus::Pending), ("c", JobStatus::Failed)] {
+            repo.add_job(
+                &format!("https://example.org/{n}"), &format!("1_T_{n}"), "T", n, "1", 10,
+                status, None, None, None,
+            )?;
+        }
+        let counts = repo.job_counts_by_status()?;
+        assert_eq!(counts.len(), JobStatus::ALL.len());
+        let get = |s: JobStatus| counts.iter().find(|(k, _)| *k == s).map(|(_, n)| *n);
+        assert_eq!(get(JobStatus::Pending), Some(2));
+        assert_eq!(get(JobStatus::Failed), Some(1));
+        assert_eq!(get(JobStatus::AwaitingApproval), Some(0));
+        assert_eq!(get(JobStatus::Completed), Some(0));
+        Ok(())
+    }
+
     #[test]
     fn repository_announces_stage_finish_and_throttled_progress() -> Result<()> {
         let (repo, id, owner, _db) = leased_at("DOWNLOAD", Some(t0()))?;
@@ -6656,6 +7095,17 @@ fn rejected_urls_in(conn: &rusqlite::Connection, job_id: i64) -> Result<Vec<Stri
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// What «Λάθος βίντεο» on an auto-delivered video did (P10.16a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrongVideoOutcome {
+    Recorded,
+    /// Pressed before: nothing changed.
+    AlreadyDone,
+    /// The job's latest repair attempt did not deliver without approval, or its file was
+    /// replaced by a new download.
+    NotAutoDelivered,
+}
+
 /// What a decision teaches the recipe store (P10.13).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Learn {
@@ -6722,6 +7172,12 @@ fn note_mcr_decision(
         "UPDATE repair_attempts SET mcr_decision = ?, mcr_reason = ? WHERE id = ?",
         params![decision, reason, hold.id],
     )?;
+    // A rejection, for any reason, ends the recipe's trust on that site for good (P10.16b).
+    if decision == "rejected" {
+        if let Some(domain) = hold.domain.as_deref() {
+            recipe_sql::record_rejection(tx, hold.recipe_hash.as_deref(), domain, now)?;
+        }
+    }
     if learn == Learn::Nothing {
         return Ok(Some(hold));
     }

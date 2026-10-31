@@ -434,7 +434,7 @@ async fn dev_hold(
             .as_ref()
             .map(PathBuf::from)
             .or_else(|| deps.find_binary(name))
-            .unwrap_or_else(|| PathBuf::from(format!("{name}.exe")))
+            .unwrap_or_else(|| deps.unresolved_path(name))
     };
     let ffmpeg = tool(&config.ffmpeg_path, "ffmpeg");
     let engine = BroadcastEngine::new(
@@ -1050,7 +1050,7 @@ async fn main() -> Result<()> {
 
 async fn run_daemon(
     paths: &AppPaths,
-    service_shutdown_rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    mut service_shutdown_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     log_redactions: Option<Redactions>,
 ) -> Result<()> {
 
@@ -1149,6 +1149,68 @@ async fn run_daemon(
     // A swap that died part-way is finished forward when its staged files match the pin, else
     // discarded; a .prev is never put back (P9.3).
     dep_mgr.recover_interrupted_swaps();
+
+    // Keeps the nightly tool update from swapping yt-dlp.exe out from under a
+    // running download (plan P2.9, defect D-16).
+    let update_gate = UpdateGate::new();
+    // Shared with the admin panel's installs and the «pinned tools» health line.
+    let tool_installer = omni_core::dependencies::ToolInstaller::new();
+
+    // A pinned tool missing from bin/ is installed at its pinned SHA-256 now, or the queue is
+    // held (the encoder self-test fails on the absent file): never whatever is on PATH (P9.6).
+    // One 180 s budget for all (the upgrade installer's /api/health wait is 4 minutes), smallest
+    // download first; each result is logged and audited as it arrives. A service Stop during
+    // this wait ends start-up at once.
+    {
+        let overrides: std::collections::HashMap<String, PathBuf> = [
+            ("ffmpeg", &config.ffmpeg_path),
+            ("ffprobe", &config.ffprobe_path),
+            ("bmxtranswrap", &config.bmxtranswrap_path),
+        ]
+        .into_iter()
+        .filter_map(|(n, p)| p.as_ref().map(|p| (n.to_string(), PathBuf::from(p))))
+        .collect();
+        let install = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+            for pin in dep_mgr.pending_pins(&overrides) {
+                let tool = pin.tool;
+                let attempt = tokio::time::timeout_at(
+                    deadline,
+                    dep_mgr.install_pinned(&pin, &omni_core::dependencies::HttpFetcher, &update_gate, Duration::from_secs(1), &tool_installer),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(out)) => {
+                        info!("Start-up install of pinned {tool}: {}", out.message);
+                        let _ = repo.log_audit("INFO", "TOOLS", &format!("Pinned {tool} was missing at start-up and was installed: {}", out.message));
+                    }
+                    Ok(Err(e)) => {
+                        error!("Start-up install of pinned {tool} failed: {e:#}");
+                        let _ = repo.log_audit("ERROR", "TOOLS", &format!("Pinned {tool} is missing and its install failed; the queue is held: {e:#}"));
+                    }
+                    Err(_) => {
+                        error!("Start-up install of pinned {tool} did not finish in the 180 s budget");
+                        let _ = repo.log_audit("ERROR", "TOOLS", &format!("Pinned {tool} is missing and its install did not finish in the 180 s start-up budget; the queue is held"));
+                    }
+                }
+            }
+        };
+        let stop = async {
+            match service_shutdown_rx.as_mut() {
+                Some(rx) => {
+                    rx.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = install => {}
+            _ = stop => {
+                info!("Windows Service Control Manager shutdown requested during the start-up tool install.");
+                return Ok(());
+            }
+        }
+    }
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
@@ -1157,19 +1219,19 @@ async fn run_daemon(
         .as_ref()
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("ffmpeg"))
-        .unwrap_or_else(|| PathBuf::from("ffmpeg.exe"));
+        .unwrap_or_else(|| dep_mgr.unresolved_path("ffmpeg"));
     let ffprobe_path = config
         .ffprobe_path
         .as_ref()
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("ffprobe"))
-        .unwrap_or_else(|| PathBuf::from("ffprobe.exe"));
+        .unwrap_or_else(|| dep_mgr.unresolved_path("ffprobe"));
     let bmxtranswrap_path = config
         .bmxtranswrap_path
         .as_ref()
         .map(PathBuf::from)
         .or_else(|| dep_mgr.find_binary("bmxtranswrap"))
-        .unwrap_or_else(|| PathBuf::from("bmxtranswrap.exe"));
+        .unwrap_or_else(|| dep_mgr.unresolved_path("bmxtranswrap"));
     let ytdl_path = config
         .ytdl_path
         .as_ref()
@@ -1250,10 +1312,6 @@ async fn run_daemon(
     .with_archive(Some(archive_settings.clone())));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
-
-    // Keeps the nightly tool update from swapping yt-dlp.exe out from under a
-    // running download (plan P2.9, defect D-16).
-    let update_gate = UpdateGate::new();
 
     // Live subsystem health, shared with the web panels (plan P6.2, W-09).
     let health = HealthState::new();
@@ -1361,13 +1419,28 @@ async fn run_daemon(
     // Only the Windows service locks its folders; a console run would lock the developer out.
     lock_down_install(service_shutdown_rx.is_some(), &[paths.data.clone(), temp_path.clone()], &health).await;
     // The «pinned tools» health line; the panel's installs refresh it and share the hash cache.
-    let tool_installer = omni_core::dependencies::ToolInstaller::new();
     {
         let override_map: std::collections::HashMap<String, PathBuf> = tool_overrides.iter().cloned().collect();
         let (mgr, st) = (DependencyManager::new(&bin_dir), tool_installer.clone());
         if let Ok(check) = tokio::task::spawn_blocking(move || mgr.pinned_tools_check(&st, &override_map)).await {
             health.set(omni_core::health::checks::PINNED_TOOLS, check);
         }
+    }
+    // The Prometheus recorder (P6.5): installed once, and only when switched on.
+    // Off, nothing is recorded and `/metrics` is a 404.
+    let metrics_handle = if config.metrics.enabled { install_metrics_recorder() } else { None };
+    if let Some(handle) = metrics_handle.clone() {
+        // Histograms need their housekeeping now and then, or they grow without bound.
+        let mut upkeep_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = upkeep_rx.recv() => break,
+                    _ = tick.tick() => handle.run_upkeep(),
+                }
+            }
+        });
     }
     let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_url_tester(url_tester.clone())
@@ -1396,6 +1469,17 @@ async fn run_daemon(
         .with_events(events.clone());
     if let Some(r) = &log_redactions {
         web_state = web_state.with_redactions(r.clone());
+    }
+    if let Some(handle) = metrics_handle {
+        web_state = web_state.with_metrics(
+            handle,
+            omni_web::state::MetricsSources {
+                temp: temp_path.clone(),
+                watchfolder: watchfolder_path.clone(),
+                archive: archive_settings.purges().then(|| archive_settings.root.clone()),
+                workers_max: config.max_concurrent_downloads.clamp(1, 10) + config.max_concurrent_transcodes.clamp(1, 8),
+            },
+        );
     }
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
@@ -1646,6 +1730,7 @@ async fn run_daemon(
             budget: Duration::from_secs(config.repair.budget_secs),
             hold_hours: config.repair.hold_hours,
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
+            auto_deliver_after_approvals: config.repair.auto_deliver_after_approvals.max(0),
             llm: repair_llm_cfg,
         },
         env: Arc::new(repair_env),
@@ -1902,6 +1987,32 @@ const QUEUE_SLOW_SECS: i64 = 30 * 60;
 /// so a backlog hovering near 30 min does not alarm on every edge.
 const QUEUE_RECOVER_SECS: i64 = 25 * 60;
 
+/// Install the global metrics recorder for `GET /metrics` (P6.5). A failure is
+/// logged and leaves the route a 404: the daemon runs the same without metrics.
+fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+    let builder = match PrometheusBuilder::new().set_buckets_for_metric(
+        Matcher::Full("omni_stage_duration_seconds".to_string()),
+        &[1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Metrics: bad histogram buckets, /metrics stays off: {e}");
+            return None;
+        }
+    };
+    match builder.install_recorder() {
+        Ok(handle) => {
+            info!("Metrics: GET /metrics is on");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!("Metrics: could not start the recorder, /metrics stays off: {e}");
+            None
+        }
+    }
+}
+
 /// The `queue` health check (plan P7.19). Never `down`: a slow queue is a warning.
 fn queue_check(w: &omni_core::models::QueueWatch, was_degraded: bool) -> omni_core::health::Check {
     use omni_core::health::Check;
@@ -1935,6 +2046,14 @@ fn hostname_for_lease() -> String {
 /// better to stop than to queue or deliver for a job MCR may have cancelled.
 fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
     repo.owns_lease(job_id, owner).unwrap_or(false)
+}
+
+/// A repaired video a trusted recipe delivered without approval (P10.16a): the
+/// pipeline has put it in the watchfolder; the worker holding the lease completes
+/// the job with that file, as it does for any delivery.
+fn finish_delivered(repo: &Repository, job_id: i64, owner: &str) -> Result<bool> {
+    let delivered = repo.get_job(job_id)?.and_then(|j| j.file_path).filter(|p| !p.is_empty());
+    repo.finish(job_id, owner, JobStatus::Completed, None, None, delivered.as_deref())
 }
 
 /// The run holding the lease parks the job for MCR's approval (P10.5): not
@@ -2685,6 +2804,9 @@ async fn run_job(
                         repair::LadderResult::Held { recipe_hash } => {
                             info!("Job #{job_id}: a repaired video is held for MCR (recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
                         }
+                        repair::LadderResult::Delivered { recipe_hash } => {
+                            info!("Job #{job_id}: a repaired video was delivered without approval (trusted recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
+                        }
                         _ => {}
                     }
                     match repair::disposition(&ladder, repair_mode, repair.cfg.budget) {
@@ -2696,6 +2818,11 @@ async fn run_job(
                             }
                             // Waiting, not failed: no site-health record.
                             finish_held(repo, job_id, owner)?;
+                            return Ok(());
+                        }
+                        repair::Disposition::Delivered => {
+                            // Delivered by the pipeline; the worker completes the job. No failure is recorded.
+                            finish_delivered(repo, job_id, owner)?;
                             return Ok(());
                         }
                         repair::Disposition::Lost => {

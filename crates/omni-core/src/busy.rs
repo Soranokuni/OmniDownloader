@@ -35,6 +35,15 @@ impl BusyJobs {
         self.map().keys().any(|(job, _)| *job == id)
     }
 
+    /// How many job runs are in progress (a job two workers share counts twice).
+    pub fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map().is_empty()
+    }
+
     /// Cancel the token of every worker busy with `id`; how many there were.
     pub fn cancel(&self, id: i64) -> usize {
         let map = self.map();
@@ -92,6 +101,12 @@ mod tests {
             assert!(!busy.contains(8));
         }
         assert!(!busy.contains(7));
+        assert_eq!(busy.len(), 0);
+        let _a = busy.guard(1, "w1");
+        let _b = busy.guard(2, "w2");
+        assert_eq!(busy.len(), 2);
+        drop(_a);
+        drop(_b);
 
         let b2 = busy.clone();
         let _ = std::thread::spawn(move || {

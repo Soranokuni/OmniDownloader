@@ -103,7 +103,12 @@ installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build.
 
 The encoder is pinned on purpose: the broadcast output was validated with
-that exact build.
+that exact build. The service never uses an ffmpeg, ffprobe or bmxtranswrap
+found on the system PATH. If one is missing from `bin\` at start-up, the
+service downloads the pinned build (up to 3 minutes, smallest first). If that
+fails, the queue is held, the `pinned_tools` health line says which tool is
+missing, and **Admin → Toolchain → Install** followed by a service restart
+fixes it.
 
 ---
 
@@ -199,11 +204,30 @@ evidence and try saved recipes, a live page load and (optionally) a model.
 |---|---|
 | `off` (default) | behaves exactly as without repair |
 | `shadow` | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. |
-| `hold` | repair runs; a video it finds waits for MCR approval (**always**), and is deleted if not approved within `hold_hours` (24) |
+| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24); the one exception is a trusted recipe (below) |
 
 Optional model rung: `repair.llm_enabled = true` with an explicit
 `repair.llm_model`; at most `llm_max_calls_per_day` (15) calls. Make one
 call by hand first with **Admin → Test URL** and **Use the model**.
+
+**Trusted recipes deliver on their own.** `repair.auto_deliver_after_approvals`
+(default **5**, `0` = never) lets a recipe that MCR approved that many times
+on a site, with **no** rejection there, deliver its video straight to the
+watchfolder instead of waiting for approval. The recipe must still be active
+on that site and unchanged; a recipe the model wrote counts the same way (it
+needs 5 real MCR approvals first), and a video the model found itself is always
+held. **Any** MCR rejection of that recipe's video on that site ends the trust at once
+(«Λάθος βίντεο», «Δεν είναι αξιοποιήσιμο» or «Άλλο»); «Λάθος βίντεο» also
+suspends the recipe there, and its videos wait for MCR again. A rejection is
+remembered permanently per recipe steps and site: it survives deleting the job,
+the 90-day retention purge, and the recipe's promotion to a player recipe. MCR's «Επόμενη
+επιλογή» is always held, whatever the trust. The delivery is the
+normal atomic one; the job log says «Παραδόθηκε χωρίς έγκριση» and **Admin →
+Repair report** counts them per site (*Auto-delivered*). Trust is checked when
+the repair starts: a job of the same recipe that is already downloading when
+MCR rejects another one still goes to Dalet, so check the next few minutes of
+deliveries from that site after a rejection. Set `0` to go back to
+"nothing repaired reaches Dalet without MCR".
 
 ### 5.6 Secrets
 
@@ -219,6 +243,46 @@ Secrets live only in `data\secrets.bin` (DPAPI). Manage them in
 
 They are never written to `config.json` or the logs. Keys only work on the
 PC they were saved on.
+
+### 5.7 Metrics for a monitoring system (`metrics`)
+
+Optional, **off by default**. Off, `GET /metrics` is a 404 like any unknown
+address and nothing is measured. Switch it on in `config.json` and restart:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `metrics.enabled` | `false` | serve `GET /metrics` in the Prometheus text format |
+| `metrics.allow_networks` | `["127.0.0.1/32", "::1/128"]` | clients that may scrape without signing in, e.g. `["10.20.5.10/32"]`; an invalid entry is logged and skipped |
+
+Who may scrape: a client in `metrics.allow_networks`, or an **Admin** session.
+Being on `security.mcr_open_networks`, or signed in as MCR or an ordinary user,
+does **not** allow it; those get 403. Behind a reverse proxy the same
+`trust_proxy_header` rules as everywhere else decide the client address.
+
+The text holds numbers only: no addresses, file names, paths, people or
+credentials. Example Prometheus job:
+
+```yaml
+scrape_configs:
+  - job_name: omni-ingest
+    metrics_path: /metrics
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["ingest-pc:8080"]
+```
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `omni_jobs` | gauge | `status` | jobs now in each status (every status, 0 when none) |
+| `omni_jobs_finished_total` | counter | `status` | jobs that reached a final status since the service started |
+| `omni_stage_duration_seconds` | histogram | `stage` | time a job spent in a stage (buckets 1 s to 30 min), since the service started |
+| `omni_mail_last_poll_age_seconds` | gauge | none | seconds since the last successful mail poll; absent until one has succeeded |
+| `omni_disk_free_bytes` | gauge | `volume` = `temp`, `watchfolder`, `archive` | free space on each volume |
+| `omni_workers_busy`, `omni_workers_max` | gauge | none | job runs in progress, and how many may run (downloads + encodes) |
+| `omni_health` | gauge | `check` | 0 ok, 1 degraded, 2 down, for each check on the Admin page |
+
+The counter and the histogram start from zero at each service start, which
+Prometheus handles as a counter reset.
 
 ---
 
@@ -320,7 +384,7 @@ Green = ok, amber = degraded, red = down.
 | `mail` | the mailbox cannot be read |
 | `llm` | the LLM endpoint does not answer (amber; jobs are unaffected) |
 | `tools` | a tool is missing (red) |
-| `pinned_tools` | a tool is not the pinned build: **Admin → Toolchain → Repair** |
+| `pinned_tools` | a tool is missing or not the pinned build: **Admin → Toolchain → Install / Repair**, then restart the service if it was missing |
 | `encoder` | the encoder self-test failed |
 | `watchfolder` | the watchfolder is not writable (red) |
 | `browser` | no Edge/Chrome usable |

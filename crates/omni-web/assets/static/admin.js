@@ -719,7 +719,7 @@ async function loadReport() {
     'A rate is blank when nothing could be measured.'));
   const sites = data.sites || [];
   if (sites.length === 0) {
-    render('report-body', el('tr', {}, el('td', { colspan: '14', class: 'empty' }, 'No repair run in the last 30 days.')));
+    render('report-body', el('tr', {}, el('td', { colspan: '15', class: 'empty' }, 'No repair run in the last 30 days.')));
     return;
   }
   const sum = (key) => sites.reduce((n, s) => n + s[key], 0);
@@ -729,6 +729,7 @@ async function loadReport() {
     el('td', { class: 'right' }, String(s.next_choices)),
     el('td', { class: 'right' }, String(s.found)),
     el('td', { class: 'right' }, String(s.held)),
+    el('td', { class: 'right', title: 'Delivered without approval by a trusted recipe' }, String(s.auto_delivered)),
     el('td', { class: 'right' }, String(s.approved)),
     el('td', { class: 'right' }, String(s.rejected_wrong_video)),
     el('td', { class: 'right' }, String(s.rejected_other)),
@@ -741,7 +742,7 @@ async function loadReport() {
   );
   const total = {
     attempts: sum('attempts'), shadow_attempts: sum('shadow_attempts'), hold_attempts: sum('hold_attempts'),
-    found: sum('found'), held: sum('held'), approved: sum('approved'),
+    found: sum('found'), held: sum('held'), auto_delivered: sum('auto_delivered'), approved: sum('approved'),
     rejected_wrong_video: sum('rejected_wrong_video'), rejected_other: sum('rejected_other'), expired: sum('expired'),
     length_stated: sum('length_stated'), next_choices: sum('next_choices'),
     image_known: sum('image_known'), image_matched: sum('image_matched'),
