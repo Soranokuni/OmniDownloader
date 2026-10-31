@@ -37,6 +37,8 @@ pub struct EvidenceRow {
 
 /// Self-heal runs kept (P10.14).
 pub const SELFHEAL_MAX_ROWS: i64 = 500;
+/// Cap of `recipe_site_rejections` (one row per rejected recipe steps and site; the oldest go first).
+pub const REJECTIONS_MAX_ROWS: i64 = 20_000;
 /// Days a self-heal run is kept.
 pub const SELFHEAL_KEEP_DAYS: i64 = 30;
 
@@ -1045,6 +1047,12 @@ impl Repository {
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'EXTRACT', 'INFO', ?)",
             params![id, now, format!("Leased by {owner}")],
         )?;
+        // A new lease means the earlier run is over: an automatic-delivery marker it left
+        // (a run cancelled and killed, a failed finish_attempt) must never read as one (P10.16b).
+        tx.execute(
+            "UPDATE repair_attempts SET outcome = 'interrupted' WHERE job_id = ? AND outcome = 'auto_delivering'",
+            params![id],
+        )?;
         tx.commit()?;
 
         self.get_job(id)
@@ -1389,7 +1397,7 @@ impl Repository {
     pub fn job_auto_delivery_superseded(&self, job_id: i64) -> Result<bool> {
         let conn = self.pool.get()?;
         Ok(conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM repair_attempts WHERE job_id = ? AND outcome = 'auto_delivered' AND mcr_decision = 'superseded')",
+            "SELECT EXISTS (SELECT 1 FROM repair_attempts WHERE job_id = ? AND outcome IN ('auto_delivered','auto_delivering') AND mcr_decision = 'superseded')",
             params![job_id],
             |r| r.get(0),
         )?)
@@ -1406,7 +1414,8 @@ impl Repository {
                  WHERE r.id = ? AND r.hash = ? AND r.state <> 'retired' AND s.domain = ?
                    AND s.state = 'active' AND s.approvals >= ? AND s.rejections = 0
                    AND NOT EXISTS (SELECT 1 FROM repair_attempts a WHERE a.recipe_id = r.id AND a.recipe_hash = r.hash
-                                   AND a.domain = s.domain AND a.mcr_decision = 'rejected')",
+                                   AND a.domain = s.domain AND a.mcr_decision = 'rejected')
+                   AND NOT EXISTS (SELECT 1 FROM recipe_site_rejections x WHERE x.steps_hash = r.steps_hash AND x.domain = s.domain)",
                 params![recipe_id, recipe_hash, domain, min_approvals],
                 |r| r.get(0),
             )
@@ -1570,11 +1579,38 @@ impl Repository {
     }
 
     /// Retention: attempts that started more than `days` days ago (their jobs'
-    /// own deletion removes the rest).
+    /// own deletion removes the rest). An automatic delivery of a job that still
+    /// exists stays (P10.16b): it carries the «Λάθος βίντεο» card and the «Νέα λήψη» guard.
     pub fn purge_repair_attempts(&self, days: i64) -> Result<usize> {
         let conn = self.pool.get()?;
         let cutoff = timestamps::format(Utc::now() - Duration::days(days));
-        Ok(conn.execute("DELETE FROM repair_attempts WHERE started_at < ?", params![cutoff])?)
+        Ok(conn.execute(
+            "DELETE FROM repair_attempts WHERE started_at < ?
+               AND NOT (COALESCE(outcome, '') IN ('auto_delivered','auto_delivering') AND EXISTS (SELECT 1 FROM queue q WHERE q.id = repair_attempts.job_id))",
+            params![cutoff],
+        )?)
+    }
+
+    /// The ladder is about to hand a trusted recipe's video to the delivery (P10.16b):
+    /// the open attempt says so first, so a crash after the watchfolder rename still
+    /// leaves the marker behind. `finish_attempt` overwrites it with the real outcome.
+    pub fn mark_attempt_auto_delivering(&self, attempt_id: i64, recipe_id: i64, recipe_hash: &str, domain: &str, held_url: &str) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = 'auto_delivering', recipe_id = ?, recipe_hash = ?, domain = ?, held_url = ? WHERE id = ?",
+            params![recipe_id, recipe_hash, domain, held_url, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    /// The marked candidate did not reach the watchfolder: the attempt is open again.
+    pub fn clear_attempt_auto_delivering(&self, attempt_id: i64) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = NULL WHERE id = ? AND outcome = 'auto_delivering'",
+            params![attempt_id],
+        )?;
+        Ok(())
     }
 
     /// Store the videos offered to MCR for this job (`candidates_json`).
@@ -1802,7 +1838,51 @@ impl Repository {
                 "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
                 params![id, now, "RECOVERED_AFTER_DELIVERY: the video was already in the watchfolder; finished, not requeued"],
             )?;
+            // A trusted recipe's delivery that a crash cut short: the marker the ladder wrote
+            // before the pipeline ran becomes the outcome, and MCR is told (P10.16b).
+            let marked = conn.execute(
+                "UPDATE repair_attempts SET outcome = 'auto_delivered'
+                 WHERE id = (SELECT id FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1)
+                   AND outcome = 'auto_delivering'",
+                params![id],
+            )?;
+            if marked == 1 {
+                conn.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
+                    params![id, now, "Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή (ανάκτηση μετά από διακοπή)"],
+                )?;
+                conn.execute(
+                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
+                    params![format!("Job {id}: delivered without approval by a trusted recipe; recovered after an interruption"), now],
+                )?;
+            }
         }
+        // Any marker still left belongs to a run that stopped before ARCHIVE: it must never read
+        // as an automatic delivery later (P10.16b). At DELIVER the rename may already have
+        // happened (or ARCHIVE is off), so MCR is warned to look in the watchfolder.
+        if changed == 0 {
+            let at_deliver: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM queue q JOIN repair_attempts a ON a.job_id = q.id
+                     WHERE q.id = ? AND q.stage = 'DELIVER' AND a.outcome = 'auto_delivering')",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+            if at_deliver {
+                conn.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'WARN', ?)",
+                    params![id, now, "Διακοπή κατά την αυτόματη παράδοση χωρίς έγκριση: ελέγξτε αν το βίντεο είναι ήδη στο Dalet"],
+                )?;
+                conn.execute(
+                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
+                    params![format!("Job {id}: interrupted at DELIVER during a trusted recipe's delivery without approval; the video may already be in the watchfolder"), now],
+                )?;
+            }
+        }
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = 'interrupted' WHERE job_id = ? AND outcome = 'auto_delivering'",
+            params![id],
+        )?;
         Ok(changed == 1)
     }
 
@@ -2146,7 +2226,7 @@ impl Repository {
             // The delivered file this run made is no longer this job's: no «Λάθος βίντεο» for it (P10.16a).
             tx.execute(
                 "UPDATE repair_attempts SET mcr_decision = 'superseded'
-                 WHERE job_id = ? AND outcome = 'auto_delivered' AND mcr_decision IS NULL",
+                 WHERE job_id = ? AND outcome IN ('auto_delivered','auto_delivering') AND mcr_decision IS NULL",
                 params![id],
             )?;
         }
@@ -4498,7 +4578,16 @@ impl Repository {
         let Some((id, recipe_id, recipe_hash, domain, held_url, outcome, decision)) = attempt else {
             return Ok(WrongVideoOutcome::NotAutoDelivered);
         };
-        if outcome.as_deref() != Some("auto_delivered") || decision.as_deref() == Some("superseded") {
+        // 'auto_delivering' (written before the pipeline ran) counts once the job is COMPLETED.
+        let delivered = match outcome.as_deref() {
+            Some("auto_delivered") => true,
+            Some("auto_delivering") => tx
+                .query_row("SELECT status = 'COMPLETED' FROM queue WHERE id = ?", params![job_id], |r| r.get::<_, bool>(0))
+                .optional()?
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !delivered || decision.as_deref() == Some("superseded") {
             return Ok(WrongVideoOutcome::NotAutoDelivered);
         }
         if decision.is_some() {
@@ -4508,6 +4597,9 @@ impl Repository {
             "UPDATE repair_attempts SET mcr_decision = 'rejected', mcr_reason = 'wrong_video' WHERE id = ?",
             params![id],
         )?;
+        if let Some(domain) = domain.as_deref() {
+            recipe_sql::record_rejection(&tx, recipe_hash.as_deref(), domain, now)?;
+        }
         if let (Some(recipe_id), Some(domain)) = (recipe_id, domain.as_deref()) {
             recipe_sql::learn_from_mcr(&tx, recipe_id, recipe_hash.as_deref(), domain, false, now)?;
             if let Some(pattern) = held_url.as_deref().and_then(crate::urlnorm::skip_pattern) {
@@ -5297,21 +5389,40 @@ mod recipe_sql {
     /// suspends the recipe and bars its steps) and, for a recipe the model
     /// wrote that MCR never approved anywhere, a tombstone so it cannot come
     /// back. A recipe that is gone teaches nothing (the decision still stands).
-    /// A held video MCR rejected for a reason other than «Λάθος βίντεο» teaches the
-    /// recipe nothing, but it still counts against its trust on that site (P10.16):
-    /// kept on the site row, so it outlives the attempt (job deleted, 90-day purge)
-    /// and travels with a promotion. No suspension, no bar.
-    pub(super) fn count_rejection(conn: &Connection, recipe_id: i64, recipe_hash: Option<&str>, domain: &str) -> Result<()> {
+    /// An MCR rejection of a recipe's video on a site, for any reason (P10.16b), kept
+    /// for good per recipe steps and site: it outlives the attempt (job deleted, 90-day
+    /// purge), the site row, a retirement and a promotion (the player recipe keeps the
+    /// steps), so the recipe's trust there never comes back. The steps are found by the
+    /// attempt's recipe hash, from the recipe or, when it is gone, its tombstone. The
+    /// table is capped, the oldest `last_at` going first. Teaches the recipe nothing.
+    pub(super) fn record_rejection(conn: &Connection, recipe_hash: Option<&str>, domain: &str, now: DateTime<Utc>) -> Result<()> {
         if domain.is_empty() {
             return Ok(());
         }
-        let Some(head) = head_by_id(conn, recipe_id)? else { return Ok(()) };
-        if recipe_hash != Some(head.hash.as_str()) {
+        let steps: Option<String> = match recipe_hash {
+            Some(h) if !h.is_empty() => conn
+                .query_row("SELECT steps_hash FROM recipes WHERE hash = ?", params![h], |r| r.get(0))
+                .optional()?
+                .or(conn
+                    .query_row("SELECT steps_hash FROM recipe_tombstones WHERE hash = ?", params![h], |r| r.get::<_, Option<String>>(0))
+                    .optional()?
+                    .flatten()),
+            _ => None,
+        };
+        let Some(steps) = steps else {
+            tracing::warn!(domain, "MCR rejection of a video whose recipe steps are unknown: not remembered");
             return Ok(());
-        }
+        };
+        let at = timestamps::format(now);
         conn.execute(
-            "UPDATE recipe_sites SET rejections = rejections + 1 WHERE recipe_id = ? AND domain = ?",
-            params![recipe_id, domain],
+            "INSERT INTO recipe_site_rejections (steps_hash, domain, first_at, last_at, count) VALUES (?, ?, ?, ?, 1)
+             ON CONFLICT(steps_hash, domain) DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+            params![steps, domain, at, at],
+        )?;
+        conn.execute(
+            "DELETE FROM recipe_site_rejections WHERE rowid IN
+               (SELECT rowid FROM recipe_site_rejections ORDER BY last_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+            params![REJECTIONS_MAX_ROWS],
         )?;
         Ok(())
     }
@@ -7061,12 +7172,13 @@ fn note_mcr_decision(
         "UPDATE repair_attempts SET mcr_decision = ?, mcr_reason = ? WHERE id = ?",
         params![decision, reason, hold.id],
     )?;
-    if learn == Learn::Nothing {
-        if decision == "rejected" {
-            if let (Some(recipe_id), Some(domain)) = (hold.recipe_id, hold.domain.as_deref()) {
-                recipe_sql::count_rejection(tx, recipe_id, hold.recipe_hash.as_deref(), domain)?;
-            }
+    // A rejection, for any reason, ends the recipe's trust on that site for good (P10.16b).
+    if decision == "rejected" {
+        if let Some(domain) = hold.domain.as_deref() {
+            recipe_sql::record_rejection(tx, hold.recipe_hash.as_deref(), domain, now)?;
         }
+    }
+    if learn == Learn::Nothing {
         return Ok(Some(hold));
     }
     if let (Some(recipe_id), Some(domain)) = (hold.recipe_id, hold.domain.as_deref()) {

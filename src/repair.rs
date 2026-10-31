@@ -1648,7 +1648,20 @@ async fn ladder(
         // A job MCR sent back for a new download after an automatic delivery is held.
         let resent = ctx.repo.job_auto_delivery_superseded(job_id).unwrap_or(true);
         let trust_recipe = if from_llm.is_none() && !resent { Some((recipe_id, recipe_hash.as_str())) } else { None };
-        let (mode, trusted_approvals) = mode_for(ctx, &domain, trust_recipe);
+        let (mut mode, trusted_approvals) = mode_for(ctx, &domain, trust_recipe);
+        // Before the pipeline can reach the watchfolder, the attempt says an automatic delivery
+        // is under way: a crash after the rename still leaves the marker for the recovery (P10.16b).
+        // Without the marker the video is held, never delivered unrecorded.
+        if matches!(mode, DeliveryMode::Deliver) {
+            let marked = match attempt {
+                Some(attempt_id) => ctx.repo.mark_attempt_auto_delivering(attempt_id, recipe_id, &recipe_hash, &domain, &v.candidate.url),
+                None => Err(anyhow::anyhow!("no repair attempt is open")),
+            };
+            if let Err(e) = marked {
+                warn!("Job #{job_id}: the automatic delivery could not be marked, the video is held: {e:#}");
+                mode = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
+            }
+        }
         let url = match hold_one(ctx, job, owner, &v.candidate.url, v.candidate.referer.clone(), &method, mode, cancel).await {
             HoldStep::Held { url } => url,
             HoldStep::Delivered { url } => {
@@ -1660,7 +1673,15 @@ async fn ladder(
                 end.next_index = index as i64;
                 return LadderResult::Delivered { recipe_hash };
             }
-            HoldStep::Skipped | HoldStep::Failed => continue,
+            HoldStep::Skipped | HoldStep::Failed => {
+                // This candidate never reached the watchfolder: its marker must not outlive it.
+                if let (DeliveryMode::Deliver, Some(attempt_id)) = (mode, attempt) {
+                    if let Err(e) = ctx.repo.clear_attempt_auto_delivering(attempt_id) {
+                        warn!("Job #{job_id}: the automatic-delivery marker could not be cleared: {e:#}");
+                    }
+                }
+                continue;
+            }
             HoldStep::Lost => return LadderResult::Lost,
             HoldStep::Stop => return LadderResult::NothingVerified,
         };

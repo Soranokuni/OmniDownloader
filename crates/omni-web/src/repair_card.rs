@@ -72,7 +72,8 @@ pub fn build(attempt: &RepairAttempt, origin: Option<&str>, approvals: i64) -> O
 /// pressed «Λάθος βίντεο» (the button is then gone).
 pub fn build_auto_delivered(attempt: &RepairAttempt, approvals: i64) -> Option<Value> {
     // A redownload replaced the file: nothing of this attempt is on air any more.
-    if attempt.outcome.as_deref() != Some("auto_delivered") || attempt.mcr_decision.as_deref() == Some("superseded") {
+    // 'auto_delivering' is the marker written before the delivery ran; the caller shows it only on a Completed job.
+    if !matches!(attempt.outcome.as_deref(), Some("auto_delivered" | "auto_delivering")) || attempt.mcr_decision.as_deref() == Some("superseded") {
         return None;
     }
     let source_host = attempt.held_url.as_deref().and_then(|u| omni_core::net::parse_public_url(u).ok()).map(|(_, h)| h);

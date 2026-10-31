@@ -63,6 +63,8 @@ struct Fake {
     host_public: AtomicBool,
     downloads: Mutex<Vec<(String, Option<String>, DeliveryMode)>>,
     script: Mutex<VecDeque<std::result::Result<RunOutcome, ErrorCode>>>,
+    /// Runs at every download call, before it answers (what the repair row says at that moment).
+    at_download: Mutex<Option<Box<dyn Fn() + Send>>>,
     fetch: NoFetch,
     /// ffmpeg for the card evidence; `None` = the ladder gets no card tools.
     card_ffmpeg: Option<PathBuf>,
@@ -174,6 +176,7 @@ impl Fake {
             host_public: AtomicBool::new(true),
             downloads: Mutex::new(Vec::new()),
             script: Mutex::new(VecDeque::new()),
+            at_download: Mutex::new(None),
             fetch: NoFetch,
             card_ffmpeg: None,
             card_cap: None,
@@ -307,6 +310,9 @@ impl Env for Fake {
         mode: DeliveryMode,
     ) -> Result<RunOutcome> {
         self.downloads.lock().unwrap().push((job.url.clone(), referer, mode));
+        if let Some(h) = self.at_download.lock().unwrap().as_ref() {
+            h();
+        }
         match self.script.lock().unwrap().pop_front() {
             Some(Ok(o)) => Ok(o),
             Some(Err(code)) => Err(anyhow::anyhow!("scripted failure").context(code.as_str())),
@@ -2243,4 +2249,77 @@ async fn the_next_choice_of_a_recipe_with_four_approvals_is_held_as_before() {
     n.run(env.clone(), n.lease()).await;
     assert_eq!(env.downloads.lock().unwrap()[0].2, hold_mode());
     assert_eq!(n.repo.get_job(n.job_id).unwrap().unwrap().status, JobStatus::AwaitingApproval);
+}
+
+/// The outcome of the job's latest repair attempt, read from the database file.
+fn attempt_outcome(db: &std::path::Path, job_id: i64) -> Option<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row("SELECT outcome FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1", rusqlite::params![job_id], |x| x.get(0))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_trusted_video_with_no_attempt_to_mark_is_held() {
+    let (r, _id) = trusted_rig(5, 5);
+    // The attempt row cannot be written: there is nowhere to put the marker.
+    let conn = rusqlite::Connection::open(r._dir.0.join("omni.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER no_attempts BEFORE INSERT ON repair_attempts BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(!matches!(res, LadderResult::Delivered { .. }), "{res:?}");
+    let d = r.fake.downloads();
+    assert!(!d.is_empty(), "the video was still downloaded");
+    assert!(d.iter().all(|x| x.2 == hold_mode()), "held, never delivered unrecorded: {d:?}");
+}
+
+#[tokio::test]
+async fn a_trusted_delivery_is_marked_on_the_attempt_before_the_pipeline_runs() {
+    let (r, id) = trusted_rig(5, 5);
+    let db = r._dir.0.join("omni.db");
+    let seen: Arc<Mutex<Vec<(Option<String>, Option<i64>, Option<String>)>>> = Arc::default();
+    let (job_id, seen2) = (r.job.id, seen.clone());
+    *r.fake.at_download.lock().unwrap() = Some(Box::new(move || {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let row = conn
+            .query_row(
+                "SELECT outcome, recipe_id, held_url FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                rusqlite::params![job_id],
+                |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?)),
+            )
+            .unwrap();
+        seen2.lock().unwrap().push(row);
+    }));
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Delivered));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Delivered { .. }), "{res:?}");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![(Some("auto_delivering".to_string()), Some(id), Some(A.to_string()))],
+        "the marker was in the database while the pipeline ran"
+    );
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivered"), "then the real outcome replaces it");
+}
+
+#[tokio::test]
+async fn a_held_video_is_never_marked_as_delivering() {
+    let (r, _) = trusted_rig(4, 5);
+    let db = r._dir.0.join("omni.db");
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let (job_id, seen2) = (r.job.id, seen.clone());
+    *r.fake.at_download.lock().unwrap() = Some(Box::new(move || seen2.lock().unwrap().push(attempt_outcome(&db, job_id))));
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert!(seen.lock().unwrap().iter().all(|o| o.as_deref() != Some("auto_delivering")), "{:?}", seen.lock().unwrap());
+}
+
+#[tokio::test]
+async fn a_failed_trusted_delivery_does_not_leave_the_marker() {
+    let (r, _) = trusted_rig(5, 5);
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::PipelineFailed));
+    let _ = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert_ne!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivering"), "the real outcome replaced it");
 }

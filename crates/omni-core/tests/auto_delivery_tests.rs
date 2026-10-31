@@ -250,3 +250,158 @@ fn a_redownload_takes_the_wrong_video_button_away() -> Result<()> {
     assert_eq!(at.mcr_decision.as_deref(), Some("superseded"));
     Ok(())
 }
+
+// ------------------- the marker written before the delivery, and the purge (P10.16b) --
+
+#[test]
+fn the_purge_keeps_an_automatic_delivery_of_a_job_that_still_exists() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("purge", Origin::Admin);
+    let delivered = r.auto_delivered(1, Some((rid, &hash)), "auto_delivered");
+    let delivering = r.auto_delivered(2, Some((rid, &hash)), "auto_delivering");
+    let held = r.auto_delivered(3, Some((rid, &hash)), "held");
+    r.raw().execute("UPDATE repair_attempts SET started_at = '2020-01-01T00:00:00.000Z'", [])?;
+
+    assert_eq!(r.repo.purge_repair_attempts(90)?, 1, "only the held one is old news");
+    assert!(r.repo.latest_attempt(delivered)?.is_some(), "the card and the «Νέα λήψη» guard stay");
+    assert!(r.repo.latest_attempt(delivering)?.is_some());
+    assert!(r.repo.latest_attempt(held)?.is_none());
+    // The guard still works after the purge.
+    assert!(r.repo.redownload_job(delivered)?);
+    assert!(r.repo.job_auto_delivery_superseded(delivered)?);
+    // Once the job is gone, so is the row.
+    r.repo.delete_job(delivering)?;
+    let left: i64 = r.raw().query_row("SELECT COUNT(*) FROM repair_attempts WHERE job_id = ?", params![delivering], |x| x.get(0))?;
+    assert_eq!(left, 0);
+    Ok(())
+}
+
+#[test]
+fn an_auto_delivering_marker_on_a_completed_job_is_an_automatic_delivery() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("marker", Origin::Admin);
+    r.approvals(rid, DOMAIN, 5);
+    let id = r.auto_delivered(1, Some((rid, &hash)), "auto_delivering");
+    assert_eq!(r.repo.wrong_video_after_auto_delivery(id, "desk", Utc::now())?, WrongVideoOutcome::Recorded);
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?);
+    assert_eq!(r.repo.wrong_video_after_auto_delivery(id, "desk", Utc::now())?, WrongVideoOutcome::AlreadyDone);
+
+    // A redownload supersedes it like an 'auto_delivered' one.
+    let (oid, ohash) = r.recipe("marker2", Origin::Admin);
+    let other = r.auto_delivered(2, Some((oid, &ohash)), "auto_delivering");
+    assert!(r.repo.redownload_job(other)?);
+    assert!(r.repo.job_auto_delivery_superseded(other)?);
+    Ok(())
+}
+
+#[test]
+fn an_auto_delivering_marker_on_a_job_that_is_not_completed_shows_nothing() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("running", Origin::Admin);
+    r.approvals(rid, DOMAIN, 5);
+    let id = r.repo.enqueue(&NewJob::new("https://news.example/story-9", "9_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(id, "w", 180)?);
+    let at = r.repo.start_attempt(id, "hold", Utc::now())?;
+    r.repo.mark_attempt_auto_delivering(at, rid, &hash, DOMAIN, URL)?;
+    assert_eq!(r.repo.wrong_video_after_auto_delivery(id, "desk", Utc::now())?, WrongVideoOutcome::NotAutoDelivered);
+    assert!(r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "nothing was learned");
+    Ok(())
+}
+
+#[test]
+fn a_crash_after_the_watchfolder_rename_leaves_an_automatic_delivery_and_tells_mcr() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("crash", Origin::Admin);
+    let owner = "mcr-pc:1:0";
+    let id = r.repo.enqueue(&NewJob::new("https://news.example/story-7", "7_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(id, owner, 3600)?);
+    let at = r.repo.start_attempt(id, "hold", Utc::now())?;
+    r.repo.mark_attempt_auto_delivering(at, rid, &hash, DOMAIN, URL)?;
+    let row = r.repo.latest_attempt(id)?.unwrap();
+    assert_eq!((row.outcome.as_deref(), row.recipe_id, row.domain.as_deref(), row.held_url.as_deref()), (Some("auto_delivering"), Some(rid), Some(DOMAIN), Some(URL)));
+    assert!(r.repo.set_stage(id, owner, omni_core::models::JobStage::Archive)?);
+    // A control: a job in the same state with a plain attempt gets no such note.
+    let plain = r.repo.enqueue(&NewJob::new("https://news.example/story-8", "8_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(plain, "mcr-pc:1:1", 3600)?);
+    r.repo.start_attempt(plain, "hold", Utc::now())?;
+    assert!(r.repo.set_stage(plain, "mcr-pc:1:1", omni_core::models::JobStage::Archive)?);
+
+    assert_eq!(r.repo.recover_on_startup("mcr-pc")?, 0, "both are finished, none requeued");
+    assert_eq!(r.repo.get_job(id)?.unwrap().status, JobStatus::Completed);
+    assert_eq!(r.repo.latest_attempt(id)?.unwrap().outcome.as_deref(), Some("auto_delivered"));
+    let msg = |j: i64| r.repo.get_job_events(j, 50).unwrap().iter().any(|e| e.message.contains("ανάκτηση μετά από διακοπή"));
+    assert!(msg(id), "the job log says so");
+    assert!(!msg(plain));
+    let audit = r.repo.get_recent_audit_logs(20)?;
+    assert!(audit.iter().any(|a| a.category == "REPAIR" && a.message.contains(&format!("Job {id}"))), "an audit row says so");
+    // And MCR can call it the wrong video.
+    assert_eq!(r.repo.wrong_video_after_auto_delivery(id, "desk", Utc::now())?, WrongVideoOutcome::Recorded);
+    Ok(())
+}
+
+#[test]
+fn a_crash_before_the_rename_never_reads_as_an_automatic_delivery_later() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("early", Origin::Admin);
+    r.approvals(rid, DOMAIN, 5);
+    let owner = "mcr-pc:1:0";
+    let id = r.repo.enqueue(&NewJob::new("https://news.example/story-9", "9_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(id, owner, 3600)?);
+    let at = r.repo.start_attempt(id, "hold", Utc::now())?;
+    r.repo.mark_attempt_auto_delivering(at, rid, &hash, DOMAIN, URL)?;
+    // The daemon dies while transcoding: nothing reached the watchfolder.
+    assert!(r.repo.set_stage(id, owner, omni_core::models::JobStage::Transcode)?);
+    assert_eq!(r.repo.recover_on_startup("mcr-pc")?, 1, "requeued");
+    assert_eq!(r.repo.latest_attempt(id)?.unwrap().outcome.as_deref(), Some("interrupted"));
+
+    // The next run delivers on the normal path, writing no attempt of its own.
+    assert!(r.repo.lease_job_by_id(id, "mcr-pc:2:0", 3600)?);
+    assert!(r.repo.finish(id, "mcr-pc:2:0", JobStatus::Completed, None, None, Some("watch/clip.mxf"))?);
+    assert_eq!(r.repo.wrong_video_after_auto_delivery(id, "desk", Utc::now())?, WrongVideoOutcome::NotAutoDelivered);
+    assert!(r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "the recipe that did not deliver is not punished");
+    let skips = r.repo.repair_skip_patterns(DOMAIN, Utc::now())?;
+    assert!(skips.is_empty(), "no skip for an address that never went on air");
+    Ok(())
+}
+
+#[test]
+fn a_new_lease_ends_a_marker_the_earlier_run_left_behind() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("lease", Origin::Admin);
+    let id = r.repo.enqueue(&NewJob::new("https://news.example/story-10", "10_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(id, "mcr-pc:1:0", 3600)?);
+    let at = r.repo.start_attempt(id, "hold", Utc::now())?;
+    r.repo.mark_attempt_auto_delivering(at, rid, &hash, DOMAIN, URL)?;
+    // MCR cancelled it and the daemon died before the worker settled the attempt; later it is retried.
+    r.raw().execute("UPDATE queue SET status = 'PENDING', lease_owner = NULL WHERE id = ?", params![id])?;
+    assert!(r.repo.lease_job_by_id(id, "mcr-pc:2:0", 3600)?);
+    assert_eq!(r.repo.latest_attempt(id)?.unwrap().outcome.as_deref(), Some("interrupted"));
+    Ok(())
+}
+
+#[test]
+fn a_crash_at_deliver_warns_mcr_that_the_video_may_be_on_air() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("deliver", Origin::Admin);
+    let owner = "mcr-pc:1:0";
+    let id = r.repo.enqueue(&NewJob::new("https://news.example/story-11", "11_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(id, owner, 3600)?);
+    let at = r.repo.start_attempt(id, "hold", Utc::now())?;
+    r.repo.mark_attempt_auto_delivering(at, rid, &hash, DOMAIN, URL)?;
+    assert!(r.repo.set_stage(id, owner, omni_core::models::JobStage::Deliver)?);
+    // A control at TRANSCODE gets no such warning.
+    let early = r.repo.enqueue(&NewJob::new("https://news.example/story-12", "12_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(r.repo.lease_job_by_id(early, "mcr-pc:1:1", 3600)?);
+    let at2 = r.repo.start_attempt(early, "hold", Utc::now())?;
+    r.repo.mark_attempt_auto_delivering(at2, rid, &hash, DOMAIN, URL)?;
+    assert!(r.repo.set_stage(early, "mcr-pc:1:1", omni_core::models::JobStage::Transcode)?);
+
+    assert_eq!(r.repo.recover_on_startup("mcr-pc")?, 2, "both requeued");
+    let warned = |j: i64| r.repo.get_job_events(j, 50).unwrap().iter().any(|e| e.message.contains("ελέγξτε αν το βίντεο είναι ήδη στο Dalet"));
+    assert!(warned(id));
+    assert!(!warned(early));
+    let audit = r.repo.get_recent_audit_logs(20)?;
+    assert!(audit.iter().any(|a| a.category == "REPAIR" && a.message.contains(&format!("Job {id}: interrupted at DELIVER"))));
+    assert_eq!(r.repo.latest_attempt(id)?.unwrap().outcome.as_deref(), Some("interrupted"));
+    Ok(())
+}

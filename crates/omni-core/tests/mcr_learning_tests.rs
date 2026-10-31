@@ -406,15 +406,145 @@ fn a_not_usable_rejection_ends_trust_on_the_site_and_outlives_the_deleted_job() 
     let id = r.held(20, Some((rid, &hash)), &[B], 0);
     assert!(r.repo.reject_held(id, "not_usable", "teaser", "desk")?);
     let (state, approvals, rejections, reason) = r.site(rid).unwrap();
-    assert_eq!((state.as_str(), approvals, rejections, reason), ("active", 5, 1, None), "counted, not suspended");
+    assert_eq!((state.as_str(), approvals, rejections, reason), ("active", 5, 0, None), "not suspended, the site row learns nothing");
+    assert_eq!(r.remembered("steps-trusted"), Some(1), "the rejection is remembered per steps and site");
     assert!(!r.barred("steps-trusted"), "not barred");
     assert!(r.skips().is_empty(), "no skip");
     assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?);
 
-    // MCR removes the job (its attempts go with it): the rejection stays on the site row.
+    // MCR removes the job (its attempts go with it): the rejection stays in its own table.
     r.repo.delete_job(id)?;
     let attempts: i64 = r.raw().query_row("SELECT COUNT(*) FROM repair_attempts WHERE job_id = ?", params![id], |x| x.get(0))?;
     assert_eq!(attempts, 0);
     assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "trust does not come back");
+    Ok(())
+}
+
+// ------------------------------- a rejection is remembered for good (P10.16b) --
+
+impl Rig {
+    fn approve_n(&self, rid: i64, n: usize) {
+        for _ in 0..n {
+            self.repo.recipe_event(rid, DOMAIN, omni_core::recipe_score::Event::Approval, Utc::now()).unwrap();
+        }
+    }
+
+    fn remembered(&self, steps: &str) -> Option<i64> {
+        self.raw()
+            .query_row("SELECT count FROM recipe_site_rejections WHERE steps_hash = ? AND domain = ?", params![steps, DOMAIN], |r| r.get(0))
+            .ok()
+    }
+}
+
+#[test]
+fn a_rejection_with_no_site_row_is_remembered_and_outlives_the_deleted_job() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("fresh", Origin::Admin);
+    // The recipe has no row on the domain yet when MCR rejects its video.
+    r.raw().execute("DELETE FROM recipe_sites WHERE recipe_id = ?", params![rid])?;
+    assert!(r.site(rid).is_none());
+    let id = r.held(1, Some((rid, &hash)), &[A], 0);
+    assert!(r.repo.reject_held(id, "not_usable", "teaser", "desk")?);
+    assert_eq!(r.remembered("steps-fresh"), Some(1), "the rejection is written for the steps and the site");
+
+    r.approve_n(rid, 5);
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "5 approvals after a rejection do not trust it");
+    // The rejected job goes (its attempts with it): the memory is not on the attempt.
+    r.repo.delete_job(id)?;
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "trust does not come back");
+    // Rejected again for another reason: counted, not duplicated.
+    let again = r.held(2, Some((rid, &hash)), &[B], 0);
+    assert!(r.repo.reject_held(again, "other", "no", "desk")?);
+    assert_eq!(r.remembered("steps-fresh"), Some(2));
+    Ok(())
+}
+
+#[test]
+fn a_rejection_survives_the_failed_job_clean_up() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("clean", Origin::Admin);
+    r.approve_n(rid, 5);
+    let id = r.held(1, Some((rid, &hash)), &[A], 0);
+    assert!(r.repo.reject_held(id, "other", "no", "desk")?);
+    // The rejected job ends up failed and is cleared away.
+    r.raw().execute("UPDATE queue SET status = 'FAILED' WHERE id = ?", params![id])?;
+    assert_eq!(r.repo.clear_failed_jobs()?, 1);
+    r.raw().execute("DELETE FROM recipe_sites WHERE recipe_id = ?", params![rid])?;
+    r.approve_n(rid, 5);
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?);
+    Ok(())
+}
+
+#[test]
+fn a_rejection_survives_the_retention_purge_and_the_deleted_site_row() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("purged", Origin::Admin);
+    r.approve_n(rid, 5);
+    let id = r.held(1, Some((rid, &hash)), &[A], 0);
+    assert!(r.repo.reject_held(id, "wrong_video", "no", "desk")?);
+    r.raw().execute("UPDATE repair_attempts SET started_at = '2020-01-01T00:00:00.000Z'", [])?;
+    assert_eq!(r.repo.purge_repair_attempts(90)?, 1, "the attempt is purged");
+    r.raw().execute("DELETE FROM recipe_sites WHERE recipe_id = ?", params![rid])?;
+    r.approve_n(rid, 5);
+    assert!(!r.repo.recipe_trusted_on(rid, &hash, DOMAIN, 5)?, "the table, not the attempt or the site row, remembers");
+    Ok(())
+}
+
+#[test]
+fn a_rejection_follows_the_steps_into_the_promoted_player_recipe() -> Result<()> {
+    let r = rig();
+    let j = r#"{"dsl_version":1,"steps":[{"op":"ldjson","field":"f1"},{"op":"media","from":0,"referer":"page"}]}"#;
+    let mk = |kind: ScopeKind, key: &str, hash: &str| NewRecipe {
+        scope_kind: kind,
+        scope_key: key.into(),
+        family: Some("jwplayer".into()),
+        recipe_json: j.into(),
+        hash: hash.into(),
+        steps_hash: "steps-promo".into(),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let store = |n: NewRecipe| match r.repo.insert_recipe(&n, Utc::now()).unwrap() {
+        InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) => id,
+        other => panic!("recipe not stored: {other:?}"),
+    };
+    let a = store(mk(ScopeKind::Site, DOMAIN, "hash-promo-a"));
+    let b = store(mk(ScopeKind::Site, "other.example", "hash-promo-b"));
+    r.approve_n(a, 5);
+    r.repo.recipe_event(b, "other.example", omni_core::recipe_score::Event::Approval, Utc::now())?;
+    assert!(r.repo.recipe_trusted_on(a, "hash-promo-a", DOMAIN, 5)?);
+
+    let id = r.held(1, Some((a, "hash-promo-a")), &[A], 0);
+    assert!(r.repo.reject_held(id, "not_usable", "teaser", "desk")?);
+    let pid = r.repo.promote_to_player("steps-promo", "jwplayer", "hash-promo-player", j, 1, Utc::now())?.expect("promoted");
+    assert_ne!(pid, a);
+    let (state, approvals, rejections, _) = r.site(pid).expect("the player recipe has the site row");
+    assert_eq!((state.as_str(), approvals, rejections), ("active", 5, 0), "the row itself looks clean");
+    assert!(!r.repo.recipe_trusted_on(pid, "hash-promo-player", DOMAIN, 5)?, "same steps, same site: still not trusted");
+    r.repo.delete_job(id)?;
+    assert!(!r.repo.recipe_trusted_on(pid, "hash-promo-player", DOMAIN, 5)?);
+    Ok(())
+}
+
+#[test]
+fn the_remembered_rejections_are_capped_oldest_first() -> Result<()> {
+    let r = rig();
+    let (rid, hash) = r.recipe("cap", Origin::Admin);
+    {
+        let c = r.raw();
+        let tx = c.unchecked_transaction()?;
+        for n in 0..omni_core::repository::REJECTIONS_MAX_ROWS {
+            tx.execute(
+                "INSERT INTO recipe_site_rejections (steps_hash, domain, first_at, last_at) VALUES (?, 'x.example', '2026-01-01T00:00:00.000Z', ?)",
+                params![format!("old-{n}"), "2026-01-01T00:00:00.000Z"],
+            )?;
+        }
+        tx.commit()?;
+    }
+    let id = r.held(1, Some((rid, &hash)), &[A], 0);
+    assert!(r.repo.reject_held(id, "other", "no", "desk")?);
+    let total: i64 = r.raw().query_row("SELECT COUNT(*) FROM recipe_site_rejections", [], |x| x.get(0))?;
+    assert_eq!(total, omni_core::repository::REJECTIONS_MAX_ROWS, "capped");
+    assert_eq!(r.remembered("steps-cap"), Some(1), "the newest is kept");
     Ok(())
 }

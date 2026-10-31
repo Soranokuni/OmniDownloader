@@ -457,7 +457,7 @@ fn auto_delivered_for_desk(state: &AppState, job: &omni_core::models::Job) -> se
     let Ok(Some(attempt)) = state.repo.latest_attempt(job.id) else {
         return serde_json::Value::Null;
     };
-    if attempt.outcome.as_deref() != Some("auto_delivered") {
+    if !matches!(attempt.outcome.as_deref(), Some("auto_delivered" | "auto_delivering")) {
         return serde_json::Value::Null;
     }
     let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {

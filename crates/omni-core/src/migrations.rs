@@ -776,6 +776,37 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_site_videos_seen ON site_videos(domain, video_hash, seen_at);
         "#,
     ),
+    (
+        30,
+        // A recipe's trust on a site never comes back after an MCR rejection (P10.16b): one row
+        // per recipe steps and site, kept for good (it outlives the attempt, the job, the site row
+        // and the recipe's promotion). Filled from what the older rejections left behind.
+        r#"
+        CREATE TABLE IF NOT EXISTS recipe_site_rejections (
+            steps_hash TEXT NOT NULL,
+            domain     TEXT NOT NULL,
+            first_at   TEXT NOT NULL,
+            last_at    TEXT NOT NULL,
+            count      INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (steps_hash, domain)
+        );
+        INSERT OR IGNORE INTO recipe_site_rejections (steps_hash, domain, first_at, last_at, count)
+        SELECT r.steps_hash, a.domain, MIN(a.started_at), MAX(a.started_at), COUNT(*)
+        FROM repair_attempts a JOIN recipes r ON r.hash = a.recipe_hash
+        WHERE a.mcr_decision = 'rejected' AND a.domain IS NOT NULL AND a.domain <> ''
+        GROUP BY r.steps_hash, a.domain;
+        INSERT OR IGNORE INTO recipe_site_rejections (steps_hash, domain, first_at, last_at, count)
+        SELECT t.steps_hash, a.domain, MIN(a.started_at), MAX(a.started_at), COUNT(*)
+        FROM repair_attempts a JOIN recipe_tombstones t ON t.hash = a.recipe_hash
+        WHERE a.mcr_decision = 'rejected' AND a.domain IS NOT NULL AND a.domain <> '' AND t.steps_hash IS NOT NULL
+        GROUP BY t.steps_hash, a.domain;
+        INSERT OR IGNORE INTO recipe_site_rejections (steps_hash, domain, first_at, last_at, count)
+        SELECT r.steps_hash, s.domain, MIN(s.created_at), MAX(COALESCE(s.suspended_at, s.created_at)), MAX(s.rejections)
+        FROM recipe_sites s JOIN recipes r ON r.id = s.recipe_id
+        WHERE s.rejections > 0
+        GROUP BY r.steps_hash, s.domain;
+        "#,
+    ),
 ];
 
 /// Connection pragmas applied to every pooled connection.
@@ -1360,6 +1391,53 @@ mod tests {
         for c in ["domain", "sealed", "cookie_count", "expires_min", "updated_at", "updated_by", "last_test_at", "last_test_ok", "last_test_detail", "last_sample_url"] {
             assert!(columns.iter().any(|x| x == c), "cookie_jars.{c} missing: {columns:?}");
         }
+    }
+
+    #[test]
+    fn migration_30_backfills_the_permanent_rejections() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 29) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        assert!(conn.prepare("SELECT 1 FROM recipe_site_rejections").is_err(), "not before 30");
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'PENDING');
+             INSERT INTO recipes (id, hash, steps_hash, scope_kind, scope_key, recipe_json, dsl_version, origin, state, created_at)
+               VALUES (1, 'h1', 's1', 'domain', 'a.example', '{}', 1, 'llm', 'active', 'x'),
+                      (2, 'h2', 's2', 'domain', 'b.example', '{}', 1, 'llm', 'active', 'x'),
+                      (3, 'h3', 's3', 'domain', 'c.example', '{}', 1, 'llm', 'active', 'x');
+             INSERT INTO recipe_sites (recipe_id, domain, scored_at, created_at, rejections) VALUES
+               (2, 'b.example', 'x', 'x', 2), (3, 'c.example', 'x', 'x', 0);
+             INSERT INTO repair_attempts (job_id, started_at, mode, recipe_id, recipe_hash, domain, mcr_decision) VALUES
+               (5, '2026-01-01T00:00:00Z', 'hold', 1, 'h1', 'a.example', 'rejected'),
+               (5, '2026-01-02T00:00:00Z', 'hold', 1, 'h1', 'a.example', 'rejected'),
+               (5, '2026-01-03T00:00:00Z', 'hold', 1, 'h1', 'a.example', 'approved'),
+               (5, '2026-01-04T00:00:00Z', 'hold', 3, 'h3', 'c.example', 'approved');",
+        )
+        .unwrap();
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(target_version() >= 30);
+        assert!(MIGRATIONS.iter().any(|(v, _)| *v == 30));
+        let mut rows: Vec<(String, String, i64)> = conn
+            .prepare("SELECT steps_hash, domain, count FROM recipe_site_rejections ORDER BY steps_hash")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![("s1".to_string(), "a.example".to_string(), 2), ("s2".to_string(), "b.example".to_string(), 2)],
+            "attempts rejected and site rows with rejections are carried over; approvals and clean sites are not"
+        );
     }
 
     #[test]

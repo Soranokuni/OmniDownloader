@@ -1594,3 +1594,18 @@ async fn wrong_video_on_a_job_nobody_delivered_automatically_is_a_conflict() -> 
     assert_eq!(status, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_completed_job_marked_auto_delivering_gets_the_card_and_wrong_video_works() -> Result<()> {
+    // A crash after the delivery left the marker the ladder wrote before the pipeline ran (P10.16b).
+    let app = App::new()?;
+    let (id, rid, hash, file) = auto_delivered_job(&app, "auto_delivering")?;
+    let (_, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    let card = &json["job"]["repair"];
+    assert_eq!((card["auto_delivered"].clone(), card["wrong_video"].clone()), (json!(true), json!(false)), "{json}");
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/wrong-video"), &app.mcr_token, None).await?;
+    assert_eq!((status, json["already"].clone()), (StatusCode::OK, json!(false)), "{json}");
+    assert!(!app.repo.recipe_trusted_on(rid, &hash, "news.example", 5)?);
+    assert_eq!(std::fs::read(&file)?, b"on air");
+    Ok(())
+}

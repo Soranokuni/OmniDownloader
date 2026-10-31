@@ -218,7 +218,9 @@ on that site and unchanged; a recipe the model wrote counts the same way (it
 needs 5 real MCR approvals first), and a video the model found itself is always
 held. **Any** MCR rejection of that recipe's video on that site ends the trust at once
 («Λάθος βίντεο», «Δεν είναι αξιοποιήσιμο» or «Άλλο»); «Λάθος βίντεο» also
-suspends the recipe there, and its videos wait for MCR again. MCR's «Επόμενη
+suspends the recipe there, and its videos wait for MCR again. A rejection is
+remembered permanently per recipe steps and site: it survives deleting the job,
+the 90-day retention purge, and the recipe's promotion to a player recipe. MCR's «Επόμενη
 επιλογή» is always held, whatever the trust. The delivery is the
 normal atomic one; the job log says «Παραδόθηκε χωρίς έγκριση» and **Admin →
 Repair report** counts them per site (*Auto-delivered*). Trust is checked when
