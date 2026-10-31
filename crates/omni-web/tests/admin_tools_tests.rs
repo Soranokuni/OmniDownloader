@@ -98,7 +98,12 @@ async fn the_listing_says_what_each_tool_needs() -> Result<()> {
     let ffmpeg = row(&listing, "ffmpeg");
     assert_eq!(ffmpeg["installed"], true);
     assert_eq!(ffmpeg["matches_pin"], false);
-    assert_eq!(ffmpeg["pinned_version"], "9.0.2");
+    // The literal per architecture, so a pin edit or the wrong list shows up here.
+    let want = match omni_core::toolpins::host_arch() {
+        omni_core::toolpins::Arch::X64 => "9.0.2",
+        omni_core::toolpins::Arch::Arm64 => "9.0.2-39-g7adfbe40dc",
+    };
+    assert_eq!(ffmpeg["pinned_version"], want);
     assert_eq!(ffmpeg["action"], "repair");
     assert!(ffmpeg["version"].is_null());
 

@@ -90,7 +90,8 @@ automatically.
 
 | Tool | Version | How it is kept |
 |---|---|---|
-| ffmpeg / ffprobe | 9.0.2 (gyan.dev full build) | **pinned** by SHA-256; never upgraded on its own |
+| ffmpeg / ffprobe, x64 hosts | 9.0.2 (gyan.dev full build) | **pinned** by SHA-256; never upgraded on its own |
+| ffmpeg / ffprobe, ARM64 hosts | 9.0.2-39-g7adfbe40dc (BtbN GPL build, native ARM64) | **pinned** by SHA-256; never upgraded on its own |
 | bmxtranswrap | 1.6.0 (BBC bmx) | **pinned** by SHA-256; never upgraded on its own |
 | yt-dlp | latest stable | verified nightly update at 03:00, previous build kept for rollback |
 | Deno | latest | needed by yt-dlp for YouTube; kept current |
@@ -101,6 +102,16 @@ button. Install downloads the exact pinned build and checks its checksum;
 jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build.
+
+The service reads the CPU of the machine it runs on. On an ARM64 Windows
+host it installs the native BtbN ARM64 ffmpeg and ffprobe, because the x64
+build runs under emulation there and has hung. Everywhere else, and whenever
+the CPU cannot be determined, it uses the x64 gyan.dev build. bmxtranswrap has
+no ARM64 build: the x64 build is used on every host (emulated on ARM64). A
+start-up install runs only when a file is missing; it then installs that
+tool's whole pinned archive (ffmpeg and ffprobe together). If an x64 ffmpeg is already in
+`bin\` on an ARM64 host, the `pinned_tools` health line says so, and
+**Admin → Toolchain → Repair** replaces it with the native one.
 
 The encoder is pinned on purpose: the broadcast output was validated with
 that exact build. The service never uses an ffmpeg, ffprobe or bmxtranswrap

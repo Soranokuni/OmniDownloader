@@ -1263,6 +1263,10 @@ async fn run_daemon(
     .collect();
 
     info!("Broadcast Toolchain:");
+    {
+        let arch = omni_core::toolpins::host_arch();
+        info!("  host:         {} (tools pinned for {})", arch.label().to_lowercase(), arch.label().to_lowercase());
+    }
     info!("  ffmpeg:       {:?}", ffmpeg_path);
     info!("  ffprobe:      {:?}", ffprobe_path);
     info!("  bmxtranswrap: {:?}", bmxtranswrap_path);
