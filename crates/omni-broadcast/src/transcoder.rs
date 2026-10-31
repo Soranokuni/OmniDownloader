@@ -271,6 +271,10 @@ pub fn build_loudness_measure_args(
     Some(vec![
         "-nostdin".into(),
         "-hide_banner".into(),
+        "-format_whitelist".into(),
+        crate::probe::SOURCE_DEMUXERS.into(),
+        "-protocol_whitelist".into(),
+        "file".into(),
         "-i".into(),
         source.to_string_lossy().into_owned(),
         "-map".into(),
@@ -343,6 +347,12 @@ pub fn build_plan(
         "-hide_banner".into(),
         "-threads".into(),
         "0".into(),
+        // Local file only, plain media demuxers only: a playlist source must not
+        // open URLs or other files (P2.11).
+        "-format_whitelist".into(),
+        crate::probe::SOURCE_DEMUXERS.into(),
+        "-protocol_whitelist".into(),
+        "file".into(),
         "-i".into(),
         source.to_string_lossy().into_owned(),
         // Silence source for the pad channels.

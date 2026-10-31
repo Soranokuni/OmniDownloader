@@ -88,6 +88,10 @@ pub struct SourceProbe {
     pub audio: Option<AudioStream>,
     /// How many audio streams the source has, for the job event when we pick one.
     pub audio_stream_count: usize,
+    /// ffprobe's `format.format_name` (comma-separated demuxer names). Empty
+    /// for values stored before this field existed.
+    #[serde(default)]
+    pub container: String,
 }
 
 impl SourceProbe {
@@ -100,22 +104,87 @@ impl SourceProbe {
     }
 }
 
-/// Probe a media file.
-///
-/// Returns `Err` when ffprobe fails, returns unparseable JSON, or reports no
-/// video stream. Callers must send the job to REQUIRES_REVIEW with
-/// `error_code=PROBE_FAILED` rather than guessing (defect D-07).
-pub async fn probe(ffprobe: &Path, media: &Path) -> Result<SourceProbe> {
-    let media_arg = media.to_string_lossy().into_owned();
-    let args = [
+/// Containers that are really lists of other inputs (P2.11). A source file
+/// naming one is refused: following it could reach the network or other files.
+const PLAYLIST_CONTAINERS: [&str; 7] = ["hls", "applehttp", "dash", "concat", "lavfi", "avisynth", "vapoursynth"];
+
+/// The only demuxers ffmpeg may pick for a job source (`-format_whitelist`,
+/// P2.11). Names are the individual tokens of ffmpeg's demuxer names (the mov
+/// demuxer is `mov,mp4,m4a,3gp,3g2,mj2`). Anything that references other inputs
+/// (hls, dash, concat, sdp, avisynth, vapoursynth, ...) is absent, so ffmpeg
+/// refuses it before reading a single segment. Audio-only demuxers are absent
+/// because `parse` needs a video stream. Verified against ffmpeg n9.0.2.
+pub const SOURCE_DEMUXERS: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,mpegts,mpeg,avi,asf,flv,mxf,dv,gxf,ogg,h264,hevc,m4v,mpegvideo,image2,jpeg_pipe,png_pipe,bmp_pipe,webp_pipe,gif";
+
+/// ffprobe arguments for a source file. The source is local-file-only: a
+/// playlist inside it must not make ffprobe open a URL, a UNC path or another
+/// job's file (P2.11).
+pub fn probe_args(media: &Path) -> Vec<String> {
+    [
         "-v",
         "error",
         "-print_format",
         "json",
         "-show_streams",
         "-show_format",
-        &media_arg,
-    ];
+        "-format_whitelist",
+        SOURCE_DEMUXERS,
+        "-protocol_whitelist",
+        "file",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain(std::iter::once(media.to_string_lossy().into_owned()))
+    .collect()
+}
+
+/// Which playlist kind the start of a file is, if any. Pure; see
+/// [`refuse_playlist_text`].
+fn sniff_playlist(head: &[u8]) -> Option<&'static str> {
+    let body = head.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(head);
+    let start = body.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(body.len());
+    let body = &body[start..];
+    let starts = |p: &[u8]| body.len() >= p.len() && body[..p.len()].eq_ignore_ascii_case(p);
+    if starts(b"#EXTM3U") {
+        Some("hls")
+    } else if starts(b"ffconcat") {
+        Some("concat")
+    } else if head.windows(4).any(|w| w == b"<MPD") {
+        Some("dash")
+    } else {
+        None
+    }
+}
+
+/// Refuse a text playlist before ffprobe opens it: ffprobe reads the first
+/// segment while working out the container, which would already touch a UNC
+/// path (NTLM leak) or another job's file (P2.11). A read failure is not an
+/// error here; ffprobe reports it as it always did.
+fn refuse_playlist_text(media: &Path) -> Result<()> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(4096);
+    let read = std::fs::File::open(media).and_then(|f| f.take(4096).read_to_end(&mut head));
+    if read.is_err() {
+        return Ok(());
+    }
+    match sniff_playlist(&head) {
+        Some(kind) => Err(anyhow!("source is a playlist ({kind}), not a media file")),
+        None => Ok(()),
+    }
+}
+
+/// Probe a media file.
+///
+/// Returns `Err` when ffprobe fails, returns unparseable JSON, or reports no
+/// video stream. Callers must send the job to REQUIRES_REVIEW with
+/// `error_code=PROBE_FAILED` rather than guessing (defect D-07).
+pub async fn probe(ffprobe: &Path, media: &Path) -> Result<SourceProbe> {
+    let sniff_path = media.to_path_buf();
+    tokio::task::spawn_blocking(move || refuse_playlist_text(&sniff_path))
+        .await
+        .map_err(|e| anyhow!("playlist check did not finish: {e}"))??;
+
+    let args = probe_args(media);
 
     let out = run_capture(ffprobe, args, PROBE_TIMEOUT)
         .await
@@ -141,6 +210,19 @@ pub async fn probe(ffprobe: &Path, media: &Path) -> Result<SourceProbe> {
 pub fn parse(json: &str) -> Result<SourceProbe> {
     let v: serde_json::Value =
         serde_json::from_str(json).context("ffprobe did not return valid JSON")?;
+
+    let container = v
+        .pointer("/format/format_name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(bad) = container
+        .split(',')
+        .map(str::trim)
+        .find(|n| PLAYLIST_CONTAINERS.contains(n))
+    {
+        return Err(anyhow!("source is a playlist container ({bad}), not a media file"));
+    }
 
     let streams = v
         .get("streams")
@@ -278,6 +360,7 @@ pub fn parse(json: &str) -> Result<SourceProbe> {
         video,
         audio: chosen,
         audio_stream_count: audio_streams.len(),
+        container,
     })
 }
 
@@ -308,6 +391,60 @@ mod tests {
               "format": {{ "duration": "12.500000", "size": "10485760" }}
             }}"#
         )
+    }
+
+    fn json_with_format(name: &str) -> String {
+        format!(
+            r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264",
+              "width":1280,"height":720,"r_frame_rate":"25/1"}}],
+              "format":{{"format_name":"{name}","duration":"2.0","size":"100"}}}}"#
+        )
+    }
+
+    #[test]
+    fn playlist_containers_are_refused_and_media_containers_are_not() {
+        for name in ["hls", "applehttp", "dash", "concat", "lavfi", "mov,mp4,hls"] {
+            let e = parse(&json_with_format(name)).unwrap_err();
+            assert!(format!("{e:#}").contains("playlist container"), "{name}: {e:#}");
+        }
+        let e = parse(&json_with_format("hls")).unwrap_err();
+        assert!(format!("{e:#}").contains("(hls)"), "{e:#}");
+        let p = parse(&json_with_format("mov,mp4,m4a,3gp,3g2,mj2")).unwrap();
+        assert_eq!(p.container, "mov,mp4,m4a,3gp,3g2,mj2");
+        assert_eq!(parse(&json_with_format("image2")).unwrap().container, "image2");
+    }
+
+    #[test]
+    fn playlist_text_is_sniffed_from_the_first_bytes() {
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(b"\n#extm3u\n#EXTINF:2,\nx.ts");
+        assert_eq!(sniff_playlist(&bom), Some("hls"));
+        assert_eq!(sniff_playlist(b"ffconcat version 1.0\nfile a.mp4"), Some("concat"));
+        assert_eq!(sniff_playlist(b"<?xml version=1?>\n<MPD xmlns=\"x\">"), Some("dash"));
+        assert_eq!(sniff_playlist(&[0, 0, 0, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm']), None);
+        assert_eq!(sniff_playlist(b""), None);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_is_refused_before_ffprobe_is_started() {
+        // The ffprobe path does not exist: reaching it would say "Could not
+        // run ffprobe". The playlist message proves it was never started.
+        let dir = tempfile::tempdir().unwrap();
+        let m3u8 = dir.path().join("source.m3u8");
+        let bs = char::from(92u8);
+        let unc = format!("{bs}{bs}127.0.0.1{bs}omni-nonexistent{bs}x.ts");
+        std::fs::write(&m3u8, format!("#EXTM3U\n#EXTINF:2.0,\n{unc}\n")).unwrap();
+        let err = probe(Path::new("Z:/no/such/ffprobe.exe"), &m3u8).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("source is a playlist (hls)"), "{msg}");
+        assert!(!msg.contains("Could not run ffprobe"), "{msg}");
+    }
+
+    #[test]
+    fn probe_args_restrict_the_source_to_local_files() {
+        let a = probe_args(Path::new("source.m3u8"));
+        let i = a.iter().position(|x| x == "source.m3u8").unwrap();
+        assert_eq!(&a[i - 4..i], ["-format_whitelist", SOURCE_DEMUXERS, "-protocol_whitelist", "file"]);
     }
 
     #[test]

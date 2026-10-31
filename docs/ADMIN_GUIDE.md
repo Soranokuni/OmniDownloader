@@ -462,7 +462,7 @@ A stopped job carries one of these codes; the desk shows a Greek hint.
 | `DRM_PROTECTED` | no | copy-protected; get the file from the source |
 | `SOURCE_TOO_LONG` | no | over the duration limit |
 | `MANUAL_DOWNLOAD` | no | file-transfer link (WeTransfer etc.): download by hand, mark done |
-| `PROBE_FAILED` | no | the downloaded file is unreadable |
+| `PROBE_FAILED` | no | the downloaded file is unreadable, or is not an accepted video container. Accepted: MP4/MOV/3GP, MKV/WebM, MPEG-TS, MPEG-PS, AVI, WMV, FLV, MXF, DV, GXF, Ogg, raw H.264/HEVC/MPEG video and still images. Playlists (HLS, DASH, concat) and scripts (AviSynth, VapourSynth) are always refused |
 | `TRANSCODE_FAILED`, `TRANSCODE_TIMEOUT` | no | encoding failed; report if it repeats |
 | `REWRAP_FAILED`, `REWRAP_TIMEOUT` | no | MXF wrapping failed; report if it repeats |
 | `COMPLIANCE_FAILED` | no | the result is not to broadcast spec: **not delivered** |
