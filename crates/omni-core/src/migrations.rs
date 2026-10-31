@@ -809,16 +809,24 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
     ),
 ];
 
-/// Connection pragmas applied to every pooled connection.
+/// Pragmas that are per connection, so every pooled connection runs them from
+/// the pool's init hook (`Repository::new`).
 ///
-/// `synchronous=NORMAL` is the right trade under WAL: it keeps the durability
-/// that matters (no corruption on crash) while removing an fsync per commit,
-/// and the queue writes a progress row several times a second per job.
-pub const CONNECTION_PRAGMAS: &str = "
-    PRAGMA journal_mode = WAL;
+/// `synchronous=FULL`, not NORMAL: under WAL+NORMAL a power cut can drop the
+/// last commits, and the ones recording a delivery after the watchfolder
+/// rename (`set_delivered_file`, `set_stage(Archive)`, `record_held_delivery`,
+/// the `auto_delivering` marker) are what stop recovery from delivering the
+/// same video again as `_1`. Cut write volume (progress rows) instead.
+pub const PER_CONNECTION_PRAGMAS: &str = "
     PRAGMA busy_timeout = 30000;
     PRAGMA foreign_keys = ON;
-    PRAGMA synchronous = NORMAL;
+    PRAGMA synchronous = FULL;
+";
+
+/// Stored in the database file, so it is set once when the schema is opened,
+/// not per connection.
+pub const DATABASE_PRAGMAS: &str = "
+    PRAGMA journal_mode = WAL;
 ";
 
 /// Highest version defined in this build.

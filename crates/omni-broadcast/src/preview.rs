@@ -81,7 +81,7 @@ const AUDIO_MIX: &str = "[0:a:0][0:a:1]amerge=inputs=2[a]";
 /// ffmpeg arguments for the preview: programme L+R (tracks 1 and 2 of the
 /// MXF) and, unless the encoder is `None`, a deinterlaced 540p picture.
 pub fn preview_args(input: &Path, output: &Path, encoder: PreviewEncoder) -> Vec<String> {
-    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-threads", "2", "-i"].iter().map(|s| s.to_string()).collect();
+    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-threads", "2", "-protocol_whitelist", "file", "-i"].iter().map(|s| s.to_string()).collect();
     a.push(input.to_string_lossy().into_owned());
     let video: &[&str] = match encoder {
         PreviewEncoder::X264 => &["-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-g", "50"],
@@ -105,7 +105,7 @@ pub fn preview_args(input: &Path, output: &Path, encoder: PreviewEncoder) -> Vec
 /// the clip.
 pub fn contact_args(input: &Path, output: &Path, duration: f64) -> Vec<String> {
     let d = if duration.is_finite() { duration.max(1.0) } else { 1.0 };
-    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-threads", "2", "-i"].iter().map(|s| s.to_string()).collect();
+    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-y", "-threads", "2", "-protocol_whitelist", "file", "-i"].iter().map(|s| s.to_string()).collect();
     a.push(input.to_string_lossy().into_owned());
     a.extend(["-an", "-frames:v", "1", "-vf"].map(String::from));
     a.push(format!("fps=12/{d:.3},scale=320:-2,tile=4x3"));

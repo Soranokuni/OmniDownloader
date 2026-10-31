@@ -478,7 +478,8 @@ impl Repository {
                 .with_context(|| format!("Failed creating directory for DB {:?}", parent))?;
         }
 
-        let manager = SqliteConnectionManager::file(path);
+        let manager = SqliteConnectionManager::file(path)
+            .with_init(|c| c.execute_batch(migrations::PER_CONNECTION_PRAGMAS));
         let pool = Pool::builder()
             .max_size(16)
             .build(manager)
@@ -509,7 +510,7 @@ impl Repository {
     fn run_migrations(&self) -> Result<()> {
         let mut conn = self.pool.get()?;
 
-        conn.execute_batch(migrations::CONNECTION_PRAGMAS)?;
+        conn.execute_batch(migrations::DATABASE_PRAGMAS)?;
         migrations::apply(&mut conn, self.db_path.as_deref())
             .context("Schema migration failed; refusing to start against a half-migrated database")?;
 
@@ -715,9 +716,11 @@ impl Repository {
             return Ok(Enqueued::DuplicateActive { existing_id });
         }
 
-        // Recently delivered for this same journalist?
+        // Recently delivered for this same journalist? A zero window means
+        // nothing counts as recent: without this, a job completed in the same
+        // millisecond as the cutoff still matched `>=` (P1.19 exposed it).
         let cutoff = timestamps::format(Utc::now() - Duration::hours(dedup_window_hours));
-        let recent: Option<i64> = tx
+        let recent: Option<i64> = if dedup_window_hours <= 0 { None } else { tx
             .query_row(
                 "SELECT id FROM queue
                  WHERE url_normalized = ?
@@ -728,7 +731,7 @@ impl Repository {
                 params![normalized, job.journalist.to_uppercase(), cutoff],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()? };
         if let Some(existing_id) = recent {
             tx.commit()?;
             self.log_audit(
@@ -6389,6 +6392,51 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn every_pooled_connection_gets_the_per_connection_pragmas() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        // Hold all 16 at once so the pool must have opened every one of them.
+        let conns = (0..16).map(|_| repo.pool.get()).collect::<std::result::Result<Vec<_>, _>>()?;
+        for (i, c) in conns.iter().enumerate() {
+            let pragma = |name: &str| -> i64 { c.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0)).unwrap() };
+            assert_eq!(pragma("foreign_keys"), 1, "connection {i}: foreign_keys");
+            assert_eq!(pragma("busy_timeout"), 30000, "connection {i}: busy_timeout");
+            assert_eq!(pragma("synchronous"), 2, "connection {i}: synchronous (2 = FULL)");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn purging_a_job_cascades_to_its_events_whichever_connection_runs_it() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        // Holding k connections makes the purge run on a different pooled one each
+        // round, so one of them is not the connection that ran the migrations.
+        for held_count in 0..14 {
+            let id = repo.add_job(
+                &format!("https://example.org/clip{held_count}"), "1_TESTER_CLIP", "TESTER", "CLIP", "1", 10,
+                JobStatus::Pending, None, None, None,
+            )?;
+            repo.record_event(id, "INFO", None, "one")?;
+            repo.record_event(id, "INFO", None, "two")?;
+            repo.pool.get()?.execute(
+                "UPDATE queue SET status = 'COMPLETED', updated_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                params![id],
+            )?;
+            assert!(!repo.get_job_events(id, 50)?.is_empty());
+            let held: Vec<_> = (0..held_count).map(|_| repo.pool.get()).collect::<std::result::Result<_, _>>()?;
+            assert_eq!(repo.purge_completed_jobs(30)?, 1);
+            drop(held);
+            let left: i64 = repo
+                .pool
+                .get()?
+                .query_row("SELECT COUNT(*) FROM job_events WHERE job_id = ?", params![id], |r| r.get(0))?;
+            assert_eq!(left, 0, "ON DELETE CASCADE did not fire with {held_count} connections held");
+        }
+        Ok(())
+    }
 
     #[test]
     fn evidence_rows_are_recorded_listed_oldest_first_and_deleted() -> Result<()> {

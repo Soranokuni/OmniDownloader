@@ -50,6 +50,7 @@ fn probe_of(v: VideoStream, a: Option<AudioStream>) -> SourceProbe {
         video: v,
         audio_stream_count: a.is_some() as usize,
         audio: a,
+        container: "mov,mp4,m4a,3gp,3g2,mj2".into(),
     }
 }
 
