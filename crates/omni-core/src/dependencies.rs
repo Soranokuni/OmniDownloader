@@ -725,7 +725,7 @@ fn which(exe_name: &str) -> Option<PathBuf> {
 // Pinned installs: ffmpeg, ffprobe, bmxtranswrap (plan P9.3)
 // ----------------------------------------------------------------------
 //
-// Fetched only at the build in `toolpins::PINS`, checked against its SHA-256,
+// Fetched only at the build in `toolpins::pins()`, checked against its SHA-256,
 // swapped in under the update gate with the previous file kept as `.prev`.
 // Never run by a scheduled task: the operator presses «Install» or «Repair».
 
@@ -1070,7 +1070,7 @@ impl DependencyManager {
     /// swap that someone deleted the new file from, the old build must not come back on
     /// air unannounced. Returns the members completed.
     pub fn recover_interrupted_swaps(&self) -> Vec<String> {
-        self.recover_interrupted_swaps_for(crate::toolpins::PINS)
+        self.recover_interrupted_swaps_for(crate::toolpins::pins())
     }
 
     fn recover_interrupted_swaps_for(&self, pins: &[ToolPin]) -> Vec<String> {
@@ -1132,7 +1132,7 @@ impl DependencyManager {
     /// (installing would swap that very file). A wrong hash on a present file is the health
     /// line's business, not this one's.
     pub fn pending_pins(&self, overrides: &HashMap<String, PathBuf>) -> Vec<ToolPin> {
-        self.pending_pins_for(crate::toolpins::PINS, overrides)
+        self.pending_pins_for(crate::toolpins::pins(), overrides)
     }
 
     fn pending_pins_for(&self, pins: &[ToolPin], overrides: &HashMap<String, PathBuf>) -> Vec<ToolPin> {
@@ -1167,7 +1167,7 @@ impl DependencyManager {
         drain: Duration,
         st: &ToolInstaller,
     ) -> Vec<(String, Result<PinnedOutcome>)> {
-        self.install_missing_pins_for(crate::toolpins::PINS, overrides, fetcher, gate, drain, st).await
+        self.install_missing_pins_for(crate::toolpins::pins(), overrides, fetcher, gate, drain, st).await
     }
 
     async fn install_missing_pins_for(
@@ -1190,10 +1190,30 @@ impl DependencyManager {
     /// `config.json` points to instead) is missing or is not the pinned build. The hash
     /// cache keeps this cheap to repeat. Blocking.
     pub fn pinned_tools_check(&self, st: &ToolInstaller, overrides: &HashMap<String, PathBuf>) -> crate::health::Check {
-        self.pinned_tools_check_for(crate::toolpins::PINS, st, overrides)
+        self.pinned_tools_check_with(
+            crate::toolpins::pins(),
+            crate::toolpins::other_pins(),
+            crate::toolpins::host_arch(),
+            st,
+            overrides,
+        )
     }
 
+    #[cfg(test)]
     fn pinned_tools_check_for(&self, pins: &[ToolPin], st: &ToolInstaller, overrides: &HashMap<String, PathBuf>) -> crate::health::Check {
+        self.pinned_tools_check_with(pins, &[], crate::toolpins::Arch::X64, st, overrides)
+    }
+
+    /// `other` are the pins of the other architecture: a file with one of their hashes is
+    /// reported as the wrong architecture's build rather than as an unknown one.
+    fn pinned_tools_check_with(
+        &self,
+        pins: &[ToolPin],
+        other: &[ToolPin],
+        host: crate::toolpins::Arch,
+        st: &ToolInstaller,
+        overrides: &HashMap<String, PathBuf>,
+    ) -> crate::health::Check {
         let mut bad: Vec<String> = Vec::new();
         let mut names: Vec<&str> = Vec::new();
         for pin in pins {
@@ -1208,6 +1228,21 @@ impl DependencyManager {
                 bad.push(match over {
                     None if !path.exists() => {
                         format!("{tool} is missing from bin/: Admin \u{2192} Toolchain \u{2192} Install, then restart the service")
+                    }
+                    None if other
+                        .iter()
+                        .filter_map(|o| crate::toolpins::member_for(o, tool))
+                        .any(|om| st.sha256_of(&path).as_deref() == Some(om.sha256)) =>
+                    {
+                        let theirs = match host {
+                            crate::toolpins::Arch::X64 => crate::toolpins::Arch::Arm64,
+                            crate::toolpins::Arch::Arm64 => crate::toolpins::Arch::X64,
+                        };
+                        format!(
+                            "{tool} is the {} build on this {} host: Admin \u{2192} Toolchain \u{2192} Repair installs the native one",
+                            theirs.label(),
+                            host.label()
+                        )
                     }
                     None => format!("{tool} is not the pinned build: Admin \u{2192} Tools \u{2192} Repair"),
                     Some(p) => format!(
@@ -2603,6 +2638,37 @@ mod pinned_tests {
         assert_eq!(mgr.recover_interrupted_swaps_for(std::slice::from_ref(&pin)).len(), 1);
         assert_eq!(std::fs::read(bin.join("fakeprobe.exe")).unwrap(), b"new probe");
         assert_eq!(std::fs::read(bin.join("fakeprobe.exe.prev")).unwrap(), b"old probe");
+    }
+
+    #[test]
+    fn the_health_line_names_the_other_architectures_build() {
+        use crate::toolpins::Arch;
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        let mgr = DependencyManager::new(&bin);
+        let archive = zip_of(&[("x", b"x")]);
+        let arm = pin_for_test(&archive, &[("fake.exe", "bin/fake.exe", b"arm64 build")], false);
+        let x64 = pin_for_test(&archive, &[("fake.exe", "bin/fake.exe", b"x64 build")], false);
+        let st = ToolInstaller::new();
+        let (arm, x64) = (std::slice::from_ref(&arm), std::slice::from_ref(&x64));
+
+        std::fs::write(bin.join("fake.exe"), b"x64 build").unwrap();
+        let check = mgr.pinned_tools_check_with(arm, x64, Arch::Arm64, &st, &HashMap::new());
+        assert_eq!(check.state, crate::health::Health::Degraded);
+        let detail = check.detail.unwrap();
+        assert!(detail.contains("fake is the x64 build on this ARM64 host"), "{detail}");
+        assert!(detail.contains("Repair installs the native one"), "{detail}");
+        assert!(!detail.contains("not the pinned build"), "{detail}");
+
+        // A file that is neither pin keeps the generic text.
+        std::fs::write(bin.join("fake.exe"), b"something else").unwrap();
+        let detail = mgr.pinned_tools_check_with(arm, x64, Arch::Arm64, &st, &HashMap::new()).detail.unwrap();
+        assert!(detail.contains("fake is not the pinned build"), "{detail}");
+
+        // The native build is green.
+        std::fs::write(bin.join("fake.exe"), b"arm64 build").unwrap();
+        let ok = mgr.pinned_tools_check_with(arm, x64, Arch::Arm64, &st, &HashMap::new());
+        assert_eq!(ok.state, crate::health::Health::Ok);
     }
 
     #[test]

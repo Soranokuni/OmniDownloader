@@ -242,8 +242,9 @@ running daemon installs or repairs them from **Admin → Toolchain**, and
 
 | Tool | Version | Source |
 |---|---|---|
-| `ffmpeg.exe`, `ffprobe.exe` | 9.0.2, pinned by SHA-256 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) full build |
-| `bmxtranswrap.exe` | 1.6.0, pinned by SHA-256 | [bmx](https://github.com/bbc/bmx) (BBC) |
+| `ffmpeg.exe`, `ffprobe.exe` (x64 hosts, and when the CPU cannot be determined) | 9.0.2, pinned by SHA-256 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) full build |
+| `ffmpeg.exe`, `ffprobe.exe` (ARM64 hosts) | 9.0.2-39-g7adfbe40dc, pinned by SHA-256 | [BtbN](https://github.com/BtbN/FFmpeg-Builds) native ARM64 GPL build |
+| `bmxtranswrap.exe` (x64 build on every host; emulated on ARM64) | 1.6.0, pinned by SHA-256 | [bmx](https://github.com/bbc/bmx) (BBC) |
 | `yt-dlp.exe` | latest stable, verified nightly update | [yt-dlp](https://github.com/yt-dlp/yt-dlp) releases |
 | `deno.exe` | latest | [Deno](https://github.com/denoland/deno) (yt-dlp needs it for YouTube) |
 
