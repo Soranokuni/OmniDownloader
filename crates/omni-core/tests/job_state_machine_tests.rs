@@ -350,6 +350,35 @@ fn a_completed_link_is_queueable_again_outside_the_dedup_window() {
 }
 
 #[test]
+fn a_completion_older_than_the_window_is_queueable_again() {
+    // The zero-window test above skips the time comparison entirely; this one
+    // runs it, so a dropped or inverted `completed_at >= cutoff` fails here.
+    let (d, repo) = repo();
+    let owner = "hostA:100:0";
+    let first = queue(&repo, "https://example.gr/story", "1_PAPADAKI_X", "PAPADAKI").job_id();
+    repo.lease_job(owner, 120).unwrap().unwrap();
+    repo.finish(first, owner, JobStatus::Completed, None, None, None)
+        .unwrap();
+
+    // Still inside the window: a duplicate.
+    let inside = queue(&repo, "https://example.gr/story", "2_PAPADAKI_X", "PAPADAKI");
+    assert_eq!(inside, Enqueued::DuplicateRecent { existing_id: first });
+
+    let old = omni_core::timestamps::format(
+        chrono::Utc::now() - Duration::hours(DEFAULT_DEDUP_WINDOW_HOURS + 1),
+    );
+    let conn = rusqlite::Connection::open(d.path().join("omni.db")).unwrap();
+    conn.execute(
+        "UPDATE queue SET completed_at = ?1, updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![old, first],
+    )
+    .unwrap();
+
+    let again = queue(&repo, "https://example.gr/story", "3_PAPADAKI_X", "PAPADAKI");
+    assert!(again.is_new(), "a link completed before the window was still a duplicate: {again:?}");
+}
+
+#[test]
 fn a_discarded_job_does_not_block_re_queuing_the_same_link() {
     // The old UNIQUE(url) made this impossible: once a link was in the table,
     // re-sending it after a failure produced a raw constraint error (D-10).
