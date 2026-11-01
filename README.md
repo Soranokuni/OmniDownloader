@@ -19,8 +19,9 @@ Pure Rust, one `omni-ingest.exe`, runs as a Windows service.
   the command line, error codes, troubleshooting.
 
 Quick start for a station: build or download a release, run `Install.cmd`,
-open `http://<pc>:8080/admin`, sign in as `Admin` / `Admin` and replace that
-account at once. The Administrator Guide covers the rest.
+open `http://127.0.0.1:8080/admin` on the server itself, sign in as
+`Admin` / `Admin` (refused from any other PC) and change that password before
+anything else. The Administrator Guide covers the rest.
 
 ---
 
@@ -179,9 +180,10 @@ can route to everything and a misconfiguration is one keystroke away. So:
 - **Convenience is scoped, not global.** The MCR desk skips the login screen,
   but only from the client networks an administrator names in CIDR form — not
   from anywhere that can reach the port.
-- **No default credentials.** There is no seeded administrator; first run
-  creates one, from the machine itself, and that window closes the moment an
-  account exists.
+- **The default account cannot be used from the network.** A new installation
+  creates `Admin` / `Admin` once. It signs in only on the server itself, and
+  until its password is changed it can do nothing but change it, create
+  another account or sign out.
 - **Secrets are encrypted at rest** with Windows DPAPI at machine scope, and no
   API ever reads one back — the panel reports only whether a secret is set. An
   admin session that is taken over can overwrite the mailbox password, which is

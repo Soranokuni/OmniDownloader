@@ -1485,6 +1485,7 @@ async fn run_daemon(
             },
         );
     }
+    web_state.end_default_admin_sessions();
     let web_host = config.web_host.clone();
     let web_port = config.web_port;
     let web_rx = shutdown_tx.subscribe();

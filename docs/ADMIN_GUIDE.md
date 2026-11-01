@@ -42,11 +42,17 @@ yt-dlp, Deno, the C++ runtime DLLs), `Install.cmd`, `Uninstall.cmd`,
    administrator rights).
 2. Give the Dalet watchfolder when asked: a local folder or `\\server\share`.
 3. When it says *OmniDownloader is running*, open
-   `http://<this-pc>:8080/admin` and sign in as **`Admin` / `Admin`**.
-   This account is created once, on a brand-new installation only.
+   `http://127.0.0.1:8080/admin` **on the server itself** and sign in as
+   **`Admin` / `Admin`**. This account is created once, on a brand-new
+   installation only. From any other PC the default password is refused (it
+   looks like a wrong password, and the attempt is audited). The page asks for
+   a new password first, and nothing else is available until you set one.
+   This needs the panel to listen on all addresses (`web_host` `0.0.0.0`, the
+   default) or on `127.0.0.1`. If `web_host` names one LAN address, set the
+   password from an elevated prompt instead:
+   `omni-ingest admin reset-password admin`.
 4. **User accounts → Create user**: create your own administrator, sign in as
-   it, and deactivate `Admin`. Until then the `accounts` health line stays
-   amber.
+   it, and deactivate `Admin`.
 5. Configure the mailbox (§5.2), the network for MCR desks (§5.1), and
    optionally the LLM (§5.4).
 

@@ -475,7 +475,7 @@ fn state_logs(dir: &TempDir) -> Result<Vec<String>> {
 }
 
 #[tokio::test]
-async fn a_new_installation_can_be_entered_as_admin_admin_from_the_network() -> Result<()> {
+async fn a_new_installation_can_be_entered_as_admin_admin_only_from_the_server_itself() -> Result<()> {
     // Owner's decision (2026-10-08): a brand-new installation starts with
     // Admin / Admin, typed as a user name, not an email address.
     let dir = TempDir::new()?;
@@ -484,8 +484,12 @@ async fn a_new_installation_can_be_entered_as_admin_admin_from_the_network() -> 
     let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));
     let app = App { router: WebServer::build_router(state), repo, _dir: dir };
 
+    // P2.14 (owner, 2026-11-01): from another host it is refused like a wrong password.
     let (status, cookie) = login(&app, "10.0.0.7:5555", "Admin", "Admin").await?;
-    assert_eq!(status, StatusCode::OK, "from a desk on the newsroom network");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "from a desk on the newsroom network");
+    assert!(cookie.is_none());
+    let (status, cookie) = login(&app, "127.0.0.1:5555", "Admin", "Admin").await?;
+    assert_eq!(status, StatusCode::OK, "on the server itself");
     assert!(cookie.is_some());
     assert_eq!(login(&app, "10.0.0.7:5556", "Admin", "admin").await?.0, StatusCode::UNAUTHORIZED, "the password is exact");
     Ok(())

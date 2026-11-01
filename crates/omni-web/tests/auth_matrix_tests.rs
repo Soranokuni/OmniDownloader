@@ -67,6 +67,15 @@ struct Tokens {
 
 impl Harness {
     fn new(with_admin: bool) -> Result<Self> {
+        Self::build(with_admin.then_some(("it@station.gr", "correct-horse-battery")))
+    }
+
+    /// The Admin caller is the first-run `admin` / `Admin` account (P2.14).
+    fn with_default_admin() -> Result<Self> {
+        Self::build(Some(("admin", "Admin")))
+    }
+
+    fn build(admin: Option<(&str, &str)>) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
 
@@ -100,10 +109,10 @@ impl Harness {
         tokens.mcr = omni_core::auth::generate_session_token();
         repo.create_session(mcr_id, &tokens.mcr, 1)?;
 
-        if with_admin {
+        if let Some((login, password)) = admin {
             let admin_id = repo.create_user(
-                "it@station.gr",
-                "correct-horse-battery",
+                login,
+                password,
                 UserRole::Admin,
                 "Administrator",
                 None,
@@ -139,6 +148,10 @@ impl Harness {
     }
 
     async fn request(&self, method: &str, uri: &str, caller: Caller) -> StatusCode {
+        self.request_full(method, uri, caller, "{}").await.0
+    }
+
+    async fn request_full(&self, method: &str, uri: &str, caller: Caller, json_body: &str) -> (StatusCode, String) {
         let peer: SocketAddr = match caller {
             AllowlistedIp => ALLOWLISTED.parse().unwrap(),
             Loopback => LOOPBACK.parse().unwrap(),
@@ -167,16 +180,23 @@ impl Harness {
                 .header("x-omni-request", "1")
                 .header("host", "mcr.local:8080")
                 .header("origin", "http://mcr.local:8080");
-            Body::from("{}")
+            Body::from(json_body.to_string())
         };
 
-        self.router
+        let res = self
+            .router
             .clone()
             .layer(MockConnectInfo(peer))
             .oneshot(builder.body(body).unwrap())
             .await
-            .unwrap()
-            .status()
+            .unwrap();
+        let status = res.status();
+        // A live stream (SSE) never ends; its body is not what is asserted.
+        if res.headers().get("content-type").is_some_and(|v| v == "text/event-stream") {
+            return (status, String::new());
+        }
+        let bytes = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 
@@ -967,6 +987,95 @@ async fn every_route_enforces_its_documented_policy() -> Result<()> {
         for (caller, expected) in cases.iter() {
             let status = h.request(method, uri, *caller).await;
             assert_outcome(&format!("{method} {uri}"), *caller, *expected, status);
+        }
+    }
+    Ok(())
+}
+
+/// P2.14: a session of the first-run account, while its password is the default,
+/// is refused everywhere except the routes that let it change that password.
+/// Driven by MATRIX, so a route added later is restricted until someone decides
+/// otherwise.
+#[tokio::test]
+async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Result<()> {
+    let mut h = Harness::with_default_admin()?;
+    let admin_id = h.repo.get_user_by_email("admin")?.unwrap().id;
+
+    const ALLOWED: &[(&str, &str)] = &[
+        ("GET", "/api/auth/me"),
+        ("POST", "/api/auth/password"),
+        ("POST", "/api/auth/logout"),
+        ("POST", "/api/auth/logout-all"),
+        ("POST", "/api/admin/users"),
+        ("GET", "/api/admin/users"),
+    ];
+
+    let mut checked = 0;
+    let mut refused_api = 0;
+    for (method, uri, cases) in MATRIX {
+        // Public routes need no session at all, so the default account's limit is moot.
+        if cases.iter().any(|(c, e)| *c == Anonymous && matches!(e, Reached | ReachedNoFile)) {
+            continue;
+        }
+        {
+            // Ends every session of the account; the password change has its own step below.
+            if *method == "POST" && *uri == "/api/auth/logout-all" {
+                continue;
+            }
+            // Whatever the row says about Admin: the default session is sent to every
+            // non-public row, so a route that bars admins today is still covered.
+            let (status, body) = h.request_full(method, uri, Admin, "{}").await;
+            checked += 1;
+            let route = format!("{method} {uri}");
+            if ALLOWED.contains(&(*method, *uri)) {
+                assert!(
+                    !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+                    "{route}: the default session must reach it, got {status}"
+                );
+            } else if *uri == "/api/setup" {
+                // Closed for this session, as for anyone once an admin exists.
+                assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+            } else if uri.starts_with("/api/") {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+                assert!(body.contains("PASSWORD_CHANGE_REQUIRED"), "{route}: {body}");
+                refused_api += 1;
+            } else {
+                // Pages: the admin page is served (it shows the change form), the
+                // first-run page is closed, everything else bounces.
+                match *uri {
+                    "/admin" => assert_eq!(status, StatusCode::OK, "{route}"),
+                    "/setup" => assert_eq!(status, StatusCode::NOT_FOUND, "{route}"),
+                    "/" => assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "{route}"),
+                    _ => assert!(
+                        matches!(status, StatusCode::TEMPORARY_REDIRECT | StatusCode::NOT_FOUND),
+                        "{route}: {status}"
+                    ),
+                }
+            }
+        }
+    }
+    assert!(checked > 90 && refused_api > 80, "the loop covered too little: {checked} / {refused_api}");
+
+    // The password change itself clears the limit with no restart: a fresh
+    // session of the same account then reaches every row an Admin reaches.
+    let (status, body) = h
+        .request_full(
+            "POST",
+            "/api/auth/password",
+            Admin,
+            r#"{"current_password":"Admin","new_password":"a-brand-new-passphrase"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    h.tokens.admin = omni_core::auth::generate_session_token();
+    h.repo.create_session(admin_id, &h.tokens.admin, 1)?;
+
+    for (method, uri, cases) in MATRIX {
+        for (caller, expected) in cases.iter() {
+            if *caller == Admin {
+                let status = h.request(method, uri, Admin).await;
+                assert_outcome(&format!("{method} {uri} (after the change)"), Admin, *expected, status);
+            }
         }
     }
     Ok(())

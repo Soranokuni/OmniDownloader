@@ -300,6 +300,16 @@ impl ApiError {
         )
     }
 
+    /// The first-run `admin` / `Admin` session may only change its password,
+    /// create a user, or sign out (P2.14).
+    pub fn password_change_required() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "PASSWORD_CHANGE_REQUIRED",
+            "Αλλάξτε πρώτα τον προεπιλεγμένο κωδικό.",
+        )
+    }
+
     pub fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", "Not found.")
     }
@@ -342,6 +352,14 @@ pub struct RequireUser(pub User);
 /// A logged-in administrator.
 pub struct RequireAdmin(pub User);
 
+/// Like [`RequireUser`], but also admits the first-run default account while
+/// its default password is live (P2.14). Only the handlers that account is
+/// allowed to reach use it; every other route refuses that session.
+pub struct RequireUserAllowDefault(pub User);
+
+/// Like [`RequireAdmin`], but also admits the locked default account (P2.14).
+pub struct RequireAdminAllowDefault(pub User);
+
 /// The principal if there is one, without rejecting.
 pub struct MaybePrincipal(pub Option<Principal>);
 
@@ -360,6 +378,9 @@ impl FromRequestParts<AppState> for RequireMcr {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         match resolve_principal(parts, state).await {
+            Some(Principal::User(u)) if state.default_admin_locks(&u) => {
+                Err(ApiError::password_change_required())
+            }
             Some(p) if p.is_mcr() => Ok(RequireMcr(p)),
             Some(_) => Err(ApiError::forbidden()),
             None => Err(ApiError::unauthorized()),
@@ -373,6 +394,9 @@ impl FromRequestParts<AppState> for RequireUser {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         match resolve_principal(parts, state).await {
+            Some(Principal::User(u)) if state.default_admin_locks(&u) => {
+                Err(ApiError::password_change_required())
+            }
             Some(Principal::User(u)) => Ok(RequireUser(*u)),
             // An allowlisted client is a room, not an account: there is nothing
             // to scope "my jobs" or a password change to.
@@ -387,7 +411,35 @@ impl FromRequestParts<AppState> for RequireAdmin {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         match resolve_principal(parts, state).await {
+            Some(Principal::User(u)) if state.default_admin_locks(&u) => {
+                Err(ApiError::password_change_required())
+            }
             Some(Principal::User(u)) if u.role == UserRole::Admin => Ok(RequireAdmin(*u)),
+            Some(Principal::User(_)) | Some(Principal::OpenMcr(_)) => Err(ApiError::forbidden()),
+            None => Err(ApiError::unauthorized()),
+        }
+    }
+}
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for RequireUserAllowDefault {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        match resolve_principal(parts, state).await {
+            Some(Principal::User(u)) => Ok(RequireUserAllowDefault(*u)),
+            Some(Principal::OpenMcr(_)) | None => Err(ApiError::unauthorized()),
+        }
+    }
+}
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for RequireAdminAllowDefault {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        match resolve_principal(parts, state).await {
+            Some(Principal::User(u)) if u.role == UserRole::Admin => Ok(RequireAdminAllowDefault(*u)),
             Some(Principal::User(_)) | Some(Principal::OpenMcr(_)) => Err(ApiError::forbidden()),
             None => Err(ApiError::unauthorized()),
         }

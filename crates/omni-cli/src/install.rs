@@ -272,9 +272,9 @@ pub async fn install(o: InstallOptions) -> Result<()> {
     } else {
         println!();
         println!("  Next:");
-        println!("   1. Open {scheme}://{host}:{}/admin and log in as  Admin / Admin.", config.web_port);
+        println!("   1. On this server only, open {scheme}://127.0.0.1:{}/admin and log in as  Admin / Admin.", config.web_port);
+        println!("      The page asks for a new password first; from any other PC Admin / Admin is refused.");
         println!("   2. Users: create your own administrator, log in as it, and deactivate Admin.");
-        println!("      (Until then every desk shows a reminder: anyone on the network can log in as Admin.)");
         println!("   3. Set the mailbox (Microsoft Graph) and, if wanted, the LLM key.");
         println!("   4. Security: add the newsroom network so the MCR desks can open the panel.");
     }

@@ -1,6 +1,7 @@
 use omni_core::config::AppConfig;
 use omni_core::repository::Repository;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -164,6 +165,12 @@ pub struct AppState {
     pub metrics: Option<metrics_exporter_prometheus::PrometheusHandle>,
     /// The paths and worker count the scrape reads; `None` in tests that have none.
     pub metrics_sources: Option<Arc<MetricsSources>>,
+    /// True while the first-run `admin` / `Admin` account still logs in with that
+    /// password (P2.14). A session of that account is then limited to changing
+    /// its password and creating a user. Cached: an Argon2 check per request
+    /// would be a denial-of-service lever. Recomputed by [`Self::refresh_default_admin`]
+    /// wherever a password or account changes.
+    pub default_admin_live: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -173,6 +180,8 @@ impl AppState {
             config.security.login_rate_limit_per_account_hour,
         );
         let tls_enabled = config.tls.is_enabled();
+        // One Argon2 check, and only when an `admin` account exists.
+        let default_admin_live = Arc::new(AtomicBool::new(repo.default_admin_still_works()));
         let llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
         // Tests and callers that do not configure secrets get a store rooted
         // beside the config; the daemon replaces it with the real one.
@@ -209,7 +218,39 @@ impl AppState {
             canary_lock: None,
             metrics: None,
             metrics_sources: None,
+            default_admin_live,
         }
+    }
+
+    /// Whether this session's account is the first-run default one while its
+    /// default password still works (P2.14).
+    pub fn default_admin_locks(&self, user: &omni_core::models::User) -> bool {
+        self.default_admin_live.load(Ordering::Relaxed)
+            && user.email.eq_ignore_ascii_case(omni_core::repository::DEFAULT_ADMIN_LOGIN)
+    }
+
+    /// At daemon start: while the default password is live, end every session of
+    /// the default account, so one opened from the network before the loopback-only
+    /// rule existed does not survive the upgrade. Returns how many ended.
+    pub fn end_default_admin_sessions(&self) -> usize {
+        if !self.default_admin_live.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let ended = match self.repo.get_user_by_email(omni_core::repository::DEFAULT_ADMIN_LOGIN) {
+            Ok(Some(u)) => self.repo.delete_sessions_for_user(u.id).unwrap_or(0),
+            _ => 0,
+        };
+        if ended > 0 {
+            tracing::info!(ended, "Ended sessions of the first-run account (default password still live)");
+        }
+        ended
+    }
+
+    /// Recompute the cached flag, and the `accounts` health line with it (one
+    /// Argon2 check). Call after every password or account change.
+    pub fn refresh_default_admin(&self) {
+        let live = omni_core::selftest::check_default_admin(&self.repo, &self.health);
+        self.default_admin_live.store(live, Ordering::Relaxed);
     }
 
     /// Where held videos live, so a rejection can remove its file now.

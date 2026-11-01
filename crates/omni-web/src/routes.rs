@@ -16,12 +16,13 @@ use tokio_stream::StreamExt;
 use omni_core::auth::{generate_session_token, verify_password};
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStatus, User, UserRole};
+use omni_core::repository::{DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
 
 use crate::assets::EmbeddedFile;
 use crate::auth::{
     build_logout_cookie, build_session_cookie, client_ip, extract_session_token,
     internal_error, is_loopback_client, resolve_principal, ApiError, MaybePrincipal, Principal,
-    RequireAdmin, RequireMcr, RequireUser,
+    RequireAdmin, RequireAdminAllowDefault, RequireMcr, RequireUser, RequireUserAllowDefault,
 };
 use crate::ratelimit::Decision;
 use crate::state::AppState;
@@ -62,14 +63,16 @@ pub async fn view_user(principal: Option<RequireUser>) -> Response {
     }
 }
 
-pub async fn view_mcr(principal: MaybePrincipal) -> Response {
+pub async fn view_mcr(State(state): State<AppState>, principal: MaybePrincipal) -> Response {
     match principal.0 {
+        // The first-run account has only the change-password card, on /admin.
+        Some(Principal::User(u)) if state.default_admin_locks(&u) => Redirect::temporary("/admin").into_response(),
         Some(p) if p.is_mcr() => EmbeddedFile("mcr.html").into_response(),
         _ => Redirect::temporary("/login").into_response(),
     }
 }
 
-pub async fn view_admin(principal: Option<RequireAdmin>) -> Response {
+pub async fn view_admin(principal: Option<RequireAdminAllowDefault>) -> Response {
     match principal {
         Some(_) => EmbeddedFile("admin.html").into_response(),
         None => Redirect::temporary("/login").into_response(),
@@ -96,7 +99,9 @@ pub async fn view_setup(State(state): State<AppState>, req: Request) -> Response
 async fn setup_window_open(parts: &axum::http::request::Parts, state: &AppState) -> bool {
     // An existing admin may always reconfigure, from anywhere they can log in.
     if let Some(p) = resolve_principal(parts, state).await {
-        if p.is_admin() {
+        // The first-run account is not an administrator until its password changes.
+        let locked = matches!(&p, Principal::User(u) if state.default_admin_locks(u));
+        if p.is_admin() && !locked {
             return true;
         }
     }
@@ -120,6 +125,9 @@ pub struct LoginResponse {
     status: String,
     role: String,
     user: User,
+    /// True for the first-run account while its default password is live: the
+    /// login page then sends it to the change-password card (P2.14).
+    password_change_required: bool,
 }
 
 pub async fn api_login(State(state): State<AppState>, req: Request) -> Response {
@@ -223,6 +231,35 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         return invalid_credentials();
     }
 
+    // The first-run password only works on the server itself (P2.14). Refused
+    // exactly like a wrong password, so the remote caller learns nothing.
+    let default_account = user.email.eq_ignore_ascii_case(DEFAULT_ADMIN_LOGIN);
+    let default_login = default_account && payload.password == DEFAULT_ADMIN_PASSWORD;
+    if default_account {
+        // The password was just verified: that is the freshest answer to "does the
+        // default password still work", so it corrects a flag another process
+        // (the CLI) or a racing refresh left stale, at no extra Argon2 check.
+        state.default_admin_live.store(default_login, std::sync::atomic::Ordering::Relaxed);
+    }
+    if default_login && !matches!(ip, Some(i) if i.is_loopback()) {
+        state.login_limiter.record_failure(ip, &payload.email);
+        let _ = state.repo.record_login_attempt(
+            Some(&payload.email),
+            ip_str.as_deref(),
+            false,
+            Some("default_admin_remote"),
+        );
+        let _ = state.repo.log_audit(
+            "WARN",
+            "AUTH",
+            &format!(
+                "Sign-in refused: the first-run account works only on the server itself (from {})",
+                ip_str.as_deref().unwrap_or("unknown")
+            ),
+        );
+        return invalid_credentials();
+    }
+
     let lifetime = session_lifetime(&state, user.role).await;
     let token = generate_session_token();
     if let Err(e) = state.repo.create_session_with_meta(
@@ -252,10 +289,12 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
 
     let cookie = build_session_cookie(&token, lifetime.num_seconds(), state.tls_enabled);
     let role = user.role.as_str().to_string();
+    let password_change_required = state.default_admin_locks(&user);
     let mut response = Json(LoginResponse {
         status: "ok".into(),
         role,
         user,
+        password_change_required,
     })
     .into_response();
     response.headers_mut().insert(SET_COOKIE, cookie);
@@ -293,7 +332,7 @@ pub async fn api_logout(headers: HeaderMap, State(state): State<AppState>) -> Re
 }
 
 /// End every session for the caller's account, on every device.
-pub async fn api_logout_all(RequireUser(user): RequireUser, State(state): State<AppState>) -> Response {
+pub async fn api_logout_all(RequireUserAllowDefault(user): RequireUserAllowDefault, State(state): State<AppState>) -> Response {
     let ended = state.repo.delete_sessions_for_user(user.id).unwrap_or(0);
     let _ = state.repo.log_audit(
         "INFO",
@@ -308,8 +347,19 @@ pub async fn api_logout_all(RequireUser(user): RequireUser, State(state): State<
     response
 }
 
-pub async fn api_me(RequireUser(user): RequireUser) -> Json<User> {
-    Json(user)
+#[derive(Serialize)]
+pub struct MeResponse {
+    #[serde(flatten)]
+    user: User,
+    password_change_required: bool,
+}
+
+pub async fn api_me(
+    RequireUserAllowDefault(user): RequireUserAllowDefault,
+    State(state): State<AppState>,
+) -> Json<MeResponse> {
+    let password_change_required = state.default_admin_locks(&user);
+    Json(MeResponse { user, password_change_required })
 }
 
 #[derive(Deserialize)]
@@ -321,7 +371,7 @@ pub struct ChangePasswordPayload {
 /// Change one's own password. Requires the current password, so a borrowed
 /// unlocked workstation cannot be turned into a permanent account takeover.
 pub async fn api_change_password(
-    RequireUser(user): RequireUser,
+    RequireUserAllowDefault(user): RequireUserAllowDefault,
     State(state): State<AppState>,
     Json(payload): Json<ChangePasswordPayload>,
 ) -> Response {
@@ -340,7 +390,7 @@ pub async fn api_change_password(
     // panel sends the operator back to the login screen afterwards.
     match state.repo.update_user_password(user.id, &payload.new_password) {
         Ok(()) => {
-            omni_core::selftest::check_default_admin(&state.repo, &state.health);
+            state.refresh_default_admin();
             let mut response =
                 Json(serde_json::json!({"status": "ok", "reauth_required": true})).into_response();
             response
@@ -1532,7 +1582,7 @@ pub async fn api_admin_import_taxonomy(
 // ==========================================
 
 pub async fn api_admin_list_users(
-    RequireAdmin(_): RequireAdmin,
+    RequireAdminAllowDefault(_): RequireAdminAllowDefault,
     State(state): State<AppState>,
 ) -> JsonResult {
     let users = state
@@ -1552,7 +1602,7 @@ pub struct CreateUserPayload {
 }
 
 pub async fn api_admin_create_user(
-    RequireAdmin(admin): RequireAdmin,
+    RequireAdminAllowDefault(admin): RequireAdminAllowDefault,
     State(state): State<AppState>,
     Json(payload): Json<CreateUserPayload>,
 ) -> JsonResult {
@@ -1640,7 +1690,7 @@ pub async fn api_admin_set_user_active(
             admin.email
         ),
     );
-    omni_core::selftest::check_default_admin(&state.repo, &state.health);
+    state.refresh_default_admin();
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1660,7 +1710,7 @@ pub async fn api_admin_update_password(
         "ADMIN",
         &format!("Password for user #{user_id} reset by {}", admin.email),
     );
-    omni_core::selftest::check_default_admin(&state.repo, &state.health);
+    state.refresh_default_admin();
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -2843,6 +2893,16 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
         Err(_) => return ApiError::bad_request("Malformed request body.").into_response(),
     };
 
+    // The same endpoint rule as the LLM card, before anything is created or saved.
+    // The card is optional: a blank endpoint is saved as before, unvalidated.
+    let llm_base = payload.ollama_endpoint.trim().to_string();
+    let llm_blank = llm_base.is_empty();
+    if !llm_blank {
+        if let Err(e) = omni_email::llm::check_base_url(&llm_base) {
+            return ApiError::bad_request(e).into_response();
+        }
+    }
+
     // Create the first administrator, if this is that moment.
     let needs_admin = !state.repo.has_active_admin().unwrap_or(true);
     if needs_admin {
@@ -2901,7 +2961,15 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
             }
             cfg.graph.client_secret = secret.to_string();
         }
-        cfg.ollama_endpoint = payload.ollama_endpoint;
+        if !llm_blank && !same_base(&llm_base, &cfg.ollama_endpoint) && !cfg.llm.api_key.is_empty() {
+            // A new provider does not inherit the old one's key (as the LLM card).
+            if let Err(e) = state.secrets.remove(omni_core::secrets::keys::LLM_API_KEY) {
+                tracing::error!(error = ?e, "Clearing the LLM API key failed");
+                return ApiError::internal("Could not clear the API key.").into_response();
+            }
+            cfg.llm.api_key.clear();
+        }
+        cfg.ollama_endpoint = if llm_blank { payload.ollama_endpoint } else { llm_base };
         cfg.ollama_model = payload.ollama_model;
         cfg.watchfolder_path = payload.watchfolder_path;
         if let Err(e) = cfg.save_to_file(&state.config_path) {

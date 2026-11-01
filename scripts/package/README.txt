@@ -5,11 +5,11 @@ INSTALL (new PC)
   1. Copy this folder (or unzip the release) anywhere on the PC.
   2. Double-click Install.cmd and allow administrator rights.
   3. Give the Dalet watchfolder when asked (a local folder or \\server\share).
-  4. When it says "OmniDownloader is running", open http://<this-pc>:8080/admin
-     and log in as   Admin / Admin   (a new installation's first account).
+  4. When it says "OmniDownloader is running", open http://127.0.0.1:8080/admin
+     ON THIS SERVER ONLY and log in as   Admin / Admin   (a new installation's
+     first account). From any other PC it is refused. The page asks you to
+     set a new password first.
   5. Users: create your own administrator, log in as it, deactivate Admin.
-     Until then every desk shows a reminder: anyone on the network could log
-     in as Admin.
   6. Then the mailbox (Microsoft Graph), the LLM key if used, and
      Security -> the newsroom network, so the MCR desks can open /mcr.
 
@@ -57,7 +57,9 @@ GUIDES
   1. Αντιγράψτε τον φάκελο στον υπολογιστή.
   2. Διπλό κλικ στο Install.cmd και αποδεχτείτε τα δικαιώματα διαχειριστή.
   3. Δώστε τον φάκελο του Dalet (watchfolder) όταν ζητηθεί.
-  4. Ανοίξτε http://<υπολογιστής>:8080/admin και συνδεθείτε ως Admin / Admin.
+  4. Ανοίξτε http://127.0.0.1:8080/admin ΜΟΝΟ στον ίδιο τον server και
+     συνδεθείτε ως Admin / Admin (από άλλον υπολογιστή απορρίπτεται).
+     Η σελίδα ζητά πρώτα νέο κωδικό.
      Δημιουργήστε δικό σας διαχειριστή, συνδεθείτε με αυτόν και
      απενεργοποιήστε τον Admin. Μετά ρυθμίστε το email στη Διαχείριση.
   Αναβάθμιση: τρέξτε το Install.cmd της νέας έκδοσης. Τα δεδομένα μένουν.
