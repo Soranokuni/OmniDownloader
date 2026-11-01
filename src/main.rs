@@ -4176,6 +4176,23 @@ async fn run_one_task(
                 Err(e) => warn!("Retention: site video sightings not purged: {e:#}"),
             }
 
+            // Finished jobs, audit entries, handled-mail records and expired sessions
+            // (P1.21): 90 / 365 / 90 days, in batches.
+            match repo.purge_old_records(chrono::Utc::now()) {
+                Ok(c) => {
+                    if c.total() > 0 {
+                        info!(
+                            "Retention: removed {} job(s), {} timeline row(s), {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s)",
+                            c.jobs, c.job_events, c.evidence, c.audit, c.mail, c.sessions
+                        );
+                    }
+                    for e in &c.errors {
+                        warn!("Retention: old records not fully purged: {e}");
+                    }
+                }
+                Err(e) => warn!("Retention: old records not purged: {e:#}"),
+            }
+
             // The text of handled mail (plan P7.6): the MCR mail view needs it
             // for a few weeks, nobody needs it for ever. Sender, subject and
             // jobs stay with the row.
