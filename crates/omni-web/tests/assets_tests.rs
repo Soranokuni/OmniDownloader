@@ -423,3 +423,19 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
     assert!(code.contains("/api/user/prefs"));
     assert!(!code.contains("innerHTML"));
 }
+
+#[test]
+fn the_first_run_password_card_ships_with_admin_v25_and_login_v6() {
+    let assets = all_assets();
+    let admin = assets.get("admin.html").expect("admin.html shipped");
+    assert!(admin.contains("/static/admin.js?v=25"), "admin.html does not import admin.js?v=25");
+    assert!(!admin.contains("/static/admin.js?v=24"), "admin.html still imports the old admin.js");
+    let login = assets.get("login.html").expect("login.html shipped");
+    assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
+    assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
+
+    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    assert!(js.contains("password_change_required"), "admin.js ignores the first-run flag");
+    let login_js = assets.get("static/login.js").expect("login.js shipped");
+    assert!(login_js.contains("password_change_required"), "login.js ignores the first-run flag");
+}

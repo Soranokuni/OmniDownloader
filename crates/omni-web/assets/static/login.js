@@ -29,8 +29,9 @@ document.getElementById('login-form').addEventListener('submit', async (event) =
       },
     });
     // Land on the panel the role actually uses.
-    location.href =
-      result.role === 'admin' ? '/admin' : result.role === 'open_mcr' ? '/mcr' : '/user';
+    // The first-run account lands on /admin, which shows only the change form.
+    location.href = result.password_change_required ? '/admin'
+      : result.role === 'admin' ? '/admin' : result.role === 'open_mcr' ? '/mcr' : '/user';
   } catch (e) {
     if (e.code === 'RATE_LIMITED') {
       errorLine.textContent =

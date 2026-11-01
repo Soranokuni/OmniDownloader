@@ -8,6 +8,54 @@
 import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=6';
 
 /* ------------------------------------------------------------------ *
+ * First-run account (P2.14)
+ *
+ * While the first-run admin still has its default password the server refuses
+ * every request but this one, so the page shows only the change form and the
+ * rest of the module never runs (the module stops at the await below).
+ * ------------------------------------------------------------------ */
+
+const whoami = await api('/api/auth/me').catch(() => null);
+if (whoami && whoami.password_change_required) {
+  const field = (id, label, auto) => el('div', { class: 'field' },
+    el('label', { for: id }, label),
+    el('input', { type: 'password', id, required: true, autocomplete: auto }));
+  const form = el('form', {
+    class: 'stack',
+    onsubmit: async (event) => {
+      event.preventDefault();
+      const fresh = document.getElementById('first-new').value;
+      if (fresh !== document.getElementById('first-repeat').value) {
+        toast('The two new passwords differ.', 'bad');
+        return;
+      }
+      try {
+        await api('/api/auth/password', {
+          method: 'POST',
+          body: {
+            current_password: document.getElementById('first-current').value,
+            new_password: fresh,
+          },
+        });
+        // The server ended the session, so the only way on is to sign in again.
+        toast('Password changed. Sign in again…', 'ok');
+        setTimeout(() => { location.href = '/login'; }, 1200);
+      } catch (e) { toast(e.message, 'bad'); }
+    },
+  },
+    field('first-current', 'Current password', 'current-password'),
+    field('first-new', 'New password (at least 12 characters)', 'new-password'),
+    field('first-repeat', 'Repeat the new password', 'new-password'),
+    el('button', { class: 'btn btn-primary', type: 'submit' }, 'Change password'));
+  render(document.querySelector('main'), el('section', { class: 'card' },
+    el('h2', { class: 'card-title' }, 'Change the default password'),
+    el('p', { class: 'note' }, 'Αλλάξτε πρώτα τον προεπιλεγμένο κωδικό. Nothing else is available until you do.'),
+    form));
+  document.getElementById('logout-btn').addEventListener('click', logout);
+  await new Promise(() => {});
+}
+
+/* ------------------------------------------------------------------ *
  * Dependencies
  * ------------------------------------------------------------------ */
 

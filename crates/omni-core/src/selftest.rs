@@ -245,19 +245,23 @@ pub async fn run(
 /// The `accounts` check: amber while the first-run Admin / Admin still logs
 /// in, so the reminder to replace it is on every desk until someone does.
 /// Gone (not merely OK) once it does not: there is nothing to report then.
-/// Asked at start-up and after every password or account change.
-pub fn check_default_admin(repo: &crate::repository::Repository, health: &HealthState) {
-    if repo.default_admin_still_works() {
+/// Asked at start-up and after every password or account change. Returns
+/// whether the default account still logs in, so the caller needs no second
+/// Argon2 check.
+pub fn check_default_admin(repo: &crate::repository::Repository, health: &HealthState) -> bool {
+    let live = repo.default_admin_still_works();
+    if live {
         health.set_if_changed(
             checks::ACCOUNTS,
             Check::degraded(
-                "Ο αρχικός λογαριασμός Admin / Admin είναι ακόμη ενεργός: δημιουργήστε δικό σας διαχειριστή \
-                 (Διαχείριση → Χρήστες) και απενεργοποιήστε τον.",
+                "Ο αρχικός λογαριασμός Admin / Admin είναι ακόμη ενεργός: συνδεθείτε στον ίδιο τον server \
+                 (http://127.0.0.1:<θύρα>/admin, π.χ. :8080) και αλλάξτε τον κωδικό του.",
             ),
         );
     } else {
         health.remove(checks::ACCOUNTS);
     }
+    live
 }
 
 /// Below this, no new job starts (plan P1.4): one more 50 Mbps file could

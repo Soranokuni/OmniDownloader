@@ -19,7 +19,8 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::{client_ip, internal_error, resolve_principal, ApiError};
+use crate::auth::{client_ip, internal_error, resolve_principal, ApiError, Principal};
+use omni_core::models::UserRole;
 use crate::state::AppState;
 
 /// Prometheus text exposition format.
@@ -43,7 +44,10 @@ pub async fn api_metrics(State(state): State<AppState>, req: Request) -> Respons
     let (parts, _) = req.into_parts();
     let from_allowed_network = client_ip(&parts, &trusted, trust_header).is_some_and(|ip| allow.contains(ip));
     if !from_allowed_network {
-        let admin = matches!(resolve_principal(&parts, &state).await, Some(p) if p.is_admin());
+        let admin = matches!(
+            resolve_principal(&parts, &state).await,
+            Some(Principal::User(u)) if u.role == UserRole::Admin && !state.default_admin_locks(&u)
+        );
         if !admin {
             return ApiError::forbidden().into_response();
         }
