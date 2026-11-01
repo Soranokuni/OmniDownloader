@@ -41,6 +41,62 @@ pub const SELFHEAL_MAX_ROWS: i64 = 500;
 pub const REJECTIONS_MAX_ROWS: i64 = 20_000;
 /// Days a self-heal run is kept.
 pub const SELFHEAL_KEEP_DAYS: i64 = 30;
+/// Days a finished job (and its events, repair attempts and evidence row) is kept (P1.21).
+pub const JOB_KEEP_DAYS: i64 = 90;
+/// Days an audit entry is kept (P1.21).
+pub const AUDIT_KEEP_DAYS: i64 = 365;
+/// Days a handled-mail record is kept (P1.21). Must stay above the mail watcher's
+/// `MAX_MAIL_AGE`, or a purged record could let an old mail in again.
+pub const MAIL_KEEP_DAYS: i64 = 90;
+/// Rows removed per transaction by the scheduled retention, so a lease heartbeat never waits long.
+pub const RETENTION_BATCH: i64 = 5000;
+
+/// The finished jobs retention may delete: terminal, past the cutoff (?1), not held (?2 = batch).
+pub const PURGE_JOB_IDS_SQL: &str = "SELECT id FROM queue
+     WHERE status IN ('COMPLETED','COMPLETED_MANUAL','FAILED','REQUIRES_REVIEW','MANUAL_DOWNLOAD','CANCELLED')
+       AND COALESCE(completed_at, updated_at) < ?1
+       AND NOT EXISTS (SELECT 1 FROM held_outputs h WHERE h.job_id = queue.id)
+     LIMIT ?2";
+/// One batch of old audit entries (?1 = cutoff, ?2 = batch). Never the newest entry:
+/// an empty audit table would let `ensure_default_admin` create Admin / Admin again.
+pub const PURGE_AUDIT_SQL: &str = "DELETE FROM audit_logs WHERE id IN
+     (SELECT id FROM audit_logs WHERE timestamp < ?1 AND id < (SELECT MAX(id) FROM audit_logs) LIMIT ?2)";
+/// One batch of old handled-mail records (?1 = cutoff, ?2 = batch).
+pub const PURGE_MAIL_SQL: &str = "DELETE FROM processed_mail WHERE rowid IN
+     (SELECT rowid FROM processed_mail WHERE COALESCE(received_at, processed_at) < ?1 LIMIT ?2)";
+
+/// The polled queries that migration 31 indexes; pub so a test can ask SQLite for their plans.
+pub const USER_JOBS_SQL: &str = "SELECT * FROM queue WHERE submitted_by_user_id = ? ORDER BY created_at DESC";
+pub const INBOX_MAIL_SQL: &str =
+    "SELECT internet_message_id, received_at, processed_at, outcome, from_address, from_name, subject,
+            substr(body_text, 1, 4000) AS body_head, attachments_json, parse_json, jobs_json
+     FROM processed_mail
+     WHERE COALESCE(received_at, processed_at) >= ?";
+pub const INBOX_JOB_SQL: &str =
+    "SELECT id, url, slug, journalist, index_str, status, stage, progress, email_message_id,
+            parent_job_id, submitted_by_user_id, group_code, created_at
+     FROM queue
+     WHERE created_at >= ? OR id IN (SELECT value FROM json_each(?))";
+
+/// What one `purge_old_records` run removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionCounts {
+    /// One line per part that failed; the other parts still ran.
+    pub errors: Vec<String>,
+    pub jobs: usize,
+    /// Timeline rows that went with those jobs (and any orphan found).
+    pub job_events: usize,
+    pub evidence: usize,
+    pub audit: usize,
+    pub mail: usize,
+    pub sessions: usize,
+}
+
+impl RetentionCounts {
+    pub fn total(&self) -> usize {
+        self.jobs + self.job_events + self.evidence + self.audit + self.mail + self.sessions
+    }
+}
 
 /// One overnight self-heal run on a broken site (plan P10.14).
 #[derive(Debug, Clone)]
@@ -2036,7 +2092,7 @@ impl Repository {
 
     pub fn get_user_jobs(&self, user_id: i64) -> Result<Vec<Job>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare("SELECT * FROM queue WHERE submitted_by_user_id = ? ORDER BY created_at DESC")?;
+        let mut stmt = conn.prepare(USER_JOBS_SQL)?;
         let rows = stmt.query_map(params![user_id], Self::map_job_row)?;
         let mut list = Vec::new();
         for r in rows {
@@ -3989,12 +4045,7 @@ impl Repository {
     /// since `since`, with the start of its text.
     pub fn inbox_mail_rows(&self, since: chrono::DateTime<Utc>) -> Result<Vec<crate::models::InboxMailRow>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT internet_message_id, received_at, processed_at, outcome, from_address, from_name, subject,
-                    substr(body_text, 1, 4000) AS body_head, attachments_json, parse_json, jobs_json
-             FROM processed_mail
-             WHERE COALESCE(received_at, processed_at) >= ?",
-        )?;
+        let mut stmt = conn.prepare(INBOX_MAIL_SQL)?;
         let rows = stmt.query_map(params![timestamps::format(since)], |r| {
             Ok(crate::models::InboxMailRow {
                 internet_message_id: r.get("internet_message_id")?,
@@ -4017,12 +4068,7 @@ impl Repository {
     /// they were created (an older job a mail's duplicate link points at).
     pub fn inbox_job_rows(&self, since: chrono::DateTime<Utc>, extra_ids: &[i64]) -> Result<Vec<crate::models::InboxJobRow>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, url, slug, journalist, index_str, status, stage, progress, email_message_id,
-                    parent_job_id, submitted_by_user_id, group_code, created_at
-             FROM queue
-             WHERE created_at >= ? OR id IN (SELECT value FROM json_each(?))",
-        )?;
+        let mut stmt = conn.prepare(INBOX_JOB_SQL)?;
         let extra = serde_json::to_string(extra_ids)?;
         let rows = stmt.query_map(params![timestamps::format(since), extra], |r| {
             Ok(crate::models::InboxJobRow {
@@ -4701,6 +4747,116 @@ impl Repository {
         let conn = self.pool.get()?;
         let cutoff = timestamps::format(now - Duration::days(SELFHEAL_KEEP_DAYS));
         Ok(conn.execute("DELETE FROM selfheal_reports WHERE at < ?", params![cutoff])?)
+    }
+
+    /// Scheduled retention (P1.21): finished jobs 90 days after they finished,
+    /// audit entries 365 days, handled-mail records 90 days, expired sessions.
+    ///
+    /// Jobs are removed in batches of `RETENTION_BATCH`, one immediate
+    /// transaction each. Their events and repair attempts go by CASCADE; the
+    /// evidence row (no FK) goes in the same transaction, and the evidence sweep
+    /// removes the file once its job is gone. A job that ever had a `held_outputs`
+    /// row is never touched. The parts are independent: one failing is recorded
+    /// in `errors` and the others still run. When anything was removed one audit
+    /// row says so, written last. The audit purge never deletes the newest entry,
+    /// so the table is never left empty (`ensure_default_admin` reads it) even if
+    /// that row cannot be written.
+    pub fn purge_old_records(&self, now: chrono::DateTime<Utc>) -> Result<RetentionCounts> {
+        let mut counts = RetentionCounts::default();
+        let job_cutoff = timestamps::format(now - Duration::days(JOB_KEEP_DAYS));
+        let mut errors: Vec<String> = Vec::new();
+        let mut note = |part: &str, r: Result<()>| {
+            if let Err(e) = r {
+                errors.push(format!("{part}: {e:#}"));
+            }
+        };
+        note("jobs", self.purge_old_jobs(&job_cutoff, &mut counts));
+        note(
+            "timeline",
+            self.pool.get().map_err(anyhow::Error::from).and_then(|conn| {
+                // Belt for the cascade: a timeline row whose job is gone.
+                counts.job_events += conn.execute("DELETE FROM job_events WHERE job_id NOT IN (SELECT id FROM queue)", [])?;
+                Ok(())
+            }),
+        );
+        note(
+            "audit",
+            self.delete_in_batches(PURGE_AUDIT_SQL, &timestamps::format(now - Duration::days(AUDIT_KEEP_DAYS)), &mut counts.audit),
+        );
+        note(
+            "mail",
+            self.delete_in_batches(PURGE_MAIL_SQL, &timestamps::format(now - Duration::days(MAIL_KEEP_DAYS)), &mut counts.mail),
+        );
+        note("sessions", self.purge_expired_sessions().map(|n| counts.sessions = n));
+        counts.errors = errors;
+        if counts.total() > 0 {
+            // A failed audit row is one more part failure: the counts of what
+            // was removed must still reach the caller's log.
+            if let Err(e) = self.log_audit(
+                "INFO",
+                "retention",
+                &format!(
+                    "Retention removed {} job(s) with {} timeline row(s) and {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s){}",
+                    counts.jobs, counts.job_events, counts.evidence, counts.audit, counts.mail, counts.sessions,
+                    if counts.errors.is_empty() { String::new() } else { format!("; {} part(s) failed", counts.errors.len()) }
+                ),
+            ) {
+                counts.errors.push(format!("audit row: {e:#}"));
+            }
+        }
+        Ok(counts)
+    }
+
+    /// The jobs part of `purge_old_records`; adds to `counts` batch by batch.
+    fn purge_old_jobs(&self, cutoff: &str, counts: &mut RetentionCounts) -> Result<()> {
+        loop {
+            let mut conn = self.pool.get()?;
+            // Immediate: a heartbeat committing between the select and the delete
+            // would otherwise fail a deferred transaction with SQLITE_BUSY_SNAPSHOT.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let ids: Vec<i64> = {
+                let mut stmt = tx.prepare(PURGE_JOB_IDS_SQL)?;
+                let rows = stmt.query_map(params![cutoff, RETENTION_BATCH], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let json = serde_json::to_string(&ids)?;
+            let events = tx.query_row(
+                "SELECT COUNT(*) FROM job_events WHERE job_id IN (SELECT value FROM json_each(?))",
+                params![json],
+                |r| r.get::<_, i64>(0),
+            )? as usize;
+            let evidence = tx.execute(
+                "DELETE FROM job_evidence WHERE job_id IN (SELECT value FROM json_each(?))",
+                params![json],
+            )?;
+            let jobs = tx.execute(
+                "DELETE FROM queue WHERE id IN (SELECT value FROM json_each(?))",
+                params![json],
+            )?;
+            tx.commit()?;
+            counts.job_events += events;
+            counts.evidence += evidence;
+            counts.jobs += jobs;
+            if (ids.len() as i64) < RETENTION_BATCH {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Run a `?1 = cutoff, ?2 = batch` delete until a batch comes up short,
+    /// adding to `total` after each batch so a later failure keeps the count.
+    fn delete_in_batches(&self, sql: &str, cutoff: &str, total: &mut usize) -> Result<()> {
+        let conn = self.pool.get()?;
+        loop {
+            let n = conn.execute(sql, params![cutoff, RETENTION_BATCH])?;
+            *total += n;
+            if (n as i64) < RETENTION_BATCH {
+                return Ok(());
+            }
+        }
     }
 
     /// Debug builds only, for `dev-seed-repair`: what MCR decided about an

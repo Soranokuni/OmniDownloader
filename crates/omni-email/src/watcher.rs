@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use omni_core::config::AppConfig;
 use omni_core::health::{Check, HealthState};
 use omni_core::models::{Enqueued, JobStatus, NewJob, ProcessedMail};
-use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
+use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS, MAIL_KEEP_DAYS};
 
 use crate::assist::{Assist, LiveAssist};
 use crate::graph::{GraphMailSource, RetryAfter};
@@ -41,6 +41,10 @@ pub const FIRST_RUN_LOOKBACK: chrono::Duration = chrono::Duration::hours(24);
 /// it shows up as changed (someone flagged or moved a month-old mail). Long
 /// enough for a Monday rescue of a Friday mail from Junk.
 pub const MAX_MAIL_AGE: chrono::Duration = chrono::Duration::hours(72);
+
+/// Days short of `MAIL_KEEP_DAYS` that a mail must be received within to be ingested:
+/// the handled-mail record that stops a re-ingest is purged after `MAIL_KEEP_DAYS`.
+pub const MAIL_RECORD_MARGIN_DAYS: i64 = 7;
 
 /// Consecutive processing failures before a message is given up on and left
 /// unread for a human (plan P4.2: "Omni/Failed"). A transient failure (the
@@ -302,6 +306,14 @@ impl EmailWatcher {
             Some(c) => (c - CHECKPOINT_OVERLAP, c - MAX_MAIL_AGE),
             None => (now - FIRST_RUN_LOOKBACK, now - FIRST_RUN_LOOKBACK),
         };
+        // Handled-mail records are purged after MAIL_KEEP_DAYS; a mail older than
+        // the safe part of that window could be re-ingested after its record is gone,
+        // however old the checkpoint is (a poll that failed for months).
+        let record_floor = now - chrono::Duration::days(MAIL_KEEP_DAYS - MAIL_RECORD_MARGIN_DAYS);
+        let received_floor = received_floor.max(record_floor);
+        // With no received time to judge by, a listing reaching back past that
+        // window cannot be trusted either.
+        let undated_too_old = since < record_floor;
         let headers = self.source.list_changed(since, LIST_LIMIT).await?;
         let mut report = PollReport {
             listed: headers.len(),
@@ -318,7 +330,7 @@ impl EmailWatcher {
         let mut advance_to = checkpoint;
         let mut held = false;
         for h in &headers {
-            let settled = self.handle(h, received_floor, &mut report).await?;
+            let settled = self.handle(h, received_floor, undated_too_old, &mut report).await?;
             if !settled {
                 held = true;
             } else if !held && advance_to.map_or(true, |c| h.modified_at > c) {
@@ -341,7 +353,13 @@ impl EmailWatcher {
 
     /// Deal with one listed message. `Ok(true)` when it is settled and the
     /// checkpoint may pass it.
-    async fn handle(&self, h: &MailHeader, received_floor: DateTime<Utc>, report: &mut PollReport) -> Result<bool> {
+    async fn handle(
+        &self,
+        h: &MailHeader,
+        received_floor: DateTime<Utc>,
+        undated_too_old: bool,
+        report: &mut PollReport,
+    ) -> Result<bool> {
         let key = key_for(&h.internet_message_id, &h.id);
         // E-07, and the heart of read-only ingest: seen before, nothing to
         // do, whatever the mailbox says about read state.
@@ -349,7 +367,7 @@ impl EmailWatcher {
             report.already_seen += 1;
             return Ok(true);
         }
-        if h.received_at.is_some_and(|r| r < received_floor) {
+        if h.received_at.map_or(undated_too_old, |r| r < received_floor) {
             info!(
                 "EmailWatcher: not ingesting '{}' from {}: received {}, before {received_floor}",
                 h.subject,
@@ -795,6 +813,98 @@ mod tests {
         source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         watcher.poll_and_report(&mut backoff, every).await;
         assert_eq!(health.last_mail_poll(), Some(first), "a failed poll leaves it as it was");
+    }
+
+    /// Lists the given headers; every fetch says the mail is gone, so a mail that
+    /// passes the age gate shows up as `fetched` and nothing else happens to it.
+    struct ListSource {
+        headers: Vec<MailHeader>,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSource for ListSource {
+        fn describe(&self) -> String {
+            "list".into()
+        }
+        fn checkpoint_key(&self) -> String {
+            "list:test".into()
+        }
+        fn is_configured(&self) -> bool {
+            true
+        }
+        async fn list_changed(&self, _: DateTime<Utc>, _: usize) -> Result<Vec<MailHeader>> {
+            Ok(self.headers.clone())
+        }
+        async fn fetch_mail(&self, id: &str) -> Result<InboundMail> {
+            Err(MailGone(id.to_string()).into())
+        }
+        async fn mark_processed(&self, _: &str, _: MailOutcome) -> Result<()> {
+            Ok(())
+        }
+        async fn download_attachment(&self, _: &str, _: &str, _: &std::path::Path) -> Result<PathBuf> {
+            anyhow::bail!("none")
+        }
+        async fn reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> crate::source::MailHealth {
+            crate::source::MailHealth { ok: true, detail: "list".into() }
+        }
+    }
+
+    fn header(n: u32, received_ago: Option<chrono::Duration>) -> MailHeader {
+        MailHeader {
+            id: format!("id{n}"),
+            internet_message_id: format!("<m{n}@news.example>"),
+            subject: format!("Subject {n}"),
+            from_address: "sender@news.example".into(),
+            received_at: received_ago.map(|a| Utc::now() - a),
+            modified_at: Utc::now(),
+        }
+    }
+
+    /// One poll over `headers` with a checkpoint `checkpoint_age` old; the report.
+    async fn poll_with(headers: Vec<MailHeader>, checkpoint_age: chrono::Duration) -> PollReport {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        repo.set_mail_checkpoint("list:test", Utc::now() - checkpoint_age).unwrap();
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo, Arc::new(ListSource { headers }));
+        watcher.poll_changed().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn after_a_long_outage_a_mail_older_than_the_record_window_is_not_ingested() {
+        // Checkpoint 100 days old: the old floor (checkpoint - 72 h) would accept a mail 95 days old.
+        let r = poll_with(vec![header(1, Some(chrono::Duration::days(95)))], chrono::Duration::days(100)).await;
+        assert_eq!((r.too_old, r.fetched), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn after_a_long_outage_an_undated_header_is_not_ingested() {
+        let r = poll_with(vec![header(2, None)], chrono::Duration::days(100)).await;
+        assert_eq!((r.too_old, r.fetched), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn after_a_long_outage_a_fresh_mail_is_still_ingested() {
+        let r = poll_with(vec![header(3, Some(chrono::Duration::hours(2)))], chrono::Duration::days(100)).await;
+        assert_eq!((r.too_old, r.fetched), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn with_a_recent_checkpoint_nothing_changes() {
+        let hour = chrono::Duration::hours(1);
+        let r = poll_with(
+            vec![
+                header(4, Some(chrono::Duration::hours(2))),
+                header(5, Some(chrono::Duration::days(5))),
+                header(6, None),
+            ],
+            hour,
+        )
+        .await;
+        // 2 h old: in; 5 days old: past the 72 h age; undated: still let in, as before.
+        assert_eq!((r.too_old, r.fetched), (1, 2));
     }
 
     #[test]

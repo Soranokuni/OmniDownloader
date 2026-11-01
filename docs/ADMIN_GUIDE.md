@@ -190,7 +190,7 @@ with a placeholder until you add the person (§6.3).
 | `max_concurrent_downloads` | 2 | jobs downloading at once |
 | `max_concurrent_transcodes` | 2 | encodes at once (about CPU cores / 6) |
 | `retention_days` | 7 | how long working files of finished jobs are kept |
-| `mail_text_retention_days` | 30 | how long mail text is kept for the desk |
+| `mail_text_retention_days` | 30 | how long mail text is kept for the desk (in effect at most 90: the handled-mail records themselves are removed after 90 days) |
 | `archive.enabled`, `archive.retention_days` | true, 14 | archive of downloaded sources |
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
@@ -378,10 +378,21 @@ before every delete or import.
 |---|---|---|
 | `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp |
 | `adblock_update` | daily 03:30 | refresh blocklists |
-| `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text |
+| `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text, and the old database records below |
 | `selfcheck` | daily 05:15 | browser check and per-site check links |
 | `cookie_test` | daily 05:30 | test each cookie jar |
 | `vacuum` | every 30 days, 04:30 | compact the database |
+
+What the `retention` task keeps in the database, and for how long (fixed, not configurable):
+
+| Records | Kept |
+|---|---|
+| Finished jobs (completed, failed, needs review, manual download, cancelled) with their timeline | 90 days after they finished; a job waiting, running or awaiting approval is never removed, and a job that ever had a held output is kept, with its timeline |
+| Handled-mail records | 90 days after the mail was received |
+| Audit log | 365 days |
+| Expired sessions | removed daily |
+
+Each run that removes anything adds one `retention` line to the audit log with the counts. The newest audit entry is never removed. To keep a purged mail record from letting an old mail back in, the mail watcher also never ingests a mail received more than 83 days ago, whatever the checkpoint says.
 
 ---
 

@@ -807,6 +807,22 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         GROUP BY r.steps_hash, s.domain;
         "#,
     ),
+    (
+        31,
+        // Indexes for the queries the panels poll (P1.21), and what the scheduled
+        // retention walks: a user's jobs, the inbox's window over queue and
+        // processed_mail, the desk counters, the audit timestamp, session expiry.
+        // `idx_processed_mail_when` is an expression index: the queries must
+        // spell the expression exactly the same.
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_queue_user_created ON queue(submitted_by_user_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_queue_created      ON queue(created_at);
+        CREATE INDEX IF NOT EXISTS idx_queue_counts       ON queue(status, cleared_at, completed_at);
+        CREATE INDEX IF NOT EXISTS idx_processed_mail_when ON processed_mail(COALESCE(received_at, processed_at));
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_ts      ON audit_logs(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires   ON sessions(expires_at);
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
