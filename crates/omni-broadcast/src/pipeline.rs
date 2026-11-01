@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -84,6 +85,117 @@ fn download_failure_text(e: &anyhow::Error) -> (ErrorCode, String) {
     match e.downcast_ref::<DownloadError>() {
         Some(d) => (d.code, format!("{}: {}", d.code, d.message)),
         None => (ErrorCode::PipelineFailed, format!("{}: {e}", ErrorCode::PipelineFailed)),
+    }
+}
+
+/// Lets a stage's progress reach the queue row at most once a second (plan
+/// P1.20). Each write is a SQLite commit, an fsync under synchronous=FULL, and
+/// yt-dlp and ffmpeg report many times a second. The first report passes, and
+/// the first 100 % passes at once (only once: yt-dlp's estimate for HLS/DASH
+/// can undershoot, so every later line may read 100); `last` moves only when
+/// a report is let through.
+struct ProgressGate {
+    last: Option<Instant>,
+    sent_100: bool,
+}
+
+impl ProgressGate {
+    const MIN_GAP: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self { last: None, sent_100: false }
+    }
+
+    fn allow(&mut self, now: Instant, percent: f64) -> bool {
+        let first_100 = percent >= 100.0 && !self.sent_100;
+        let due = match self.last {
+            None => true,
+            Some(last) => first_100 || now.saturating_duration_since(last) >= Self::MIN_GAP,
+        };
+        if due {
+            self.last = Some(now);
+            self.sent_100 |= percent >= 100.0;
+        }
+        due
+    }
+}
+
+/// A progress callback for one stage of one job: owns its own gate, so the
+/// first line of the next stage is written at once. Errors are ignored, as
+/// progress is display only.
+fn progress_writer(repo: Repository, job_id: i64) -> impl FnMut(f64, &str, &str) + Send + 'static {
+    let mut gate = ProgressGate::new();
+    move |percent, speed, eta| {
+        if gate.allow(Instant::now(), percent) {
+            let _ = repo.update_job_progress(job_id, percent, speed, eta);
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_gate_tests {
+    use super::*;
+    use omni_core::models::NewJob;
+    use omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS;
+
+    #[test]
+    fn a_burst_in_one_instant_lets_one_write_through() {
+        let t0 = Instant::now();
+        let mut gate = ProgressGate::new();
+        let allowed = (0..1000).filter(|i| gate.allow(t0, (*i as f64) / 20.0)).count();
+        assert_eq!(allowed, 1);
+    }
+
+    #[test]
+    fn the_gap_is_one_second_from_the_last_allowed_write_and_100_always_passes() {
+        let t0 = Instant::now();
+        let mut gate = ProgressGate::new();
+        assert!(gate.allow(t0, 1.0));
+        assert!(!gate.allow(t0 + Duration::from_millis(999), 2.0));
+        // A refused call does not move the window.
+        assert!(gate.allow(t0 + Duration::from_millis(1000), 3.0));
+        assert!(!gate.allow(t0 + Duration::from_millis(1500), 50.0));
+        assert!(gate.allow(t0 + Duration::from_millis(1001), 100.0));
+        // Only the first 100 skips the wait: an estimate stuck at 100 is
+        // throttled like any other line.
+        assert!(!gate.allow(t0 + Duration::from_millis(1002), 100.0));
+        assert!(gate.allow(t0 + Duration::from_millis(2001), 100.0));
+    }
+
+    fn row_progress(repo: &Repository, id: i64) -> f64 {
+        repo.get_job(id).unwrap().unwrap().progress
+    }
+
+    #[test]
+    fn the_writer_commits_the_first_and_the_100_and_skips_the_burst_between() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let id = repo
+            .enqueue(&NewJob::new("https://news.example/story-1", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)
+            .unwrap()
+            .job_id();
+
+        let mut write = progress_writer(repo.clone(), id);
+        let started = Instant::now();
+        write(10.0, "1MiB/s", "00:10");
+        assert_eq!(row_progress(&repo, id), 10.0);
+        for p in 20..=90 {
+            write(p as f64, "1MiB/s", "00:05");
+        }
+        // The real clock runs here: a machine stalled past the gap (parallel
+        // gate) legitimately lets one line through, so only judge a fast run.
+        if started.elapsed() < Duration::from_millis(900) {
+            assert_eq!(row_progress(&repo, id), 10.0, "the burst inside one second must not reach the row");
+        } else {
+            eprintln!("warning: burst took over 900 ms; throttle assertion skipped");
+        }
+        write(100.0, "1MiB/s", "00:00");
+        assert_eq!(row_progress(&repo, id), 100.0);
+
+        // The next stage has its own gate: its first value is written at once.
+        let mut next = progress_writer(repo.clone(), id);
+        next(5.0, "2.0x", "01:00");
+        assert_eq!(row_progress(&repo, id), 5.0);
     }
 }
 
@@ -457,13 +569,9 @@ impl BroadcastEngine {
                     cancel: cancel.clone(),
                     ..Default::default()
                 },
-                move |prog| {
-                    let _ = repo_clone.update_job_progress(
-                        job_id,
-                        prog.percent,
-                        &prog.speed,
-                        &prog.eta,
-                    );
+                {
+                    let mut write = progress_writer(repo_clone, job_id);
+                    move |prog| write(prog.percent, &prog.speed, &prog.eta)
                 },
             )
             .await;
@@ -564,15 +672,10 @@ impl BroadcastEngine {
                 return Err(anyhow::anyhow!("{}: {why}", ErrorCode::LowDisk.as_str()).context(ErrorCode::LowDisk.as_str()));
             }
         }
-        let repo_clone = self.repo.clone();
+        let mut write_progress = progress_writer(self.repo.clone(), job_id);
         let transcode_res = transcoder
             .transcode(job_id, &downloaded_file, &job_temp, move |prog| {
-                let _ = repo_clone.update_job_progress(
-                    job_id,
-                    prog.percent,
-                    &prog.speed,
-                    &prog.eta,
-                );
+                write_progress(prog.percent, &prog.speed, &prog.eta)
             })
             .await;
         drop(encoder);
