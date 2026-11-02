@@ -17,7 +17,14 @@ INSTALL (new PC)
   starts with Windows, restarts by itself after a failure, panel on port 8080
   (opened in the firewall for domain and private networks).
 
-  A network watchfolder needs a service account that may write to it:
+  The service runs as the virtual account NT SERVICE\OmniIngestService (no
+  password), with write rights only on its own data, temp, logs, archive, bin,
+  config.json and a local watchfolder. "--account LocalSystem" opts out.
+  An upgrade keeps the account it has; to switch an old install:
+       Install.cmd --account "NT SERVICE\OmniIngestService"
+
+  A network watchfolder needs a domain account that may write to it (or this
+  computer's account granted on the share):
        Install.cmd --watchfolder "\\dalet\ingest" --account "DOMAIN\svc_omni"
   Other options:  --dir D:\OmniIngest   --port 8081   --yes   --no-firewall
 

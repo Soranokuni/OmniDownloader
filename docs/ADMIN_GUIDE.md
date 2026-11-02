@@ -65,12 +65,20 @@ firewall opened for domain and private networks.
 | Option | Meaning |
 |---|---|
 | `--watchfolder "\\dalet\ingest"` | the Dalet watchfolder |
-| `--account "DOMAIN\svc_omni"` | run the service as this account (**required for a network watchfolder**: LocalSystem cannot write to a share). The password is prompted. |
+| `--account "DOMAIN\svc_omni"` | run the service as this account. The default for a new installation is the virtual account `NT SERVICE\OmniIngestService` (no password); `--account LocalSystem` opts out. **A network watchfolder needs a domain account** (password prompted), or the computer account granted Modify on the share: the default account and LocalSystem both reach a share as the computer account. |
 | `--dir D:\OmniIngest` | install somewhere else |
 | `--port 8081` | another web port |
 | `--yes` | accept the defaults, no questions |
 | `--no-firewall` | do not add the firewall rule |
 | `--import D:\OmniDownloader` | move an existing setup on this PC (config, database, keys, seeds) |
+
+The installer restricts the install folder: Users can read it, and only the service writes its own folders, so no local user can replace the program. The service account gets Modify only on `data\`, `temp\`, `logs\`, `archive\`,
+`bin\`, the file `config.json` and a local watchfolder (a watchfolder inside the
+install folder keeps write access for local users, which Dalet's ingest account
+relies on; the owner can tighten it); the install folder
+itself and the executable are not granted. An upgrade keeps the account the
+service already runs as; if that is LocalSystem the installer says so, and
+`Install.cmd --account "NT SERVICE\OmniIngestService"` switches it.
 
 After installation `data\` and `temp\` are readable only by SYSTEM,
 Administrators and the service account, so CLI commands against the
@@ -155,6 +163,10 @@ existing file is never overwritten: a second delivery becomes `…_2.mxf`.
 ---
 
 ## 5. Configuration
+
+The service's write right on `config.json` is an entry on that file itself, so
+edit it in place (Notepad is fine); a tool that replaces the file drops the
+right, and running the installer again restores it.
 
 Most settings are on the Admin page. The rest are in `config.json`; restart
 the service after editing it. `config.example.json` shows every key.
@@ -503,7 +515,7 @@ A stopped job carries one of these codes; the desk shows a Greek hint.
 | YouTube LOGIN_REQUIRED | update yt-dlp (**Download engine**); if it persists, add `youtube.com` cookies |
 | X / Instagram posts fail | upload that site's cookies and **Test** |
 | Wrong video from a news site | **Test URL** on the article; report the article link |
-| Files not appearing in Dalet | `watchfolder` health line; for a share, the service must run as an account with write rights (`--account`) |
+| Files not appearing in Dalet | `watchfolder` health line; for a share, the service must run as a domain account with write rights (`--account`), or the computer account must be granted on the share |
 | Everything waits | `disk` health line (no new jobs below 5 GB) |
 
 **Logs:** `logs\omni-ingest.YYYY-MM-DD.log`. Each job's step-by-step history

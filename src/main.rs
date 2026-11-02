@@ -76,7 +76,8 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
         /// Run the service as this account (a domain account for a network
-        /// watchfolder); LocalSystem when not given
+        /// watchfolder); `NT SERVICE\OmniIngestService` when not given,
+        /// `LocalSystem` to opt out. An upgrade keeps the installed account
         #[arg(long)]
         account: Option<String>,
         /// Ask nothing; take the defaults
@@ -256,10 +257,11 @@ enum AdblockAction {
 #[derive(Subcommand)]
 enum ServiceAction {
     Install {
-        /// Account the service runs as, e.g. `DOMAIN\svc_omni`. The password is
-        /// prompted for. Omit for LocalSystem, which cannot authenticate to an
-        /// SMB share (defect W-13) — the installer warns when the watchfolder
-        /// is one.
+        /// Account the service runs as, e.g. `DOMAIN\svc_omni` (the password is
+        /// prompted for). Omit for the virtual account `NT SERVICE\OmniIngestService`;
+        /// `LocalSystem` to opt out. Both authenticate to an SMB share as the
+        /// computer account (defect W-13): the installer warns when the
+        /// watchfolder is one.
         #[arg(long)]
         account: Option<String>,
     },
@@ -823,21 +825,19 @@ async fn main() -> Result<()> {
             })?;
         }
         Some(Commands::Setup) => {
-            omni_cli::run_setup_wizard(Some(&cli.config))?;
+            omni_cli::run_setup_wizard(Some(&cli.config)).await?;
         }
         Some(Commands::Install { .. } | Commands::Uninstall { .. }) => unreachable!("handled before paths"),
         Some(Commands::Service { action }) => {
             let sub = match action {
                 ServiceAction::Install { account } => {
-                    // The watchfolder is read from the config so the installer
-                    // can tell whether LocalSystem will actually be able to
-                    // deliver to it.
-                    let watchfolder = AppConfig::load_from_file(&paths.config)
-                        .ok()
-                        .map(|c| c.watchfolder_path);
+                    // The config gives the watchfolder (can the account reach
+                    // it?) and the folders that need rights.
+                    let config = AppConfig::load_from_file(&paths.config).ok();
                     omni_cli::ServiceSubcommand::Install {
                         account,
-                        watchfolder,
+                        paths: paths.clone(),
+                        config,
                     }
                 }
                 ServiceAction::Uninstall => omni_cli::ServiceSubcommand::Uninstall,
@@ -845,7 +845,7 @@ async fn main() -> Result<()> {
                 ServiceAction::Stop => omni_cli::ServiceSubcommand::Stop,
                 ServiceAction::Status => omni_cli::ServiceSubcommand::Status,
             };
-            omni_cli::handle_service_command(sub)?;
+            omni_cli::handle_service_command(sub).await?;
         }
         Some(Commands::Selfcheck) => {
             let config = AppConfig::load_from_file(&paths.config)

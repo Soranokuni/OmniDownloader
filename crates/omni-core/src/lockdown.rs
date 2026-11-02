@@ -66,6 +66,73 @@ pub fn lockdown_args(dir: &Path, service_account: Option<&str>) -> Vec<OsString>
     args
 }
 
+const USERS_SID: &str = "S-1-5-32-545";
+
+/// The icacls arguments for the install root itself (P2.16): inheritance
+/// removed, so the `Authenticated Users:Modify` that `C:\` hands down is gone;
+/// SYSTEM and Administrators Full; Users Read & execute (docs, logs, CLI);
+/// the service account Read & execute, so it can run the executable whether or
+/// not Windows puts it in Users. Its write rights are granted per folder.
+/// Pure; `/grant:r` makes a second run change nothing.
+pub fn root_lockdown_args(root: &Path, service_account: Option<&str>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        root.as_os_str().to_os_string(),
+        "/inheritance:r".into(),
+        "/grant:r".into(),
+        format!("*{SYSTEM_SID}:(OI)(CI)F").into(),
+        "/grant:r".into(),
+        format!("*{ADMINISTRATORS_SID}:(OI)(CI)F").into(),
+        "/grant:r".into(),
+        format!("*{USERS_SID}:(OI)(CI)RX").into(),
+    ];
+    if let Some(a) = service_account.filter(|a| !a.trim().is_empty() && !is_system(a)) {
+        args.push("/grant:r".into());
+        args.push(format!("{}:(OI)(CI)RX", account_spec(a)).into());
+    }
+    args
+}
+
+/// The icacls arguments that strip every explicit grant `account` holds on the
+/// root and below (`/T`, errors on single files skipped with `/C`). An older
+/// installer ran `/grant account:(OI)(CI)M /T` on the whole root, leaving an
+/// explicit ACE on the root and on every file, executable included;
+/// `/inheritance:r` and `/grant:r` do not remove those. Pure.
+pub fn remove_grants_args(root: &Path, account: &str) -> Vec<OsString> {
+    vec![
+        root.as_os_str().to_os_string(),
+        "/remove:g".into(),
+        account_spec(account).into(),
+        "/T".into(),
+        "/C".into(),
+        "/Q".into(),
+    ]
+}
+
+/// Strip `account`'s explicit grants from the root tree (see [`remove_grants_args`]).
+/// LocalSystem has none to strip. The caller re-grants what is needed afterwards.
+pub async fn remove_grants(root: &Path, account: &str) -> Result<()> {
+    if is_system(account) || account.trim().is_empty() {
+        return Ok(());
+    }
+    let o = crate::process::run_capture(Path::new("icacls"), remove_grants_args(root, account), Duration::from_secs(600)).await?;
+    if o.success {
+        Ok(())
+    } else {
+        Err(anyhow!("icacls exit {:?} removing {} from {}", o.exit_code, account, root.display()))
+    }
+}
+
+/// Lock the install root (see [`root_lockdown_args`]). Errors are for the caller to report.
+pub async fn lock_root(root: &Path, service_account: Option<&str>) -> Result<()> {
+    let o = crate::process::run_capture(Path::new("icacls"), root_lockdown_args(root, service_account), Duration::from_secs(120)).await?;
+    if o.success {
+        info!("Install folder permissions restricted: {}", root.display());
+        Ok(())
+    } else {
+        Err(anyhow!("icacls exit {:?} on {}", o.exit_code, root.display()))
+    }
+}
+
 /// The SID in `whoami /user /fo csv /nh` output: `"DOMAIN\user","S-1-5-..."`.
 pub fn parse_whoami_sid(csv: &str) -> Option<String> {
     csv.lines()
@@ -215,6 +282,51 @@ mod tests {
         // Every grant is a replace, so a second run changes nothing.
         assert_eq!(a.iter().filter(|x| *x == "/grant:r").count(), 3);
         assert!(!a.iter().any(|x| x == "/grant" || x.contains("Everyone") || x.contains("Users")));
+    }
+
+    #[test]
+    fn the_root_keeps_users_read_only_and_drops_the_inherited_modify() {
+        let a = strings(root_lockdown_args(Path::new("C:/Omni"), Some("NT SERVICE\\OmniIngestService")));
+        assert_eq!(a[0], "C:/Omni");
+        assert_eq!(a[1], "/inheritance:r");
+        let grants: Vec<&String> = a.iter().skip(2).filter(|x| *x != "/grant:r").collect();
+        assert_eq!(
+            grants,
+            [
+                &"*S-1-5-18:(OI)(CI)F".to_string(),
+                &"*S-1-5-32-544:(OI)(CI)F".to_string(),
+                &"*S-1-5-32-545:(OI)(CI)RX".to_string(),
+                &"NT SERVICE\\OmniIngestService:(OI)(CI)RX".to_string(),
+            ]
+        );
+        let all = a.join(" ");
+        assert!(!all.contains("S-1-5-11") && !all.contains("S-1-1-0"), "no Authenticated Users, no Everyone");
+        // Nothing but Users is read-only-and-broad: no write right for anyone but SYSTEM/Admins.
+        assert!(grants.iter().filter(|g| !g.contains("S-1-5-18") && !g.contains("S-1-5-32-544")).all(|g| g.ends_with(")RX")));
+        // LocalSystem: no extra entry.
+        assert_eq!(root_lockdown_args(Path::new("d"), None).len(), 8);
+        assert_eq!(root_lockdown_args(Path::new("d"), Some("LocalSystem")).len(), 8);
+    }
+
+    #[test]
+    fn a_users_read_entry_is_what_the_open_check_flags_on_data_and_not_on_the_root_listing_we_write() {
+        // The root result as icacls would list it: Users read-only is intended there...
+        let root = "C:\\Omni BUILTIN\\Users:(OI)(CI)(RX)\n NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n BUILTIN\\Administrators:(OI)(CI)(F)";
+        // ...and exactly what the data\ check must keep refusing (negative control).
+        assert!(open_to_everyone(root), "the data/temp check still flags a Users entry");
+        // What data\ looks like after the lockdown (no inheritance from the root) is clean.
+        let data = "C:\\Omni\\data NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n BUILTIN\\Administrators:(OI)(CI)(F)\n NT SERVICE\\OmniIngestService:(OI)(CI)(M)";
+        assert!(!open_to_everyone(data));
+        // The args we emit for the root carry no Authenticated Users or Everyone.
+        let args = strings(root_lockdown_args(Path::new("r"), None)).join(" ");
+        assert!(!open_to_everyone(&args.replace("*S-1-5-32-545", "")), "Users RX is the only broad entry");
+    }
+
+    #[test]
+    fn the_old_whole_root_grant_is_removed_recursively_before_the_lockdown() {
+        let a = strings(remove_grants_args(Path::new("C:/Omni"), "NT SERVICE\\OmniIngestService"));
+        assert_eq!(a, ["C:/Omni", "/remove:g", "NT SERVICE\\OmniIngestService", "/T", "/C", "/Q"]);
+        assert_eq!(strings(remove_grants_args(Path::new("r"), "S-1-5-80-1"))[2], "*S-1-5-80-1");
     }
 
     #[test]
