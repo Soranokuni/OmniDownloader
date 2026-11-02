@@ -270,6 +270,9 @@ struct DiagFacts {
 /// trigger programmatic lazy hydration, and extract broadcast-grade video streams.
 pub struct StreamSniffer;
 
+/// The context [`StreamSniffer::self_test`] puts on a browser that would not start (P2.13).
+pub const SANDBOXED_LAUNCH_FAILED: &str = "sandboxed launch failed";
+
 /// An address as the log may show it: host and path, never the query or fragment
 /// (a media address often carries a token there).
 pub fn log_addr(url: &str) -> String {
@@ -359,7 +362,8 @@ impl StreamSniffer {
     ///
     /// This is the daily "does the browser still work?" check (plan P6.7):
     /// a Chrome/Edge update that the browser library no longer understands
-    /// otherwise shows up as news-article jobs failing one by one.
+    /// otherwise shows up as news-article jobs failing one by one. A browser that does not
+    /// start at all (with its sandbox, P2.13) carries [`SANDBOXED_LAUNCH_FAILED`] in the chain.
     pub async fn self_test() -> Result<String> {
         const PAGE: &str = "data:text/html;charset=utf-8,%3C!doctype%20html%3E%3Cmeta%20charset%3Dutf-8%3E\
             %3Ch1%3EOmniDownloader%20self-test%3C%2Fh1%3E%3Cblockquote%20class%3D%22twitter-tweet%22%3E\
@@ -367,7 +371,7 @@ impl StreamSniffer {
             %3C%2Fblockquote%3E";
         const EXPECTED: &str = "https://x.com/SelfTest/status/1900000000000000042";
 
-        let mut session = HeadlessBrowserManager::launch().await?;
+        let mut session = HeadlessBrowserManager::launch().await.context(SANDBOXED_LAUNCH_FAILED)?;
         let version = session
             .browser
             .version()
@@ -1635,6 +1639,17 @@ fn final_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real launch failure cannot be forced here (the browser paths are fixed), so this keeps the
+    /// context the self-test's red `browser` line reads (P2.13) on the launch inside `self_test`.
+    #[test]
+    fn the_self_test_marks_a_failed_launch_as_sandboxed_launch_failed() {
+        let src = include_str!("sniffer.rs");
+        let body = &src[src.find("pub async fn self_test()").expect("self_test")..];
+        // Up to the next function (the file may be CRLF on disk, so no newline-based end).
+        let body = &body[..body.find("pub async fn extract_media_bundle").expect("the next function")];
+        assert!(body.contains("HeadlessBrowserManager::launch().await.context(SANDBOXED_LAUNCH_FAILED)?"), "{body}");
+    }
 
     /// Production source only (everything before the test module).
     fn production_source() -> &'static str {
