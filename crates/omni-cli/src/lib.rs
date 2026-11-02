@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use inquire::{Confirm, CustomType, Password, Text};
 use omni_core::config::AppConfig;
 use omni_core::models::UserRole;
+use omni_core::paths::AppPaths;
 use omni_core::repository::Repository;
 use omni_core::secrets::{keys as secret_keys, SecretStore};
 use omni_service::{
@@ -16,11 +17,13 @@ use std::path::Path;
 
 pub enum ServiceSubcommand {
     Install {
-        /// Account to run as, e.g. `DOMAIN\svc_omni`. `None` = LocalSystem.
+        /// Account to run as, e.g. `DOMAIN\svc_omni`. `None` = the virtual
+        /// account `NT SERVICE\OmniIngestService`; `LocalSystem` opts out.
         account: Option<String>,
-        /// Watchfolder path, so the installer can warn when LocalSystem will
-        /// not be able to reach it.
-        watchfolder: Option<String>,
+        /// The installation, and its configuration when it can be read (the
+        /// watchfolder warning and the folder permissions follow it).
+        paths: AppPaths,
+        config: Option<AppConfig>,
     },
     Uninstall,
     Start,
@@ -28,20 +31,27 @@ pub enum ServiceSubcommand {
     Status,
 }
 
-pub fn handle_service_command(cmd: ServiceSubcommand) -> Result<()> {
+pub async fn handle_service_command(cmd: ServiceSubcommand) -> Result<()> {
     match cmd {
         ServiceSubcommand::Install {
             account,
-            watchfolder,
+            paths,
+            config,
         } => {
             let current_exe = env::current_exe().context("Failed to get current executable path")?;
             println!("Installing Windows Service with binary: {}", current_exe.display());
 
-            let account = resolve_service_account(account.as_deref(), watchfolder.as_deref())?;
+            let config = config.unwrap_or_default();
+            let watchfolder = config.watchfolder_path.clone();
+            let account = resolve_service_account(account.as_deref(), Some(watchfolder.as_str()))?;
+            let previous = omni_service::installed_service_account();
             install_service(&current_exe, account.as_ref())?;
+            // The same rights as the installer: without them the new account
+            // cannot open data\ and temp\ if they were locked for LocalSystem.
+            install::apply_acls(&paths, &config, account.as_ref(), previous.as_deref(), &current_exe).await;
 
             println!("✓ Windows Service 'OmniIngestService' installed successfully!");
-            print_privilege_checklist(account.as_ref(), watchfolder.as_deref());
+            print_privilege_checklist(account.as_ref(), Some(watchfolder.as_str()));
             println!("\nTo start the service, run: omni-ingest service start");
         }
         ServiceSubcommand::Uninstall => {
@@ -73,49 +83,11 @@ fn resolve_service_account(
     account: Option<&str>,
     watchfolder: Option<&str>,
 ) -> Result<Option<ServiceAccount>> {
-    let Some(name) = account.map(str::trim).filter(|s| !s.is_empty()) else {
-        // LocalSystem. Fine for a local watchfolder; broken for a UNC one,
-        // because LocalSystem authenticates to SMB as the *computer account*
-        // and a file server will usually refuse it. That failure happens at
-        // the last step of the pipeline, after a correct MXF already exists,
-        // so it looks like a delivery bug rather than a permissions one.
-        if watchfolder.map(needs_network_identity).unwrap_or(false) {
-            println!();
-            println!("! The watchfolder is a network share, and the service will run as");
-            println!("  LocalSystem, which authenticates to SMB as this computer's account.");
-            println!("  Most file servers refuse that, and the failure only appears at");
-            println!("  delivery — after a correct MXF has already been produced.");
-            println!();
-            println!("  Re-run with a domain account that has Modify on the share:");
-            println!("    omni-ingest service install --account \"DOMAIN\\svc_omni\"");
-            println!();
-            let proceed = Confirm::new("Install as LocalSystem anyway?")
-                .with_default(false)
-                .prompt()?;
-            if !proceed {
-                anyhow::bail!("Installation cancelled.");
-            }
-        }
-        return Ok(None);
-    };
-
-    if ServiceAccount::is_passwordless_builtin(name) {
-        // Prompting here and passing an empty string makes CreateService fail
-        // with a misleading "logon failure".
-        println!("  {name} is a built-in account; no password is needed.");
-        return Ok(Some(ServiceAccount {
-            name: name.to_string(),
-            password: None,
-        }));
-    }
-
-    let password = Password::new(&format!("Password for {name}:"))
-        .with_display_mode(inquire::PasswordDisplayMode::Masked)
-        .without_confirmation()
-        .with_help_message("Passed to the Service Control Manager; never written to disk by us")
-        .prompt()?;
-
-    Ok(Some(ServiceAccount::with_password(name, password)))
+    // One decision for both installers (P2.16): the virtual account unless
+    // `--account` says otherwise, the network-share warning, and a password
+    // prompt only for an account that takes one (an empty password for a
+    // built-in makes CreateService fail with a misleading "logon failure").
+    install::choose_account(account, watchfolder.unwrap_or(""), false)
 }
 
 /// What the operator has to grant before the service will actually work.
@@ -128,10 +100,14 @@ fn print_privilege_checklist(account: Option<&ServiceAccount>, watchfolder: Opti
     let Some(account) = account else {
         return;
     };
+    let named_user = !ServiceAccount::is_passwordless_builtin(&account.name);
     println!();
     println!("Grant {} the following, or the service will fail:", account.name);
-    println!("  • 'Log on as a service'  (secpol.msc → Local Policies → User Rights Assignment)");
-    println!("  • Modify on the install directory's data\\, temp\\, logs\\ and archive\\");
+    if named_user {
+        println!("  • 'Log on as a service'  (secpol.msc → Local Policies → User Rights Assignment)");
+    }
+    println!("  • Modify on the install directory's data\\, temp\\, logs\\, archive\\ and bin\\");
+    println!("  • Modify on the file config.json (the admin pages save it); not on the install directory itself");
     if let Some(w) = watchfolder {
         println!("  • Modify on the watchfolder: {w}");
         if needs_network_identity(w) {
@@ -140,7 +116,8 @@ fn print_privilege_checklist(account: Option<&ServiceAccount>, watchfolder: Opti
     } else {
         println!("  • Modify on the watchfolder");
     }
-    println!("  • Write on temp\\browser-profile (the headless browser runs as this account)");
+    println!("  • %TEMP%\\omni-sniffer (the headless browser's profile) is in this account's own profile temp;");
+    println!("    nothing to grant for a virtual account");
     println!();
     println!("Note: secrets are encrypted with DPAPI at machine scope, so changing the");
     println!("service account does NOT invalidate data\\secrets.bin.");
@@ -314,7 +291,7 @@ fn ensure_known_key(key: &str) -> Result<()> {
     )
 }
 
-pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
+pub async fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
     println!();
     println!("============================================================");
     println!("   OMNIDOWNLOADER BROADCAST INGEST ENGINE - SETUP WIZARD    ");
@@ -464,19 +441,22 @@ pub fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
             // Ask for the account here rather than after the fact: a UNC
             // watchfolder under LocalSystem produces a correct MXF and then
             // fails to deliver it, which reads as a pipeline bug.
-            let account_name = Text::new("Service account (blank = LocalSystem):")
+            let account_name = Text::new(r"Service account (blank = NT SERVICE\OmniIngestService; LocalSystem to opt out):")
                 .with_default("")
-                .with_help_message(r"e.g. DOMAIN\svc_omni — required when the watchfolder is a network share")
+                .with_help_message(r"e.g. DOMAIN\svc_omni — needed when the watchfolder is a network share")
                 .prompt()?;
             let account = resolve_service_account(
                 Some(account_name.as_str()),
                 Some(config.watchfolder_path.as_str()),
             )?;
 
+            let previous = omni_service::installed_service_account();
             if let Err(e) = install_service(&current_exe, account.as_ref()) {
                 println!("! Service installation returned notice: {}", e);
                 println!("  (You may need to run setup in an Administrator terminal to install services)");
             } else {
+                let paths = AppPaths::discover(target_config_path);
+                install::apply_acls(&paths, &config, account.as_ref(), previous.as_deref(), &current_exe).await;
                 println!("✓ Windows Service 'OmniIngestService' installed successfully!");
                 print_privilege_checklist(account.as_ref(), Some(&config.watchfolder_path));
                 let start_now = Confirm::new("Start the Windows Service now?")

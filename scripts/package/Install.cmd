@@ -2,6 +2,8 @@
 rem OmniDownloader installer: double-click, or run with options, e.g.
 rem   Install.cmd --watchfolder "\\dalet\ingest" --account "DOMAIN\svc_omni"
 rem   Install.cmd --dir D:\OmniIngest --port 8080
+rem Default account: NT SERVICE\OmniIngestService; --account LocalSystem opts out.
+rem An upgrade keeps the service's current account.
 rem Run it again from a newer release folder to upgrade.
 setlocal
 cd /d "%~dp0"

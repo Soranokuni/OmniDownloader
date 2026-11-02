@@ -318,6 +318,13 @@ mod windows_impl {
         Some(service.query_config().ok()?.executable_path)
     }
 
+    pub fn installed_account() -> Option<String> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+        let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
+        let name = service.query_config().ok()?.account_name?;
+        Some(name.to_string_lossy().into_owned())
+    }
+
     /// Stop the service if it runs, and wait until it has (up to `timeout`):
     /// the executable cannot be replaced while the process holds it.
     pub fn stop_and_wait(timeout: Duration) -> Result<()> {
@@ -430,6 +437,45 @@ impl ServiceAccount {
     }
 }
 
+/// The account a new installation runs as (plan P2.16): the virtual service
+/// account. Windows requires it to equal the service name, so it is the literal
+/// of `NT SERVICE\` + `SERVICE_NAME` (a test keeps the two together).
+pub const DEFAULT_SERVICE_ACCOUNT: &str = "NT SERVICE\\OmniIngestService";
+
+/// Which account an install should use, before any prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountChoice {
+    /// LocalSystem (`install_service` takes `None`).
+    LocalSystem,
+    /// An account Windows takes no password for.
+    Passwordless(String),
+    /// A domain or local user account; the password has to be asked for.
+    NeedsPassword(String),
+}
+
+/// The one decision both installers share. Nothing given = the virtual account;
+/// `LocalSystem` / `NT AUTHORITY\SYSTEM` is the explicit opt-out.
+pub fn default_or_given(account: Option<&str>) -> AccountChoice {
+    let Some(name) = account.map(str::trim).filter(|s| !s.is_empty()) else {
+        return AccountChoice::Passwordless(DEFAULT_SERVICE_ACCOUNT.to_string());
+    };
+    let upper = name.to_ascii_uppercase();
+    if upper == "LOCALSYSTEM" || upper == "NT AUTHORITY\\SYSTEM" || upper == "NT AUTHORITY\\LOCALSYSTEM" {
+        AccountChoice::LocalSystem
+    } else if ServiceAccount::is_passwordless_builtin(name) {
+        AccountChoice::Passwordless(name.to_string())
+    } else {
+        AccountChoice::NeedsPassword(name.to_string())
+    }
+}
+
+/// Whether the network-watchfolder warning applies. LocalSystem, the virtual
+/// account and NetworkService all reach SMB as the computer account, which a
+/// file server usually refuses; only a user account carries its own identity.
+pub fn network_share_warning_applies(watchfolder: &str, choice: &AccountChoice) -> bool {
+    needs_network_identity(watchfolder) && !matches!(choice, AccountChoice::NeedsPassword(_))
+}
+
 /// Install the service. `account` of `None` means LocalSystem.
 pub fn install_service(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
     #[cfg(windows)]
@@ -482,6 +528,15 @@ pub fn can_install_services() -> bool {
 pub fn installed_service_exe() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     return windows_impl::installed_exe();
+    #[cfg(not(windows))]
+    return None;
+}
+
+/// The account the installed service runs as (`LocalSystem` for the default);
+/// `None` when it is not installed or cannot be read.
+pub fn installed_service_account() -> Option<String> {
+    #[cfg(windows)]
+    return windows_impl::installed_account();
     #[cfg(not(windows))]
     return None;
 }
@@ -571,6 +626,36 @@ mod tests {
         assert!(needs_network_identity(r"//dalet/ingest"));
         assert!(!needs_network_identity(r"D:\watchfolder"));
         assert!(!needs_network_identity("watchfolder"));
+    }
+
+    #[test]
+    fn the_default_account_is_the_virtual_account_named_after_the_service() {
+        assert_eq!(DEFAULT_SERVICE_ACCOUNT, format!("NT SERVICE\\{SERVICE_NAME}"));
+    }
+
+    #[test]
+    fn no_account_means_the_virtual_account_and_localsystem_is_the_opt_out() {
+        let virt = AccountChoice::Passwordless(DEFAULT_SERVICE_ACCOUNT.to_string());
+        assert_eq!(default_or_given(None), virt);
+        assert_eq!(default_or_given(Some("  ")), virt);
+        for s in ["LocalSystem", "localsystem", "NT AUTHORITY\\SYSTEM", "nt authority\\localsystem"] {
+            assert_eq!(default_or_given(Some(s)), AccountChoice::LocalSystem, "{s}");
+        }
+        assert_eq!(default_or_given(Some("DOMAIN\\svc")), AccountChoice::NeedsPassword("DOMAIN\\svc".into()));
+        assert_eq!(
+            default_or_given(Some("NT SERVICE\\Other")),
+            AccountChoice::Passwordless("NT SERVICE\\Other".into())
+        );
+    }
+
+    #[test]
+    fn the_share_warning_covers_every_computer_identity_but_not_a_user_account() {
+        let unc = r"\\dalet\ingest";
+        assert!(network_share_warning_applies(unc, &default_or_given(None)));
+        assert!(network_share_warning_applies(unc, &default_or_given(Some("LocalSystem"))));
+        assert!(!network_share_warning_applies(unc, &default_or_given(Some("DOMAIN\\svc"))));
+        assert!(!network_share_warning_applies(r"D:\watchfolder", &default_or_given(None)));
+        assert!(!network_share_warning_applies(r"D:\watchfolder", &default_or_given(Some("LocalSystem"))));
     }
 }
 

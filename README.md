@@ -298,7 +298,8 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe browser-test "https://example.com/video/..."
 
 # Windows service (admin terminal)
-.\target\release\omni-ingest.exe service install --account "DOMAIN\svc_omni"
+# runs as NT SERVICE\OmniIngestService; add --account LocalSystem or --account "DOMAIN\svc_omni" to choose another
+.\target\release\omni-ingest.exe service install
 .\target\release\omni-ingest.exe service start|stop|status|uninstall
 ```
 
@@ -312,8 +313,16 @@ left out shows why, and can be queued from there. The text is kept for
 `mail_text_retention_days` (30) and then cleared; `/mcr#queue`, `#review` and
 `#completed` open the other lists directly.
 
+A new installation runs the service as the virtual account
+`NT SERVICE\OmniIngestService` (no password), with Modify only on `data\`,
+`temp\`, `logs\`, `archive\`, `bin\`, the file `config.json` and a local
+watchfolder, not on the install folder itself. `--account LocalSystem` opts out.
+An upgrade keeps the account the service already has (it prints how to switch:
+`Install.cmd --account "NT SERVICE\OmniIngestService"`).
+
 If the watchfolder is a network share, install the service under a domain
-account. LocalSystem authenticates to SMB as the computer account, which most
+account, or grant this computer's account Modify on the share. Both LocalSystem
+and the virtual account authenticate to SMB as the computer account, which most
 file servers refuse — and the failure appears only at delivery, after a correct
 file has already been produced.
 
