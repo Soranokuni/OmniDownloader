@@ -1,9 +1,9 @@
 use omni_core::config::AppConfig;
 use omni_core::repository::Repository;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::ratelimit::LoginRateLimiter;
 
@@ -174,7 +174,16 @@ pub struct AppState {
     /// The `Host` values the panel answers to (P2.17). `None` means the check is off, which only a
     /// test harness building the router directly leaves; `WebServer::run` installs one.
     pub allowed_hosts: Option<Arc<crate::middleware::AllowedHosts>>,
+    /// At most [`ARGON_CONCURRENCY`] Argon2 jobs run at once (P2.18): each takes 64 MiB and
+    /// about a core, so an unbounded burst of logins would starve the runtime and the box.
+    pub argon_permits: Arc<Semaphore>,
+    /// How many password verifications the login path has started. Test-visible: proves
+    /// a burst was stopped by the limiter before it reached Argon2, without timing.
+    pub password_checks: Arc<AtomicUsize>,
 }
+
+/// Concurrent Argon2 hash/verify jobs the panel allows.
+pub const ARGON_CONCURRENCY: usize = 2;
 
 impl AppState {
     pub fn new(repo: Repository, config: AppConfig, config_path: PathBuf) -> Self {
@@ -223,7 +232,80 @@ impl AppState {
             metrics_sources: None,
             default_admin_live,
             allowed_hosts: None,
+            argon_permits: Arc::new(Semaphore::new(ARGON_CONCURRENCY)),
+            password_checks: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Run `f` (anything that hashes or verifies a password) on the blocking pool, behind the
+    /// Argon2 semaphore. The permit is held only while `f` runs.
+    pub async fn argon<T, F>(&self, f: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(AppState) -> T + Send + 'static,
+    {
+        let permit = Arc::clone(&self.argon_permits)
+            .acquire_owned()
+            .await
+            .expect("the Argon2 semaphore is never closed");
+        let state = self.clone();
+        // The permit travels into the job: if the request is dropped (client
+        // disconnect) the job keeps running, and so must its permit.
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(state)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => panic!("Argon2 task cancelled: {e}"),
+        }
+    }
+
+    /// Verify a password off the runtime, bounded.
+    pub async fn verify_password(&self, password: String, hash: String) -> bool {
+        self.argon(move |s| {
+            s.password_checks.fetch_add(1, Ordering::Relaxed);
+            omni_core::auth::verify_password(&password, &hash)
+        })
+        .await
+    }
+
+    /// Verify a login password and, when it is right but the stored hash is below the current
+    /// Argon2 parameters, rewrite the hash (P2.18). A legacy hash verifies several times faster
+    /// than the dummy, so leaving one would let a fast refusal tell that the account exists.
+    pub async fn verify_and_upgrade(&self, user_id: i64, password: String, hash: String) -> bool {
+        self.argon(move |s| {
+            s.password_checks.fetch_add(1, Ordering::Relaxed);
+            if !omni_core::auth::verify_password(&password, &hash) {
+                return false;
+            }
+            if omni_core::auth::needs_rehash(&hash) {
+                match omni_core::auth::hash_password(&password)
+                    .and_then(|new| s.repo.upgrade_password_hash(user_id, &hash, &new))
+                {
+                    Ok(true) => tracing::info!(user_id, "Password hash upgraded to the current Argon2 parameters"),
+                    Ok(false) => tracing::info!(user_id, "Password hash changed concurrently; not upgraded"),
+                    Err(e) => tracing::warn!(user_id, error = ?e, "Password hash upgrade failed"),
+                }
+            }
+            true
+        })
+        .await
+    }
+
+    /// Burn the cost of one verification against the dummy hash and discard it, so an unknown
+    /// or inactive account takes as long to refuse as a wrong password does.
+    pub async fn verify_dummy(&self) {
+        let _ = self
+            .verify_password("dummy".to_string(), omni_core::auth::DUMMY_PASSWORD_HASH.to_string())
+            .await;
+    }
+
+    /// [`Self::refresh_default_admin`] off the runtime, bounded.
+    pub async fn refresh_default_admin_blocking(&self) {
+        self.argon(|s| s.refresh_default_admin()).await;
     }
 
     /// Whether this session's account is the first-run default one while its

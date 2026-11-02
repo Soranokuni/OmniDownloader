@@ -65,6 +65,32 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
         .is_ok()
 }
 
+/// A well-formed Argon2id PHC hash of a throwaway password, at the production
+/// parameters. The login path verifies against it for an unknown or inactive
+/// account and discards the result, so those answers cost as long as a wrong
+/// password does and response time does not reveal which addresses exist.
+pub const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=1$Q5BQH7B+WFJyPRP/ek6BcQ$MQs1mQAsAKrkdxfgKXF5BH21i4VlqwcG3finbaIgP94";
+
+/// True when a stored PHC hash is not Argon2id at the current parameters, so a
+/// successful login should rewrite it (P2.18). Unparseable hashes say false:
+/// there is nothing to upgrade from.
+pub fn needs_rehash(password_hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(password_hash) else {
+        return false;
+    };
+    if parsed.algorithm.as_str() != "argon2id" {
+        return true;
+    }
+    match Params::try_from(&parsed) {
+        Ok(p) => {
+            p.m_cost() != ARGON2_MEMORY_KIB
+                || p.t_cost() != ARGON2_ITERATIONS
+                || p.p_cost() != ARGON2_PARALLELISM
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn generate_session_token() -> String {
     let mut rng = rand::thread_rng();
     let random_bytes: [u8; 32] = rng.gen();
@@ -92,6 +118,29 @@ mod tests {
         let hashed = hash_password(raw).expect("Hashing should succeed");
         assert!(verify_password(raw, &hashed));
         assert!(!verify_password("WrongPassword!", &hashed));
+    }
+
+    #[test]
+    fn the_dummy_hash_is_argon2id_at_the_production_parameters_and_never_verifies() {
+        let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH).expect("dummy hash must parse");
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        let params = Params::try_from(&parsed).expect("dummy hash carries Argon2 params");
+        assert_eq!(params.m_cost(), ARGON2_MEMORY_KIB);
+        assert_eq!(params.t_cost(), ARGON2_ITERATIONS);
+        assert_eq!(params.p_cost(), ARGON2_PARALLELISM);
+        assert!(!verify_password("Admin", DUMMY_PASSWORD_HASH));
+        assert!(!verify_password("", DUMMY_PASSWORD_HASH));
+        assert!(!verify_password("anything-at-all-123", DUMMY_PASSWORD_HASH));
+    }
+
+    #[test]
+    fn needs_rehash_flags_only_hashes_below_the_current_parameters() {
+        let fresh = hash_password("whatever-pass").unwrap();
+        assert!(!needs_rehash(&fresh));
+        let salt = SaltString::from_b64("c29tZXNhbHR2YWx1ZQ").unwrap();
+        let legacy = Argon2::default().hash_password(b"x", &salt).unwrap().to_string();
+        assert!(needs_rehash(&legacy));
+        assert!(!needs_rehash("not a phc string"));
     }
 
     #[test]

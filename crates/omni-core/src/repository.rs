@@ -409,6 +409,17 @@ pub struct HeldOutput {
     pub delivered_path: Option<String>,
 }
 
+/// Longest e-mail address stored in `login_attempts` (RFC 5321 path limit).
+const LOGIN_EMAIL_MAX_CHARS: usize = 254;
+
+/// `s` cut to at most `max` characters, always on a char boundary.
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s.to_string(),
+    }
+}
+
 /// The first-run administrator of a new installation (see
 /// [`Repository::ensure_default_admin`]). Logins are matched lowercased, so
 /// "Admin" and "admin" both work.
@@ -2716,6 +2727,18 @@ impl Repository {
         Ok(())
     }
 
+    /// Replace a stored hash with a stronger one for the same password (P2.18).
+    /// Only if the row still holds `old_hash`, so a password change that raced the
+    /// login is never overwritten. Ends no sessions: the password did not change.
+    pub fn upgrade_password_hash(&self, user_id: i64, old_hash: &str, new_hash: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            params![new_hash, user_id, old_hash],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn set_user_active_status(&self, user_id: i64, active: bool) -> Result<()> {
         let conn = self.pool.get()?;
         let val = if active { 1 } else { 0 };
@@ -2829,7 +2852,8 @@ impl Repository {
             "INSERT INTO login_attempts (at, email, ip, successful, reason) VALUES (?, ?, ?, ?, ?)",
             params![
                 timestamps::format(Utc::now()),
-                email.map(|e| e.to_lowercase()),
+                // The e-mail is attacker-supplied: cap what a single row can hold.
+                email.map(|e| truncate_chars(&e.to_lowercase(), LOGIN_EMAIL_MAX_CHARS)),
                 ip,
                 if successful { 1 } else { 0 },
                 reason
@@ -6548,6 +6572,37 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn a_login_attempt_stores_at_most_254_characters_of_the_email() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        // Multi-byte characters: a byte cut at 254 would split one.
+        let huge = "\u{3a9}".repeat(30_000); // 60 KB
+        repo.record_login_attempt(Some(&huge), Some("10.0.0.1"), false, Some("unknown_account"))?;
+        repo.record_login_attempt(Some("Short@Station.GR"), None, false, None)?;
+        let rows = repo.recent_login_attempts(10)?;
+        let long = rows.iter().find(|r| r.email.as_deref().is_some_and(|e| e.len() > 20)).unwrap();
+        assert_eq!(long.email.as_deref().unwrap().chars().count(), 254);
+        assert!(rows.iter().any(|r| r.email.as_deref() == Some("short@station.gr")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_hash_upgrade_never_overwrites_a_hash_changed_since_the_login_read_it() -> Result<()> {
+        // A reset between the login's read and its upgrade must win: an
+        // unconditional UPDATE here would quietly restore the old password.
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo.create_user("cas@example.test", "first-password-123", UserRole::User, "Cas Test", None)?;
+        let read_by_login = repo.get_user_by_email("cas@example.test")?.unwrap().password_hash;
+        repo.update_user_password(id, "reset-password-456")?;
+        let after_reset = repo.get_user_by_email("cas@example.test")?.unwrap().password_hash;
+
+        assert!(!repo.upgrade_password_hash(id, &read_by_login, "$argon2id$stale")?);
+        assert_eq!(repo.get_user_by_email("cas@example.test")?.unwrap().password_hash, after_reset);
+        Ok(())
+    }
 
     #[test]
     fn every_pooled_connection_gets_the_per_connection_pragmas() -> Result<()> {

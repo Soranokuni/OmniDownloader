@@ -425,6 +425,28 @@ pub struct RequireUserAllowDefault(pub User);
 /// Like [`RequireAdmin`], but also admits the locked default account (P2.14).
 pub struct RequireAdminAllowDefault(pub User);
 
+/// The address the login limiter keys on: the resolved client address, or the
+/// socket peer when a trusted proxy's forwarded header is unresolved (P2.18).
+pub struct LimiterIp(pub Option<IpAddr>);
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for LimiterIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let (trusted, trust_header) = {
+            let cfg = state.config.read().await;
+            (
+                cfg.security.trusted_proxy_networks(),
+                cfg.security.trust_proxy_header,
+            )
+        };
+        Ok(LimiterIp(
+            client_ip(parts, &trusted, trust_header).or_else(|| peer_ip(parts)),
+        ))
+    }
+}
+
 /// The principal if there is one, without rejecting.
 pub struct MaybePrincipal(pub Option<Principal>);
 

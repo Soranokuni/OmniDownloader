@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use omni_core::auth::{generate_session_token, verify_password};
+use omni_core::auth::generate_session_token;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStatus, User, UserRole};
 use omni_core::repository::{DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
@@ -21,7 +21,7 @@ use omni_core::repository::{DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
 use crate::assets::EmbeddedFile;
 use crate::auth::{
     build_logout_cookie, build_session_cookie, client_ip, extract_session_token,
-    internal_error, is_loopback_client, resolve_principal, ApiError, MaybePrincipal, Principal,
+    internal_error, is_loopback_client, LimiterIp, resolve_principal, ApiError, MaybePrincipal, Principal,
     RequireAdmin, RequireAdminAllowDefault, RequireMcr, RequireUser, RequireUserAllowDefault,
 };
 use crate::ratelimit::Decision;
@@ -161,30 +161,32 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
 
     // Rate limit first, so a locked-out caller never reaches the password
     // comparison and cannot use its timing as an oracle.
-    if let Decision::Deny { retry_after } = state.login_limiter.check(limiter_ip, &payload.email) {
-        let _ = state.repo.record_login_attempt(
-            Some(&payload.email),
-            ip_str.as_deref(),
-            false,
-            Some("rate_limited"),
-        );
-        tracing::warn!(
-            ip = ip_str.as_deref().unwrap_or("unknown"),
-            "Login rate limit hit"
-        );
-        let mut response = ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            "Πάρα πολλές αποτυχημένες προσπάθειες σύνδεσης. Δοκιμάστε ξανά σε λίγο.",
-        )
-        .into_response();
-        response.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            axum::http::HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
-                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
-        );
-        return response;
-    }
+    // The attempt is counted here, under the limiter's lock (P2.18): dropping
+    // `reservation` on any refusal below leaves it counted as a failure, and only
+    // a successful sign-in takes that back.
+    let reservation = match state.login_limiter.reserve(limiter_ip, &payload.email) {
+        Ok(r) => r,
+        Err(Decision::Allow) => return ApiError::internal("Login is unavailable.").into_response(),
+        Err(Decision::Deny { retry_after, scope }) => {
+            // One audit row and one warning per lockout, not one per denied request.
+            if state
+                .login_limiter
+                .first_denial(limiter_ip, &payload.email, retry_after, scope)
+            {
+                let _ = state.repo.record_login_attempt(
+                    Some(&payload.email),
+                    ip_str.as_deref(),
+                    false,
+                    Some("rate_limited"),
+                );
+                tracing::warn!(
+                    ip = ip_str.as_deref().unwrap_or("unknown"),
+                    "Login rate limit hit"
+                );
+            }
+            return rate_limited_response(retry_after);
+        }
+    };
 
     let lookup = state.repo.get_user_by_email(&payload.email);
     let user = match lookup {
@@ -192,7 +194,9 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         Ok(None) => {
             // Same response and same wording as a wrong password: the login
             // form must not tell an anonymous caller which addresses exist.
-            state.login_limiter.record_failure(limiter_ip, &payload.email);
+            // The dummy verification gives it the same cost, too. (An inactive
+            // account is not returned by the lookup, so it lands here as well.)
+            state.verify_dummy().await;
             let _ = state.repo.record_login_attempt(
                 Some(&payload.email),
                 ip_str.as_deref(),
@@ -207,19 +211,10 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         }
     };
 
-    if !user.is_active {
-        state.login_limiter.record_failure(limiter_ip, &payload.email);
-        let _ = state.repo.record_login_attempt(
-            Some(&payload.email),
-            ip_str.as_deref(),
-            false,
-            Some("inactive_account"),
-        );
-        return invalid_credentials();
-    }
-
-    if !verify_password(&payload.password, &user.password_hash) {
-        state.login_limiter.record_failure(limiter_ip, &payload.email);
+    if !state
+        .verify_and_upgrade(user.id, payload.password.clone(), user.password_hash.clone())
+        .await
+    {
         let _ = state.repo.record_login_attempt(
             Some(&payload.email),
             ip_str.as_deref(),
@@ -233,7 +228,6 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         );
         return invalid_credentials();
     }
-
     // The first-run password only works on the server itself (P2.14). Refused
     // exactly like a wrong password, so the remote caller learns nothing.
     let default_account = user.email.eq_ignore_ascii_case(DEFAULT_ADMIN_LOGIN);
@@ -245,7 +239,6 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         state.default_admin_live.store(default_login, std::sync::atomic::Ordering::Relaxed);
     }
     if default_login && !matches!(ip, Some(i) if i.is_loopback()) {
-        state.login_limiter.record_failure(limiter_ip, &payload.email);
         let _ = state.repo.record_login_attempt(
             Some(&payload.email),
             ip_str.as_deref(),
@@ -276,7 +269,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         return ApiError::internal("Sign-in is temporarily unavailable.").into_response();
     }
 
-    state.login_limiter.record_success(limiter_ip, &payload.email);
+    reservation.succeeded();
     let _ = state
         .repo
         .record_login_attempt(Some(&payload.email), ip_str.as_deref(), true, None);
@@ -301,6 +294,22 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
     })
     .into_response();
     response.headers_mut().insert(SET_COOKIE, cookie);
+    response
+}
+
+/// The 429 answer, with the `Retry-After` the limiter computed.
+fn rate_limited_response(retry_after: std::time::Duration) -> Response {
+    let mut response = ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMITED",
+        "Πάρα πολλές αποτυχημένες προσπάθειες σύνδεσης. Δοκιμάστε ξανά σε λίγο.",
+    )
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
+    );
     response
 }
 
@@ -376,9 +385,21 @@ pub struct ChangePasswordPayload {
 pub async fn api_change_password(
     RequireUserAllowDefault(user): RequireUserAllowDefault,
     State(state): State<AppState>,
+    LimiterIp(limiter_ip): LimiterIp,
     Json(payload): Json<ChangePasswordPayload>,
 ) -> Response {
-    if !verify_password(&payload.current_password, &user.password_hash) {
+    // Guessing the current password is a brute-force path too (P2.18): the same
+    // limiter, keyed on the session's login and the caller's address. The attempt
+    // is counted up front; only a correct password gives it back.
+    let reservation = match state.login_limiter.reserve(limiter_ip, &user.email) {
+        Ok(r) => r,
+        Err(Decision::Allow) => return ApiError::internal("Could not change the password.").into_response(),
+        Err(Decision::Deny { retry_after, .. }) => return rate_limited_response(retry_after),
+    };
+    if !state
+        .verify_password(payload.current_password.clone(), user.password_hash.clone())
+        .await
+    {
         return ApiError::new(
             StatusCode::FORBIDDEN,
             "INVALID_CREDENTIALS",
@@ -386,14 +407,26 @@ pub async fn api_change_password(
         )
         .into_response();
     }
+    reservation.succeeded();
     if let Err(e) = validate_password(&payload.new_password) {
         return ApiError::bad_request(e).into_response();
     }
     // This also ends every session for the account, including this one, so the
     // panel sends the operator back to the login screen afterwards.
-    match state.repo.update_user_password(user.id, &payload.new_password) {
+    let (user_id, new_password) = (user.id, payload.new_password.clone());
+    match state
+        .argon(move |s| {
+            // The audit row and the default-admin flag go in the same job as the
+            // change, so a client that disconnects cannot split them (P2.18).
+            let r = s.repo.update_user_password(user_id, &new_password);
+            if r.is_ok() {
+                s.refresh_default_admin();
+            }
+            r
+        })
+        .await
+    {
         Ok(()) => {
-            state.refresh_default_admin();
             let mut response =
                 Json(serde_json::json!({"status": "ok", "reauth_required": true})).into_response();
             response
@@ -1614,29 +1647,30 @@ pub async fn api_admin_create_user(
         return Err(ApiError::bad_request("A valid email address is required."));
     }
     let role = UserRole::from_str_lossy(&payload.role);
+    let (email, password, full_name, surname, admin_email) = (
+        payload.email.trim().to_string(),
+        payload.password.clone(),
+        payload.full_name.trim().to_string(),
+        payload.journalist_surname.clone(),
+        admin.email.clone(),
+    );
     let id = state
-        .repo
-        .create_user(
-            payload.email.trim(),
-            &payload.password,
-            role,
-            payload.full_name.trim(),
-            payload.journalist_surname.as_deref(),
-        )
+        .argon(move |s| {
+            let id = s
+                .repo
+                .create_user(&email, &password, role, &full_name, surname.as_deref())?;
+            let _ = s.repo.log_audit(
+                "INFO",
+                "ADMIN",
+                &format!("User {email} created with role {} by {admin_email}", role.as_str()),
+            );
+            Ok::<_, anyhow::Error>(id)
+        })
+        .await
         .map_err(|e| {
             tracing::error!(error = ?e, "User creation failed");
             ApiError::bad_request("Could not create the account (is the address already in use?).")
         })?;
-    let _ = state.repo.log_audit(
-        "INFO",
-        "ADMIN",
-        &format!(
-            "User {} created with role {} by {}",
-            payload.email.trim(),
-            role.as_str(),
-            admin.email
-        ),
-    );
     Ok(Json(serde_json::json!({ "status": "ok", "user_id": id })))
 }
 
@@ -1693,7 +1727,7 @@ pub async fn api_admin_set_user_active(
             admin.email
         ),
     );
-    state.refresh_default_admin();
+    state.refresh_default_admin_blocking().await;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -1704,16 +1738,20 @@ pub async fn api_admin_update_password(
     Json(payload): Json<UpdatePasswordPayload>,
 ) -> JsonResult {
     validate_password(&payload.password).map_err(ApiError::bad_request)?;
+    let (new_password, admin_email) = (payload.password.clone(), admin.email.clone());
     state
-        .repo
-        .update_user_password(user_id, &payload.password)
+        .argon(move |s| {
+            s.repo.update_user_password(user_id, &new_password)?;
+            let _ = s.repo.log_audit(
+                "WARN",
+                "ADMIN",
+                &format!("Password for user #{user_id} reset by {admin_email}"),
+            );
+            s.refresh_default_admin();
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
         .map_err(internal_error("Could not update the password."))?;
-    let _ = state.repo.log_audit(
-        "WARN",
-        "ADMIN",
-        &format!("Password for user #{user_id} reset by {}", admin.email),
-    );
-    state.refresh_default_admin();
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
@@ -2923,26 +2961,33 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
         if !email.contains('@') {
             return ApiError::bad_request("A valid email address is required.").into_response();
         }
-        if let Err(e) = state.repo.create_user(
-            email.trim(),
-            password,
-            UserRole::Admin,
+        let (new_email, new_password, new_name) = (
+            email.trim().to_string(),
+            password.to_string(),
             payload
                 .admin_full_name
                 .as_deref()
                 .unwrap_or("System Administrator")
-                .trim(),
-            None,
-        ) {
+                .trim()
+                .to_string(),
+        );
+        if let Err(e) = state
+            .argon(move |s| {
+                s.repo
+                    .create_user(&new_email, &new_password, UserRole::Admin, &new_name, None)?;
+                let _ = s.repo.log_audit(
+                    "WARN",
+                    "ADMIN",
+                    &format!("First-run administrator {new_email} created"),
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        {
             tracing::error!(error = ?e, "First-run admin creation failed");
             return ApiError::bad_request("Could not create the administrator account.")
                 .into_response();
         }
-        let _ = state.repo.log_audit(
-            "WARN",
-            "ADMIN",
-            &format!("First-run administrator {} created", email.trim()),
-        );
     }
 
     {
