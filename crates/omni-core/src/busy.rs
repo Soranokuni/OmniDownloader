@@ -35,6 +35,14 @@ impl BusyJobs {
         self.map().keys().any(|(job, _)| *job == id)
     }
 
+    /// The jobs some worker is busy with, each once.
+    pub fn ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.map().keys().map(|(job, _)| *job).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// How many job runs are in progress (a job two workers share counts twice).
     pub fn len(&self) -> usize {
         self.map().len()
