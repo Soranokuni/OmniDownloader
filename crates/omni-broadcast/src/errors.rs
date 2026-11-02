@@ -70,11 +70,13 @@ pub enum ErrorCode {
     HeldFileChanged,
     /// The automatic repair ran out of time or attempts.
     RepairExhausted,
+    /// The link, or a stream found behind it, points at a loopback, private or reserved address (P2.12).
+    NonPublicAddress,
 }
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 31] = [
+    pub const ALL: [ErrorCode; 32] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
@@ -106,6 +108,7 @@ impl ErrorCode {
         Self::ApprovalExpired,
         Self::HeldFileChanged,
         Self::RepairExhausted,
+        Self::NonPublicAddress,
     ];
 
     /// The code stored on a job, back as a code.
@@ -146,6 +149,7 @@ impl ErrorCode {
             Self::ApprovalExpired => "APPROVAL_EXPIRED",
             Self::HeldFileChanged => "HELD_FILE_CHANGED",
             Self::RepairExhausted => "REPAIR_EXHAUSTED",
+            Self::NonPublicAddress => "NON_PUBLIC_ADDRESS",
         }
     }
 
@@ -220,6 +224,7 @@ impl ErrorCode {
             Self::ApprovalExpired => "Κανείς δεν ενέκρινε το βίντεο μέσα σε 24 ώρες και το αρχείο σβήστηκε. Πατήστε «Δοκιμή ξανά» αν το χρειάζεστε ακόμα.",
             Self::HeldFileChanged => "Το αρχείο που περίμενε έγκριση άλλαξε ή χάθηκε και ΔΕΝ παραδόθηκε. Πατήστε «Δοκιμή ξανά».",
             Self::RepairExhausted => "Η αυτόματη επισκευή δεν βρήκε το βίντεο μέσα στον χρόνο της. Ανοίξτε τον σύνδεσμο και κατεβάστε το χειροκίνητα.",
+            Self::NonPublicAddress => "Ο σύνδεσμος δείχνει σε εσωτερική διεύθυνση· δεν κατεβαίνει αυτόματα.",
         }
     }
 
@@ -731,6 +736,7 @@ mod tests {
             ErrorCode::ApprovalExpired,
             ErrorCode::HeldFileChanged,
             ErrorCode::RepairExhausted,
+            ErrorCode::NonPublicAddress,
         ] {
             let hint = code.hint_el();
             assert!(hint.len() > 20, "{code} has no useful hint");
@@ -760,9 +766,9 @@ mod tests {
             assert!(!c.should_try_sniffer());
             assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
         }
-        assert_eq!(ErrorCode::ALL.len(), 31);
+        assert_eq!(ErrorCode::ALL.len(), 32);
         let unique: std::collections::HashSet<_> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(unique.len(), 31);
+        assert_eq!(unique.len(), 32);
     }
 
     #[test]
@@ -772,6 +778,7 @@ mod tests {
             (ErrorCode::ApprovalExpired, "APPROVAL_EXPIRED"),
             (ErrorCode::HeldFileChanged, "HELD_FILE_CHANGED"),
             (ErrorCode::RepairExhausted, "REPAIR_EXHAUSTED"),
+            (ErrorCode::NonPublicAddress, "NON_PUBLIC_ADDRESS"),
         ];
         for (c, text) in cases {
             assert_eq!(c.as_str(), text);

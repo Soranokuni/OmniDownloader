@@ -231,8 +231,15 @@ async fn the_final_address_follows_redirects_past_the_fetch_limit_and_never_reac
     assert_eq!(f.final_url(&format!("{base}/r0")).await.unwrap(), format!("{base}/ok"));
     // A page that answers 404 is still where the chain ended.
     assert_eq!(f.final_url(&format!("{base}/gone")).await.unwrap(), format!("{base}/gone"));
-    assert!(f.final_url(&format!("{base}/to-private")).await.is_err());
+    let refused = f.final_url(&format!("{base}/to-private")).await.expect_err("a private hop");
+    // The refusal is reported as one (with the host only), not as a lookup that failed (P2.12).
+    let r = refused.downcast_ref::<omni_browser::http_fetcher::Refused>().expect("a refused hop is typed");
+    assert_eq!(r.host, "127.0.0.1");
+    assert!(!refused.to_string().contains("secret"), "{refused}");
     assert_eq!(hits.secret.load(Ordering::SeqCst), 0);
+    // A chain that merely fails is not a refusal.
+    let loopy = f.final_url(&format!("{base}/loop")).await.expect_err("a loop never ends");
+    assert!(loopy.downcast_ref::<omni_browser::http_fetcher::Refused>().is_none(), "{loopy}");
 }
 
 #[tokio::test]

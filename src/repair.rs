@@ -179,6 +179,8 @@ pub struct RepairCfg {
     /// MCR approvals of a recipe on a site after which its video skips the hold (0 = never).
     pub auto_deliver_after_approvals: i64,
     pub llm: LlmCfg,
+    /// Networks the job path may request although they are internal (`security.egress_allow_networks`, P2.12).
+    pub egress_allow: omni_core::net::CidrSet,
 }
 
 /// The model rung's settings (`repair.llm_*`). Off unless enabled AND a model is named.
@@ -487,14 +489,37 @@ fn live_result(snap: PageSnapshot, diag: &omni_browser::evidence::Diagnostic, ac
 /// never read. `None` when it fails; the caller then does what it did before. Only host and
 /// path are logged.
 pub async fn final_page_url(url: &str) -> Option<String> {
-    match omni_browser::HttpFetcher::new().final_url(url).await {
-        Ok(found) => Some(found),
-        Err(e) => {
-            tracing::debug!(page = %omni_core::cookies::host_and_path(url), "page address lookup failed: {e:#}");
-            None
-        }
+    match final_page_landing(url).await {
+        Landing::At(found) => Some(found),
+        Landing::Internal(_) | Landing::Unknown => None,
     }
 }
+
+/// Where [`final_page_landing`] found a page's chain of redirects to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landing {
+    /// The final address.
+    At(String),
+    /// A hop was refused as a loopback, private or reserved address (its host).
+    Internal(String),
+    /// The lookup failed for any other reason.
+    Unknown,
+}
+
+/// [`final_page_url`], telling a refused internal hop (P2.12) from a failed lookup.
+pub async fn final_page_landing(url: &str) -> Landing {
+    match omni_browser::HttpFetcher::new().final_url(url).await {
+        Ok(found) => Landing::At(found),
+        Err(e) => match e.downcast_ref::<omni_browser::http_fetcher::Refused>() {
+            Some(refused) => Landing::Internal(refused.host.clone()),
+            None => {
+                tracing::debug!(page = %omni_core::cookies::host_and_path(url), "page address lookup failed: {e:#}");
+                Landing::Unknown
+            }
+        },
+    }
+}
+
 
 /// What kind of job this is, for [`omni_broadcast::repair::eligible`].
 pub fn job_kind(job: &Job, url: &str) -> JobKind {

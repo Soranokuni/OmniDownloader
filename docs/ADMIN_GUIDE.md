@@ -165,6 +165,7 @@ the service after editing it. `config.example.json` shows every key.
 |---|---|---|
 | `mcr_open_networks` | `["127.0.0.1/32", "::1/128"]` | networks whose PCs open `/mcr` **without** signing in, e.g. `["10.20.0.0/16"]`. Empty: everyone signs in. |
 | `trust_proxy_header`, `trusted_proxies` | off | only behind a reverse proxy |
+| `egress_allow_networks` | `[]` | networks the job path may request although they are internal (loopback, private, link-local, reserved). Empty: a link to an internal address is never downloaded. Addresses inside pass the internal-address rule; syntax example only: `["10.0.0.0/8"]`. yt-dlp and ffprobe still follow redirects on their own after the check. |
 | `session_hours_admin` / `session_hours_user` / `session_days_mcr` | 8 / 12 / 30 | session lengths |
 | `session_idle_hours` | 12 | sign out after this long idle |
 | `login_rate_limit_per_5min`, `login_rate_limit_per_account_hour` | 5, 10 | login lockout |
@@ -488,6 +489,7 @@ A stopped job carries one of these codes; the desk shows a Greek hint.
 | `APPROVAL_EXPIRED` | no | not approved within 24 h; the held file was deleted |
 | `HELD_FILE_CHANGED` | no | the held file changed: not delivered |
 | `REPAIR_EXHAUSTED` | no | repair ran out of time or attempts |
+| `NON_PUBLIC_ADDRESS` | no | the link, or a stream behind it, is an internal address: not downloaded (see `egress_allow_networks`) |
 | `PIPELINE_FAILED` | no | unexpected error; see the job's history |
 
 ---
