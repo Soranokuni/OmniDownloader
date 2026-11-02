@@ -307,22 +307,28 @@ pub fn refresh_health(repo: &Repository, health: &HealthState) {
 
 /// Launch the browser on its test page and record the outcome.
 pub async fn check_browser(health: &HealthState) -> bool {
-    match StreamSniffer::self_test().await {
-        Ok(version) => {
-            info!("Browser self-test passed ({version})");
-            health.set(checks::BROWSER, Check::ok(format!("{version} works")));
-            true
-        }
-        Err(e) => {
-            warn!("Browser self-test failed: {e:#}");
-            health.set(
-                checks::BROWSER,
-                Check::degraded(format!(
-                    "the browser failed its test ({e:#}); video in news articles cannot be found until this is fixed"
-                )),
-            );
-            false
-        }
+    let result = StreamSniffer::self_test().await;
+    match &result {
+        Ok(version) => info!("Browser self-test passed ({version})"),
+        Err(e) => warn!("Browser self-test failed: {e:#}"),
+    }
+    let ok = result.is_ok();
+    health.set(checks::BROWSER, browser_check(result));
+    ok
+}
+
+/// The `browser` line for a self-test result. A browser that does not start with its sandbox
+/// (P2.13) is red: every article job needs it, and the fix is the account or the install, never
+/// turning the sandbox off. One that starts but fails its page is amber, as before.
+fn browser_check(result: anyhow::Result<String>) -> Check {
+    match result {
+        Ok(version) => Check::ok(format!("{version} works")),
+        Err(e) if e.chain().any(|c| c.to_string() == omni_browser::sniffer::SANDBOXED_LAUNCH_FAILED) => Check::down(format!(
+            "{e:#}; video in news articles cannot be found until the browser starts with its sandbox"
+        )),
+        Err(e) => Check::degraded(format!(
+            "the browser failed its test ({e:#}); video in news articles cannot be found until this is fixed"
+        )),
     }
 }
 
@@ -340,6 +346,21 @@ pub async fn run(repo: &Repository, ytdl: &Path, health: &HealthState) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A browser that will not start sandboxed is red, with the reason; a page failure stays amber (P2.13).
+    #[test]
+    fn a_failed_sandboxed_launch_turns_the_browser_line_red() {
+        use anyhow::Context;
+        use omni_core::health::Health;
+        let launch: anyhow::Result<String> = Err(anyhow::anyhow!("Failed launching Chromium via CDP"))
+            .context(omni_browser::sniffer::SANDBOXED_LAUNCH_FAILED);
+        let c = browser_check(launch);
+        assert_eq!(c.state, Health::Down);
+        assert!(c.detail.as_deref().unwrap_or("").contains("sandboxed launch failed"), "{c:?}");
+        let page: anyhow::Result<String> = Err(anyhow::anyhow!("the browser opened its test page but did not find the video on it"));
+        assert_eq!(browser_check(page).state, Health::Degraded);
+        assert_eq!(browser_check(Ok("Chrome/141.0.7390.55".into())).state, Health::Ok);
+    }
 
     fn link(label: &str, ok: Option<bool>) -> SelfcheckLink {
         SelfcheckLink {

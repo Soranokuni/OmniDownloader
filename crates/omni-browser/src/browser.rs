@@ -138,12 +138,14 @@ pub fn desktop_user_agent(edge: bool, major: u32) -> String {
 }
 
 /// The flags every headless launch (sniffer and cookie export) adds to chromiumoxide's.
+/// Never `--no-sandbox` (P2.13): a renderer exploit on a mailed page must stay inside
+/// Chromium's sandbox, not run as the service account. A launch that fails sandboxed is
+/// an error (the self-test turns the `browser` line red), never a relaunch without it.
 pub fn headless_args(edge: bool, major: u32) -> Vec<String> {
     vec![
         "--headless=new".to_string(),
         "--disable-gpu".to_string(),
         "--mute-audio".to_string(),
-        "--no-sandbox".to_string(),
         "--disable-dev-shm-usage".to_string(),
         format!("--user-agent={}", desktop_user_agent(edge, major)),
     ]
@@ -239,14 +241,17 @@ mod tests {
     }
 
     #[test]
-    fn the_sniffer_launch_flags_are_unchanged() {
+    fn the_sniffer_launch_flags_keep_the_sandbox() {
+        for edge in [true, false] {
+            let args = headless_args(edge, 141);
+            assert!(!args.iter().any(|a| a.contains("no-sandbox")), "the sandbox is never turned off: {args:?}");
+        }
         assert_eq!(
             headless_args(true, 141),
             [
                 "--headless=new",
                 "--disable-gpu",
                 "--mute-audio",
-                "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
             ]

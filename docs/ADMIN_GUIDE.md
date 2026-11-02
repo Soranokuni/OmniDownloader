@@ -416,7 +416,7 @@ Green = ok, amber = degraded, red = down.
 | `pinned_tools` | a tool is missing or not the pinned build: **Admin → Toolchain → Install / Repair**, then restart the service if it was missing |
 | `encoder` | the encoder self-test failed |
 | `watchfolder` | the watchfolder is not writable (red) |
-| `browser` | no Edge/Chrome usable |
+| `browser` | Edge/Chrome failed its test page (amber); **red "sandboxed launch failed"**: the browser does not start at all. It always runs with Chromium's sandbox, which is never turned off: check the service account and the browser install |
 | `disk` | low space (amber); almost full, no new job starts (red) |
 | `queue` | jobs are waiting or running unusually long |
 | `selfcheck` | a daily check link failed |
