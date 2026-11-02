@@ -816,6 +816,10 @@ async fn main() -> Result<()> {
                         error!("Daemon error inside Windows Service: {:?}", e);
                     }
                 });
+                // Dropping the runtime waits without limit for blocking tasks
+                // (a stuck mail fetch); SCM must hear SERVICE_STOPPED within
+                // the wait hint the stop reported (P2.15).
+                rt.shutdown_timeout(Duration::from_secs(20));
             })?;
         }
         Some(Commands::Setup) => {
@@ -1971,11 +1975,67 @@ async fn run_daemon(
         info!("Ctrl+C received. Initiating graceful shutdown...");
     }
 
+    // First, so no job still encoding starts a copy the stop below would cut.
+    broadcast_engine.stop_new_deliveries();
     let _ = shutdown_tx.send(());
     tokio::time::sleep(Duration::from_millis(800)).await;
+    // A job already delivering is let finish: dropped mid-copy it leaves its
+    // `.slug.mxf.tmp`, which takes the slug from its own re-run (`_2`), and
+    // dropped after the rename it is requeued and delivered twice (P2.15).
+    // A database error counts as delivering: one failed read must not end the wait.
+    let stuck = wait_for_deliveries(&busy_jobs, |id| match repo.get_job(id) {
+        Ok(row) => row.map(|j| (j.status, j.stage)),
+        Err(_) => Some((JobStatus::Running, JobStage::Deliver)),
+    }, SHUTDOWN_DELIVERY_BUDGET).await;
+    if stuck > 0 {
+        warn!("{stuck} job(s) still delivering after {} s; stopping anyway", SHUTDOWN_DELIVERY_BUDGET.as_secs());
+    }
+    // The rest stay RUNNING under this host's lease: their tools die with the
+    // process (job object) and the next start's recovery requeues them.
+    let left = busy_jobs.len();
+    if left > 0 {
+        info!("{left} job(s) in flight are left to start-up recovery");
+    }
     info!("OmniDownloader shutdown complete. Goodbye!");
 
     Ok(())
+}
+
+/// How long a stop waits for jobs that have reached the watchfolder step.
+/// With the runtime's 20 s shutdown it stays inside the service's stop wait
+/// hint (`omni_service` STOP_WAIT_HINT, 60 s).
+const SHUTDOWN_DELIVERY_BUDGET: Duration = Duration::from_secs(25);
+
+/// A running job at DELIVER or later: stopping it now costs a stale staging
+/// file or a second delivery, so a stop waits for it.
+fn is_delivering(status: JobStatus, stage: JobStage) -> bool {
+    status == JobStatus::Running && matches!(stage, JobStage::Deliver | JobStage::Archive | JobStage::Done)
+}
+
+/// Wait until no busy job is delivering, up to `budget`; how many still are.
+/// Re-checked every poll, so a job that reaches DELIVER meanwhile is waited for too.
+async fn wait_for_deliveries(
+    busy: &omni_core::busy::BusyJobs,
+    status_of: impl Fn(i64) -> Option<(JobStatus, JobStage)>,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut announced = false;
+    loop {
+        let delivering = busy
+            .ids()
+            .into_iter()
+            .filter(|id| status_of(*id).is_some_and(|(status, stage)| is_delivering(status, stage)))
+            .count();
+        if delivering == 0 || tokio::time::Instant::now() >= deadline {
+            return delivering;
+        }
+        if !announced {
+            info!("Waiting up to {} s for {delivering} job(s) delivering to the watchfolder", budget.as_secs());
+            announced = true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Lease renewal interval and lease length.
@@ -4516,6 +4576,49 @@ fn sweep_evidence_with(
 
 #[cfg(test)]
 mod tests {
+    /// P2.15: a stop lets a job that reached the watchfolder step finish, so it
+    /// leaves neither a stale `.tmp` holding its slug nor a requeue that
+    /// delivers it twice; earlier stages are left to recovery at once.
+    #[tokio::test]
+    async fn a_stop_waits_for_a_delivering_job_and_for_nothing_else() {
+        use omni_core::models::{JobStage, JobStatus};
+        use std::time::Duration;
+        let busy = omni_core::busy::BusyJobs::new();
+        let budget = Duration::from_secs(5);
+
+        // Nothing busy, and a job still transcoding: no wait.
+        let t = std::time::Instant::now();
+        assert_eq!(super::wait_for_deliveries(&busy, |_| None, budget).await, 0);
+        let transcoding = busy.guard(1, "w1");
+        assert_eq!(super::wait_for_deliveries(&busy, |_| Some((JobStatus::Running, JobStage::Transcode)), budget).await, 0);
+        assert!(t.elapsed() < Duration::from_secs(1));
+
+        // A delivering job is waited for until its worker is done with it.
+        let delivering = busy.guard(2, "w2");
+        let stage = |id: i64| Some((JobStatus::Running, if id == 2 { JobStage::Deliver } else { JobStage::Transcode }));
+        let t = std::time::Instant::now();
+        let done = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            drop(delivering);
+        });
+        assert_eq!(super::wait_for_deliveries(&busy, stage, budget).await, 0);
+        assert!(t.elapsed() >= Duration::from_millis(500), "returned before the delivery ended");
+        done.await.unwrap();
+
+        // One that never ends is given up on at the budget, and counted.
+        let _stuck = busy.guard(3, "w3");
+        let t = std::time::Instant::now();
+        let left = super::wait_for_deliveries(&busy, |id| Some((JobStatus::Running, if id == 3 { JobStage::Archive } else { JobStage::Transcode })), Duration::from_millis(400)).await;
+        assert_eq!(left, 1);
+        assert!(t.elapsed() < Duration::from_secs(2));
+        drop(transcoding);
+
+        // A job already finished in the database is not waited for.
+        assert!(!super::is_delivering(JobStatus::Completed, JobStage::Done));
+        assert!(super::is_delivering(JobStatus::Running, JobStage::Deliver));
+        assert!(!super::is_delivering(JobStatus::Running, JobStage::Verify));
+    }
+
     #[test]
     fn the_banner_names_deno_even_when_it_is_missing() {
         // An empty bin dir that need not exist: nothing is written.

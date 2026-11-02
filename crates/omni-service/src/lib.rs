@@ -43,21 +43,64 @@ mod windows_impl {
         }
     }
 
+    /// How long SCM is told a stop may take: the daemon's own drain plus the
+    /// runtime's shutdown budget, with room to spare.
+    pub(crate) const STOP_WAIT_HINT: Duration = Duration::from_secs(60);
+
+    /// What the control handler does with one control (P2.15).
+    ///
+    /// It runs on the dispatcher thread, which is `main`'s and so inside the
+    /// `#[tokio::main]` runtime: `blocking_send` there panics, a panic cannot
+    /// unwind out of the `extern "system"` callback, and the process aborts
+    /// with the stop half done — SCM's caller sees "The pipe has been ended"
+    /// (os error 109) and the daemon never logs that it was asked to stop.
+    /// `try_send` never blocks; a second Stop while the first is queued is
+    /// the same request and is dropped.
+    pub(crate) fn on_control(control: ServiceControl, shutdown_tx: &tokio::sync::mpsc::Sender<()>) -> ServiceControlHandlerResult {
+        match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = shutdown_tx.try_send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    }
+
+    fn stop_pending() -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::StopPending,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: STOP_WAIT_HINT,
+            process_id: None,
+        }
+    }
+
     fn run_service_impl() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        // Set once registered: the handler reports STOP_PENDING itself, so SCM
+        // waits for the drain instead of calling the service hung. Taken back
+        // under the same lock before STOPPED, so a late STOP_PENDING can never
+        // follow it.
+        let handle_cell: std::sync::Arc<Mutex<Option<service_control_handler::ServiceStatusHandle>>> =
+            Default::default();
+        let handler_cell = handle_cell.clone();
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
-            match control_event {
-                ServiceControl::Stop | ServiceControl::Shutdown => {
-                    let _ = shutdown_tx.blocking_send(());
-                    ServiceControlHandlerResult::NoError
+            if matches!(control_event, ServiceControl::Stop | ServiceControl::Shutdown) {
+                let cell = handler_cell.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(h) = cell.as_ref() {
+                    let _ = h.set_service_status(stop_pending());
                 }
-                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-                _ => ServiceControlHandlerResult::NotImplemented,
             }
+            on_control(control_event, &shutdown_tx)
         };
 
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
             .context("Failed registering service control handler")?;
+        *handle_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(status_handle);
 
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -91,6 +134,11 @@ mod windows_impl {
             &format!("{SERVICE_DISPLAY_NAME} stopped."),
         );
 
+        let _no_more_pending = {
+            let mut cell = handle_cell.lock().unwrap_or_else(|p| p.into_inner());
+            cell.take();
+            cell
+        };
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Stopped,
@@ -149,7 +197,7 @@ mod windows_impl {
         };
 
         let service = manager
-            .create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
+            .create_service(&service_info, INSTALL_ACCESS)
             .context("Failed creating Windows Service")?;
 
         let _ = service.set_description(SERVICE_DESCRIPTION);
@@ -169,10 +217,12 @@ mod windows_impl {
             actions: Some(vec![restart(60), restart(60), restart(300)]),
         };
         if let Err(e) = service.update_failure_actions(actions) {
-            info!("Restart-on-failure not set ({e})");
+            info!("Restart-on-failure not set ({})", winapi_detail(&e));
         }
         // Also when the process exits with an error rather than crashing.
-        let _ = service.set_failure_actions_on_non_crash_failures(true);
+        if let Err(e) = service.set_failure_actions_on_non_crash_failures(true) {
+            info!("Restart after a non-crash failure not set ({})", winapi_detail(&e));
+        }
 
         // Register the Event Log source while we still have the administrator
         // rights that creating a service required. A failure here is not fatal
@@ -193,6 +243,23 @@ mod windows_impl {
             ),
         }
         Ok(())
+    }
+
+    /// The handle `install` configures the new service through. Restart
+    /// failure actions need SERVICE_START as well as SERVICE_CHANGE_CONFIG
+    /// (ChangeServiceConfig2, SERVICE_CONFIG_FAILURE_ACTIONS); without it the
+    /// call is refused with access denied and the service is never restarted
+    /// after a crash (P2.15).
+    pub(crate) const INSTALL_ACCESS: ServiceAccess =
+        ServiceAccess::CHANGE_CONFIG.union(ServiceAccess::START);
+
+    /// windows-service prints every OS error as "IO error in winapi call";
+    /// the OS error itself is in the source.
+    fn winapi_detail(e: &windows_service::Error) -> String {
+        match std::error::Error::source(e) {
+            Some(inner) => format!("{e}: {inner}"),
+            None => e.to_string(),
+        }
     }
 
     pub fn uninstall() -> Result<()> {
@@ -458,6 +525,41 @@ mod tests {
                 "{name} is a real account and does need a password"
             );
         }
+    }
+
+    /// P2.15: SCM's Stop reaches the handler on `main`'s thread, inside the
+    /// `#[tokio::main]` runtime. Blocking there panicked and aborted the
+    /// process mid-stop (os error 109, no shutdown logged).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_stop_inside_a_runtime_neither_panics_nor_blocks_and_reaches_the_daemon() {
+        use windows_service::service::ServiceControl;
+        use windows_service::service_control_handler::ServiceControlHandlerResult;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        for c in [ServiceControl::Stop, ServiceControl::Shutdown, ServiceControl::Stop] {
+            // The channel holds one: the second and third find it full and
+            // must return at once rather than wait for the daemon.
+            assert!(matches!(windows_impl::on_control(c, &tx), ServiceControlHandlerResult::NoError));
+        }
+        assert!(rx.try_recv().is_ok(), "the stop request reaches the daemon");
+        assert!(matches!(
+            windows_impl::on_control(ServiceControl::Interrogate, &tx),
+            ServiceControlHandlerResult::NoError
+        ));
+        // A daemon that already returned (receiver gone) is no reason to panic either.
+        drop(rx);
+        assert!(matches!(windows_impl::on_control(ServiceControl::Stop, &tx), ServiceControlHandlerResult::NoError));
+    }
+
+    /// P2.15: restart-on-failure was refused at install (access denied shown
+    /// only as "IO error in winapi call") because the handle lacked START.
+    #[cfg(windows)]
+    #[test]
+    fn the_install_handle_may_set_restart_failure_actions() {
+        use windows_service::service::ServiceAccess;
+        assert!(windows_impl::INSTALL_ACCESS.contains(ServiceAccess::CHANGE_CONFIG));
+        assert!(windows_impl::INSTALL_ACCESS.contains(ServiceAccess::START));
+        assert!(windows_impl::STOP_WAIT_HINT.as_secs() >= 50, "covers the 25 s delivery wait plus the 20 s runtime shutdown");
     }
 
     #[test]

@@ -273,6 +273,9 @@ pub struct BroadcastEngine {
     /// Where a delivered job's source goes instead of the bin (P1.7); `None`
     /// when the archive is switched off.
     archive: Option<omni_core::archive::ArchiveSettings>,
+    /// Set once the daemon is stopping (P2.15): no job enters DELIVER after
+    /// it, so none starts a watchfolder copy the stop would cut.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BroadcastEngine {
@@ -349,7 +352,16 @@ impl BroadcastEngine {
             login_sites: Arc::new(Mutex::new(HashMap::new())),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
             archive: None,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The daemon is stopping: a job reaching DELIVER from now on waits just before it
+    /// (P2.15). It is still at its earlier stage under this host's lease, so
+    /// the next start requeues it cleanly, with no staging file in the
+    /// watchfolder. Deliveries already copying are not affected.
+    pub fn stop_new_deliveries(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The videos yt-dlp sees on a news page that holds several, in page
@@ -422,6 +434,10 @@ impl BroadcastEngine {
     /// another worker took, must not reach the watchfolder from here. Writes
     /// no event and no audit row: the job is not ours to write to.
     async fn enter_stage(&self, job_id: i64, owner: &str, stage: JobStage, job_temp: &Path) -> Result<()> {
+        if stage == JobStage::Deliver && self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("Job #{job_id}: the daemon is stopping; not starting its delivery");
+            std::future::pending::<()>().await;
+        }
         match self.repo.set_stage(job_id, owner, stage) {
             Ok(true) => Ok(()),
             Ok(false) => Err(self.lost(job_id, stage, job_temp).await),
@@ -1186,5 +1202,62 @@ impl BroadcastEngine {
         let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Verify), &err_msg);
         let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{job_id}: {err_msg}"));
         anyhow::anyhow!("{}: {err_msg}", ErrorCode::HeldFileChanged.as_str()).context(ErrorCode::HeldFileChanged.as_str())
+    }
+}
+
+#[cfg(test)]
+mod stopping_tests {
+    use super::*;
+    use omni_core::models::NewJob;
+    use omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS;
+
+    /// P2.15: once the daemon is stopping, a job that finishes encoding does
+    /// not start its watchfolder copy (a stop would cut it and leave a stale
+    /// `.tmp` that pushes the re-run to `_2`); earlier stages go on as ever.
+    #[tokio::test]
+    async fn a_stopping_engine_starts_no_new_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let engine = BroadcastEngine::new(
+            repo.clone(),
+            dir.path().join("yt-dlp.exe"),
+            dir.path().join("ffmpeg.exe"),
+            dir.path().join("ffprobe.exe"),
+            dir.path().join("bmxtranswrap.exe"),
+            dir.path().join("temp"),
+            dir.path().join("watchfolder"),
+        );
+        let id = repo
+            .enqueue(&NewJob::new("https://example.org/v/1", "1_PAPADAKI_LIMANI", "PAPADAKI"), DEFAULT_DEDUP_WINDOW_HOURS)
+            .unwrap()
+            .job_id();
+        repo.lease_job("w1", 180).unwrap().expect("leasable");
+        let job_temp = dir.path().join("temp").join(id.to_string());
+
+        // Earlier stages go on whether or not the engine is stopping.
+        let shared = engine.clone();
+        engine.enter_stage(id, "w1", JobStage::Verify, &job_temp).await.unwrap();
+        shared.stop_new_deliveries(); // a clone shares the flag, as the workers' Arc does
+        engine.enter_stage(id, "w1", JobStage::Verify, &job_temp).await.unwrap();
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            engine.enter_stage(id, "w1", JobStage::Deliver, &job_temp),
+        )
+        .await;
+        assert!(blocked.is_err(), "a stopping engine must not enter DELIVER");
+        assert_eq!(repo.get_job(id).unwrap().unwrap().stage, JobStage::Verify, "recovery sees the job before delivery");
+
+        // Not stopping: DELIVER is entered at once.
+        let fresh = BroadcastEngine::new(
+            repo.clone(),
+            dir.path().join("yt-dlp.exe"),
+            dir.path().join("ffmpeg.exe"),
+            dir.path().join("ffprobe.exe"),
+            dir.path().join("bmxtranswrap.exe"),
+            dir.path().join("temp"),
+            dir.path().join("watchfolder"),
+        );
+        fresh.enter_stage(id, "w1", JobStage::Deliver, &job_temp).await.unwrap();
+        assert_eq!(repo.get_job(id).unwrap().unwrap().stage, JobStage::Deliver);
     }
 }
