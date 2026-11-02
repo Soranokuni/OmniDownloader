@@ -137,6 +137,13 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
+    /// Extra names the panel may be reached by (DNS alias, reverse-proxy name),
+    /// on top of this machine's own names and addresses. A request whose `Host`
+    /// is in none of them gets a 421 (P2.17, DNS-rebinding defence). Read once
+    /// at start-up.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+
     /// Networks the job path may request although they are loopback, private or
     /// reserved (CIDR form). Empty (the default): the normal job path never
     /// requests an internal address (P2.12).
@@ -208,6 +215,7 @@ impl Default for SecurityConfig {
             mcr_open_networks: default_mcr_open_networks(),
             trust_proxy_header: false,
             trusted_proxies: Vec::new(),
+            allowed_hosts: Vec::new(),
             egress_allow_networks: Vec::new(),
             session_hours_user: default_session_hours_user(),
             session_hours_admin: default_session_hours_admin(),

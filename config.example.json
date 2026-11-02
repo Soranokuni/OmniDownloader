@@ -15,6 +15,7 @@
 
     "trust_proxy_header": false,
     "trusted_proxies": [],
+    "allowed_hosts": [],
 
     "egress_allow_networks": [],
 

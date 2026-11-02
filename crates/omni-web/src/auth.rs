@@ -99,11 +99,22 @@ pub fn client_ip(parts: &Parts, trusted_proxies: &CidrSet, trust_proxy_header: b
     let peer = peer_addr(parts).map(|addr| unmap_v4(addr.ip()))?;
 
     if trust_proxy_header && trusted_proxies.contains(peer) {
-        if let Some(forwarded) = forwarded_for(&parts.headers) {
-            return Some(forwarded);
+        match forwarded_for(&parts.headers, trusted_proxies) {
+            Forwarded::Absent => {}
+            Forwarded::Client(ip) => return Some(ip),
+            // A header the trusted proxy relayed but we cannot read: the peer is
+            // the proxy, and giving the proxy's address (often loopback) to an
+            // unknown client would hand it that machine's privileges.
+            Forwarded::Unresolved => return None,
         }
     }
     Some(peer)
+}
+
+/// The socket peer alone, for keys that need *some* address (the login lockout
+/// bucket) when [`client_ip`] could not name the client.
+pub(crate) fn peer_ip(parts: &Parts) -> Option<IpAddr> {
+    peer_addr(parts).map(|addr| unmap_v4(addr.ip()))
 }
 
 /// The socket peer, read the same way axum's `ConnectInfo` extractor reads it.
@@ -114,7 +125,7 @@ pub fn client_ip(parts: &Parts, trusted_proxies: &CidrSet, trust_proxy_header: b
 /// direct `extensions.get::<ConnectInfo<_>>()` silently returns `None` under
 /// test and every allowlist case looks denied. Both are checked here, so the
 /// tests exercise the same code path production does.
-fn peer_addr(parts: &Parts) -> Option<SocketAddr> {
+pub(crate) fn peer_addr(parts: &Parts) -> Option<SocketAddr> {
     if let Some(ConnectInfo(addr)) = parts.extensions.get::<ConnectInfo<SocketAddr>>() {
         return Some(*addr);
     }
@@ -124,21 +135,75 @@ fn peer_addr(parts: &Parts) -> Option<SocketAddr> {
         .map(|m| m.0)
 }
 
-/// Left-most entry of `X-Forwarded-For` — the original client, as written by
-/// the proxy we just decided to believe.
-fn forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
-    let raw = headers.get("x-forwarded-for")?.to_str().ok()?;
-    let first = raw.split(',').next()?.trim();
-    // A proxy may write `ip:port` for IPv4 or `[v6]:port`.
-    let candidate = first
-        .strip_prefix('[')
-        .and_then(|s| s.split(']').next())
-        .unwrap_or_else(|| first.rsplit_once(':').map(|(h, _)| h).unwrap_or(first));
-    candidate
-        .parse::<IpAddr>()
-        .or_else(|_| first.parse::<IpAddr>())
-        .ok()
-        .map(unmap_v4)
+/// What `X-Forwarded-For` said, as far as a trusted proxy's word goes.
+enum Forwarded {
+    /// No such header: the peer is talking for itself.
+    Absent,
+    /// The client address.
+    Client(IpAddr),
+    /// Present, but the walk reached something that is not an address (garbage,
+    /// or a line that is not plain ASCII).
+    Unresolved,
+}
+
+/// The real client in `X-Forwarded-For`, read from the right.
+///
+/// Proxies append the peer they saw to whatever the client sent, so the
+/// left-most entries are client-written and anything may be in them. Walking
+/// from the right, every entry a trusted proxy added is skipped; the first one
+/// that is not a trusted proxy is the client as our own infrastructure saw it.
+/// When every entry is a trusted proxy the left-most is used. An entry that does
+/// not parse ends the walk as [`Forwarded::Unresolved`]: never fall back to an
+/// earlier, client-written entry, and the caller never falls back to the peer.
+fn forwarded_for(headers: &HeaderMap, trusted_proxies: &CidrSet) -> Forwarded {
+    // Several header lines are one list, in order. Each line is judged alone: a
+    // line that is not visible ASCII contributes one unresolvable entry.
+    let mut entries: Vec<Option<IpAddr>> = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        match value.to_str() {
+            Ok(line) => entries.extend(line.split(',').map(|e| parse_forwarded_entry(e.trim()))),
+            Err(_) => entries.push(None),
+        }
+    }
+    let mut leftmost = None;
+    for entry in entries.iter().rev() {
+        let Some(ip) = *entry else {
+            return Forwarded::Unresolved;
+        };
+        if !trusted_proxies.contains(ip) {
+            return Forwarded::Client(ip);
+        }
+        leftmost = Some(ip);
+    }
+    match leftmost {
+        Some(ip) => Forwarded::Client(ip),
+        None => Forwarded::Absent,
+    }
+}
+
+/// One `X-Forwarded-For` entry: `ip`, `ip:port`, `[v6]` or `[v6]:port`.
+///
+/// The whole entry is tried as an address first, so a bare IPv6 such as
+/// `::ffff:10.20.1.5` or `2001:db8::a:b` is never cut at its last colon. A
+/// `:port` is stripped only from an entry with exactly one colon.
+fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Some(unmap_v4(ip));
+    }
+    if let Ok(sa) = entry.parse::<SocketAddr>() {
+        return Some(unmap_v4(sa.ip()));
+    }
+    // `[v6]` without a port.
+    if let Some(inner) = entry.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return inner.parse::<IpAddr>().ok().map(unmap_v4);
+    }
+    if entry.matches(':').count() == 1 {
+        let (host, port) = entry.split_once(':')?;
+        if port.parse::<u16>().is_ok() {
+            return host.parse::<std::net::Ipv4Addr>().ok().map(|v4| IpAddr::V4(v4));
+        }
+    }
+    None
 }
 
 // ==========================================
@@ -494,12 +559,13 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_for_takes_the_left_most_entry_and_tolerates_ports() {
+    fn forwarded_for_takes_the_right_most_untrusted_entry_and_tolerates_ports() {
         let mut parts = parts_with_peer("127.0.0.1:1");
         let trusted = CidrSet::parse(&["127.0.0.1/32".to_string()]).unwrap();
 
         for (header, expected) in [
-            ("10.1.2.3, 192.168.0.1", "10.1.2.3"),
+            // Was the left-most ("10.1.2.3") before P2.17; that entry is client-written.
+            ("10.1.2.3, 192.168.0.1", "192.168.0.1"),
             ("10.1.2.3:5555", "10.1.2.3"),
             ("[2001:db8::1]:5555", "2001:db8::1"),
             ("2001:db8::1", "2001:db8::1"),
@@ -513,6 +579,85 @@ mod tests {
                 "header {header}"
             );
         }
+    }
+
+    fn resolve(peer: &str, header: &str, trusted: &[&str]) -> String {
+        resolve_opt(peer, header, trusted).expect("a client address")
+    }
+
+    fn resolve_opt(peer: &str, header: &str, trusted: &[&str]) -> Option<String> {
+        let mut parts = parts_with_peer(peer);
+        parts
+            .headers
+            .insert("x-forwarded-for", HeaderValue::from_str(header).unwrap());
+        let trusted = CidrSet::parse(&trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+        client_ip(&parts, &trusted, true).map(|ip| ip.to_string())
+    }
+
+    #[test]
+    fn forwarded_for_skips_the_proxy_appended_entry() {
+        // The proxy 10.0.0.1 appended the peer it saw, 10.0.0.9 here being
+        // another untrusted address; the client-written "1.2.3.4" is not the answer.
+        assert_eq!(resolve("10.0.0.1:5", "1.2.3.4, 10.0.0.9", &["10.0.0.1/32"]), "10.0.0.9");
+    }
+
+    #[test]
+    fn a_client_prepended_loopback_never_wins() {
+        let got = resolve("10.0.0.1:5", "127.0.0.1, 10.0.0.9", &["10.0.0.1/32"]);
+        assert_eq!(got, "10.0.0.9");
+        assert_ne!(got, "127.0.0.1");
+    }
+
+    #[test]
+    fn two_trusted_proxies_in_the_chain_resolve_to_the_real_client() {
+        let trusted = ["10.0.0.1/32", "10.0.0.2/32"];
+        assert_eq!(resolve("10.0.0.1:5", "203.0.113.7, 10.0.0.2", &trusted), "203.0.113.7");
+        // A forged left entry in front of the real one is still not reached.
+        assert_eq!(
+            resolve("10.0.0.1:5", "127.0.0.1, 203.0.113.7, 10.0.0.2", &trusted),
+            "203.0.113.7"
+        );
+        // Every entry trusted: the left-most.
+        assert_eq!(resolve("10.0.0.1:5", "10.0.0.2, 10.0.0.1", &trusted), "10.0.0.2");
+    }
+
+    #[test]
+    fn garbage_in_the_chain_resolves_to_no_client_never_the_proxy() {
+        let trusted = ["10.0.0.1/32", "10.0.0.2/32"];
+        // Unparseable entry between a trusted proxy and a believable-looking client.
+        assert_eq!(resolve_opt("10.0.0.1:5", "203.0.113.7, garbage, 10.0.0.2", &trusted), None);
+        // Garbage on the right: nothing to the left is trusted either.
+        assert_eq!(resolve_opt("10.0.0.1:5", "203.0.113.7, garbage", &trusted), None);
+        // Garbage left of the first untrusted entry is never reached.
+        assert_eq!(resolve("10.0.0.1:5", "garbage, 203.0.113.7", &trusted), "203.0.113.7");
+    }
+
+    #[test]
+    fn a_non_ascii_forwarded_line_from_a_trusted_proxy_resolves_to_no_client() {
+        let mut parts = parts_with_peer("127.0.0.1:1");
+        let trusted = CidrSet::parse(&["127.0.0.1/32".to_string()]).unwrap();
+        parts
+            .headers
+            .insert("x-forwarded-for", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(client_ip(&parts, &trusted, true), None);
+        // A readable, untrusted line to its right is reached first and wins.
+        parts
+            .headers
+            .append("x-forwarded-for", HeaderValue::from_static("10.0.0.2"));
+        assert_eq!(client_ip(&parts, &trusted, true).unwrap().to_string(), "10.0.0.2");
+        // With no header at all the peer speaks for itself.
+        parts.headers.remove("x-forwarded-for");
+        assert_eq!(client_ip(&parts, &trusted, true).unwrap().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn bare_ipv6_entries_are_not_cut_at_the_last_colon() {
+        let trusted = ["10.0.0.1/32"];
+        assert_eq!(resolve("10.0.0.1:5", "::ffff:10.20.1.5", &trusted), "10.20.1.5");
+        assert_eq!(resolve("10.0.0.1:5", "2001:db8::a:b", &trusted), "2001:db8::a:b");
+        assert_eq!(resolve("10.0.0.1:5", "[2001:db8::a:b]:443", &trusted), "2001:db8::a:b");
+        assert_eq!(resolve("10.0.0.1:5", "[2001:db8::1]", &trusted), "2001:db8::1");
+        assert_eq!(resolve("10.0.0.1:5", "10.20.1.5:443", &trusted), "10.20.1.5");
     }
 
     #[test]

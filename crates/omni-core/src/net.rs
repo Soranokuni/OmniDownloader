@@ -240,6 +240,127 @@ pub fn unmap_v4(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The names this machine answers to: NetBIOS name, DNS host name and DNS FQDN
+/// (P2.17), lower-cased, without duplicates or blanks. Used to build the `Host`
+/// allowlist. On a non-Windows build only `COMPUTERNAME` / `HOSTNAME` are read.
+pub fn local_host_names() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::{
+            ComputerNameDnsFullyQualified, ComputerNameDnsHostname, ComputerNameNetBIOS,
+            GetComputerNameExW, COMPUTER_NAME_FORMAT,
+        };
+        let read = |kind: COMPUTER_NAME_FORMAT| -> Option<String> {
+            let mut len: u32 = 0;
+            // First call reports the size needed (and fails with ERROR_MORE_DATA).
+            // SAFETY: a null buffer with `len` = 0 is the documented size query; `len` is a live local.
+            let _ = unsafe { GetComputerNameExW(kind, windows::core::PWSTR::null(), &mut len) };
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let mut len = buf.len() as u32;
+            // SAFETY: `buf` holds `len` UTF-16 units and outlives the call; `len` is a live local.
+            unsafe { GetComputerNameExW(kind, windows::core::PWSTR(buf.as_mut_ptr()), &mut len) }.ok()?;
+            Some(String::from_utf16_lossy(&buf[..len as usize]))
+        };
+        for kind in [ComputerNameNetBIOS, ComputerNameDnsHostname, ComputerNameDnsFullyQualified] {
+            if let Some(n) = read(kind) {
+                names.push(n);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for var in ["COMPUTERNAME", "HOSTNAME"] {
+            if let Ok(n) = std::env::var(var) {
+                names.push(n);
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for n in names {
+        let n = n.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Every unicast address of every local network interface (P2.17). Empty when
+/// the OS call fails; the caller still has the loopback names.
+pub fn local_ip_addrs() -> Vec<IpAddr> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+            GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        };
+        use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
+
+        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+        let mut out = Vec::new();
+        // The adapter list can change between the size query and the fill, so retry.
+        let mut size: u32 = 15_000;
+        for _ in 0..4 {
+            // u64 elements keep the buffer 8-byte aligned for the adapter structs.
+            let mut buf = vec![0u64; (size as usize).div_ceil(8) + 1];
+            let head = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+            // SAFETY: `head` points at `buf`, at least `size` bytes and 8-byte aligned, alive for the
+            // whole call and for the list walk below; `size` is a live local.
+            let rc = unsafe { GetAdaptersAddresses(AF_UNSPEC.0 as u32, flags, None, Some(head), &mut size) };
+            if rc == 111 {
+                // ERROR_BUFFER_OVERFLOW: `size` now holds the length needed.
+                continue;
+            }
+            if rc != 0 {
+                return out;
+            }
+            let mut adapter = head as *const IP_ADAPTER_ADDRESSES_LH;
+            while !adapter.is_null() {
+                // SAFETY: `adapter` is `head` or an `.Next` of a list the OS filled into `buf`,
+                // which is still alive; the list ends with a null `Next`.
+                let a = unsafe { &*adapter };
+                let mut u = a.FirstUnicastAddress;
+                while !u.is_null() {
+                    // SAFETY: `u` is non-null and part of the same OS-filled list inside `buf`.
+                    let ua = unsafe { &*u };
+                    let sa = ua.Address.lpSockaddr;
+                    if !sa.is_null() {
+                        // SAFETY: `sa` is non-null and points at a sockaddr inside `buf`.
+                        let family = unsafe { (*sa).sa_family };
+                        if family == AF_INET {
+                            // SAFETY: family AF_INET means the sockaddr is a SOCKADDR_IN.
+                            let s = unsafe { &*(sa as *const SOCKADDR_IN) };
+                            out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                                // SAFETY: reading the plain-integer view of the address union.
+                                unsafe { s.sin_addr.S_un.S_addr },
+                            ))));
+                        } else if family == AF_INET6 {
+                            // SAFETY: family AF_INET6 means the sockaddr is a SOCKADDR_IN6.
+                            let s = unsafe { &*(sa as *const SOCKADDR_IN6) };
+                            out.push(IpAddr::V6(Ipv6Addr::from(
+                                // SAFETY: reading the byte view of the address union.
+                                unsafe { s.sin6_addr.u.Byte },
+                            )));
+                        }
+                    }
+                    u = ua.Next;
+                }
+                adapter = a.Next;
+            }
+            return out;
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 /// True for an address an outbound fetch must never reach: private, loopback,
 /// link-local, CGNAT, multicast, reserved, documentation and benchmarking
 /// ranges, ULA, and every IPv6 form that embeds an IPv4 address
@@ -718,6 +839,15 @@ pub async fn get_public(url: &str, how: PublicGet<'_>) -> Option<reqwest::Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn this_machine_has_a_name_and_an_address() {
+        let names = local_host_names();
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|n| *n == n.to_ascii_lowercase() && !n.ends_with('.')));
+        assert!(!local_ip_addrs().is_empty(), "GetAdaptersAddresses returned nothing");
+    }
 
     #[test]
     fn public_ip_range_edges() {
