@@ -149,7 +149,10 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         )
     };
     let ip = client_ip(&parts, &trusted, trust_header);
-    let ip_str = ip.map(|i| i.to_string());
+    // The per-IP lockout bucket still needs a key when the forwarded address is
+    // unresolved (`ip` is then `None`): the socket peer. Policy checks keep `ip`.
+    let limiter_ip = ip.or_else(|| crate::auth::peer_ip(&parts));
+    let ip_str = limiter_ip.map(|i| i.to_string());
     let user_agent = parts
         .headers
         .get(axum::http::header::USER_AGENT)
@@ -158,7 +161,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
 
     // Rate limit first, so a locked-out caller never reaches the password
     // comparison and cannot use its timing as an oracle.
-    if let Decision::Deny { retry_after } = state.login_limiter.check(ip, &payload.email) {
+    if let Decision::Deny { retry_after } = state.login_limiter.check(limiter_ip, &payload.email) {
         let _ = state.repo.record_login_attempt(
             Some(&payload.email),
             ip_str.as_deref(),
@@ -189,7 +192,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         Ok(None) => {
             // Same response and same wording as a wrong password: the login
             // form must not tell an anonymous caller which addresses exist.
-            state.login_limiter.record_failure(ip, &payload.email);
+            state.login_limiter.record_failure(limiter_ip, &payload.email);
             let _ = state.repo.record_login_attempt(
                 Some(&payload.email),
                 ip_str.as_deref(),
@@ -205,7 +208,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
     };
 
     if !user.is_active {
-        state.login_limiter.record_failure(ip, &payload.email);
+        state.login_limiter.record_failure(limiter_ip, &payload.email);
         let _ = state.repo.record_login_attempt(
             Some(&payload.email),
             ip_str.as_deref(),
@@ -216,7 +219,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
     }
 
     if !verify_password(&payload.password, &user.password_hash) {
-        state.login_limiter.record_failure(ip, &payload.email);
+        state.login_limiter.record_failure(limiter_ip, &payload.email);
         let _ = state.repo.record_login_attempt(
             Some(&payload.email),
             ip_str.as_deref(),
@@ -242,7 +245,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         state.default_admin_live.store(default_login, std::sync::atomic::Ordering::Relaxed);
     }
     if default_login && !matches!(ip, Some(i) if i.is_loopback()) {
-        state.login_limiter.record_failure(ip, &payload.email);
+        state.login_limiter.record_failure(limiter_ip, &payload.email);
         let _ = state.repo.record_login_attempt(
             Some(&payload.email),
             ip_str.as_deref(),
@@ -273,7 +276,7 @@ pub async fn api_login(State(state): State<AppState>, req: Request) -> Response 
         return ApiError::internal("Sign-in is temporarily unavailable.").into_response();
     }
 
-    state.login_limiter.record_success(ip, &payload.email);
+    state.login_limiter.record_success(limiter_ip, &payload.email);
     let _ = state
         .repo
         .record_login_attempt(Some(&payload.email), ip_str.as_deref(), true, None);

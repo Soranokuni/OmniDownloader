@@ -503,3 +503,75 @@ async fn setup_accepts_a_blank_llm_endpoint() -> Result<()> {
     }
     Ok(())
 }
+
+/// A raw request so the forwarded header can hold bytes `&str` cannot.
+async fn raw(app: &App, method: &str, uri: &str, peer: &str, xff: Option<&[u8]>, body: Option<Value>) -> Reply {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(x) = xff {
+        req = req.header("x-forwarded-for", axum::http::HeaderValue::from_bytes(x).unwrap());
+    }
+    let body = match body {
+        Some(b) => {
+            req = req
+                .header("content-type", "application/json")
+                .header("x-omni-request", "1")
+                .header("host", "mcr.local")
+                .header("origin", "http://mcr.local");
+            Body::from(b.to_string())
+        }
+        None => Body::empty(),
+    };
+    let res = app
+        .router
+        .clone()
+        .layer(MockConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+        .oneshot(req.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let cookie = res.headers().get("set-cookie").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let body = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned();
+    Reply { status, cookie, body }
+}
+
+#[tokio::test]
+async fn an_unreadable_forwarded_header_from_a_trusted_proxy_is_not_the_proxy_itself() -> Result<()> {
+    let a = app(
+        |c| {
+            c.security.trust_proxy_header = true;
+            c.security.trusted_proxies = vec!["127.0.0.1/32".to_string()];
+        },
+        false,
+    )?;
+
+    // Control: the proxy on this machine with no forwarded header is the machine
+    // itself, which the default allowlist lets into the MCR API.
+    let r = raw(&a, "GET", "/api/jobs", LOOPBACK, None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    // A non-ASCII line: the client is unknown, so it is on no allowlist.
+    let r = raw(&a, "GET", "/api/jobs", LOOPBACK, Some(b"\xff"), None).await;
+    assert!(
+        r.status == StatusCode::UNAUTHORIZED || r.status == StatusCode::FORBIDDEN,
+        "got {} {}",
+        r.status,
+        r.body
+    );
+    // ... and so is garbage reached in the walk.
+    let r = raw(&a, "GET", "/api/jobs", LOOPBACK, Some(b"not-an-address"), None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    // The loopback-only default login is refused, and no session is made.
+    let r = raw(
+        &a,
+        "POST",
+        "/api/auth/login",
+        LOOPBACK,
+        Some(b"\xff"),
+        Some(json!({"email": "admin", "password": "Admin"})),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert_eq!(session_count(&a), 0);
+    Ok(())
+}

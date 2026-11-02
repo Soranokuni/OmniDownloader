@@ -171,6 +171,9 @@ pub struct AppState {
     /// would be a denial-of-service lever. Recomputed by [`Self::refresh_default_admin`]
     /// wherever a password or account changes.
     pub default_admin_live: Arc<AtomicBool>,
+    /// The `Host` values the panel answers to (P2.17). `None` means the check is off, which only a
+    /// test harness building the router directly leaves; `WebServer::run` installs one.
+    pub allowed_hosts: Option<Arc<crate::middleware::AllowedHosts>>,
 }
 
 impl AppState {
@@ -219,6 +222,7 @@ impl AppState {
             metrics: None,
             metrics_sources: None,
             default_admin_live,
+            allowed_hosts: None,
         }
     }
 
@@ -251,6 +255,12 @@ impl AppState {
     pub fn refresh_default_admin(&self) {
         let live = omni_core::selftest::check_default_admin(&self.repo, &self.health);
         self.default_admin_live.store(live, Ordering::Relaxed);
+    }
+
+    /// The `Host` allowlist (built once; tests inject their own).
+    pub fn with_allowed_hosts(mut self, hosts: crate::middleware::AllowedHosts) -> Self {
+        self.allowed_hosts = Some(Arc::new(hosts));
+        self
     }
 
     /// Where held videos live, so a rejection can remove its file now.

@@ -10,7 +10,7 @@ use crate::admin_cookies;
 use crate::admin_sites;
 use crate::admin_tools;
 use crate::assets::serve_static;
-use crate::middleware::{csrf_guard, security_headers};
+use crate::middleware::{csrf_guard, host_guard, security_headers};
 use crate::routes::*;
 use crate::state::AppState;
 use crate::user_jobs;
@@ -146,9 +146,24 @@ impl WebServer {
             // ---- Static assets (public; they contain no data) ----
             .route("/static/*file", get(serve_static))
             .layer(axum::middleware::from_fn(csrf_guard))
+            // Outside the CSRF guard, so a wrong Host is refused before anything else looks at it;
+            // inside the security headers, so the 421 carries them.
+            .layer(axum::middleware::from_fn_with_state(state.clone(), host_guard))
             .layer(axum::middleware::from_fn(security_headers))
             .layer(TraceLayer::new_for_http())
             .with_state(state)
+    }
+
+    /// Turn the `Host` check on for the daemon: install the discovered allowlist
+    /// (loopback, this machine, `web_host`, `security.allowed_hosts`) unless the
+    /// caller already injected one. `run` always goes through here, so a
+    /// production listener never runs with the check off.
+    pub async fn with_host_allowlist(state: AppState, web_host: &str) -> AppState {
+        if state.allowed_hosts.is_some() {
+            return state;
+        }
+        let configured = state.config.read().await.security.allowed_hosts.clone();
+        state.with_allowed_hosts(crate::middleware::AllowedHosts::discover(web_host, &configured))
     }
 
     pub async fn run(
@@ -160,6 +175,8 @@ impl WebServer {
         let addr: SocketAddr = format!("{}:{}", host, port)
             .parse()
             .with_context(|| format!("Invalid socket address {}:{}", host, port))?;
+
+        let state = Self::with_host_allowlist(state, host).await;
 
         // Resolved before the router is built, because the answer decides
         // whether the session cookie is marked `Secure`.
@@ -308,5 +325,43 @@ impl WebServer {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omni_core::config::AppConfig;
+    use omni_core::repository::Repository;
+
+    fn state_with(configure: impl FnOnce(&mut AppConfig)) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let mut config = AppConfig::default();
+        configure(&mut config);
+        (AppState::new(repo, config, dir.path().join("config.json")), dir)
+    }
+
+    #[tokio::test]
+    async fn run_turns_the_host_check_on_and_it_refuses_a_foreign_host() {
+        let (state, _dir) = state_with(|c| c.security.allowed_hosts = vec!["Alias.Station.Test".into()]);
+        assert!(state.allowed_hosts.is_none(), "the harness default is off");
+
+        let state = WebServer::with_host_allowlist(state, "0.0.0.0").await;
+        let hosts = state.allowed_hosts.as_ref().expect("installed");
+        assert!(hosts.allows("localhost:8080"));
+        assert!(hosts.allows("alias.station.test"));
+        assert!(!hosts.allows("evil.example"));
+        assert!(!hosts.allows("0.0.0.0"), "a wildcard bind names nothing");
+    }
+
+    #[tokio::test]
+    async fn an_injected_allowlist_is_kept() {
+        let (state, _dir) = state_with(|_| {});
+        let state = state.with_allowed_hosts(crate::middleware::AllowedHosts::new(["only.test"]));
+        let state = WebServer::with_host_allowlist(state, "0.0.0.0").await;
+        let hosts = state.allowed_hosts.as_ref().unwrap();
+        assert!(hosts.allows("only.test"));
+        assert!(!hosts.allows("localhost"));
     }
 }
