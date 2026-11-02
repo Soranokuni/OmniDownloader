@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
@@ -39,6 +39,17 @@ pub struct EvidenceRow {
 pub const SELFHEAL_MAX_ROWS: i64 = 500;
 /// Cap of `recipe_site_rejections` (one row per rejected recipe steps and site; the oldest go first).
 pub const REJECTIONS_MAX_ROWS: i64 = 20_000;
+
+/// `last_seen_at` is rewritten at most this often (P2.19).
+pub const SESSION_TOUCH_INTERVAL_SECS: i64 = 60;
+
+/// What `sessions.token` holds for a cookie token (P2.19): its SHA-256, lowercase
+/// hex. The cookie value is a 256-bit random bearer token, so a plain hash is
+/// enough; a copy of omni.db then cannot be replayed as a session.
+pub fn session_key(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
 /// Days a self-heal run is kept.
 pub const SELFHEAL_KEEP_DAYS: i64 = 30;
 /// Days a finished job (and its events, repair attempts and evidence row) is kept (P1.21).
@@ -2769,7 +2780,7 @@ impl Repository {
             "INSERT INTO sessions (token, user_id, expires_at, created_at, last_seen_at, ip, user_agent)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![
-                token,
+                session_key(token),
                 user_id,
                 timestamps::format(now + lifetime),
                 timestamps::format(now),
@@ -2787,11 +2798,17 @@ impl Repository {
     /// which case it is deleted. The absolute expiry is still enforced by
     /// [`Self::get_user_by_session_token`]; this is the second, shorter clock.
     pub fn touch_session(&self, token: &str, idle: Duration) -> Result<bool> {
+        self.touch_session_at(token, idle, Utc::now())
+    }
+
+    /// [`Self::touch_session`] with the clock passed in, so tests need no sleeping.
+    pub fn touch_session_at(&self, token: &str, idle: Duration, now: DateTime<Utc>) -> Result<bool> {
+        let key = session_key(token);
         let conn = self.pool.get()?;
         let last_seen: Option<String> = conn
             .query_row(
                 "SELECT last_seen_at FROM sessions WHERE token = ?",
-                params![token],
+                params![key],
                 |r| r.get(0),
             )
             .optional()?;
@@ -2803,18 +2820,24 @@ impl Repository {
         // A row backfilled by migration 3 (or written before it) has an empty
         // string here. Treat that as "seen now" rather than as expired: the
         // upgrade must not log the newsroom out.
-        if !last_seen.is_empty() {
-            if let Some(seen) = timestamps::parse_opt(Some(last_seen)) {
-                if Utc::now() - seen > idle {
-                    conn.execute("DELETE FROM sessions WHERE token = ?", params![token])?;
-                    return Ok(false);
-                }
+        let seen = if last_seen.is_empty() { None } else { timestamps::parse_opt(Some(last_seen)) };
+        if let Some(seen) = seen {
+            if now - seen > idle {
+                conn.execute("DELETE FROM sessions WHERE token = ?", params![key])?;
+                return Ok(false);
+            }
+            // Every request lands here; one write a minute is enough for an
+            // idle clock measured in minutes. A `seen` in the future (the
+            // wall clock stepped back) is rewritten, or the idle limit would
+            // stretch by the size of the step.
+            if now >= seen && now - seen < Duration::seconds(SESSION_TOUCH_INTERVAL_SECS) {
+                return Ok(true);
             }
         }
 
         conn.execute(
             "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
-            params![timestamps::format(Utc::now()), token],
+            params![timestamps::format(now), key],
         )?;
         Ok(true)
     }
@@ -2898,7 +2921,7 @@ impl Repository {
         let conn = self.pool.get()?;
         conn.execute(
             "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
-            params![timestamps::format(Utc::now() - by), token],
+            params![timestamps::format(Utc::now() - by), session_key(token)],
         )?;
         Ok(())
     }
@@ -3395,7 +3418,7 @@ impl Repository {
             WHERE s.token = ? AND s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND u.is_active = 1
             "#,
         )?;
-        let mut rows = stmt.query(params![token])?;
+        let mut rows = stmt.query(params![session_key(token)])?;
         if let Some(row) = rows.next()? {
             let role_str: String = row.get("role")?;
             Ok(Some(User {
@@ -3415,7 +3438,7 @@ impl Repository {
 
     pub fn delete_session(&self, token: &str) -> Result<()> {
         let conn = self.pool.get()?;
-        conn.execute("DELETE FROM sessions WHERE token = ?", params![token])?;
+        conn.execute("DELETE FROM sessions WHERE token = ?", params![session_key(token)])?;
         Ok(())
     }
 

@@ -234,7 +234,7 @@ fn expired_sessions_are_removed_and_live_ones_stay() -> Result<()> {
     let uid = f.repo.create_user("tester@example.invalid", "correct horse battery", omni_core::models::UserRole::Admin, "Test User", None)?;
     f.repo.create_session(uid, "live-token", 7)?;
     f.repo.create_session(uid, "dead-token", 7)?;
-    f.conn.execute("UPDATE sessions SET expires_at = ? WHERE token = 'dead-token'", params![timestamps::format(Utc::now() - Duration::days(1))])?;
+    f.conn.execute("UPDATE sessions SET expires_at = ? WHERE token = ?", params![timestamps::format(Utc::now() - Duration::days(1)), omni_core::repository::session_key("dead-token")])?;
     let c = f.repo.purge_old_records(Utc::now())?;
     assert_eq!(c.sessions, 1);
     assert_eq!(f.count("sessions"), 1);

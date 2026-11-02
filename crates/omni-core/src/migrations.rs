@@ -823,6 +823,15 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_sessions_expires   ON sessions(expires_at);
         "#,
     ),
+    (
+        32,
+        // Session tokens are stored as a SHA-256 hex digest from here on (P2.19), so
+        // a copy of omni.db no longer replays a live session. Existing rows hold the
+        // plaintext token, which SQL cannot convert: everyone signs in once.
+        r#"
+        DELETE FROM sessions;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1462,6 +1471,31 @@ mod tests {
             vec![("s1".to_string(), "a.example".to_string(), 2), ("s2".to_string(), "b.example".to_string(), 2)],
             "attempts rejected and site rows with rejections are carried over; approvals and clean sites are not"
         );
+    }
+
+    #[test]
+    fn migration_32_ends_the_plaintext_token_sessions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 31) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO users (id, email, password_hash, role, full_name) VALUES (1, 'a@example.invalid', 'h', 'admin', 'A Tester');
+             INSERT INTO sessions (token, user_id, expires_at) VALUES ('plain-bearer-token', 1, '9999-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 31);
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(MIGRATIONS.iter().any(|(v, _)| *v == 32));
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0, "a plaintext-token session survived migration 32");
     }
 
     #[test]

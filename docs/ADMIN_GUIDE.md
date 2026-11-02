@@ -93,6 +93,9 @@ written to `data\backups\`. If the new version does not answer on
 `/api/health` within 4 minutes, the previous release is put back
 automatically.
 
+After upgrading to this version everyone signs in once again; session tokens
+are now stored hashed.
+
 ### 2.3 Uninstalling
 
 `Uninstall.cmd` removes the service and the firewall rule. The install folder
