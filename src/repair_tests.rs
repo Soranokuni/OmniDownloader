@@ -360,7 +360,7 @@ struct Rig {
 }
 
 fn cfg(mode: RepairMode, budget: Duration) -> RepairCfg {
-    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default() }
+    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default(), egress_allow: Default::default() }
 }
 
 fn leased_job(repo: &Repository) -> Job {
@@ -2322,4 +2322,109 @@ async fn a_failed_trusted_delivery_does_not_leave_the_marker() {
     r.fake.script.lock().unwrap().push_back(Err(ErrorCode::PipelineFailed));
     let _ = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
     assert_ne!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivering"), "the real outcome replaced it");
+}
+
+// ------------------------------------------- the egress rule through run_job (P2.12)
+
+/// `work` with a network allowlist.
+async fn work_allowing(repo: &Repository, engine: &Arc<BroadcastEngine>, root: &Path, job: Job, allow: &[&str], cancel: CancellationToken) {
+    let mut c = cfg(RepairMode::Off, Duration::from_secs(5));
+    c.egress_allow = omni_core::net::CidrSet::parse_lossy(&allow.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let ctx = RepairCtx { repo: repo.clone(), cfg: c, env: Arc::new(PanicEnv) };
+    let health = omni_core::health::HealthState::new();
+    let canary = Arc::new(crate::canary::CanaryEnv::new(repo.clone(), health.clone(), root.join("bin"), "stable".into()));
+    crate::run_job(repo, engine, OWNER, job, cancel, &root.join("evidence"), &ctx, &health, &canary).await.unwrap();
+}
+
+fn leased_url(repo: &Repository, url: &str) -> Job {
+    repo.enqueue(&NewJob::new(url, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap();
+    repo.lease_job(OWNER, 600).unwrap().expect("leased")
+}
+
+/// A job whose link is a loopback, private or link-local address ends in
+/// review as NON_PUBLIC_ADDRESS without any request of any kind: the listener
+/// bound on the loopback address sees no connection. The job's events and
+/// message name the host, never the path or the query.
+#[tokio::test]
+async fn an_internal_job_url_ends_in_review_and_nothing_connects() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    for (url, host) in [
+        (format!("http://127.0.0.1:{port}/v.mp4?token=SECRET"), "127.0.0.1"),
+        ("http://10.0.0.5/v.mp4?token=SECRET".to_string(), "10.0.0.5"),
+        ("http://169.254.169.254/latest/meta-data?token=SECRET".to_string(), "169.254.169.254"),
+        ("http://[::1]/v.mp4?token=SECRET".to_string(), "::1"),
+        // The scheme and host as typed in the MCR form: judged by the parsed form, not skipped.
+        ("HTTP://10.0.0.5/v.mp4?token=SECRET".to_string(), "10.0.0.5"),
+        (format!("Http://127.0.0.1:{port}/?token=SECRET"), "127.0.0.1"),
+        ("HTTP://169.254.169.254/latest?token=SECRET".to_string(), "169.254.169.254"),
+    ] {
+        let dir = Scratch::new();
+        let root = dir.0.clone();
+        let engine = engine_in(&root, None);
+        let repo = Repository::new(root.join("omni.db")).unwrap();
+        let job = leased_url(&repo, &url);
+        let id = job.id;
+        work_allowing(&repo, &engine, &root, job, &[], CancellationToken::new()).await;
+        let done = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(done.status, JobStatus::RequiresReview, "{url}");
+        assert_eq!(done.error_code.as_deref(), Some("NON_PUBLIC_ADDRESS"), "{url}");
+        let shown = format!(
+            "{} {}",
+            done.error_message.clone().unwrap_or_default(),
+            repo.get_job_events(id, 100).unwrap().iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(" ")
+        );
+        assert!(shown.contains(host), "{shown}");
+        assert!(!shown.contains("SECRET") && !shown.contains("v.mp4"), "host only: {shown}");
+        assert_eq!(done.attempts, 1, "not retried");
+    }
+    assert_eq!(l.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "the loopback listener saw a connection");
+}
+
+/// The negative control: with the loopback network allowlisted the same job is
+/// not refused by the rule. The token is cancelled before the run so the job
+/// stops where the page scan would begin (no yt-dlp or browser here): it is
+/// neither ended in review nor given the refusal's code or event, and nothing
+/// connected (the dead-link check keeps the strict rule).
+#[tokio::test]
+async fn an_allowlisted_network_is_not_refused() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    let dir = Scratch::new();
+    let root = dir.0.clone();
+    let engine = engine_in(&root, None);
+    let repo = Repository::new(root.join("omni.db")).unwrap();
+    let job = leased_url(&repo, &format!("http://127.0.0.1:{port}/v.mp4"));
+    let id = job.id;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    work_allowing(&repo, &engine, &root, job, &["127.0.0.0/8"], cancel).await;
+    let done = repo.get_job(id).unwrap().unwrap();
+    assert_ne!(done.status, JobStatus::RequiresReview, "{:?}", done.error_message);
+    assert_ne!(done.error_code.as_deref(), Some("NON_PUBLIC_ADDRESS"));
+    assert!(!repo.get_job_events(id, 100).unwrap().iter().any(|e| e.message.contains("internal")), "no refusal event");
+    assert!(l.accept().is_err());
+}
+
+/// A link that is not a plain web address (another scheme, user info) is refused too, fail
+/// closed, with its own text: no host is called internal and no credential is echoed.
+#[tokio::test]
+async fn a_link_that_is_not_a_plain_web_address_ends_in_review_with_its_own_text() {
+    for url in ["ftp://files.example/v.mp4", "http://admin:hunter2@news.example/v.mp4"] {
+        let dir = Scratch::new();
+        let root = dir.0.clone();
+        let engine = engine_in(&root, None);
+        let repo = Repository::new(root.join("omni.db")).unwrap();
+        let job = leased_url(&repo, url);
+        let id = job.id;
+        work_allowing(&repo, &engine, &root, job, &[], CancellationToken::new()).await;
+        let done = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(done.status, JobStatus::RequiresReview, "{url}");
+        assert_eq!(done.error_code.as_deref(), Some("NON_PUBLIC_ADDRESS"), "{url}");
+        assert_eq!(done.error_message.as_deref(), Some(crate::egress::MALFORMED_LINK_EL), "{url}");
+        let events: String = repo.get_job_events(id, 100).unwrap().iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(" ");
+        assert!(!events.contains("hunter2") && !events.contains("admin"), "{events}");
+    }
 }

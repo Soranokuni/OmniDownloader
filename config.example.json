@@ -16,6 +16,8 @@
     "trust_proxy_header": false,
     "trusted_proxies": [],
 
+    "egress_allow_networks": [],
+
     "session_hours_admin": 8,
     "session_hours_user": 12,
     "session_days_mcr": 30,

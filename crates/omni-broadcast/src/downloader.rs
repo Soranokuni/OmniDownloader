@@ -571,7 +571,7 @@ pub fn parse_page_videos(json: &str) -> Vec<String> {
         let Some(u) = e.get("url").or_else(|| e.get("webpage_url")).and_then(|u| u.as_str()) else {
             continue;
         };
-        if !(u.starts_with("https://") || u.starts_with("http://")) {
+        if !is_http_url(u) {
             continue;
         }
         let u = canonical_streamable(u).unwrap_or_else(|| u.to_string());
@@ -661,6 +661,7 @@ impl Downloader {
                     hand_off_only: why == Some(GenericWhy::HandOff),
                     webpage_url: json.as_ref().and_then(|v| v.get("webpage_url")).and_then(|v| v.as_str()).map(str::to_string),
                     media_urls: json.as_ref().map(|v| parse_scan_media_urls(v, url)).unwrap_or_default(),
+                    fetch_urls: json.as_ref().map(parse_scan_fetch_urls).unwrap_or_default(),
                 }
             }
             Ok(o) if !o.timed_out => PageScan {
@@ -864,6 +865,9 @@ pub struct PageScan {
     /// its media `url`, its formats' and the scan's `webpage_url` when that is another address
     /// than the page. What yt-dlp's own pick would download, for the site-wide check.
     pub media_urls: Vec<String>,
+    /// Every address the single video's result could make yt-dlp fetch ([`parse_scan_fetch_urls`]),
+    /// uncapped: what the egress screen judges before yt-dlp reads the page (P2.12).
+    pub fetch_urls: Vec<String>,
 }
 
 /// At most this many format addresses of a single-video scan are kept.
@@ -879,13 +883,13 @@ pub fn parse_scan_media_urls(scan: &serde_json::Value, page_url: &str) -> Vec<St
     // The scan's `webpage_url` first and outside the cap: for a hand-off it is the form the browser
     // records (a `watch?v=` address), and a long format list must not crowd it out.
     if let Some(w) = scan.get("webpage_url").and_then(|u| u.as_str()) {
-        if (w.starts_with("https://") || w.starts_with("http://")) && omni_core::urlnorm::normalize(w) != omni_core::urlnorm::normalize(page_url) {
+        if is_http_url(w) && omni_core::urlnorm::normalize(w) != omni_core::urlnorm::normalize(page_url) {
             out.push(w.to_string());
         }
     }
     let reserved = out.len();
     let mut add = |u: &str| {
-        if (u.starts_with("https://") || u.starts_with("http://")) && out.len() < reserved + MAX_SCAN_MEDIA_URLS && !out.iter().any(|o| o == u) {
+        if is_http_url(u) && out.len() < reserved + MAX_SCAN_MEDIA_URLS && !out.iter().any(|o| o == u) {
             out.push(u.to_string());
         }
     };
@@ -895,6 +899,52 @@ pub fn parse_scan_media_urls(scan: &serde_json::Value, page_url: &str) -> Vec<St
     for f in scan.get("formats").and_then(|f| f.as_array()).into_iter().flatten() {
         if let Some(u) = f.get("url").and_then(|u| u.as_str()) {
             add(u);
+        }
+    }
+    out
+}
+
+/// An http(s) address, however its scheme is written (`HTTP://` too: yt-dlp reads it alike).
+pub fn is_http_url(u: &str) -> bool {
+    let has = |p: &str| u.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p));
+    has("http://") || has("https://")
+}
+
+/// Every address a single-video `-J` result could make yt-dlp fetch, for the egress screen (P2.12):
+/// the scan's `webpage_url` (a hand-off), its `url`, `manifest_url` and `fragment_base_url`, and
+/// the same of every format and requested format. Uncapped, unlike [`parse_scan_media_urls`]:
+/// yt-dlp's pick is often the last format. Another protocol (`rtmp://host/…`) is given as
+/// `http://host/…` so its host is judged; a value with no scheme (a relative fragment path) is
+/// not an address. Empty for a playlist, whose entries are the page's videos.
+pub fn parse_scan_fetch_urls(scan: &serde_json::Value) -> Vec<String> {
+    if scan.get("_type").and_then(|t| t.as_str()) == Some("playlist") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |v: &serde_json::Value| {
+        for key in ["url", "manifest_url", "fragment_base_url"] {
+            let Some(u) = v.get(key).and_then(|u| u.as_str()).map(str::trim) else {
+                continue;
+            };
+            let u = match u.find("://") {
+                _ if is_http_url(u) => u.to_string(),
+                Some(i) if i > 0 && u[..i].chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) => format!("http://{}", &u[i + 3..]),
+                _ => continue,
+            };
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    };
+    add(scan);
+    for list in ["formats", "requested_formats"] {
+        for f in scan.get(list).and_then(|f| f.as_array()).into_iter().flatten() {
+            add(f);
+        }
+    }
+    if let Some(w) = scan.get("webpage_url").and_then(|u| u.as_str()) {
+        if is_http_url(w) && !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
         }
     }
     out
@@ -1227,6 +1277,39 @@ mod tests {
         // A playlist's entries are the page's videos, not a single pick.
         let list = scan_json(r#"{"_type":"playlist","webpage_url":"https://x.example/","entries":[{"url":"https://x.example/a.mp4"}]}"#);
         assert!(parse_scan_media_urls(&list, page).is_empty());
+        // An uppercase scheme is still an address yt-dlp would fetch (P2.12).
+        let upper = scan_json(r#"{"extractor":"html5","url":"HTTP://169.254.169.254/latest/x","formats":[{"url":"HTTPS://10.0.0.5/v.mp4"}]}"#);
+        assert_eq!(parse_scan_media_urls(&upper, page), ["HTTP://169.254.169.254/latest/x", "HTTPS://10.0.0.5/v.mp4"]);
+        let list = scan_json(r#"{"_type":"playlist","entries":[{"url":"HTTP://10.0.0.5/a.mp4"}]}"#);
+        assert_eq!(parse_page_videos(&list.to_string()), ["HTTP://10.0.0.5/a.mp4"]);
+    }
+
+    /// The egress screen sees every address yt-dlp could fetch for one video: past the media cap,
+    /// the manifest and fragment bases, requested formats, another protocol's host (P2.12).
+    #[test]
+    fn the_fetch_list_names_every_address_uncapped() {
+        let mut formats: Vec<String> = (0..12).map(|i| format!(r#"{{"url":"https://cdn.example/f{i}.mp4"}}"#)).collect();
+        formats.push(r#"{"url":"https://cdn.example/last.m3u8","manifest_url":"HTTP://10.0.0.5/master.m3u8"}"#.into());
+        formats.push(r#"{"url":"rtmp://10.0.0.6/live/x","fragment_base_url":"https://frag.example/b/","fragments":[{"path":"seg1"}]}"#.into());
+        let scan = scan_json(&format!(
+            r#"{{"extractor":"generic","webpage_url":"https://news.example/a","url":"https://cdn.example/f0.mp4","formats":[{}],"requested_formats":[{{"url":"https://req.example/v"}}]}}"#,
+            formats.join(",")
+        ));
+        let got = parse_scan_fetch_urls(&scan);
+        for want in [
+            "https://cdn.example/f11.mp4",
+            "HTTP://10.0.0.5/master.m3u8",
+            "http://10.0.0.6/live/x",
+            "https://frag.example/b/",
+            "https://req.example/v",
+            "https://news.example/a",
+        ] {
+            assert!(got.iter().any(|u| u == want), "{want} missing from {got:?}");
+        }
+        assert!(!got.iter().any(|u| u == "seg1"), "a relative fragment path is not an address");
+        assert_eq!(got.iter().filter(|u| *u == "https://cdn.example/f0.mp4").count(), 1);
+        let list = scan_json(r#"{"_type":"playlist","entries":[{"url":"https://x.example/a.mp4"}]}"#);
+        assert!(parse_scan_fetch_urls(&list).is_empty());
     }
 
     #[test]

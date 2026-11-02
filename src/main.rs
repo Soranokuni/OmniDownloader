@@ -29,6 +29,7 @@ use omni_web::state::AppState;
 mod benchmark;
 mod canary;
 mod cookies_cli;
+mod egress;
 mod repair;
 mod selfcheck;
 mod site_memory;
@@ -1737,6 +1738,7 @@ async fn run_daemon(
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
             auto_deliver_after_approvals: config.repair.auto_deliver_after_approvals.max(0),
             llm: repair_llm_cfg,
+            egress_allow: config.security.egress_allow_networks(),
         },
         env: Arc::new(repair_env),
     });
@@ -2235,6 +2237,24 @@ async fn run_job(
     // decorated address, so a 404 never says so. The same rule as the
     // parser: no guess, no request.
     let mut job = job;
+    // The first request of the job path is the first thing checked (P2.12): a link to a
+    // loopback, private, link-local or reserved address ends the job here, before any
+    // request of any kind (the dead-link check, the site API, yt-dlp, the browser).
+    let egress_allow = &repair.cfg.egress_allow;
+    // Every URL but an attachment's is judged by its PARSED form: `HTTP://10.0.0.5/` and
+    // `ftp://...` are not skipped for the way they are written. What passes is used from here
+    // on as written, trimmed and with the scheme lowercased (not stored: a retry vets it again).
+    let orig_url = if orig_url.starts_with("attachment://") {
+        orig_url
+    } else {
+        match egress::vet_url(&orig_url, egress_allow).await {
+            Ok(normal) => {
+                job.url = normal.clone();
+                normal
+            }
+            Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
+        }
+    };
     let orig_url = if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
         let known = omni_email::parser::without_annotation(&orig_url);
         let (fixed, why) = if known != orig_url {
@@ -2244,7 +2264,12 @@ async fn run_job(
         };
         match fixed {
             Some(fixed) => {
-                info!("Job #{job_id}: {orig_url} -> {fixed}");
+                // A replacement address is judged by the same rule before it is used.
+                let fixed = match egress::vet_url(&fixed, egress_allow).await {
+                    Ok(normal) => normal,
+                    Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
+                };
+                info!("Job #{job_id}: {} -> {}", omni_core::cookies::host_and_path(&orig_url), omni_core::cookies::host_and_path(&fixed));
                 repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed}"))?;
                 if let Err(e) = repo.set_leased_job_url(job_id, owner, &fixed) {
                     warn!("Job #{job_id}: could not store the corrected link: {e:#}");
@@ -2294,7 +2319,12 @@ async fn run_job(
     if is_web {
         match omni_browser::pages::resolve(&orig_url).await {
             Ok(Some(video)) => {
-                info!("Job #{job_id}: the page's own API names {video}");
+                // The API's answer can name any address: it is judged like the job's own.
+                let video = match egress::vet_url(&video, egress_allow).await {
+                    Ok(normal) => normal,
+                    Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
+                };
+                info!("Job #{job_id}: the page's own API names {}", omni_core::cookies::host_and_path(&video));
                 repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Video named by the site's API: {video}"))?;
                 job.url = video;
                 page_referer = Some(orig_url.clone());
@@ -2318,15 +2348,31 @@ async fn run_job(
     // yt-dlp reads this page only through its generic scan, which does not know
     // where on the page each video sits: the browser chooses (P3.15), and yt-dlp's
     // own pick waits as the fallback.
+    // Where the page lands is judged by the egress rule too; an internal landing ends the job.
+    let landed_refusal = std::sync::Mutex::new(None);
     let route = omni_broadcast::downloader::first_attempt_resolved(
         page_referer.is_some(),
         is_platform,
         job.parent_job_id.is_some(),
         &scan,
         &orig_url,
-        |u| async move { repair::final_page_url(&u).await },
+        |u| {
+            let slot = &landed_refusal;
+            async move {
+                match egress::vet_landing_with(repair::final_page_landing(&u).await, egress_allow, omni_core::net::system_lookup).await {
+                    Ok(landed) => landed,
+                    Err(why) => {
+                        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+                        None
+                    }
+                }
+            }
+        },
     )
     .await;
+    if let Some(why) = landed_refusal.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return egress::end_job_internal_address(repo, job_id, owner, &why);
+    }
     let sniff_first = route == omni_broadcast::downloader::FirstAttempt::SnifferFirst;
     let mut deferred_scan: Option<omni_broadcast::downloader::PageScan> = None;
     let mut process_result = if sniff_first {
@@ -2348,7 +2394,7 @@ async fn run_job(
         Err(anyhow::anyhow!("{}: yt-dlp reads the page only generically", ErrorCode::UnsupportedUrl.as_str())
             .context(ErrorCode::UnsupportedUrl.as_str()))
     } else {
-        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), None, &[]).await? {
+        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), None, &[], egress_allow).await? {
             None => return Ok(()),
             Some(a) => {
                 page_referer = a.page_referer;
@@ -2445,6 +2491,17 @@ async fn run_job(
                     |u| omni_browser::sniffer::is_demoted(&bundle.meta, u),
                 );
                 furniture_urls.extend(furniture.iter().map(|f| f.url.clone()));
+                // No stream on a loopback, private or reserved address is probed, chosen or
+                // downloaded (P2.12). Screened before the first probe of any of them.
+                // Nothing public left after dropping internal ones: the job ends here, and yt-dlp is
+                // not sent to fetch the same address as its fallback.
+                let pool = match egress::screen_candidates(pool, egress_allow).await {
+                    egress::Screened::Kept { urls, dropped, unreadable } => {
+                        egress::record_dropped_hosts(repo, job_id, &dropped, unreadable)?;
+                        urls
+                    }
+                    egress::Screened::AllInternal { dropped } => return egress::end_job_internal_hosts(repo, job_id, owner, &dropped),
+                };
                 let mut streams = without_videoless_posts(repo, engine, job_id, &pool, &cancel).await;
                 if cancel.is_cancelled() {
                     return Ok(());
@@ -2543,7 +2600,7 @@ async fn run_job(
                         // queued; the browser found one more, so a failure from here is
                         // that video's own and gets the assessment and the ladder.
                         siblings_hold_the_rest = false;
-                        info!("Job #{job_id}: sniffer found {primary}");
+                        info!("Job #{job_id}: sniffer found {}", omni_core::cookies::host_and_path(&primary));
                         repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Sniffed stream: {primary}"))?;
                         let mut retry_job = job.clone();
                         if !still_ours(repo, job_id, owner) {
@@ -2680,7 +2737,7 @@ async fn run_job(
         // The login guard is the attempt's to make again; two for one job would drop the new one.
         _login_guard = None;
         let scan = deferred_scan.take().unwrap_or_default();
-        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), snapshot.as_ref().and_then(|s| s.final_url.as_deref()), &refused_held).await? {
+        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), snapshot.as_ref().and_then(|s| s.final_url.as_deref()), &refused_held, egress_allow).await? {
             None => return Ok(()),
             Some(a) => {
                 page_referer = a.page_referer;
@@ -3044,14 +3101,36 @@ async fn ytdlp_attempt(
     cancel: &CancellationToken,
     orig_url: &str,
     queued: &[String],
-    scan: omni_broadcast::downloader::PageScan,
+    mut scan: omni_broadcast::downloader::PageScan,
     page_referer: Option<String>,
     // Where the browser ended, when it looked at the page first (its site is looked up too).
     browser_final: Option<&str>,
     // Held videos the browser's look took out (furniture removed the article's own): not yt-dlp's pick either.
     refused: &[String],
+    egress_allow: &omni_core::net::CidrSet,
 ) -> Result<Option<YtdlpAttempt>> {
     let job_id = job.id;
+    // yt-dlp's page scan names videos by any http(s) address: none on an internal address is probed,
+    // queued or downloaded (P2.12). Nothing public left and something refused: the job ends here.
+    // yt-dlp's own pick on a single-video page is among `fetch_urls` (every address its result names,
+    // uncapped): screened with the videos, and an internal or refused one ends the job before yt-dlp
+    // reads the page. Nothing kept and something refused ends it as well: yt-dlp is not sent to pick
+    // the same address. No guard around it: with nothing to screen it is `Continue` at once.
+    let scan_dropped = match egress::screen_page_scan(std::mem::take(&mut scan.videos), &scan.fetch_urls, egress_allow).await {
+        egress::PageScanVerdict::Continue { videos, dropped, unreadable } => {
+            egress::record_dropped_hosts(repo, job_id, &dropped, unreadable)?;
+            scan.videos = videos;
+            !dropped.is_empty() || unreadable > 0
+        }
+        egress::PageScanVerdict::EndInternal { hosts } => {
+            egress::end_job_internal_hosts(repo, job_id, owner, &hosts)?;
+            return Ok(None);
+        }
+        egress::PageScanVerdict::EndUnreadable => {
+            egress::end_job_unreadable(repo, job_id, owner)?;
+            return Ok(None);
+        }
+    };
     let mut page_referer = page_referer;
     let mut scan_siblings: Vec<String> = Vec::new();
     // An embedded video on another site, whose cookie jar this job also carries (P3.5).
@@ -3071,7 +3150,9 @@ async fn ytdlp_attempt(
         let guard = site_memory::guard_scan(repo, orig_url, scan.webpage_url.as_deref(), browser_final, std::mem::take(&mut videos), &scan.media_urls, refused);
         (videos, furniture, only_furniture) = (guard.videos, guard.furniture, guard.only_furniture);
     }
-    if scan_count > 1 && !videos.is_empty() {
+    // One left after the screen took the others out is still a choice among the page's videos: yt-dlp
+    // is not sent to read the page itself, where it could pick the refused one.
+    if (scan_count > 1 || scan_dropped) && !videos.is_empty() {
         // yt-dlp's page scan says nothing about where on the page a video
         // sat, so the placement rule (R2) is the sniffer's alone; here only
         // a glomex contextual list is known (held), and live videos are

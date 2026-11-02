@@ -102,15 +102,8 @@ pub async fn repair_dead_link(url: &str) -> Option<String> {
     if candidates.is_empty() {
         return None;
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(PAGE_CHECK_UA)
-        .build()
-        .ok()?;
-    let status = |u: String| {
-        let client = client.clone();
-        async move { client.get(u).send().await.ok().map(|r| r.status()) }
-    };
+    // The strict address rule, before the first request and at every hop (P2.12).
+    let status = |u: String| async move { omni_core::net::get_public(&u, how(Duration::from_secs(10))).await.map(|r| r.status()) };
     let gone = status(url.to_string()).await.is_some_and(|s| s.as_u16() == 404 || s.as_u16() == 410);
     if !gone {
         return None;
@@ -127,12 +120,16 @@ pub async fn repair_dead_link(url: &str) -> Option<String> {
 /// `None` when no answer came. Used to tell a removed article (404/410) from
 /// a site that changed (plan P10.4).
 pub async fn page_status(url: &str) -> Option<u16> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent(PAGE_CHECK_UA)
-        .build()
-        .ok()?;
-    client.get(url).send().await.ok().map(|r| r.status().as_u16())
+    omni_core::net::get_public(url, how(Duration::from_secs(15))).await.map(|r| r.status().as_u16())
+}
+
+/// How long the name lookup of the address rule may take (P2.12).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The page checks' requests: redirects are followed by `get_public`, one checked hop at a
+/// time, each pinned to the address that was checked.
+fn how(timeout: Duration) -> omni_core::net::PublicGet<'static> {
+    omni_core::net::PublicGet { timeout, lookup: CHECK_TIMEOUT, user_agent: PAGE_CHECK_UA }
 }
 
 /// A desktop browser's identity: some portals answer a bare HTTP client
@@ -168,6 +165,18 @@ mod tests {
     fn a_hosted_file_is_used_when_there_is_no_embed() {
         let a = json!({"hyperlink":"","file_url":"../files/202610/clip.mp4"});
         assert_eq!(amna_video_from_answer(&a).as_deref(), Some("https://www.amna.gr/files/202610/clip.mp4"));
+    }
+
+    /// An internal address is refused before any connection (P2.12): the local
+    /// listener sees nothing, and the answer is "no answer".
+    #[tokio::test]
+    async fn a_page_check_never_connects_to_an_internal_address() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert_eq!(page_status(&format!("http://127.0.0.1:{port}/a")).await, None);
+        assert_eq!(page_status(&format!("http://localhost:{port}/a")).await, None);
+        assert_eq!(l.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "nothing connected");
     }
 
     #[test]

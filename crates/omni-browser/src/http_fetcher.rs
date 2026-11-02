@@ -44,6 +44,26 @@ pub fn check_target(raw: &str) -> Result<(Url, String, u16), String> {
     Ok((url, host, port))
 }
 
+/// A hop (or the address itself) is a loopback, private or reserved address: refused by the
+/// egress rule, as against a lookup that merely failed. Carried inside the `anyhow` error of
+/// [`HttpFetcher::final_url`] so a caller can tell the two apart (`downcast_ref`). Names the
+/// host only.
+#[derive(Debug, thiserror::Error)]
+#[error("{host} is not a public address")]
+pub struct Refused {
+    pub host: String,
+}
+
+/// The host of `raw` when the egress rule refuses it as internal without any lookup (an
+/// IP literal, or `localhost`); `None` for every other reason.
+async fn internal_host(raw: &str) -> Option<Refused> {
+    let no_lookup = |_h: String, _p: u16| async { Err::<Vec<SocketAddr>, _>(std::io::Error::other("no lookup")) };
+    match omni_core::net::check_public_with(raw, &omni_core::net::CidrSet::default(), Duration::ZERO, no_lookup).await {
+        Err(omni_core::net::EgressRefusal::NonPublic(host)) => Some(Refused { host }),
+        _ => None,
+    }
+}
+
 pub struct HttpFetcher {
     /// Test only: one fake public name that resolves to a local server.
     pinned_for_tests: Option<(String, SocketAddr)>,
@@ -84,9 +104,10 @@ impl HttpFetcher {
             // A literal passed `check_target`, so it is public.
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
-        omni_core::net::resolve_public(host, port, RESOLVE_TIMEOUT)
-            .await
-            .map_err(|e| anyhow!("{host}: {e}"))
+        omni_core::net::resolve_public(host, port, RESOLVE_TIMEOUT).await.map_err(|e| match e {
+            omni_core::net::EgressError::NonPublic => anyhow::Error::new(Refused { host: host.to_string() }),
+            e => anyhow!("{host}: {e}"),
+        })
     }
 }
 
@@ -169,7 +190,15 @@ impl HttpFetcher {
             if left.is_zero() {
                 bail!("no time left");
             }
-            let (target, host, port) = check_target(&current).map_err(|e| anyhow!("lookup refused: {e}"))?;
+            let (target, host, port) = match check_target(&current) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(match internal_host(&current).await {
+                        Some(refused) => anyhow::Error::new(refused),
+                        None => anyhow!("lookup refused: {e}"),
+                    })
+                }
+            };
             let addrs = tokio::time::timeout(left, self.resolve(&host, port))
                 .await
                 .map_err(|_| anyhow!("{host}: no time left to resolve"))??;

@@ -137,6 +137,12 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
+    /// Networks the job path may request although they are loopback, private or
+    /// reserved (CIDR form). Empty (the default): the normal job path never
+    /// requests an internal address (P2.12).
+    #[serde(default)]
+    pub egress_allow_networks: Vec<String>,
+
     /// Absolute session lifetime for `user` accounts.
     #[serde(default = "default_session_hours_user")]
     pub session_hours_user: i64,
@@ -202,6 +208,7 @@ impl Default for SecurityConfig {
             mcr_open_networks: default_mcr_open_networks(),
             trust_proxy_header: false,
             trusted_proxies: Vec::new(),
+            egress_allow_networks: Vec::new(),
             session_hours_user: default_session_hours_user(),
             session_hours_admin: default_session_hours_admin(),
             session_days_mcr: default_session_days_mcr(),
@@ -216,6 +223,11 @@ impl SecurityConfig {
     /// Parse [`Self::mcr_open_networks`], dropping and logging bad entries.
     pub fn open_networks(&self) -> crate::net::CidrSet {
         crate::net::CidrSet::parse_lossy(&self.mcr_open_networks)
+    }
+
+    /// Parse [`Self::egress_allow_networks`], dropping and logging bad entries.
+    pub fn egress_allow_networks(&self) -> crate::net::CidrSet {
+        crate::net::CidrSet::parse_lossy(&self.egress_allow_networks)
     }
 
     /// Parse [`Self::trusted_proxies`], dropping and logging bad entries.

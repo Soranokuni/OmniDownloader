@@ -27,6 +27,8 @@ pub enum TitleSource {
 /// Per lookup; the lookups run side by side.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(6);
 /// A page's title is in its head; nothing past this is read.
+/// The name lookup of the address rule.
+const ADDRESS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PAGE_BYTES: usize = 512 * 1024;
 const MAX_TITLE_CHARS: usize = 200;
 
@@ -39,14 +41,10 @@ impl TitleSource {
         match self {
             Self::Fixed(t) => urls.iter().filter_map(|u| t.get(u).map(|v| (u.clone(), v.clone()))).collect(),
             Self::Web => {
-                let Ok(client) = reqwest::Client::builder().timeout(LOOKUP_TIMEOUT).user_agent(UA).build() else {
-                    return HashMap::new();
-                };
                 let mut set = tokio::task::JoinSet::new();
                 for u in urls.iter().take(20).cloned() {
-                    let client = client.clone();
                     set.spawn(async move {
-                        let t = tokio::time::timeout(LOOKUP_TIMEOUT, title_of(&client, &u)).await.ok().flatten();
+                        let t = tokio::time::timeout(LOOKUP_TIMEOUT, title_of(&u)).await.ok().flatten();
                         (u, t)
                     });
                 }
@@ -62,12 +60,18 @@ impl TitleSource {
     }
 }
 
-async fn title_of(client: &reqwest::Client, url: &str) -> Option<String> {
+/// The strict address rule (P2.12): the lookup and every redirect hop are checked; a refusal is no title.
+async fn get_public(url: &str) -> Option<reqwest::Response> {
+    let how = omni_core::net::PublicGet { timeout: LOOKUP_TIMEOUT, lookup: ADDRESS_CHECK_TIMEOUT, user_agent: UA };
+    omni_core::net::get_public(url, how).await
+}
+
+async fn title_of(url: &str) -> Option<String> {
     if let Some(endpoint) = oembed_url(url) {
-        let v: Value = client.get(endpoint).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+        let v: Value = get_public(&endpoint).await?.error_for_status().ok()?.json().await.ok()?;
         return title_from_oembed(&v);
     }
-    let resp = client.get(url).send().await.ok()?.error_for_status().ok()?;
+    let resp = get_public(url).await?.error_for_status().ok()?;
     let mut body = Vec::new();
     let mut resp = resp;
     while let Ok(Some(chunk)) = resp.chunk().await {
@@ -170,6 +174,19 @@ mod tests {
         assert!(oembed_url("https://vimeo.com/123").unwrap().starts_with("https://vimeo.com/api/oembed.json"));
         assert_eq!(oembed_url("https://www.news247.gr/kosmos/arthro/"), None, "a portal page is read for its <title>");
         assert_eq!(oembed_url("https://notyoutube.com/watch?v=x"), None);
+    }
+
+    /// A link to an internal address is never requested for its title (P2.12).
+    #[tokio::test]
+    async fn a_title_lookup_never_connects_to_an_internal_address() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/page");
+        let titles = TitleSource::Web.titles(&[url.clone(), format!("http://localhost:{port}/page")]).await;
+        assert!(titles.is_empty(), "{titles:?}");
+        assert_eq!(title_of(&url).await, None);
+        assert_eq!(l.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "nothing connected");
     }
 
     #[test]
