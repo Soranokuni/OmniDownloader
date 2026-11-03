@@ -458,6 +458,70 @@ pub enum CancelOutcome {
     NotCancellable,
 }
 
+/// What the watchfolder holds at a RUNNING job's `delivering_to` marker, read
+/// once at start-up (P1.22).
+enum MarkerCheck {
+    /// The delivered path was recorded for this attempt after the rename: delivered,
+    /// whether or not the file is still in the watchfolder (no file check is made).
+    Recorded { path: String },
+    /// A file of exactly the recorded size: the rename happened.
+    Delivered { path: String },
+    /// Nothing there, and the folder answers: the rename did not happen (or Dalet took the file).
+    Missing,
+    /// A file is there, but not of the recorded size: not ours to claim.
+    WrongSize { path: String, found: u64, expected: u64 },
+    /// The folder cannot be read (an unreachable share): nobody knows.
+    Unknown { path: String, reason: String },
+}
+
+/// How long start-up recovery waits for the watchfolder to say what is at a job's
+/// `delivering_to` path.
+const MARKER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run `f` on a thread and wait up to `timeout`; `None` when it has not finished
+/// (the thread is left to end on its own).
+fn run_with_timeout<T: Send + 'static>(timeout: std::time::Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
+/// What is at `path` compared with the `expected` size (blocking file I/O).
+fn inspect_marker_file(path: String, expected: u64) -> MarkerCheck {
+    let found = match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => Ok(m.len()),
+        Ok(_) => Err(None),
+        Err(e) => Err(Some(e)),
+    };
+    match found {
+        Ok(len) if len == expected => MarkerCheck::Delivered { path },
+        Ok(len) => MarkerCheck::WrongSize { path, found: len, expected },
+        Err(None) => MarkerCheck::Missing,
+        Err(Some(e)) => {
+            // An unreachable share reads as "not found" on Windows, so a missing
+            // file only counts when its folder answers.
+            let parent_ok = std::path::Path::new(&path)
+                .parent()
+                .is_some_and(|p| std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false));
+            if e.kind() == std::io::ErrorKind::NotFound && parent_ok {
+                MarkerCheck::Missing
+            } else {
+                MarkerCheck::Unknown { path, reason: e.to_string() }
+            }
+        }
+    }
+}
+
+/// The file name of a watchfolder path, for events (never the folder, which may be a UNC share).
+fn marker_file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// One job reached a final status (plan P6.5). Called after the commit of a
 /// transition that really changed a row, never for a refused or no-op one.
 fn count_finished(status: JobStatus) {
@@ -926,6 +990,8 @@ impl Repository {
                 progress = CASE WHEN ? = 'COMPLETED' THEN 100.0 ELSE progress END,
                 completed_at = CASE WHEN ? = 'AWAITING_APPROVAL' THEN completed_at ELSE ? END,
                 delivered_at = CASE WHEN ? THEN ? ELSE delivered_at END,
+                delivering_to = NULL,
+                delivering_bytes = NULL,
                 updated_at = ?
             WHERE id = ? AND lease_owner = ?
             "#,
@@ -1119,6 +1185,8 @@ impl Repository {
                 progress = 0.0,
                 speed = '0 Mbps',
                 eta = '--:--',
+                delivering_to = NULL,
+                delivering_bytes = NULL,
                 updated_at = ?
             WHERE id = ?
             "#,
@@ -1800,7 +1868,7 @@ impl Repository {
         for (id, attempts, max_attempts) in expired {
             // Already in the watchfolder: finishing it is the only safe
             // recovery, a requeue would put a second copy on air.
-            if Self::recover_if_delivered(&tx, id, &now)? {
+            if Self::recover_if_delivered(&tx, id, &now, None)? {
                 finished.push(JobStatus::Completed);
                 continue;
             }
@@ -1852,6 +1920,16 @@ impl Repository {
     /// Only this host's jobs are touched, so two daemons sharing a database
     /// never steal each other's work.
     pub fn recover_on_startup(&self, hostname: &str) -> Result<usize> {
+        self.recover_on_startup_with(hostname, MARKER_CHECK_TIMEOUT, inspect_marker_file)
+    }
+
+    /// [`Self::recover_on_startup`] with the marker look and its time limit passed in.
+    fn recover_on_startup_with(
+        &self,
+        hostname: &str,
+        timeout: std::time::Duration,
+        inspect: fn(String, u64) -> MarkerCheck,
+    ) -> Result<usize> {
         let mut conn = self.pool.get()?;
         let now = timestamps::now_string();
         let prefix = format!("{hostname}:%");
@@ -1865,17 +1943,52 @@ impl Repository {
 
         let mut requeued = 0usize;
         for id in &ids {
+            // The watchfolder is asked before the transaction opens: a UNC path can block.
+            let check = Self::check_delivery_marker_with(&conn, *id, timeout, inspect)?;
             // Each job's change and its event land together or not at all.
             let tx = conn.transaction()?;
-            if Self::recover_if_delivered(&tx, *id, &now)? {
+            if Self::recover_if_delivered(&tx, *id, &now, check.as_ref())? {
                 tx.commit()?;
                 count_finished(JobStatus::Completed);
+                continue;
+            }
+            if let Some(MarkerCheck::Unknown { path, reason }) = &check {
+                // The rename may have happened and the share cannot say: a requeue could put
+                // a second copy on air, so a person decides.
+                warn!("Job #{id}: cannot tell whether {} was delivered before the restart: {reason}", marker_file_name(path));
+                tx.execute(
+                    "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+                     error_code='DELIVERY_FAILED', error_message=?, updated_at=? WHERE id=?",
+                    params![
+                        format!(
+                            "The daemon restarted while delivering {}, and the watchfolder cannot be read to tell whether it arrived. Check Dalet before retrying",
+                            marker_file_name(path)
+                        ),
+                        now,
+                        id
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
+                    params![
+                        id,
+                        now,
+                        format!("Restart during delivery of {}; the watchfolder is unreachable, so it is not known whether the video arrived. Not requeued", marker_file_name(path))
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+                    params![format!("Job {id}: restart during delivery and the watchfolder cannot be read; sent to review, not requeued"), now],
+                )?;
+                tx.commit()?;
+                count_finished(JobStatus::RequiresReview);
                 continue;
             }
             requeued += 1;
             tx.execute(
                 "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
-                 lease_expires_at=NULL, progress=0.0, speed='0 Mbps', eta='--:--', updated_at=?
+                 lease_expires_at=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
+                 delivering_to=NULL, delivering_bytes=NULL, updated_at=?
                  WHERE id=?",
                 params![now, id],
             )?;
@@ -1883,6 +1996,16 @@ impl Repository {
                 "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
                 params![id, now, "Recovered after daemon restart; requeued"],
             )?;
+            if let Some(MarkerCheck::WrongSize { path, found, expected }) = &check {
+                tx.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
+                    params![
+                        id,
+                        now,
+                        format!("{} is in the watchfolder with {found} bytes, not the {expected} this job was delivering; it is not treated as this job's video, so the job was requeued. Check Dalet for a duplicate", marker_file_name(path))
+                    ],
+                )?;
+            }
             tx.commit()?;
         }
         if !ids.is_empty() {
@@ -1906,10 +2029,17 @@ impl Repository {
     /// approved keeps its own idempotent re-delivery. `delivered_at` is left
     /// as it is: the moment of delivery is not known. The update and its event
     /// are one transaction when `conn` is one.
-    fn recover_if_delivered(conn: &rusqlite::Connection, id: i64, now: &str) -> Result<bool> {
-        let changed = conn.execute(
+    ///
+    /// The other proof is the `delivering_to` marker (P1.22): at start-up
+    /// (`check` is `Some`) a marker whose file is at that path with that size
+    /// means the rename happened, at any stage and for a held delivery too, so
+    /// the job is finished with that file recorded (and its held row delivered).
+    /// The reaper passes `None`: a live daemon's expired lease is not a crash.
+    fn recover_if_delivered(conn: &rusqlite::Connection, id: i64, now: &str, check: Option<&MarkerCheck>) -> Result<bool> {
+        let mut changed = conn.execute(
             "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
-             lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL, updated_at=?
+             lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
+             delivering_to=NULL, delivering_bytes=NULL, updated_at=?
              WHERE id=? AND status='RUNNING' AND stage = 'ARCHIVE'
                AND NOT EXISTS (SELECT 1 FROM held_outputs h WHERE h.job_id = queue.id AND h.decision = 'approved')",
             params![now, now, id],
@@ -1919,6 +2049,48 @@ impl Repository {
                 "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
                 params![id, now, "RECOVERED_AFTER_DELIVERY: the video was already in the watchfolder; finished, not requeued"],
             )?;
+        } else if let Some(delivered) = check.filter(|c| matches!(c, MarkerCheck::Delivered { .. } | MarkerCheck::Recorded { .. })) {
+            let (path, recorded) = match delivered {
+                MarkerCheck::Delivered { path } => (path, false),
+                MarkerCheck::Recorded { path } => (path, true),
+                _ => unreachable!("filtered above"),
+            };
+            changed = conn.execute(
+                "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
+                 lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
+                 file_path=?, delivering_to=NULL, delivering_bytes=NULL, updated_at=?
+                 WHERE id=? AND status='RUNNING'",
+                params![now, path, now, id],
+            )?;
+            if changed == 1 {
+                let name = marker_file_name(path);
+                conn.execute(
+                    "UPDATE held_outputs SET decision = 'delivered', decided_at = ?, delivered_path = ?
+                     WHERE job_id = ? AND decision = 'approved'",
+                    params![now, path, id],
+                )?;
+                let (event, audit) = if recorded {
+                    (
+                        format!("Recovered after a restart: already delivered as {name}; archive skipped"),
+                        format!("Job {id}: restart after the delivery was recorded; {name} was already delivered, so the job was finished, not requeued"),
+                    )
+                } else {
+                    (
+                        format!("Recovered after a restart: already delivered to the watchfolder as {name}; archive skipped"),
+                        format!("Job {id}: restart after the rename; {name} was already in the watchfolder, so the job was finished, not requeued"),
+                    )
+                };
+                conn.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DONE', 'WARN', ?)",
+                    params![id, now, event],
+                )?;
+                conn.execute(
+                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+                    params![audit, now],
+                )?;
+            }
+        }
+        if changed == 1 {
             // A trusted recipe's delivery that a crash cut short: the marker the ladder wrote
             // before the pipeline ran becomes the outcome, and MCR is told (P10.16b).
             let marked = conn.execute(
@@ -1986,15 +2158,71 @@ impl Repository {
 
     /// Record the delivered file and its duration on a job, without touching
     /// its status: the worker holding the lease decides the terminal status
-    /// (`finish`). Only the lease holder may write it.
+    /// (`finish`). Only the lease holder may write it. The `delivering_to`
+    /// marker is left for `finish` to clear: until then a crash is still a
+    /// delivery that must not be repeated (P1.22).
     pub fn set_delivered_file(&self, id: i64, owner: &str, file_path: &str, duration: f64) -> Result<bool> {
         let conn = self.pool.get()?;
         let n = conn.execute(
-            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?
+            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?,
+                    delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
-            params![file_path, duration, timestamps::now_string(), id, owner],
+            params![file_path, duration, timestamps::now_string(), file_path, id, owner],
         )?;
         Ok(n == 1)
+    }
+
+    /// Record where the lease holder is about to rename a finished file, and its
+    /// size, immediately before the rename into the watchfolder (P1.22). A job
+    /// found RUNNING at start-up with a file of that size at that path was
+    /// delivered and is finished, not requeued. The marker stays until the job
+    /// finishes (`finish`, `finish_held_delivery`) or is leased again. Only the
+    /// lease holder may write it; `false` when the lease is gone (nothing written).
+    pub fn mark_delivering(&self, id: i64, owner: &str, path: &str, bytes: u64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE queue SET delivering_to = ?, delivering_bytes = ?, delivering_recorded = 0, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![path, bytes as i64, timestamps::now_string(), id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// What the watchfolder says about a job's `delivering_to` marker. Does file
+    /// I/O (a UNC path may block), so start-up only, never inside a transaction.
+    fn check_delivery_marker_with(
+        conn: &rusqlite::Connection,
+        id: i64,
+        timeout: std::time::Duration,
+        inspect: fn(String, u64) -> MarkerCheck,
+    ) -> Result<Option<MarkerCheck>> {
+        let marker: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+            .query_row(
+                "SELECT delivering_to, delivering_bytes, delivering_recorded FROM queue WHERE id = ?",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (Some(path), Some(expected), recorded) = (match marker {
+            Some((p, b, rec)) => (p.filter(|p| !p.is_empty()), b, rec == Some(1)),
+            None => (None, None, false),
+        }) else {
+            return Ok(None);
+        };
+        if recorded {
+            // This attempt wrote the delivered path right after the rename. MCR moves
+            // files out of the watchfolder by hand, so a missing file proves nothing.
+            return Ok(Some(MarkerCheck::Recorded { path }));
+        }
+        let expected = expected.max(0) as u64;
+        // A UNC path can hang for the better part of a minute: the look runs on its own
+        // thread, and a share that does not answer in time is "unknown", not "absent".
+        let probe_path = path.clone();
+        let looked = run_with_timeout(timeout, move || inspect(probe_path, expected));
+        Ok(Some(looked.unwrap_or_else(|| MarkerCheck::Unknown {
+            path,
+            reason: format!("no answer from the watchfolder within {} ms", timeout.as_millis()),
+        })))
     }
 
     pub fn update_job_progress(&self, id: i64, progress: f64, speed: &str, eta: &str) -> Result<()> {
@@ -4404,10 +4632,13 @@ impl Repository {
     pub fn record_held_delivery(&self, job_id: i64, owner: &str, path: &str, duration: f64) -> Result<bool> {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // The `delivering_to` marker stays until `finish_held_delivery`: a crash between
+        // this write and that finish must still be recognised as delivered (P1.22).
         let n = tx.execute(
-            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?
+            "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?,
+                    delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
-            params![path, duration, timestamps::now_string(), job_id, owner],
+            params![path, duration, timestamps::now_string(), path, job_id, owner],
         )?;
         if n != 1 {
             return Ok(false);
@@ -4442,6 +4673,7 @@ impl Repository {
             SET status = 'COMPLETED', stage = 'DONE', lease_owner = NULL, lease_expires_at = NULL,
                 error_code = NULL, error_message = NULL, progress = 100.0,
                 completed_at = ?, delivered_at = ?, updated_at = ?,
+                delivering_to = NULL, delivering_bytes = NULL,
                 stage_timings_json = COALESCE(?, stage_timings_json)
             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'
               AND file_path IS NOT NULL AND file_path != ''
@@ -6595,6 +6827,47 @@ impl Repository {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn a_marker_check_that_times_out_sends_the_job_to_review_not_back_to_the_queue() -> Result<()> {
+        use std::time::Duration;
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo
+            .enqueue(&NewJob::new("https://example.invalid/v/9", "9_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?
+            .job_id();
+        assert!(repo.lease_job("host:1:0", 3600)?.is_some());
+        assert!(repo.mark_delivering(id, "host:1:0", "X:/share/9_ANNA_TEST.mxf", 100)?);
+
+        // The share hangs past the limit; the file may or may not be there.
+        let requeued = repo.recover_on_startup_with("host", Duration::from_millis(50), |_, _| {
+            std::thread::sleep(Duration::from_secs(2));
+            MarkerCheck::Missing
+        })?;
+
+        assert_eq!(requeued, 0, "a job whose watchfolder did not answer was requeued");
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::RequiresReview);
+        assert_eq!(job.error_code.as_deref(), Some("DELIVERY_FAILED"));
+        let events = repo.get_job_events(id, 50)?;
+        assert!(
+            events.iter().any(|e| e.level == "ERROR" && e.message.contains("not known whether the video arrived")),
+            "no review event: {events:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_watchfolder_that_does_not_answer_in_time_is_unknown_not_absent() {
+        use std::time::Duration;
+        let slow = run_with_timeout(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(2));
+            MarkerCheck::Missing
+        });
+        assert!(slow.is_none(), "a hanging look was waited for");
+        let quick = run_with_timeout(Duration::from_secs(5), || MarkerCheck::Missing);
+        assert!(matches!(quick, Some(MarkerCheck::Missing)));
+    }
 
     #[test]
     fn a_login_attempt_stores_at_most_254_characters_of_the_email() -> Result<()> {

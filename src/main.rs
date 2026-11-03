@@ -1612,10 +1612,16 @@ async fn run_daemon(
     // Without it a crash during a transcode strands the job in RUNNING forever:
     // no worker owns it and no lease anybody is watching will expire.
     let hostname = hostname_for_lease();
-    match repo.recover_on_startup(&hostname) {
-        Ok(0) => info!("No orphaned jobs to recover."),
-        Ok(n) => warn!("Recovered {n} orphaned job(s) from a previous run; requeued."),
-        Err(e) => error!("Orphan recovery failed: {e:?}"),
+    // On a blocking thread: recovery looks at the watchfolder, which may be a slow share.
+    let recovery = {
+        let (repo, hostname) = (repo.clone(), hostname.clone());
+        tokio::task::spawn_blocking(move || repo.recover_on_startup(&hostname)).await
+    };
+    match recovery {
+        Ok(Ok(0)) => info!("No orphaned jobs to recover."),
+        Ok(Ok(n)) => warn!("Recovered {n} orphaned job(s) from a previous run; requeued."),
+        Ok(Err(e)) => error!("Orphan recovery failed: {e:?}"),
+        Err(e) => error!("Orphan recovery did not finish: {e:?}"),
     }
 
     // 5. Sweep scratch directories left behind by jobs that are no longer
@@ -1632,6 +1638,17 @@ async fn run_daemon(
             }
         }
         Err(e) => warn!("Could not list running jobs for the temp sweep: {e:?}"),
+    }
+
+    // 5b. Leftover staging files of copies a crash interrupted, in the watchfolder
+    // itself (top level, only our own `.name.mxf.tmp` and probe names, 10 minutes old).
+    {
+        let wf = watchfolder_path.clone();
+        match tokio::task::spawn_blocking(move || omni_broadcast::delivery::sweep_stale_staging(&wf)).await {
+            Ok(0) => {}
+            Ok(n) => info!("Removed {n} stale staging file(s) from the watchfolder."),
+            Err(e) => warn!("The watchfolder staging sweep did not finish: {e:?}"),
+        }
     }
 
     // 6. Lease reaper: requeue jobs whose owner died without releasing them.

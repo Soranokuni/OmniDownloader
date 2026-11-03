@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use omni_core::models::{Job, JobStage};
 use omni_core::repository::{HeldOutput, Repository};
 
-use crate::delivery::WatchfolderDelivery;
+use crate::delivery::{LeaseLostBeforeRename, WatchfolderDelivery};
 use crate::downloader::{DownloadError, DownloadOpts, Downloader};
 use crate::errors::ErrorCode;
 use crate::preview::{self, PreviewEncoder};
@@ -452,6 +452,40 @@ impl BroadcastEngine {
         }
     }
 
+    /// Copy `source` into the watchfolder, recording the destination on the job right
+    /// before the rename (P1.22). A job that is no longer ours at that moment delivers
+    /// nothing: no `.mxf`, no `.tmp`, and the error is [`LeaseLost`].
+    async fn deliver_to_watchfolder(
+        &self,
+        job_id: i64,
+        owner: &str,
+        source: &Path,
+        slug: &str,
+        job_temp: &Path,
+    ) -> Result<crate::delivery::Delivered> {
+        match WatchfolderDelivery::deliver_with(source, &self.watchfolder_dir, slug, |to, bytes| {
+            self.record_delivering(job_id, owner, to, bytes)
+        })
+        .await
+        {
+            Err(e) if e.downcast_ref::<LeaseLostBeforeRename>().is_some() => {
+                Err(self.lost(job_id, JobStage::Deliver, job_temp).await)
+            }
+            other => other,
+        }
+    }
+
+    /// Write the delivery marker (P1.22) for the rename that follows. `Ok(false)`:
+    /// the lease is gone, so the rename must not happen. An error also stops the
+    /// delivery: without the marker a crash after the rename would be delivered
+    /// a second time.
+    fn record_delivering(&self, job_id: i64, owner: &str, to: &Path, bytes: u64) -> Result<bool> {
+        self.repo
+            .mark_delivering(job_id, owner, &to.to_string_lossy(), bytes)
+            .context("Could not record the delivery before the rename")
+            .context(ErrorCode::DeliveryFailed.as_str())
+    }
+
     /// The error for a job that is no longer ours. Its workspace is removed
     /// when the row is gone (discarded) or CANCELLED: otherwise another
     /// worker may hold the very same `temp/jobs/{id}` and be reading its
@@ -799,8 +833,9 @@ impl BroadcastEngine {
 
         // 5. Atomic Delivery to Dalet Watchfolder
         self.enter_stage(job_id, owner, JobStage::Deliver, &job_temp).await?;
-        let delivered = match WatchfolderDelivery::deliver(&final_temp_mxf, &self.watchfolder_dir, &slug).await {
+        let delivered = match self.deliver_to_watchfolder(job_id, owner, &final_temp_mxf, &slug, &job_temp).await {
             Ok(dest) => dest,
+            Err(e) if e.downcast_ref::<LeaseLost>().is_some() => return Err(e),
             Err(e) => {
                 let err_msg = format!("Watchfolder delivery failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
@@ -1104,8 +1139,12 @@ impl BroadcastEngine {
             return Err(self.held_changed(job_id, "its SHA-256 is not the one that was approved"));
         }
 
-        let delivered = match WatchfolderDelivery::deliver(&path, &self.watchfolder_dir, &slug).await {
+        let delivered = match self.deliver_to_watchfolder(job_id, owner, &path, &slug, &job_temp).await {
             Ok(dest) => dest,
+            Err(e) if e.downcast_ref::<LeaseLost>().is_some() => {
+                drop(guard);
+                return Err(e);
+            }
             Err(e) => {
                 drop(guard);
                 let err_msg = format!("Watchfolder delivery failed: {e:#}");
@@ -1259,5 +1298,78 @@ mod stopping_tests {
         );
         fresh.enter_stage(id, "w1", JobStage::Deliver, &job_temp).await.unwrap();
         assert_eq!(repo.get_job(id).unwrap().unwrap().stage, JobStage::Deliver);
+    }
+
+    /// P1.22: the engine writes the delivery marker right before the rename, and a job
+    /// that is no longer ours at that moment delivers nothing.
+    fn marker_rig() -> (tempfile::TempDir, Repository, BroadcastEngine, i64, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let watchfolder = dir.path().join("watchfolder");
+        let engine = BroadcastEngine::new(
+            repo.clone(),
+            dir.path().join("yt-dlp.exe"),
+            dir.path().join("ffmpeg.exe"),
+            dir.path().join("ffprobe.exe"),
+            dir.path().join("bmxtranswrap.exe"),
+            dir.path().join("temp"),
+            watchfolder.clone(),
+        );
+        let id = repo
+            .enqueue(&NewJob::new("https://example.org/v/2", "2_PAPADAKI_LIMANI", "PAPADAKI"), DEFAULT_DEDUP_WINDOW_HOURS)
+            .unwrap()
+            .job_id();
+        repo.lease_job("host:1:0", 180).unwrap().expect("leasable");
+        let source = dir.path().join("out.mxf");
+        std::fs::write(&source, b"A_FINISHED_MXF").unwrap();
+        (dir, repo, engine, id, source, watchfolder)
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_job_that_lost_its_lease_before_the_rename_leaves_nothing_in_the_watchfolder() {
+        let (dir, repo, engine, id, source, watchfolder) = marker_rig();
+        let job_temp = dir.path().join("temp").join("jobs").join(id.to_string());
+        // The lease is gone by the time the copy is done (a worker whose lease was
+        // reaped and taken over); here finish() just ends this one.
+        assert!(repo.finish(id, "host:1:0", omni_core::models::JobStatus::Failed, Some("X"), Some("gone"), None).unwrap());
+        let before = repo.get_job(id).unwrap().unwrap();
+
+        let err = engine
+            .deliver_to_watchfolder(id, "host:1:0", &source, "2_PAPADAKI_LIMANI", &job_temp)
+            .await
+            .expect_err("a job that is not ours delivers nothing");
+
+        assert!(err.downcast_ref::<LeaseLost>().is_some(), "{err:#}");
+        assert!(listing(&watchfolder).is_empty(), "left in the watchfolder: {:?}", listing(&watchfolder));
+        let after = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(
+            (after.status, after.stage, after.file_path, after.lease_owner),
+            (before.status, before.stage, before.file_path, before.lease_owner),
+            "the row changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivery_records_where_it_is_going_and_a_crash_before_finish_is_recovered_as_delivered() {
+        let (dir, repo, engine, id, source, watchfolder) = marker_rig();
+        let job_temp = dir.path().join("temp").join("jobs").join(id.to_string());
+
+        let delivered = engine
+            .deliver_to_watchfolder(id, "host:1:0", &source, "2_PAPADAKI_LIMANI", &job_temp)
+            .await
+            .expect("delivers");
+        assert_eq!(listing(&watchfolder), vec!["2_PAPADAKI_LIMANI.mxf".to_string()]);
+
+        // The process dies here: no set_delivered_file, no finish. Only the marker
+        // the engine wrote (path and size) can tell recovery the video is on air.
+        assert_eq!(repo.recover_on_startup("host").unwrap(), 0, "the delivered video was requeued");
+        let job = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(job.status, omni_core::models::JobStatus::Completed);
+        assert_eq!(job.file_path.as_deref(), Some(delivered.path.to_string_lossy().as_ref()));
+        assert_eq!(listing(&watchfolder).len(), 1);
     }
 }

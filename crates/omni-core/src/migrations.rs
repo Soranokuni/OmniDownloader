@@ -832,6 +832,19 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         DELETE FROM sessions;
         "#,
     ),
+    (
+        33,
+        // Where a delivery is about to rename its file, written by the lease holder just
+        // before the rename (P1.22). A job found RUNNING at start-up with a file of that
+        // size at that path is finished as delivered instead of requeued and delivered twice.
+        r#"
+        ALTER TABLE queue ADD COLUMN delivering_to TEXT;
+        ALTER TABLE queue ADD COLUMN delivering_bytes INTEGER;
+        -- 1 once the lease holder recorded that very path after the rename; only read
+        -- while delivering_to is set, and reset by every new marker.
+        ALTER TABLE queue ADD COLUMN delivering_recorded INTEGER;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1496,6 +1509,35 @@ mod tests {
         assert!(MIGRATIONS.iter().any(|(v, _)| *v == 32));
         let left: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0, "a plaintext-token session survived migration 32");
+    }
+
+    #[test]
+    fn migration_33_adds_the_delivering_marker_and_keeps_existing_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 32) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status) VALUES ('https://example.invalid/v', 'S', 'PENDING')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 32);
+        assert!(!columns_of(&conn, "queue").contains(&"delivering_to".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        let cols = columns_of(&conn, "queue");
+        assert!(cols.contains(&"delivering_to".to_string()) && cols.contains(&"delivering_bytes".to_string()));
+        let (to, bytes): (Option<String>, Option<i64>) = conn
+            .query_row("SELECT delivering_to, delivering_bytes FROM queue", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((to, bytes), (None, None), "an existing job must start with no marker");
     }
 
     #[test]
