@@ -17,6 +17,9 @@ Pure Rust, one `omni-ingest.exe`, runs as a Windows service.
 - **[Administrator Guide](docs/ADMIN_GUIDE.md)**: installing and upgrading,
   configuration, the toolchain, cookies, health lines, scheduled maintenance,
   the command line, error codes, troubleshooting.
+- Greek versions: [USER_GUIDE.el.md](docs/USER_GUIDE.el.md),
+  [ADMIN_GUIDE.el.md](docs/ADMIN_GUIDE.el.md). The English text wins where
+  they differ.
 
 Quick start for a station: build or download a release, run `Install.cmd`,
 open `http://127.0.0.1:8080/admin` on the server itself, sign in as
