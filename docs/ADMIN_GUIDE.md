@@ -163,6 +163,16 @@ directory.
 `.…tmp` and renamed when complete, so Dalet never sees a partial file. An
 existing file is never overwritten: a second delivery becomes `…_2.mxf`.
 
+If a copy is interrupted, the leftover hidden `.<name>.mxf.tmp` file (and a
+leftover `.omni-probe-<number>.tmp`) is removed automatically once it is older
+than 10 minutes and nothing has it open, at start-up and when its name is next
+needed; finished `.mxf` files and any other file are never touched. The job
+records where the file is going just before the final rename, so after a crash
+or restart a video that is already in the watchfolder is never delivered a
+second time: the job is finished as delivered ("Recovered after a restart").
+If the share cannot be read at that moment, the job goes to review instead of
+being requeued: check Dalet before retrying it.
+
 ---
 
 ## 5. Configuration
