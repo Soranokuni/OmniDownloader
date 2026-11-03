@@ -1,6 +1,9 @@
 {
   "_comment": "Copy to config.json and edit. Secrets never belong in this file: the Graph client secret and any API secret live in the encrypted store (data/secrets.bin), set with `omni-ingest secrets set graph.client_secret` or from the admin panel.",
 
+  "setup_completed": false,
+  "setup_mode": "beginner",
+
   "database_path": "data/omni.db",
   "watchfolder_path": "watchfolder",
   "temp_path": "temp",

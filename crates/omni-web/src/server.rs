@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::admin_bench;
 use crate::admin_cookies;
+use crate::admin_settings;
 use crate::admin_sites;
 use crate::admin_tools;
 use crate::assets::serve_static;
@@ -101,6 +102,15 @@ impl WebServer {
             .route("/api/admin/purge", post(api_admin_purge))
             .route("/api/admin/vacuum", post(api_admin_vacuum))
             .route("/api/admin/dependencies", get(api_admin_dependencies))
+            // The first-setup wizard and the settings behind it (P7.12).
+            .route("/api/setup/wizard/account", post(admin_settings::api_wizard_account))
+            .route("/api/admin/settings", get(admin_settings::api_admin_get_settings))
+            .route("/api/admin/settings/watchfolder/test", post(admin_settings::api_admin_test_watchfolder))
+            .route("/api/admin/settings/watchfolder", post(admin_settings::api_admin_save_watchfolder))
+            .route("/api/admin/settings/mail", post(admin_settings::api_admin_save_mail))
+            .route("/api/admin/settings/advanced", post(admin_settings::api_admin_save_advanced))
+            .route("/api/admin/settings/complete", post(admin_settings::api_admin_complete_setup))
+            .route("/api/admin/settings/answer-file", get(admin_settings::api_admin_answer_file))
             .route("/api/admin/tools", get(admin_tools::api_admin_tools))
             .route("/api/admin/tools/:name/install", post(admin_tools::api_admin_tool_install))
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))

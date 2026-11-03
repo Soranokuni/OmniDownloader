@@ -809,6 +809,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
+    /// First-setup wizard (plan P7.12). A config.json written before the wizard
+    /// existed has no key and reads as completed, so an upgrade never meets it;
+    /// a config this version creates writes `false`.
+    #[serde(default = "default_true")]
+    pub setup_completed: bool,
+
+    /// "beginner", "intermediate" or "it": which wizard mode was last chosen.
+    #[serde(default = "default_setup_mode")]
+    pub setup_mode: String,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -876,6 +886,9 @@ fn default_ollama_model() -> String {
 fn default_channel() -> String {
     "stable".to_string()
 }
+fn default_setup_mode() -> String {
+    "beginner".to_string()
+}
 fn default_true() -> bool {
     true
 }
@@ -906,6 +919,8 @@ impl Default for AppConfig {
             repair: RepairConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
+            setup_completed: false,
+            setup_mode: default_setup_mode(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -1076,6 +1091,27 @@ mod tests {
     use super::*;
     use crate::secrets::{keys, SecretStore};
     use tempfile::TempDir;
+
+    #[test]
+    fn an_old_config_without_setup_keys_reads_as_completed() {
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(old.setup_completed, "an upgrade must never meet the wizard");
+        assert_eq!(old.setup_mode, "beginner");
+        let marked: AppConfig = serde_json::from_str(r#"{"setup_completed":false}"#).unwrap();
+        assert!(!marked.setup_completed);
+    }
+
+    #[test]
+    fn a_config_created_fresh_writes_setup_not_completed() {
+        assert!(!AppConfig::default().setup_completed);
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("config.json");
+        let created = AppConfig::load_from_file(&p).unwrap();
+        assert!(!created.setup_completed);
+        let again = AppConfig::load_from_file(&p).unwrap();
+        assert!(!again.setup_completed, "the written file must say false, not omit the key");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("\"setup_completed\": false"));
+    }
 
     #[test]
     fn a_config_without_archive_keeps_sources_14_days_in_archive() {

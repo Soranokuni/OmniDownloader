@@ -1,5 +1,6 @@
 pub mod admin_bench;
 pub mod admin_cookies;
+pub mod admin_settings;
 pub mod admin_sites;
 pub mod admin_tools;
 pub mod assets;

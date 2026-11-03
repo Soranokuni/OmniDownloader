@@ -6,17 +6,19 @@
  */
 
 import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=6';
+import { runWizard } from '/static/wizard.js?v=3';
 
 /* ------------------------------------------------------------------ *
- * First-run account (P2.14)
+ * First-run account (P2.14) and the setup wizard (P7.12)
  *
  * While the first-run admin still has its default password the server refuses
- * every request but this one, so the page shows only the change form and the
- * rest of the module never runs (the module stops at the await below).
+ * every request but the wizard's account step and the password change, so the
+ * page shows only the wizard (whose first real step replaces that account) and
+ * the rest of the module never runs (the module stops at the await below).
+ * The change-password form stays reachable from the wizard as a fallback.
  * ------------------------------------------------------------------ */
 
-const whoami = await api('/api/auth/me').catch(() => null);
-if (whoami && whoami.password_change_required) {
+function showPasswordCard() {
   const field = (id, label, auto) => el('div', { class: 'field' },
     el('label', { for: id }, label),
     el('input', { type: 'password', id, required: true, autocomplete: auto }));
@@ -51,8 +53,33 @@ if (whoami && whoami.password_change_required) {
     el('h2', { class: 'card-title' }, 'Change the default password'),
     el('p', { class: 'note' }, 'Αλλάξτε πρώτα τον προεπιλεγμένο κωδικό. Nothing else is available until you do.'),
     form));
+}
+
+const whoami = await api('/api/auth/me').catch(() => null);
+if (whoami && whoami.password_change_required) {
   document.getElementById('logout-btn').addEventListener('click', logout);
+  await runWizard({ defaultAdmin: true, showPasswordCard });
   await new Promise(() => {});
+}
+
+// A real administrator on an installation whose wizard was never finished
+// (a config written by this version): the wizard takes the page until Finish.
+const setupState = await api('/api/admin/settings').catch(() => null);
+const leftWizard = sessionStorage.getItem('omni.setup.leave') === '1';
+if (setupState && setupState.setup_completed === false && !leftWizard) {
+  document.getElementById('logout-btn').addEventListener('click', logout);
+  await runWizard({ defaultAdmin: false });
+  await new Promise(() => {});
+}
+
+// The Setup card: whether the wizard was finished, and a way to run it again.
+// The account step appears only for the first-run session, which never gets here.
+{
+  const done = setupState && setupState.setup_completed;
+  document.getElementById('setup-state').textContent = done
+    ? `Setup was completed in ${setupState.setup_mode} mode.`
+    : 'Setup not finished: the wizard was left before its last screen.';
+  document.getElementById('setup-rerun').addEventListener('click', () => runWizard({ defaultAdmin: false }));
 }
 
 /* ------------------------------------------------------------------ *

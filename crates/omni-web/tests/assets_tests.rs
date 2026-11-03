@@ -425,11 +425,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v25_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v28_and_login_v6() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=25"), "admin.html does not import admin.js?v=25");
-    assert!(!admin.contains("/static/admin.js?v=24"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=28"), "admin.html does not import admin.js?v=28");
+    assert!(!admin.contains("/static/admin.js?v=27"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
     assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
@@ -438,4 +438,33 @@ fn the_first_run_password_card_ships_with_admin_v25_and_login_v6() {
     assert!(js.contains("password_change_required"), "admin.js ignores the first-run flag");
     let login_js = assets.get("static/login.js").expect("login.js shipped");
     assert!(login_js.contains("password_change_required"), "login.js ignores the first-run flag");
+}
+
+/// P7.12: the wizard is one module under one URL, built with el() only, and the
+/// admin page still hands the first-run session to it.
+#[test]
+fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
+    let assets = all_assets();
+    let wizard = assets.get("static/wizard.js").expect("wizard.js shipped");
+    let code: String = wizard.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    for banned in ["innerHTML", "outerHTML", "document.write", "insertAdjacentHTML", "http://", "https://"] {
+        assert!(!code.contains(banned), "wizard.js contains {banned}");
+    }
+    assert!(code.contains("/api/setup/wizard/account"), "the account step is not wired");
+    assert!(code.contains("/api/admin/settings/watchfolder/test"), "the watchfolder test is not wired");
+    assert!(code.contains("/api/admin/settings/complete"), "Finish does not complete setup");
+
+    // One URL per ES module: admin.js imports it, nothing else does.
+    let mut versions = std::collections::BTreeSet::new();
+    for s in assets.values() {
+        for (i, _) in s.match_indices("/static/wizard.js?v=") {
+            let rest = &s[i + "/static/wizard.js?v=".len()..];
+            versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
+        }
+    }
+    assert_eq!(versions, ["3".to_string()].into(), "wizard.js is imported under different versions");
+    let admin = assets.get("static/admin.js").expect("admin.js shipped");
+    assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
+    let page = assets.get("admin.html").expect("admin.html shipped");
+    assert!(page.contains("id=\"setup-rerun\""), "the Setup card is missing");
 }
