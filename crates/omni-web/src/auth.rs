@@ -101,6 +101,10 @@ pub fn client_ip(parts: &Parts, trusted_proxies: &CidrSet, trust_proxy_header: b
     if trust_proxy_header && trusted_proxies.contains(peer) {
         match forwarded_for(&parts.headers, trusted_proxies) {
             Forwarded::Absent => {}
+            // A loopback or unspecified address in the header is believed only from a proxy
+            // on this box: from a LAN proxy range it would let any client in that range
+            // claim to be the server itself (default-admin login, /setup, open MCR).
+            Forwarded::Client(ip) if (ip.is_loopback() || ip.is_unspecified()) && !peer.is_loopback() => return None,
             Forwarded::Client(ip) => return Some(ip),
             // A header the trusted proxy relayed but we cannot read: the peer is
             // the proxy, and giving the proxy's address (often loopback) to an
@@ -578,6 +582,28 @@ mod tests {
             client_ip(&parts, &trusted, false).unwrap().to_string(),
             "203.0.113.9"
         );
+    }
+
+    #[test]
+    fn a_lan_proxy_range_cannot_forward_a_loopback_address() {
+        let lan = CidrSet::parse(&["10.0.0.0/8".to_string()]).unwrap();
+        for forged in ["127.0.0.1", "::1", "0.0.0.0"] {
+            let mut parts = parts_with_peer("10.0.0.1:5");
+            parts.headers.insert("x-forwarded-for", HeaderValue::from_str(forged).unwrap());
+            assert_eq!(client_ip(&parts, &lan, true), None, "{forged}");
+        }
+        // A normal LAN client through the same proxy is unaffected.
+        let mut parts = parts_with_peer("10.0.0.1:5");
+        parts.headers.insert("x-forwarded-for", HeaderValue::from_static("10.20.0.5"));
+        assert_eq!(client_ip(&parts, &lan, true).unwrap().to_string(), "10.20.0.5");
+    }
+
+    #[test]
+    fn a_proxy_on_this_box_may_forward_a_loopback_client() {
+        let local = CidrSet::parse(&["127.0.0.1/32".to_string()]).unwrap();
+        let mut parts = parts_with_peer("127.0.0.1:1");
+        parts.headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        assert_eq!(client_ip(&parts, &local, true).unwrap().to_string(), "127.0.0.1");
     }
 
     #[test]

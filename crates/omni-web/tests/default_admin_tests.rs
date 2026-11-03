@@ -602,3 +602,21 @@ async fn setup_accepts_the_default_relative_watchfolder_and_stores_it_trimmed() 
     assert_eq!(a.state.config.read().await.watchfolder_path, "watchfolder");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_lan_proxy_range_cannot_forward_loopback_to_reach_the_default_login() -> Result<()> {
+    let a = app(
+        |c| {
+            c.security.trust_proxy_header = true;
+            c.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        },
+        false,
+    )?;
+    // The peer is inside the trusted LAN range and claims to be the server itself.
+    for forged in ["127.0.0.1", "::1", "0.0.0.0"] {
+        let r = login(&a, REMOTE, Some(forged), "admin", "Admin").await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{forged}");
+    }
+    assert_eq!(session_count(&a), 0);
+    Ok(())
+}

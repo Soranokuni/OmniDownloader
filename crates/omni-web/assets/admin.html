@@ -28,6 +28,13 @@
 <main class="grid-3" style="align-items:start">
 
   <div class="stack">
+
+    <section class="card" id="setup-card">
+      <h2 class="card-title">Setup</h2>
+      <p class="note" id="setup-state" style="margin-bottom:10px">Checking…</p>
+      <button class="btn btn-block" type="button" id="setup-rerun">Run setup wizard again</button>
+      <p class="note" style="margin-top:8px">Walks through the administrator account (only while the first-run account exists), watchfolder, mail and, in the other modes, network, TLS and metrics.</p>
+    </section>
     <section class="card">
       <h2 class="card-title">Download engine</h2>
       <div class="spec-row"><span>Installed yt-dlp</span><span id="ytdl-installed" class="mono">checking…</span></div>
@@ -645,6 +652,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=25"></script>
+<script type="module" src="/static/admin.js?v=28"></script>
 </body>
 </html>

@@ -625,6 +625,15 @@ const MATRIX: &[Row] = &[
         "/api/auth/password",
         &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Reached)],
     ),
+    // ---- First-setup wizard and settings (P7.12) ----
+    ("POST", "/api/setup/wizard/account", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Denied)]),
+    ("GET", "/api/admin/settings", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("GET", "/api/admin/settings/answer-file", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("POST", "/api/admin/settings/watchfolder/test", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("POST", "/api/admin/settings/watchfolder", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("POST", "/api/admin/settings/mail", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("POST", "/api/admin/settings/advanced", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("POST", "/api/admin/settings/complete", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     // ---- Admin ----
     (
         "GET",
@@ -647,6 +656,46 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ],
+    ),
+    (
+        "POST",
+        "/api/setup/wizard/account",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Denied)],
+    ),
+    (
+        "GET",
+        "/api/admin/settings",
+        &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
+    ),
+    (
+        "GET",
+        "/api/admin/settings/answer-file",
+        &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
+    ),
+    (
+        "POST",
+        "/api/admin/settings/watchfolder/test",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
+    ),
+    (
+        "POST",
+        "/api/admin/settings/watchfolder",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
+    ),
+    (
+        "POST",
+        "/api/admin/settings/mail",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
+    ),
+    (
+        "POST",
+        "/api/admin/settings/advanced",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
+    ),
+    (
+        "POST",
+        "/api/admin/settings/complete",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)],
     ),
     (
         "POST",
@@ -1007,6 +1056,8 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
         ("POST", "/api/auth/logout"),
         ("POST", "/api/auth/logout-all"),
         ("POST", "/api/admin/users"),
+        ("POST", "/api/setup/wizard/account"),
+        ("POST", "/api/setup/wizard/account"),
         ("GET", "/api/admin/users"),
     ];
 

@@ -95,6 +95,42 @@ Share permissions:
 - MCR and Dalet need **Modify** to move files out.
 - Nobody else needs access.
 
+### 2.1b The first-setup wizard
+
+A new installation is configured from the browser. Open `http://127.0.0.1:8080/admin` **on the server itself** and sign in with the first-run account `admin` / `Admin` (it works only from the server). The Admin page then shows the wizard full-page instead of the panel. It also appears, for any administrator, while `setup_completed` is `false` in `config.json`, which is what a configuration created by this version starts with. A configuration from an older version has no such key and counts as completed, so an upgrade never shows the wizard.
+
+The wizard has three modes, chosen on the first screen. They differ only in how many screens follow:
+
+| Mode | Screens |
+|---|---|
+| Beginner | the essentials with safe defaults: administrator account, watchfolder, mail, check |
+| Intermediate | Beginner plus network access, archive and the language model note (service account, MCR open networks, archive on/off and days, web port) |
+| IT / sysadmin | Intermediate plus TLS, reverse proxy, metrics and the answer file |
+
+Back and Next move between screens; Next stays disabled until the screen is valid. Every field shows its default and a one-line explanation.
+
+1. **Welcome.** Pick the mode.
+2. **Administrator account** (only while the first-run account still works). Enter a full name, a login (at least 3 characters, no spaces, not `admin`) and a password (at least 12 characters, typed twice; the ticks turn green as the rules are met). On Next the new administrator is created, the first-run `admin` account is switched off and its sessions end, and this browser is signed in as the new administrator. If anything fails, the first-run account stays as it was and you can try again. A link on this screen offers the older route: keep `admin` and only change its password.
+3. **Watchfolder.** Enter the share's `\\server\share` path (placeholder `\\192.168.4.42\FileIngest`), never a mapped drive letter. **Test** runs in the daemon itself, as the account the service runs as: it creates the folder if it is missing, writes a probe file, renames it and deletes it, within 15 seconds. On "access denied" it names the account to grant **Modify** on the share and the folder. Next saves the path and is enabled only after a passing test; it starts filled with where the current setting resolves. When the test says access denied, the screen explains the cause (the service is not running as an account the share accepts) and the `--account` reinstall. **Skip for now** changes nothing: files keep going to the current watchfolder (the local default folder next to the program on a new installation) until you set the share, and the warning says so. See 2.1a.
+4. **Mail (Microsoft 365).** Tenant ID, client ID, mailbox and client secret of the app registration (see 5.2). **Test connection** reads the mailbox. The secret goes to the encrypted store and is never shown again; leave it blank later to keep the stored one. **Skip for now** warns that no email is ingested until a mailbox is set.
+5. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the LLM card (5.4); a button leaves the wizard and opens it. A short note explains that a NAS or IP share needs the service reinstalled with `--account`.
+6. **TLS, reverse proxy and metrics** (IT only). The `.pfx` certificate path and passphrase, whether to trust the proxy header and from which networks, extra allowed host names, `/metrics` on/off and its networks, and **Download answer file**. A trusted-proxy range wider than /24 (IPv4) or /64 (IPv6) is flagged: every machine in it could speak for any client address. The certificate is opened with its passphrase before it is saved; a file that is not a PKCS#12 bundle, or a wrong passphrase, is refused, because it would stop the web listener at the next start.
+7. **Check and finish.** The daemon's current health lines, green, amber or red, each with its hint, and a notice if a restart is needed. **Finish** records `setup_completed` and the mode, and opens the normal panel.
+
+Which settings apply at once and which wait for a restart of the service:
+
+| Applies at once | Needs a restart |
+|---|---|
+| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks | watchfolder, mailbox settings, web port, TLS, allowed hosts, metrics on/off, archive |
+
+The wizard tells you after each save, and again on the last screen, when a restart is needed.
+
+**Leaving early.** On every screen after the account step, **Open the admin panel** leaves the wizard for this browser session without completing setup; the Setup card then says "Setup not finished", and the wizard returns at the next sign-in.
+
+**Running it again.** The Admin page has a **Setup** card with **Run setup wizard again**. The account step is skipped when the first-run account no longer exists. The settings the wizard writes are also available on their own, to an administrator, at `GET /api/admin/settings` and the `POST /api/admin/settings/...` routes the screens use.
+
+**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation for an unattended install later; nothing reads it back yet.
+
 ### 2.2 Upgrading
 
 Run the new release's `Install.cmd`. The service stops, the program and tools
