@@ -46,7 +46,7 @@ try {
     }
     # The operator and administrator guides travel with every release.
     New-Item -ItemType Directory -Force (Join-Path $stage 'docs') | Out-Null
-    foreach ($f in 'USER_GUIDE.md', 'ADMIN_GUIDE.md') {
+    foreach ($f in 'USER_GUIDE.md', 'ADMIN_GUIDE.md', 'USER_GUIDE.el.md', 'ADMIN_GUIDE.el.md') {
         Copy-Item (Join-Path $root "docs\$f") (Join-Path $stage 'docs')
     }
 
