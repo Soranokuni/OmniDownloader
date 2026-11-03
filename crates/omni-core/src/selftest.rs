@@ -114,6 +114,11 @@ pub async fn probe_one(path: &Path, args: &[&str]) -> Option<String> {
 /// failure otherwise appears at the very end of the pipeline, after a correct
 /// MXF has been produced, and reads as a delivery bug.
 pub fn probe_watchfolder(watchfolder: &Path) -> Result<(), String> {
+    // A mapped drive letter or a relative path is refused before anything is
+    // written: the service cannot see the former, and the latter means nothing.
+    if let Some(problem) = crate::paths::watchfolder_problem(&watchfolder.to_string_lossy()) {
+        return Err(problem);
+    }
     if !watchfolder.exists() {
         // Try to create it: a first run on a local folder should not need the
         // operator to mkdir by hand.
@@ -427,6 +432,13 @@ mod tests {
         let target = dir.path().join("watch").join("nested");
         assert!(probe_watchfolder(&target).is_ok());
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_before_anything_is_created() {
+        let err = probe_watchfolder(Path::new("omni-p220-relative-watch")).unwrap_err();
+        assert!(err.contains("relative path"), "{err}");
+        assert!(!Path::new("omni-p220-relative-watch").exists());
     }
 
     #[test]

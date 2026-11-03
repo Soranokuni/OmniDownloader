@@ -618,6 +618,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_drive_letter_counts_as_a_network_watchfolder() {
+        use omni_core::paths::{DriveKind, DriveLookup};
+        struct Mapped;
+        impl DriveLookup for Mapped {
+            fn drive_kind(&self, l: char) -> DriveKind {
+                if l == 'Z' { DriveKind::Remote } else { DriveKind::Other }
+            }
+            fn connection(&self, _: char) -> Option<String> {
+                Some(r"\\nas\ingest".into())
+            }
+            fn persistent_mapping(&self, _: char) -> Option<String> {
+                None
+            }
+        }
+        assert!(needs_network_identity_with(r"Z:\watch", &Mapped));
+        assert!(!needs_network_identity_with(r"D:\watch", &Mapped));
+    }
+
+    #[test]
     fn a_unc_watchfolder_is_what_makes_localsystem_wrong() {
         // LocalSystem authenticates to SMB as the computer account, which a
         // file server usually refuses -- so delivery fails at the last step,
@@ -662,6 +681,13 @@ mod tests {
 /// True when the watchfolder is on another machine, so the service needs an
 /// identity the file server will accept.
 pub fn needs_network_identity(watchfolder: &str) -> bool {
+    needs_network_identity_with(watchfolder, &omni_core::paths::SystemDrives)
+}
+
+/// `needs_network_identity` with the drive lookup injected. A mapped drive
+/// letter counts: it is refused at install, but the account warning must not
+/// depend on that.
+pub fn needs_network_identity_with(watchfolder: &str, drives: &dyn omni_core::paths::DriveLookup) -> bool {
     let w = watchfolder.trim();
-    w.starts_with(r"\\") || w.starts_with("//")
+    w.starts_with(r"\\") || w.starts_with("//") || omni_core::paths::is_mapped_drive_with(w, drives)
 }

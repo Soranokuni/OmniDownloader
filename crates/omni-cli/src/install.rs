@@ -107,6 +107,22 @@ fn import_from(old: &Path, new: &AppPaths) -> Result<AppConfig> {
     Ok(config)
 }
 
+/// Refuse a watchfolder the service cannot use (a mapped drive letter, a path that is
+/// empty), with the path to use instead. A relative value in config.json is legitimate
+/// (it means "under the install folder"), so the resolved path is judged, never the raw one.
+pub(crate) fn check_config_watchfolder(
+    paths: &AppPaths,
+    config: &AppConfig,
+    drives: &dyn omni_core::paths::DriveLookup,
+) -> Result<()> {
+    let raw = config.watchfolder_path.trim();
+    let judged = if raw.is_empty() { String::new() } else { paths.resolve(raw).to_string_lossy().into_owned() };
+    match omni_core::paths::watchfolder_problem_with(&judged, drives) {
+        Some(problem) => anyhow::bail!("Cannot install: {problem}"),
+        None => Ok(()),
+    }
+}
+
 /// A config path as an absolute one, resolved against the folder it was
 /// relative to; UNC and absolute paths unchanged.
 fn absolute(paths: &AppPaths, p: &str) -> String {
@@ -164,6 +180,9 @@ pub async fn install(o: InstallOptions) -> Result<()> {
     if let Some(p) = o.port {
         config.web_port = p;
     }
+    // Before anything is stopped or copied. A relative value in config.json is
+    // legitimate (it means "under the install folder"), so judge the resolved path.
+    check_config_watchfolder(&paths, &config, &omni_core::paths::SystemDrives)?;
 
     // The service is (re)registered when it is missing, points elsewhere, or
     // a new account was asked for. Otherwise its account is kept as it is.
@@ -720,6 +739,36 @@ fn print_health(body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MappedZ;
+    impl omni_core::paths::DriveLookup for MappedZ {
+        fn drive_kind(&self, l: char) -> omni_core::paths::DriveKind {
+            if l == 'Z' { omni_core::paths::DriveKind::Remote } else { omni_core::paths::DriveKind::Other }
+        }
+        fn connection(&self, _: char) -> Option<String> {
+            Some(r"\\192.168.4.42\FileIngest".into())
+        }
+        fn persistent_mapping(&self, _: char) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn install_refuses_a_mapped_drive_and_names_the_share() {
+        let paths = AppPaths::with_root(r"C:\omni", "config.json");
+        let check = |w: &str| {
+            let mut c = AppConfig::default();
+            c.watchfolder_path = w.to_string();
+            check_config_watchfolder(&paths, &c, &MappedZ)
+        };
+        let err = check(r"Z:\Dalet").unwrap_err().to_string();
+        assert!(err.contains(r"use \\192.168.4.42\FileIngest\Dalet instead"), "{err}");
+        assert!(check(r"D:\Dalet").is_ok());
+        assert!(check(r"\\nas\ingest").is_ok());
+        // The default relative value means "under the install folder": fine.
+        assert!(check("watchfolder").is_ok());
+        assert!(check("  ").is_err());
+    }
 
     /// The root is restricted only when the service's exe sits directly in it: never a repo whose
     /// build is in `target\release` (the developer would lose write access under UAC).

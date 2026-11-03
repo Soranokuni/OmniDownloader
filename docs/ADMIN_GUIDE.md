@@ -84,6 +84,17 @@ After installation `data\` and `temp\` are readable only by SYSTEM,
 Administrators and the service account, so CLI commands against the
 installed root need an elevated prompt.
 
+### 2.1a The watchfolder and its share
+
+Use the share's `\\server\share` path, never a mapped drive letter: a mapping belongs to your Windows session and the service cannot see it. The installer, the setup page and the health page refuse a mapped letter. They show the exact path to use wherever the mapping can be resolved: an elevated installer cannot see your desktop's drives, so it reads the mapping your Windows account remembers; the service itself cannot, and then only says that the letter is not usable and asks for the `\\server\share` path.
+
+Share permissions:
+
+- The account the service runs as needs **Modify** on the share. By default that is the server's computer account `DOMAIN\SERVER$`, and that only works on a domain-joined server.
+- For a NAS or a share addressed by IP, install with `--account` and a user the share accepts.
+- MCR and Dalet need **Modify** to move files out.
+- Nobody else needs access.
+
 ### 2.2 Upgrading
 
 Run the new release's `Install.cmd`. The service stops, the program and tools
