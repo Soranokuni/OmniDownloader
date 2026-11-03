@@ -2944,6 +2944,19 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
         }
     }
 
+    // A mapped drive letter or a relative path: the service could not use it.
+    // The form pre-fills the config's own value, which may be the default relative
+    // "watchfolder" (under the install folder), so judge the resolved path.
+    let watch = payload.watchfolder_path.trim().to_string();
+    let judged = if watch.is_empty() {
+        String::new()
+    } else {
+        state.config.read().await.resolve_path(&watch).to_string_lossy().into_owned()
+    };
+    if let Some(problem) = omni_core::paths::watchfolder_problem(&judged) {
+        return ApiError::bad_request(problem).into_response();
+    }
+
     // Create the first administrator, if this is that moment.
     let needs_admin = !state.repo.has_active_admin().unwrap_or(true);
     if needs_admin {
@@ -3019,7 +3032,7 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
         }
         cfg.ollama_endpoint = if llm_blank { payload.ollama_endpoint } else { llm_base };
         cfg.ollama_model = payload.ollama_model;
-        cfg.watchfolder_path = payload.watchfolder_path;
+        cfg.watchfolder_path = watch;
         if let Err(e) = cfg.save_to_file(&state.config_path) {
             tracing::error!(error = ?e, "Saving config failed");
             return ApiError::internal("Could not save the configuration.").into_response();

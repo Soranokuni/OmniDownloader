@@ -575,3 +575,30 @@ async fn an_unreadable_forwarded_header_from_a_trusted_proxy_is_not_the_proxy_it
     assert_eq!(session_count(&a), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn setup_refuses_an_empty_watchfolder_and_keeps_the_old_one() -> Result<()> {
+    let a = app(|_| {}, false)?;
+    let normal = normal_session(&a).await;
+    let before = a.state.config.read().await.watchfolder_path.clone();
+    let mut body = setup_body("");
+    body["watchfolder_path"] = json!("   ");
+    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(body)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("No watchfolder was given"), "{}", r.body);
+    assert_eq!(a.state.config.read().await.watchfolder_path, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_accepts_the_default_relative_watchfolder_and_stores_it_trimmed() -> Result<()> {
+    let a = app(|_| {}, false)?;
+    let normal = normal_session(&a).await;
+    // The form pre-fills the config's own relative value: it must be accepted.
+    let mut body = setup_body("");
+    body["watchfolder_path"] = json!(" watchfolder ");
+    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(body)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(a.state.config.read().await.watchfolder_path, "watchfolder");
+    Ok(())
+}

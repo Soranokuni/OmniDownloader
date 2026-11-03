@@ -314,10 +314,25 @@ pub async fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
         .prompt()?;
 
     // 2. Watchfolder
-    config.watchfolder_path = Text::new("Broadcast ingest watchfolder (play-out destination):")
-        .with_default(&config.watchfolder_path)
-        .with_help_message("Directory where atomic broadcast MXF assets will be dropped")
-        .prompt()?;
+    // A relative value in config.json means "under the install folder"; show it
+    // in full, because the wizard accepts only a full path.
+    let mut default_watch = config.resolve_path(&config.watchfolder_path).display().to_string();
+    loop {
+        let answer = Text::new("Broadcast ingest watchfolder (play-out destination):")
+            .with_default(&default_watch)
+            .with_help_message("Use the share's \\\\server\\share path, never a mapped drive letter")
+            .prompt()?;
+        match omni_core::paths::watchfolder_problem(&answer) {
+            None => {
+                config.watchfolder_path = answer.trim().to_string();
+                break;
+            }
+            Some(problem) => {
+                println!("{problem}");
+                default_watch = answer.trim().to_string();
+            }
+        }
+    }
 
     // 3. Temp dir
     config.temp_path = Text::new("Temporary Working Directory:")
