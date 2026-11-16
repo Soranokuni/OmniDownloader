@@ -1660,35 +1660,11 @@ fn without_log_prefixes(mut line: &str) -> &str {
 /// Recover the error code the pipeline attached to a failure.
 ///
 /// The pipeline wraps failures with `.context(code.as_str())`, so the code is in
-/// the anyhow chain rather than parsed back out of a message. Anything
-/// unrecognised goes to a human rather than being retried on a guess.
+/// the anyhow chain: the first code of `errors::CLASSIFIED` the chain's text
+/// names as a whole token (`errors::code_in_text`). Anything unrecognised goes
+/// to a human rather than being retried on a guess.
 pub(crate) fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
-    let text = format!("{e:#}");
-    for code in [
-        ErrorCode::ManualDownload,
-        ErrorCode::HeldFileChanged,
-        ErrorCode::ComplianceFailed,
-        ErrorCode::ProbeFailed,
-        ErrorCode::LoginRequired,
-        ErrorCode::GeoBlocked,
-        ErrorCode::PrivateOrRemoved,
-        ErrorCode::PageNotFound,
-        ErrorCode::LiveStream,
-        ErrorCode::Http403,
-        ErrorCode::UnsupportedUrl,
-        ErrorCode::NoStreamFound,
-        ErrorCode::DownloadTimeout,
-        ErrorCode::TranscodeTimeout,
-        ErrorCode::RewrapTimeout,
-        ErrorCode::DeliveryFailed,
-        ErrorCode::LowDisk,
-        ErrorCode::Network,
-    ] {
-        if text.contains(code.as_str()) {
-            return code;
-        }
-    }
-    ErrorCode::PipelineFailed
+    omni_broadcast::errors::code_in_text(&format!("{e:#}")).unwrap_or(ErrorCode::PipelineFailed)
 }
 
 #[cfg(test)]
@@ -1839,6 +1815,29 @@ mod tests {
         let code = classify_pipeline_error(&e);
         assert_eq!(code, ErrorCode::HeldFileChanged);
         assert!(!code.is_retryable(), "a file that is not the approved one is never retried into delivery");
+    }
+
+    /// P11.1: a failed encode or rewrap keeps its code; it used to read
+    /// PIPELINE_FAILED, "unexpected error", as did a full disk in rewrap (job 68).
+    #[test]
+    fn a_stage_failure_keeps_its_code_and_an_uncoded_one_is_unexpected() {
+        let rewrap = anyhow::anyhow!("bmxtranswrap exited with code Some(1). stderr tail: ERROR: BMX exception caught")
+            .context("REWRAP_FAILED")
+            .context("bmxtranswrap RDD9 failed");
+        assert_eq!(classify_pipeline_error(&rewrap), ErrorCode::RewrapFailed);
+        let encode = anyhow::anyhow!("ffmpeg exited with code Some(1). stderr tail: Conversion failed!")
+            .context("TRANSCODE_FAILED")
+            .context("FFmpeg Transcode failed");
+        assert_eq!(classify_pipeline_error(&encode), ErrorCode::TranscodeFailed);
+        let full = anyhow::anyhow!("bmxtranswrap exited with code Some(1). stderr tail: ERROR: 'mxf_file->write(data, size) == size' check failed")
+            .context(ErrorCode::LowDisk.as_str());
+        assert_eq!(classify_pipeline_error(&full), ErrorCode::LowDisk);
+        assert!(classify_pipeline_error(&full).is_retryable());
+        let plain = anyhow::anyhow!("x").context("something went wrong");
+        assert_eq!(classify_pipeline_error(&plain), ErrorCode::PipelineFailed);
+        // A code inside a longer identifier (a slug in a path) is not that code.
+        let slug = anyhow::anyhow!("could not open C:\\temp\\jobs\\9\\3_NETWORK_OUTAGE.mxf");
+        assert_eq!(classify_pipeline_error(&slug), ErrorCode::PipelineFailed);
     }
 
     /// 2026-10-19: a live download's DEBUG line read "LIVE_STREAM: LIVE_STREAM: …".

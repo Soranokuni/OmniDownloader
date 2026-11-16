@@ -271,6 +271,83 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// The codes [`code_in_text`] looks for in a failure's error chain, first
+/// match wins. The specific ones come before the generic: a chain that says
+/// both NO_STREAM_FOUND and NETWORK is a page without a video, and one that
+/// says both LOW_DISK and REWRAP_FAILED is a full disk. The two stage
+/// failures come last, so any more exact code a stage attached wins.
+pub const CLASSIFIED: &[ErrorCode] = &[
+    ErrorCode::ManualDownload,
+    ErrorCode::HeldFileChanged,
+    ErrorCode::ComplianceFailed,
+    ErrorCode::ProbeFailed,
+    ErrorCode::LoginRequired,
+    ErrorCode::GeoBlocked,
+    ErrorCode::PrivateOrRemoved,
+    ErrorCode::PageNotFound,
+    ErrorCode::LiveStream,
+    ErrorCode::Http403,
+    ErrorCode::UnsupportedUrl,
+    ErrorCode::NoStreamFound,
+    ErrorCode::DownloadTimeout,
+    ErrorCode::TranscodeTimeout,
+    ErrorCode::RewrapTimeout,
+    ErrorCode::DeliveryFailed,
+    ErrorCode::LowDisk,
+    ErrorCode::Network,
+    ErrorCode::TranscodeFailed,
+    ErrorCode::RewrapFailed,
+];
+
+/// Every other code, and why the text classifier does not look for it. A new
+/// code goes in one of the two lists, or a test fails.
+pub const NOT_CLASSIFIED: &[(ErrorCode, &str)] = &[
+    (ErrorCode::SourceTooLong, "set by the benchmark only; no job path raises it"),
+    (ErrorCode::ExtractTimeout, "set by the benchmark only; no job path raises it"),
+    (ErrorCode::DeliverTimeout, "nothing raises it; a failed delivery is DELIVERY_FAILED"),
+    (ErrorCode::LeaseExpired, "set by the reaper in SQL; the engine's lost lease is recognised by type, not text"),
+    (ErrorCode::PipelineFailed, "the fallback"),
+    (ErrorCode::DrmProtected, "set directly by the worker from the failed page's evidence"),
+    (ErrorCode::NoVideoOnPage, "set directly by the worker from the failed page's evidence"),
+    (ErrorCode::VideoUnresolved, "set directly by the worker from the failed page's evidence or the repair ladder"),
+    (ErrorCode::RejectedByMcr, "set by an MCR action in SQL"),
+    (ErrorCode::ApprovalExpired, "set by the held-video expiry in SQL"),
+    (ErrorCode::RepairExhausted, "set directly by the repair ladder"),
+    (ErrorCode::NonPublicAddress, "set directly by the egress check, which ends the job itself"),
+];
+
+/// The first code of [`CLASSIFIED`] that `text` names as a whole token: the
+/// characters either side of it are not `A-Z`, `0-9` or `_`. So
+/// "MY_NETWORK_X" and "HTTP_4031" name nothing, and "x:NETWORK" names NETWORK.
+pub fn code_in_text(text: &str) -> Option<ErrorCode> {
+    CLASSIFIED.iter().copied().find(|code| names_token(text, code.as_str()))
+}
+
+fn names_token(text: &str, token: &str) -> bool {
+    let bytes = text.as_bytes();
+    let part = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_';
+    text.match_indices(token).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|i| bytes[i]);
+        let after = bytes.get(at + token.len()).copied();
+        !before.is_some_and(part) && !after.is_some_and(part)
+    })
+}
+
+/// Whether a tool's failure text says the disk is full: bmxtranswrap's failed
+/// write check (job 68), FFmpeg's ENOSPC, or Windows' own wording.
+pub fn disk_full_text(text: &str) -> bool {
+    let s = text.to_ascii_lowercase();
+    if s.contains("write(data, size) == size")
+        || s.contains("no space left on device")
+        || s.contains("there is not enough space on the disk")
+    {
+        return true;
+    }
+    // ERROR_DISK_FULL, and not a longer number that starts with 112.
+    s.match_indices("os error 112")
+        .any(|(at, m)| !s.as_bytes().get(at + m.len()).is_some_and(|b| b.is_ascii_digit()))
+}
+
 /// The card's hint for a login wall, naming the site (P3.5): no jar yet, or a
 /// jar that no longer gets in. Greek, for MCR; the action is the admin's.
 pub fn login_hint_el(domain: &str, jar_exists: bool) -> String {
@@ -802,5 +879,95 @@ mod tests {
             assert!(!c.hint_el().is_empty());
         }
         assert_eq!(ErrorCode::from_code("NOT_A_CODE"), None);
+    }
+
+    /// P11.1: a code added later and forgotten in both lists is caught here.
+    #[test]
+    fn every_code_is_either_classified_or_says_why_not() {
+        for c in ErrorCode::ALL {
+            let classified = CLASSIFIED.iter().filter(|x| **x == c).count();
+            let not = NOT_CLASSIFIED.iter().filter(|(x, _)| *x == c).count();
+            assert_eq!(classified + not, 1, "{c}: in CLASSIFIED {classified}x, in NOT_CLASSIFIED {not}x");
+        }
+        for (c, why) in NOT_CLASSIFIED {
+            assert!(!why.trim().is_empty(), "{c} needs a reason");
+        }
+        assert_eq!(CLASSIFIED.len() + NOT_CLASSIFIED.len(), ErrorCode::ALL.len());
+    }
+
+    /// Every classified code comes back out of a chain shaped like the
+    /// worker's `{e:#}`, at the front or in the middle.
+    #[test]
+    fn every_classified_code_is_found_in_a_real_shaped_chain() {
+        for c in CLASSIFIED {
+            let code = c.as_str();
+            for text in [
+                format!("{code}: outer: middle: inner detail"),
+                format!("bmxtranswrap RDD9 failed: {code}: bmxtranswrap exited with code Some(1). stderr tail: boom"),
+                format!("outer: middle (caused by {code})"),
+                code.to_string(),
+            ] {
+                assert_eq!(code_in_text(&text), Some(*c), "{text}");
+            }
+        }
+        assert_eq!(code_in_text("ffmpeg exited with code Some(1). stderr tail: boom"), None);
+        assert_eq!(code_in_text(""), None);
+    }
+
+    /// The old `contains` read a code inside a longer identifier.
+    #[test]
+    fn a_code_inside_a_longer_identifier_is_not_that_code() {
+        for text in ["MY_NETWORK_X", "HTTP_4031", "XLOW_DISK", "NETWORKS", "a file 3_NETWORK_OUTAGE.mp4", "2HTTP_403"] {
+            assert_eq!(code_in_text(text), None, "{text}");
+        }
+        for text in ["… (NETWORK)", "NETWORK: reset", "x:NETWORK", "networkNETWORK.", "Δίκτυο NETWORK"] {
+            assert_eq!(code_in_text(text), Some(ErrorCode::Network), "{text}");
+        }
+        // Every occurrence is looked at, not only the first.
+        assert_eq!(code_in_text("MY_NETWORK_X then NETWORK: reset"), Some(ErrorCode::Network));
+        assert_eq!(code_in_text("XLOW_DISK: REWRAP_FAILED"), Some(ErrorCode::RewrapFailed));
+    }
+
+    #[test]
+    fn the_more_exact_code_wins_whatever_its_place_in_the_text() {
+        let both = "NETWORK: x: NO_STREAM_FOUND: no video";
+        assert_eq!(code_in_text(both), Some(ErrorCode::NoStreamFound));
+        assert_eq!(code_in_text("REWRAP_FAILED: LOW_DISK: bmxtranswrap exited"), Some(ErrorCode::LowDisk));
+        assert_eq!(code_in_text("LOW_DISK: REWRAP_FAILED: bmxtranswrap exited"), Some(ErrorCode::LowDisk));
+        assert_eq!(code_in_text("TRANSCODE_FAILED: PROBE_FAILED for job #3"), Some(ErrorCode::ProbeFailed));
+        // The original 18 keep their order.
+        assert_eq!(&CLASSIFIED[..18], &[
+            ErrorCode::ManualDownload,
+            ErrorCode::HeldFileChanged,
+            ErrorCode::ComplianceFailed,
+            ErrorCode::ProbeFailed,
+            ErrorCode::LoginRequired,
+            ErrorCode::GeoBlocked,
+            ErrorCode::PrivateOrRemoved,
+            ErrorCode::PageNotFound,
+            ErrorCode::LiveStream,
+            ErrorCode::Http403,
+            ErrorCode::UnsupportedUrl,
+            ErrorCode::NoStreamFound,
+            ErrorCode::DownloadTimeout,
+            ErrorCode::TranscodeTimeout,
+            ErrorCode::RewrapTimeout,
+            ErrorCode::DeliveryFailed,
+            ErrorCode::LowDisk,
+            ErrorCode::Network,
+        ]);
+    }
+
+    /// Job 68: bmxtranswrap on a full disk read as "unexpected error".
+    #[test]
+    fn a_full_disk_is_recognised_in_each_tool_s_words() {
+        let job68 = "bmxtranswrap exited with code Some(1). stderr tail: ERROR: 'mxf_file->write(data, size) == size' check failed\nERROR: near bmx/src/rdd9_mxf/RDD9ContentPackage.cpp:187\nERROR: BMX exception caught\n";
+        assert!(disk_full_text(job68));
+        assert!(disk_full_text("[out#0/mxf @ 000001] av_interleaved_write_frame(): No space left on device"));
+        assert!(disk_full_text("Failed writing the file (os error 112)"));
+        assert!(disk_full_text("There is not enough space on the disk. (os error 112)"));
+        assert!(!disk_full_text("ERROR: Failed to open file 'C:\\temp\\7_transcode.mxf'\nERROR: BMX exception caught"));
+        assert!(!disk_full_text("[mpeg2video @ 000001] VBV buffer too small for bitrate\nConversion failed!"));
+        assert!(!disk_full_text("The system cannot find the file specified. (os error 1123)"));
     }
 }

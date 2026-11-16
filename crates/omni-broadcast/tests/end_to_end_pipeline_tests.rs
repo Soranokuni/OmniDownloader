@@ -516,3 +516,41 @@ async fn the_clip_name_reaches_the_mxf_and_the_gate_checks_it() {
     .expect("verify ran");
     assert!(!wrong.pass, "a wrong material package name was accepted");
 }
+
+/// P11.1: a tool that fails in transcode or rewrap leaves its stage's code on
+/// the error, which is what the worker classifies. Both used to read as
+/// PIPELINE_FAILED, "unexpected error", on the MCR card.
+#[tokio::test]
+async fn a_failed_encode_or_rewrap_carries_its_stage_code() {
+    use omni_broadcast::errors::{code_in_text, ErrorCode};
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let Some(bmx) = tool("bmxtranswrap") else {
+        eprintln!("WARNING: skipping stage-code test -- bmxtranswrap not found in bin/");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.mp4");
+    assert!(make_source(&ffmpeg, &src, "25", 2, true).await);
+
+    // ffprobe in ffmpeg's place: the source probes, the encode exits non-zero.
+    let err = Transcoder::new(&ffprobe, &ffprobe)
+        .transcode_with_target(
+            5,
+            &src,
+            &dir.path().join("work"),
+            &LoudnessTarget { enabled: false, ..LoudnessTarget::default() },
+            |_| {},
+        )
+        .await
+        .expect_err("ffprobe cannot encode");
+    assert_eq!(code_in_text(&format!("{err:#}")), Some(ErrorCode::TranscodeFailed), "{err:#}");
+
+    // An MP4 is not an MXF bmxtranswrap can read.
+    let err = omni_broadcast::Rewrapper::new(&bmx)
+        .rewrap_with_clip(5, &src, &dir.path().join("work"), Some("5_INVENTED_CLIP"), None)
+        .await
+        .expect_err("bmxtranswrap cannot rewrap an MP4");
+    assert_eq!(code_in_text(&format!("{err:#}")), Some(ErrorCode::RewrapFailed), "{err:#}");
+}

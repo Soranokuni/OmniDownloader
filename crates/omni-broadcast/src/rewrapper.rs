@@ -14,6 +14,8 @@ use omni_core::process::{run, RunOpts};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::errors::{disk_full_text, ErrorCode};
+
 /// Rewrapping copies essence rather than re-encoding, so it runs at disk speed.
 /// Ten minutes is generous for anything the queue accepts and still bounded.
 const DEFAULT_REWRAP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -113,7 +115,10 @@ impl Rewrapper {
                 DEFAULT_REWRAP_TIMEOUT.as_secs()
             ));
         }
-        outcome.ok_or_err("bmxtranswrap").map_err(|e| e.context("REWRAP_FAILED"))?;
+        outcome.ok_or_err("bmxtranswrap").map_err(|e| {
+            let code = rewrap_failure_code(&format!("{e:#}"));
+            e.context(code.as_str())
+        })?;
 
         if !final_temp_mxf.exists() {
             return Err(anyhow!(
@@ -125,9 +130,32 @@ impl Rewrapper {
     }
 }
 
+/// The code for a bmxtranswrap run that failed: a full disk is LOW_DISK and
+/// retried later (job 68 read as "unexpected error"); anything else is a
+/// failed rewrap.
+fn rewrap_failure_code(text: &str) -> ErrorCode {
+    if disk_full_text(text) {
+        ErrorCode::LowDisk
+    } else {
+        ErrorCode::RewrapFailed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rewrap_on_a_full_disk_is_low_disk_and_any_other_failure_is_a_failed_rewrap() {
+        // Job 68's stderr, verbatim apart from the header ok_or_err adds.
+        let job68 = "bmxtranswrap exited with code Some(1). stderr tail: ERROR: 'mxf_file->write(data, size) == size' check failed\nERROR: near bmx/src/rdd9_mxf/RDD9ContentPackage.cpp:187\nERROR: BMX exception caught\n";
+        assert_eq!(rewrap_failure_code(job68), ErrorCode::LowDisk);
+        assert_eq!(
+            rewrap_failure_code("bmxtranswrap exited with code Some(1). stderr tail: ERROR: Failed to open file\nERROR: BMX exception caught"),
+            ErrorCode::RewrapFailed
+        );
+        assert_eq!(rewrap_failure_code("bmxtranswrap was cancelled"), ErrorCode::RewrapFailed);
+    }
 
     #[test]
     fn the_source_stays_the_final_argument_when_a_clip_name_is_added() {

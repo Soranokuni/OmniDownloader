@@ -415,7 +415,7 @@ mod tests {
             ("egress::end_job_internal_hosts(", 2),
             ("egress::end_job_unreadable(", 1),
         ] {
-            assert_eq!(main.matches(call).count(), times, "`{call}` must appear {times} time(s) in main.rs");
+            assert_eq!(main.matches(call).count(), times, "`{call}` must appear {times} time(s) in worker.rs");
         }
     }
 }
