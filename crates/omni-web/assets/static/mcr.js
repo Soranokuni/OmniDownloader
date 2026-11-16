@@ -440,19 +440,39 @@ async function loadQueue() {
   const jobs = data.jobs || [];
   renderOffers('article-offers', jobs);
   if (jobs.length === 0) {
+    liveCards.clear();
+    queueList.cards.clear();
     render('queue-cards', el('div', { class: 'card center' },
       'Δεν περιμένει τίποτα. Οι νέοι σύνδεσμοι από email εμφανίζονται εδώ αυτόματα.'));
   } else {
-    liveCards.clear();
-    const cards = jobs.map((j) => {
-      if (j.status !== 'PENDING' && j.status !== 'RUNNING') return deliveredCard(j);
-      const node = activeCard(j);
-      liveCards.set(j.id, { job: j, node });
-      return node;
+    syncKeyedList(queueList, document.getElementById('queue-cards'), jobs, {
+      build: (j) => {
+        if (!isActive(j)) {
+          liveCards.delete(j.id);
+          return deliveredCard(j);
+        }
+        const node = activeCard(j);
+        liveCards.set(j.id, { job: j, node });
+        return node;
+      },
+      sig: queueSig,
     });
-    render('queue-cards', cards);
+    // A card that left the page (or finished) is no longer a live card.
+    for (const id of [...liveCards.keys()]) if (!queueList.cards.has(id)) liveCards.delete(id);
   }
   pager('queue-pager', pages.live, data.total || 0, loadQueue);
+}
+
+const isActive = (job) => job.status === 'PENDING' || job.status === 'RUNNING';
+
+/** A queue card's signature: the job, plus the one thing a card shows that
+ *  changes with the clock (the countdown / minutes-in-step text and its warning
+ *  colour), so a ticking card is redrawn and a still one is left alone. */
+function queueSig(job) {
+  if (!isActive(job)) return JSON.stringify(job);
+  const t = job.status === 'RUNNING' ? stepTimeNode(job) : null;
+  const wait = job.status === 'PENDING' ? waitLine(job) : '';
+  return JSON.stringify([job, wait, t ? t.className : '', t ? t.textContent : '', groupGen]);
 }
 
 function activeCard(job) {
@@ -605,16 +625,123 @@ function dayHeading(at) {
   return long.charAt(0).toLocaleUpperCase('el-GR') + long.slice(1);
 }
 
-function withDayHeadings(jobs, card) {
-  const out = [];
+/* Keyed lists (P12.3). The lists refresh every 5 s; rebuilding every card
+ * threw away what an operator was typing, the focus and the open panels. Each
+ * list keeps `cards` (job id -> { node, sig }) and `days` (heading key -> node).
+ * A card whose signature is unchanged is not touched; a changed one is built
+ * again and takes over the typed values and the focus of the old one. The
+ * signature is the whole job (everything a card reads is in it), so no field
+ * can be forgotten. */
+const reviewList = { cards: new Map(), days: new Map() };
+const queueList = { cards: new Map(), days: new Map() };
+const completedList = { cards: new Map(), days: new Map() };
+
+const CONTROLS = 'input, textarea, select';
+
+/** True when the operator changed the control after it was built. */
+function controlEdited(c) {
+  if (c.tagName === 'SELECT') return [...c.options].some((o) => o.selected !== o.defaultSelected);
+  if (c.type === 'checkbox' || c.type === 'radio') return c.checked !== c.defaultChecked;
+  return c.value !== c.defaultValue;
+}
+
+/** Copy what the operator typed (and the focus) from `oldNode`'s controls to
+ *  the matching ones of `newNode`. Returns a function to run once `newNode` is
+ *  on the page, which gives back the focus and the selection. */
+function carryControls(oldNode, newNode) {
+  const fresh = [...newNode.querySelectorAll(CONTROLS)];
+  const active = document.activeElement;
+  const restores = [];
+  [...oldNode.querySelectorAll(CONTROLS)].forEach((old, i) => {
+    const next = old.id ? fresh.find((c) => c.id === old.id) : fresh[i];
+    if (!next || next.tagName !== old.tagName) return;
+    if (controlEdited(old)) {
+      if (old.type === 'checkbox' || old.type === 'radio') next.checked = old.checked;
+      else next.value = old.value;
+    }
+    if (old !== active) return;
+    let start = null;
+    let end = null;
+    let dir = 'none';
+    try { start = old.selectionStart; end = old.selectionEnd; dir = old.selectionDirection || 'none'; } catch { /* no selection on this type */ }
+    restores.push(() => {
+      if (!next.isConnected) return;
+      next.focus({ preventScroll: true });
+      if (start === null || end === null) return;
+      try { next.setSelectionRange(start, end, dir); } catch { /* not a text control */ }
+    });
+  });
+  return restores;
+}
+
+/** Put `wanted` in `host` in that order, moving only what is out of place and
+ *  removing the rest: a node that is not moved keeps its focus and scroll. */
+function reconcileChildren(host, wanted) {
+  const keep = new Set(wanted);
+  let cur = host.firstChild;
+  for (const node of wanted) {
+    // Stale nodes (replaced, gone, placeholders) go first, in place, so the
+    // kept nodes after them are not moved: a moved node loses focus and caret.
+    while (cur && !keep.has(cur)) {
+      const stale = cur.nextSibling;
+      cur.remove();
+      cur = stale;
+    }
+    if (node === cur) {
+      cur = cur.nextSibling;
+      continue;
+    }
+    host.insertBefore(node, cur);
+  }
+  while (cur) {
+    const next = cur.nextSibling;
+    cur.remove();
+    cur = next;
+  }
+}
+
+/** Show `jobs` in `host`, one keyed node each (`build(job)`), reusing the node
+ *  of every job whose `sig(job)` is unchanged. With `headings`, a small day
+ *  heading precedes the first job of each local day of `updated_at`. */
+function syncKeyedList(list, host, jobs, { build, sig, headings = false }) {
+  if (!host) return;
+  const wanted = [];
+  const restores = [];
+  const seen = new Set();
+  const days = new Map();
+  const dayCount = new Map();
   let day;
   for (const job of jobs) {
-    const label = job.updated_at ? dayHeading(job.updated_at) : null;
-    if (label && label !== day) out.push(el('div', { class: 'ib-day' }, label));
-    day = label;
-    out.push(card(job));
+    if (headings) {
+      const label = job.updated_at ? dayHeading(job.updated_at) : null;
+      if (label && label !== day) {
+        // Counted, so a day that comes back later in the list gets its own node.
+        const n = dayCount.get(label) || 0;
+        dayCount.set(label, n + 1);
+        const key = `${label}#${n}`;
+        const node = list.days.get(key) || el('div', { class: 'ib-day' }, label);
+        days.set(key, node);
+        wanted.push(node);
+      }
+      day = label;
+    }
+    const s = sig(job);
+    const prev = list.cards.get(job.id);
+    let node;
+    if (prev && prev.sig === s && prev.node.parentNode === host) {
+      node = prev.node;
+    } else {
+      node = build(job);
+      if (prev && prev.node.parentNode === host) restores.push(...carryControls(prev.node, node));
+      list.cards.set(job.id, { node, sig: s });
+    }
+    seen.add(job.id);
+    wanted.push(node);
   }
-  return out;
+  list.days = days;
+  for (const id of [...list.cards.keys()]) if (!seen.has(id)) list.cards.delete(id);
+  reconcileChildren(host, wanted);
+  for (const restore of restores) restore();
 }
 
 /* The held videos (P10.7): fetched with every review refresh, but their cards
@@ -650,10 +777,16 @@ async function loadReview() {
   }
   if (jobs.length === 0) {
     const filtered = reviewSearch.value.trim() || reviewJournalist.value;
+    reviewList.cards.clear();
+    reviewList.days.clear();
     render('review-cards', el('div', { class: 'card center' },
       filtered ? 'Κανένα βίντεο δεν ταιριάζει με την αναζήτηση.' : 'Δεν υπάρχει κάτι για έλεγχο.'));
   } else {
-    render('review-cards', withDayHeadings(jobs, reviewCard));
+    syncKeyedList(reviewList, document.getElementById('review-cards'), jobs, {
+      build: reviewCard,
+      sig: (job) => JSON.stringify(job),
+      headings: true,
+    });
     for (const id of historyOpen) restoreHistoryScroll(id);
   }
   pager('review-pager', pages.review, data.total || 0, loadReview);
@@ -750,6 +883,12 @@ function reviewCard(job) {
     id: `override-${job.id}`,
     value: job.url,
   });
+  // Enter in the field does what the button beside it does.
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.isComposing) return;
+    event.preventDefault();
+    overrideJob(job, input.value);
+  });
   const href = safeHref(job.url);
   const locker = job.status === 'MANUAL_DOWNLOAD';
   const history = historyPanel(job);
@@ -834,6 +973,9 @@ searchInput.addEventListener('input', () => {
 
 /* Group labels (plan P4.20): code → name, for titles and the filter. */
 let groupNames = new Map();
+// Bumped whenever groupNames is replaced: cards that show a group's name are
+// kept between refreshes, so their signatures carry it.
+let groupGen = 0;
 function groupName(code) {
   return groupNames.get(code) || code;
 }
@@ -842,6 +984,7 @@ async function loadFilters() {
   try {
     const [g, j] = await Promise.all([api('/api/groups'), api('/api/journalists')]);
     groupNames = new Map((g.groups || []).map((x) => [x.code, x.name]));
+    groupGen += 1;
     journalists = j.journalists || [];
   } catch { /* the lists show codes and the filter stays at "all" */ }
   const surnames = journalists.map((x) => x.surname).filter(Boolean).sort();
@@ -877,10 +1020,14 @@ async function loadCompleted() {
   renderOffers('completed-offers', jobs);
   if (jobs.length === 0) {
     const filtered = searchInput.value.trim() || filterSelect.value || groupSelect.value;
+    completedList.cards.clear();
     render('completed-body', el('tr', {},
       el('td', { colspan: '6', class: 'empty' }, filtered ? 'Τίποτα δεν ταιριάζει με την αναζήτηση.' : 'Δεν έχει παραδοθεί τίποτα ακόμη.')));
   } else {
-    render('completed-body', jobs.map(completedRow));
+    syncKeyedList(completedList, document.getElementById('completed-body'), jobs, {
+      build: completedRow,
+      sig: (job) => JSON.stringify([job, groupGen]),
+    });
   }
   pager('completed-pager', pages.completed, data.total || 0, loadCompleted);
 }
@@ -1072,6 +1219,8 @@ function onLiveMessage(message) {
     const node = activeCard(entry.job);
     entry.node.replaceWith(node);
     entry.node = node;
+    // Keep the reconciler's record of this card in step with what is on screen.
+    queueList.cards.set(entry.job.id, { node, sig: queueSig(entry.job) });
     return;
   }
   // A progress tick for a card that is not on screen: the 5 s poll covers it.

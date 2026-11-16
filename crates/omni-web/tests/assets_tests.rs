@@ -377,7 +377,7 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 #[test]
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
-    for (module, version) in [("desk.js", 12), ("inbox.js", 18), ("approval.js", 7), ("mcr.js", 43)] {
+    for (module, version) in [("desk.js", 12), ("inbox.js", 18), ("approval.js", 7), ("mcr.js", 44)] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
         for s in assets.values() {
@@ -405,6 +405,29 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
         ["setInterval(reloadAll, 5000);", "reloadAll();"],
         "mcr.js must end with the unconditional poll"
     );
+}
+
+/// P12.3: the desk's lists are updated in place. A full `render(list, every card)` on the 5 s
+/// refresh throws away an operator's typed address, the focus and the open panels.
+#[test]
+fn mcr_lists_are_reconciled_not_rebuilt_every_refresh() {
+    let assets = all_assets();
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    for old in [
+        "render('review-cards', withDayHeadings",
+        "render('queue-cards', cards)",
+        "render('completed-body', jobs.map(completedRow))",
+    ] {
+        assert!(!mcr.contains(old), "mcr.js rebuilds a whole list again: {old}");
+    }
+    for new in [
+        "syncKeyedList(reviewList,",
+        "syncKeyedList(queueList,",
+        "syncKeyedList(completedList,",
+        "carryControls(",
+    ] {
+        assert!(mcr.contains(new), "mcr.js no longer reconciles its lists: {new}");
+    }
 }
 
 #[test]
