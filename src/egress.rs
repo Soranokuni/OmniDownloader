@@ -176,7 +176,7 @@ pub fn refusal_message(why: &EgressRefusal) -> String {
 /// End a job whose address, or a replacement for it, may not be requested: review, no request
 /// made, the code NON_PUBLIC_ADDRESS, the same text as the job's event. The lease holder ends it.
 fn end_job_non_public(repo: &Repository, job_id: i64, owner: &str, message: &str) -> Result<()> {
-    if crate::still_ours(repo, job_id, owner) {
+    if crate::worker::still_ours(repo, job_id, owner) {
         repo.record_event(job_id, "ERROR", Some(JobStage::Extract), message)?;
     }
     repo.finish(job_id, owner, JobStatus::RequiresReview, Some(ErrorCode::NonPublicAddress.as_str()), Some(message), None)?;
@@ -404,7 +404,7 @@ mod tests {
     /// `run_job` and `ytdlp_attempt` from being deleted without a test failing.
     #[test]
     fn every_enforcement_point_is_still_wired_into_the_job_path() {
-        let main = include_str!("main.rs");
+        let main = include_str!("worker.rs");
         for (call, times) in [
             ("vet_url(&orig_url, egress_allow)", 1),
             ("vet_url(&fixed, egress_allow)", 1),

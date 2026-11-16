@@ -618,7 +618,7 @@ pub async fn after_failure_with(
     let already_rejected_same = false;
     if !omni_broadcast::repair::eligible(ctx.cfg.mode, code, job_kind(job, orig_url), site_breaker_open, already_rejected_same)
         || cancel.is_cancelled()
-        || !crate::still_ours(&ctx.repo, job.id, owner)
+        || !crate::worker::still_ours(&ctx.repo, job.id, owner)
     {
         return None;
     }
@@ -645,7 +645,7 @@ fn skips_of_site(repo: &Repository, job: &Job, orig_url: &str) -> Option<Vec<Str
 const NO_JOB: i64 = 0;
 
 fn lost(ctx: &RepairCtx, job_id: i64, owner: &str, cancel: &CancellationToken) -> bool {
-    cancel.is_cancelled() || (job_id != NO_JOB && !crate::still_ours(&ctx.repo, job_id, owner))
+    cancel.is_cancelled() || (job_id != NO_JOB && !crate::worker::still_ours(&ctx.repo, job_id, owner))
 }
 
 fn note(ctx: &RepairCtx, job_id: i64, level: &str, text: &str) {
@@ -2012,7 +2012,7 @@ async fn hold_one(
             if e.downcast_ref::<LeaseLost>().is_some() || lost(ctx, job_id, owner, cancel) {
                 return HoldStep::Lost;
             }
-            let code: ErrorCode = crate::classify_pipeline_error(&e);
+            let code: ErrorCode = crate::worker::classify_pipeline_error(&e);
             info!("Job #{job_id}: repair download from {host} failed: {code}");
             note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: η λήψη από {host} απέτυχε ({})", code.as_str()));
             HoldStep::Failed

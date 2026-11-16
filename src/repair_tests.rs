@@ -859,7 +859,7 @@ async fn rerun(r: &Rig, snap: PageSnapshot) -> Option<LadderResult> {
 /// repository functions: the file is held, the job parked, then MCR decides.
 fn park(r: &Rig) {
     assert!(r.repo.hold_output(r.job.id, OWNER, "temp/held/x/clip.mxf", 10, &"ab".repeat(32), Some(9.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
-    assert!(crate::finish_held(&r.repo, r.job.id, OWNER).unwrap());
+    assert!(crate::worker::finish_held(&r.repo, r.job.id, OWNER).unwrap());
 }
 
 fn held_urls(r: &Rig) -> Vec<String> {
@@ -1364,7 +1364,7 @@ async fn a_repaired_video_goes_through_the_real_pipeline_and_waits_for_mcr() {
     assert_eq!(recipe_hash, shipped_hash("next_data_media"));
     // The worker, not the ladder, parks the job.
     assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Running);
-    assert!(crate::finish_held(&repo, id, OWNER).unwrap());
+    assert!(crate::worker::finish_held(&repo, id, OWNER).unwrap());
 
     let job = repo.get_job(id).unwrap().unwrap();
     assert_eq!(job.status, JobStatus::AwaitingApproval);
@@ -1403,7 +1403,7 @@ async fn work(repo: &Repository, engine: &Arc<BroadcastEngine>, root: &Path, job
     let ctx = RepairCtx { repo: repo.clone(), cfg: cfg(mode, Duration::from_secs(5)), env: Arc::new(PanicEnv) };
     let health = omni_core::health::HealthState::new();
     let canary = Arc::new(crate::canary::CanaryEnv::new(repo.clone(), health.clone(), root.join("bin"), "stable".into()));
-    crate::run_job(repo, engine, OWNER, job, CancellationToken::new(), &root.join("evidence"), &ctx, &health, &canary)
+    crate::worker::run_job(repo, engine, OWNER, job, CancellationToken::new(), &root.join("evidence"), &ctx, &health, &canary)
         .await
         .unwrap();
 }
@@ -1945,7 +1945,7 @@ impl NextRig {
         let ctx = RepairCtx { repo: self.repo.clone(), cfg: c, env };
         let health = omni_core::health::HealthState::new();
         let canary = Arc::new(crate::canary::CanaryEnv::new(self.repo.clone(), health.clone(), self.root.join("bin"), "stable".into()));
-        crate::run_job(&self.repo, &self.engine, OWNER, job, CancellationToken::new(), &self.root.join("evidence"), &ctx, &health, &canary)
+        crate::worker::run_job(&self.repo, &self.engine, OWNER, job, CancellationToken::new(), &self.root.join("evidence"), &ctx, &health, &canary)
             .await
             .unwrap();
     }
@@ -2055,7 +2055,7 @@ async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
         let ctx = RepairCtx { repo: n.repo.clone(), cfg: cfg(mode, Duration::from_secs(5)), env: env.clone() };
         let health = omni_core::health::HealthState::new();
         let canary = Arc::new(crate::canary::CanaryEnv::new(n.repo.clone(), health.clone(), n.root.join("bin"), "stable".into()));
-        crate::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
+        crate::worker::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
             .await
             .unwrap();
         assert!(env.downloads.lock().unwrap().is_empty(), "{mode:?}: nothing is downloaded");
@@ -2333,7 +2333,7 @@ async fn work_allowing(repo: &Repository, engine: &Arc<BroadcastEngine>, root: &
     let ctx = RepairCtx { repo: repo.clone(), cfg: c, env: Arc::new(PanicEnv) };
     let health = omni_core::health::HealthState::new();
     let canary = Arc::new(crate::canary::CanaryEnv::new(repo.clone(), health.clone(), root.join("bin"), "stable".into()));
-    crate::run_job(repo, engine, OWNER, job, cancel, &root.join("evidence"), &ctx, &health, &canary).await.unwrap();
+    crate::worker::run_job(repo, engine, OWNER, job, cancel, &root.join("evidence"), &ctx, &health, &canary).await.unwrap();
 }
 
 fn leased_url(repo: &Repository, url: &str) -> Job {
