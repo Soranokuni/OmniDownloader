@@ -143,7 +143,14 @@ fn trim_for_message(s: &str) -> String {
     if t.is_empty() {
         "(empty)".to_string()
     } else if t.len() > 1200 {
-        format!("…{}", &t[t.len() - 1200..])
+        // Forward to the next character boundary: Greek file names and
+        // metadata are normal in a tool's stderr, and a cut inside a
+        // character panics (P11.8).
+        let mut start = t.len() - 1200;
+        while !t.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("…{}", &t[start..])
     } else {
         t.to_string()
     }
@@ -443,6 +450,25 @@ mod tests {
         } else {
             vec!["-c".into(), format!("sleep {secs}")]
         }
+    }
+
+    /// P11.8: a long Greek stderr tail whose cut point falls inside a
+    /// character panicked here, inside the job run.
+    #[test]
+    fn a_long_greek_stderr_tail_is_cut_at_a_character_boundary() {
+        // 1 + 999 × 2 + 1 = 2000 bytes; every 'α' starts at an odd byte, so
+        // byte 800 (= len - 1200) is the middle of one.
+        let tail = format!("x{}!", "α".repeat(999));
+        assert_eq!(tail.len(), 2000);
+        assert!(!tail.is_char_boundary(tail.len() - 1200));
+        let cut = trim_for_message(&tail);
+        assert!(cut.starts_with('…'), "{cut}");
+        assert!(cut.ends_with("ααα!"), "{cut}");
+        assert!(cut.len() <= "…".len() + 1200, "{} bytes", cut.len());
+        // A tail that is short enough, or ASCII, is unchanged in behaviour.
+        assert_eq!(trim_for_message("  short  "), "short");
+        let ascii = "y".repeat(2000);
+        assert_eq!(trim_for_message(&ascii), format!("…{}", &ascii[800..]));
     }
 
     #[test]

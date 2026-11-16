@@ -3,10 +3,12 @@
 //! classification; the lease holder sets every terminal status here.
 
 use anyhow::Result;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
@@ -15,7 +17,7 @@ use omni_browser::evidence::{Evidence, EvidenceClass};
 use omni_browser::sniffer::StreamSniffer;
 use omni_core::config::RepairMode;
 use omni_core::models::{JobStage, JobStatus};
-use omni_core::repository::Repository;
+use omni_core::repository::{DeliverySettled, Repository};
 use omni_core::health::HealthState;
 use omni_core::site_health::{SiteOutcome, SiteState};
 
@@ -71,6 +73,325 @@ pub(crate) const LEASE_REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// better to stop than to queue or deliver for a job MCR may have cancelled.
 pub(crate) fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
     repo.owns_lease(job_id, owner).unwrap_or(false)
+}
+
+/// How long a job run's internal error keeps the `workers` health line amber.
+const PANIC_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A job that hit an internal error on its first attempt is tried once more after this.
+const PANIC_RETRY_SECS: i64 = 30;
+
+/// What the worker loop shares with every job run (P11.8).
+#[derive(Clone)]
+pub(crate) struct JobRunCtx {
+    pub(crate) repo: Repository,
+    pub(crate) engine: Arc<BroadcastEngine>,
+    pub(crate) health: HealthState,
+    /// How often a run renews its lease ([`HEARTBEAT_INTERVAL`]; shorter in tests).
+    pub(crate) heartbeat_interval: Duration,
+    /// When job runs hit an internal error, oldest first.
+    panics: Arc<Mutex<VecDeque<Instant>>>,
+    /// The heartbeat of each run, so a test can see it has stopped.
+    #[cfg(test)]
+    heartbeats: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl JobRunCtx {
+    pub(crate) fn new(repo: Repository, engine: Arc<BroadcastEngine>, health: HealthState) -> Self {
+        Self {
+            repo,
+            engine,
+            health,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            panics: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(test)]
+            heartbeats: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn panics(&self) -> std::sync::MutexGuard<'_, VecDeque<Instant>> {
+        self.panics.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Bring the `workers` line up to date: amber while a run hit an internal
+    /// error in the last 24 h. Called on every lease, so it turns green again.
+    pub(crate) fn refresh_health(&self) {
+        let check = workers_check(&mut self.panics(), Instant::now());
+        self.health.set_if_changed(omni_core::health::checks::WORKERS, check);
+    }
+
+    fn note_panic(&self) {
+        self.panics().push_back(Instant::now());
+        self.refresh_health();
+    }
+}
+
+/// The `workers` line for the internal errors in `panics`, dropping those older than 24 h.
+fn workers_check(panics: &mut VecDeque<Instant>, now: Instant) -> omni_core::health::Check {
+    while panics.front().is_some_and(|t| now.saturating_duration_since(*t) >= PANIC_WINDOW) {
+        panics.pop_front();
+    }
+    match panics.len() {
+        0 => omni_core::health::Check::ok("running"),
+        n => omni_core::health::Check::degraded(format!("{n} job(s) hit an internal error in the last 24 h")),
+    }
+}
+
+/// What one leased job holds until its run is over, a panic included.
+pub(crate) struct LeasedJob {
+    pub(crate) job_id: i64,
+    pub(crate) owner: String,
+    pub(crate) busy: omni_core::busy::BusyGuard,
+    pub(crate) gate_pass: omni_core::update_gate::GatePass,
+    pub(crate) job_slot: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) download_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Ends a run's hold on its job when dropped, whichever way the run ends:
+/// fires the run's token, stops the lease heartbeat, and stops the job body
+/// if the run itself is dropped (a daemon stop) while the body still runs.
+struct LeaseKeeper {
+    cancel: CancellationToken,
+    heartbeat: tokio::task::JoinHandle<()>,
+    body: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.heartbeat.abort();
+        if let Some(body) = &self.body {
+            body.abort();
+        }
+    }
+}
+
+/// Keep the lease alive while we work. If it stops succeeding we have lost the
+/// job -- the reaper requeued it, or an operator cancelled it -- and must stop
+/// rather than deliver a file for a job somebody else now owns.
+fn spawn_heartbeat(
+    repo: Repository,
+    job_id: i64,
+    owner: String,
+    cancel: CancellationToken,
+    every: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await; // fires immediately; skip it
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    match repo.heartbeat(job_id, &owner, LEASE_SECS) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!("Job #{job_id}: lease lost, abandoning work");
+                            cancel.cancel();
+                            break;
+                        }
+                        Err(e) => warn!("Job #{job_id}: heartbeat failed: {e:?}"),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Run one leased job's `body` (in the daemon, [`run_job`]) under its lease
+/// heartbeat, and release everything the job holds when it ends (P11.8).
+///
+/// The body runs as its own task, so a panic in it is caught here: the
+/// heartbeat stops, and a job still ours goes back to the queue once, then to
+/// review, instead of staying RUNNING under a lease that never expires.
+pub(crate) async fn run_leased_job<F, Fut>(ctx: &JobRunCtx, leased: LeasedJob, body: F)
+where
+    F: FnOnce(CancellationToken) -> Fut + Send,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let LeasedJob { job_id, owner, busy, gate_pass, job_slot, download_slot } = leased;
+    // Held for the whole job, including every error path: dropping it is what
+    // tells a waiting updater the downloader is idle.
+    let _gate_pass = gate_pass;
+    // Until this run is done with the job, MCR cannot queue it again (a
+    // cancelled job stops only at its next stage). Its token is the job run's:
+    // MCR's cancel and a lost lease both fire it, and it kills the running
+    // tool (plan P1.15).
+    let cancel = busy.token();
+    let _busy = busy;
+    // Handed back on every exit, a panic in the body included.
+    let _slot_guard = download_slot.map(|slot| {
+        ctx.engine.hold_download_slot(job_id, &owner, slot);
+        ctx.engine.download_slot_guard(job_id, &owner)
+    });
+
+    let mut keeper = LeaseKeeper {
+        cancel: cancel.clone(),
+        heartbeat: spawn_heartbeat(ctx.repo.clone(), job_id, owner.clone(), cancel.clone(), ctx.heartbeat_interval),
+        body: None,
+    };
+    #[cfg(test)]
+    ctx.heartbeats.lock().unwrap_or_else(|p| p.into_inner()).push(keeper.heartbeat.abort_handle());
+    let task = tokio::spawn(body(cancel));
+    keeper.body = Some(task.abort_handle());
+    let joined = task.await;
+    // The heartbeat stops before anything below releases the lease.
+    drop(keeper);
+
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => bookkeeping_failed(&ctx.repo, job_id, &owner, &e),
+        Err(join) if join.is_panic() => after_panic(ctx, job_id, &owner, join.into_panic()).await,
+        // Cancelled, which only a runtime shutdown does: the row is left RUNNING with
+        // its delivery marker for start-up recovery to judge, as a crash would.
+        Err(_) => info!("Job #{job_id}: the run was stopped before it finished; left to start-up recovery"),
+    }
+
+    drop(job_slot);
+}
+
+/// run_job handles its own failures; reaching here means the bookkeeping
+/// itself failed, so release the lease rather than leaving the job RUNNING
+/// until the reaper notices.
+fn bookkeeping_failed(repo: &Repository, job_id: i64, owner: &str, e: &anyhow::Error) {
+    error!("Job #{job_id}: worker bookkeeping failed: {e:?}");
+    let _ = repo.finish(
+        job_id,
+        owner,
+        JobStatus::RequiresReview,
+        Some(ErrorCode::PipelineFailed.as_str()),
+        Some(&e.to_string()),
+        None,
+    );
+}
+
+/// The job's body panicked. One that is no longer ours (cancelled, reaped,
+/// finished before the panic) is left as it is. One at DELIVER or later is
+/// never requeued: the video may already be on air, so the rule start-up
+/// recovery applies decides (completed, or review to check Dalet). Any other
+/// is tried once more after [`PANIC_RETRY_SECS`], then goes to review. The
+/// job's event is written only after its row was.
+async fn after_panic(ctx: &JobRunCtx, job_id: i64, owner: &str, payload: Box<dyn std::any::Any + Send>) {
+    let text = panic_text(payload.as_ref());
+    error!("Job #{job_id}: internal error while running the job: {text}");
+    ctx.note_panic();
+    let repo = &ctx.repo;
+    // A row that cannot be read is treated as delivering: never a requeue on a guess.
+    let (delivering, attempts) = match repo.get_job(job_id) {
+        Ok(Some(j)) if j.lease_owner.as_deref() != Some(owner) || j.status != JobStatus::Running => {
+            info!("Job #{job_id}: no longer ours after the internal error; nothing written");
+            return;
+        }
+        Ok(Some(j)) => (is_delivering(j.status, j.stage), Some(j.attempts)),
+        Ok(None) => return,
+        Err(e) => {
+            warn!("Job #{job_id}: the job could not be read after the internal error: {e:#}");
+            (true, None)
+        }
+    };
+
+    let event = if delivering {
+        // Looks at the watchfolder, which may be a slow share: off the async threads.
+        let settle = {
+            let (repo, owner) = (repo.clone(), owner.to_string());
+            tokio::task::spawn_blocking(move || repo.settle_after_delivery_panic(job_id, &owner)).await
+        };
+        match settle {
+            Ok(Ok(DeliverySettled::Completed)) => {
+                info!("Job #{job_id}: the video was already in the watchfolder; finished, not requeued");
+                Some(format!("Internal error while running the job, after the video was delivered: {text}"))
+            }
+            Ok(Ok(DeliverySettled::Review)) => {
+                warn!("Job #{job_id}: internal error while delivering; sent to review, not requeued");
+                Some(format!("Internal error while running the job, during delivery: {text}"))
+            }
+            Ok(Ok(DeliverySettled::NotOurs)) => None,
+            Ok(Err(e)) => {
+                error!("Job #{job_id}: could not settle the delivery after the internal error: {e:#}");
+                None
+            }
+            Err(e) => {
+                error!("Job #{job_id}: could not settle the delivery after the internal error: {e}");
+                None
+            }
+        }
+    } else {
+        let code = ErrorCode::PipelineFailed.as_str();
+        let written = if attempts.is_some_and(|a| a <= 1) {
+            repo.requeue_after(job_id, owner, chrono::Duration::seconds(PANIC_RETRY_SECS), code, "internal error (panic)")
+        } else {
+            repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code), Some(&format!("internal error (panic): {text}")), None)
+        };
+        match written {
+            Ok(true) => Some(format!("Internal error while running the job: {text}")),
+            Ok(false) => None,
+            Err(e) => {
+                error!("Job #{job_id}: could not release the job after the internal error: {e:#}");
+                None
+            }
+        }
+    };
+    match event {
+        Some(line) => {
+            if let Err(e) = repo.record_event(job_id, "ERROR", None, &line) {
+                warn!("Job #{job_id}: the internal error could not be recorded: {e:#}");
+            }
+        }
+        None => info!("Job #{job_id}: no longer ours after the internal error; nothing written"),
+    }
+}
+
+/// A panic's message, for the log and the job: at most 300 characters, every
+/// address cut to host and path (a slicing panic quotes its string; JSON
+/// escapes `/` as `\/`), and the query, password and fragment a `url::Url`
+/// prints with `{:?}` left out.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    let raw = if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    };
+    let raw = without_debug_url_parts(raw);
+    let scrubbed: Vec<String> = raw
+        .split_whitespace()
+        .map(|w| {
+            if w.contains(r":\/\/") {
+                omni_core::cookies::host_and_path(&w.replace(r"\/", "/"))
+            } else if w.contains("://") {
+                omni_core::cookies::host_and_path(w)
+            } else {
+                w.to_string()
+            }
+        })
+        .collect();
+    scrubbed.join(" ").chars().take(300).collect()
+}
+
+/// `query: Some("…")`, `password: Some("…")` and `fragment: Some("…")` of a
+/// `url::Url` printed with `{:?}`, with the value left out.
+fn without_debug_url_parts(mut s: String) -> String {
+    for key in [r#"query: Some(""#, r#"password: Some(""#, r#"fragment: Some(""#] {
+        let mut from = 0;
+        while let Some(at) = s[from..].find(key) {
+            let start = from + at + key.len();
+            // The closing `")`, not an escaped quote inside the value.
+            let mut end = s.len();
+            let mut look = start;
+            while let Some(i) = s[look..].find("\")") {
+                let i = look + i;
+                if !s[..i].ends_with('\\') {
+                    end = i;
+                    break;
+                }
+                look = i + 1;
+            }
+            s.replace_range(start..end, "…");
+            from = start + "…".len();
+        }
+    }
+    s
 }
 
 /// A repaired video a trusted recipe delivered without approval (P10.16a): the
@@ -1782,6 +2103,458 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// One leased job's run on a scratch database, with what the worker loop
+    /// would hand it (P11.8).
+    struct LeasedRun {
+        db: ScratchDb,
+        ctx: JobRunCtx,
+        busy: omni_core::busy::BusyJobs,
+        gate: omni_core::update_gate::UpdateGate,
+        jobs: Arc<tokio::sync::Semaphore>,
+        downloads: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl LeasedRun {
+        fn new(heartbeat: Duration) -> Self {
+            let (db, repo) = ScratchDb::new();
+            let engine = Arc::new(BroadcastEngine::new(
+                repo.clone(),
+                db.0.join("bin").join("yt-dlp.exe"),
+                db.0.join("bin").join("ffmpeg.exe"),
+                db.0.join("bin").join("ffprobe.exe"),
+                db.0.join("bin").join("bmxtranswrap.exe"),
+                db.0.join("temp"),
+                db.0.join("watch"),
+            ));
+            let mut ctx = JobRunCtx::new(repo, engine, HealthState::new());
+            ctx.heartbeat_interval = heartbeat;
+            Self {
+                db,
+                ctx,
+                busy: omni_core::busy::BusyJobs::new(),
+                gate: omni_core::update_gate::UpdateGate::new(),
+                jobs: Arc::new(tokio::sync::Semaphore::new(1)),
+                downloads: Arc::new(tokio::sync::Semaphore::new(1)),
+            }
+        }
+
+        fn repo(&self) -> &Repository {
+            &self.ctx.repo
+        }
+
+        /// Queue job `n` and lease it as `owner` for `lease_secs`.
+        fn queue_and_lease(&self, n: u32, owner: &str, lease_secs: i64) -> i64 {
+            let id = self
+                .repo()
+                .enqueue(
+                    &omni_core::models::NewJob::new(&format!("https://example.gr/p118/{n}"), &format!("{n}_ELENI_P118"), "ELENI"),
+                    omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
+                )
+                .unwrap()
+                .job_id();
+            assert_eq!(self.repo().lease_job(owner, lease_secs).unwrap().map(|j| j.id), Some(id));
+            id
+        }
+
+        /// What the worker loop hands the run of `id`, and the run's token.
+        fn leased(&self, id: i64, owner: &str) -> (LeasedJob, CancellationToken) {
+            let busy = self.busy.guard(id, owner);
+            let token = busy.token();
+            let leased = LeasedJob {
+                job_id: id,
+                owner: owner.to_string(),
+                busy,
+                gate_pass: self.gate.try_enter().expect("no update pending"),
+                job_slot: self.jobs.clone().try_acquire_owned().expect("a job slot"),
+                download_slot: Some(self.downloads.clone().try_acquire_owned().expect("a download slot")),
+            };
+            (leased, token)
+        }
+
+        fn job(&self, id: i64) -> omni_core::models::Job {
+            self.repo().get_job(id).unwrap().unwrap()
+        }
+
+        fn internal_error_lines(&self, id: i64) -> Vec<omni_core::models::JobEvent> {
+            self.repo()
+                .get_job_events(id, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.message.starts_with("Internal error while running the job"))
+                .collect()
+        }
+
+        /// Whether every run's heartbeat task has ended (within a second).
+        async fn heartbeats_stopped(&self) -> bool {
+            for _ in 0..100 {
+                if self.ctx.heartbeats.lock().unwrap().iter().all(|h| h.is_finished()) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+
+        /// The 30 s back-off is over.
+        fn end_backoff(&self, id: i64) {
+            rusqlite::Connection::open(self.db.0.join("omni.db"))
+                .unwrap()
+                .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![id])
+                .unwrap();
+        }
+    }
+
+    /// P11.8: a panic in the job's body left the heartbeat renewing the lease
+    /// for ever, so the job stayed RUNNING until the daemon restarted.
+    #[tokio::test]
+    async fn a_panicking_job_goes_back_to_the_queue_and_its_heartbeat_stops() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, token) = r.leased(id, "w1");
+        run_leased_job(&r.ctx, leased, |_| async { panic!("the stderr of https://cdn.example.gr/v/1.mp4?sig=SECRET1 ended") }).await;
+
+        assert!(token.is_cancelled(), "the run's token must fire when the run ends");
+        assert!(r.heartbeats_stopped().await, "the heartbeat still runs after the job ended");
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Pending);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.lease_expires_at, None);
+        assert!(job.not_before.is_some_and(|t| t > chrono::Utc::now()), "requeued without a back-off: {:?}", job.not_before);
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::PipelineFailed.as_str()));
+        let lines = r.internal_error_lines(id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].level, "ERROR");
+        assert!(lines[0].message.contains("cdn.example.gr/v/1.mp4"), "{}", lines[0].message);
+        assert!(!lines[0].message.contains("SECRET1"), "an address's query reached the job: {}", lines[0].message);
+    }
+
+    #[tokio::test]
+    async fn a_second_panic_sends_the_job_to_review() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, _) = r.leased(id, "w1");
+        run_leased_job(&r.ctx, leased, |_| async { panic!("first run") }).await;
+        assert_eq!(r.job(id).status, JobStatus::Pending);
+
+        r.end_backoff(id);
+        assert_eq!(r.repo().lease_job("w2", LEASE_SECS).unwrap().map(|j| j.id), Some(id));
+        let (leased, _) = r.leased(id, "w2");
+        let index = 7;
+        run_leased_job(&r.ctx, leased, move |_| async move { panic!("index {index} out of range in the second run") }).await;
+
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::RequiresReview);
+        assert_eq!(job.attempts, 2);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::PipelineFailed.as_str()));
+        assert_eq!(job.error_message.as_deref(), Some("internal error (panic): index 7 out of range in the second run"));
+        assert!(r.heartbeats_stopped().await);
+    }
+
+    #[tokio::test]
+    async fn a_normal_job_body_behaves_as_before() {
+        let r = LeasedRun::new(Duration::from_millis(20));
+
+        // Ok: the job is left exactly as the body left it (here: untouched).
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, token) = r.leased(id, "w1");
+        run_leased_job(&r.ctx, leased, |_| async { Ok(()) }).await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.lease_owner.as_deref(), Some("w1"));
+        assert_eq!(job.error_code, None);
+        assert!(token.is_cancelled());
+        // Ten heartbeat intervals later the lease has not been renewed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(r.job(id).lease_expires_at, job.lease_expires_at, "the heartbeat renewed a lease after the run ended");
+        assert!(r.internal_error_lines(id).is_empty());
+        r.repo().finish(id, "w1", JobStatus::Completed, None, None, None).unwrap();
+
+        // Err: review, exactly as the old bookkeeping path.
+        let id = r.queue_and_lease(2, "w1", LEASE_SECS);
+        let (leased, _) = r.leased(id, "w1");
+        run_leased_job(&r.ctx, leased, |_| async { Err(anyhow::anyhow!("the stage table could not be written")) }).await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::RequiresReview);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::PipelineFailed.as_str()));
+        assert_eq!(job.error_message.as_deref(), Some("the stage table could not be written"));
+        assert!(r.internal_error_lines(id).is_empty());
+        assert!(r.heartbeats_stopped().await);
+        assert!(r.ctx.health.get(omni_core::health::checks::WORKERS).is_none(), "no panic, no amber");
+    }
+
+    #[tokio::test]
+    async fn a_panic_releases_the_slot_and_the_busy_entry() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, _) = r.leased(id, "w1");
+        // What the body saw: download slot held, busy entry, update-gate pass, permits taken.
+        let seen = Arc::new(Mutex::new(None));
+        let (engine, busy, gate, jobs, downloads, sink) =
+            (r.ctx.engine.clone(), r.busy.clone(), r.gate.clone(), r.jobs.clone(), r.downloads.clone(), seen.clone());
+        run_leased_job(&r.ctx, leased, move |_| async move {
+            *sink.lock().unwrap() = Some((
+                engine.holds_download_slot(id, "w1"),
+                busy.contains(id),
+                gate.active(),
+                jobs.available_permits(),
+                downloads.available_permits(),
+            ));
+            panic!("after everything was taken")
+        })
+        .await;
+
+        assert_eq!(*seen.lock().unwrap(), Some((true, true, 1, 0, 0)), "the body did not run holding everything");
+        assert!(!r.ctx.engine.holds_download_slot(id, "w1"), "the download slot was kept");
+        assert!(!r.busy.contains(id), "the busy entry was kept: MCR could never queue the job again");
+        assert_eq!(r.gate.active(), 0, "the update-gate pass was kept: a yt-dlp update would wait for ever");
+        assert_eq!(r.jobs.available_permits(), 1, "the in-flight permit was kept");
+        assert_eq!(r.downloads.available_permits(), 1, "the download permit was kept");
+    }
+
+    #[tokio::test]
+    async fn a_panic_after_the_lease_was_lost_writes_nothing() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+
+        // The reaper took the job back and another worker leased it.
+        let id = r.queue_and_lease(1, "w1", -5);
+        let (leased, _) = r.leased(id, "w1");
+        let repo = r.repo().clone();
+        run_leased_job(&r.ctx, leased, move |_| async move {
+            assert_eq!(repo.reap_expired_leases().unwrap(), (1, 0));
+            assert!(repo.lease_job("w2", LEASE_SECS).unwrap().is_some());
+            panic!("after the lease was lost")
+        })
+        .await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.lease_owner.as_deref(), Some("w2"));
+        assert_eq!(job.attempts, 2);
+        assert_eq!(job.not_before, None);
+        assert_eq!(job.error_code, None);
+        assert!(r.internal_error_lines(id).is_empty());
+
+        // MCR cancelled the job.
+        let id = r.queue_and_lease(2, "w1", LEASE_SECS);
+        let (leased, _) = r.leased(id, "w1");
+        let repo = r.repo().clone();
+        run_leased_job(&r.ctx, leased, move |_| async move {
+            repo.cancel_job(id).unwrap();
+            panic!("after MCR cancelled")
+        })
+        .await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Cancelled);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.error_message, None);
+        assert!(r.internal_error_lines(id).is_empty());
+        // Still counted: the code panicked whoever owns the job now.
+        assert_eq!(r.ctx.health.get(omni_core::health::checks::WORKERS).unwrap().state, omni_core::health::Health::Degraded);
+    }
+
+    #[tokio::test]
+    async fn the_workers_line_goes_amber_after_a_panic_and_green_a_day_later() {
+        use omni_core::health::{checks, Health};
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        r.ctx.refresh_health();
+        let line = r.ctx.health.get(checks::WORKERS).expect("a workers line");
+        assert_eq!((line.state, line.detail.as_deref()), (Health::Ok, Some("running")));
+
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, _) = r.leased(id, "w1");
+        run_leased_job(&r.ctx, leased, |_| async { panic!("boom") }).await;
+        let line = r.ctx.health.get(checks::WORKERS).unwrap();
+        assert_eq!(line.state, Health::Degraded, "amber, never red: other jobs still run");
+        assert_eq!(line.detail.as_deref(), Some("1 job(s) hit an internal error in the last 24 h"));
+        r.ctx.refresh_health();
+        assert_eq!(r.ctx.health.get(checks::WORKERS).unwrap().state, Health::Degraded, "the next lease keeps it amber");
+
+        // The window: two panics an hour ago count; a day later none does.
+        let t = Instant::now();
+        let mut panics = VecDeque::from([t, t]);
+        let c = workers_check(&mut panics, t + Duration::from_secs(3600));
+        assert_eq!((c.state, c.detail.as_deref()), (Health::Degraded, Some("2 job(s) hit an internal error in the last 24 h")));
+        let c = workers_check(&mut panics, t + PANIC_WINDOW);
+        assert_eq!((c.state, c.detail.as_deref()), (Health::Ok, Some("running")));
+        assert!(panics.is_empty());
+    }
+
+    /// A body that reaches DELIVER, records the marker, optionally puts a file of
+    /// that size at the marker's path, and panics (P11.8 review).
+    async fn panic_while_delivering(r: &LeasedRun, n: u32, file_there: bool) -> (i64, String) {
+        let id = r.queue_and_lease(n, "w1", LEASE_SECS);
+        let watch = r.db.0.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+        let path = watch.join(format!("{n}_ELENI_P118.mxf")).to_string_lossy().into_owned();
+        let (leased, _) = r.leased(id, "w1");
+        let (repo, at) = (r.repo().clone(), path.clone());
+        run_leased_job(&r.ctx, leased, move |_| async move {
+            assert!(repo.set_stage(id, "w1", JobStage::Deliver).unwrap());
+            assert!(repo.mark_delivering(id, "w1", &at, 4096).unwrap());
+            if file_there {
+                std::fs::write(&at, vec![0u8; 4096]).unwrap();
+            }
+            panic!("after the rename into the watchfolder")
+        })
+        .await;
+        (id, path)
+    }
+
+    /// The review's blocker: a panic after the rename requeued the job, and the
+    /// re-run put a second copy (`_1`) on air.
+    #[tokio::test]
+    async fn a_panic_after_the_rename_finishes_the_job_and_never_requeues_it() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let (id, path) = panic_while_delivering(&r, 1, true).await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Completed, "a delivered video was not finished: {:?}", job.status);
+        assert_eq!(job.stage, JobStage::Done);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.not_before, None);
+        assert_eq!(job.error_code, None);
+        assert_eq!(job.file_path.as_deref(), Some(path.as_str()));
+        let lines = r.internal_error_lines(id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].message.contains("after the video was delivered"), "{}", lines[0].message);
+        let events = r.repo().get_job_events(id, 100).unwrap();
+        assert!(
+            events.iter().any(|e| e.message == "Recovered after an internal error: already delivered to the watchfolder as 1_ELENI_P118.mxf; archive skipped"),
+            "{events:?}"
+        );
+        assert!(r.repo().lease_job("w2", LEASE_SECS).unwrap().is_none(), "the job was leased again");
+        assert!(std::path::Path::new(&path).exists(), "the delivered file is never touched");
+    }
+
+    #[tokio::test]
+    async fn a_panic_at_deliver_with_no_file_goes_to_review_never_back_to_the_queue() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let (id, _) = panic_while_delivering(&r, 1, false).await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::RequiresReview, "{:?}", job.status);
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.not_before, None);
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::DeliveryFailed.as_str()));
+        assert_eq!(
+            job.error_message.as_deref(),
+            Some("An internal error happened while delivering 1_ELENI_P118.mxf; check Dalet before retrying")
+        );
+        let lines = r.internal_error_lines(id);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].message.contains("during delivery"), "{}", lines[0].message);
+        let events = r.repo().get_job_events(id, 100).unwrap();
+        assert!(
+            events.iter().any(|e| e.message == "Internal error during delivery of 1_ELENI_P118.mxf; the watchfolder does not have it. Not requeued"),
+            "{events:?}"
+        );
+        assert!(r.repo().lease_job("w2", LEASE_SECS).unwrap().is_none(), "the job was leased again");
+    }
+
+    #[tokio::test]
+    async fn a_panic_at_archive_after_the_recorded_delivery_finishes_the_job() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let watch = r.db.0.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+        let path = watch.join("1_ELENI_P118.mxf").to_string_lossy().into_owned();
+        let (leased, _) = r.leased(id, "w1");
+        let (repo, at) = (r.repo().clone(), path.clone());
+        run_leased_job(&r.ctx, leased, move |_| async move {
+            assert!(repo.set_stage(id, "w1", JobStage::Deliver).unwrap());
+            assert!(repo.mark_delivering(id, "w1", &at, 4096).unwrap());
+            std::fs::write(&at, vec![0u8; 4096]).unwrap();
+            assert!(repo.set_delivered_file(id, "w1", &at, 12.0).unwrap());
+            assert!(repo.set_stage(id, "w1", JobStage::Archive).unwrap());
+            // Dalet has already taken the file: the recorded delivery is the proof.
+            std::fs::remove_file(&at).unwrap();
+            panic!("while archiving the source")
+        })
+        .await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Completed, "{:?}", job.status);
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.file_path.as_deref(), Some(path.as_str()));
+        assert_eq!(r.internal_error_lines(id).len(), 1);
+        assert!(r.repo().lease_job("w2", LEASE_SECS).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_panic_at_transcode_is_still_requeued_once() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, _) = r.leased(id, "w1");
+        let repo = r.repo().clone();
+        run_leased_job(&r.ctx, leased, move |_| async move {
+            assert!(repo.set_stage(id, "w1", JobStage::Transcode).unwrap());
+            panic!("mid-encode")
+        })
+        .await;
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Pending);
+        assert!(job.not_before.is_some_and(|t| t > chrono::Utc::now()));
+        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::PipelineFailed.as_str()));
+        assert_eq!(r.internal_error_lines(id).len(), 1);
+    }
+
+    /// A daemon stop drops the run: its job body must stop with it, not run on
+    /// detached holding the job; the job is left RUNNING for start-up recovery.
+    #[tokio::test]
+    async fn a_dropped_run_stops_its_job_body() {
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let (leased, token) = r.leased(id, "w1");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let ctx = r.ctx.clone();
+        let run = tokio::spawn(async move {
+            run_leased_job(&ctx, leased, move |_| async move {
+                let _alive = alive_tx;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.expect("the body started");
+        run.abort();
+        let _ = run.await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), alive_rx).await.is_ok_and(|r| r.is_err()),
+            "the job body still runs after its run was dropped"
+        );
+        assert!(token.is_cancelled());
+        assert!(r.heartbeats_stopped().await);
+        assert!(!r.busy.contains(id));
+        assert_eq!(r.jobs.available_permits(), 1);
+        assert_eq!(r.job(id).status, JobStatus::Running, "left to start-up recovery, as before");
+    }
+
+    #[test]
+    fn a_panic_text_names_no_full_address_and_stays_short() {
+        assert_eq!(panic_text(&"plain"), "plain");
+        assert_eq!(panic_text(&String::from("owned")), "owned");
+        assert_eq!(panic_text(&42_u32), "non-string panic payload");
+        let t = panic_text(&String::from("of `https://user:pw@news.example.gr/a/1?token=T0K#x` here"));
+        assert_eq!(t, "of news.example.gr/a/1 here");
+        assert_eq!(panic_text(&"ά".repeat(500)).chars().count(), 300);
+        // A JSON-escaped address.
+        let t = panic_text(&String::from(r#"bad json {"url":"https:\/\/news.example.gr\/a\/2?token=T1"} end"#));
+        assert_eq!(t, "bad json news.example.gr/a/2 end");
+        // A `url::Url` printed with `{:?}`.
+        let t = panic_text(&String::from(
+            r#"Url { scheme: "https", username: "", password: Some("PW1"), host: Some(Domain("news.example.gr")), port: None, path: "/a", query: Some("sig=S1&x=\")y"), fragment: Some("F1") }"#,
+        ));
+        for secret in ["PW1", "sig=", "S1", ")y", "F1"] {
+            assert!(!t.contains(secret), "{secret} in {t}");
+        }
+        assert!(t.contains(r#"password: Some("…")"#) && t.contains(r#"query: Some("…")"#) && t.contains(r#"fragment: Some("…")"#), "{t}");
+        assert!(t.contains("news.example.gr") && t.contains(r#"path: "/a""#), "{t}");
     }
 
     #[test]

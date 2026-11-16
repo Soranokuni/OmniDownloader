@@ -474,6 +474,26 @@ enum MarkerCheck {
     Unknown { path: String, reason: String },
 }
 
+/// What ended the run [`Repository::recover_if_delivered`] finishes; words its events.
+#[derive(Debug, Clone, Copy)]
+enum RecoveryCause {
+    /// The daemon restarted (or the reaper found the lease expired).
+    Restart,
+    /// The run holding the lease hit an internal error (a panic, P11.8).
+    InternalError,
+}
+
+/// What [`Repository::settle_after_delivery_panic`] did with the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverySettled {
+    /// The video is provably in the watchfolder: COMPLETED, as start-up recovery finishes it.
+    Completed,
+    /// Not provably delivered: REQUIRES_REVIEW with DELIVERY_FAILED, never requeued.
+    Review,
+    /// The lease is no longer this worker's: nothing written.
+    NotOurs,
+}
+
 /// How long start-up recovery waits for the watchfolder to say what is at a job's
 /// `delivering_to` path.
 const MARKER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -1868,7 +1888,7 @@ impl Repository {
         for (id, attempts, max_attempts) in expired {
             // Already in the watchfolder: finishing it is the only safe
             // recovery, a requeue would put a second copy on air.
-            if Self::recover_if_delivered(&tx, id, &now, None)? {
+            if Self::recover_if_delivered(&tx, id, &now, None, RecoveryCause::Restart)? {
                 finished.push(JobStatus::Completed);
                 continue;
             }
@@ -1947,7 +1967,7 @@ impl Repository {
             let check = Self::check_delivery_marker_with(&conn, *id, timeout, inspect)?;
             // Each job's change and its event land together or not at all.
             let tx = conn.transaction()?;
-            if Self::recover_if_delivered(&tx, *id, &now, check.as_ref())? {
+            if Self::recover_if_delivered(&tx, *id, &now, check.as_ref(), RecoveryCause::Restart)? {
                 tx.commit()?;
                 count_finished(JobStatus::Completed);
                 continue;
@@ -2035,7 +2055,16 @@ impl Repository {
     /// means the rename happened, at any stage and for a held delivery too, so
     /// the job is finished with that file recorded (and its held row delivered).
     /// The reaper passes `None`: a live daemon's expired lease is not a crash.
-    fn recover_if_delivered(conn: &rusqlite::Connection, id: i64, now: &str, check: Option<&MarkerCheck>) -> Result<bool> {
+    ///
+    /// `cause` only words the events of the marker case: a restart, or a run's
+    /// internal error at a delivering stage (P11.8).
+    fn recover_if_delivered(
+        conn: &rusqlite::Connection,
+        id: i64,
+        now: &str,
+        check: Option<&MarkerCheck>,
+        cause: RecoveryCause,
+    ) -> Result<bool> {
         let mut changed = conn.execute(
             "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
              lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
@@ -2069,15 +2098,19 @@ impl Repository {
                      WHERE job_id = ? AND decision = 'approved'",
                     params![now, path, id],
                 )?;
+                let (after, what) = match cause {
+                    RecoveryCause::Restart => ("a restart", "restart"),
+                    RecoveryCause::InternalError => ("an internal error", "internal error"),
+                };
                 let (event, audit) = if recorded {
                     (
-                        format!("Recovered after a restart: already delivered as {name}; archive skipped"),
-                        format!("Job {id}: restart after the delivery was recorded; {name} was already delivered, so the job was finished, not requeued"),
+                        format!("Recovered after {after}: already delivered as {name}; archive skipped"),
+                        format!("Job {id}: {what} after the delivery was recorded; {name} was already delivered, so the job was finished, not requeued"),
                     )
                 } else {
                     (
-                        format!("Recovered after a restart: already delivered to the watchfolder as {name}; archive skipped"),
-                        format!("Job {id}: restart after the rename; {name} was already in the watchfolder, so the job was finished, not requeued"),
+                        format!("Recovered after {after}: already delivered to the watchfolder as {name}; archive skipped"),
+                        format!("Job {id}: {what} after the rename; {name} was already in the watchfolder, so the job was finished, not requeued"),
                     )
                 };
                 conn.execute(
@@ -2137,6 +2170,75 @@ impl Repository {
             params![id],
         )?;
         Ok(changed == 1)
+    }
+
+    /// The run holding the lease hit an internal error (a panic) while the job was
+    /// at DELIVER, ARCHIVE or DONE (P11.8). The rename may already have happened, so
+    /// the job is never requeued: the rule start-up recovery applies decides. A
+    /// marker whose file is in the watchfolder whole, a recorded delivery, or stage
+    /// ARCHIVE finishes it COMPLETED exactly as recovery does; anything else goes to
+    /// REQUIRES_REVIEW with DELIVERY_FAILED, the marker kept, for MCR to check Dalet.
+    /// Only while `owner` holds the lease (checked in the same IMMEDIATE transaction);
+    /// otherwise nothing is written. Blocking: looks at the watchfolder for up to
+    /// 15 s first, outside the transaction.
+    pub fn settle_after_delivery_panic(&self, id: i64, owner: &str) -> Result<DeliverySettled> {
+        let mut conn = self.pool.get()?;
+        // The watchfolder is asked before the transaction opens: a UNC path can block.
+        let check = Self::check_delivery_marker_with(&conn, id, MARKER_CHECK_TIMEOUT, inspect_marker_file)?;
+        let now = timestamps::now_string();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ours: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM queue WHERE id = ? AND lease_owner = ? AND status = 'RUNNING')",
+            params![id, owner],
+            |r| r.get(0),
+        )?;
+        if !ours {
+            return Ok(DeliverySettled::NotOurs);
+        }
+        if Self::recover_if_delivered(&tx, id, &now, check.as_ref(), RecoveryCause::InternalError)? {
+            tx.commit()?;
+            count_finished(JobStatus::Completed);
+            return Ok(DeliverySettled::Completed);
+        }
+        let marker: Option<String> = tx
+            .query_row("SELECT delivering_to FROM queue WHERE id = ?", params![id], |r| r.get(0))?;
+        let name = marker.filter(|p| !p.is_empty()).map(|p| marker_file_name(&p)).unwrap_or_else(|| "the video".to_string());
+        let seen = match &check {
+            Some(MarkerCheck::Missing) => "the watchfolder does not have it".to_string(),
+            Some(MarkerCheck::WrongSize { found, expected, .. }) => {
+                format!("the watchfolder has a file of {found} bytes there, not the {expected} this job was delivering")
+            }
+            Some(MarkerCheck::Unknown { reason, .. }) => {
+                warn!("Job #{id}: cannot tell whether {name} was delivered before the internal error: {reason}");
+                "the watchfolder cannot be read".to_string()
+            }
+            _ => "no delivery to the watchfolder was recorded".to_string(),
+        };
+        let n = tx.execute(
+            "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+             error_code='DELIVERY_FAILED', error_message=?, updated_at=?
+             WHERE id=? AND lease_owner=? AND status='RUNNING'",
+            params![
+                format!("An internal error happened while delivering {name}; check Dalet before retrying"),
+                now,
+                id,
+                owner
+            ],
+        )?;
+        if n != 1 {
+            return Ok(DeliverySettled::NotOurs);
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
+            params![id, now, format!("Internal error during delivery of {name}; {seen}. Not requeued")],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+            params![format!("Job {id}: internal error during delivery of {name}; sent to review, not requeued"), now],
+        )?;
+        tx.commit()?;
+        count_finished(JobStatus::RequiresReview);
+        Ok(DeliverySettled::Review)
     }
 
     pub fn update_job_status(&self, id: i64, status: JobStatus, error_message: Option<&str>, file_path: Option<&str>, duration: Option<f64>) -> Result<()> {
@@ -6854,6 +6956,43 @@ mod tests {
             events.iter().any(|e| e.level == "ERROR" && e.message.contains("not known whether the video arrived")),
             "no review event: {events:?}"
         );
+        Ok(())
+    }
+
+    /// P11.8: settling a delivery cut short by a panic is the lease holder's
+    /// alone, and a file of another size is not taken as this job's video.
+    #[test]
+    fn a_delivery_cut_short_by_a_panic_is_settled_only_by_its_lease_holder() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let id = repo
+            .enqueue(&NewJob::new("https://example.invalid/v/11", "11_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?
+            .job_id();
+        assert!(repo.lease_job("host:1:0", 3600)?.is_some());
+        assert!(repo.set_stage(id, "host:1:0", JobStage::Deliver)?);
+        let path = dir.path().join("11_ANNA_TEST.mxf");
+        assert!(repo.mark_delivering(id, "host:1:0", &path.to_string_lossy(), 100)?);
+        std::fs::write(&path, vec![0u8; 100])?;
+
+        // Another owner: nothing written, although the file proves the delivery.
+        assert_eq!(repo.settle_after_delivery_panic(id, "host:1:9")?, DeliverySettled::NotOurs);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!((job.status, job.lease_owner.as_deref()), (JobStatus::Running, Some("host:1:0")));
+
+        // A file of another size at the marker: review, the marker kept, never requeued.
+        std::fs::write(&path, vec![0u8; 50])?;
+        assert_eq!(repo.settle_after_delivery_panic(id, "host:1:0")?, DeliverySettled::Review);
+        let job = repo.get_job(id)?.unwrap();
+        assert_eq!(job.status, JobStatus::RequiresReview);
+        assert_eq!(job.error_code.as_deref(), Some("DELIVERY_FAILED"));
+        assert_eq!(job.lease_owner, None);
+        let marker: Option<String> = repo.pool.get()?.query_row("SELECT delivering_to FROM queue WHERE id = ?", params![id], |r| r.get(0))?;
+        assert_eq!(marker.as_deref(), Some(path.to_string_lossy().as_ref()), "the marker MCR needs was cleared");
+        let events = repo.get_job_events(id, 50)?;
+        assert!(events.iter().any(|e| e.message.contains("has a file of 50 bytes there, not the 100")), "{events:?}");
+        // Settled once: a second call writes nothing.
+        assert_eq!(repo.settle_after_delivery_panic(id, "host:1:0")?, DeliverySettled::NotOurs);
         Ok(())
     }
 

@@ -154,6 +154,8 @@ pub mod checks {
     pub const LOCKDOWN: &str = "lockdown";
     /// The source archive: refused for overlapping the watchfolder, or short of space on its own volume (P1.7).
     pub const ARCHIVE: &str = "archive";
+    /// Job runs that hit an internal error (a panic) in the last 24 h (P11.8).
+    pub const WORKERS: &str = "workers";
 }
 
 impl Default for HealthState {

@@ -6,7 +6,6 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{error, info, warn};
 
-use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
 use omni_browser::sniffer::StreamSniffer;
 use omni_core::config::AppConfig;
@@ -33,7 +32,7 @@ mod worker;
 
 #[cfg(debug_assertions)]
 use worker::finish_held;
-use worker::{run_job, wait_for_deliveries, HEARTBEAT_INTERVAL, LEASE_REAP_INTERVAL, LEASE_SECS, SHUTDOWN_DELIVERY_BUDGET};
+use worker::{run_job, wait_for_deliveries, LEASE_REAP_INTERVAL, LEASE_SECS, SHUTDOWN_DELIVERY_BUDGET};
 
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
@@ -1768,6 +1767,10 @@ async fn run_daemon(
     canary_env.set_heal(worker_repair.clone());
     url_tester.set_ctx(worker_repair.clone());
     let worker_canary = canary_env.clone();
+    // The job runs (P11.8): lease heartbeat, release on every exit, and the
+    // `workers` line for runs that hit an internal error.
+    let worker_ctx = worker::JobRunCtx::new(repo_worker.clone(), engine_worker.clone(), worker_health.clone());
+    worker_health.set(omni_core::health::checks::WORKERS, omni_core::health::Check::ok("running"));
 
     tokio::spawn(async move {
         info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
@@ -1882,6 +1885,8 @@ async fn run_daemon(
                     // Nothing ready. Release the permit and idle with jitter so
                     // several workers do not wake in lockstep and hammer SQLite.
                     drop(permit);
+                    // An internal error ages out of the `workers` line on a quiet day too.
+                    worker_ctx.refresh_health();
                     let jitter = Duration::from_millis(1000 + (worker_seq % 5) * 100);
                     tokio::select! {
                         _ = worker_rx.recv() => break,
@@ -1896,82 +1901,29 @@ async fn run_daemon(
                 }
             };
 
+            worker_ctx.refresh_health();
+            let ctx = worker_ctx.clone();
             let eng = engine_worker.clone();
             let rep = repo_worker.clone();
-            let busy_guard = busy_worker.guard(job.id, &owner);
             let evidence_dir = worker_temp.join("evidence");
             let job_health = worker_health.clone();
             let job_canary = worker_canary.clone();
             let job_repair = worker_repair.clone();
+            let (job_slot, download_slot) = permit;
+            let leased = worker::LeasedJob {
+                job_id: job.id,
+                owner: owner.clone(),
+                busy: busy_worker.guard(job.id, &owner),
+                gate_pass,
+                job_slot,
+                download_slot,
+            };
 
             tokio::spawn(async move {
-                // Held for the whole job, including every error path: dropping
-                // it is what tells a waiting updater the downloader is idle.
-                let _gate_pass = gate_pass;
-                // Until this task is done with the job, MCR cannot queue it
-                // again (a cancelled job stops only at its next stage).
-                // Its token is the job run's: MCR's cancel and a lost lease
-                // both fire it, and it kills the running tool (plan P1.15).
-                let cancel = busy_guard.token();
-                let _busy = busy_guard;
-                let job_id = job.id;
-                let (job_slot, download_slot) = permit;
-                // Handed back on every exit, a panic in run_job included.
-                let _slot_guard = download_slot.map(|slot| {
-                    eng.hold_download_slot(job_id, &owner, slot);
-                    eng.download_slot_guard(job_id, &owner)
-                });
-
-                // Keep the lease alive while we work. If it stops succeeding we
-                // have lost the job -- the reaper requeued it, or an operator
-                // cancelled it -- and must stop rather than deliver a file for a
-                // job somebody else now owns.
-                let heartbeat = {
-                    let rep = rep.clone();
-                    let owner = owner.clone();
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-                        tick.tick().await; // fires immediately; skip it
-                        loop {
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tick.tick() => {
-                                    match rep.heartbeat(job_id, &owner, LEASE_SECS) {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            warn!("Job #{job_id}: lease lost, abandoning work");
-                                            cancel.cancel();
-                                            break;
-                                        }
-                                        Err(e) => warn!("Job #{job_id}: heartbeat failed: {e:?}"),
-                                    }
-                                }
-                            }
-                        }
-                    })
-                };
-
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, &job_repair, &job_health, &job_canary).await;
-                cancel.cancel();
-                heartbeat.abort();
-
-                if let Err(e) = outcome {
-                    // run_job handles its own failures; reaching here means the
-                    // bookkeeping itself failed, so release the lease rather
-                    // than leaving the job RUNNING until the reaper notices.
-                    error!("Job #{job_id}: worker bookkeeping failed: {e:?}");
-                    let _ = rep.finish(
-                        job_id,
-                        &owner,
-                        JobStatus::RequiresReview,
-                        Some(ErrorCode::PipelineFailed.as_str()),
-                        Some(&e.to_string()),
-                        None,
-                    );
-                }
-
-                drop(job_slot);
+                worker::run_leased_job(&ctx, leased, move |cancel| async move {
+                    run_job(&rep, &eng, &owner, job, cancel, &evidence_dir, &job_repair, &job_health, &job_canary).await
+                })
+                .await;
             });
         }
     });
@@ -3115,7 +3067,7 @@ mod tests {
     /// verdict needs the second look; a weak page keeps what it had.
     #[test]
     fn only_four_codes_count_against_a_site() {
-        let counting: Vec<&str> = ErrorCode::ALL
+        let counting: Vec<&str> = omni_broadcast::errors::ErrorCode::ALL
             .iter()
             .map(|c| c.as_str())
             .filter(|c| omni_core::site_health::counts_against_site(c))
