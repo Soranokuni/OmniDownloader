@@ -402,6 +402,123 @@ fn finish_delivered(repo: &Repository, job_id: i64, owner: &str) -> Result<bool>
     repo.finish(job_id, owner, JobStatus::Completed, None, None, delivered.as_deref())
 }
 
+/// The waiting job's `error_message` when the engine has no line for it (P11.2a).
+const DELIVERY_WAIT_MESSAGE: &str = "Watchfolder not reachable; the finished video waits and will be delivered when it answers";
+
+/// P11.2a: a run whose finished video now waits for the watchfolder (the
+/// engine tagged DELIVERY_FAILED and the row has `delivery_wait` = 1) puts
+/// the job back in the queue to wait: no attempt spent, never review, however
+/// often it repeats. `true` when the run was such a one, whatever the requeue
+/// could write (a job that is no longer ours gets nothing); `false` leaves the
+/// failure to the normal rules. Called only after the engine returned, so the
+/// next lease never shares the waiting file with this run. The delay grows
+/// with the job's waits in a row (30 s, 60 s, 2 min, then 5 min), and the
+/// `error_message` is the engine's line for the last wait.
+pub(crate) fn wait_for_watchfolder(
+    repo: &Repository,
+    engine: &BroadcastEngine,
+    job_id: i64,
+    owner: &str,
+    code: ErrorCode,
+) -> Result<bool> {
+    if code != ErrorCode::DeliveryFailed {
+        return Ok(false);
+    }
+    let row = repo.get_job(job_id)?;
+    let waits = row
+        .as_ref()
+        .is_some_and(|j| j.delivery_wait && j.status == JobStatus::Running && j.lease_owner.as_deref() == Some(owner));
+    if !waits {
+        return Ok(false);
+    }
+    let backoff = engine.wait_backoff(job_id);
+    // No line of the engine's (a stop, or the first try after a restart): the row's own stays.
+    let line = engine
+        .wait_line(job_id)
+        .or_else(|| row.and_then(|j| j.error_message))
+        .unwrap_or_else(|| DELIVERY_WAIT_MESSAGE.to_string());
+    if repo.requeue_waiting_delivery(job_id, owner, backoff, &line)? {
+        info!("Job #{job_id}: the finished video waits for the watchfolder (next try in {} s)", backoff.num_seconds());
+    } else {
+        warn!("Job #{job_id}: no longer ours; its waiting video is left to whoever holds it");
+    }
+    Ok(true)
+}
+
+/// A waiting video the engine would not deliver on its own (P11.2a): its
+/// earlier rename may have landed, or the watchfolder changed. The lease
+/// holder sends the job to review, keeping its marker, wait and file. `true`
+/// when `e` is such a case (whatever could be written).
+fn review_if_needs_check(repo: &Repository, job_id: i64, owner: &str, e: &anyhow::Error) -> Result<bool> {
+    let Some(check) = e.downcast_ref::<omni_broadcast::pipeline::DeliveryNeedsCheck>() else {
+        return Ok(false);
+    };
+    if !repo.review_waiting_delivery(job_id, owner, &check.message)? {
+        warn!("Job #{job_id}: no longer ours; its delivery is left to whoever holds it");
+    }
+    Ok(true)
+}
+
+/// A job leased with `delivery_wait` = 1 (P11.2a): deliver the finished video
+/// that waited for the watchfolder, and nothing else. The terminal status is
+/// set here, by the worker holding the lease, as for every other job.
+pub(crate) async fn run_waiting_delivery(
+    repo: &Repository,
+    engine: &Arc<BroadcastEngine>,
+    owner: &str,
+    job: &omni_core::models::Job,
+    cancel: &CancellationToken,
+    repair: &repair::RepairCtx,
+) -> Result<()> {
+    let job_id = job.id;
+    let result = engine.deliver_ready(job, owner, Some(cancel.clone())).await;
+    if lost_lease(&result) {
+        warn!("Job #{job_id}: no longer ours; nothing more to do");
+        return Ok(());
+    }
+    match result {
+        Ok(omni_broadcast::pipeline::ReadyOutcome::Delivered) => {
+            // A trusted recipe's video that waited: counted and told as delivered without approval, once.
+            if finish_delivered(repo, job_id, owner)? {
+                repair::after_waiting_delivery(repair, job_id);
+            }
+        }
+        Ok(omni_broadcast::pipeline::ReadyOutcome::Rerun) => {
+            // The workspace is gone already; the next lease is a normal one.
+            if !repo.requeue_for_rerun(job_id, owner, "The parked video is missing or changed; running the job again")? {
+                warn!("Job #{job_id}: no longer ours; not queued to run again");
+            }
+        }
+        Err(e) => {
+            if review_if_needs_check(repo, job_id, owner, &e)? {
+                return Ok(());
+            }
+            let code = classify_pipeline_error(&e);
+            if wait_for_watchfolder(repo, engine, job_id, owner, code)? {
+                return Ok(());
+            }
+            // Not waiting any more: the next run starts the back-off afresh.
+            engine.forget_waits(job_id);
+            let row = repo.get_job(job_id)?;
+            let attempts = row.as_ref().map(|j| j.attempts).unwrap_or(1);
+            let max_attempts = row.as_ref().map(|j| j.max_attempts).unwrap_or(3);
+            let message = readable_cause(&e);
+            let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
+            let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
+            if code.is_retryable() && attempts < max_attempts {
+                // A full run next time: `requeue_after` ends the wait.
+                repo.requeue_after(job_id, owner, code.backoff(attempts), code.as_str(), &message)?;
+            } else {
+                if still_ours(repo, job_id, owner) {
+                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
+                }
+                repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The run holding the lease parks the job for MCR's approval (P10.5): not
 /// terminal, no lease, never leased again until approved. `false` when the
 /// job is no longer this worker's.
@@ -412,7 +529,7 @@ pub(crate) fn finish_held(repo: &Repository, job_id: i64, owner: &str) -> Result
 /// An approved held video: deliver exactly that file (P10.5). No download,
 /// no encode, no site-health or evidence bookkeeping. The terminal status is
 /// set here, by the worker holding the lease, as for every other job.
-async fn run_approved_delivery(
+pub(crate) async fn run_approved_delivery(
     repo: &Repository,
     engine: &Arc<BroadcastEngine>,
     owner: &str,
@@ -437,7 +554,16 @@ async fn run_approved_delivery(
             }
         }
         Err(e) => {
+            // The approved file's earlier rename needs a person (P11.2a).
+            if review_if_needs_check(repo, job_id, owner, &e)? {
+                return Ok(());
+            }
             let code = classify_pipeline_error(&e);
+            // The watchfolder did not answer: the approved file waits for it (P11.2a).
+            if wait_for_watchfolder(repo, engine, job_id, owner, code)? {
+                return Ok(());
+            }
+            engine.forget_waits(job_id);
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
             let message = readable_cause(&e);
@@ -505,6 +631,12 @@ pub(crate) async fn run_job(
     // nothing of what follows (no download, no page scan, no sniffing).
     if let Some(held) = repo.approved_held(job_id)? {
         return run_approved_delivery(repo, engine, owner, &job, &held, &cancel).await;
+    }
+
+    // The finished video waited for the watchfolder (P11.2a): deliver that file,
+    // and nothing else (no download, no encode, no page scan).
+    if job.delivery_wait {
+        return run_waiting_delivery(repo, engine, owner, &job, &cancel, repair).await;
     }
 
     // MCR asked for the next verified candidate of this job (P10.13): hold that
@@ -751,6 +883,13 @@ pub(crate) async fn run_job(
     if lost_lease(&process_result) {
         warn!("Job #{job_id}: no longer ours; nothing more to do");
         return Ok(());
+    }
+    // The video was made and verified, and waits for the watchfolder (P11.2a): no
+    // sniffing, no second download into the workspace that holds it.
+    if let Err(e) = &process_result {
+        if wait_for_watchfolder(repo, engine, job_id, owner, classify_pipeline_error(e))? {
+            return Ok(());
+        }
     }
 
     // yt-dlp could not resolve the page. For a news portal that is expected:
@@ -1129,6 +1268,10 @@ pub(crate) async fn run_job(
             // delays telling the journalist their link is dead; retrying a
             // dropped connection usually just works.
             let mut code = classify_pipeline_error(&e);
+            // The video was made and verified, and waits for the watchfolder (P11.2a).
+            if wait_for_watchfolder(repo, engine, job_id, owner, code)? {
+                return Ok(());
+            }
             let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
             let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
             let mut message = readable_cause(&e);
@@ -1208,6 +1351,9 @@ pub(crate) async fn run_job(
                         repair::LadderResult::Delivered { recipe_hash } => {
                             info!("Job #{job_id}: a repaired video was delivered without approval (trusted recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
                         }
+                        repair::LadderResult::Parked { recipe_hash } => {
+                            info!("Job #{job_id}: a repaired video waits for the watchfolder (trusted recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
+                        }
                         _ => {}
                     }
                     match repair::disposition(&ladder, repair_mode, repair.cfg.budget) {
@@ -1224,6 +1370,14 @@ pub(crate) async fn run_job(
                         repair::Disposition::Delivered => {
                             // Delivered by the pipeline; the worker completes the job. No failure is recorded.
                             finish_delivered(repo, job_id, owner)?;
+                            return Ok(());
+                        }
+                        repair::Disposition::Parked => {
+                            // A trusted recipe's video waits for the watchfolder (P11.2a); its
+                            // automatic-delivery marker stays for the delivery after the wait.
+                            if !wait_for_watchfolder(repo, engine, job_id, owner, ErrorCode::DeliveryFailed)? {
+                                warn!("Job #{job_id}: the repaired video was to wait for the watchfolder, but the job is no longer ours");
+                            }
                             return Ok(());
                         }
                         repair::Disposition::Lost => {
@@ -3003,3 +3157,7 @@ mod furniture_end_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "parked_delivery_tests.rs"]
+mod parked_delivery_tests;

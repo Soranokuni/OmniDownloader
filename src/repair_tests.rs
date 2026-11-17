@@ -2324,6 +2324,94 @@ async fn a_failed_trusted_delivery_does_not_leave_the_marker() {
     assert_ne!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivering"), "the real outcome replaced it");
 }
 
+/// P11.2a, risk (c): the trusted recipe's video was made and verified but the
+/// watchfolder did not answer, so the pipeline parked it. The ladder stops
+/// there (nothing else is made into the workspace that holds it), the attempt
+/// keeps `auto_delivering` with the recipe, so the job's card reads «delivered
+/// without approval» once the wait ends in a delivery, and the worker requeues
+/// the job to wait.
+#[tokio::test]
+async fn a_trusted_delivery_that_found_the_share_down_waits_with_its_marker() {
+    let (r, id) = trusted_rig(5, 5);
+    let (repo, job_id) = (r.repo.clone(), r.job.id);
+    *r.fake.at_download.lock().unwrap() = Some(Box::new(move || {
+        assert!(repo.park_for_delivery(job_id, OWNER, "temp/jobs/1/1_output.mxf", 10, "00", 2.0).unwrap());
+    }));
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::DeliveryFailed));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    let LadderResult::Parked { recipe_hash } = res else { panic!("expected Parked, got {res:?}") };
+    assert_eq!(recipe_hash, shipped_hash("next_data_media"));
+    assert_eq!(disposition(&LadderResult::Parked { recipe_hash }, RepairMode::Hold, Duration::from_secs(60)), Disposition::Parked);
+    assert_eq!(r.fake.downloads().len(), 1);
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!((at.outcome.as_deref(), at.recipe_id, at.held_url.as_deref()), (Some("auto_delivering"), Some(id), Some(A)));
+    assert_eq!(site_counts(&r, id), (5, 0, 5), "no use is scored before anything is delivered");
+    assert_eq!(r.repo.get_job(r.job.id).unwrap().unwrap().status, JobStatus::Running, "the worker requeues it, not the ladder");
+
+    // Control: the same failure without a parked video is an ordinary failed download.
+    // (The delivery after the wait is `a_trusted_delivery_that_waited_is_counted_once_when_it_lands`.)
+    let (r, _) = trusted_rig(5, 5);
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::DeliveryFailed));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(!matches!(res, LadderResult::Parked { .. } | LadderResult::Delivered { .. }), "{res:?}");
+    assert_ne!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivering"));
+}
+
+/// P11.2a review, finding 3: the trusted recipe's video that waited for the
+/// watchfolder and is then delivered is counted and told exactly as one that
+/// did not wait: one AutoDelivered use, the «Παραδόθηκε χωρίς έγκριση» note,
+/// the REPAIR audit row, outcome `auto_delivered`; a second pass adds nothing.
+#[tokio::test]
+async fn a_trusted_delivery_that_waited_is_counted_once_when_it_lands() {
+    let (r, id) = trusted_rig(5, 5);
+    let root = r._dir.0.clone();
+    let job_id = r.job.id;
+    let ws = root.join("temp").join("jobs").join(job_id.to_string());
+    std::fs::create_dir_all(&ws).unwrap();
+    let ready = ws.join(format!("{job_id}_output.mxf"));
+    std::fs::write(&ready, b"the verified video").unwrap();
+    let sha = omni_core::held::sha256_file(&ready).unwrap();
+    let (repo, ready_s, sha2) = (r.repo.clone(), ready.to_string_lossy().into_owned(), sha.clone());
+    *r.fake.at_download.lock().unwrap() = Some(Box::new(move || {
+        assert!(repo.park_for_delivery(job_id, OWNER, &ready_s, 18, &sha2, 2.0).unwrap());
+    }));
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::DeliveryFailed));
+    assert!(matches!(go(&r, Some(page(&next_data(A))), &Prior::default()).await, LadderResult::Parked { .. }));
+
+    let watch = root.join("watch");
+    std::fs::create_dir_all(&watch).unwrap();
+    let engine = Arc::new(BroadcastEngine::new(
+        r.repo.clone(),
+        root.join("y.exe"),
+        root.join("f.exe"),
+        root.join("p.exe"),
+        root.join("b.exe"),
+        root.join("temp"),
+        watch.clone(),
+    ));
+    assert!(crate::worker::wait_for_watchfolder(&r.repo, &engine, job_id, OWNER, ErrorCode::DeliveryFailed).unwrap());
+    rusqlite::Connection::open(root.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![job_id])
+        .unwrap();
+    let job = r.repo.lease_job_when(OWNER, 600, true).unwrap().expect("the waiting job");
+    crate::worker::run_waiting_delivery(&r.repo, &engine, OWNER, &job, &CancellationToken::new(), &r.ctx).await.unwrap();
+
+    assert_eq!(r.repo.get_job(job_id).unwrap().unwrap().status, JobStatus::Completed);
+    assert_eq!(std::fs::read_dir(&watch).unwrap().count(), 1, "delivered once");
+    assert_eq!(site_counts(&r, id), (5, 0, 6), "one use, no approval");
+    let at = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!(at.outcome.as_deref(), Some("auto_delivered"));
+    let told = |r: &Rig| events(r).iter().filter(|m| m.starts_with("Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή (5 εγκρίσεις στο site)")).count();
+    let audited = |r: &Rig| r.repo.get_recent_audit_logs(500).unwrap().iter().filter(|a| a.category == "REPAIR" && a.message.contains("delivered without approval")).count();
+    assert_eq!((told(&r), audited(&r)), (1, 1));
+
+    // A second pass (a repeated call, a later run) counts nothing more.
+    crate::repair::after_waiting_delivery(&r.ctx, job_id);
+    assert_eq!(site_counts(&r, id), (5, 0, 6));
+    assert_eq!((told(&r), audited(&r)), (1, 1));
+}
+
 // ------------------------------------------- the egress rule through run_job (P2.12)
 
 /// `work` with a network allowlist.

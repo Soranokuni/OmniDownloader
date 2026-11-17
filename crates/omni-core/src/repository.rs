@@ -458,9 +458,22 @@ pub enum CancelOutcome {
     NotCancellable,
 }
 
+/// Which ready jobs a lease may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseScope {
+    /// Any job.
+    Any,
+    /// Jobs that download and encode nothing: an approved held video, or a
+    /// finished video that waits for the watchfolder (P10.5, P11.2a).
+    DeliverOnly,
+    /// Only a finished video that waits for the watchfolder (P11.2a).
+    WaitingOnly,
+}
+
 /// What the watchfolder holds at a RUNNING job's `delivering_to` marker, read
-/// once at start-up (P1.22).
-enum MarkerCheck {
+/// once at start-up (P1.22), and before a waiting video is delivered (P11.2a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerCheck {
     /// The delivered path was recorded for this attempt after the rename: delivered,
     /// whether or not the file is still in the watchfolder (no file check is made).
     Recorded { path: String },
@@ -1012,6 +1025,10 @@ impl Repository {
                 delivered_at = CASE WHEN ? THEN ? ELSE delivered_at END,
                 delivering_to = NULL,
                 delivering_bytes = NULL,
+                delivery_wait = 0,
+                ready_path = NULL,
+                ready_bytes = NULL,
+                ready_sha256 = NULL,
                 updated_at = ?
             WHERE id = ? AND lease_owner = ?
             "#,
@@ -1061,7 +1078,9 @@ impl Repository {
     /// Used for the retryable error codes: transient network trouble, a full
     /// disk, a delivery share that was briefly unreachable. `not_before` keeps
     /// the worker from immediately re-leasing the same job and burning all its
-    /// attempts inside a second.
+    /// attempts inside a second. The retry is a full run: a video that waited
+    /// for the watchfolder (P11.2a) and failed for another reason no longer
+    /// waits, so its next lease spends an attempt like any other.
     pub fn requeue_after(
         &self,
         job_id: i64,
@@ -1076,7 +1095,8 @@ impl Repository {
         let changed = conn.execute(
             "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
              lease_expires_at=NULL, not_before=?, error_code=?, error_message=?,
-             progress=0.0, updated_at=?
+             progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL,
+             updated_at=?
              WHERE id=? AND lease_owner=?",
             params![not_before, error_code, error_message, now, job_id, owner],
         )?;
@@ -1092,6 +1112,169 @@ impl Repository {
             )?;
         }
         Ok(changed == 1)
+    }
+
+    /// The watchfolder could not be written (P11.2a): the finished, verified
+    /// file at `ready_path` waits for it, with its size and SHA-256. Only the
+    /// lease holder of a RUNNING job may write it; `false` otherwise (nothing
+    /// written). The `delivering_*` marker of the rename that was attempted is
+    /// kept: it is what the delivery after the wait asks first.
+    ///
+    /// The attempt the lease spent is given back the first time a run parks
+    /// the job; a run that leased an already waiting job spent none (see
+    /// `lease_next`), so parking it again leaves `attempts` as it is. Waiting
+    /// for the share therefore never uses up the job's attempts, and nothing
+    /// else gets this.
+    pub fn park_for_delivery(
+        &self,
+        job_id: i64,
+        owner: &str,
+        ready_path: &str,
+        bytes: u64,
+        sha256: &str,
+        duration: f64,
+    ) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE queue SET attempts = CASE WHEN delivery_wait = 1 THEN attempts ELSE MAX(attempts - 1, 0) END,
+                    delivery_wait = 1, ready_path = ?, ready_bytes = ?, ready_sha256 = ?, duration_secs = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
+            params![ready_path, bytes as i64, sha256, duration, timestamps::now_string(), job_id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Put a job whose video waits for the watchfolder back in the queue for
+    /// `backoff` (P11.2a). Unlike [`Self::requeue_after`] it keeps the wait,
+    /// the `ready_*` file and the delivery marker, and it never spends an
+    /// attempt (see [`Self::park_for_delivery`]), however often it repeats.
+    /// Only for the lease holder of a RUNNING job that waits; `false` otherwise.
+    ///
+    /// The queue line is written only when `error_message` (the cause) is not
+    /// the one the row already carries: a share that stays down for hours
+    /// does not fill the job's history with the same line (P11.2a).
+    pub fn requeue_waiting_delivery(&self, job_id: i64, owner: &str, backoff: Duration, error_message: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let not_before = timestamps::format(Utc::now() + backoff);
+        let before: Option<String> = conn
+            .query_row("SELECT error_message FROM queue WHERE id = ?", params![job_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let changed = conn.execute(
+            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+             not_before=?, error_code='DELIVERY_FAILED', error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
+             updated_at=?
+             WHERE id=? AND lease_owner=? AND status='RUNNING' AND delivery_wait=1",
+            params![not_before, error_message, now, job_id, owner],
+        )?;
+        if changed == 1 && before.as_deref() != Some(error_message) {
+            self.record_event(
+                job_id,
+                "WARN",
+                Some(JobStage::Queued),
+                &format!("DELIVERY_FAILED: waiting for the watchfolder; trying again in {} s", backoff.num_seconds()),
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// The video that waited for the watchfolder is gone or no longer the
+    /// one that was verified (P11.2a): the job runs again from its link. The
+    /// wait, the `ready_*` file and the delivery marker are cleared; the next
+    /// lease is a normal one and spends an attempt. Only for the lease holder
+    /// of a RUNNING job; `false` otherwise.
+    pub fn requeue_for_rerun(&self, job_id: i64, owner: &str, error_message: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let changed = conn.execute(
+            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+             not_before=NULL, error_code=NULL, error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
+             delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL,
+             delivering_to=NULL, delivering_bytes=NULL, delivering_recorded=NULL, updated_at=?
+             WHERE id=? AND lease_owner=? AND status='RUNNING'",
+            params![error_message, now, job_id, owner],
+        )?;
+        if changed == 1 {
+            self.record_event(job_id, "WARN", Some(JobStage::Queued), "Requeued to run again from its link")?;
+        }
+        Ok(changed == 1)
+    }
+
+    /// Jobs whose finished video waits for the watchfolder (P11.2a), queued or
+    /// being delivered: their `temp/jobs/{id}` holds that video, so the
+    /// start-up sweep must leave it.
+    pub fn parked_job_ids(&self) -> Result<Vec<i64>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT id FROM queue WHERE delivery_wait = 1 AND status IN ('PENDING','RUNNING')")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+    }
+
+    /// Job `id`'s delivery marker as stored: the path a rename was about to
+    /// go to, its size, and whether that delivery was recorded. No file I/O.
+    pub fn delivery_marker(&self, id: i64) -> Result<Option<(String, i64, bool)>> {
+        Self::read_delivery_marker(&*self.pool.get()?, id)
+    }
+
+    /// A waiting video whose delivery a person must settle (P11.2a): a rename
+    /// was attempted and its file is not in the watchfolder now (MCR may have
+    /// moved it into Dalet), or the watchfolder changed while it waited. The
+    /// lease holder sends it to REQUIRES_REVIEW with DELIVERY_FAILED and
+    /// `message`, an ERROR event and a WARN DELIVERY audit row, in one
+    /// transaction. Unlike `finish`, the marker, the wait and the `ready_*`
+    /// file are kept: nothing is lost, and nothing is delivered on its own.
+    /// Only the lease holder of a RUNNING job; `false` otherwise.
+    pub fn review_waiting_delivery(&self, id: i64, owner: &str, message: &str) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let n = tx.execute(
+            "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+             error_code='DELIVERY_FAILED', error_message=?, completed_at=?, updated_at=?
+             WHERE id=? AND lease_owner=? AND status='RUNNING'",
+            params![message, now, now, id, owner],
+        )?;
+        if n != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
+            params![id, now, message],
+        )?;
+        tx.execute(
+            "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+            params![format!("Job {id}: {message}"), now],
+        )?;
+        tx.commit()?;
+        count_finished(JobStatus::RequiresReview);
+        if let Some(bus) = &self.events {
+            bus.job(id, JobStatus::RequiresReview.as_str(), None, None);
+        }
+        Ok(true)
+    }
+
+    /// The trusted recipe's automatic delivery that waited for the
+    /// watchfolder has now landed (P11.2a): its attempt's `auto_delivering`
+    /// becomes `auto_delivered`. `true` only for the call that changed it, so
+    /// the delivery is counted once.
+    pub fn promote_attempt_auto_delivered(&self, attempt_id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE repair_attempts SET outcome = 'auto_delivered' WHERE id = ? AND outcome = 'auto_delivering'",
+            params![attempt_id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// What the watchfolder says about job `id`'s `delivering_to` marker
+    /// (P11.2a): `None` with no marker. Looks at the watchfolder for up to 15 s
+    /// (a share that does not answer is `Unknown`): blocking, call it from a
+    /// blocking thread.
+    pub fn check_delivery_marker(&self, id: i64) -> Result<Option<MarkerCheck>> {
+        // The connection goes back to the pool before the watchfolder is asked.
+        let marker = Self::read_delivery_marker(&*self.pool.get()?, id)?;
+        Ok(Self::look_at_marker(marker, MARKER_CHECK_TIMEOUT, inspect_marker_file))
     }
 
     /// Store the pre-delivery compliance report (plan P1.6).
@@ -1128,63 +1311,110 @@ impl Repository {
     /// Runs in one IMMEDIATE transaction so two workers cannot select the same
     /// row before either updates it.
     pub fn lease_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
-        self.lease_next(owner, lease_secs, false, None)
+        self.lease_job_when(owner, lease_secs, true)
+    }
+
+    /// [`Self::lease_job`] for the worker loop: while `deliver_ok` is false (the
+    /// watchfolder does not answer, P11.2a) a job whose finished video waits for
+    /// it is not taken; every other job is, in the usual order.
+    pub fn lease_job_when(&self, owner: &str, lease_secs: i64, deliver_ok: bool) -> Result<Option<Job>> {
+        self.lease_next(owner, lease_secs, LeaseScope::Any, None, deliver_ok)
+    }
+
+    /// Only a job whose finished video waits for the watchfolder (P11.2a), and
+    /// only while `deliver_ok`: what the worker loop may still start when the
+    /// `disk` check is red. It needs no temp space, and delivering it frees some.
+    pub fn lease_waiting_delivery_when(&self, owner: &str, lease_secs: i64, deliver_ok: bool) -> Result<Option<Job>> {
+        self.lease_next(owner, lease_secs, LeaseScope::WaitingOnly, None, deliver_ok)
     }
 
     /// Lease exactly job `id`, and only while it is PENDING and ready; any
     /// other job is left alone. For tools that made a job themselves and must
     /// never take someone else's. `false`: nothing leased.
     pub fn lease_job_by_id(&self, id: i64, owner: &str, lease_secs: i64) -> Result<bool> {
-        Ok(self.lease_next(owner, lease_secs, false, Some(id))?.is_some())
+        Ok(self.lease_next(owner, lease_secs, LeaseScope::Any, Some(id), true)?.is_some())
     }
 
     /// [`Self::lease_job`] limited to jobs MCR approved a held video for
-    /// (P10.5). Delivering such a job downloads and encodes nothing, so the
+    /// (P10.5), and to jobs whose finished video waits for the watchfolder
+    /// (P11.2a). Delivering such a job downloads and encodes nothing, so the
     /// worker loop may take one when every download slot is busy.
     pub fn lease_approved_held_job(&self, owner: &str, lease_secs: i64) -> Result<Option<Job>> {
-        self.lease_next(owner, lease_secs, true, None)
+        self.lease_approved_held_job_when(owner, lease_secs, true)
     }
 
-    fn lease_next(&self, owner: &str, lease_secs: i64, approved_held_only: bool, only_id: Option<i64>) -> Result<Option<Job>> {
+    /// [`Self::lease_approved_held_job`] that leaves the waiting videos alone
+    /// while `deliver_ok` is false.
+    pub fn lease_approved_held_job_when(&self, owner: &str, lease_secs: i64, deliver_ok: bool) -> Result<Option<Job>> {
+        self.lease_next(owner, lease_secs, LeaseScope::DeliverOnly, None, deliver_ok)
+    }
+
+    /// A row with `delivery_wait` = 1 (P11.2a) is leased straight to DELIVER
+    /// without spending an attempt, and keeps its delivery marker and its
+    /// `ready_*` file: the run delivers that file and nothing else.
+    fn lease_next(
+        &self,
+        owner: &str,
+        lease_secs: i64,
+        scope: LeaseScope,
+        only_id: Option<i64>,
+        deliver_ok: bool,
+    ) -> Result<Option<Job>> {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         let now = timestamps::now_string();
         let select = if only_id.is_some() {
             r#"
-                SELECT id FROM queue
+                SELECT id, delivery_wait FROM queue
                 WHERE status = 'PENDING'
                   AND (not_before IS NULL OR not_before <= ?)
+                  AND (delivery_wait = 0 OR ?)
                   AND id = ?
                 "#
-        } else if approved_held_only {
+        } else if scope == LeaseScope::WaitingOnly {
             r#"
-                SELECT id FROM queue
+                SELECT id, delivery_wait FROM queue
                 WHERE status = 'PENDING'
                   AND (not_before IS NULL OR not_before <= ?)
-                  AND id IN (SELECT job_id FROM held_outputs WHERE decision = 'approved')
+                  AND delivery_wait = 1 AND ?
+                ORDER BY priority DESC, created_at ASC, id ASC
+                LIMIT 1
+                "#
+        } else if scope == LeaseScope::DeliverOnly {
+            r#"
+                SELECT id, delivery_wait FROM queue
+                WHERE status = 'PENDING'
+                  AND (not_before IS NULL OR not_before <= ?)
+                  AND (delivery_wait = 0 OR ?)
+                  AND (delivery_wait = 1 OR id IN (SELECT job_id FROM held_outputs WHERE decision = 'approved'))
                 ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1
                 "#
         } else {
             r#"
-                SELECT id FROM queue
+                SELECT id, delivery_wait FROM queue
                 WHERE status = 'PENDING'
                   AND (not_before IS NULL OR not_before <= ?)
+                  AND (delivery_wait = 0 OR ?)
                 ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT 1
                 "#
         };
-        let id: Option<i64> = tx
+        let picked: Option<(i64, bool)> = tx
             .query_row(
                 select,
-                rusqlite::params_from_iter(std::iter::once(rusqlite::types::Value::Text(now.clone())).chain(only_id.map(rusqlite::types::Value::Integer))),
-                |r| r.get(0),
+                rusqlite::params_from_iter(
+                    [rusqlite::types::Value::Text(now.clone()), rusqlite::types::Value::Integer(deliver_ok as i64)]
+                        .into_iter()
+                        .chain(only_id.map(rusqlite::types::Value::Integer)),
+                ),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
             )
             .optional()?;
 
-        let id = match id {
-            Some(id) => id,
+        let (id, waiting) = match picked {
+            Some(p) => p,
             None => {
                 tx.commit()?;
                 return Ok(None);
@@ -1196,32 +1426,35 @@ impl Repository {
             r#"
             UPDATE queue
             SET status = 'RUNNING',
-                stage = 'EXTRACT',
+                stage = CASE WHEN delivery_wait = 1 THEN 'DELIVER' ELSE 'EXTRACT' END,
                 lease_owner = ?,
                 lease_expires_at = ?,
                 stage_started_at = ?,
-                attempts = attempts + 1,
+                attempts = CASE WHEN delivery_wait = 1 THEN attempts ELSE attempts + 1 END,
                 not_before = NULL,
                 progress = 0.0,
                 speed = '0 Mbps',
                 eta = '--:--',
-                delivering_to = NULL,
-                delivering_bytes = NULL,
+                delivering_to = CASE WHEN delivery_wait = 1 THEN delivering_to ELSE NULL END,
+                delivering_bytes = CASE WHEN delivery_wait = 1 THEN delivering_bytes ELSE NULL END,
                 updated_at = ?
             WHERE id = ?
             "#,
             params![owner, expires, now, now, id],
         )?;
         tx.execute(
-            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'EXTRACT', 'INFO', ?)",
-            params![id, now, format!("Leased by {owner}")],
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, ?, 'INFO', ?)",
+            params![id, now, if waiting { "DELIVER" } else { "EXTRACT" }, format!("Leased by {owner}")],
         )?;
         // A new lease means the earlier run is over: an automatic-delivery marker it left
         // (a run cancelled and killed, a failed finish_attempt) must never read as one (P10.16b).
-        tx.execute(
-            "UPDATE repair_attempts SET outcome = 'interrupted' WHERE job_id = ? AND outcome = 'auto_delivering'",
-            params![id],
-        )?;
+        // A waiting video's marker stays: that run is not over, its delivery is (P11.2a).
+        if !waiting {
+            tx.execute(
+                "UPDATE repair_attempts SET outcome = 'interrupted' WHERE job_id = ? AND outcome = 'auto_delivering'",
+                params![id],
+            )?;
+        }
         tx.commit()?;
 
         self.get_job(id)
@@ -1379,7 +1612,8 @@ impl Repository {
     /// becomes its slug, the file name it is delivered under. Only while the
     /// file is not being made yet: waiting, needing review, or running up to
     /// the transcode (the worker reads the slug again when it starts the
-    /// rewrap, which names the clip). One statement, so a job that moves on
+    /// rewrap, which names the clip). A job whose finished video waits for the
+    /// watchfolder (P11.2a) is past that point too. One statement, so a job that moves on
     /// meanwhile is refused rather than half-renamed. `(old, new)` slug, or
     /// `None` when it is too late (or the job is gone).
     pub fn rename_job_keyword(&self, job_id: i64, keyword: &str) -> Result<Option<(String, String)>> {
@@ -1396,7 +1630,9 @@ impl Repository {
                AND (status IN ('PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED')
                     OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))
                AND NOT EXISTS (SELECT 1 FROM held_outputs h
-                               WHERE h.job_id = queue.id AND (h.decision IS NULL OR h.decision = 'approved'))",
+                               WHERE h.job_id = queue.id AND (h.decision IS NULL OR h.decision = 'approved'))
+               -- A video that waits for the watchfolder (P11.2a) is made: its clip carries the slug.
+               AND delivery_wait = 0",
             params![keyword, slug, timestamps::now_string(), job_id],
         )?;
         Ok((changed == 1).then_some((job.slug, slug)))
@@ -1954,15 +2190,15 @@ impl Repository {
         let now = timestamps::now_string();
         let prefix = format!("{hostname}:%");
 
-        let ids: Vec<i64> = {
+        let ids: Vec<(i64, bool)> = {
             let mut stmt =
-                conn.prepare("SELECT id FROM queue WHERE status = 'RUNNING' AND lease_owner LIKE ?")?;
-            let rows = stmt.query_map(params![prefix], |r| r.get(0))?;
+                conn.prepare("SELECT id, delivery_wait FROM queue WHERE status = 'RUNNING' AND lease_owner LIKE ?")?;
+            let rows = stmt.query_map(params![prefix], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
         let mut requeued = 0usize;
-        for id in &ids {
+        for (id, waiting) in &ids {
             // The watchfolder is asked before the transaction opens: a UNC path can block.
             let check = Self::check_delivery_marker_with(&conn, *id, timeout, inspect)?;
             // Each job's change and its event land together or not at all.
@@ -1970,6 +2206,27 @@ impl Repository {
             if Self::recover_if_delivered(&tx, *id, &now, check.as_ref(), RecoveryCause::Restart)? {
                 tx.commit()?;
                 count_finished(JobStatus::Completed);
+                continue;
+            }
+            if *waiting {
+                // Its finished video waits for the watchfolder (P11.2a): the daemon stopped
+                // between parking it and the requeue, or while delivering it after the wait.
+                // It waits again, marker and file kept; the delivery after the wait asks the
+                // marker first, so neither an unreadable share nor a rename that landed sends
+                // it to review or delivers it twice. The attempt was given back when it parked.
+                requeued += 1;
+                tx.execute(
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                     lease_expires_at=NULL, not_before=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
+                     error_code='DELIVERY_FAILED', updated_at=?
+                     WHERE id=?",
+                    params![now, id],
+                )?;
+                tx.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
+                    params![id, now, "Recovered after daemon restart; the finished video still waits for the watchfolder"],
+                )?;
+                tx.commit()?;
                 continue;
             }
             if let Some(MarkerCheck::Unknown { path, reason }) = &check {
@@ -2065,10 +2322,12 @@ impl Repository {
         check: Option<&MarkerCheck>,
         cause: RecoveryCause,
     ) -> Result<bool> {
+        // A video that waited for the watchfolder (P11.2a) and is found delivered waits no more.
         let mut changed = conn.execute(
             "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
              lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
-             delivering_to=NULL, delivering_bytes=NULL, updated_at=?
+             delivering_to=NULL, delivering_bytes=NULL,
+             delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, updated_at=?
              WHERE id=? AND status='RUNNING' AND stage = 'ARCHIVE'
                AND NOT EXISTS (SELECT 1 FROM held_outputs h WHERE h.job_id = queue.id AND h.decision = 'approved')",
             params![now, now, id],
@@ -2087,7 +2346,8 @@ impl Repository {
             changed = conn.execute(
                 "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
                  lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
-                 file_path=?, delivering_to=NULL, delivering_bytes=NULL, updated_at=?
+                 file_path=?, delivering_to=NULL, delivering_bytes=NULL,
+                 delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, updated_at=?
                  WHERE id=? AND status='RUNNING'",
                 params![now, path, now, id],
             )?;
@@ -2141,6 +2401,17 @@ impl Repository {
                     "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
                     params![format!("Job {id}: delivered without approval by a trusted recipe; recovered after an interruption"), now],
                 )?;
+            }
+        }
+        // A video that waits for the watchfolder (P11.2a) keeps its marker: its delivery is not
+        // over, and the delivery after the wait asks the watchfolder before it copies.
+        if changed == 0 {
+            let waiting: bool = conn
+                .query_row("SELECT delivery_wait = 1 FROM queue WHERE id = ?", params![id], |r| r.get(0))
+                .optional()?
+                .unwrap_or(false);
+            if waiting {
+                return Ok(false);
             }
         }
         // Any marker still left belongs to a run that stopped before ARCHIVE: it must never read
@@ -2262,12 +2533,14 @@ impl Repository {
     /// its status: the worker holding the lease decides the terminal status
     /// (`finish`). Only the lease holder may write it. The `delivering_to`
     /// marker is left for `finish` to clear: until then a crash is still a
-    /// delivery that must not be repeated (P1.22).
+    /// delivery that must not be repeated (P1.22). A video that waited for the
+    /// watchfolder (P11.2a) stops waiting in the same write.
     pub fn set_delivered_file(&self, id: i64, owner: &str, file_path: &str, duration: f64) -> Result<bool> {
         let conn = self.pool.get()?;
         let n = conn.execute(
             "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?,
-                    delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END
+                    delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END,
+                    delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![file_path, duration, timestamps::now_string(), file_path, id, owner],
         )?;
@@ -2298,6 +2571,12 @@ impl Repository {
         timeout: std::time::Duration,
         inspect: fn(String, u64) -> MarkerCheck,
     ) -> Result<Option<MarkerCheck>> {
+        let marker = Self::read_delivery_marker(conn, id)?;
+        Ok(Self::look_at_marker(marker, timeout, inspect))
+    }
+
+    /// Job `id`'s marker: path, size, and whether the delivery of that very path was recorded.
+    fn read_delivery_marker(conn: &rusqlite::Connection, id: i64) -> Result<Option<(String, i64, bool)>> {
         let marker: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
             .query_row(
                 "SELECT delivering_to, delivering_bytes, delivering_recorded FROM queue WHERE id = ?",
@@ -2305,26 +2584,33 @@ impl Repository {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (Some(path), Some(expected), recorded) = (match marker {
-            Some((p, b, rec)) => (p.filter(|p| !p.is_empty()), b, rec == Some(1)),
-            None => (None, None, false),
-        }) else {
-            return Ok(None);
-        };
+        Ok(match marker {
+            Some((Some(p), Some(b), rec)) if !p.is_empty() => Some((p, b, rec == Some(1))),
+            _ => None,
+        })
+    }
+
+    /// What the watchfolder says about `marker` (file I/O, no database).
+    fn look_at_marker(
+        marker: Option<(String, i64, bool)>,
+        timeout: std::time::Duration,
+        inspect: fn(String, u64) -> MarkerCheck,
+    ) -> Option<MarkerCheck> {
+        let (path, expected, recorded) = marker?;
         if recorded {
             // This attempt wrote the delivered path right after the rename. MCR moves
             // files out of the watchfolder by hand, so a missing file proves nothing.
-            return Ok(Some(MarkerCheck::Recorded { path }));
+            return Some(MarkerCheck::Recorded { path });
         }
         let expected = expected.max(0) as u64;
         // A UNC path can hang for the better part of a minute: the look runs on its own
         // thread, and a share that does not answer in time is "unknown", not "absent".
         let probe_path = path.clone();
         let looked = run_with_timeout(timeout, move || inspect(probe_path, expected));
-        Ok(Some(looked.unwrap_or_else(|| MarkerCheck::Unknown {
+        Some(looked.unwrap_or_else(|| MarkerCheck::Unknown {
             path,
             reason: format!("no answer from the watchfolder within {} ms", timeout.as_millis()),
-        })))
+        }))
     }
 
     pub fn update_job_progress(&self, id: i64, progress: f64, speed: &str, eta: &str) -> Result<()> {
@@ -2661,7 +2947,9 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
-                url_normalized = COALESCE(?, url_normalized), updated_at = ?
+                url_normalized = COALESCE(?, url_normalized),
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
+                updated_at = ?
             WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED','AWAITING_APPROVAL')
             "#,
             params![new_url, new_url.map(crate::urlnorm::normalize), timestamps::now_string(), id],
@@ -2709,6 +2997,7 @@ impl Repository {
             UPDATE queue
             SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
                 completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL
             WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','AWAITING_APPROVAL')
             "#,
@@ -2732,6 +3021,7 @@ impl Repository {
             r#"
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
                 completed_at = ?, updated_at = ?
             WHERE id = ? AND (status IN ('PENDING','AWAITING_APPROVAL') OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
             "#,
@@ -2761,6 +3051,7 @@ impl Repository {
             r#"
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
                 completed_at = ?, updated_at = ?
             WHERE id = ? AND submitted_by_user_id = ? AND status = 'PENDING'
             "#,
@@ -2896,6 +3187,10 @@ impl Repository {
             delivered_at: timestamps::parse_opt(row.get("delivered_at").ok().flatten()),
             completed_at: timestamps::parse_opt(row.get("completed_at").ok().flatten()),
             cleared_at: timestamps::parse_opt(row.get("cleared_at").ok().flatten()),
+            delivery_wait: row.get::<_, Option<i64>>("delivery_wait").ok().flatten().unwrap_or(0) != 0,
+            ready_path: row.get("ready_path").ok().flatten(),
+            ready_bytes: row.get("ready_bytes").ok().flatten(),
+            ready_sha256: row.get("ready_sha256").ok().flatten(),
 
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
@@ -4738,7 +5033,8 @@ impl Repository {
         // this write and that finish must still be recognised as delivered (P1.22).
         let n = tx.execute(
             "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?,
-                    delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END
+                    delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END,
+                    delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![path, duration, timestamps::now_string(), path, job_id, owner],
         )?;
@@ -4776,6 +5072,7 @@ impl Repository {
                 error_code = NULL, error_message = NULL, progress = 100.0,
                 completed_at = ?, delivered_at = ?, updated_at = ?,
                 delivering_to = NULL, delivering_bytes = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
                 stage_timings_json = COALESCE(?, stage_timings_json)
             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'
               AND file_path IS NOT NULL AND file_path != ''

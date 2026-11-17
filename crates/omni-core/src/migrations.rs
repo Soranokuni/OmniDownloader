@@ -845,6 +845,19 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN delivering_recorded INTEGER;
         "#,
     ),
+    (
+        34,
+        // A finished, verified video whose watchfolder could not be written waits for it
+        // (P11.2a): `delivery_wait` = 1 while it waits, and the file that will be delivered,
+        // its size and its SHA-256, so the wait never re-downloads, re-encodes or delivers
+        // a file that changed meanwhile.
+        r#"
+        ALTER TABLE queue ADD COLUMN delivery_wait INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queue ADD COLUMN ready_path TEXT;
+        ALTER TABLE queue ADD COLUMN ready_bytes INTEGER;
+        ALTER TABLE queue ADD COLUMN ready_sha256 TEXT;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1538,6 +1551,39 @@ mod tests {
             .query_row("SELECT delivering_to, delivering_bytes FROM queue", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((to, bytes), (None, None), "an existing job must start with no marker");
+    }
+
+    #[test]
+    fn migration_34_adds_the_delivery_wait_and_existing_rows_do_not_wait() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 33) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status) VALUES ('https://example.invalid/v', 'S', 'PENDING')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 33);
+        assert!(!columns_of(&conn, "queue").contains(&"delivery_wait".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        let cols = columns_of(&conn, "queue");
+        for c in ["delivery_wait", "ready_path", "ready_bytes", "ready_sha256"] {
+            assert!(cols.contains(&c.to_string()), "{c} is missing");
+        }
+        let row: (i64, Option<String>, Option<i64>, Option<String>) = conn
+            .query_row("SELECT delivery_wait, ready_path, ready_bytes, ready_sha256 FROM queue", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(row, (0, None, None, None), "an existing job must not wait for the watchfolder");
     }
 
     #[test]

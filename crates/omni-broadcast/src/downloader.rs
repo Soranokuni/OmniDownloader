@@ -1165,7 +1165,7 @@ async fn clear_stale_sources(dir: &Path) -> std::io::Result<()> {
 /// before the spawn. `.part*` and `.ytdl` are in-progress artefacts; picking
 /// one would hand a truncated file to the transcoder. No mtime test: yt-dlp may
 /// stamp a fresh file with the server's date.
-async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
+pub(crate) async fn find_downloaded_file(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     let mut entries = tokio::fs::read_dir(dir).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {

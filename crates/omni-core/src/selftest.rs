@@ -146,6 +146,120 @@ pub fn probe_watchfolder(watchfolder: &Path) -> Result<(), String> {
     }
 }
 
+/// Whether the watchfolder answers now (P11.2a), shared by the share watch,
+/// the deliveries and the worker loop: while it is false, no job whose video
+/// waits for the watchfolder is leased. Clones share one flag.
+#[derive(Debug, Clone)]
+pub struct WatchfolderState(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl WatchfolderState {
+    pub fn new(reachable: bool) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(reachable)))
+    }
+
+    pub fn reachable(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set(&self, reachable: bool) {
+        self.0.store(reachable, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Default for WatchfolderState {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+/// How often the running daemon probes the watchfolder (P11.2a).
+pub const WATCHFOLDER_PROBE_EVERY: Duration = Duration::from_secs(30);
+/// A probe that has not answered by then counts as not reachable.
+pub const WATCHFOLDER_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What the running daemon's share watch looks at (P11.2a). While the
+/// watchfolder answers it only reads (nothing is written into the
+/// watchfolder); once it does not, only a passing write probe reopens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareCheck {
+    /// `metadata` of the watchfolder: it is a directory.
+    Read,
+    /// [`probe_watchfolder`]: a probe file is written and removed.
+    Write,
+}
+
+impl ShareCheck {
+    /// The check for the flag as it is now.
+    pub fn for_state(reachable: bool) -> Self {
+        if reachable {
+            Self::Read
+        } else {
+            Self::Write
+        }
+    }
+
+    /// Run it (blocking file I/O: a UNC path can hang).
+    pub fn run(self, watchfolder: &Path) -> Result<(), String> {
+        match self {
+            Self::Read => read_watchfolder(watchfolder),
+            Self::Write => probe_watchfolder(watchfolder),
+        }
+    }
+}
+
+/// The read-only look of the share watch: the watchfolder is a directory
+/// that answers. Writes nothing.
+pub fn read_watchfolder(watchfolder: &Path) -> Result<(), String> {
+    match std::fs::metadata(watchfolder) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} is not a directory", watchfolder.display())),
+        Err(e) => Err(format!("{} cannot be read: {e}", watchfolder.display())),
+    }
+}
+
+/// The `watchfolder` line and the flag for one `check` of `watchfolder`:
+/// `Some(result)` of the check, `None` when it did not answer in time. A
+/// passing read keeps the line the last passing write probe set ("writable").
+/// Pure.
+pub fn watchfolder_verdict(watchfolder: &Path, check: ShareCheck, probe: Option<&Result<(), String>>) -> (bool, Check) {
+    let down = |detail: &str| {
+        Check::down(format!(
+            "{} is not reachable; finished videos are waiting: {detail}",
+            watchfolder.display()
+        ))
+    };
+    let what = match check {
+        ShareCheck::Read => "the read check",
+        ShareCheck::Write => "the write probe",
+    };
+    match probe {
+        Some(Ok(())) => (true, Check::ok("writable")),
+        Some(Err(detail)) => (false, down(detail)),
+        None => (false, down(&format!("{what} did not answer within {} s", WATCHFOLDER_PROBE_TIMEOUT.as_secs()))),
+    }
+}
+
+/// Record one check of the running daemon's share watch: the flag, and the
+/// `watchfolder` line with `set_if_changed` (it runs every 30 s). Returns
+/// whether the watchfolder answers.
+pub fn record_watchfolder(
+    health: &HealthState,
+    state: &WatchfolderState,
+    watchfolder: &Path,
+    check: ShareCheck,
+    probe: Option<&Result<(), String>>,
+) -> bool {
+    // A read that passed while the flag went down meanwhile (a delivery found the
+    // share unreachable) proves nothing: only a passing write probe reopens it.
+    if check == ShareCheck::Read && !state.reachable() && matches!(probe, Some(Ok(()))) {
+        return false;
+    }
+    let (reachable, line) = watchfolder_verdict(watchfolder, check, probe);
+    state.set(reachable);
+    health.set_if_changed(checks::WATCHFOLDER, line);
+    reachable
+}
+
 /// Free and total bytes on the volume holding `path`.
 pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     #[cfg(windows)]
@@ -449,6 +563,82 @@ mod tests {
 
         let err = probe_watchfolder(&file).unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
+    }
+
+    /// P11.2a: the share watch. A probe that answers opens the lease gate; an
+    /// error or no answer in 15 s closes it and says that videos wait.
+    #[test]
+    fn the_share_watch_turns_each_check_into_the_flag_and_the_line_in_both_modes() {
+        use crate::health::Health;
+        let wf = Path::new(r"\\fileserver\dalet\watch");
+        for check in [ShareCheck::Read, ShareCheck::Write] {
+            let (ok, c) = watchfolder_verdict(wf, check, Some(&Ok(())));
+            assert!(ok, "{check:?}");
+            assert_eq!((c.state, c.detail.as_deref()), (Health::Ok, Some("writable")), "{check:?}");
+
+            let (ok, c) = watchfolder_verdict(wf, check, Some(&Err("Access is denied. (os error 5)".into())));
+            assert!(!ok, "{check:?}");
+            assert_eq!(c.state, Health::Down);
+            assert_eq!(
+                c.detail.as_deref(),
+                Some(r"\\fileserver\dalet\watch is not reachable; finished videos are waiting: Access is denied. (os error 5)")
+            );
+
+            let (ok, c) = watchfolder_verdict(wf, check, None);
+            assert!(!ok, "{check:?}: a check that did not answer counts as not reachable");
+            assert_eq!(c.state, Health::Down);
+            assert!(c.detail.unwrap().ends_with("did not answer within 15 s"));
+        }
+        let (_, c) = watchfolder_verdict(wf, ShareCheck::Read, None);
+        assert!(c.detail.unwrap().contains("the read check"));
+    }
+
+    /// C of P11.2a: while the share answers the watch only reads, and writes
+    /// nothing into the watchfolder; only while it does not is the write probe run.
+    #[test]
+    fn the_share_watch_reads_while_the_share_answers_and_writes_only_while_it_does_not() {
+        assert_eq!(ShareCheck::for_state(true), ShareCheck::Read);
+        assert_eq!(ShareCheck::for_state(false), ShareCheck::Write);
+
+        let dir = TempDir::new().unwrap();
+        let wf = dir.path().join("watch");
+        std::fs::create_dir_all(&wf).unwrap();
+        assert!(ShareCheck::Read.run(&wf).is_ok());
+        assert!(std::fs::read_dir(&wf).unwrap().next().is_none(), "the read check left something");
+
+        // A watchfolder that is gone: the read fails and creates nothing (the write probe would create it).
+        let gone = dir.path().join("gone");
+        assert!(ShareCheck::Read.run(&gone).unwrap_err().contains("cannot be read"));
+        assert!(!gone.exists(), "the read check created the folder");
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(ShareCheck::Read.run(&file).unwrap_err().contains("not a directory"));
+        assert!(ShareCheck::Write.run(&gone).is_ok() && gone.is_dir());
+    }
+
+    #[test]
+    fn the_share_watch_sets_the_flag_and_keeps_the_line_when_nothing_changed() {
+        use crate::health::Health;
+        let wf = Path::new(r"\\fileserver\dalet\watch");
+        let (health, state) = (HealthState::new(), WatchfolderState::new(true));
+        let shared = state.clone();
+
+        assert!(!record_watchfolder(&health, &state, wf, ShareCheck::Read, None));
+        assert!(!shared.reachable(), "a clone shares the flag the worker loop reads");
+        assert_eq!(health.get(checks::WATCHFOLDER).unwrap().state, Health::Down);
+        // Down: a passing read (one that started before) does not reopen it; a write probe does.
+        assert!(!record_watchfolder(&health, &state, wf, ShareCheck::Read, Some(&Ok(()))));
+        assert!(!shared.reachable());
+        assert_eq!(health.get(checks::WATCHFOLDER).unwrap().state, Health::Down);
+
+        assert!(record_watchfolder(&health, &state, wf, ShareCheck::Write, Some(&Ok(()))));
+        assert!(shared.reachable());
+        let first = health.get(checks::WATCHFOLDER).unwrap().last_ok;
+        std::thread::sleep(Duration::from_millis(5));
+        record_watchfolder(&health, &state, wf, ShareCheck::Read, Some(&Ok(())));
+        // set_if_changed: a steady state every 30 s does not churn "last worked at".
+        assert_eq!(health.get(checks::WATCHFOLDER).unwrap().last_ok, first);
+        assert!(WatchfolderState::default().reachable());
     }
 
     #[tokio::test]

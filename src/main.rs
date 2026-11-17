@@ -1308,6 +1308,9 @@ async fn run_daemon(
     let repair_ffprobe = ffprobe_path.clone();
     let repair_ffmpeg = ffmpeg_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
+    // Whether the watchfolder answers (P11.2a): the start-up probe sets it, the
+    // share watch and every delivery keep it current, the worker loop reads it.
+    let watchfolder_state = omni_core::selftest::WatchfolderState::default();
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdl_path.clone(),
@@ -1318,7 +1321,8 @@ async fn run_daemon(
         watchfolder_path.clone(),
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
-    .with_archive(Some(archive_settings.clone())));
+    .with_archive(Some(archive_settings.clone()))
+    .with_watchfolder_state(watchfolder_state.clone()));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -1331,6 +1335,11 @@ async fn run_daemon(
     // URL, once per job. It never blocks start-up: refusing to come up is the
     // one outcome an operator cannot diagnose from the MCR desk.
     omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
+    watchfolder_state.set(
+        health
+            .get(omni_core::health::checks::WATCHFOLDER)
+            .is_some_and(|c| c.state == omni_core::health::Health::Ok),
+    );
     omni_core::selftest::check_default_admin(&repo, &health);
     omni_core::selftest::check_archive(
         &health,
@@ -1626,17 +1635,10 @@ async fn run_daemon(
 
     // 5. Sweep scratch directories left behind by jobs that are no longer
     // running. On a newsroom machine these are gigabytes of source media.
-    match repo.running_job_ids() {
-        Ok(running) => {
-            let removed = omni_broadcast::delivery::WatchfolderDelivery::sweep_orphan_job_dirs(
-                &temp_path.join("jobs"),
-                &running,
-            )
-            .await;
-            if removed > 0 {
-                info!("Swept {removed} orphaned job workspace(s) from temp/jobs.");
-            }
-        }
+    // A finished video that waits for the watchfolder (P11.2a) is kept.
+    match startup_sweep(&repo, &temp_path.join("jobs")).await {
+        Ok(0) => {}
+        Ok(removed) => info!("Swept {removed} orphaned job workspace(s) from temp/jobs."),
         Err(e) => warn!("Could not list running jobs for the temp sweep: {e:?}"),
     }
 
@@ -1703,6 +1705,57 @@ async fn run_daemon(
         });
     }
 
+    // 6b. Share watch (P11.2a): the watchfolder is looked at every 30 s, so a
+    // video that waits for it is delivered soon after it answers again, and the
+    // `watchfolder` line says while it does not. While it answers the look is
+    // read-only (nothing is written into the watchfolder); once it does not (a
+    // failed look, a failed start-up probe, a delivery that found it
+    // unreachable) the write probe runs, and only a passing one reopens it. A
+    // look that does not answer in 15 s counts as not reachable; one still
+    // hanging is not started twice.
+    {
+        let (state, wf_health, wf) = (watchfolder_state.clone(), health.clone(), watchfolder_path.clone());
+        let mut watch_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            use omni_core::selftest::ShareCheck;
+            let mut tick = tokio::time::interval(omni_core::selftest::WATCHFOLDER_PROBE_EVERY);
+            tick.tick().await; // the start-up self-test has just probed
+            let mut probe: Option<(ShareCheck, tokio::task::JoinHandle<Result<(), String>>)> = None;
+            loop {
+                tokio::select! {
+                    _ = watch_rx.recv() => break,
+                    _ = tick.tick() => {
+                        let (check, mut running) = match probe.take() {
+                            Some((check, p)) if !p.is_finished() => (check, p),
+                            _ => {
+                                let (path, check) = (wf.clone(), ShareCheck::for_state(state.reachable()));
+                                (check, tokio::task::spawn_blocking(move || check.run(&path)))
+                            }
+                        };
+                        let answered = tokio::time::timeout(omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT, &mut running).await;
+                        let result = match answered {
+                            Ok(Ok(r)) => Some(r),
+                            Ok(Err(e)) => Some(Err(format!("the check did not finish: {e}"))),
+                            Err(_) => {
+                                probe = Some((check, running));
+                                None
+                            }
+                        };
+                        let was = state.reachable();
+                        let now = omni_core::selftest::record_watchfolder(&wf_health, &state, &wf, check, result.as_ref());
+                        if was != now {
+                            if now {
+                                info!("The watchfolder answers again; videos waiting for it are delivered");
+                            } else {
+                                warn!("The watchfolder does not answer; finished videos wait for it");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // 7. Worker pool.
     //
     // Capacity is acquired *before* leasing (plan P1.1, defect D-01). The old
@@ -1729,6 +1782,7 @@ async fn run_daemon(
     let worker_encoder_ok = encoder_ok.clone();
     let worker_health = health.clone();
     let worker_watchfolder = watchfolder_path.clone();
+    let worker_watchfolder_state = watchfolder_state.clone();
     let worker_temp = temp_path.clone();
     let worker_archive = archive_settings.clone();
     // The LLM rung of the repair ladder (P10.12): both the switch and a model name,
@@ -1837,13 +1891,9 @@ async fn run_daemon(
                 archive_separate,
                 omni_core::selftest::disk_space(&worker_archive.root).map(|(free, _)| free),
             );
-            if !omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp) {
-                drop(permit);
-                tokio::select! {
-                    _ = worker_rx.recv() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
-                }
-            }
+            // A video that waits for the watchfolder (P11.2a) still goes then: it
+            // needs no temp space, and delivering it is what frees some.
+            let disk_ok = omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp);
 
             // A tool swap is pending: hold off rather than lease a job whose
             // downloader is about to be replaced underneath it. The pass is
@@ -1858,29 +1908,37 @@ async fn run_daemon(
             };
 
             let owner = format!("{worker_hostname}:{}:{worker_seq}", std::process::id());
+            // A video that waits for the watchfolder is leased only while it answers (P11.2a).
+            let deliver_ok = worker_watchfolder_state.reachable();
 
-            let leased = if permit.1.is_some() {
-                repo_worker.lease_job(&owner, LEASE_SECS)
-            } else {
-                // Every download slot is busy: an approved held video can
-                // still start; anything else waits briefly for a slot.
-                match repo_worker.lease_approved_held_job(&owner, LEASE_SECS) {
-                    Ok(None) => match tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned()).await {
+            let leased = match lease_now(&repo_worker, &owner, disk_ok, permit.1.is_some(), deliver_ok) {
+                // Every download slot is busy and nothing deliver-only is ready:
+                // anything else waits briefly for a slot.
+                Ok(None) if disk_ok && permit.1.is_none() => {
+                    match tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned()).await {
                         Ok(Ok(slot)) => {
                             permit.1 = Some(slot);
-                            repo_worker.lease_job(&owner, LEASE_SECS)
+                            repo_worker.lease_job_when(&owner, LEASE_SECS, worker_watchfolder_state.reachable())
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
                             drop(permit);
                             continue;
                         }
-                    },
-                    other => other,
+                    }
                 }
+                other => other,
             };
             let job = match leased {
                 Ok(Some(job)) => job,
+                Ok(None) if !disk_ok => {
+                    // Under STOP_DISK_GB and no waiting delivery: wait for room, as before.
+                    drop(permit);
+                    tokio::select! {
+                        _ = worker_rx.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                    }
+                }
                 Ok(None) => {
                     // Nothing ready. Release the permit and idle with jitter so
                     // several workers do not wake in lockstep and hammer SQLite.
@@ -2686,6 +2744,38 @@ async fn run_one_task(
             Ok(TaskOutcome::Skipped)
         }
     }
+}
+
+/// What the worker loop leases now. With the `disk` check red (`disk_ok`
+/// false) only a video that waits for the watchfolder (P11.2a): it needs no
+/// temp space and delivering it frees some; ordinary jobs and approved held
+/// videos wait for room as before. Otherwise any job with a download slot,
+/// and without one only a deliver-only job (approved held, or waiting). A
+/// waiting video only while the watchfolder answers (`deliver_ok`).
+fn lease_now(
+    repo: &Repository,
+    owner: &str,
+    disk_ok: bool,
+    has_download_slot: bool,
+    deliver_ok: bool,
+) -> anyhow::Result<Option<omni_core::models::Job>> {
+    if !disk_ok {
+        repo.lease_waiting_delivery_when(owner, LEASE_SECS, deliver_ok)
+    } else if has_download_slot {
+        repo.lease_job_when(owner, LEASE_SECS, deliver_ok)
+    } else {
+        repo.lease_approved_held_job_when(owner, LEASE_SECS, deliver_ok)
+    }
+}
+
+/// The start-up sweep of `temp/jobs`: every job's workspace goes but those of
+/// RUNNING jobs and of jobs whose finished video waits for the watchfolder
+/// (P11.2a). Runs after start-up recovery, which turns a waiting job that was
+/// RUNNING when the daemon stopped back into a waiting one.
+async fn startup_sweep(repo: &Repository, jobs_root: &std::path::Path) -> anyhow::Result<usize> {
+    let mut keep = repo.running_job_ids()?;
+    keep.extend(repo.parked_job_ids()?);
+    Ok(omni_broadcast::delivery::WatchfolderDelivery::sweep_orphan_job_dirs(jobs_root, &keep).await)
 }
 
 /// Remove `{dir}/{id}` directories (`temp/jobs`, `temp/attachments`) whose

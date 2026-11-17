@@ -10,7 +10,9 @@ use tracing::{error, info, warn};
 use omni_core::models::{Job, JobStage};
 use omni_core::repository::{HeldOutput, Repository};
 
-use crate::delivery::{LeaseLostBeforeRename, WatchfolderDelivery};
+use crate::delivery::{DeliveryError, LeaseLostBeforeRename, WatchfolderDelivery};
+use omni_core::repository::MarkerCheck;
+use omni_core::selftest::WatchfolderState;
 use crate::downloader::{DownloadError, DownloadOpts, Downloader};
 use crate::errors::ErrorCode;
 use crate::preview::{self, PreviewEncoder};
@@ -72,6 +74,80 @@ pub enum RunOutcome {
     Delivered,
     /// The file is held for MCR; nothing was delivered.
     Held,
+}
+
+/// How [`BroadcastEngine::deliver_ready`] ended (P11.2a) when it returned `Ok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyOutcome {
+    /// The video that waited is in the watchfolder (copied now, or found
+    /// there from the interrupted delivery); the worker completes the job.
+    Delivered,
+    /// The video that waited is gone or changed and was not delivered; its
+    /// workspace is removed. The worker queues the job to run from its link.
+    Rerun,
+}
+
+/// Free space a waiting video needs on the watchfolder volume beyond its own size.
+const WATCHFOLDER_MARGIN: u64 = 64 * 1024 * 1024;
+
+/// `Err(cause)` when the watchfolder volume's free space is known (`free`)
+/// and smaller than `bytes` plus 64 MiB (P11.2a): a waiting video is not
+/// copied into a share that is full, it waits again. Unknown space is not
+/// held against it.
+pub fn watchfolder_room(free: Option<u64>, bytes: u64) -> std::result::Result<(), String> {
+    let need = bytes.saturating_add(WATCHFOLDER_MARGIN);
+    match free {
+        Some(free) if free < need => {
+            let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            Err(format!("the watchfolder has {:.1} GB free, the video needs {:.1} GB", gb(free), gb(need)))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The requeue delay after a job's `n`th wait in a row (P11.2a): 30 s, 60 s,
+/// 2 min, then 5 min for every later one.
+pub fn wait_backoff_for(n: u32) -> chrono::Duration {
+    chrono::Duration::seconds(match n {
+        0 | 1 => 30,
+        2 => 60,
+        3 => 120,
+        _ => 300,
+    })
+}
+
+/// A video that waited for the watchfolder and that no run may deliver on its
+/// own (P11.2a): its earlier rename may have landed and been taken into Dalet
+/// by hand, or the watchfolder changed while it waited. The worker holding the
+/// lease sends the job to review with `message`; nothing is copied.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct DeliveryNeedsCheck {
+    pub message: String,
+}
+
+/// Whether `a` and `b` name the same folder, as written: separators and a
+/// trailing one ignored, and on Windows case too. Used to tell a delivery
+/// marker of the current watchfolder from one of an older setting (P11.2a).
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().replace('/', "\\");
+        let s = s.trim_end_matches('\\').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    norm(a) == norm(b)
+}
+
+/// The cause when `e` is a watchfolder that could not be written (P11.2a).
+fn unreachable_cause(e: &anyhow::Error) -> Option<String> {
+    match e.downcast_ref::<DeliveryError>() {
+        Some(DeliveryError::Unreachable(cause)) => Some(cause.clone()),
+        _ => None,
+    }
 }
 
 fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
@@ -200,6 +276,64 @@ mod progress_gate_tests {
 }
 
 #[cfg(test)]
+mod waiting_rule_tests {
+    use super::*;
+
+    /// B1 of P11.2a: a waiting video is not copied into a share without room
+    /// for it and 64 MiB; unknown space is not held against it.
+    #[test]
+    fn a_waiting_video_needs_its_size_and_64_mib_free_in_the_watchfolder() {
+        const MIB: u64 = 1024 * 1024;
+        let video = 500 * MIB;
+        assert!(watchfolder_room(None, video).is_ok(), "space that cannot be read is not held against it");
+        assert!(watchfolder_room(Some(video + 64 * MIB), video).is_ok());
+        let why = watchfolder_room(Some(video + 64 * MIB - 1), video).unwrap_err();
+        assert_eq!(why, "the watchfolder has 0.6 GB free, the video needs 0.6 GB");
+        assert_eq!(watchfolder_room(Some(0), 3 * 1024 * MIB).unwrap_err(), "the watchfolder has 0.0 GB free, the video needs 3.1 GB");
+    }
+
+    /// Finding 7: a marker's folder is compared with the watchfolder as written,
+    /// separators, a trailing one and (Windows) case aside.
+    #[test]
+    fn the_same_folder_is_recognised_however_it_is_written() {
+        assert!(same_folder(Path::new(r"\\fileserver\Dalet\Watch"), Path::new(r"\\fileserver\Dalet\Watch\")));
+        assert!(same_folder(Path::new("D:/omni/watch"), Path::new(r"D:\omni\watch")));
+        #[cfg(windows)]
+        assert!(same_folder(Path::new(r"\\FILESERVER\dalet\watch"), Path::new(r"\\fileserver\Dalet\Watch")));
+        assert!(!same_folder(Path::new(r"\\fileserver\dalet\watch-old"), Path::new(r"\\fileserver\dalet\watch")));
+        assert!(!same_folder(Path::new(r"\\fileserver\dalet\watch\sub"), Path::new(r"\\fileserver\dalet\watch")));
+    }
+
+    /// B2 of P11.2a: 30 s, 60 s, 2 min, then 5 min for every later wait.
+    #[test]
+    fn repeated_waits_back_off_to_five_minutes() {
+        let secs: Vec<i64> = (1..=7).map(|n| wait_backoff_for(n).num_seconds()).collect();
+        assert_eq!(secs, vec![30, 60, 120, 300, 300, 300, 300]);
+        assert_eq!(wait_backoff_for(0).num_seconds(), 30);
+    }
+
+    #[test]
+    fn the_engine_counts_waits_per_job_and_forgets_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let engine = BroadcastEngine::new(repo, p("y"), p("f"), p("p"), p("b"), p("temp"), p("watch"));
+        let shared = engine.clone();
+        assert_eq!(engine.wait_backoff(7).num_seconds(), 30);
+        engine.note_wait(7, true, "first");
+        engine.note_wait(7, false, "again");
+        engine.note_wait(8, true, "other job");
+        assert_eq!(shared.wait_backoff(7).num_seconds(), 60, "clones share the count (the ladder's engine is a clone)");
+        assert_eq!(shared.wait_line(7).as_deref(), Some("again"));
+        engine.note_wait(7, true, "a new series");
+        assert_eq!(engine.wait_backoff(7).num_seconds(), 30, "a first park starts again");
+        engine.forget_waits(7);
+        assert_eq!((engine.wait_backoff(7).num_seconds(), engine.wait_line(7)), (30, None));
+        assert_eq!(engine.wait_line(8).as_deref(), Some("other job"));
+    }
+}
+
+#[cfg(test)]
 mod failure_text_tests {
     use super::*;
 
@@ -276,9 +410,51 @@ pub struct BroadcastEngine {
     /// Set once the daemon is stopping (P2.15): no job enters DELIVER after
     /// it, so none starts a watchfolder copy the stop would cut.
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the watchfolder answers (P11.2a): a delivery that finds it
+    /// unreachable clears it at once, a delivery that lands sets it.
+    watchfolder_state: WatchfolderState,
+    /// Each waiting job's consecutive waits and the line of the last one
+    /// (P11.2a): the requeue backs off, and a repeated cause is not written
+    /// again. Lost on restart, which only restarts the back-off.
+    waits: Arc<Mutex<HashMap<i64, (u32, String)>>>,
 }
 
 impl BroadcastEngine {
+    /// Count one more wait of `job_id` (the first of a series when `first`).
+    fn note_wait(&self, job_id: i64, first: bool, line: &str) {
+        let mut waits = self.waits.lock().unwrap_or_else(|p| p.into_inner());
+        let n = if first { 1 } else { waits.get(&job_id).map_or(1, |(n, _)| n.saturating_add(1)) };
+        waits.insert(job_id, (n, line.to_string()));
+    }
+
+    /// How long job `job_id` waits before its next try ([`wait_backoff_for`]).
+    pub fn wait_backoff(&self, job_id: i64) -> chrono::Duration {
+        let n = self.waits.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).map_or(1, |(n, _)| *n);
+        wait_backoff_for(n)
+    }
+
+    /// The line of job `job_id`'s last wait: what its `error_message` says.
+    pub fn wait_line(&self, job_id: i64) -> Option<String> {
+        self.waits.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).map(|(_, l)| l.clone())
+    }
+
+    /// Job `job_id` no longer waits: delivered, run again, or failed otherwise.
+    pub fn forget_waits(&self, job_id: i64) {
+        self.waits.lock().unwrap_or_else(|p| p.into_inner()).remove(&job_id);
+    }
+
+    /// Share the daemon's watchfolder flag (P11.2a), which the worker loop
+    /// reads before it leases a job whose video waits for the watchfolder.
+    pub fn with_watchfolder_state(mut self, state: WatchfolderState) -> Self {
+        self.watchfolder_state = state;
+        self
+    }
+
+    /// The watchfolder flag this engine updates.
+    pub fn watchfolder_state(&self) -> WatchfolderState {
+        self.watchfolder_state.clone()
+    }
+
     /// Keep delivered sources as `settings` says (plan P1.7).
     pub fn with_archive(mut self, settings: Option<omni_core::archive::ArchiveSettings>) -> Self {
         // Only a usable archive is kept: off or overlapping the watchfolder means none.
@@ -353,6 +529,8 @@ impl BroadcastEngine {
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
             archive: None,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watchfolder_state: WatchfolderState::default(),
+            waits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -836,6 +1014,11 @@ impl BroadcastEngine {
         let delivered = match self.deliver_to_watchfolder(job_id, owner, &final_temp_mxf, &slug, &job_temp).await {
             Ok(dest) => dest,
             Err(e) if e.downcast_ref::<LeaseLost>().is_some() => return Err(e),
+            // The share does not answer (P11.2a): the verified file waits in its
+            // workspace and is delivered when it does; nothing is made again.
+            Err(e) if unreachable_cause(&e).is_some() => {
+                return Err(self.park(job_id, owner, &final_temp_mxf, None, duration, &slug, &job_temp, e, true).await);
+            }
             Err(e) => {
                 let err_msg = format!("Watchfolder delivery failed: {e:#}");
                 error!("Job #{}: {}", job_id, err_msg);
@@ -846,6 +1029,27 @@ impl BroadcastEngine {
             }
         };
 
+        self.after_delivery(job_id, owner, &slug, &delivered, duration, Some(&downloaded_file), &job_temp).await;
+        info!("Job #{} ({}) broadcast ingest successfully finished!", job_id, slug);
+        Ok(RunOutcome::Delivered)
+    }
+
+    /// Stages 6 and 7 after the file is in the watchfolder: the collision
+    /// warning, the recorded file, the archive and the workspace's removal.
+    /// The status is not set here: the worker that holds the lease finishes the
+    /// job as Completed with this file_path. Never fails the job.
+    async fn after_delivery(
+        &self,
+        job_id: i64,
+        owner: &str,
+        slug: &str,
+        delivered: &crate::delivery::Delivered,
+        duration: f64,
+        source: Option<&Path>,
+        job_temp: &Path,
+    ) {
+        self.watchfolder_state.set(true);
+        self.forget_waits(job_id);
         if delivered.suffixed {
             // Two assets now share a slug in Dalet. Not a failure -- the file is
             // on air -- but an operator has to know which one is which.
@@ -860,8 +1064,7 @@ impl BroadcastEngine {
             );
         }
 
-        // 6. Record the file. The status is not set here: the worker that
-        // holds the lease finishes the job as Completed with this file_path.
+        // 6. Record the file.
         let dest_str = delivered.path.to_string_lossy().to_string();
         let _ = self.repo.update_job_progress(job_id, 100.0, "Completed", "00:00");
         match self.repo.set_delivered_file(job_id, owner, &dest_str, duration) {
@@ -872,16 +1075,358 @@ impl BroadcastEngine {
 
         // 7. The file is on air and recorded: keep the source for the archive
         // (P1.7), then remove the workspace. Never fails the job.
-        self.archive_then_clean(job_id, owner, Some(&downloaded_file), &job_temp, &delivered.filename).await;
+        self.archive_then_clean(job_id, owner, source, job_temp, &delivered.filename).await;
 
         let _ = self.repo.log_audit(
             "SUCCESS",
             "INGEST",
             &format!("Job #{} ({}) ready in watchfolder at {:?}", job_id, slug, dest_str),
         );
+    }
 
-        info!("Job #{} ({}) broadcast ingest successfully finished!", job_id, slug);
-        Ok(RunOutcome::Delivered)
+    /// The watchfolder did not answer (P11.2a): record that the verified file
+    /// at `ready` waits for it, with its size and SHA-256 (`known`, or worked
+    /// out now), and return the error tagged DELIVERY_FAILED; the worker queues
+    /// the job to wait. The workspace stays. When the wait cannot be recorded,
+    /// the job is handled as before: lost lease → [`LeaseLost`]; anything else
+    /// → the workspace is removed and the error, tagged DELIVERY_FAILED, takes
+    /// the normal retry rule.
+    async fn park(
+        &self,
+        job_id: i64,
+        owner: &str,
+        ready: &Path,
+        known: Option<(u64, String)>,
+        duration: f64,
+        slug: &str,
+        job_temp: &Path,
+        delivery_err: anyhow::Error,
+        first: bool,
+    ) -> anyhow::Error {
+        self.watchfolder_state.set(false);
+        let fingerprint = match known {
+            Some(k) => Ok(k),
+            None => {
+                let path = ready.to_path_buf();
+                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, String)> {
+                    let bytes = std::fs::metadata(&path)?.len();
+                    Ok((bytes, omni_core::held::sha256_file(&path)?))
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r.map_err(anyhow::Error::from))
+            }
+        };
+        let parked = fingerprint.and_then(|(bytes, sha)| {
+            self.repo.park_for_delivery(job_id, owner, &ready.to_string_lossy(), bytes, &sha, duration)
+        });
+        match parked {
+            Ok(true) => self.waiting(job_id, slug, delivery_err, first, true),
+            Ok(false) => {
+                self.forget_waits(job_id);
+                self.lost(job_id, JobStage::Deliver, job_temp).await
+            }
+            Err(e) => {
+                self.forget_waits(job_id);
+                let err_msg = format!("Watchfolder delivery failed and the finished video could not be kept for later: {delivery_err:#}");
+                error!("Job #{job_id}: {err_msg} ({e:#})");
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
+                let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{job_id} ({slug}): {err_msg}"));
+                WatchfolderDelivery::cleanup_job_temp_files(job_temp).await;
+                delivery_err.context(ErrorCode::DeliveryFailed.as_str())
+            }
+        }
+    }
+
+    /// The error of a video that waits for the watchfolder (P11.2a); the row
+    /// already says it waits. One more wait is counted (the requeue backs off,
+    /// see [`Self::wait_backoff`]). The WARN event and the audit row are
+    /// written for the first park of a job (`first`) and afterwards only when
+    /// the cause is not the one the job's `error_message` already carries: a
+    /// share that stays down writes them once, not every try. `share_down`
+    /// closes the lease gate until the share watch sees the share again.
+    fn waiting(&self, job_id: i64, slug: &str, delivery_err: anyhow::Error, first: bool, share_down: bool) -> anyhow::Error {
+        if share_down {
+            self.watchfolder_state.set(false);
+        }
+        let line = format!("Watchfolder not reachable; the finished video waits and will be delivered when it answers: {delivery_err}");
+        let current = self.repo.get_job(job_id).ok().flatten().and_then(|j| j.error_message);
+        self.note_wait(job_id, first, &line);
+        if first || current.as_deref() != Some(line.as_str()) {
+            warn!("Job #{job_id}: {line}");
+            let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Deliver), &line);
+            let _ = self.repo.log_audit("WARN", "DELIVERY", &format!("Job #{job_id} ({slug}): {line}"));
+        } else {
+            info!("Job #{job_id}: still waiting for the watchfolder");
+        }
+        delivery_err.context(ErrorCode::DeliveryFailed.as_str())
+    }
+
+    /// B1 of P11.2a: `Err` (the video waits again, nothing is copied) when the
+    /// watchfolder volume's free space can be read and is short of `bytes`
+    /// plus 64 MiB. Asked off the async threads, for at most 15 s; a volume
+    /// that does not answer is not held against the delivery.
+    async fn room_in_watchfolder(&self, job_id: i64, slug: &str, bytes: u64) -> Result<()> {
+        let wf = self.watchfolder_dir.clone();
+        let asked = tokio::time::timeout(
+            omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
+            tokio::task::spawn_blocking(move || omni_core::selftest::disk_space(&wf).map(|(free, _)| free)),
+        )
+        .await;
+        let free = match asked {
+            Ok(Ok(free)) => free,
+            _ => None,
+        };
+        watchfolder_room(free, bytes)
+            .map_err(|cause| self.waiting(job_id, slug, anyhow::Error::new(DeliveryError::Unreachable(cause)), false, false))
+    }
+
+    /// What the watchfolder says about the job's delivery marker; blocking
+    /// file I/O (up to 15 s on a share), so off the async threads.
+    async fn ask_marker(&self, job_id: i64) -> Result<Option<MarkerCheck>> {
+        let repo = self.repo.clone();
+        tokio::task::spawn_blocking(move || repo.check_delivery_marker(job_id))
+            .await
+            .context("delivery marker check task")?
+    }
+
+    /// The event for a marker whose file is in the watchfolder with another
+    /// size: not this job's video, so the delivery goes on (with `_N`), as
+    /// start-up recovery decides for it.
+    fn note_wrong_size(&self, job_id: i64, path: &str, found: u64, expected: u64) {
+        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+        let _ = self.repo.record_event(
+            job_id,
+            "WARN",
+            Some(JobStage::Deliver),
+            &format!("{name} is in the watchfolder with {found} bytes, not the {expected} this job was delivering; it is not treated as this job's video, so it is delivered again. Check Dalet for a duplicate"),
+        );
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The daemon is stopping: a waiting video goes back to waiting at once,
+    /// with no event, no count and no change to the lease gate, so the stop
+    /// does not wait for it (P11.2a).
+    fn stopping_wait(&self) -> anyhow::Error {
+        anyhow::Error::new(DeliveryError::Unreachable("the daemon is stopping".into())).context(ErrorCode::DeliveryFailed.as_str())
+    }
+
+    /// The error for a waiting video a person must settle (P11.2a); the worker
+    /// sends the job to review with `message` and keeps everything.
+    fn needs_check(&self, job_id: i64, message: String) -> anyhow::Error {
+        warn!("Job #{job_id}: {message}");
+        self.forget_waits(job_id);
+        anyhow::Error::new(DeliveryNeedsCheck { message }).context(ErrorCode::DeliveryFailed.as_str())
+    }
+
+    /// What became of the rename an earlier attempt of this waiting video
+    /// tried, if any (its delivery marker, P11.2a):
+    /// - none recorded: `Ok(None)`, deliver;
+    /// - its file is in the watchfolder at that size, or its delivery was
+    ///   recorded: `Ok(Some(path))`, complete without copying;
+    /// - a file of another size is there: noted, `Ok(None)`, deliver next to it;
+    /// - the share cannot say: `Err`, wait again (the lease gate closes);
+    /// - not there although a rename was attempted (it may have landed and been
+    ///   moved into Dalet by hand), or the watchfolder changed since: `Err`
+    ///   [`DeliveryNeedsCheck`], a person decides; nothing is copied.
+    async fn earlier_rename(&self, job_id: i64, slug: &str) -> Result<Option<String>> {
+        let marker = self.repo.delivery_marker(job_id).context(ErrorCode::DeliveryFailed.as_str())?;
+        let Some((path, _, recorded)) = marker else {
+            return Ok(None);
+        };
+        let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        let folder = Path::new(&path).parent().map(Path::to_path_buf).unwrap_or_default();
+        if !recorded && !same_folder(&folder, &self.watchfolder_dir) {
+            // An old folder may be a share that is gone for good: not asked, not waited for.
+            return Err(self.needs_check(
+                job_id,
+                format!("The watchfolder changed while {name} was waiting; check {} and Dalet before retrying", folder.display()),
+            ));
+        }
+        match self.ask_marker(job_id).await.context(ErrorCode::DeliveryFailed.as_str())? {
+            Some(MarkerCheck::Delivered { path } | MarkerCheck::Recorded { path }) => Ok(Some(path)),
+            Some(MarkerCheck::Unknown { reason, .. }) => {
+                Err(self.waiting(job_id, slug, anyhow::Error::new(DeliveryError::Unreachable(reason)), false, true))
+            }
+            Some(MarkerCheck::WrongSize { path, found, expected }) => {
+                self.note_wrong_size(job_id, &path, found, expected);
+                Ok(None)
+            }
+            Some(MarkerCheck::Missing) => Err(self.needs_check(
+                job_id,
+                format!("The delivery of {name} was interrupted and the file is not in the watchfolder now. Check Dalet for {name} before retrying"),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Before a waiting video picks its name: its own leftover staging file
+    /// from the attempt the share cut goes, whatever its age, unless in use
+    /// ([`crate::delivery::reclaim_own_staging`]). Off the async threads.
+    async fn reclaim_own_staging(&self, job_id: i64, slug: &str) {
+        let (dir, name) = (self.watchfolder_dir.clone(), format!("{slug}.mxf"));
+        let ran = tokio::time::timeout(
+            omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
+            tokio::task::spawn_blocking(move || crate::delivery::reclaim_own_staging(&dir, &name)),
+        )
+        .await;
+        if !matches!(ran, Ok(Ok(_))) {
+            warn!("Job #{job_id}: could not look for its leftover staging file");
+        }
+    }
+
+    /// Deliver the finished, verified video that waited for the watchfolder
+    /// (P11.2a), for a job leased with `delivery_wait` = 1: no download, no
+    /// encode, no compliance run (the bytes are proven to be the verified ones).
+    ///
+    /// First the watchfolder is asked about the delivery marker the earlier
+    /// attempt left: a rename that landed although it looked failed completes
+    /// the job without a second copy; a share that cannot be read waits again.
+    /// Then the file must still be the one recorded (inside this job's
+    /// workspace, same size, same SHA-256, hashed through a handle nobody can
+    /// write to and kept open for the copy); if not, the workspace is removed
+    /// and the worker runs the job again ([`ReadyOutcome::Rerun`]). Otherwise
+    /// it is delivered exactly as the normal path delivers, and on success the
+    /// job ends as the normal path ends it. The engine sets no status.
+    pub async fn deliver_ready(&self, job: &Job, owner: &str, cancel: Option<CancellationToken>) -> Result<ReadyOutcome> {
+        let job_id = job.id;
+        let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
+        // Nothing is downloaded: the slot it was leased under goes back.
+        self.release_download_slot(job_id, owner);
+        let duration = job.duration_secs;
+        let source = if job.url.starts_with("attachment://") {
+            job.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file())
+        } else {
+            crate::downloader::find_downloaded_file(&job_temp).await
+        };
+
+        // A stop is under way: back to waiting at once, as it is (no event).
+        if self.is_stopping() {
+            return Err(self.stopping_wait());
+        }
+        // The name the file was wrapped with (`--clip`): a waiting job cannot be
+        // renamed, so the row's slug is it; never re-read for a later name.
+        let slug = job.slug.clone();
+
+        // a. Did the interrupted delivery land after all?
+        match self.earlier_rename(job_id, &slug).await? {
+            Some(path) => {
+                if !self.repo.owns_lease(job_id, owner).unwrap_or(false) {
+                    return Err(self.lost(job_id, JobStage::Deliver, &job_temp).await);
+                }
+                let filename = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                info!("Job #{job_id}: the waiting video is already in the watchfolder as {filename}; not copied again");
+                let _ = self.repo.record_event(
+                    job_id,
+                    "INFO",
+                    Some(JobStage::Deliver),
+                    "Already in the watchfolder from the interrupted delivery; not copied again",
+                );
+                let bytes = job.ready_bytes.unwrap_or(0).max(0) as u64;
+                let delivered = crate::delivery::Delivered { path: PathBuf::from(&path), filename, suffixed: false, bytes };
+                self.after_delivery(job_id, owner, &slug, &delivered, duration, source.as_deref(), &job_temp).await;
+                return Ok(ReadyOutcome::Delivered);
+            }
+            None => {}
+        }
+
+        // b. Still exactly the file that was verified?
+        let ready = job.ready_path.as_deref().map(PathBuf::from).filter(|p| p.starts_with(&job_temp));
+        let (Some(ready), Some(bytes), Some(sha)) = (ready, job.ready_bytes, job.ready_sha256.clone()) else {
+            return self.rerun(job_id, owner, "nothing is recorded for it in this job's workspace").await;
+        };
+        let lock_path = ready.clone();
+        let hashed = tokio::task::spawn_blocking(move || {
+            let file = omni_core::held::open_locked(&lock_path)?;
+            let len = file.metadata()?.len();
+            if len as i64 != bytes {
+                return Ok((None, file));
+            }
+            let found = omni_core::held::sha256_reader(&file)?;
+            Ok::<_, std::io::Error>((Some(found), file))
+        })
+        .await;
+        let guard = match hashed {
+            Ok(Ok((Some(found), guard))) if found.eq_ignore_ascii_case(&sha) => guard,
+            Ok(Ok((Some(_), guard))) => {
+                drop(guard);
+                return self.rerun(job_id, owner, "its SHA-256 is not the one that was verified").await;
+            }
+            Ok(Ok((None, guard))) => {
+                drop(guard);
+                return self.rerun(job_id, owner, "its size is not the one that was verified").await;
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return self.rerun(job_id, owner, &format!("it cannot be read: {e}")).await
+            }
+            // Held open, no permission, a disk error: the file may be fine. Wait, never delete it.
+            Ok(Err(e)) => {
+                let cause = format!("the waiting video cannot be read now: {e}");
+                return Err(self.waiting(job_id, &slug, anyhow::Error::new(DeliveryError::Unreachable(cause)), false, false));
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(ErrorCode::PipelineFailed.as_str())),
+        };
+        if is_cancelled(&cancel) {
+            drop(guard);
+            return Err(self.lost(job_id, JobStage::Deliver, &job_temp).await);
+        }
+
+        // c. The same delivery as every other video, under the name it was wrapped with.
+        if let Err(e) = self.enter_stage(job_id, owner, JobStage::Deliver, &job_temp).await {
+            drop(guard);
+            return Err(e);
+        }
+        // A share that answers but has no room for it: not copied, it waits again.
+        if let Err(e) = self.room_in_watchfolder(job_id, &slug, bytes.max(0) as u64).await {
+            drop(guard);
+            return Err(e);
+        }
+        self.reclaim_own_staging(job_id, &slug).await;
+        let delivered = match self.deliver_to_watchfolder(job_id, owner, &ready, &slug, &job_temp).await {
+            Ok(dest) => dest,
+            Err(e) if e.downcast_ref::<LeaseLost>().is_some() => {
+                drop(guard);
+                return Err(e);
+            }
+            // d. Still not answering: it waits again, as it is.
+            Err(e) if unreachable_cause(&e).is_some() => {
+                drop(guard);
+                return Err(self.waiting(job_id, &slug, e, false, true));
+            }
+            Err(e) => {
+                drop(guard);
+                let err_msg = format!("Watchfolder delivery failed: {e:#}");
+                error!("Job #{job_id}: {err_msg}");
+                let _ = self.repo.record_event(job_id, "ERROR", None, &err_msg);
+                let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{job_id} ({slug}): {err_msg}"));
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+                return Err(e);
+            }
+        };
+        drop(guard);
+        self.after_delivery(job_id, owner, &slug, &delivered, duration, source.as_deref(), &job_temp).await;
+        info!("Job #{job_id} ({slug}) delivered after waiting for the watchfolder");
+        Ok(ReadyOutcome::Delivered)
+    }
+
+    /// The waiting video is not the verified one any more: deliver nothing,
+    /// remove the workspace, and say why (P11.2a).
+    async fn rerun(&self, job_id: i64, owner: &str, why: &str) -> Result<ReadyOutcome> {
+        let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
+        // Another worker may hold the very same workspace now.
+        if !self.repo.owns_lease(job_id, owner).unwrap_or(false) {
+            return Err(self.lost(job_id, JobStage::Deliver, &job_temp).await);
+        }
+        self.forget_waits(job_id);
+        let err_msg = format!("The parked video is missing or changed; running the job again: {why}");
+        error!("Job #{job_id}: {err_msg}");
+        let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Deliver), &err_msg);
+        let _ = self.repo.log_audit("ERROR", "DELIVERY", &format!("Job #{job_id}: {err_msg}"));
+        WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+        Ok(ReadyOutcome::Rerun)
     }
 
     /// The encoder slots (for tests and diagnostics): a deliver-only job
@@ -1075,6 +1620,31 @@ impl BroadcastEngine {
             }
         }
 
+        // The approved video waited for the watchfolder (P11.2a): did the
+        // interrupted delivery land after all? A share that cannot say waits again.
+        if job.delivery_wait {
+            if self.is_stopping() {
+                return Err(self.stopping_wait());
+            }
+            if let Some(path) = self.earlier_rename(job_id, &job.slug).await? {
+                match self.repo.record_held_delivery(job_id, owner, &path, held.duration.unwrap_or(0.0)) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(self.lost(job_id, JobStage::Deliver, &job_temp).await),
+                    Err(e) => return Err(e.context("Could not record the delivery").context(ErrorCode::PipelineFailed.as_str())),
+                }
+                self.watchfolder_state.set(true);
+                self.forget_waits(job_id);
+                info!("Job #{job_id}: the approved video is already in the watchfolder; not copied again");
+                let _ = self.repo.record_event(
+                    job_id,
+                    "INFO",
+                    Some(JobStage::Deliver),
+                    "Already in the watchfolder from the interrupted delivery; not copied again",
+                );
+                return Ok(());
+            }
+        }
+
         self.enter_stage(job_id, owner, JobStage::Verify, &job_temp).await?;
         let path = PathBuf::from(&held.path);
         // The file is the one recorded for this job, in its own directory.
@@ -1138,12 +1708,27 @@ impl BroadcastEngine {
         if !sha.eq_ignore_ascii_case(&held.sha256) {
             return Err(self.held_changed(job_id, "its SHA-256 is not the one that was approved"));
         }
+        // An approved video that waited, and a share that answers but has no room for it (P11.2a).
+        if job.delivery_wait {
+            if let Err(e) = self.room_in_watchfolder(job_id, &slug, held.bytes.max(0) as u64).await {
+                drop(guard);
+                return Err(e);
+            }
+            self.reclaim_own_staging(job_id, &slug).await;
+        }
 
         let delivered = match self.deliver_to_watchfolder(job_id, owner, &path, &slug, &job_temp).await {
             Ok(dest) => dest,
             Err(e) if e.downcast_ref::<LeaseLost>().is_some() => {
                 drop(guard);
                 return Err(e);
+            }
+            // The share does not answer (P11.2a): the approved file waits where it
+            // is, bound to the hash it was approved with.
+            Err(e) if unreachable_cause(&e).is_some() => {
+                drop(guard);
+                let known = Some((held.bytes.max(0) as u64, held.sha256.clone()));
+                return Err(self.park(job_id, owner, &path, known, duration, &slug, &job_temp, e, !job.delivery_wait).await);
             }
             Err(e) => {
                 drop(guard);
@@ -1155,6 +1740,8 @@ impl BroadcastEngine {
             }
         };
         drop(guard);
+        self.watchfolder_state.set(true);
+        self.forget_waits(job_id);
         if delivered.suffixed {
             let _ = self.repo.record_event(
                 job_id,

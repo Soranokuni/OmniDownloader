@@ -237,6 +237,17 @@ pub struct Job {
     /// review tab). `None`: shown.
     #[serde(default)]
     pub cleared_at: Option<DateTime<Utc>>,
+    /// The finished, verified video waits for an unreachable watchfolder
+    /// (P11.2a): the next lease delivers `ready_path` and nothing else.
+    #[serde(default)]
+    pub delivery_wait: bool,
+    /// The file that waits, its size and its SHA-256 (checked before it is delivered).
+    #[serde(default)]
+    pub ready_path: Option<String>,
+    #[serde(default)]
+    pub ready_bytes: Option<i64>,
+    #[serde(default)]
+    pub ready_sha256: Option<String>,
 
     /// Stored timestamp, `None` when the row predates real timestamps or the
     /// value is unreadable. Never substituted with "now" (defect D-11): the MCR
