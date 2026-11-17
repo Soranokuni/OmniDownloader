@@ -164,36 +164,53 @@ impl ErrorCode {
     /// and delays real work; worse, it delays the moment a human is told the
     /// link is dead, which is the only thing that can actually fix it.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Network
-                // A bare 403 is a CDN or platform refusing for now: YouTube
-                // turned two videos away for a few minutes on 2026-10-06
-                // that downloaded fine minutes later. Geo blocks and logins
-                // have codes of their own and are not retried.
-                | Self::Http403
-                | Self::DeliveryFailed
-                | Self::LowDisk
-                | Self::DownloadTimeout
-                | Self::ExtractTimeout
-                | Self::DeliverTimeout
-        )
+        !self.retry_delays().is_empty()
     }
 
-    /// Backoff before the nth retry (1-based).
+    /// The waits before each automatic retry of a job that failed with this
+    /// code (P11.3a): the nth retry waits the nth. Empty for a code no wait
+    /// can fix. A newsroom video is needed in minutes: a CDN hiccup or a share
+    /// that is briefly unreachable clears in seconds, and four tries over
+    /// about 17 minutes are patient enough without hiding a real fault.
+    /// HTTP_403 keeps two (30 s, 2 min).
     ///
-    /// A share that is briefly unreachable or a CDN hiccup clears in seconds; a
-    /// full disk needs someone to act, so the waits lengthen quickly rather than
-    /// hammering.
-    pub fn backoff(&self, attempt: i32) -> Duration {
+    /// LOW_DISK waits 10 minutes three times, then goes to review: the clip
+    /// itself may need more room than the volume has, and every retry is a
+    /// full run. A disk that is really full is handled by the worker loop,
+    /// which leases nothing while the disk check is red.
+    pub fn retry_delays(&self) -> &'static [Duration] {
         match self {
-            Self::LowDisk => Duration::minutes(10),
-            _ => match attempt.max(1) {
-                1 => Duration::seconds(30),
-                2 => Duration::minutes(2),
-                _ => Duration::minutes(5),
-            },
+            // A bare 403 is a CDN or platform refusing for now: YouTube
+            // turned two videos away for a few minutes on 2026-10-06
+            // that downloaded fine minutes later. Geo blocks and logins
+            // have codes of their own and are not retried. Two tries only:
+            // a 403 that survives them is far more often a real block, and
+            // on a news page the evidence and repair route takes it from there.
+            Self::Http403 => &HTTP_403_DELAYS,
+            Self::Network
+                | Self::DeliveryFailed
+                | Self::DownloadTimeout
+                | Self::ExtractTimeout
+                | Self::DeliverTimeout => &TRANSIENT_DELAYS,
+            Self::LowDisk => &LOW_DISK_DELAYS,
+            _ => &[],
         }
+    }
+
+    /// The `max_attempts` a job retried for this code shows: the first run
+    /// and one per wait. `None` for a code that is not retried.
+    pub fn retry_max_attempts(&self) -> Option<i32> {
+        let delays = self.retry_delays();
+        (!delays.is_empty()).then(|| delays.len() as i32 + 1)
+    }
+
+    /// Whether a job that stopped retrying with this code shows the
+    /// "exhausted" hint instead of its own (P11.3a): only the codes whose own
+    /// hint describes a passing condition. DELIVERY_FAILED (check the share),
+    /// HTTP_403 (already says the retries failed) and LOW_DISK (tell the
+    /// administrator) keep their own.
+    pub fn uses_exhausted_hint(&self) -> bool {
+        matches!(self, Self::Network | Self::DownloadTimeout | Self::ExtractTimeout | Self::DeliverTimeout)
     }
 
     /// What the MCR card tells the operator to do, in Greek.
@@ -274,6 +291,45 @@ impl ErrorCode {
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// 30 s, 2 min, 5 min, 10 min: the transient codes' waits (P11.3a).
+static TRANSIENT_DELAYS: [Duration; 4] =
+    [Duration::seconds(30), Duration::minutes(2), Duration::minutes(5), Duration::minutes(10)];
+
+/// 30 s, 2 min: HTTP_403's waits, its budget before P11.3a.
+static HTTP_403_DELAYS: [Duration; 2] = [Duration::seconds(30), Duration::minutes(2)];
+
+/// 10 min three times: LOW_DISK's waits, then review.
+static LOW_DISK_DELAYS: [Duration; 3] = [Duration::minutes(10), Duration::minutes(10), Duration::minutes(10)];
+
+/// How long a job that failed with `code` waits before its automatic retry,
+/// or `None` when it goes to review instead (P11.3a). `attempts` is the
+/// job's count after the failed run (1 for the first; a value below 1 reads
+/// as 1), and `age` how long ago it was queued, or last started afresh by
+/// MCR; an age below zero (a clock that stepped back) reads as 0.
+///
+/// A code no wait can fix is never retried. Otherwise the job retries while
+/// it has a wait left for this attempt, and only while it is younger than
+/// `max_age`.
+pub fn retry_after(code: ErrorCode, attempts: i32, age: Duration, max_age: Duration) -> Option<Duration> {
+    if age.max(Duration::zero()) >= max_age {
+        return None;
+    }
+    let nth = usize::try_from(attempts.max(1) - 1).ok()?;
+    code.retry_delays().get(nth).copied()
+}
+
+/// The card's hint for a job that stopped retrying with a code whose own
+/// hint says a retry is under way ([`ErrorCode::uses_exhausted_hint`],
+/// P11.3a). A job that ran once was not retried at all: the age limit
+/// stopped it.
+pub fn exhausted_hint_el(attempts: i32) -> String {
+    if attempts <= 1 {
+        "Δεν τα κατάφερε και δεν ξαναδοκιμάστηκε αυτόματα, γιατί η εργασία είναι παλιά. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον σύνδεσμο.".to_string()
+    } else {
+        format!("Δεν τα κατάφερε μετά από {attempts} προσπάθειες. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον σύνδεσμο.")
     }
 }
 
@@ -702,9 +758,12 @@ mod tests {
             ErrorCode::DeliveryFailed,
             ErrorCode::LowDisk,
             ErrorCode::DownloadTimeout,
+            ErrorCode::ExtractTimeout,
+            ErrorCode::DeliverTimeout,
         ] {
             assert!(retryable.is_retryable(), "{retryable} should retry");
         }
+        assert_eq!(ErrorCode::ALL.iter().filter(|c| c.is_retryable()).count(), 7, "the same seven codes as before");
         for terminal in [
             ErrorCode::PrivateOrRemoved,
             ErrorCode::GeoBlocked,
@@ -750,10 +809,131 @@ mod tests {
 
     #[test]
     fn backoff_lengthens_and_low_disk_waits_for_a_human() {
-        assert!(ErrorCode::Network.backoff(1) < ErrorCode::Network.backoff(2));
-        assert!(ErrorCode::Network.backoff(2) < ErrorCode::Network.backoff(3));
+        let hours2 = Duration::minutes(120);
+        let wait = |n| retry_after(ErrorCode::Network, n, Duration::zero(), hours2).unwrap();
+        assert!(wait(1) < wait(2) && wait(2) < wait(3) && wait(3) < wait(4));
         // A full disk will not clear in 30 seconds; somebody has to act.
-        assert_eq!(ErrorCode::LowDisk.backoff(1), Duration::minutes(10));
+        assert_eq!(retry_after(ErrorCode::LowDisk, 1, Duration::zero(), hours2), Some(Duration::minutes(10)));
+        assert_eq!(ErrorCode::LowDisk.retry_max_attempts(), Some(4));
+        assert_eq!(ErrorCode::Network.retry_max_attempts(), Some(5));
+        assert_eq!(ErrorCode::PrivateOrRemoved.retry_max_attempts(), None);
+    }
+
+    /// P11.3a: the waits per code, over every code. Seven codes retry; five
+    /// transient ones wait 30 s, 2 min, 5 min, 10 min; HTTP_403 30 s, 2 min;
+    /// LOW_DISK 10 min three times; every other code has none.
+    #[test]
+    fn every_code_has_its_retry_waits() {
+        let transient = [
+            Duration::seconds(30),
+            Duration::minutes(2),
+            Duration::minutes(5),
+            Duration::minutes(10),
+        ];
+        for c in ErrorCode::ALL {
+            let want: &[Duration] = match c {
+                ErrorCode::Http403 => &[Duration::seconds(30), Duration::minutes(2)],
+                ErrorCode::Network
+                | ErrorCode::DownloadTimeout
+                | ErrorCode::ExtractTimeout
+                | ErrorCode::DeliverTimeout
+                | ErrorCode::DeliveryFailed => &transient,
+                ErrorCode::LowDisk => &[Duration::minutes(10), Duration::minutes(10), Duration::minutes(10)],
+                _ => &[],
+            };
+            assert_eq!(c.retry_delays(), want, "{c}");
+            assert_eq!(c.is_retryable(), !want.is_empty(), "{c}");
+            assert_eq!(c.retry_max_attempts(), (!want.is_empty()).then(|| want.len() as i32 + 1), "{c}");
+        }
+        assert_eq!(ErrorCode::Http403.retry_max_attempts(), Some(3), "HTTP_403 keeps its old budget");
+        let max = Duration::minutes(120);
+        let got: Vec<_> = (1..=3).map(|n| retry_after(ErrorCode::Http403, n, Duration::zero(), max)).collect();
+        assert_eq!(got, vec![Some(Duration::seconds(30)), Some(Duration::minutes(2)), None]);
+    }
+
+    #[test]
+    fn a_network_failure_retries_four_times_then_goes_to_review() {
+        let max = Duration::minutes(120);
+        let young = Duration::minutes(1);
+        let got: Vec<_> = (1..=5).map(|n| retry_after(ErrorCode::Network, n, young, max)).collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(Duration::seconds(30)),
+                Some(Duration::minutes(2)),
+                Some(Duration::minutes(5)),
+                Some(Duration::minutes(10)),
+                None
+            ]
+        );
+        // A count below 1 (a waiting video's lease spends none) is the first try.
+        assert_eq!(retry_after(ErrorCode::Network, 0, young, max), Some(Duration::seconds(30)));
+        assert_eq!(retry_after(ErrorCode::Network, -3, young, max), Some(Duration::seconds(30)));
+        assert_eq!(retry_after(ErrorCode::DeliveryFailed, 40, young, max), None);
+    }
+
+    #[test]
+    fn no_retry_once_the_job_is_two_hours_old() {
+        let max = Duration::minutes(120);
+        assert_eq!(retry_after(ErrorCode::Network, 1, Duration::minutes(119), max), Some(Duration::seconds(30)));
+        assert_eq!(retry_after(ErrorCode::Network, 1, Duration::minutes(121), max), None);
+        assert_eq!(retry_after(ErrorCode::Network, 1, max, max), None, "at the limit it stops");
+        assert_eq!(retry_after(ErrorCode::Http403, 2, Duration::minutes(121), max), None);
+        // A created_at in the future (the clock stepped back) is age 0: retried, and still bounded.
+        assert_eq!(retry_after(ErrorCode::Network, 1, Duration::minutes(-500), max), Some(Duration::seconds(30)));
+        assert_eq!(retry_after(ErrorCode::Network, 5, Duration::minutes(-500), max), None);
+    }
+
+    /// A clip too big for the volume fails LOW_DISK on every run: three waits
+    /// of 10 minutes, then review, and not at all past the age limit.
+    #[test]
+    fn a_full_disk_retries_three_times_and_nothing_else_retries_on_its_own() {
+        let max = Duration::minutes(120);
+        let young = Duration::minutes(1);
+        let got: Vec<_> = (1..=4).map(|n| retry_after(ErrorCode::LowDisk, n, young, max)).collect();
+        let ten = Some(Duration::minutes(10));
+        assert_eq!(got, vec![ten, ten, ten, None]);
+        assert_eq!(retry_after(ErrorCode::LowDisk, 9, young, max), None);
+        assert_eq!(retry_after(ErrorCode::LowDisk, 1, Duration::minutes(121), max), None, "an old job waited anyway");
+        assert_eq!(retry_after(ErrorCode::LowDisk, 1, Duration::hours(5), max), None);
+        for c in ErrorCode::ALL.into_iter().filter(|c| !c.is_retryable()) {
+            assert_eq!(retry_after(c, 1, Duration::zero(), max), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn the_exhausted_hint_names_the_attempts_and_the_two_ways_on() {
+        assert_eq!(
+            exhausted_hint_el(5),
+            "Δεν τα κατάφερε μετά από 5 προσπάθειες. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον σύνδεσμο."
+        );
+        assert_eq!(
+            exhausted_hint_el(2),
+            "Δεν τα κατάφερε μετά από 2 προσπάθειες. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον σύνδεσμο."
+        );
+        // One run and no retry: the age limit stopped it. No «1 προσπάθειες».
+        let once = "Δεν τα κατάφερε και δεν ξαναδοκιμάστηκε αυτόματα, γιατί η εργασία είναι παλιά. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον σύνδεσμο.";
+        assert_eq!(exhausted_hint_el(1), once);
+        assert_eq!(exhausted_hint_el(0), once);
+        for n in [0, 1, 2, 5] {
+            assert!(!exhausted_hint_el(n).contains("Γίνεται αυτόματη επανάληψη"));
+            assert!(!exhausted_hint_el(n).contains("1 προσπάθειες"));
+        }
+    }
+
+    /// Only the codes whose own hint says a retry is under way swap it for the
+    /// exhausted text; the share, a 403 and a full disk keep their own advice.
+    #[test]
+    fn only_the_passing_conditions_use_the_exhausted_hint() {
+        let uses: Vec<ErrorCode> = ErrorCode::ALL.into_iter().filter(|c| c.uses_exhausted_hint()).collect();
+        assert_eq!(
+            uses,
+            vec![ErrorCode::Network, ErrorCode::ExtractTimeout, ErrorCode::DownloadTimeout, ErrorCode::DeliverTimeout]
+        );
+        for c in [ErrorCode::DeliveryFailed, ErrorCode::Http403, ErrorCode::LowDisk] {
+            assert!(c.is_retryable() && !c.uses_exhausted_hint(), "{c}");
+        }
+        assert!(uses.iter().all(|c| c.is_retryable()));
     }
 
     #[test]

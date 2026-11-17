@@ -1077,7 +1077,8 @@ impl Repository {
     /// Release a lease and requeue the job after a backoff (plan P1.9).
     ///
     /// Used for the retryable error codes: transient network trouble, a full
-    /// disk, a delivery share that was briefly unreachable. `not_before` keeps
+    /// disk, a delivery share that was briefly unreachable (through
+    /// [`Self::requeue_retry`] since P11.3a), and once after a panic. `not_before` keeps
     /// the worker from immediately re-leasing the same job and burning all its
     /// attempts inside a second. The retry is a full run: a video that waited
     /// for the watchfolder (P11.2a) and failed for another reason no longer
@@ -1090,16 +1091,46 @@ impl Repository {
         error_code: &str,
         error_message: &str,
     ) -> Result<bool> {
+        self.requeue(job_id, owner, backoff, error_code, error_message, None)
+    }
+
+    /// [`Self::requeue_after`] for a retry the policy decided (P11.3a): the
+    /// attempt the lease spent stays spent, and `max_attempts` becomes the
+    /// code's budget (first run plus its retries), so the desk's «έγιναν N
+    /// από M» is true. Only for the lease holder; `false` otherwise (nothing
+    /// written).
+    pub fn requeue_retry(
+        &self,
+        job_id: i64,
+        owner: &str,
+        backoff: Duration,
+        error_code: &str,
+        error_message: &str,
+        max_attempts: i32,
+    ) -> Result<bool> {
+        self.requeue(job_id, owner, backoff, error_code, error_message, Some(max_attempts))
+    }
+
+    fn requeue(
+        &self,
+        job_id: i64,
+        owner: &str,
+        backoff: Duration,
+        error_code: &str,
+        error_message: &str,
+        max_attempts: Option<i32>,
+    ) -> Result<bool> {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let not_before = timestamps::format(Utc::now() + backoff);
         let changed = conn.execute(
             "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
              lease_expires_at=NULL, not_before=?, error_code=?, error_message=?,
+             max_attempts = COALESCE(?, max_attempts),
              progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
              updated_at=?
              WHERE id=? AND lease_owner=?",
-            params![not_before, error_code, error_message, now, job_id, owner],
+            params![not_before, error_code, error_message, max_attempts, now, job_id, owner],
         )?;
         if changed == 1 {
             self.record_event(
@@ -1853,8 +1884,10 @@ impl Repository {
     /// its next run is held whatever the trust, so the same video cannot go on air twice
     /// unapproved (P10.16). Also after «Δοκιμή ξανά» on a waiting job whose
     /// trusted-recipe delivery was cut and may be in Dalet already (P11.2b):
-    /// that attempt is `interrupted` and `superseded`, a pair only `retry_job`
-    /// writes.
+    /// that attempt is `interrupted` and `superseded`. `retry_job` writes that
+    /// pair; so does «Νέα λήψη» on a job whose attempt was still
+    /// `auto_delivering` (it marks it `superseded`), followed by the next
+    /// ordinary lease (which ends it `interrupted`).
     pub fn job_auto_delivery_superseded(&self, job_id: i64) -> Result<bool> {
         let conn = self.pool.get()?;
         Ok(conn.query_row(
@@ -2981,7 +3014,8 @@ impl Repository {
 
     /// Run a delivered job again from its link (plan P7.1): the file was
     /// deleted, or the wrong video came out. Everything about the last run
-    /// is reset; the new file is delivered next to the old one if that is
+    /// is reset (the age limit on automatic retries counts from now,
+    /// P11.3a); the new file is delivered next to the old one if that is
     /// still there (`_2`), never over it. `false` if the job is not a
     /// delivered one.
     pub fn redownload_job(&self, id: i64) -> Result<bool> {
@@ -2994,8 +3028,8 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 file_path = NULL, delivered_at = NULL, completed_at = NULL, cleared_at = NULL,
-                updated_at = ?
-            WHERE id = ? AND status IN ('COMPLETED','COMPLETED_MANUAL')
+                retry_from = ?1, updated_at = ?1
+            WHERE id = ?2 AND status IN ('COMPLETED','COMPLETED_MANUAL')
             "#,
             params![timestamps::now_string(), id],
         )?;
@@ -3013,12 +3047,14 @@ impl Repository {
 
     /// MCR's «Δοκιμή ξανά» / «Χρήση αυτού του συνδέσμου»: the job starts a
     /// clean new run, like a fresh queue entry (attempts, error, back-off and
-    /// lease all reset). `cleared_at` is reset too (P7.21): a job tidied away
+    /// lease all reset; the age limit on automatic retries counts from now,
+    /// `retry_from`, P11.3a). `cleared_at` is reset too (P7.21): a job tidied away
     /// from the review tab that comes back to life behaves normally. Refused (`false`) for a running or delivered job:
     /// a worker still holds the lease of the first, and the second has its
     /// own action, `redownload_job`.
     pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<bool> {
         let mut conn = self.pool.get()?;
+        let now = timestamps::now_string();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let waiting = Self::waits_for_watchfolder(&tx, id)?;
         let n = tx.execute(
@@ -3030,10 +3066,10 @@ impl Repository {
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
                 url_normalized = COALESCE(?, url_normalized),
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
-                updated_at = ?
+                retry_from = ?, updated_at = ?
             WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED','AWAITING_APPROVAL')
             "#,
-            params![new_url, new_url.map(crate::urlnorm::normalize), timestamps::now_string(), id],
+            params![new_url, new_url.map(crate::urlnorm::normalize), now, now, id],
         )?;
         if n > 0 {
             // A new run, possibly of another link: a file held (or approved
@@ -3061,8 +3097,15 @@ impl Repository {
             // A waiting trusted-recipe delivery nobody approved may already be in Dalet
             // (P11.2b): MCR is told, and the new run is held for approval whatever the
             // trust, as after «Νέα λήψη» (`job_auto_delivery_superseded`), so the same
-            // video cannot go on air a second time unapproved.
-            if waiting && Self::close_waiting_auto_delivery(&tx, id, &timestamps::now_string())? {
+            // video cannot go on air a second time unapproved. Also when the attempt was
+            // closed before this call (P11.3a): a DELIVERY_UNCONFIRMED review that kept
+            // the wait already ended it `interrupted`. `interrupted` is only ever written
+            // over `auto_delivering`, a trusted recipe's unapproved delivery, so a latest
+            // attempt that says it with no MCR decision is always such a delivery whose
+            // arrival nobody confirmed (this wait's, or one an earlier run of this job
+            // left cut): holding the next run is the safe side either way.
+            if waiting {
+                Self::close_waiting_auto_delivery(&tx, id, &now)?;
                 tx.execute(
                     "UPDATE repair_attempts SET mcr_decision = 'superseded'
                      WHERE id = (SELECT id FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1)
@@ -3081,11 +3124,17 @@ impl Repository {
     /// MCR put the video into Dalet by hand (plan P7.16). Only a job that is
     /// waiting for a person can be marked; `false` otherwise. The error code
     /// and message stay as the history of why it was done by hand, and
-    /// `file_path` stays empty: no file was made here.
+    /// `file_path` stays empty: no file was made here. A video that waited
+    /// for the watchfolder leaves the wait (P11.3a): when it was a trusted
+    /// recipe's delivery nobody approved, still `auto_delivering`, MCR gets
+    /// the P10.16b note and the attempt ends `interrupted`, in the same
+    /// transaction, as a cancel or a retry does.
     pub fn mark_completed_manually(&self, id: i64) -> Result<bool> {
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
         let now = timestamps::now_string();
-        let n = conn.execute(
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let waiting = Self::waits_for_watchfolder(&tx, id)?;
+        let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
@@ -3096,6 +3145,10 @@ impl Repository {
             "#,
             params![now, now, now, id],
         )?;
+        if n > 0 && waiting {
+            Self::close_waiting_auto_delivery(&tx, id, &now)?;
+        }
+        tx.commit()?;
         if n > 0 {
             count_finished(JobStatus::CompletedManual);
         }
@@ -3301,6 +3354,7 @@ impl Repository {
             ready_bytes: row.get("ready_bytes").ok().flatten(),
             ready_sha256: row.get("ready_sha256").ok().flatten(),
             ready_at: timestamps::parse_opt(row.get("ready_at").ok().flatten()),
+            retry_from: timestamps::parse_opt(row.get("retry_from").ok().flatten()),
 
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
@@ -5243,10 +5297,10 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
-                updated_at = ?
+                retry_from = ?, updated_at = ?
             WHERE id = ? AND status = 'AWAITING_APPROVAL'
             "#,
-            params![now, job_id],
+            params![now, now, job_id],
         )?;
         if held != 1 || queued != 1 {
             return Ok(false);
@@ -5374,10 +5428,10 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
-                updated_at = ?
+                retry_from = ?, updated_at = ?
             WHERE id = ? AND status = 'AWAITING_APPROVAL'
             "#,
-            params![at, job_id],
+            params![at, at, job_id],
         )?;
         if held != 1 || queued != 1 {
             return Ok(None);

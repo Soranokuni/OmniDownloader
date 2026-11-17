@@ -866,6 +866,15 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN ready_at TEXT;
         "#,
     ),
+    (
+        36,
+        // When MCR last started the job afresh (P11.3a): «Δοκιμή ξανά», «Νέα λήψη», an
+        // approval or the next candidate. Automatic retries stop once the job is older than
+        // `retry.max_age_mins`, counted from this, or from `created_at` while it is NULL.
+        r#"
+        ALTER TABLE queue ADD COLUMN retry_from TEXT;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1618,6 +1627,32 @@ mod tests {
         assert!(columns_of(&conn, "queue").contains(&"ready_at".to_string()));
         let at: Option<String> = conn.query_row("SELECT ready_at FROM queue", [], |r| r.get(0)).unwrap();
         assert_eq!(at, None, "a row parked before the migration has no known park time");
+    }
+
+    #[test]
+    fn migration_36_adds_the_retry_start_and_existing_rows_have_none() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 35) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, attempts) VALUES ('https://example.invalid/v', 'S', 'REQUIRES_REVIEW', 3)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 35);
+        assert!(!columns_of(&conn, "queue").contains(&"retry_from".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(columns_of(&conn, "queue").contains(&"retry_from".to_string()));
+        let from: Option<String> = conn.query_row("SELECT retry_from FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(from, None, "an existing job counts its age from created_at");
     }
 
     #[test]

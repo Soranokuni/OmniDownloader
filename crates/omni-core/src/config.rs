@@ -579,6 +579,55 @@ impl Default for RepairConfig {
     }
 }
 
+/// Automatic retries of a failed job (`retry` in config.json, P11.3a). Old
+/// files without the section load with these defaults. Values are read
+/// where they are used, not checked at load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// No automatic retry for a job older than this, counted from when it was
+    /// queued or from MCR's last «Δοκιμή ξανά» (read as 30..=360).
+    #[serde(default = "default_retry_max_age_mins")]
+    pub max_age_mins: i64,
+    /// Minutes after which a job not yet delivered counts as late on the
+    /// desk. Not read yet (the desk's late strip, next item).
+    #[serde(default = "default_late_after_mins")]
+    pub late_after_mins: i64,
+    /// The same for an urgent job. Not read yet.
+    #[serde(default = "default_late_after_urgent_mins")]
+    pub late_after_urgent_mins: i64,
+    /// How long after it failed a job may still get one more automatic try
+    /// (for example after a yt-dlp update or a new cookie jar). Not read yet.
+    #[serde(default = "default_second_chance_window_mins")]
+    pub second_chance_window_mins: i64,
+}
+
+fn default_retry_max_age_mins() -> i64 {
+    120
+}
+
+fn default_late_after_mins() -> i64 {
+    10
+}
+
+fn default_late_after_urgent_mins() -> i64 {
+    5
+}
+
+fn default_second_chance_window_mins() -> i64 {
+    120
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_age_mins: default_retry_max_age_mins(),
+            late_after_mins: default_late_after_mins(),
+            late_after_urgent_mins: default_late_after_urgent_mins(),
+            second_chance_window_mins: default_second_chance_window_mins(),
+        }
+    }
+}
+
 /// The delivered source archive (plan P1.7): after a video is in the
 /// watchfolder its downloaded source is kept under
 /// `{path}/YYYY/MM/DD/` for `retention_days`, with a JSON sidecar, instead
@@ -801,6 +850,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub repair: RepairConfig,
 
+    /// Automatic retries of a failed job (P11.3a).
+    #[serde(default)]
+    pub retry: RetryConfig,
+
     /// Delivered sources kept for a while after air (plan P1.7).
     #[serde(default)]
     pub archive: ArchiveConfig,
@@ -917,6 +970,7 @@ impl Default for AppConfig {
             ollama_model: default_ollama_model(),
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
+            retry: RetryConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
             setup_completed: false,
@@ -1153,6 +1207,29 @@ mod tests {
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);
         assert_eq!(set.repair.evidence_max_mb, 200);
+    }
+
+    #[test]
+    fn retry_section_defaults_and_parses() {
+        let check = |r: &RetryConfig, want: (i64, i64, i64, i64)| {
+            assert_eq!((r.max_age_mins, r.late_after_mins, r.late_after_urgent_mins, r.second_chance_window_mins), want);
+        };
+        // A config without the section loads with the owner's numbers.
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        check(&old.retry, (120, 10, 5, 120));
+        check(&AppConfig::default().retry, (120, 10, 5, 120));
+        check(&RetryConfig::default(), (120, 10, 5, 120));
+        // A key that is set is taken; the others keep their defaults.
+        let set: AppConfig = serde_json::from_str(r#"{"retry":{"max_age_mins":60,"late_after_urgent_mins":3}}"#).unwrap();
+        check(&set.retry, (60, 10, 3, 120));
+        let all: AppConfig = serde_json::from_str(
+            r#"{"retry":{"max_age_mins":200,"late_after_mins":15,"late_after_urgent_mins":7,"second_chance_window_mins":90}}"#,
+        )
+        .unwrap();
+        check(&all.retry, (200, 15, 7, 90));
+        // Saved and read back unchanged.
+        let back: AppConfig = serde_json::from_str(&serde_json::to_string(&all).unwrap()).unwrap();
+        check(&back.retry, (200, 15, 7, 90));
     }
 
     #[test]

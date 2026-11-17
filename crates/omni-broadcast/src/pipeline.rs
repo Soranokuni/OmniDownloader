@@ -348,6 +348,19 @@ mod waiting_rule_tests {
         assert_eq!((engine.wait_backoff(7).num_seconds(), engine.wait_line(7)), (30, None));
         assert_eq!(engine.wait_line(8).as_deref(), Some("other job"));
     }
+
+    /// P11.3a: the age limit on automatic retries is two hours unless set,
+    /// and a set value is read as 30..=360 minutes.
+    #[test]
+    fn the_retry_age_limit_is_two_hours_and_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let engine = BroadcastEngine::new(repo, p("y"), p("f"), p("p"), p("b"), p("temp"), p("watch"));
+        assert_eq!(engine.retry_max_age().num_minutes(), 120);
+        let mins = |m: i64| engine.clone().with_retry_max_age(m).retry_max_age().num_minutes();
+        assert_eq!((mins(90), mins(5), mins(-1), mins(10_000)), (90, 30, 30, 360));
+    }
 }
 
 #[cfg(test)]
@@ -434,9 +447,26 @@ pub struct BroadcastEngine {
     /// (P11.2a): the requeue backs off, and a repeated cause is not written
     /// again. Lost on restart, which only restarts the back-off.
     waits: Arc<Mutex<HashMap<i64, (u32, String)>>>,
+    /// No automatic retry for a job older than this (P11.3a, `retry.max_age_mins`).
+    retry_max_age: chrono::Duration,
 }
 
+/// `retry.max_age_mins` when the daemon sets none: the owner's two hours.
+pub const DEFAULT_RETRY_MAX_AGE_MINS: i64 = 120;
+
 impl BroadcastEngine {
+    /// No automatic retry for a job older than `minutes` (P11.3a), read as 30..=360.
+    pub fn with_retry_max_age(mut self, minutes: i64) -> Self {
+        self.retry_max_age = chrono::Duration::minutes(minutes.clamp(30, 360));
+        self
+    }
+
+    /// How old a job may be and still be retried automatically; the worker's
+    /// retry decision reads it.
+    pub fn retry_max_age(&self) -> chrono::Duration {
+        self.retry_max_age
+    }
+
     /// Count one more wait of `job_id` (the first of a series when `first`).
     fn note_wait(&self, job_id: i64, first: bool, line: &str) {
         let mut waits = self.waits.lock().unwrap_or_else(|p| p.into_inner());
@@ -548,6 +578,7 @@ impl BroadcastEngine {
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             watchfolder_state: WatchfolderState::default(),
             waits: Arc::new(Mutex::new(HashMap::new())),
+            retry_max_age: chrono::Duration::minutes(DEFAULT_RETRY_MAX_AGE_MINS),
         }
     }
 

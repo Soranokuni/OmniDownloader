@@ -253,6 +253,10 @@ pub struct Job {
     /// start-up without a trusted file, or parked before the column existed.
     #[serde(default)]
     pub ready_at: Option<DateTime<Utc>>,
+    /// When MCR last started the job afresh (P11.3a): the 2-hour limit on
+    /// automatic retries counts from it, or from `created_at` when `None`.
+    #[serde(default)]
+    pub retry_from: Option<DateTime<Utc>>,
 
     /// Stored timestamp, `None` when the row predates real timestamps or the
     /// value is unreadable. Never substituted with "now" (defect D-11): the MCR

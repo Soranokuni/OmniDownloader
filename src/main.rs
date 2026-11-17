@@ -1322,7 +1322,8 @@ async fn run_daemon(
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
     .with_archive(Some(archive_settings.clone()))
-    .with_watchfolder_state(watchfolder_state.clone()));
+    .with_watchfolder_state(watchfolder_state.clone())
+    .with_retry_max_age(config.retry.max_age_mins));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 

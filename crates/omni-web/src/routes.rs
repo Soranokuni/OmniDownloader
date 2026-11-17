@@ -468,8 +468,17 @@ pub struct JobsQuery {
 fn job_for_desk(repo: &omni_core::repository::Repository, job: &omni_core::models::Job) -> serde_json::Value {
     let mut v = serde_json::to_value(job).unwrap_or_default();
     if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
-        // A login wall names the site and says whether its cookies are there (P3.5).
-        v["hint"] = serde_json::Value::String(omni_broadcast::errors::hint_for_job(code, &job.url, repo));
+        // A job that stopped retrying must not say a retry is under way (P11.3a); a queued
+        // or running one, or a video waiting for the watchfolder, still is. Only the codes
+        // whose own hint says so swap it (`uses_exhausted_hint`).
+        let stopped = !matches!(job.status, JobStatus::Pending | JobStatus::Running) && !job.delivery_wait;
+        let hint = if code.uses_exhausted_hint() && stopped {
+            omni_broadcast::errors::exhausted_hint_el(job.attempts)
+        } else {
+            // A login wall names the site and says whether its cookies are there (P3.5).
+            omni_broadcast::errors::hint_for_job(code, &job.url, repo)
+        };
+        v["hint"] = serde_json::Value::String(hint);
     }
     v
 }
@@ -3139,6 +3148,67 @@ mod tests {
         assert!(!is_submittable_url(""));
         assert!(!is_submittable_url(&format!("https://x/{}", "a".repeat(3000))));
         assert!(!is_submittable_url("https://x/\u{0}evil"));
+    }
+
+    /// P11.3a: a NETWORK job that went to review says how many tries it had
+    /// and what to do, not that a retry is under way; one still queued keeps
+    /// the code's own hint; a login wall keeps its site hint; DELIVERY_FAILED,
+    /// HTTP_403 and LOW_DISK keep their own advice in review.
+    #[test]
+    fn the_desk_hint_says_when_automatic_retries_have_stopped() {
+        use omni_broadcast::errors::{exhausted_hint_el, ErrorCode};
+        use omni_core::models::NewJob;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let queued = |n: u32, url: &str| {
+            repo.enqueue(&NewJob::new(url, format!("{n}_ANNA_TEST"), "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+                .unwrap()
+                .job_id()
+        };
+        let hint = |id: i64| {
+            let job = repo.get_job(id).unwrap().unwrap();
+            job_for_desk(&repo, &job)["hint"].as_str().map(str::to_string)
+        };
+
+        // Five runs, the last one sent to review.
+        let failed = queued(1, "https://news.example/story/1");
+        for _ in 0..4 {
+            assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, failed);
+            assert!(repo.requeue_after(failed, "w", chrono::Duration::seconds(-1), "NETWORK", "reset").unwrap());
+        }
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, failed);
+        assert!(repo.finish(failed, "w", JobStatus::RequiresReview, Some("NETWORK"), Some("reset"), None).unwrap());
+        assert_eq!(repo.get_job(failed).unwrap().unwrap().attempts, 5);
+        assert_eq!(hint(failed), Some(exhausted_hint_el(5)));
+        assert!(hint(failed).unwrap().contains("μετά από 5 προσπάθειες"));
+
+        // Queued for its next try: the code's own hint.
+        let waiting = queued(2, "https://news.example/story/2");
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, waiting);
+        assert!(repo.requeue_after(waiting, "w", chrono::Duration::minutes(5), "NETWORK", "reset").unwrap());
+        assert_eq!(hint(waiting).as_deref(), Some(ErrorCode::Network.hint_el()));
+
+        // Not a retried code: unchanged, the login wall naming its site.
+        let login = queued(3, "https://twitter.com/someone/status/1");
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, login);
+        assert!(repo.finish(login, "w", JobStatus::RequiresReview, Some("LOGIN_REQUIRED"), Some("login"), None).unwrap());
+        assert_eq!(hint(login), Some(omni_broadcast::errors::login_hint_el("x.com", false)));
+
+        // Retried codes whose own hint is the advice MCR needs keep it in review:
+        // the share and its rights, a 403's own words, a full disk for the administrator.
+        for (n, code) in [(4, ErrorCode::DeliveryFailed), (5, ErrorCode::Http403), (6, ErrorCode::LowDisk)] {
+            let id = queued(n, &format!("https://news.example/story/{n}"));
+            assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, id);
+            assert!(repo.finish(id, "w", JobStatus::RequiresReview, Some(code.as_str()), Some("x"), None).unwrap());
+            assert_eq!(hint(id).as_deref(), Some(code.hint_el()), "{code}");
+        }
+
+        // One run and no retry (the age limit): never «1 προσπάθειες».
+        let old = queued(7, "https://news.example/story/7");
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, old);
+        assert!(repo.finish(old, "w", JobStatus::RequiresReview, Some("DOWNLOAD_TIMEOUT"), Some("x"), None).unwrap());
+        assert_eq!(hint(old), Some(exhausted_hint_el(1)));
+        assert!(hint(old).unwrap().contains("δεν ξαναδοκιμάστηκε αυτόματα"));
     }
 
     #[test]

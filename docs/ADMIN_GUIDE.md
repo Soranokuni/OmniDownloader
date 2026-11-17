@@ -272,6 +272,9 @@ with a placeholder until you add the person (§6.3).
 | `retention_days` | 7 | how long working files of finished jobs are kept |
 | `mail_text_retention_days` | 30 | how long mail text is kept for the desk (in effect at most 90: the handled-mail records themselves are removed after 90 days) |
 | `archive.enabled`, `archive.retention_days` | true, 14 | archive of downloaded sources |
+| `retry.max_age_mins` | 120 | no automatic retry for a job older than this, counted from when it was queued or from MCR's last «Δοκιμή ξανά» (read as 30 to 360); see §10 |
+| `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | when a job not yet delivered counts as late, ordinary and urgent; not used yet |
+| `retry.second_chance_window_mins` | 120 | how long after it failed a job may still get one more automatic try (for example after a yt-dlp update or a new cookie jar); not used yet |
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
 | `adblock_*` | on | blocklists for the page reader, updated nightly |
@@ -532,8 +535,15 @@ Run from the install folder (elevated on an installed service).
 ## 10. Error codes
 
 A stopped job carries one of these codes; the desk shows a Greek hint.
-"Auto" means the job retries by itself (after 30 s, 2 min, then 5 min;
-10 min for low disk).
+"Auto" means the job retries by itself: after 30 s, 2 min, 5 min and
+10 min, then it goes to review (five tries in all, about 17 minutes);
+`HTTP_403` only after 30 s and 2 min (three tries), then the page's own
+checks and the repair route (§5.5) or review take over. A job
+older than `retry.max_age_mins` (2 hours), counted from when it was queued
+or from MCR's last «Δοκιμή ξανά», is not retried. `LOW_DISK` retries after
+10 minutes three times (four tries), then goes to review: the clip may need
+more room than the temp or watchfolder volume has. While the disk check is
+red, no job is started at all; they wait in the queue.
 
 | Code | Auto | Meaning / action |
 |---|---|---|

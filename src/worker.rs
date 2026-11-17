@@ -445,6 +445,42 @@ pub(crate) fn wait_for_watchfolder(
     Ok(true)
 }
 
+/// The retry policy for a run that failed with `code` (P11.3a), as every
+/// failed run's lease holder applies it: `true` when the job goes back to the
+/// queue for the code's next wait (whatever the requeue could write: a job
+/// that is no longer ours gets nothing), `false` when it goes to review.
+///
+/// Bounded on every path: a retried code has at most four waits, each
+/// spends the attempt its lease took, and a job older than the engine's
+/// `retry_max_age` (from `retry_from`, or `created_at`) is not retried at
+/// all. LOW_DISK included: a clip too big for the volume fails the same way
+/// on every run, so it gets three waits like any other code; a disk that is
+/// really full stops the worker loop from leasing instead.
+pub(crate) fn retry_by_policy(
+    repo: &Repository,
+    engine: &BroadcastEngine,
+    job_id: i64,
+    owner: &str,
+    code: ErrorCode,
+    message: &str,
+) -> Result<bool> {
+    let row = repo.get_job(job_id)?;
+    let attempts = row.as_ref().map(|j| j.attempts).unwrap_or(1);
+    // An unreadable or legacy timestamp is no reason to stop: the waits still bound the job.
+    let age = row
+        .as_ref()
+        .and_then(|j| j.retry_from.or(j.created_at))
+        .map_or_else(chrono::Duration::zero, |from| chrono::Utc::now() - from);
+    let (Some(delay), Some(max)) =
+        (omni_broadcast::errors::retry_after(code, attempts, age, engine.retry_max_age()), code.retry_max_attempts())
+    else {
+        return Ok(false);
+    };
+    info!("Job #{job_id}: {code}, retrying in {} s (attempt {attempts}/{max})", delay.num_seconds());
+    repo.requeue_retry(job_id, owner, delay, code.as_str(), message, max)?;
+    Ok(true)
+}
+
 /// A waiting video the engine would not deliver on its own (P11.2a): its
 /// earlier rename may have landed, or the watchfolder changed
 /// (DELIVERY_UNCONFIRMED), or its file could not be read for too long
@@ -501,16 +537,11 @@ pub(crate) async fn run_waiting_delivery(
             }
             // Not waiting any more: the next run starts the back-off afresh.
             engine.forget_waits(job_id);
-            let row = repo.get_job(job_id)?;
-            let attempts = row.as_ref().map(|j| j.attempts).unwrap_or(1);
-            let max_attempts = row.as_ref().map(|j| j.max_attempts).unwrap_or(3);
             let message = readable_cause(&e);
             let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
             let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
-            if code.is_retryable() && attempts < max_attempts {
-                // A full run next time: `requeue_after` ends the wait.
-                repo.requeue_after(job_id, owner, code.backoff(attempts), code.as_str(), &message)?;
-            } else {
+            // A full run next time: the requeue ends the wait.
+            if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {
                 if still_ours(repo, job_id, owner) {
                     repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
                 }
@@ -566,17 +597,11 @@ pub(crate) async fn run_approved_delivery(
                 return Ok(());
             }
             engine.forget_waits(job_id);
-            let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
-            let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
             let message = readable_cause(&e);
             let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
             let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
-            if code.is_retryable() && attempts < max_attempts {
-                // The approval stands: the next lease delivers the same file.
-                let backoff = code.backoff(attempts);
-                info!("Job #{job_id}: {code} delivering the approved video, retrying in {} s", backoff.num_seconds());
-                repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
-            } else {
+            // A retry keeps the approval: the next lease delivers the same file.
+            if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {
                 if still_ours(repo, job_id, owner) {
                     repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
                 }
@@ -1274,8 +1299,6 @@ pub(crate) async fn run_job(
             if wait_for_watchfolder(repo, engine, job_id, owner, code)? {
                 return Ok(());
             }
-            let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
-            let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
             let mut message = readable_cause(&e);
 
             // The full context chain, which carries each stage's stderr tail,
@@ -1286,14 +1309,7 @@ pub(crate) async fn run_job(
             let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
             let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
 
-            if code.is_retryable() && attempts < max_attempts {
-                let backoff = code.backoff(attempts);
-                info!(
-                    "Job #{job_id}: {code}, retrying in {} s (attempt {attempts}/{max_attempts})",
-                    backoff.num_seconds()
-                );
-                repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
-            } else {
+            if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {
                 // MANUAL_DOWNLOAD is not a failure, it is a different workflow.
                 let status = match code {
                     ErrorCode::ManualDownload => JobStatus::ManualDownload,
@@ -3163,3 +3179,7 @@ mod furniture_end_tests {
 #[cfg(test)]
 #[path = "parked_delivery_tests.rs"]
 mod parked_delivery_tests;
+
+#[cfg(test)]
+#[path = "retry_policy_tests.rs"]
+mod retry_policy_tests;

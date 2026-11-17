@@ -72,6 +72,14 @@
     "evidence_max_mb": 200
   },
 
+  "retry": {
+    "_comment": "Automatic retries of a failed job. No automatic retry for a job older than max_age_mins (30-360), counted from when it was queued or from MCR's last retry. The other three keys are read by later versions.",
+    "max_age_mins": 120,
+    "late_after_mins": 10,
+    "late_after_urgent_mins": 5,
+    "second_chance_window_mins": 120
+  },
+
   "ytdl_channel": "stable",
   "ytdl_auto_update_nightly": true,
 

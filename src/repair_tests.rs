@@ -2682,6 +2682,101 @@ async fn retrying_a_waiting_trusted_delivery_reports_it_and_holds_the_next_run()
     assert!(!r.repo.job_auto_delivery_superseded(plain).unwrap());
 }
 
+/// Job `job_id`'s back-off is over.
+fn ready_now(r: &Rig, job_id: i64) {
+    rusqlite::Connection::open(r._dir.0.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![job_id])
+        .unwrap();
+}
+
+/// P11.3a (8a): «Δοκιμή ξανά» pressed after a DELIVERY_UNCONFIRMED review of a
+/// waiting trusted-recipe delivery. The review already ended the attempt
+/// `interrupted` and told MCR; the retry still marks it `superseded`, so the
+/// trusted recipe's next result is held, never delivered a second time
+/// unapproved, and the note is not written again. A waiting row without such
+/// an attempt gets nothing.
+#[tokio::test]
+async fn retrying_after_an_unconfirmed_review_of_a_trusted_waiting_delivery_holds_the_next_run() {
+    use omni_core::models::JobStage;
+    let (r, id) = trusted_rig(5, 5);
+    let job_id = r.job.id;
+    let at = r.repo.start_attempt(job_id, "hold", Utc::now()).unwrap();
+    r.repo.mark_attempt_auto_delivering(at, id, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+    assert!(r.repo.set_stage(job_id, OWNER, JobStage::Deliver).unwrap());
+    let target = r._dir.0.join("watch").join("1_ANNA_TEST.mxf");
+    assert!(r.repo.mark_delivering(job_id, OWNER, &target.to_string_lossy(), 26).unwrap());
+    assert!(r.repo.park_for_delivery(job_id, OWNER, "temp/jobs/1/1_output.mxf", 26, "00", 2.0).unwrap());
+    assert!(r.repo.requeue_waiting_delivery(job_id, OWNER, chrono::Duration::zero(), "waits").unwrap());
+    // The share answers and the file is not at the marker: review, the wait kept.
+    let waiting = r.repo.lease_job_when(OWNER, 600, true).unwrap().expect("the waiting job");
+    assert_eq!((waiting.id, waiting.stage), (job_id, JobStage::Deliver));
+    assert!(r.repo.review_waiting_delivery(job_id, OWNER, "DELIVERY_UNCONFIRMED", "Check Dalet for 1_ANNA_TEST.mxf before retrying").unwrap());
+    let row = r.repo.get_job(job_id).unwrap().unwrap();
+    assert_eq!((row.status, row.delivery_wait), (JobStatus::RequiresReview, true));
+    let attempt = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!((attempt.outcome.as_deref(), attempt.mcr_decision.as_deref()), (Some("interrupted"), None));
+    assert_eq!(notes(&r, job_id), (1, 1));
+    assert!(!r.repo.job_auto_delivery_superseded(job_id).unwrap());
+
+    assert!(r.repo.retry_job(job_id, None).unwrap());
+
+    let attempt = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!((attempt.id, attempt.outcome.as_deref(), attempt.mcr_decision.as_deref()), (at, Some("interrupted"), Some("superseded")));
+    assert!(r.repo.job_auto_delivery_superseded(job_id).unwrap(), "the retry after the review may deliver without approval again");
+    assert_eq!(notes(&r, job_id), (1, 1), "the note was written twice");
+
+    // The full run: the trusted recipe finds the same video, and it is held for MCR.
+    assert_eq!(r.repo.lease_job(OWNER, 600).unwrap().unwrap().id, job_id);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.downloads()[0].2, hold_mode(), "the same video went to air unapproved a second time");
+    assert_eq!(site_counts(&r, id), (5, 0, 5));
+
+    // A waiting row without an automatic delivery, after the same review: nothing.
+    let plain = recovered_waiting_job(&r, id, 3, false, None);
+    ready_now(&r, plain);
+    assert_eq!(r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("the plain waiting job").id, plain);
+    assert!(r.repo.review_waiting_delivery(plain, HOST_OWNER, "DELIVERY_UNCONFIRMED", "check Dalet").unwrap());
+    assert!(r.repo.retry_job(plain, None).unwrap());
+    assert_eq!(notes(&r, plain), (0, 0));
+    assert_eq!(r.repo.latest_attempt(plain).unwrap().map(|a| a.id), None);
+    assert!(!r.repo.job_auto_delivery_superseded(plain).unwrap());
+}
+
+/// P11.3a (8b): «Το έβαλα στο Dalet» on a waiting trusted-recipe delivery in
+/// the 2-hour PIPELINE_FAILED review: done by hand, the attempt ends
+/// `interrupted` (never `auto_delivering` for ever) and MCR's note is written
+/// once. A waiting row without such an attempt gets no note.
+#[test]
+fn marking_a_waiting_trusted_delivery_done_by_hand_ends_its_attempt() {
+    let (r, id) = trusted_rig(5, 5);
+    let trusted = recovered_waiting_job(&r, id, 2, true, None);
+    let plain = recovered_waiting_job(&r, id, 3, false, None);
+    for job_id in [trusted, plain] {
+        ready_now(&r, job_id);
+        assert_eq!(r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("a waiting job").id, job_id);
+        let msg = "The finished video in the workspace could not be read for 2 hours: access denied";
+        assert!(r.repo.review_waiting_delivery(job_id, HOST_OWNER, "PIPELINE_FAILED", msg).unwrap());
+        assert!(r.repo.get_job(job_id).unwrap().unwrap().delivery_wait);
+    }
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), trusted).as_deref(), Some("auto_delivering"));
+    assert_eq!(notes(&r, trusted), (0, 0));
+
+    assert!(r.repo.mark_completed_manually(trusted).unwrap());
+    let row = r.repo.get_job(trusted).unwrap().unwrap();
+    assert_eq!((row.status, row.delivery_wait), (JobStatus::CompletedManual, false));
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), trusted).as_deref(), Some("interrupted"));
+    assert_eq!(notes(&r, trusted), (1, 1));
+    assert!(!r.repo.mark_completed_manually(trusted).unwrap(), "a done job was marked again");
+    assert_eq!(notes(&r, trusted), (1, 1), "the note was written twice");
+
+    assert!(r.repo.mark_completed_manually(plain).unwrap());
+    assert_eq!(notes(&r, plain), (0, 0));
+    assert_eq!(site_counts(&r, id), (5, 0, 5));
+}
+
 /// Finding 2: a waiting trusted-recipe delivery whose run panics at DELIVER
 /// with no file at the marker goes to review with MCR's note and its attempt
 /// ended; a non-waiting one keeps today's behaviour, with the note once.
