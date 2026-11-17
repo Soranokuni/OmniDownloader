@@ -6,12 +6,15 @@ INSTALL (new PC)
   2. Double-click Install.cmd and allow administrator rights.
   3. Give the Dalet watchfolder when asked (a local folder or \\server\share).
   4. When it says "OmniDownloader is running", open http://127.0.0.1:8080/admin
-     ON THIS SERVER ONLY and log in as   Admin / Admin   (a new installation's
-     first account). From any other PC it is refused. The page asks you to
-     set a new password first.
-  5. Users: create your own administrator, log in as it, deactivate Admin.
-  6. Then the mailbox (Microsoft Graph), the LLM key if used, and
-     Security -> the newsroom network, so the MCR desks can open /mcr.
+     ON THIS COMPUTER and sign in as   Admin / Admin   (the first-run account,
+     which works only from this computer). The setup wizard then opens by
+     itself; it replaces that account with your own administrator and walks
+     you through the watchfolder and the mailbox.
+     To let the MCR desks open the panel without signing in, choose
+     Intermediate in the wizard and enter the newsroom network in its Network
+     step (you can run the wizard again later from the admin page).
+     A watchfolder on a NAS or an IP-addressed share needs the service to run
+     under an account; the wizard tells you what to do.
 
   Installs to C:\OmniIngest as the Windows service "OmniIngestService":
   starts with Windows, restarts by itself after a failure, panel on port 8080
@@ -64,10 +67,16 @@ GUIDES
   1. Αντιγράψτε τον φάκελο στον υπολογιστή.
   2. Διπλό κλικ στο Install.cmd και αποδεχτείτε τα δικαιώματα διαχειριστή.
   3. Δώστε τον φάκελο του Dalet (watchfolder) όταν ζητηθεί.
-  4. Ανοίξτε http://127.0.0.1:8080/admin ΜΟΝΟ στον ίδιο τον server και
-     συνδεθείτε ως Admin / Admin (από άλλον υπολογιστή απορρίπτεται).
-     Η σελίδα ζητά πρώτα νέο κωδικό.
-     Δημιουργήστε δικό σας διαχειριστή, συνδεθείτε με αυτόν και
-     απενεργοποιήστε τον Admin. Μετά ρυθμίστε το email στη Διαχείριση.
+  4. Ανοίξτε http://127.0.0.1:8080/admin ΣΕ ΑΥΤΟΝ ΤΟΝ ΥΠΟΛΟΓΙΣΤΗ και
+     συνδεθείτε ως Admin / Admin (ο λογαριασμός πρώτης εκκίνησης, που
+     λειτουργεί μόνο από εδώ). Μετά ανοίγει μόνος του ο οδηγός ρύθμισης:
+     αντικαθιστά αυτόν τον λογαριασμό με δικό σας διαχειριστή και σας
+     καθοδηγεί στον φάκελο Dalet (watchfolder) και στο email.
+     Για να ανοίγουν οι θέσεις MCR τον πίνακα χωρίς σύνδεση, επιλέξτε
+     Intermediate στον οδηγό και δώστε το δίκτυο της σύνταξης στο βήμα
+     Network (μπορείτε να ξανατρέξετε τον οδηγό αργότερα από τη σελίδα
+     διαχείρισης).
+     Φάκελος Dalet σε NAS ή σε κοινόχρηστο φάκελο με διεύθυνση IP χρειάζεται
+     η υπηρεσία να τρέχει με λογαριασμό· ο οδηγός σας λέει τι να κάνετε.
   Αναβάθμιση: τρέξτε το Install.cmd της νέας έκδοσης. Τα δεδομένα μένουν.
   Αν η νέα έκδοση δεν ξεκινήσει, επανέρχεται αυτόματα η προηγούμενη.
