@@ -60,6 +60,7 @@ impl WebServer {
             .route("/api/jobs/:id/override", post(api_override_job))
             .route("/api/jobs/:id/rename", post(api_rename_job))
             .route("/api/jobs/:id/retry", post(api_retry_job))
+            .route("/api/jobs/:id/now", post(api_run_now_job))
             .route("/api/jobs/:id/approve", post(api_approve_job))
             .route("/api/jobs/:id/reject", post(api_reject_job))
             .route("/api/jobs/:id/wrong-video", post(api_wrong_video))

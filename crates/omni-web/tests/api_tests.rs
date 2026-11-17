@@ -40,10 +40,14 @@ impl App {
     }
 
     fn with_repair_mode(mode: omni_core::config::RepairMode) -> Result<Self> {
+        Self::with_config(|config| config.repair.mode = mode)
+    }
+
+    fn with_config(tweak: impl FnOnce(&mut AppConfig)) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
         let mut config = AppConfig::default();
-        config.repair.mode = mode;
+        tweak(&mut config);
 
         let mcr_id = repo.create_user(
             "desk@station.gr",
@@ -1639,5 +1643,133 @@ async fn a_rate_limit_that_ran_out_of_retries_on_a_platform_shows_the_cookie_adv
     assert!(app.repo.requeue_after(waiting, "W", chrono::Duration::minutes(2), "RATE_LIMITED", "limited")?);
     let (_, json) = app.send("GET", &format!("/api/jobs/{waiting}"), &app.mcr_token, None).await?;
     assert_eq!(json["job"]["hint"], json!(ErrorCode::RateLimited.hint_el()));
+    Ok(())
+}
+
+// ---- P11.3b: late videos on the desk, and «Τώρα» ----
+
+fn sql(app: &App, query: &str, params: impl rusqlite::Params) {
+    rusqlite::Connection::open(app._dir.path().join("omni.db")).unwrap().execute(query, params).unwrap();
+}
+
+/// A PENDING job `mins` old.
+fn aged_job(app: &App, n: u32, mins: i64) -> Result<i64> {
+    let new = omni_core::models::NewJob::new(format!("https://example.gr/late{n}"), format!("{n}_ANNA_LATE"), "ANNA");
+    let id = app.repo.enqueue(&new, 24)?.job_id();
+    let at = omni_core::timestamps::format(chrono::Utc::now() - chrono::Duration::minutes(mins));
+    sql(app, "UPDATE queue SET created_at = ? WHERE id = ?", rusqlite::params![at, id]);
+    Ok(id)
+}
+
+#[tokio::test]
+async fn the_desk_says_what_a_late_or_waiting_video_waits_for() -> Result<()> {
+    let app = App::new()?;
+    let queued = aged_job(&app, 1, 12)?;
+    let backoff = aged_job(&app, 2, 30)?;
+    let parked = aged_job(&app, 3, 20)?;
+    let running = aged_job(&app, 4, 15)?;
+    let young = aged_job(&app, 5, 1)?;
+    let done = aged_job(&app, 6, 60)?;
+
+    // Lease order is by priority then age; take them by id instead of relying on it.
+    sql(&app, "UPDATE queue SET status = 'RUNNING', lease_owner = 'W' WHERE id = ?", rusqlite::params![running]);
+    let later = omni_core::timestamps::format(chrono::Utc::now() + chrono::Duration::minutes(5));
+    sql(&app, "UPDATE queue SET not_before = ?, error_code = 'NETWORK' WHERE id = ?", rusqlite::params![later, backoff]);
+    sql(&app, "UPDATE queue SET not_before = ?, delivery_wait = 1 WHERE id = ?", rusqlite::params![later, parked]);
+    sql(&app, "UPDATE queue SET status = 'COMPLETED' WHERE id = ?", rusqlite::params![done]);
+
+    let (status, page) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let find = |id: i64| page["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone();
+    let facts = |id: i64| {
+        let j = find(id);
+        (j["late"].clone(), j["wait_reason"].clone(), j["next_try_at"].is_null())
+    };
+    assert_eq!(facts(queued), (json!(true), json!("queue"), true));
+    assert_eq!(facts(backoff), (json!(true), json!("retry"), false));
+    assert_eq!(facts(parked), (json!(true), json!("delivery"), false), "the watchfolder wait wins over the back-off");
+    assert_eq!(facts(running), (json!(true), json!("running"), true));
+    assert_eq!(facts(young), (json!(false), json!("queue"), true));
+    assert_eq!(facts(done), (json!(false), json!(null), true));
+    assert!(find(backoff)["next_try_at"].as_str().unwrap().ends_with('Z'));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_late_view_lists_the_late_jobs_oldest_first_and_the_counts_say_how_many() -> Result<()> {
+    let app = App::new()?;
+    let newer = aged_job(&app, 1, 12)?;
+    let older = aged_job(&app, 2, 50)?;
+    let _young = aged_job(&app, 3, 2)?;
+    let urgent = aged_job(&app, 4, 6)?;
+    sql(&app, "UPDATE queue SET priority = ? WHERE id = ?", rusqlite::params![15, urgent]);
+
+    let (status, page) = app.send("GET", "/api/jobs?view=late", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let ids: Vec<i64> = page["jobs"].as_array().unwrap().iter().map(|j| j["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![older, newer, urgent], "{page}");
+    assert_eq!(page["counts"]["late"], 3);
+    assert!(page["jobs"][0]["late"].as_bool().unwrap());
+
+    // The status payload the desk polls carries the same number.
+    let (status, st) = app.send("GET", "/api/system/status", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(st["queue"]["late"], 3, "{st}");
+
+    // The limits are the live config's: a user is not allowed here at all.
+    let (status, _) = app.send("GET", "/api/jobs?view=late", &app.user_token, None).await?;
+    assert_ne!(status, StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_now_ends_a_back_off_once_and_leaves_the_audit_trail() -> Result<()> {
+    let app = App::new()?;
+    let id = aged_job(&app, 1, 12)?;
+    let later = omni_core::timestamps::format(chrono::Utc::now() + chrono::Duration::minutes(5));
+    sql(&app, "UPDATE queue SET not_before = ? WHERE id = ?", rusqlite::params![later, id]);
+
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/now"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(app.repo.get_job(id)?.unwrap().not_before.is_none());
+    assert!(app.repo.get_job_events(id, 50)?.iter().any(|e| e.message.starts_with("Run now requested by")));
+    assert!(app.repo.get_recent_audit_logs(5)?.iter().any(|a| a.message.contains(&format!("Job #{id}")) && a.message.contains("run now")));
+
+    // Pressed again: nothing to clear, so a conflict with the project's error shape.
+    let events = app.repo.get_job_events(id, 50)?.len();
+    let (status, json) = app.send("POST", &format!("/api/jobs/{id}/now"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    assert_eq!(json["error"]["code"], "NOT_WAITING_TO_RETRY", "{json}");
+    assert_eq!(app.repo.get_job_events(id, 50)?.len(), events, "a refused click records nothing");
+
+    // A video waiting for the watchfolder is not released by the click.
+    let parked = aged_job(&app, 2, 12)?;
+    sql(&app, "UPDATE queue SET not_before = ?, delivery_wait = 1 WHERE id = ?", rusqlite::params![later, parked]);
+    let (status, _) = app.send("POST", &format!("/api/jobs/{parked}/now"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(app.repo.get_job(parked)?.unwrap().not_before.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_late_limits_are_the_configured_ones() -> Result<()> {
+    let app = App::with_config(|c| {
+        c.retry.late_after_mins = 30;
+        c.retry.late_after_urgent_mins = 20;
+    })?;
+    let young = aged_job(&app, 1, 12)?;
+    let old = aged_job(&app, 2, 31)?;
+
+    let (_, page) = app.send("GET", "/api/jobs?view=late", &app.mcr_token, None).await?;
+    let ids: Vec<i64> = page["jobs"].as_array().unwrap().iter().map(|j| j["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![old], "{page}");
+    assert_eq!(page["counts"]["late"], 1);
+
+    let (_, live) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    let late_of = |id: i64| live["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap()["late"].clone();
+    assert_eq!((late_of(young), late_of(old)), (json!(false), json!(true)), "{live}");
+
+    let (_, st) = app.send("GET", "/api/system/status", &app.mcr_token, None).await?;
+    assert_eq!(st["queue"]["late"], 1, "{st}");
     Ok(())
 }

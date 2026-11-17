@@ -377,7 +377,7 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 #[test]
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
-    for (module, version) in [("desk.js", 12), ("inbox.js", 18), ("approval.js", 7), ("mcr.js", 44)] {
+    for (module, version) in [("desk.js", 13), ("inbox.js", 19), ("approval.js", 8), ("notify.js", 11), ("mcr.js", 45)] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
         for s in assets.values() {
@@ -405,6 +405,51 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
         ["setInterval(reloadAll, 5000);", "reloadAll();"],
         "mcr.js must end with the unconditional poll"
     );
+}
+
+/// One app.css URL across every page, so a bump cannot miss one.
+#[test]
+fn every_page_links_the_same_app_css_version() {
+    let versions: std::collections::BTreeSet<String> = all_assets()
+        .values()
+        .flat_map(|s| {
+            s.match_indices("/static/app.css?v=").map(move |(i, m)| {
+                let rest = &s[i + m.len()..];
+                rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+            })
+        })
+        .collect();
+    assert_eq!(versions.len(), 1, "pages link different app.css versions: {versions:?}");
+}
+
+/// P11.3b: the late strip is loaded on every refresh and reconciled by job id, the chime reads
+/// `queue.late` (and is not part of the needs-a-person count), and a video that waits for the
+/// watchfolder says so.
+#[test]
+fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
+    let assets = all_assets();
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    assert!(mcr.contains("'/api/jobs?view=late'"), "mcr.js does not load the late list");
+    assert!(
+        mcr.contains("const reloadAll = () => { refresh(); loadStatus(); loadLate(); };"),
+        "the late strip is not part of the 5 s cycle on every tab"
+    );
+    assert!(mcr.contains("syncKeyedList(lateList,"), "the late strip is not reconciled by job id");
+    assert!(mcr.contains("/now`, { method: 'POST' }"), "no «Τώρα» action");
+    assert!(mcr.contains("και άλλα"), "the strip does not cap its rows");
+    let page = assets.get("mcr.html").expect("mcr.html shipped");
+    let strip = page.find("id=\"late-strip\"").expect("the strip is in mcr.html");
+    assert!(strip < page.find("class=\"tabs\"").unwrap(), "the strip is not above the tab bar");
+
+    let notify = assets.get("static/notify.js").expect("notify.js shipped");
+    assert!(notify.contains("workers: {"), "CHECK_INFO has no entry for the workers check");
+    assert!(notify.contains("queue.late"), "notify.js does not read queue.late");
+    let need = notify.split("function needCount").nth(1).and_then(|s| s.split('}').next()).unwrap();
+    assert!(!need.contains("late"), "late videos must not count as needing a person");
+
+    let desk = assets.get("static/desk.js").expect("desk.js shipped");
+    assert!(desk.contains("Περιμένει τον φάκελο παράδοσης"), "desk.js has no watchfolder wait text");
+    assert!(desk.contains("export function lateReason"), "desk.js has no lateReason");
 }
 
 /// P12.3: the desk's lists are updated in place. A full `render(list, every card)` on the 5 s

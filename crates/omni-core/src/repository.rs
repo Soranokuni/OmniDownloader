@@ -2774,10 +2774,19 @@ impl Repository {
     /// every few seconds and the archive grows without bound, so counting rows
     /// by loading them would make the panel slower the longer the station runs
     /// (defect W-12's smaller sibling).
-    pub fn queue_summary(&self) -> Result<QueueSummary> {
+    pub fn queue_summary(&self, late: crate::models::LateAfter) -> Result<QueueSummary> {
         let conn = self.pool.get()?;
 
         let mut summary = QueueSummary::default();
+        // Late: the same rule as `Job::is_late` and the desk's late view (P11.3b).
+        let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(late);
+        summary.late = conn.query_row(
+            "SELECT COUNT(*) FROM queue
+             WHERE status IN ('PENDING','RUNNING')
+               AND COALESCE(retry_from, created_at) <= CASE WHEN priority >= ? THEN ? ELSE ? END",
+            params![crate::models::URGENT_PRIORITY_BOOST, urgent_cutoff, normal_cutoff],
+            |r| r.get(0),
+        )?;
         let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM queue GROUP BY status")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -2865,7 +2874,22 @@ impl Repository {
         let per_page = per_page.clamp(5, 100);
         let page = page.max(1);
 
+        // The late view's two cutoffs, bound first: the scope is the first clause (P11.3b).
+        let mut values: Vec<String> = Vec::new();
+        let late_scope;
         let (scope, order) = match view {
+            JobsView::Late => {
+                let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(filter.late_after);
+                values.push(urgent_cutoff);
+                values.push(normal_cutoff);
+                // The integer is a compile-time constant, not input.
+                late_scope = format!(
+                    "status IN ('PENDING','RUNNING') AND COALESCE(retry_from, created_at) <= \
+                     CASE WHEN priority >= {} THEN ? ELSE ? END",
+                    crate::models::URGENT_PRIORITY_BOOST
+                );
+                (late_scope.as_str(), "COALESCE(retry_from, created_at) ASC, id ASC")
+            }
             JobsView::Live => (
                 "(status IN ('PENDING','RUNNING') OR (status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL))",
                 // Working first, then waiting in the order they will run,
@@ -2891,7 +2915,6 @@ impl Repository {
         };
 
         let mut clauses = vec![scope.to_string()];
-        let mut values: Vec<String> = Vec::new();
         let search = filter.search.trim();
         if !search.is_empty() {
             let like = format!(
@@ -2935,9 +2958,20 @@ impl Repository {
     }
 
     /// Tab badge counts for the MCR desk, in one query.
-    pub fn job_counts(&self) -> Result<crate::models::JobCounts> {
+    pub fn job_counts(&self, late: crate::models::LateAfter) -> Result<crate::models::JobCounts> {
         // "Today" is the station's day, not UTC's: local midnight, stored as UTC.
-        self.job_counts_since(local_midnight_utc())
+        self.job_counts_since(local_midnight_utc(), late)
+    }
+
+    /// The stored-format cutoffs of "late" (P11.3b): a job whose age starts at
+    /// or before the first (urgent) or the second (normal) is late.
+    fn late_cutoffs(late: crate::models::LateAfter) -> (String, String) {
+        use crate::models::URGENT_PRIORITY_BOOST;
+        let now = Utc::now();
+        (
+            timestamps::format(now - Duration::minutes(late.mins_for(URGENT_PRIORITY_BOOST))),
+            timestamps::format(now - Duration::minutes(late.mins_for(0))),
+        )
     }
 
     /// Jobs per status, every status present (0 when none), for `/metrics`.
@@ -2958,8 +2992,13 @@ impl Repository {
     }
 
     /// `job_counts` with the start of "today" given (UTC), so a test can pin it.
-    pub fn job_counts_since(&self, day_start_utc: chrono::DateTime<Utc>) -> Result<crate::models::JobCounts> {
+    pub fn job_counts_since(
+        &self,
+        day_start_utc: chrono::DateTime<Utc>,
+        late: crate::models::LateAfter,
+    ) -> Result<crate::models::JobCounts> {
         let today_start = timestamps::format(day_start_utc);
+        let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(late);
         let conn = self.pool.get()?;
         Ok(conn.query_row(
             r#"
@@ -2970,10 +3009,12 @@ impl Repository {
               COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL')), 0),
               COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NOT NULL), 0),
               COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND completed_at >= ?), 0),
-              COALESCE(SUM(status = 'AWAITING_APPROVAL'), 0)
+              COALESCE(SUM(status = 'AWAITING_APPROVAL'), 0),
+              COALESCE(SUM(status IN ('PENDING','RUNNING')
+                           AND COALESCE(retry_from, created_at) <= CASE WHEN priority >= ? THEN ? ELSE ? END), 0)
             FROM queue
             "#,
-            params![today_start],
+            params![today_start, crate::models::URGENT_PRIORITY_BOOST, urgent_cutoff, normal_cutoff],
             |r| {
                 Ok(crate::models::JobCounts {
                     active: r.get(0)?,
@@ -2983,6 +3024,7 @@ impl Repository {
                     review_hidden: r.get(4)?,
                     completed_today: r.get(5)?,
                     approval: r.get(6)?,
+                    late: r.get(7)?,
                 })
             },
         )?)
@@ -3118,6 +3160,21 @@ impl Repository {
         if n > 0 {
             self.log_audit("INFO", "QUEUE", &format!("Retried Job #{}", id))?;
         }
+        Ok(n > 0)
+    }
+
+    /// MCR's «Τώρα» (P11.3b): a job waiting out an automatic retry's back-off is
+    /// taken by the next free worker at once. Only a PENDING job that has a
+    /// `not_before` and is not waiting for the watchfolder
+    /// (that wait is released by the share answering, not by a click); `false`
+    /// when nothing changed. Attempts, error and age are left as they are.
+    pub fn run_now(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE queue SET not_before = NULL, updated_at = ?
+             WHERE id = ? AND status = 'PENDING' AND not_before IS NOT NULL AND delivery_wait = 0",
+            params![timestamps::now_string(), id],
+        )?;
         Ok(n > 0)
     }
 

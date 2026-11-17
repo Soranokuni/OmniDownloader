@@ -19,11 +19,11 @@ import {
   stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
-  canRename, renameJob as deskRename, timelineNode, autoDeliveredNode,
-} from '/static/desk.js?v=12';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=18';
-import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=10';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=7';
+  canRename, renameJob as deskRename, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
+} from '/static/desk.js?v=13';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=19';
+import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=11';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=8';
 
 let journalists = [];
 
@@ -1196,11 +1196,88 @@ initNotify(document.querySelector('.topbar-status'), (id) => {
 loadFilters();
 switchTab(currentTab);
 
+/* ------------------------------------------------------------------ *
+ * Videos that are late (P11.3b)
+ * ------------------------------------------------------------------ */
+
+/* A strip above the tabs, on every tab: one row per video that is waiting or
+ * running longer than the late limit, with the reason, and «Τώρα» for a video
+ * that only waits out a retry's back-off. Fetched with every refresh and
+ * reconciled by job id (syncKeyedList), never rebuilt. */
+const LATE_ROWS = 5;
+const URGENT_PRIORITY = 10; // omni_core::models::URGENT_PRIORITY_BOOST
+const lateStrip = document.getElementById('late-strip');
+const lateList = { cards: new Map(), days: new Map() };
+const lateRows = el('div', { class: 'late-rows' });
+const lateMore = el('p', { class: 'late-more', hidden: true });
+if (lateStrip) lateStrip.append(el('p', { class: 'late-title' }, 'Καθυστερούν'), lateRows, lateMore);
+
+/** «Τώρα»: the next free worker takes the video at once. The server says no
+ *  (409) when it started meanwhile; either way the strip is refreshed. */
+async function runNow(job, button) {
+  button.disabled = true;
+  try {
+    await api(`/api/jobs/${job.id}/now`, { method: 'POST' });
+  } catch (e) {
+    toast(e.message, 'bad');
+    button.disabled = false; // the row may stay as it is: let the operator try again
+  }
+  reloadAll();
+}
+
+function lateRow(job) {
+  return el('div', { class: 'late-row', 'data-id': String(job.id) },
+    el('span', { class: 'late-name' }, fileName(job)),
+    Number(job.priority) >= URGENT_PRIORITY ? el('span', { class: 'badge warn' }, 'Επείγον') : null,
+    el('span', { class: 'late-reason' }, lateReason(job)),
+    el('span', { class: 'late-age' }, arrivedAgo(job)),
+    job.wait_reason === 'retry'
+      ? el('button', {
+          class: 'btn btn-warn',
+          type: 'button',
+          title: 'Να δοκιμάσει το σύστημα αμέσως, χωρίς να περιμένει την επόμενη προσπάθεια',
+          onClick: (ev) => runNow(job, ev.currentTarget),
+        }, 'Τώρα')
+      : null,
+  );
+}
+
+/** A row's signature: what it shows, minute counters included, so a still row is left alone. */
+const lateSig = (job) => JSON.stringify([job.id, fileName(job), job.priority, job.wait_reason, lateReason(job), arrivedAgo(job)]);
+
+let lateBusy = false;
+async function loadLate() {
+  if (!lateStrip || lateBusy) return;
+  lateBusy = true;
+  try {
+    let data;
+    try {
+      data = await api('/api/jobs?view=late');
+    } catch (e) { failed(e); return; }
+    const jobs = data.jobs || [];
+    const shown = jobs.slice(0, LATE_ROWS);
+    const extra = Math.max(0, (Number(data.total) || jobs.length) - shown.length);
+    // A button the operator tabbed to keeps its focus when its row is rebuilt.
+    const focused = document.activeElement && lateStrip.contains(document.activeElement)
+      ? document.activeElement.closest('.late-row')?.dataset.id : null;
+    syncKeyedList(lateList, lateRows, shown, { build: lateRow, sig: lateSig });
+    if (focused && !lateStrip.contains(document.activeElement)) {
+      lateRows.querySelector(`.late-row[data-id="${CSS.escape(focused)}"] button`)?.focus({ preventScroll: true });
+    }
+    const more = extra > 0 ? `και άλλα ${extra}` : '';
+    if (lateMore.textContent !== more) lateMore.textContent = more;
+    if (lateMore.hidden !== (extra === 0)) lateMore.hidden = extra === 0;
+    if (lateStrip.hidden !== (shown.length === 0)) lateStrip.hidden = shown.length === 0;
+  } finally {
+    lateBusy = false;
+  }
+}
+
 /* Live updates (P1.10). The server streams one JSON event per change; a job
  * event redraws that job's card, anything else (or anything unreadable)
  * reloads the open list, at most once a second. The 5 s poll stays underneath,
  * always. */
-const reloadAll = () => { refresh(); loadStatus(); };
+const reloadAll = () => { refresh(); loadStatus(); loadLate(); };
 let reloadTimer = null;
 function reloadSoon() {
   if (reloadTimer) return;

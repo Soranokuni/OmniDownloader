@@ -266,6 +266,56 @@ pub struct Job {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// Priority added to jobs from a mail whose subject is urgent (plan P4.5).
+/// `omni_email::watcher` re-exports it.
+pub const URGENT_PRIORITY_BOOST: i32 = 10;
+
+/// After how many minutes a job not yet delivered counts as late on the MCR
+/// desk (P11.3b): one limit for a normal job, a shorter one for an urgent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateAfter {
+    normal_mins: i64,
+    urgent_mins: i64,
+}
+
+impl LateAfter {
+    /// Both limits are read as 1..=120 minutes, so a config typo cannot make every job late or none.
+    pub fn new(normal_mins: i64, urgent_mins: i64) -> Self {
+        Self { normal_mins: normal_mins.clamp(1, 120), urgent_mins: urgent_mins.clamp(1, 120) }
+    }
+
+    /// The limit for a job of this priority.
+    pub fn mins_for(&self, priority: i32) -> i64 {
+        if priority >= URGENT_PRIORITY_BOOST {
+            self.urgent_mins
+        } else {
+            self.normal_mins
+        }
+    }
+}
+
+impl Default for LateAfter {
+    fn default() -> Self {
+        Self::new(10, 5)
+    }
+}
+
+impl Job {
+    /// The one rule for "late" (P11.3b): waiting or running, and at least the
+    /// limit old, counted from MCR's last restart (`retry_from`) or else from
+    /// `created_at`. A job with neither timestamp is never late: no "now" is
+    /// invented for it.
+    pub fn is_late(&self, now: DateTime<Utc>, after: LateAfter) -> bool {
+        if !matches!(self.status, JobStatus::Pending | JobStatus::Running) {
+            return false;
+        }
+        match self.retry_from.or(self.created_at) {
+            Some(since) => now - since >= chrono::Duration::minutes(after.mins_for(self.priority)),
+            None => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
@@ -337,6 +387,8 @@ pub enum JobsView {
     Approval,
     /// Every delivered job, cleared or not, newest first.
     Completed,
+    /// Waiting or working for longer than the late limit, oldest first (P11.3b).
+    Late,
 }
 
 /// Filters for a page of jobs; empty strings mean "any".
@@ -349,6 +401,8 @@ pub struct JobsFilter {
     pub group: String,
     /// Review view only: also list the jobs the desk tidied away (P7.21).
     pub include_hidden: bool,
+    /// Late view only: the limits (default: 10 and 5 minutes).
+    pub late_after: LateAfter,
 }
 
 /// One page of a job list.
@@ -377,6 +431,9 @@ pub struct JobCounts {
     pub completed_today: i64,
     /// Videos waiting for MCR approval (P10.7).
     pub approval: i64,
+    /// Waiting or working for longer than the late limit right now (P11.3b).
+    #[serde(default)]
+    pub late: i64,
 }
 
 /// What the `queue` health check looks at (plan P7.19).
@@ -411,6 +468,9 @@ pub struct QueueSummary {
     /// stalled": twenty pending jobs are normal right after a rundown arrives
     /// and alarming an hour later.
     pub oldest_pending_age_secs: Option<i64>,
+    /// Waiting or working for longer than the late limit (P11.3b); the desk chimes when it rises.
+    #[serde(default)]
+    pub late: i64,
 }
 
 /// One row of `login_attempts` (plan P2.2).

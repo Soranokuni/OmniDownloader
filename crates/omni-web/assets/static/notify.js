@@ -130,6 +130,10 @@ export const CHECK_INFO = {
     name: 'Ουρά',
     action: 'Βίντεο περιμένουν ή τρέχουν ασυνήθιστα πολύ. Ελέγξτε την καρτέλα «Σε εξέλιξη».',
   },
+  workers: {
+    name: 'Εκτέλεση εργασιών',
+    action: 'Κάποια εργασία σταμάτησε από εσωτερικό σφάλμα και μπήκε ξανά στην ουρά. Αν επαναληφθεί, ενημερώστε τον διαχειριστή.',
+  },
   accounts: { name: 'Λογαριασμοί', action: '' },
   sites: {
     name: 'Ιστότοποι',
@@ -153,12 +157,17 @@ function needCount(q) {
  * (first load) reports nothing, so what was already there is not alarmed.
  */
 export function diffStatus(prev, next) {
-  const out = { needsPerson: 0, wentBad: [], recovered: [] };
+  const out = { needsPerson: 0, newlyLate: 0, wentBad: [], recovered: [] };
   if (!prev || !next) return out;
   // The server sends `queue: null` when it could not count; comparing with
   // that would announce the whole backlog as new on the next good answer.
   if (prev.queue && next.queue) {
     out.needsPerson = Math.max(0, needCount(next.queue) - needCount(prev.queue));
+    // Late videos (P11.3b) are not "needs a person": they are still being tried.
+    // Only a rise is news; a field an older server does not send counts nothing.
+    if (typeof prev.queue.late === 'number' && typeof next.queue.late === 'number') {
+      out.newlyLate = Math.max(0, next.queue.late - prev.queue.late);
+    }
   }
   const before = prev.checks || {};
   for (const [name, check] of Object.entries(next.checks || {})) {
@@ -205,6 +214,11 @@ export function watchStatus(data) {
     toast(text, 'bad');
     plainNotification(text, 'omni-review');
     if (!covered) count(n, true);
+  }
+  if (diff.newlyLate > 0) {
+    // The softer of the two jingles, once; no title count and no review alert.
+    jingle(false);
+    toast(diff.newlyLate === 1 ? 'Ένα βίντεο καθυστερεί' : `${diff.newlyLate} βίντεο καθυστερούν`, 'warn');
   }
   if (diff.wentBad.length) alarm();
   for (const bad of diff.wentBad) {

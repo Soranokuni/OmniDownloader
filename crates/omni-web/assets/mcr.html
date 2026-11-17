@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — MCR</title>
-<link rel="stylesheet" href="/static/app.css?v=11">
+<link rel="stylesheet" href="/static/app.css?v=12">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -36,6 +36,9 @@
   <div id="offline-banner" role="alert" hidden></div>
   <div id="health-banner" hidden></div>
   <div id="selfheal-lines" hidden></div>
+
+  <!-- Videos that are late and why; filled by mcr.js, hidden when none (P11.3b). -->
+  <section id="late-strip" class="late-strip" aria-label="Καθυστερούν" hidden></section>
 
   <div class="tabs">
   <div role="tablist" style="display:flex;gap:4px;flex-wrap:wrap">
@@ -269,6 +272,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=44"></script>
+<script type="module" src="/static/mcr.js?v=45"></script>
 </body>
 </html>

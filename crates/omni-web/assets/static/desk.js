@@ -64,6 +64,8 @@ function msSince(iso, now) {
  *  «Σε αναμονή». RUNNING: «· σε αυτό το βήμα N′», or '' when unknown. */
 export function waitLine(job, now = Date.now()) {
   if (job.status === 'PENDING') {
+    // A finished video waits for the share, not for a back-off (P11.3b).
+    if (job.delivery_wait || job.wait_reason === 'delivery') return 'Περιμένει τον φάκελο παράδοσης';
     const since = msSince(job.not_before, now); // negative while the back-off lasts
     if (since !== null && since < 0) {
       const secs = Math.ceil(-since / 1000);
@@ -80,6 +82,30 @@ export function waitLine(job, now = Date.now()) {
     return ` · σε αυτό το βήμα ${mins < 1 ? '<1' : mins}′`;
   }
   return '';
+}
+
+/** Why a late video is late, for the strip above the tabs (P11.3b). */
+export function lateReason(job, now = Date.now()) {
+  switch (job.wait_reason) {
+    case 'delivery':
+      return 'Περιμένει τον φάκελο παράδοσης';
+    case 'retry': {
+      const text = `Νέα προσπάθεια στις ${clock(job.next_try_at)}`;
+      return job.hint ? `${text} · ${job.hint}` : text;
+    }
+    case 'running': {
+      const ms = msSince(job.stage_started_at, now);
+      return ms === null ? 'Σε επεξεργασία' : `Σε επεξεργασία · στο τρέχον βήμα εδώ και ${Math.max(0, Math.floor(ms / 60000))}′`;
+    }
+    default:
+      return 'Σε αναμονή στη σειρά';
+  }
+}
+
+/** «πριν από 12′»: how long ago the video arrived (or was last restarted); '' when unknown. */
+export function arrivedAgo(job, now = Date.now()) {
+  const ms = msSince(job.retry_from || job.created_at, now);
+  return ms === null ? '' : `πριν από ${Math.max(0, Math.floor(ms / 60000))}′`;
 }
 
 /** True when a RUNNING video has been in its step longer than it should. */

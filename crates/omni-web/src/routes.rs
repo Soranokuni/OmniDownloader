@@ -452,8 +452,8 @@ pub use omni_core::auth::validate_password;
 pub struct JobsQuery {
     my: Option<bool>,
     journalist: Option<String>,
-    /// `live`, `review` or `completed`: one page of an MCR desk list
-    /// (plan P7.1). Without it, the old unpaged list.
+    /// `live`, `review`, `approval`, `completed` or `late`: one page of an MCR
+    /// desk list (plan P7.1). Without it, the old unpaged list.
     view: Option<omni_core::models::JobsView>,
     page: Option<i64>,
     per_page: Option<i64>,
@@ -463,10 +463,36 @@ pub struct JobsQuery {
     hidden: Option<u8>,
 }
 
+/// The late limits from the live config, read once per request (P11.3b).
+async fn late_after(state: &AppState) -> omni_core::models::LateAfter {
+    let cfg = state.config.read().await;
+    omni_core::models::LateAfter::new(cfg.retry.late_after_mins, cfg.retry.late_after_urgent_mins)
+}
+
 /// A job as the MCR desk shows it: the row, plus what its error code means
 /// and what to do about it, in the operators' language.
-fn job_for_desk(repo: &omni_core::repository::Repository, job: &omni_core::models::Job) -> serde_json::Value {
+///
+/// `late`, `next_try_at` and `wait_reason` (P11.3b) say whether the video is
+/// late and what it is waiting for: `delivery` (the watchfolder), `retry` (a
+/// back-off), `running`, `queue`; `null` for a job that is neither waiting nor running.
+fn job_for_desk(
+    repo: &omni_core::repository::Repository,
+    job: &omni_core::models::Job,
+    late: omni_core::models::LateAfter,
+) -> serde_json::Value {
     let mut v = serde_json::to_value(job).unwrap_or_default();
+    let now = chrono::Utc::now();
+    let next_try = job.not_before.filter(|t| *t > now);
+    v["late"] = serde_json::Value::Bool(job.is_late(now, late));
+    v["next_try_at"] = next_try.map(omni_core::timestamps::format).into();
+    let reason: Option<&str> = match job.status {
+        JobStatus::Pending if job.delivery_wait => Some("delivery"),
+        JobStatus::Pending if next_try.is_some() => Some("retry"),
+        JobStatus::Pending => Some("queue"),
+        JobStatus::Running => Some("running"),
+        _ => None,
+    };
+    v["wait_reason"] = reason.into();
     if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
         // A job that stopped retrying must not say a retry is under way (P11.3a); a queued
         // or running one, or a video waiting for the watchfolder, still is. Only the codes
@@ -629,17 +655,25 @@ pub async fn api_get_jobs(
     State(state): State<AppState>,
 ) -> JsonResult {
     if let Some(view) = query.view {
+        let late = late_after(&state).await;
         let filter = omni_core::models::JobsFilter {
             search: query.q.clone().unwrap_or_default(),
             journalist: query.journalist.clone().unwrap_or_default(),
             group: query.group.clone().unwrap_or_default(),
             include_hidden: query.hidden == Some(1),
+            late_after: late,
+        };
+        // The late strip is one short list: the first 50, no pager (P11.3b).
+        let (page_no, per_page) = if view == omni_core::models::JobsView::Late {
+            (1, 50)
+        } else {
+            (query.page.unwrap_or(1), query.per_page.unwrap_or(20))
         };
         let page = state
             .repo
-            .list_jobs_page(view, &filter, query.page.unwrap_or(1), query.per_page.unwrap_or(20))
+            .list_jobs_page(view, &filter, page_no, per_page)
             .map_err(internal_error("Could not read the job queue."))?;
-        let counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+        let counts = state.repo.job_counts(late).map_err(internal_error("Could not count the jobs."))?;
         // Which mail each came from, so the desk can open it (plan P7.11).
         let keys: Vec<String> = page.jobs.iter().filter_map(|j| j.email_message_id.clone()).collect();
         let subjects = state.repo.mail_subjects(&keys).unwrap_or_default();
@@ -654,7 +688,7 @@ pub async fn api_get_jobs(
             .jobs
             .iter()
             .map(|j| {
-                let mut v = job_for_desk(&state.repo, j);
+                let mut v = job_for_desk(&state.repo, j, late);
                 v["held"] = held_for_desk(&state, j);
                 v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
@@ -704,7 +738,7 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
-    let mut desk_job = job_for_desk(&state.repo, &job);
+    let mut desk_job = job_for_desk(&state.repo, &job, late_after(&state).await);
     desk_job["held"] = held_for_desk(&state, &job);
     desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
@@ -1000,6 +1034,40 @@ pub async fn api_retry_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
+    state.broadcast_job_event("job_updated", job_id);
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// «Τώρα» was pressed for a video that is not waiting out a retry's back-off (P11.3b).
+fn not_waiting_to_retry() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "NOT_WAITING_TO_RETRY",
+        "Αυτό το βίντεο δεν περιμένει νέα προσπάθεια: ξεκίνησε ήδη, παραδόθηκε, ή περιμένει τον φάκελο παράδοσης. Ανανεώστε τη λίστα.",
+    )
+}
+
+/// MCR's «Τώρα»: the next free worker takes a job that waits for its next
+/// automatic try, instead of waiting out the back-off (P11.3b).
+pub async fn api_run_now_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let started = state
+        .repo
+        .run_now(job_id)
+        .map_err(internal_error("Could not start the job now."))?;
+    if !started {
+        return Err(not_waiting_to_retry());
+    }
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Run now requested by {}", principal.audit_label()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: run now"));
     state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -2174,7 +2242,7 @@ pub async fn api_system_status(
     // `null` when the count failed, never zeros: the desk alerts on a rise in
     // the review count, and zeros followed by the real count would announce
     // the whole backlog as new (P7.14).
-    let queue = state.repo.queue_summary().ok();
+    let queue = state.repo.queue_summary(late_after(&state).await).ok();
 
     let checks = state.health.all();
 
@@ -2371,7 +2439,7 @@ pub async fn api_get_mails(
             v
         })
         .collect();
-    let job_counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+    let job_counts = state.repo.job_counts(late_after(&state).await).map_err(internal_error("Could not count the jobs."))?;
     Ok(Json(serde_json::json!({
         "entries": entries,
         "total": page.total,
@@ -2473,12 +2541,13 @@ pub async fn api_get_mail_view(
     // The Email tab's cards say the place in the queue too (plan P7.19).
     let positions = state.repo.pending_positions().unwrap_or_default();
     let next_ok = next_choice_allowed(&state).await;
+    let late = late_after(&state).await;
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
-                let mut v = job_for_desk(&state.repo, j);
+                let mut v = job_for_desk(&state.repo, j, late);
                 v["held"] = held_for_desk(&state, j);
                 v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
@@ -3168,7 +3237,7 @@ mod tests {
         };
         let hint = |id: i64| {
             let job = repo.get_job(id).unwrap().unwrap();
-            job_for_desk(&repo, &job)["hint"].as_str().map(str::to_string)
+            job_for_desk(&repo, &job, omni_core::models::LateAfter::default())["hint"].as_str().map(str::to_string)
         };
 
         // Five runs, the last one sent to review.
