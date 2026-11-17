@@ -114,17 +114,26 @@ fn is_probe_name(name: &str) -> bool {
 
 /// The staging file a delivery of a video that waited for the watchfolder
 /// left when the share dropped (P11.2a): `.{filename}.tmp` in `dir`, removed
-/// whatever its age, but only when this process is not writing it (in-flight
-/// registry) and nothing anywhere holds it open (exclusive open). Without it
-/// the delivery after the wait, which comes inside [`STALE_STAGING_AGE`],
-/// would skip its own name and land as `_2`. Only for that delivery's own
-/// names; every other staging file keeps the age rule. Blocking file I/O.
-pub fn reclaim_own_staging(dir: &Path, filename: &str) -> bool {
+/// however young, but only when it was last touched before this delivery run
+/// began (`run_started`, P11.2b: a newer one is another copy's, not a cut
+/// one), this process is not writing it (in-flight registry) and nothing
+/// anywhere holds it open (exclusive open). Without it the delivery after the
+/// wait, which comes inside [`STALE_STAGING_AGE`], would skip its own name and
+/// land as `_2`. Only for that delivery's own names; every other staging
+/// file, and one newer than the run's start, keeps the age rule. Blocking
+/// file I/O.
+pub fn reclaim_own_staging(dir: &Path, filename: &str, run_started: SystemTime) -> bool {
     let Some(claim) = StagingClaim::try_new(dir.join(format!(".{filename}.tmp"))) else {
         return false;
     };
     let path = claim.path();
-    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) || !unheld(path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    // The newer of last-write and creation, as for the age rule.
+    let last_touched = [meta.modified().ok(), meta.created().ok()].into_iter().flatten().max();
+    let before_run = last_touched.is_some_and(|t| t < run_started);
+    if !meta.is_file() || !before_run || !unheld(path) {
         return false;
     }
     let removed = std::fs::remove_file(path).is_ok();
@@ -953,10 +962,12 @@ mod tests {
         let other = watchfolder.join(".21_ANNA_CLIP.mxf.tmp");
         std::fs::write(&own, b"half a copy, a minute old").unwrap();
         std::fs::write(&other, b"someone else's fresh copy").unwrap();
+        // This delivery run began after the cut copy was written.
+        let parked = SystemTime::now() + Duration::from_secs(1);
 
         // In this process's in-flight registry: kept.
         let claim = StagingClaim::try_new(own.clone()).expect("claimed");
-        assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf"));
+        assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked));
         assert!(own.exists());
         drop(claim);
 
@@ -964,16 +975,38 @@ mod tests {
         #[cfg(windows)]
         {
             let handle = std::fs::File::open(&own).unwrap();
-            assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf"));
+            assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked));
             assert!(own.exists());
             drop(handle);
         }
 
-        assert!(reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf"), "a fresh leftover of our own name");
+        assert!(reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked), "a fresh leftover of our own name");
         assert!(!own.exists());
         assert!(other.exists(), "another name's fresh staging file keeps the age rule");
         assert_eq!(sweep_stale_staging(&watchfolder), 0);
-        assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf"), "nothing left to reclaim");
+        assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked), "nothing left to reclaim");
+    }
+
+    /// P11.2b review finding 2: a staging file of the video's own name that
+    /// was already there when this delivery run began is a cut copy, whatever
+    /// its age; one created after the run began (another instance's fresh
+    /// copy) keeps the age rule.
+    #[tokio::test]
+    async fn only_a_staging_file_older_than_the_run_start_is_reclaimed() {
+        let (_d, watchfolder, _work) = scratch().await;
+        let own = watchfolder.join(".22_ANNA_CLIP.mxf.tmp");
+        let run_started = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&own, b"a copy started after this run began").unwrap();
+
+        assert!(!reclaim_own_staging(&watchfolder, "22_ANNA_CLIP.mxf", run_started));
+        assert!(own.exists(), "a staging file newer than the run's start was reclaimed");
+        assert!(!remove_if_stale(&own), "and the age rule keeps it too");
+
+        // The next run starts after it was written: it is a cut copy, reclaimed.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(reclaim_own_staging(&watchfolder, "22_ANNA_CLIP.mxf", SystemTime::now()));
+        assert!(!own.exists());
     }
 
     fn kind(err: &anyhow::Error) -> &'static str {

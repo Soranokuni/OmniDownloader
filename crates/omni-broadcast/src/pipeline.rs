@@ -118,12 +118,29 @@ pub fn wait_backoff_for(n: u32) -> chrono::Duration {
 
 /// A video that waited for the watchfolder and that no run may deliver on its
 /// own (P11.2a): its earlier rename may have landed and been taken into Dalet
-/// by hand, or the watchfolder changed while it waited. The worker holding the
-/// lease sends the job to review with `message`; nothing is copied.
+/// by hand, or the watchfolder changed while it waited (`code`
+/// DELIVERY_UNCONFIRMED, P11.2b); or its file in the workspace could not be
+/// read for [`UNREADABLE_WAIT_LIMIT`] (PIPELINE_FAILED). The worker holding the
+/// lease sends the job to review with `code` and `message`; nothing is copied,
+/// and the workspace is kept.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct DeliveryNeedsCheck {
+    pub code: ErrorCode,
     pub message: String,
+}
+
+/// How long a waiting video whose file in the workspace cannot be read (held
+/// open, no permission, a disk error) waits, counted from its first park,
+/// before a person is asked (P11.2b). A watchfolder that is down is waited for
+/// whatever the age; only this local read failure is capped.
+pub const UNREADABLE_WAIT_LIMIT: chrono::Duration = chrono::Duration::hours(2);
+
+/// Whether a waiting video parked at `ready_at` and unreadable now has waited
+/// past [`UNREADABLE_WAIT_LIMIT`] at `now`. An unknown park time (a row parked
+/// before the time was kept) is never past it.
+pub fn unreadable_too_long(ready_at: Option<chrono::DateTime<chrono::Utc>>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    ready_at.is_some_and(|at| now - at > UNREADABLE_WAIT_LIMIT)
 }
 
 /// Whether `a` and `b` name the same folder, as written: separators and a
@@ -1215,11 +1232,11 @@ impl BroadcastEngine {
     }
 
     /// The error for a waiting video a person must settle (P11.2a); the worker
-    /// sends the job to review with `message` and keeps everything.
-    fn needs_check(&self, job_id: i64, message: String) -> anyhow::Error {
+    /// sends the job to review with `code` and `message` and keeps everything.
+    fn needs_check(&self, job_id: i64, code: ErrorCode, message: String) -> anyhow::Error {
         warn!("Job #{job_id}: {message}");
         self.forget_waits(job_id);
-        anyhow::Error::new(DeliveryNeedsCheck { message }).context(ErrorCode::DeliveryFailed.as_str())
+        anyhow::Error::new(DeliveryNeedsCheck { code, message }).context(code.as_str())
     }
 
     /// What became of the rename an earlier attempt of this waiting video
@@ -1243,6 +1260,7 @@ impl BroadcastEngine {
             // An old folder may be a share that is gone for good: not asked, not waited for.
             return Err(self.needs_check(
                 job_id,
+                ErrorCode::DeliveryUnconfirmed,
                 format!("The watchfolder changed while {name} was waiting; check {} and Dalet before retrying", folder.display()),
             ));
         }
@@ -1257,6 +1275,7 @@ impl BroadcastEngine {
             }
             Some(MarkerCheck::Missing) => Err(self.needs_check(
                 job_id,
+                ErrorCode::DeliveryUnconfirmed,
                 format!("The delivery of {name} was interrupted and the file is not in the watchfolder now. Check Dalet for {name} before retrying"),
             )),
             None => Ok(None),
@@ -1264,13 +1283,14 @@ impl BroadcastEngine {
     }
 
     /// Before a waiting video picks its name: its own leftover staging file
-    /// from the attempt the share cut goes, whatever its age, unless in use
+    /// from an attempt the share cut goes, if it was there before this run
+    /// began (`run_started`) and is not in use
     /// ([`crate::delivery::reclaim_own_staging`]). Off the async threads.
-    async fn reclaim_own_staging(&self, job_id: i64, slug: &str) {
+    async fn reclaim_own_staging(&self, job_id: i64, slug: &str, run_started: std::time::SystemTime) {
         let (dir, name) = (self.watchfolder_dir.clone(), format!("{slug}.mxf"));
         let ran = tokio::time::timeout(
             omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
-            tokio::task::spawn_blocking(move || crate::delivery::reclaim_own_staging(&dir, &name)),
+            tokio::task::spawn_blocking(move || crate::delivery::reclaim_own_staging(&dir, &name, run_started)),
         )
         .await;
         if !matches!(ran, Ok(Ok(_))) {
@@ -1292,6 +1312,8 @@ impl BroadcastEngine {
     /// it is delivered exactly as the normal path delivers, and on success the
     /// job ends as the normal path ends it. The engine sets no status.
     pub async fn deliver_ready(&self, job: &Job, owner: &str, cancel: Option<CancellationToken>) -> Result<ReadyOutcome> {
+        // Before anything is copied: a staging file of this slug older than this is a cut copy.
+        let run_started = std::time::SystemTime::now();
         let job_id = job.id;
         let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
         // Nothing is downloaded: the slot it was leased under goes back.
@@ -1362,7 +1384,18 @@ impl BroadcastEngine {
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 return self.rerun(job_id, owner, &format!("it cannot be read: {e}")).await
             }
-            // Held open, no permission, a disk error: the file may be fine. Wait, never delete it.
+            // Held open, no permission, a disk error: the file may be fine. Wait, never delete it;
+            // past the limit a person is asked, the workspace kept (P11.2b).
+            Ok(Err(e)) if unreadable_too_long(job.ready_at, chrono::Utc::now()) => {
+                return Err(self.needs_check(
+                    job_id,
+                    ErrorCode::PipelineFailed,
+                    format!(
+                        "The finished video in the workspace could not be read for {} hours: {e}",
+                        UNREADABLE_WAIT_LIMIT.num_hours()
+                    ),
+                ));
+            }
             Ok(Err(e)) => {
                 let cause = format!("the waiting video cannot be read now: {e}");
                 return Err(self.waiting(job_id, &slug, anyhow::Error::new(DeliveryError::Unreachable(cause)), false, false));
@@ -1384,7 +1417,7 @@ impl BroadcastEngine {
             drop(guard);
             return Err(e);
         }
-        self.reclaim_own_staging(job_id, &slug).await;
+        self.reclaim_own_staging(job_id, &slug, run_started).await;
         let delivered = match self.deliver_to_watchfolder(job_id, owner, &ready, &slug, &job_temp).await {
             Ok(dest) => dest,
             Err(e) if e.downcast_ref::<LeaseLost>().is_some() => {
@@ -1601,6 +1634,8 @@ impl BroadcastEngine {
         held: &HeldOutput,
         cancel: Option<CancellationToken>,
     ) -> Result<()> {
+        // Before anything is copied: a staging file of this slug older than this is a cut copy.
+        let run_started = std::time::SystemTime::now();
         let job_id = job.id;
         let job_temp = self.temp_dir.join("jobs").join(job_id.to_string());
         // A deliver-only job has no use for the slot it was leased under.
@@ -1714,7 +1749,7 @@ impl BroadcastEngine {
                 drop(guard);
                 return Err(e);
             }
-            self.reclaim_own_staging(job_id, &slug).await;
+            self.reclaim_own_staging(job_id, &slug, run_started).await;
         }
 
         let delivered = match self.deliver_to_watchfolder(job_id, owner, &path, &slug, &job_temp).await {

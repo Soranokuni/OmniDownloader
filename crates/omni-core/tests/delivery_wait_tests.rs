@@ -303,10 +303,10 @@ fn a_waiting_delivery_sent_to_review_keeps_everything_until_mcr_decides() {
     let id = f.parked_pending(1);
     f.repo.lease_job_when(OWNER, 3600, true).unwrap().unwrap();
     let msg = "The delivery of 1_ANNA_TEST.mxf was interrupted and the file is not in the watchfolder now. Check Dalet for 1_ANNA_TEST.mxf before retrying";
-    assert!(!f.repo.review_waiting_delivery(id, OTHER, msg).unwrap(), "not the lease holder");
-    assert!(f.repo.review_waiting_delivery(id, OWNER, msg).unwrap());
+    assert!(!f.repo.review_waiting_delivery(id, OTHER, "DELIVERY_UNCONFIRMED", msg).unwrap(), "not the lease holder");
+    assert!(f.repo.review_waiting_delivery(id, OWNER, "DELIVERY_UNCONFIRMED", msg).unwrap());
     let job = f.repo.get_job(id).unwrap().unwrap();
-    assert_eq!((job.status, job.error_code.as_deref(), job.error_message.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_FAILED"), Some(msg)));
+    assert_eq!((job.status, job.error_code.as_deref(), job.error_message.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_UNCONFIRMED"), Some(msg)));
     assert_eq!(job.lease_owner, None);
     assert!(job.delivery_wait && job.ready_path.is_some(), "the waiting file is kept");
     assert_eq!(f.marker(id), (Some(f.marker_path(1)), Some(4096)), "the marker is kept");
@@ -323,7 +323,7 @@ fn a_waiting_delivery_sent_to_review_keeps_everything_until_mcr_decides() {
 
     let id = f.parked_pending(2);
     f.repo.lease_job_when(OWNER, 3600, true).unwrap().unwrap();
-    assert!(f.repo.review_waiting_delivery(id, OWNER, msg).unwrap());
+    assert!(f.repo.review_waiting_delivery(id, OWNER, "DELIVERY_UNCONFIRMED", msg).unwrap());
     assert!(f.repo.retry_job(id, None).unwrap());
     let job = f.repo.lease_job_when(OWNER, 3600, true).unwrap().expect("a full run");
     assert_eq!((job.id, job.stage, job.delivery_wait), (id, JobStage::Extract, false));
@@ -394,19 +394,54 @@ fn a_waiting_job_whose_file_is_in_the_watchfolder_is_finished_at_start_up() {
     assert!(!job.delivery_wait && job.ready_path.is_none());
 }
 
-/// Every other start-up case is as before: a RUNNING job that does not wait
-/// and whose marker cannot be read still goes to review.
+/// P11.2b: a RUNNING job that does not wait and whose marker cannot be read
+/// waits for the share too, but with nothing `ready_*`: the crashed run's
+/// workspace is not trusted. Not leased again for 30 s.
 #[test]
-fn a_job_that_does_not_wait_is_recovered_exactly_as_before() {
+fn a_job_that_does_not_wait_and_whose_marker_cannot_be_read_waits_without_a_ready_file() {
     let f = Fixture::new();
     let id = f.queue(1);
     f.repo.lease_job(OWNER, 3600).unwrap().unwrap();
     assert!(f.repo.set_stage(id, OWNER, JobStage::Deliver).unwrap());
     let unreadable = f.dir.path().join("no-share").join("1_ANNA_TEST.mxf").to_string_lossy().into_owned();
     assert!(f.repo.mark_delivering(id, OWNER, &unreadable, 4096).unwrap());
-    assert_eq!(f.repo.recover_on_startup(HOST).unwrap(), 0);
+    assert_eq!(f.repo.recover_on_startup(HOST).unwrap(), 1);
     let job = f.repo.get_job(id).unwrap().unwrap();
-    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_FAILED")));
+    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::Pending, Some("DELIVERY_FAILED")));
+    assert!(job.delivery_wait);
+    assert_eq!((job.ready_path, job.ready_bytes, job.ready_sha256, job.ready_at), (None, None, None, None));
+    assert_eq!(f.marker(id), (Some(unreadable), Some(4096)));
+    assert_eq!(f.repo.parked_job_ids().unwrap(), vec![id], "the start-up sweep must spare it");
+    assert!(f.repo.lease_job_when(OTHER, 3600, true).unwrap().is_none(), "leased before its 30 s");
+}
+
+/// P11.2b M1: the park time is that of the first park; a later park of the
+/// same wait keeps it, and whatever ends the wait clears it.
+#[test]
+fn the_park_time_is_the_first_parks_and_ends_with_the_wait() {
+    let f = Fixture::new();
+    let before = Utc::now() - Duration::milliseconds(5);
+    let id = f.parked_pending(1);
+    let first = f.repo.get_job(id).unwrap().unwrap().ready_at.expect("the first park's time");
+    assert!(first >= before && first <= Utc::now(), "{first}");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    f.repo.lease_job_when(OWNER, 3600, true).unwrap().unwrap();
+    assert!(f.repo.park_for_delivery(id, OWNER, &f.ready_path(id), 4096, SHA, 12.5).unwrap());
+    assert_eq!(f.repo.get_job(id).unwrap().unwrap().ready_at, Some(first), "a later park moved it");
+
+    assert!(f.repo.requeue_for_rerun(id, OWNER, "x").unwrap());
+    assert_eq!(f.repo.get_job(id).unwrap().unwrap().ready_at, None);
+
+    let f = Fixture::new();
+    let id = f.parked_pending(2);
+    f.repo.lease_job_when(OWNER, 3600, true).unwrap().unwrap();
+    assert!(f.repo.set_delivered_file(id, OWNER, &f.marker_path(2), 1.0).unwrap());
+    assert_eq!(f.repo.get_job(id).unwrap().unwrap().ready_at, None);
+
+    let f = Fixture::new();
+    let id = f.parked_pending(3);
+    assert!(f.repo.retry_job(id, None).unwrap());
+    assert_eq!(f.repo.get_job(id).unwrap().unwrap().ready_at, None);
 }
 
 /// Risk (c): a trusted recipe's video that waits keeps its automatic-delivery

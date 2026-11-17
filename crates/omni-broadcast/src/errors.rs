@@ -72,11 +72,14 @@ pub enum ErrorCode {
     RepairExhausted,
     /// The link, or a stream found behind it, points at a loopback, private or reserved address (P2.12).
     NonPublicAddress,
+    /// A delivery was interrupted and nobody can tell whether its file reached
+    /// the watchfolder (P11.2b): MCR checks Dalet before anything is retried.
+    DeliveryUnconfirmed,
 }
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 32] = [
+    pub const ALL: [ErrorCode; 33] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
@@ -109,6 +112,7 @@ impl ErrorCode {
         Self::HeldFileChanged,
         Self::RepairExhausted,
         Self::NonPublicAddress,
+        Self::DeliveryUnconfirmed,
     ];
 
     /// The code stored on a job, back as a code.
@@ -150,6 +154,7 @@ impl ErrorCode {
             Self::HeldFileChanged => "HELD_FILE_CHANGED",
             Self::RepairExhausted => "REPAIR_EXHAUSTED",
             Self::NonPublicAddress => "NON_PUBLIC_ADDRESS",
+            Self::DeliveryUnconfirmed => "DELIVERY_UNCONFIRMED",
         }
     }
 
@@ -225,6 +230,7 @@ impl ErrorCode {
             Self::HeldFileChanged => "Το αρχείο που περίμενε έγκριση άλλαξε ή χάθηκε και ΔΕΝ παραδόθηκε. Πατήστε «Δοκιμή ξανά».",
             Self::RepairExhausted => "Η αυτόματη επισκευή δεν βρήκε το βίντεο μέσα στον χρόνο της. Ανοίξτε τον σύνδεσμο και κατεβάστε το χειροκίνητα.",
             Self::NonPublicAddress => "Ο σύνδεσμος δείχνει σε εσωτερική διεύθυνση· δεν κατεβαίνει αυτόματα.",
+            Self::DeliveryUnconfirmed => "Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε. Ελέγξτε πρώτα στο Dalet αν υπάρχει ήδη: αν υπάρχει, πατήστε «Το έβαλα στο Dalet»· αν όχι, πατήστε «Δοκιμή ξανά».",
         }
     }
 
@@ -314,6 +320,7 @@ pub const NOT_CLASSIFIED: &[(ErrorCode, &str)] = &[
     (ErrorCode::ApprovalExpired, "set by the held-video expiry in SQL"),
     (ErrorCode::RepairExhausted, "set directly by the repair ladder"),
     (ErrorCode::NonPublicAddress, "set directly by the egress check, which ends the job itself"),
+    (ErrorCode::DeliveryUnconfirmed, "set directly when a delivery was interrupted and its result is unknown"),
 ];
 
 /// The first code of [`CLASSIFIED`] that `text` names as a whole token: the
@@ -814,6 +821,7 @@ mod tests {
             ErrorCode::HeldFileChanged,
             ErrorCode::RepairExhausted,
             ErrorCode::NonPublicAddress,
+            ErrorCode::DeliveryUnconfirmed,
         ] {
             let hint = code.hint_el();
             assert!(hint.len() > 20, "{code} has no useful hint");
@@ -843,9 +851,34 @@ mod tests {
             assert!(!c.should_try_sniffer());
             assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
         }
-        assert_eq!(ErrorCode::ALL.len(), 32);
+        assert_eq!(ErrorCode::ALL.len(), 33);
         let unique: std::collections::HashSet<_> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(unique.len(), 32);
+        assert_eq!(unique.len(), 33);
+    }
+
+    /// P11.2b: the code of a delivery whose result nobody knows. Appended last
+    /// (the list is append-only), stable, never retried on its own, set
+    /// directly (never read out of a failure's text), and its hint tells MCR
+    /// to look in Dalet before choosing between the two buttons.
+    #[test]
+    fn delivery_unconfirmed_is_the_last_code_terminal_and_says_check_dalet_first() {
+        let c = ErrorCode::DeliveryUnconfirmed;
+        assert_eq!(ErrorCode::ALL.last(), Some(&c));
+        assert_eq!(c.as_str(), "DELIVERY_UNCONFIRMED");
+        assert_eq!(ErrorCode::from_code("DELIVERY_UNCONFIRMED"), Some(c));
+        assert!(!c.is_retryable(), "a delivery that may be on air must not be retried on its own");
+        assert!(!c.should_try_sniffer());
+        assert!(!CLASSIFIED.contains(&c));
+        assert_eq!(NOT_CLASSIFIED.iter().filter(|(x, _)| *x == c).count(), 1);
+        assert_eq!(
+            c.hint_el(),
+            "Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε. Ελέγξτε πρώτα στο Dalet αν υπάρχει ήδη: αν υπάρχει, πατήστε «Το έβαλα στο Dalet»· αν όχι, πατήστε «Δοκιμή ξανά»."
+        );
+        assert_ne!(c.hint_el(), ErrorCode::DeliveryFailed.hint_el());
+        // The ordinary wait keeps its code, and stays retryable.
+        assert_eq!(ErrorCode::DeliveryFailed.as_str(), "DELIVERY_FAILED");
+        assert!(ErrorCode::DeliveryFailed.is_retryable());
+        assert_eq!(code_in_text("x: DELIVERY_UNCONFIRMED: y"), None, "read out of text");
     }
 
     #[test]

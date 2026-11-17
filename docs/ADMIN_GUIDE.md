@@ -563,6 +563,7 @@ A stopped job carries one of these codes; the desk shows a Greek hint.
 | `HELD_FILE_CHANGED` | no | the held file changed: not delivered |
 | `REPAIR_EXHAUSTED` | no | repair ran out of time or attempts |
 | `NON_PUBLIC_ADDRESS` | no | the link, or a stream behind it, is an internal address: not downloaded (see `egress_allow_networks`) |
+| `DELIVERY_UNCONFIRMED` | no | a delivery was interrupted; check Dalet for the file before retrying |
 | `PIPELINE_FAILED` | no | unexpected error; see the job's history |
 
 ---
@@ -585,3 +586,20 @@ is also on its card under «Τεχνικές λεπτομέρειες».
 **Rollback:** the installer keeps the previous release, and the
 pre-migration database backup is in `data\backups\`. A restored backup needs
 the matching older program (the database schema only moves forward).
+
+### 11.1 When the watchfolder share is down
+
+- A finished video that cannot be written to the watchfolder waits on this
+  computer and is delivered when the share answers again, however long that
+  takes. It is not downloaded or encoded again, with two exceptions: a
+  waiting video whose saved file changed or disappeared, and a job recovered
+  after a restart that still has to deliver, are downloaded and encoded again
+  from their link.
+- A waiting video whose saved file cannot be read for 2 hours goes to review
+  with `PIPELINE_FAILED`.
+- The `watchfolder` health line turns red while the share does not answer.
+- A video whose delivery was interrupted (a restart or an error during the
+  copy) and whose arrival cannot be confirmed goes to review with
+  `DELIVERY_UNCONFIRMED`. Check in Dalet whether it is already there: if it
+  is, press «Το έβαλα στο Dalet»; if not, press «Δοκιμή ξανά».
+- A waiting video cannot be renamed.

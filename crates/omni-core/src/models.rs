@@ -248,6 +248,11 @@ pub struct Job {
     pub ready_bytes: Option<i64>,
     #[serde(default)]
     pub ready_sha256: Option<String>,
+    /// When the video first parked (P11.2b): the limit on waiting for a file
+    /// that cannot be read counts from it. `None` for a row recovered at
+    /// start-up without a trusted file, or parked before the column existed.
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
 
     /// Stored timestamp, `None` when the row predates real timestamps or the
     /// value is unreadable. Never substituted with "now" (defect D-11): the MCR

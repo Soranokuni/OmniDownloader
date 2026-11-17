@@ -528,7 +528,7 @@ async fn a_waiting_video_whose_attempted_rename_is_not_there_goes_to_review_not_
     assert!(watch_files_in(&root).is_empty(), "found a file in the watchfolder: {:?}", watch_files_in(&root));
     let job = repo.get_job(id).unwrap().unwrap();
     let msg = "The delivery of 1_ELENI_TEST.mxf was interrupted and the file is not in the watchfolder now. Check Dalet for 1_ELENI_TEST.mxf before retrying";
-    assert_eq!((job.status, job.error_code.as_deref(), job.error_message.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_FAILED"), Some(msg)));
+    assert_eq!((job.status, job.error_code.as_deref(), job.error_message.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_UNCONFIRMED"), Some(msg)));
     assert!(ready.exists(), "the workspace was removed");
     assert!(job.delivery_wait && job.ready_path.is_some());
     assert_eq!(repo.delivery_marker(id).unwrap().map(|m| m.0), Some(attempted.to_string_lossy().into_owned()), "the marker is kept");
@@ -568,7 +568,7 @@ async fn an_approved_held_video_whose_attempted_rename_is_not_there_goes_to_revi
 
     assert!(watch_files_in(&root).is_empty(), "found a file in the watchfolder: {:?}", watch_files_in(&root));
     let job = repo.get_job(id).unwrap().unwrap();
-    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_FAILED")));
+    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_UNCONFIRMED")));
     assert!(job.error_message.unwrap().starts_with("The delivery of 1_ELENI_TEST.mxf was interrupted"));
     assert!(held_file.exists(), "the held file was removed");
     assert_eq!(repo.delivery_marker(id).unwrap().map(|m| m.0), Some(attempted.to_string_lossy().into_owned()));
@@ -593,4 +593,148 @@ async fn a_waiting_video_with_no_attempted_rename_is_delivered_on_its_own() {
 
     assert_eq!(watch_files_in(&root), vec!["1_ELENI_TEST.mxf".to_string()]);
     assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Completed);
+}
+
+// ---------------------------------------------------------------- P11.2b
+
+/// The bytes the crashed run was delivering.
+const CUT: &[u8] = b"the video the crashed run was renaming";
+
+/// P11.2b: a job of host `host` was renaming its video into `root/watch` when
+/// the daemon died, and at start-up the share does not answer (the folder is
+/// not there). Recovery makes it wait for the watchfolder with its marker and
+/// no `ready_*` file; the crashed run's workspace still holds a stale output.
+/// Then the share answers (the folder is back) and the wait is over. Returns
+/// the job leased for the delivery after the wait.
+fn recovered_waiting(repo: &Repository, root: &Path) -> Job {
+    let new = NewJob::new("https://news.example.invalid/crash", "1_ELENI_TEST", "ELENI");
+    let id = repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    assert_eq!(repo.lease_job(OWNER, 600).unwrap().unwrap().id, id);
+    assert!(repo.set_stage(id, OWNER, JobStage::Deliver).unwrap());
+    let ws = root.join("temp").join("jobs").join(id.to_string());
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join(format!("{id}_output.mxf")), b"stale output of the crashed run").unwrap();
+    let target = root.join("watch").join("1_ELENI_TEST.mxf");
+    assert!(repo.mark_delivering(id, OWNER, &target.to_string_lossy(), CUT.len() as u64).unwrap());
+
+    std::fs::remove_dir_all(root.join("watch")).unwrap();
+    assert_eq!(repo.recover_on_startup("host").unwrap(), 1);
+    let row = repo.get_job(id).unwrap().unwrap();
+    assert!(row.delivery_wait && row.ready_path.is_none(), "{:?} {:?}", row.status, row.error_message);
+
+    std::fs::create_dir_all(root.join("watch")).unwrap();
+    rusqlite::Connection::open(root.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![id])
+        .unwrap();
+    let job = repo.lease_job_when(OWNER, 600, true).unwrap().expect("the recovered waiting job");
+    assert_eq!((job.id, job.stage), (id, JobStage::Deliver));
+    job
+}
+
+/// Test 4a: the rename had landed before the crash. Completed with that file,
+/// nothing copied, one file in the watchfolder.
+#[tokio::test]
+async fn a_recovered_wait_whose_rename_landed_is_completed_without_a_copy() {
+    let dir = Scratch::new();
+    let (repo, engine, ctx) = toolless(&dir);
+    let root = dir.0.clone();
+    let job = recovered_waiting(&repo, &root);
+    let landed = root.join("watch").join("1_ELENI_TEST.mxf");
+    std::fs::write(&landed, CUT).unwrap();
+
+    run_waiting_delivery(&repo, &engine, OWNER, &job, &CancellationToken::new(), &ctx).await.unwrap();
+
+    assert_eq!(watch_files_in(&root), vec!["1_ELENI_TEST.mxf".to_string()], "a second copy reached the watchfolder");
+    assert_eq!(std::fs::read(&landed).unwrap(), CUT, "the delivered file was touched");
+    let row = repo.get_job(job.id).unwrap().unwrap();
+    assert_eq!(row.status, JobStatus::Completed);
+    assert_eq!(row.file_path.as_deref(), Some(landed.to_string_lossy().as_ref()));
+    assert!(!row.delivery_wait);
+}
+
+/// Test 4b: the rename was attempted and its file is not there now (it may be
+/// in Dalet already): review with DELIVERY_UNCONFIRMED, nothing copied.
+#[tokio::test]
+async fn a_recovered_wait_whose_file_is_not_there_goes_to_review_as_unconfirmed() {
+    let dir = Scratch::new();
+    let (repo, engine, ctx) = toolless(&dir);
+    let root = dir.0.clone();
+    let job = recovered_waiting(&repo, &root);
+
+    run_waiting_delivery(&repo, &engine, OWNER, &job, &CancellationToken::new(), &ctx).await.unwrap();
+
+    assert!(watch_files_in(&root).is_empty(), "copied: {:?}", watch_files_in(&root));
+    let row = repo.get_job(job.id).unwrap().unwrap();
+    assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::RequiresReview, Some(ErrorCode::DeliveryUnconfirmed.as_str())));
+    assert!(row.error_message.unwrap().starts_with("The delivery of 1_ELENI_TEST.mxf was interrupted"));
+    assert!(repo.lease_job_when(OWNER, 600, true).unwrap().is_none(), "a job in review was leased");
+}
+
+/// Test 4c: a file of another size is at the marker: not this job's. With no
+/// trusted `ready_*` file the job runs again from its link; the other file and
+/// the stale workspace are never delivered or touched.
+#[tokio::test]
+async fn a_recovered_wait_with_another_file_at_the_marker_runs_again_from_its_link() {
+    let dir = Scratch::new();
+    let (repo, engine, ctx) = toolless(&dir);
+    let root = dir.0.clone();
+    let job = recovered_waiting(&repo, &root);
+    let other = root.join("watch").join("1_ELENI_TEST.mxf");
+    std::fs::write(&other, b"someone else's file").unwrap();
+
+    run_waiting_delivery(&repo, &engine, OWNER, &job, &CancellationToken::new(), &ctx).await.unwrap();
+
+    assert_eq!(watch_files_in(&root), vec!["1_ELENI_TEST.mxf".to_string()], "something was delivered");
+    assert_eq!(std::fs::read(&other).unwrap(), b"someone else's file");
+    let row = repo.get_job(job.id).unwrap().unwrap();
+    assert_eq!((row.status, row.stage, row.delivery_wait), (JobStatus::Pending, JobStage::Queued, false));
+    assert_eq!(repo.delivery_marker(job.id).unwrap(), None);
+    assert!(!root.join("temp").join("jobs").join(job.id.to_string()).exists(), "the untrusted workspace stayed");
+    let next = repo.lease_job_when(OWNER, 600, true).unwrap().expect("a full run");
+    assert_eq!((next.id, next.stage), (job.id, JobStage::Extract));
+}
+
+/// P11.2b M2: the waiting file cannot be opened (held open elsewhere). Within
+/// the limit it waits; past two hours from its first park a person is asked
+/// (PIPELINE_FAILED), and the workspace is kept.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_waiting_video_unreadable_for_two_hours_goes_to_review_and_is_kept() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = Scratch::new();
+    let (repo, engine, ctx) = toolless(&dir);
+    let root = dir.0.clone();
+    let id = parked_without_tools(&repo, &root, 1);
+    let ready = root.join("temp").join("jobs").join(id.to_string()).join(format!("{id}_output.mxf"));
+    let held_open = std::fs::OpenOptions::new().read(true).share_mode(0).open(&ready).unwrap();
+
+    // Parked 1 h 59 min ago: it waits.
+    let job = repo.lease_job_when(OWNER, 600, true).unwrap().unwrap();
+    let job = Job { ready_at: Some(chrono::Utc::now() - chrono::Duration::minutes(119)), ..job };
+    run_waiting_delivery(&repo, &engine, OWNER, &job, &CancellationToken::new(), &ctx).await.unwrap();
+    let row = repo.get_job(id).unwrap().unwrap();
+    assert_eq!((row.status, row.delivery_wait), (JobStatus::Pending, true), "{:?}", row.error_message);
+    assert_eq!(row.error_code.as_deref(), Some(ErrorCode::DeliveryFailed.as_str()));
+
+    // Parked 2 h 1 min ago: review.
+    rusqlite::Connection::open(root.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![id])
+        .unwrap();
+    let job = repo.lease_job_when(OWNER, 600, true).unwrap().unwrap();
+    let job = Job { ready_at: Some(chrono::Utc::now() - chrono::Duration::minutes(121)), ..job };
+    run_waiting_delivery(&repo, &engine, OWNER, &job, &CancellationToken::new(), &ctx).await.unwrap();
+    drop(held_open);
+
+    let row = repo.get_job(id).unwrap().unwrap();
+    assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::RequiresReview, Some(ErrorCode::PipelineFailed.as_str())));
+    let msg = row.error_message.clone().unwrap();
+    assert!(msg.starts_with("The finished video in the workspace could not be read for 2 hours: "), "{msg}");
+    assert_eq!(row.lease_owner, None);
+    assert_eq!(std::fs::read(&ready).unwrap(), b"verified", "the workspace was not kept");
+    let events: Vec<(String, String)> = repo.get_job_events(id, 100).unwrap().into_iter().map(|e| (e.level, e.message)).collect();
+    assert!(events.iter().any(|(l, m)| l == "ERROR" && *m == msg), "{events:?}");
+    assert!(repo.get_recent_audit_logs(50).unwrap().iter().any(|a| a.category == "DELIVERY" && a.message.contains(&msg)));
+    assert!(watch_files_in(&root).is_empty());
 }

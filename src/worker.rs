@@ -446,14 +446,16 @@ pub(crate) fn wait_for_watchfolder(
 }
 
 /// A waiting video the engine would not deliver on its own (P11.2a): its
-/// earlier rename may have landed, or the watchfolder changed. The lease
-/// holder sends the job to review, keeping its marker, wait and file. `true`
-/// when `e` is such a case (whatever could be written).
+/// earlier rename may have landed, or the watchfolder changed
+/// (DELIVERY_UNCONFIRMED), or its file could not be read for too long
+/// (PIPELINE_FAILED, P11.2b). The lease holder sends the job to review with
+/// the engine's code, keeping its marker, wait and file. `true` when `e` is
+/// such a case (whatever could be written).
 fn review_if_needs_check(repo: &Repository, job_id: i64, owner: &str, e: &anyhow::Error) -> Result<bool> {
     let Some(check) = e.downcast_ref::<omni_broadcast::pipeline::DeliveryNeedsCheck>() else {
         return Ok(false);
     };
-    if !repo.review_waiting_delivery(job_id, owner, &check.message)? {
+    if !repo.review_waiting_delivery(job_id, owner, check.code.as_str(), &check.message)? {
         warn!("Job #{job_id}: no longer ours; its delivery is left to whoever holds it");
     }
     Ok(true)
@@ -2594,7 +2596,7 @@ mod tests {
         assert_eq!(job.lease_owner, None);
         assert_eq!(job.not_before, None);
         assert_eq!(job.attempts, 1);
-        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::DeliveryFailed.as_str()));
+        assert_eq!(job.error_code.as_deref(), Some(ErrorCode::DeliveryUnconfirmed.as_str()));
         assert_eq!(
             job.error_message.as_deref(),
             Some("An internal error happened while delivering 1_ELENI_P118.mxf; check Dalet before retrying")

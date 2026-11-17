@@ -858,6 +858,14 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN ready_sha256 TEXT;
         "#,
     ),
+    (
+        35,
+        // When a finished video first parked for the watchfolder (P11.2b): a waiting video
+        // whose file cannot be read goes to review after a limit counted from it.
+        r#"
+        ALTER TABLE queue ADD COLUMN ready_at TEXT;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1584,6 +1592,32 @@ mod tests {
             })
             .unwrap();
         assert_eq!(row, (0, None, None, None), "an existing job must not wait for the watchfolder");
+    }
+
+    #[test]
+    fn migration_35_adds_the_park_time_and_existing_rows_have_none() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 34) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, delivery_wait, ready_path) VALUES ('https://example.invalid/v', 'S', 'PENDING', 1, 'x.mxf')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 34);
+        assert!(!columns_of(&conn, "queue").contains(&"ready_at".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(columns_of(&conn, "queue").contains(&"ready_at".to_string()));
+        let at: Option<String> = conn.query_row("SELECT ready_at FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(at, None, "a row parked before the migration has no known park time");
     }
 
     #[test]

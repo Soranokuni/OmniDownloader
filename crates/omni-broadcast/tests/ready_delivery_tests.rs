@@ -291,6 +291,7 @@ async fn a_marker_of_an_older_watchfolder_goes_to_a_person_and_keeps_the_gate_op
     let err = r.engine.deliver_ready(&job, OWNER, None).await.unwrap_err();
 
     let check = err.downcast_ref::<omni_broadcast::pipeline::DeliveryNeedsCheck>().expect("a person decides");
+    assert_eq!(check.code, omni_broadcast::errors::ErrorCode::DeliveryUnconfirmed);
     assert_eq!(
         check.message,
         format!("The watchfolder changed while {SLUG}.mxf was waiting; check {} and Dalet before retrying", old.parent().unwrap().display())
@@ -313,6 +314,7 @@ async fn a_marker_whose_file_is_not_there_is_never_delivered_again_on_its_own() 
 
     assert!(r.watch_files().is_empty(), "delivered again on its own: {:?}", r.watch_files());
     let check = err.downcast_ref::<omni_broadcast::pipeline::DeliveryNeedsCheck>().expect("a person decides");
+    assert_eq!(check.code, omni_broadcast::errors::ErrorCode::DeliveryUnconfirmed);
     assert_eq!(
         check.message,
         format!("The delivery of {SLUG}.mxf was interrupted and the file is not in the watchfolder now. Check Dalet for {SLUG}.mxf before retrying")
@@ -334,6 +336,43 @@ async fn the_leftover_staging_file_of_the_cut_attempt_does_not_push_the_video_to
 
     assert_eq!(r.watch_files(), vec![format!("{SLUG}.mxf")], "the leftover stayed or the video went to _2");
     assert!(!r.events(job.id).iter().any(|e| e.starts_with("Slug collision")), "{:?}", r.events(job.id));
+}
+
+/// P11.2b review finding 2: the video parked at T0; a later delivery attempt
+/// after the wait was cut mid-copy too and left a fresh `.slug.mxf.tmp`, newer
+/// than the park. The next try reclaims it (it was there before that try
+/// began) and lands under the slug itself, with no collision warning.
+#[tokio::test]
+async fn a_staging_file_cut_by_a_later_attempt_does_not_push_the_video_to_2() {
+    let r = rig(false, false);
+    std::fs::create_dir_all(&r.watch).unwrap();
+    let job = r.waiting_job(None);
+    let parked = job.ready_at.expect("the park time was not recorded");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let cut = r.watch.join(format!(".{SLUG}.mxf.tmp"));
+    std::fs::write(&cut, &VIDEO[..7]).unwrap();
+    let touched = chrono::DateTime::<chrono::Utc>::from(std::fs::metadata(&cut).unwrap().modified().unwrap());
+    assert!(touched > parked, "the cut copy must be newer than the first park");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    assert_eq!(r.engine.deliver_ready(&job, OWNER, None).await.unwrap(), ReadyOutcome::Delivered);
+
+    assert_eq!(r.watch_files(), vec![format!("{SLUG}.mxf")], "the leftover stayed or the video went to _2");
+    assert_eq!(std::fs::read(r.watch.join(format!("{SLUG}.mxf"))).unwrap(), VIDEO);
+    assert!(!r.events(job.id).iter().any(|e| e.starts_with("Slug collision")), "{:?}", r.events(job.id));
+}
+
+/// P11.2b M2: the cap on a waiting video that cannot be read counts from its
+/// first park; an unknown park time is never past it.
+#[test]
+fn the_unreadable_wait_is_capped_at_two_hours_from_the_first_park() {
+    use omni_broadcast::pipeline::{unreadable_too_long, UNREADABLE_WAIT_LIMIT};
+    let now = chrono::Utc::now();
+    assert_eq!(UNREADABLE_WAIT_LIMIT, Duration::hours(2));
+    assert!(!unreadable_too_long(Some(now - Duration::minutes(119)), now));
+    assert!(!unreadable_too_long(Some(now - Duration::hours(2)), now));
+    assert!(unreadable_too_long(Some(now - Duration::minutes(121)), now));
+    assert!(!unreadable_too_long(None, now));
 }
 
 /// Finding 5: once the daemon is stopping, a waiting video goes straight back

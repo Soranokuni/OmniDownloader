@@ -501,7 +501,7 @@ enum RecoveryCause {
 pub enum DeliverySettled {
     /// The video is provably in the watchfolder: COMPLETED, as start-up recovery finishes it.
     Completed,
-    /// Not provably delivered: REQUIRES_REVIEW with DELIVERY_FAILED, never requeued.
+    /// Not provably delivered: REQUIRES_REVIEW with DELIVERY_UNCONFIRMED, never requeued.
     Review,
     /// The lease is no longer this worker's: nothing written.
     NotOurs,
@@ -1029,6 +1029,7 @@ impl Repository {
                 ready_path = NULL,
                 ready_bytes = NULL,
                 ready_sha256 = NULL,
+                ready_at = NULL,
                 updated_at = ?
             WHERE id = ? AND lease_owner = ?
             "#,
@@ -1095,7 +1096,7 @@ impl Repository {
         let changed = conn.execute(
             "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
              lease_expires_at=NULL, not_before=?, error_code=?, error_message=?,
-             progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL,
+             progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
              updated_at=?
              WHERE id=? AND lease_owner=?",
             params![not_before, error_code, error_message, now, job_id, owner],
@@ -1125,6 +1126,9 @@ impl Repository {
     /// `lease_next`), so parking it again leaves `attempts` as it is. Waiting
     /// for the share therefore never uses up the job's attempts, and nothing
     /// else gets this.
+    ///
+    /// `ready_at` (P11.2b) is the time of that first park, under the same
+    /// condition: a later park of the same wait keeps it.
     pub fn park_for_delivery(
         &self,
         job_id: i64,
@@ -1135,11 +1139,13 @@ impl Repository {
         duration: f64,
     ) -> Result<bool> {
         let conn = self.pool.get()?;
+        let now = timestamps::now_string();
         let n = conn.execute(
             "UPDATE queue SET attempts = CASE WHEN delivery_wait = 1 THEN attempts ELSE MAX(attempts - 1, 0) END,
+                    ready_at = CASE WHEN delivery_wait = 1 THEN ready_at ELSE ? END,
                     delivery_wait = 1, ready_path = ?, ready_bytes = ?, ready_sha256 = ?, duration_secs = ?, updated_at = ?
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
-            params![ready_path, bytes as i64, sha256, duration, timestamps::now_string(), job_id, owner],
+            params![now, ready_path, bytes as i64, sha256, duration, now, job_id, owner],
         )?;
         Ok(n == 1)
     }
@@ -1190,7 +1196,7 @@ impl Repository {
         let changed = conn.execute(
             "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
              not_before=NULL, error_code=NULL, error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
-             delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL,
+             delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
              delivering_to=NULL, delivering_bytes=NULL, delivering_recorded=NULL, updated_at=?
              WHERE id=? AND lease_owner=? AND status='RUNNING'",
             params![error_message, now, job_id, owner],
@@ -1219,21 +1225,25 @@ impl Repository {
 
     /// A waiting video whose delivery a person must settle (P11.2a): a rename
     /// was attempted and its file is not in the watchfolder now (MCR may have
-    /// moved it into Dalet), or the watchfolder changed while it waited. The
-    /// lease holder sends it to REQUIRES_REVIEW with DELIVERY_FAILED and
-    /// `message`, an ERROR event and a WARN DELIVERY audit row, in one
-    /// transaction. Unlike `finish`, the marker, the wait and the `ready_*`
-    /// file are kept: nothing is lost, and nothing is delivered on its own.
-    /// Only the lease holder of a RUNNING job; `false` otherwise.
-    pub fn review_waiting_delivery(&self, id: i64, owner: &str, message: &str) -> Result<bool> {
+    /// moved it into Dalet), or the watchfolder changed while it waited
+    /// (`error_code` DELIVERY_UNCONFIRMED, P11.2b); or the waiting file could
+    /// not be read for too long (PIPELINE_FAILED). The lease holder sends it
+    /// to REQUIRES_REVIEW with `error_code` and `message`, an ERROR event and
+    /// a WARN DELIVERY audit row, in one transaction. Unlike `finish`, the
+    /// marker, the wait and the `ready_*` file are kept: nothing is lost, and
+    /// nothing is delivered on its own. Only the lease holder of a RUNNING
+    /// job; `false` otherwise. With DELIVERY_UNCONFIRMED and a latest repair
+    /// attempt still `auto_delivering`, the same transaction also writes the
+    /// P10.16b note and ends that attempt as `interrupted`.
+    pub fn review_waiting_delivery(&self, id: i64, owner: &str, error_code: &str, message: &str) -> Result<bool> {
         let mut conn = self.pool.get()?;
         let now = timestamps::now_string();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let n = tx.execute(
             "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
-             error_code='DELIVERY_FAILED', error_message=?, completed_at=?, updated_at=?
+             error_code=?, error_message=?, completed_at=?, updated_at=?
              WHERE id=? AND lease_owner=? AND status='RUNNING'",
-            params![message, now, now, id, owner],
+            params![error_code, message, now, now, id, owner],
         )?;
         if n != 1 {
             return Ok(false);
@@ -1246,12 +1256,55 @@ impl Repository {
             "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
             params![format!("Job {id}: {message}"), now],
         )?;
+        // A trusted recipe's delivery nobody approved, whose arrival is now in doubt: MCR is
+        // told it was one (P10.16b, as start-up recovery tells it), and the marker ends, so it
+        // never reads as an automatic delivery later (P11.2b).
+        if error_code == "DELIVERY_UNCONFIRMED" {
+            Self::close_waiting_auto_delivery(&tx, id, &now)?;
+        }
         tx.commit()?;
         count_finished(JobStatus::RequiresReview);
         if let Some(bus) = &self.events {
             bus.job(id, JobStatus::RequiresReview.as_str(), None, None);
         }
         Ok(true)
+    }
+
+    /// A waiting job leaves the wait without a proven delivery (P11.2b): to
+    /// review as DELIVERY_UNCONFIRMED, cancelled, retried, or after an internal
+    /// error. When its latest repair attempt is still `auto_delivering` (a
+    /// trusted recipe's delivery nobody approved, which may be in Dalet
+    /// already), MCR gets the P10.16b note and the attempt ends `interrupted`.
+    /// `true` when it did. Call it inside the caller's transaction, after the
+    /// caller's own guarded write changed the row.
+    fn close_waiting_auto_delivery(conn: &rusqlite::Connection, id: i64, now: &str) -> Result<bool> {
+        let latest: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT id, outcome FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((attempt, Some(outcome))) = latest else {
+            return Ok(false);
+        };
+        if outcome != "auto_delivering" {
+            return Ok(false);
+        }
+        Self::note_interrupted_auto_delivery(conn, id, now)?;
+        conn.execute(
+            "UPDATE repair_attempts SET outcome = 'interrupted' WHERE id = ? AND outcome = 'auto_delivering'",
+            params![attempt],
+        )?;
+        Ok(true)
+    }
+
+    /// Whether job `id` waits for the watchfolder (P11.2a) right now.
+    fn waits_for_watchfolder(conn: &rusqlite::Connection, id: i64) -> Result<bool> {
+        Ok(conn
+            .query_row("SELECT delivery_wait = 1 FROM queue WHERE id = ?", params![id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// The trusted recipe's automatic delivery that waited for the
@@ -1798,11 +1851,14 @@ impl Repository {
     /// steps not barred there.
     /// Whether MCR pressed «Νέα λήψη» on this job after a trusted recipe delivered it:
     /// its next run is held whatever the trust, so the same video cannot go on air twice
-    /// unapproved (P10.16).
+    /// unapproved (P10.16). Also after «Δοκιμή ξανά» on a waiting job whose
+    /// trusted-recipe delivery was cut and may be in Dalet already (P11.2b):
+    /// that attempt is `interrupted` and `superseded`, a pair only `retry_job`
+    /// writes.
     pub fn job_auto_delivery_superseded(&self, job_id: i64) -> Result<bool> {
         let conn = self.pool.get()?;
         Ok(conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM repair_attempts WHERE job_id = ? AND outcome IN ('auto_delivered','auto_delivering') AND mcr_decision = 'superseded')",
+            "SELECT EXISTS (SELECT 1 FROM repair_attempts WHERE job_id = ? AND outcome IN ('auto_delivered','auto_delivering','interrupted') AND mcr_decision = 'superseded')",
             params![job_id],
             |r| r.get(0),
         )?)
@@ -1985,13 +2041,16 @@ impl Repository {
 
     /// Retention: attempts that started more than `days` days ago (their jobs'
     /// own deletion removes the rest). An automatic delivery of a job that still
-    /// exists stays (P10.16b): it carries the «Λάθος βίντεο» card and the «Νέα λήψη» guard.
+    /// exists stays (P10.16b): it carries the «Λάθος βίντεο» card and the «Νέα λήψη» guard;
+    /// so does a retried waiting delivery's `interrupted` + `superseded` attempt, the same guard (P11.2b).
     pub fn purge_repair_attempts(&self, days: i64) -> Result<usize> {
         let conn = self.pool.get()?;
         let cutoff = timestamps::format(Utc::now() - Duration::days(days));
         Ok(conn.execute(
             "DELETE FROM repair_attempts WHERE started_at < ?
-               AND NOT (COALESCE(outcome, '') IN ('auto_delivered','auto_delivering') AND EXISTS (SELECT 1 FROM queue q WHERE q.id = repair_attempts.job_id))",
+               AND NOT ((COALESCE(outcome, '') IN ('auto_delivered','auto_delivering')
+                         OR (COALESCE(outcome, '') = 'interrupted' AND COALESCE(mcr_decision, '') = 'superseded'))
+                        AND EXISTS (SELECT 1 FROM queue q WHERE q.id = repair_attempts.job_id))",
             params![cutoff],
         )?)
     }
@@ -2124,7 +2183,7 @@ impl Repository {
         for (id, attempts, max_attempts) in expired {
             // Already in the watchfolder: finishing it is the only safe
             // recovery, a requeue would put a second copy on air.
-            if Self::recover_if_delivered(&tx, id, &now, None, RecoveryCause::Restart)? {
+            if Self::recover_if_delivered(&tx, id, &now, None, RecoveryCause::Restart, false)? {
                 finished.push(JobStatus::Completed);
                 continue;
             }
@@ -2203,7 +2262,10 @@ impl Repository {
             let check = Self::check_delivery_marker_with(&conn, *id, timeout, inspect)?;
             // Each job's change and its event land together or not at all.
             let tx = conn.transaction()?;
-            if Self::recover_if_delivered(&tx, *id, &now, check.as_ref(), RecoveryCause::Restart)? {
+            // A marker the share cannot answer about makes the row wait below (P11.2b): it is
+            // recovered as a waiting row, so a trusted recipe's marker survives until the wait ends.
+            let unknown = matches!(check, Some(MarkerCheck::Unknown { .. }));
+            if Self::recover_if_delivered(&tx, *id, &now, check.as_ref(), RecoveryCause::Restart, *waiting || unknown)? {
                 tx.commit()?;
                 count_finished(JobStatus::Completed);
                 continue;
@@ -2230,35 +2292,33 @@ impl Repository {
                 continue;
             }
             if let Some(MarkerCheck::Unknown { path, reason }) = &check {
-                // The rename may have happened and the share cannot say: a requeue could put
-                // a second copy on air, so a person decides.
-                warn!("Job #{id}: cannot tell whether {} was delivered before the restart: {reason}", marker_file_name(path));
+                // The rename may have happened and the share cannot say (it did not answer, or
+                // not in time): a requeue could put a second copy on air. The job waits for the
+                // watchfolder instead, marker kept, and the delivery after the wait asks the
+                // marker first (P11.2b). The crashed run's workspace is not trusted, so nothing
+                // is `ready_*`: a job that must still deliver runs again from its link. Not
+                // leased again for 30 s; the attempt the crashed lease spent is not given back.
+                let name = marker_file_name(path);
+                let line = format!("The daemon restarted while delivering {name}; waiting for the watchfolder to answer");
+                warn!("Job #{id}: cannot tell whether {name} was delivered before the restart: {reason}");
+                requeued += 1;
                 tx.execute(
-                    "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
-                     error_code='DELIVERY_FAILED', error_message=?, updated_at=? WHERE id=?",
-                    params![
-                        format!(
-                            "The daemon restarted while delivering {}, and the watchfolder cannot be read to tell whether it arrived. Check Dalet before retrying",
-                            marker_file_name(path)
-                        ),
-                        now,
-                        id
-                    ],
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+                     not_before=?, progress=0.0, speed='0 Mbps', eta='--:--', delivery_wait=1,
+                     ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
+                     error_code='DELIVERY_FAILED', error_message=?, updated_at=?
+                     WHERE id=?",
+                    params![timestamps::format(Utc::now() + Duration::seconds(30)), line, now, id],
                 )?;
                 tx.execute(
-                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
-                    params![
-                        id,
-                        now,
-                        format!("Restart during delivery of {}; the watchfolder is unreachable, so it is not known whether the video arrived. Not requeued", marker_file_name(path))
-                    ],
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'WARN', ?)",
+                    params![id, now, line],
                 )?;
                 tx.execute(
                     "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
-                    params![format!("Job {id}: restart during delivery and the watchfolder cannot be read; sent to review, not requeued"), now],
+                    params![format!("Job {id}: {line}"), now],
                 )?;
                 tx.commit()?;
-                count_finished(JobStatus::RequiresReview);
                 continue;
             }
             requeued += 1;
@@ -2315,19 +2375,26 @@ impl Repository {
     ///
     /// `cause` only words the events of the marker case: a restart, or a run's
     /// internal error at a delivering stage (P11.8).
+    ///
+    /// `will_wait`: the caller makes the row wait for the watchfolder when it is
+    /// not finished here (start-up recovery of a marker the share cannot answer
+    /// about, P11.2b). Such a row is treated as one that already waits: its
+    /// automatic-delivery marker stays and no "check Dalet" warning is written,
+    /// since nothing has been judged yet.
     fn recover_if_delivered(
         conn: &rusqlite::Connection,
         id: i64,
         now: &str,
         check: Option<&MarkerCheck>,
         cause: RecoveryCause,
+        will_wait: bool,
     ) -> Result<bool> {
         // A video that waited for the watchfolder (P11.2a) and is found delivered waits no more.
         let mut changed = conn.execute(
             "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
              lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
              delivering_to=NULL, delivering_bytes=NULL,
-             delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, updated_at=?
+             delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL, updated_at=?
              WHERE id=? AND status='RUNNING' AND stage = 'ARCHIVE'
                AND NOT EXISTS (SELECT 1 FROM held_outputs h WHERE h.job_id = queue.id AND h.decision = 'approved')",
             params![now, now, id],
@@ -2347,7 +2414,7 @@ impl Repository {
                 "UPDATE queue SET status='COMPLETED', stage='DONE', lease_owner=NULL,
                  lease_expires_at=NULL, progress=100.0, completed_at=?, error_code=NULL, error_message=NULL,
                  file_path=?, delivering_to=NULL, delivering_bytes=NULL,
-                 delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, updated_at=?
+                 delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL, updated_at=?
                  WHERE id=? AND status='RUNNING'",
                 params![now, path, now, id],
             )?;
@@ -2406,10 +2473,11 @@ impl Repository {
         // A video that waits for the watchfolder (P11.2a) keeps its marker: its delivery is not
         // over, and the delivery after the wait asks the watchfolder before it copies.
         if changed == 0 {
-            let waiting: bool = conn
-                .query_row("SELECT delivery_wait = 1 FROM queue WHERE id = ?", params![id], |r| r.get(0))
-                .optional()?
-                .unwrap_or(false);
+            let waiting: bool = will_wait
+                || conn
+                    .query_row("SELECT delivery_wait = 1 FROM queue WHERE id = ?", params![id], |r| r.get(0))
+                    .optional()?
+                    .unwrap_or(false);
             if waiting {
                 return Ok(false);
             }
@@ -2426,14 +2494,7 @@ impl Repository {
                     |r| r.get(0),
                 )?;
             if at_deliver {
-                conn.execute(
-                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'WARN', ?)",
-                    params![id, now, "Διακοπή κατά την αυτόματη παράδοση χωρίς έγκριση: ελέγξτε αν το βίντεο είναι ήδη στο Dalet"],
-                )?;
-                conn.execute(
-                    "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
-                    params![format!("Job {id}: interrupted at DELIVER during a trusted recipe's delivery without approval; the video may already be in the watchfolder"), now],
-                )?;
+                Self::note_interrupted_auto_delivery(conn, id, now)?;
             }
         }
         conn.execute(
@@ -2443,12 +2504,27 @@ impl Repository {
         Ok(changed == 1)
     }
 
+    /// MCR's note that a trusted recipe's delivery without approval was cut at
+    /// DELIVER and may already be in the watchfolder (P10.16b): a WARN job event
+    /// and a WARN REPAIR audit row. The caller ends the attempt's marker.
+    fn note_interrupted_auto_delivery(conn: &rusqlite::Connection, id: i64, now: &str) -> Result<()> {
+        conn.execute(
+            "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'WARN', ?)",
+            params![id, now, "Διακοπή κατά την αυτόματη παράδοση χωρίς έγκριση: ελέγξτε αν το βίντεο είναι ήδη στο Dalet"],
+        )?;
+        conn.execute(
+            "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'REPAIR', ?, ?)",
+            params![format!("Job {id}: interrupted at DELIVER during a trusted recipe's delivery without approval; the video may already be in the watchfolder"), now],
+        )?;
+        Ok(())
+    }
+
     /// The run holding the lease hit an internal error (a panic) while the job was
     /// at DELIVER, ARCHIVE or DONE (P11.8). The rename may already have happened, so
     /// the job is never requeued: the rule start-up recovery applies decides. A
     /// marker whose file is in the watchfolder whole, a recorded delivery, or stage
     /// ARCHIVE finishes it COMPLETED exactly as recovery does; anything else goes to
-    /// REQUIRES_REVIEW with DELIVERY_FAILED, the marker kept, for MCR to check Dalet.
+    /// REQUIRES_REVIEW with DELIVERY_UNCONFIRMED (P11.2b), the marker kept, for MCR to check Dalet.
     /// Only while `owner` holds the lease (checked in the same IMMEDIATE transaction);
     /// otherwise nothing is written. Blocking: looks at the watchfolder for up to
     /// 15 s first, outside the transaction.
@@ -2466,7 +2542,7 @@ impl Repository {
         if !ours {
             return Ok(DeliverySettled::NotOurs);
         }
-        if Self::recover_if_delivered(&tx, id, &now, check.as_ref(), RecoveryCause::InternalError)? {
+        if Self::recover_if_delivered(&tx, id, &now, check.as_ref(), RecoveryCause::InternalError, false)? {
             tx.commit()?;
             count_finished(JobStatus::Completed);
             return Ok(DeliverySettled::Completed);
@@ -2487,7 +2563,7 @@ impl Repository {
         };
         let n = tx.execute(
             "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
-             error_code='DELIVERY_FAILED', error_message=?, updated_at=?
+             error_code='DELIVERY_UNCONFIRMED', error_message=?, updated_at=?
              WHERE id=? AND lease_owner=? AND status='RUNNING'",
             params![
                 format!("An internal error happened while delivering {name}; check Dalet before retrying"),
@@ -2507,6 +2583,10 @@ impl Repository {
             "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
             params![format!("Job {id}: internal error during delivery of {name}; sent to review, not requeued"), now],
         )?;
+        // A waiting trusted-recipe delivery keeps its marker through `recover_if_delivered`;
+        // it ends here, with MCR's note (P11.2b). A row that did not wait was already
+        // closed there, so this finds nothing and writes nothing twice.
+        Self::close_waiting_auto_delivery(&tx, id, &now)?;
         tx.commit()?;
         count_finished(JobStatus::RequiresReview);
         Ok(DeliverySettled::Review)
@@ -2540,7 +2620,7 @@ impl Repository {
         let n = conn.execute(
             "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?,
                     delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END,
-                    delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL
+                    delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![file_path, duration, timestamps::now_string(), file_path, id, owner],
         )?;
@@ -2940,6 +3020,7 @@ impl Repository {
     pub fn retry_job(&self, id: i64, new_url: Option<&str>) -> Result<bool> {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let waiting = Self::waits_for_watchfolder(&tx, id)?;
         let n = tx.execute(
             r#"
             UPDATE queue
@@ -2948,7 +3029,7 @@ impl Repository {
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
                 url_normalized = COALESCE(?, url_normalized),
-                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 updated_at = ?
             WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED','AWAITING_APPROVAL')
             "#,
@@ -2977,6 +3058,18 @@ impl Repository {
                  WHERE job_id = ? AND rung = 'next' AND outcome IS NULL",
                 params![timestamps::now_string(), id],
             )?;
+            // A waiting trusted-recipe delivery nobody approved may already be in Dalet
+            // (P11.2b): MCR is told, and the new run is held for approval whatever the
+            // trust, as after «Νέα λήψη» (`job_auto_delivery_superseded`), so the same
+            // video cannot go on air a second time unapproved.
+            if waiting && Self::close_waiting_auto_delivery(&tx, id, &timestamps::now_string())? {
+                tx.execute(
+                    "UPDATE repair_attempts SET mcr_decision = 'superseded'
+                     WHERE id = (SELECT id FROM repair_attempts WHERE job_id = ? ORDER BY id DESC LIMIT 1)
+                       AND outcome = 'interrupted' AND mcr_decision IS NULL",
+                    params![id],
+                )?;
+            }
         }
         tx.commit()?;
         if n > 0 {
@@ -2997,7 +3090,7 @@ impl Repository {
             UPDATE queue
             SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
-                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL
             WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','AWAITING_APPROVAL')
             "#,
@@ -3015,26 +3108,34 @@ impl Repository {
     /// job is in DELIVER the file is on its way to the watchfolder and the
     /// cancel is refused.
     pub fn cancel_job(&self, id: i64) -> Result<CancelOutcome> {
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
         let now = timestamps::now_string();
-        let n = conn.execute(
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let waiting = Self::waits_for_watchfolder(&tx, id)?;
+        let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
-                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 completed_at = ?, updated_at = ?
             WHERE id = ? AND (status IN ('PENDING','AWAITING_APPROVAL') OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
             "#,
             params![now, now, id],
         )?;
         if n > 0 {
+            // A waiting trusted-recipe delivery may already be in Dalet (P11.2b).
+            if waiting {
+                Self::close_waiting_auto_delivery(&tx, id, &now)?;
+            }
+            tx.commit()?;
             count_finished(JobStatus::Cancelled);
             self.log_audit("WARN", "QUEUE", &format!("Cancelled Job #{}", id))?;
             return Ok(CancelOutcome::Cancelled);
         }
-        let row: Option<(String, String)> = conn
+        let row: Option<(String, String)> = tx
             .query_row("SELECT status, stage FROM queue WHERE id = ?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
+        drop(tx);
         Ok(match row {
             Some((status, stage)) if status == "RUNNING" && matches!(stage.as_str(), "DELIVER" | "ARCHIVE" | "DONE") => CancelOutcome::TooLate,
             _ => CancelOutcome::NotCancellable,
@@ -3045,22 +3146,30 @@ impl Repository {
     /// (P7.3). One guarded UPDATE: ownership and PENDING are checked in the
     /// same statement that changes the row, so nothing can slip in between.
     pub fn cancel_own_pending(&self, id: i64, user_id: i64) -> Result<OwnCancelOutcome> {
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
         let now = timestamps::now_string();
-        let n = conn.execute(
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let waiting = Self::waits_for_watchfolder(&tx, id)?;
+        let n = tx.execute(
             r#"
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
-                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 completed_at = ?, updated_at = ?
             WHERE id = ? AND submitted_by_user_id = ? AND status = 'PENDING'
             "#,
             params![now, now, id, user_id],
         )?;
         if n > 0 {
+            // A waiting trusted-recipe delivery may already be in Dalet (P11.2b).
+            if waiting {
+                Self::close_waiting_auto_delivery(&tx, id, &now)?;
+            }
+            tx.commit()?;
             count_finished(JobStatus::Cancelled);
             return Ok(OwnCancelOutcome::Cancelled);
         }
+        drop(tx);
         let owned: Option<i64> = conn
             .query_row(
                 "SELECT id FROM queue WHERE id = ? AND submitted_by_user_id = ?",
@@ -3191,6 +3300,7 @@ impl Repository {
             ready_path: row.get("ready_path").ok().flatten(),
             ready_bytes: row.get("ready_bytes").ok().flatten(),
             ready_sha256: row.get("ready_sha256").ok().flatten(),
+            ready_at: timestamps::parse_opt(row.get("ready_at").ok().flatten()),
 
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
@@ -5034,7 +5144,7 @@ impl Repository {
         let n = tx.execute(
             "UPDATE queue SET file_path = ?, duration_secs = ?, updated_at = ?,
                     delivering_recorded = CASE WHEN delivering_to = ? THEN 1 ELSE delivering_recorded END,
-                    delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL
+                    delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL
              WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'",
             params![path, duration, timestamps::now_string(), path, job_id, owner],
         )?;
@@ -5072,7 +5182,7 @@ impl Repository {
                 error_code = NULL, error_message = NULL, progress = 100.0,
                 completed_at = ?, delivered_at = ?, updated_at = ?,
                 delivering_to = NULL, delivering_bytes = NULL,
-                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL,
+                delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 stage_timings_json = COALESCE(?, stage_timings_json)
             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING'
               AND file_path IS NOT NULL AND file_path != ''
@@ -7227,8 +7337,11 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// P11.2b test 2: a share that does not answer the start-up look in time is
+    /// not "no marker": the job waits for the watchfolder with its marker, and is
+    /// never requeued from scratch (which could deliver it a second time as `_1`).
     #[test]
-    fn a_marker_check_that_times_out_sends_the_job_to_review_not_back_to_the_queue() -> Result<()> {
+    fn a_marker_check_that_times_out_makes_the_job_wait_for_the_watchfolder_not_rerun() -> Result<()> {
         use std::time::Duration;
         let temp_db = NamedTempFile::new()?;
         let repo = Repository::new(temp_db.path())?;
@@ -7236,23 +7349,28 @@ mod tests {
             .enqueue(&NewJob::new("https://example.invalid/v/9", "9_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?
             .job_id();
         assert!(repo.lease_job("host:1:0", 3600)?.is_some());
+        assert!(repo.set_stage(id, "host:1:0", JobStage::Deliver)?);
         assert!(repo.mark_delivering(id, "host:1:0", "X:/share/9_ANNA_TEST.mxf", 100)?);
+        let attempts = repo.get_job(id)?.unwrap().attempts;
 
         // The share hangs past the limit; the file may or may not be there.
-        let requeued = repo.recover_on_startup_with("host", Duration::from_millis(50), |_, _| {
+        let before = Utc::now();
+        repo.recover_on_startup_with("host", Duration::from_millis(50), |_, _| {
             std::thread::sleep(Duration::from_secs(2));
             MarkerCheck::Missing
         })?;
 
-        assert_eq!(requeued, 0, "a job whose watchfolder did not answer was requeued");
         let job = repo.get_job(id)?.unwrap();
-        assert_eq!(job.status, JobStatus::RequiresReview);
+        assert!(job.delivery_wait, "requeued from scratch: the video could be delivered twice");
+        assert_eq!((job.status, job.stage), (JobStatus::Pending, JobStage::Queued));
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.attempts, attempts);
+        assert_eq!((job.ready_path, job.ready_bytes, job.ready_sha256, job.ready_at), (None, None, None, None));
         assert_eq!(job.error_code.as_deref(), Some("DELIVERY_FAILED"));
-        let events = repo.get_job_events(id, 50)?;
-        assert!(
-            events.iter().any(|e| e.level == "ERROR" && e.message.contains("not known whether the video arrived")),
-            "no review event: {events:?}"
-        );
+        let nb = job.not_before.expect("not before");
+        assert!(nb >= before + chrono::Duration::seconds(29), "{nb} vs {before}");
+        assert_eq!(repo.delivery_marker(id)?, Some(("X:/share/9_ANNA_TEST.mxf".to_string(), 100, false)));
+        assert!(repo.parked_job_ids()?.contains(&id));
         Ok(())
     }
 
@@ -7282,7 +7400,7 @@ mod tests {
         assert_eq!(repo.settle_after_delivery_panic(id, "host:1:0")?, DeliverySettled::Review);
         let job = repo.get_job(id)?.unwrap();
         assert_eq!(job.status, JobStatus::RequiresReview);
-        assert_eq!(job.error_code.as_deref(), Some("DELIVERY_FAILED"));
+        assert_eq!(job.error_code.as_deref(), Some("DELIVERY_UNCONFIRMED"));
         assert_eq!(job.lease_owner, None);
         let marker: Option<String> = repo.pool.get()?.query_row("SELECT delivering_to FROM queue WHERE id = ?", params![id], |r| r.get(0))?;
         assert_eq!(marker.as_deref(), Some(path.to_string_lossy().as_ref()), "the marker MCR needs was cleared");
