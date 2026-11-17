@@ -101,11 +101,13 @@ pub struct RetentionCounts {
     pub audit: usize,
     pub mail: usize,
     pub sessions: usize,
+    /// Autonomy outcome rows older than [`OUTCOME_KEEP_DAYS`] (P11.0).
+    pub outcomes: usize,
 }
 
 impl RetentionCounts {
     pub fn total(&self) -> usize {
-        self.jobs + self.job_events + self.evidence + self.audit + self.mail + self.sessions
+        self.jobs + self.job_events + self.evidence + self.audit + self.mail + self.sessions + self.outcomes
     }
 }
 
@@ -446,6 +448,113 @@ fn local_midnight_utc() -> chrono::DateTime<Utc> {
         .map(|d| d.with_timezone(&Utc))
         // A midnight that does not exist locally: fall back to 24 h ago.
         .unwrap_or_else(|| Utc::now() - Duration::hours(24))
+}
+
+/// Days an autonomy outcome row is kept (P11.0): longer than a year, so the
+/// report can compare a month with the same month last year.
+pub const OUTCOME_KEEP_DAYS: i64 = 400;
+
+/// The rows `autonomy_report` reads (?1 = since); pub so a test can ask SQLite for its plan.
+pub const AUTONOMY_ROWS_SQL: &str =
+    "SELECT outcome, touched, touch_reason, first_error_code, site, from_mail
+     FROM job_outcomes WHERE ended_at >= ?1";
+
+/// One batch of old outcome rows (?1 = cutoff, ?2 = batch).
+pub const PURGE_OUTCOMES_SQL: &str = "DELETE FROM job_outcomes WHERE id IN
+     (SELECT id FROM job_outcomes WHERE ended_at < ?1 LIMIT ?2)";
+
+/// The statuses of a job that has not ended (P11.0): discarding one of these
+/// is an ending of its own. A COMPLETED, COMPLETED_MANUAL or CANCELLED job
+/// already has the outcome row of its ending.
+const NOT_ENDED_STATUSES: &[&str] =
+    &["PENDING", "RUNNING", "REQUIRES_REVIEW", "MANUAL_DOWNLOAD", "AWAITING_APPROVAL", "FAILED"];
+
+/// The calendar day of `at` in the server's local time, as the desk's
+/// "today" counts it ([`local_midnight_utc`]).
+fn local_day(at: chrono::DateTime<Utc>) -> String {
+    at.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()
+}
+
+/// The site an outcome row may name: the registrable domain of a web link's
+/// plain host, nothing else. The host is cut out first (no path, query,
+/// fragment, `user:pass@` or `:port`), so no part of the address can reach
+/// the row. An attachment's address (it holds a message id), an IP address or
+/// anything that is not a dotted host name is `None`.
+fn outcome_site(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    if !matches!(trimmed[..scheme_end].to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let rest = &trimmed[scheme_end + 3..];
+    let authority = &rest[..rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len())];
+    let host_port = authority.rsplit('@').next()?;
+    if host_port.starts_with('[') {
+        return None; // an IPv6 literal
+    }
+    let host = host_port.split(':').next()?.trim_end_matches('.').to_ascii_lowercase();
+    let plain = |h: &str| {
+        h.contains('.')
+            && h.split('.').all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+            && !h.split('.').all(|l| l.chars().all(|c| c.is_ascii_digit()))
+    };
+    if !plain(&host) {
+        return None;
+    }
+    crate::urlnorm::registrable_domain(&format!("https://{host}/")).filter(|d| plain(d))
+}
+
+/// [`record_outcome`] that can never fail the ending it records (P11.0): it
+/// runs inside a savepoint of the caller's transaction, and on any error the
+/// savepoint is rolled back, a warning names the job and the outcome, and the
+/// caller's transaction goes on to commit the ending exactly as without the
+/// statistic. A delivery must never be undone by its own bookkeeping.
+fn record_outcome_best_effort(conn: &rusqlite::Connection, id: i64, outcome: &str, ended_at: &str, discard: bool) {
+    best_effort_outcome_write(conn, id, outcome, || record_outcome(conn, id, outcome, ended_at, discard));
+}
+
+/// Run `write` (a write to `job_outcomes` only) inside a savepoint; on error roll
+/// it back and log a warning instead of failing the caller.
+fn best_effort_outcome_write(conn: &rusqlite::Connection, id: i64, outcome: &str, write: impl FnOnce() -> Result<()>) {
+    let result = conn.execute_batch("SAVEPOINT job_outcome").map_err(anyhow::Error::from).and_then(|()| {
+        match write() {
+            Ok(()) => conn.execute_batch("RELEASE job_outcome").map_err(anyhow::Error::from),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO job_outcome; RELEASE job_outcome");
+                Err(e)
+            }
+        }
+    });
+    if let Err(e) = result {
+        warn!(job_id = id, outcome, "Autonomy outcome row not written; the job's ending stands: {e:#}");
+    }
+}
+
+/// The one `job_outcomes` row of an ending of job `id` (P11.0), copied from
+/// the job row as it is now. Call it through [`record_outcome_best_effort`] in
+/// the caller's transaction, after its guarded write ended the row (or, for a
+/// discard, before the DELETE). `discard` records the operator's discard as
+/// the touch. Writes nothing for a job that is gone.
+fn record_outcome(conn: &rusqlite::Connection, id: i64, outcome: &str, ended_at: &str, discard: bool) -> Result<()> {
+    let row: Option<(String, i64, Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT url, human_touched, touch_reason, first_error_code, email_message_id FROM queue WHERE id = ?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((url, touched, reason, first_error, mail)) = row else {
+        return Ok(());
+    };
+    let (touched, reason) = if discard { (true, Some("discard".to_string())) } else { (touched != 0, reason) };
+    let from_mail = mail.is_some_and(|m| !m.trim().is_empty());
+    let day = local_day(timestamps::parse(ended_at).unwrap_or_else(Utc::now));
+    conn.execute(
+        "INSERT INTO job_outcomes (job_id, ended_at, day, site, outcome, touched, touch_reason, first_error_code, from_mail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![id, ended_at, day, outcome_site(&url), outcome, touched, reason, first_error, from_mail],
+    )?;
+    Ok(())
 }
 
 /// What [`Repository::cancel_job`] did.
@@ -838,6 +947,7 @@ impl Repository {
             group_code: None,
             max_videos: None,
             parent_job_id: None,
+            queued_by_operator: false,
         };
         Ok(self.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id())
     }
@@ -935,8 +1045,8 @@ impl Repository {
                 url, url_normalized, slug, journalist, keyword, index_str, priority,
                 status, stage, submitted_by_user_id, notes, email_source,
                 email_message_id, extraction_method, group_code, max_videos, parent_job_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, human_touched, touch_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 job.url,
@@ -956,7 +1066,10 @@ impl Repository {
                 job.max_videos.filter(|n| *n > 0),
                 job.parent_job_id,
                 now,
-                now
+                now,
+                // MCR queued an offered video or a skipped mail link by hand (P11.0).
+                job.queued_by_operator,
+                job.queued_by_operator.then_some("queued")
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1018,6 +1131,7 @@ impl Repository {
                 lease_owner = NULL,
                 lease_expires_at = NULL,
                 error_code = ?,
+                first_error_code = COALESCE(first_error_code, ?),
                 error_message = ?,
                 file_path = COALESCE(?, file_path),
                 progress = CASE WHEN ? = 'COMPLETED' THEN 100.0 ELSE progress END,
@@ -1038,6 +1152,7 @@ impl Repository {
                 timings,
                 status.as_str(),
                 error_code,
+                error_code,
                 error_message,
                 file_path,
                 status.as_str(),
@@ -1050,6 +1165,10 @@ impl Repository {
                 owner
             ],
         )?;
+        // The lease guard makes this once per ending: the write above clears the lease.
+        if changed == 1 && delivered {
+            record_outcome_best_effort(&tx, job_id, "delivered", &now, false);
+        }
         tx.commit()?;
         if changed == 1 {
             StageClose::observe(&close);
@@ -1125,12 +1244,12 @@ impl Repository {
         let not_before = timestamps::format(Utc::now() + backoff);
         let changed = conn.execute(
             "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
-             lease_expires_at=NULL, not_before=?, error_code=?, error_message=?,
-             max_attempts = COALESCE(?, max_attempts),
+             lease_expires_at=NULL, not_before=?, error_code=?, first_error_code = COALESCE(first_error_code, ?),
+             error_message=?, max_attempts = COALESCE(?, max_attempts),
              progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
              updated_at=?
              WHERE id=? AND lease_owner=?",
-            params![not_before, error_code, error_message, max_attempts, now, job_id, owner],
+            params![not_before, error_code, error_code, error_message, max_attempts, now, job_id, owner],
         )?;
         if changed == 1 {
             self.record_event(
@@ -1200,7 +1319,8 @@ impl Repository {
             .flatten();
         let changed = conn.execute(
             "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
-             not_before=?, error_code='DELIVERY_FAILED', error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
+             not_before=?, error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
+             error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
              updated_at=?
              WHERE id=? AND lease_owner=? AND status='RUNNING' AND delivery_wait=1",
             params![not_before, error_message, now, job_id, owner],
@@ -1272,9 +1392,9 @@ impl Repository {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let n = tx.execute(
             "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
-             error_code=?, error_message=?, completed_at=?, updated_at=?
+             error_code=?, first_error_code = COALESCE(first_error_code, ?), error_message=?, completed_at=?, updated_at=?
              WHERE id=? AND lease_owner=? AND status='RUNNING'",
-            params![error_code, message, now, now, id, owner],
+            params![error_code, error_code, message, now, now, id, owner],
         )?;
         if n != 1 {
             return Ok(false);
@@ -1709,7 +1829,8 @@ impl Repository {
         let changed = conn.execute(
             // A waiting job keeps its updated_at: it is the start of its wait (plan P7.19).
             "UPDATE queue SET keyword = ?, slug = ?,
-                    updated_at = CASE WHEN status = 'PENDING' THEN updated_at ELSE ? END
+                    updated_at = CASE WHEN status = 'PENDING' THEN updated_at ELSE ? END,
+                    human_touched = 1, touch_reason = COALESCE(touch_reason, 'rename')
              WHERE id = ?
                AND (status IN ('PENDING', 'REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'FAILED')
                     OR (status = 'RUNNING' AND stage IN ('QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE')))
@@ -2238,7 +2359,8 @@ impl Repository {
             } else {
                 tx.execute(
                     "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
-                     error_code='LEASE_EXPIRED', error_message=?, updated_at=? WHERE id=?",
+                     error_code='LEASE_EXPIRED', first_error_code = COALESCE(first_error_code, 'LEASE_EXPIRED'),
+                     error_message=?, updated_at=? WHERE id=?",
                     params![
                         format!("Lease expired after {attempts} attempts without completing"),
                         now,
@@ -2313,7 +2435,8 @@ impl Repository {
                 tx.execute(
                     "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
                      lease_expires_at=NULL, not_before=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
-                     error_code='DELIVERY_FAILED', updated_at=?
+                     error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
+                     updated_at=?
                      WHERE id=?",
                     params![now, id],
                 )?;
@@ -2339,7 +2462,8 @@ impl Repository {
                     "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
                      not_before=?, progress=0.0, speed='0 Mbps', eta='--:--', delivery_wait=1,
                      ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
-                     error_code='DELIVERY_FAILED', error_message=?, updated_at=?
+                     error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
+                     error_message=?, updated_at=?
                      WHERE id=?",
                     params![timestamps::format(Utc::now() + Duration::seconds(30)), line, now, id],
                 )?;
@@ -2484,6 +2608,8 @@ impl Repository {
             }
         }
         if changed == 1 {
+            // Both completions above are guarded by status RUNNING, so a job is counted once.
+            record_outcome_best_effort(conn, id, "delivered", now, false);
             // A trusted recipe's delivery that a crash cut short: the marker the ladder wrote
             // before the pipeline ran becomes the outcome, and MCR is told (P10.16b).
             let marked = conn.execute(
@@ -2596,7 +2722,8 @@ impl Repository {
         };
         let n = tx.execute(
             "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
-             error_code='DELIVERY_UNCONFIRMED', error_message=?, updated_at=?
+             error_code='DELIVERY_UNCONFIRMED', first_error_code = COALESCE(first_error_code, 'DELIVERY_UNCONFIRMED'),
+             error_message=?, updated_at=?
              WHERE id=? AND lease_owner=? AND status='RUNNING'",
             params![
                 format!("An internal error happened while delivering {name}; check Dalet before retrying"),
@@ -3070,6 +3197,9 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 file_path = NULL, delivered_at = NULL, completed_at = NULL, cleared_at = NULL,
+                -- The new run is not reset to untouched: the re-download is itself a person's
+                -- act, so its own outcome row counts as touched (P11.0).
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'redownload'),
                 retry_from = ?1, updated_at = ?1
             WHERE id = ?2 AND status IN ('COMPLETED','COMPLETED_MANUAL')
             "#,
@@ -3108,10 +3238,18 @@ impl Repository {
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
                 url_normalized = COALESCE(?, url_normalized),
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
+                human_touched = 1, touch_reason = COALESCE(touch_reason, ?),
                 retry_from = ?, updated_at = ?
             WHERE id = ? AND status IN ('PENDING','REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','CANCELLED','AWAITING_APPROVAL')
             "#,
-            params![new_url, new_url.map(crate::urlnorm::normalize), now, now, id],
+            params![
+                new_url,
+                new_url.map(crate::urlnorm::normalize),
+                if new_url.is_some() { "override" } else { "retry" },
+                now,
+                now,
+                id
+            ],
         )?;
         if n > 0 {
             // A new run, possibly of another link: a file held (or approved
@@ -3171,7 +3309,8 @@ impl Repository {
     pub fn run_now(&self, id: i64) -> Result<bool> {
         let conn = self.pool.get()?;
         let n = conn.execute(
-            "UPDATE queue SET not_before = NULL, updated_at = ?
+            "UPDATE queue SET not_before = NULL, updated_at = ?,
+                    human_touched = 1, touch_reason = COALESCE(touch_reason, 'now')
              WHERE id = ? AND status = 'PENDING' AND not_before IS NOT NULL AND delivery_wait = 0",
             params![timestamps::now_string(), id],
         )?;
@@ -3197,13 +3336,18 @@ impl Repository {
             SET status = 'COMPLETED_MANUAL', stage = 'DONE', progress = 100.0, speed = '0 Mbps', eta = '--:--',
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
-                completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL
+                completed_at = ?, delivered_at = ?, updated_at = ?, cleared_at = NULL,
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'manual_done')
             WHERE id = ? AND status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED','AWAITING_APPROVAL')
             "#,
             params![now, now, now, id],
         )?;
         if n > 0 && waiting {
             Self::close_waiting_auto_delivery(&tx, id, &now)?;
+        }
+        // The status guard above makes this once per ending.
+        if n > 0 {
+            record_outcome_best_effort(&tx, id, "delivered_manual", &now, false);
         }
         tx.commit()?;
         if n > 0 {
@@ -3227,7 +3371,8 @@ impl Repository {
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
-                completed_at = ?, updated_at = ?
+                completed_at = ?, updated_at = ?,
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'cancel')
             WHERE id = ? AND (status IN ('PENDING','AWAITING_APPROVAL') OR (status = 'RUNNING' AND stage NOT IN ('DELIVER','ARCHIVE','DONE')))
             "#,
             params![now, now, id],
@@ -3237,6 +3382,8 @@ impl Repository {
             if waiting {
                 Self::close_waiting_auto_delivery(&tx, id, &now)?;
             }
+            // A CANCELLED job never matches the guard again, so it is counted once.
+            record_outcome_best_effort(&tx, id, "cancelled", &now, false);
             tx.commit()?;
             count_finished(JobStatus::Cancelled);
             self.log_audit("WARN", "QUEUE", &format!("Cancelled Job #{}", id))?;
@@ -3265,7 +3412,8 @@ impl Repository {
             UPDATE queue
             SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
-                completed_at = ?, updated_at = ?
+                completed_at = ?, updated_at = ?,
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'cancel')
             WHERE id = ? AND submitted_by_user_id = ? AND status = 'PENDING'
             "#,
             params![now, now, id, user_id],
@@ -3275,6 +3423,7 @@ impl Repository {
             if waiting {
                 Self::close_waiting_auto_delivery(&tx, id, &now)?;
             }
+            record_outcome_best_effort(&tx, id, "cancelled", &now, false);
             tx.commit()?;
             count_finished(JobStatus::Cancelled);
             return Ok(OwnCancelOutcome::Cancelled);
@@ -3313,9 +3462,21 @@ impl Repository {
         Ok(n > 0)
     }
 
+    /// MCR discards a job: the row and its history go. A job that had not
+    /// ended gets its `discarded` outcome row first, in the same transaction
+    /// (P11.0); a finished one (COMPLETED, COMPLETED_MANUAL, CANCELLED) already
+    /// has the row of its ending, so tidying it away writes none.
     pub fn delete_job(&self, id: i64) -> Result<()> {
-        let conn = self.pool.get()?;
-        conn.execute("DELETE FROM queue WHERE id = ?", params![id])?;
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let status: Option<String> = tx
+            .query_row("SELECT status FROM queue WHERE id = ?", params![id], |r| r.get(0))
+            .optional()?;
+        if status.is_some_and(|s| NOT_ENDED_STATUSES.contains(&s.as_str())) {
+            record_outcome_best_effort(&tx, id, "discarded", &timestamps::now_string(), true);
+        }
+        tx.execute("DELETE FROM queue WHERE id = ?", params![id])?;
+        tx.commit()?;
         self.log_audit("WARN", "QUEUE", &format!("Deleted Job #{}", id))?;
         Ok(())
     }
@@ -3331,12 +3492,25 @@ impl Repository {
         Ok(count)
     }
 
+    /// Discard every failed and review job; each gets its `discarded` outcome
+    /// row (P11.0) in the transaction that deletes it.
     pub fn clear_failed_jobs(&self) -> Result<usize> {
-        let conn = self.pool.get()?;
-        let count = conn.execute(
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM queue WHERE status IN ('FAILED', 'REQUIRES_REVIEW')")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = timestamps::now_string();
+        for id in &ids {
+            record_outcome_best_effort(&tx, *id, "discarded", &now, true);
+        }
+        let count = tx.execute(
             "DELETE FROM queue WHERE status IN ('FAILED', 'REQUIRES_REVIEW')",
             [],
         )?;
+        tx.commit()?;
         self.log_audit("WARN", "ADMIN", &format!("Cleared {} failed/review jobs from queue", count))?;
         Ok(count)
     }
@@ -3412,6 +3586,9 @@ impl Repository {
             ready_sha256: row.get("ready_sha256").ok().flatten(),
             ready_at: timestamps::parse_opt(row.get("ready_at").ok().flatten()),
             retry_from: timestamps::parse_opt(row.get("retry_from").ok().flatten()),
+            human_touched: row.get::<_, Option<i64>>("human_touched").ok().flatten().unwrap_or(0) != 0,
+            touch_reason: row.get("touch_reason").ok().flatten(),
+            first_error_code: row.get("first_error_code").ok().flatten(),
 
             created_at: timestamps::parse_opt(row.get("created_at").ok()),
             updated_at: timestamps::parse_opt(row.get("updated_at").ok()),
@@ -5337,6 +5514,8 @@ impl Repository {
             "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, NULL, 'INFO', 'Finished as COMPLETED')",
             params![job_id, now],
         )?;
+        // The lease guard makes this once per ending, as in `finish_at`.
+        record_outcome_best_effort(&tx, job_id, "delivered", &now, false);
         tx.commit()?;
         StageClose::observe(&close);
         count_finished(JobStatus::Completed);
@@ -5378,6 +5557,7 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'approve'),
                 retry_from = ?, updated_at = ?
             WHERE id = ? AND status = 'AWAITING_APPROVAL'
             "#,
@@ -5411,6 +5591,8 @@ impl Repository {
             r#"
             UPDATE queue
             SET status = 'REQUIRES_REVIEW', error_code = 'REJECTED_BY_MCR', error_message = ?,
+                first_error_code = COALESCE(first_error_code, 'REJECTED_BY_MCR'),
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'reject'),
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 completed_at = ?, cleared_at = NULL, updated_at = ?
             WHERE id = ? AND status = 'AWAITING_APPROVAL'
@@ -5445,6 +5627,7 @@ impl Repository {
             r#"
             UPDATE queue
             SET status = 'REQUIRES_REVIEW', error_code = 'APPROVAL_EXPIRED',
+                first_error_code = COALESCE(first_error_code, 'APPROVAL_EXPIRED'),
                 error_message = 'Nobody approved the video in time; the held file was deleted',
                 lease_owner = NULL, lease_expires_at = NULL, not_before = NULL,
                 completed_at = ?, cleared_at = NULL, updated_at = ?
@@ -5509,6 +5692,7 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
+                human_touched = 1, touch_reason = COALESCE(touch_reason, 'next'),
                 retry_from = ?, updated_at = ?
             WHERE id = ? AND status = 'AWAITING_APPROVAL'
             "#,
@@ -5569,6 +5753,20 @@ impl Repository {
             "UPDATE repair_attempts SET mcr_decision = 'rejected', mcr_reason = 'wrong_video' WHERE id = ?",
             params![id],
         )?;
+        // A person had to act on the job (P11.0). A wrong video on air is no success: the
+        // delivery's outcome row counts as touched too. The only rewrite of an outcome row.
+        tx.execute(
+            "UPDATE queue SET human_touched = 1, touch_reason = COALESCE(touch_reason, 'wrong_video') WHERE id = ?",
+            params![job_id],
+        )?;
+        best_effort_outcome_write(&tx, job_id, "wrong_video", || {
+            tx.execute(
+                "UPDATE job_outcomes SET touched = 1, touch_reason = COALESCE(touch_reason, 'wrong_video')
+                 WHERE id = (SELECT id FROM job_outcomes WHERE job_id = ? AND outcome = 'delivered' ORDER BY id DESC LIMIT 1)",
+                params![job_id],
+            )?;
+            Ok(())
+        });
         if let Some(domain) = domain.as_deref() {
             recipe_sql::record_rejection(&tx, recipe_hash.as_deref(), domain, now)?;
         }
@@ -5711,6 +5909,14 @@ impl Repository {
             self.delete_in_batches(PURGE_MAIL_SQL, &timestamps::format(now - Duration::days(MAIL_KEEP_DAYS)), &mut counts.mail),
         );
         note("sessions", self.purge_expired_sessions().map(|n| counts.sessions = n));
+        note(
+            "outcomes",
+            self.delete_in_batches(
+                PURGE_OUTCOMES_SQL,
+                &timestamps::format(now - Duration::days(OUTCOME_KEEP_DAYS)),
+                &mut counts.outcomes,
+            ),
+        );
         counts.errors = errors;
         if counts.total() > 0 {
             // A failed audit row is one more part failure: the counts of what
@@ -5719,8 +5925,8 @@ impl Repository {
                 "INFO",
                 "retention",
                 &format!(
-                    "Retention removed {} job(s) with {} timeline row(s) and {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s){}",
-                    counts.jobs, counts.job_events, counts.evidence, counts.audit, counts.mail, counts.sessions,
+                    "Retention removed {} job(s) with {} timeline row(s) and {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s), {} outcome row(s){}",
+                    counts.jobs, counts.job_events, counts.evidence, counts.audit, counts.mail, counts.sessions, counts.outcomes,
                     if counts.errors.is_empty() { String::new() } else { format!("; {} part(s) failed", counts.errors.len()) }
                 ),
             ) {
@@ -5872,6 +6078,82 @@ impl Repository {
             }
         }
         report.sort_by(|a, b| b.attempts.cmp(&a.attempts).then_with(|| a.domain.cmp(&b.domain)));
+        Ok(report)
+    }
+
+    /// The autonomy report since `since` (P11.0), from the outcome rows whose
+    /// `ended_at` is at or after it (an index range, never a scan of the queue
+    /// or the timeline), plus the jobs waiting for a person right now.
+    pub fn autonomy_report(&self, since: chrono::DateTime<Utc>) -> Result<crate::models::AutonomyReport> {
+        use crate::models::{AutonomyCount, AutonomyReport, AutonomySite};
+        use std::collections::HashMap;
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(AUTONOMY_ROWS_SQL)?;
+        let rows = stmt
+            .query_map(params![timestamps::format(since)], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)? != 0,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut report = AutonomyReport::default();
+        let mut errors: HashMap<String, i64> = HashMap::new();
+        let mut reasons: HashMap<String, i64> = HashMap::new();
+        let mut sites: HashMap<String, AutonomySite> = HashMap::new();
+        for (outcome, touched, reason, first_error, site, from_mail) in rows {
+            report.totals.add(&outcome, touched);
+            if from_mail {
+                report.from_mail.add(&outcome, touched);
+            } else {
+                report.manual.add(&outcome, touched);
+            }
+            let untouched_delivery = outcome == "delivered" && !touched;
+            if !untouched_delivery {
+                *errors.entry(first_error.unwrap_or_else(|| "(none)".to_string())).or_default() += 1;
+            }
+            if touched {
+                *reasons.entry(reason.unwrap_or_else(|| "(unknown)".to_string())).or_default() += 1;
+            }
+            if let Some(site) = site.filter(|s| !s.is_empty()) {
+                let s = sites.entry(site.clone()).or_insert_with(|| AutonomySite {
+                    site,
+                    needed_person: 0,
+                    delivered_untouched: 0,
+                    total: 0,
+                });
+                s.total += 1;
+                if untouched_delivery {
+                    s.delivered_untouched += 1;
+                } else {
+                    s.needed_person += 1;
+                }
+            }
+        }
+        report.untouched_rate = report.totals.untouched_rate();
+        report.strict_rate = report.totals.strict_rate();
+        let ranked = |m: HashMap<String, i64>| {
+            let mut v: Vec<AutonomyCount> = m.into_iter().map(|(key, count)| AutonomyCount { key, count }).collect();
+            v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+            v
+        };
+        report.by_first_error = ranked(errors);
+        report.by_touch_reason = ranked(reasons);
+        let mut by_site: Vec<AutonomySite> = sites.into_values().collect();
+        by_site.sort_by(|a, b| {
+            b.needed_person.cmp(&a.needed_person).then_with(|| b.total.cmp(&a.total)).then_with(|| a.site.cmp(&b.site))
+        });
+        by_site.truncate(15);
+        report.by_site = by_site;
+        report.waiting_now = conn.query_row(
+            "SELECT COUNT(*) FROM queue WHERE status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','AWAITING_APPROVAL')",
+            [],
+            |r| r.get(0),
+        )?;
         Ok(report)
     }
 

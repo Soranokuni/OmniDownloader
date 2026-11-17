@@ -415,6 +415,33 @@ pub async fn api_admin_repair_report(
     })))
 }
 
+// ------------------------------------------------------------- autonomy
+
+/// Longest period the autonomy report may ask for (outcome rows are kept 400 days).
+const MAX_AUTONOMY_DAYS: i64 = 365;
+const DEFAULT_AUTONOMY_DAYS: i64 = 14;
+
+/// The autonomy report (P11.0): how often a video reached air with nobody
+/// touching it, and why somebody had to. `days` is clamped to 1..=365.
+/// Outcome counts, error codes, actions and sites only, never an address.
+pub async fn api_admin_autonomy_report(
+    RequireAdmin(_): RequireAdmin,
+    Query(q): Query<ReportQuery>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let days = q.days.unwrap_or(DEFAULT_AUTONOMY_DAYS).clamp(1, MAX_AUTONOMY_DAYS);
+    let report = state
+        .repo
+        .autonomy_report(Utc::now() - Duration::days(days))
+        .map_err(internal_error("Could not build the autonomy report."))?;
+    let mut body = serde_json::to_value(&report)
+        .map_err(|e| internal_error("Could not build the autonomy report.")(anyhow::Error::from(e)))?;
+    if let Some(map) = body.as_object_mut() {
+        map.insert("days".into(), json!(days));
+    }
+    Ok(Json(body))
+}
+
 // -------------------------------------------------------------- test url
 
 /// Longest address the Test URL accepts.

@@ -26,6 +26,7 @@ mod canary;
 mod cookies_cli;
 mod egress;
 mod repair;
+mod report_cli;
 mod selfcheck;
 mod site_memory;
 mod worker;
@@ -149,6 +150,11 @@ enum Commands {
         /// The .eml files
         #[arg(long, required = true)]
         eml: Vec<std::path::PathBuf>,
+    },
+    /// Reports from the database the daemon writes (read only; safe while it runs)
+    Report {
+        #[command(subcommand)]
+        what: report_cli::ReportKind,
     },
     /// The mail the daemon has handled, newest first
     MailHistory {
@@ -949,6 +955,7 @@ async fn main() -> Result<()> {
             dev_seed_repair(&Repository::new(&db_path)?)?;
             println!("Seeded invented sites, recipes and repair attempts.");
         }
+        Some(Commands::Report { what }) => report_cli::run(&paths, what)?,
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)
                 .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
@@ -2765,8 +2772,8 @@ async fn run_one_task(
                 Ok(c) => {
                     if c.total() > 0 {
                         info!(
-                            "Retention: removed {} job(s), {} timeline row(s), {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s)",
-                            c.jobs, c.job_events, c.evidence, c.audit, c.mail, c.sessions
+                            "Retention: removed {} job(s), {} timeline row(s), {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s), {} outcome row(s)",
+                            c.jobs, c.job_events, c.evidence, c.audit, c.mail, c.sessions, c.outcomes
                         );
                     }
                     for e in &c.errors {

@@ -589,10 +589,10 @@ pub struct RetryConfig {
     #[serde(default = "default_retry_max_age_mins")]
     pub max_age_mins: i64,
     /// Minutes after which a job not yet delivered counts as late on the
-    /// desk. Not read yet (the desk's late strip, next item).
+    /// desk's late strip (P11.3b; read as 1..=120).
     #[serde(default = "default_late_after_mins")]
     pub late_after_mins: i64,
-    /// The same for an urgent job. Not read yet.
+    /// The same for an urgent job (read as 1..=120).
     #[serde(default = "default_late_after_urgent_mins")]
     pub late_after_urgent_mins: i64,
     /// How long after it failed a job may still get one more automatic try

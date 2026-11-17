@@ -10,8 +10,8 @@ use tempfile::TempDir;
 use omni_core::migrations;
 use omni_core::models::{Enqueued, JobStatus, NewJob};
 use omni_core::repository::{
-    Repository, AUDIT_KEEP_DAYS, INBOX_JOB_SQL, INBOX_MAIL_SQL, JOB_KEEP_DAYS, MAIL_KEEP_DAYS, PURGE_AUDIT_SQL,
-    PURGE_JOB_IDS_SQL, PURGE_MAIL_SQL, RETENTION_BATCH, USER_JOBS_SQL,
+    Repository, AUDIT_KEEP_DAYS, AUTONOMY_ROWS_SQL, INBOX_JOB_SQL, INBOX_MAIL_SQL, JOB_KEEP_DAYS, MAIL_KEEP_DAYS,
+    PURGE_AUDIT_SQL, PURGE_JOB_IDS_SQL, PURGE_MAIL_SQL, PURGE_OUTCOMES_SQL, RETENTION_BATCH, USER_JOBS_SQL,
 };
 use omni_core::timestamps;
 
@@ -370,6 +370,8 @@ fn polled() -> Vec<(&'static str, &'static str, usize, &'static [&'static str], 
         ("purge jobs", PURGE_JOB_IDS_SQL, 2, &["queue"], "idx_queue_"),
         ("purge audit", PURGE_AUDIT_SQL, 2, &["audit_logs"], "idx_audit_logs_ts"),
         ("purge mail", PURGE_MAIL_SQL, 2, &["processed_mail"], "idx_processed_mail_when"),
+        ("autonomy report", AUTONOMY_ROWS_SQL, 1, &["job_outcomes"], "idx_job_outcomes_ended_at"),
+        ("purge outcomes", PURGE_OUTCOMES_SQL, 2, &["job_outcomes"], "idx_job_outcomes_ended_at"),
     ]
 }
 

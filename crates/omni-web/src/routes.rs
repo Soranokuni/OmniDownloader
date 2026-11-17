@@ -987,6 +987,7 @@ pub async fn api_queue_offer(
     new.group_code = job.group_code.clone();
     new.parent_job_id = Some(job_id);
     new.notes = Some(format!("Offered from the article of job #{job_id}: {}", job.url));
+    new.queued_by_operator = true;
     let result = state
         .repo
         .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
@@ -2659,6 +2660,7 @@ pub async fn api_mail_queue_link(
     };
     new.submitted_by_user_id = principal.user().map(|u| u.id);
     new.notes = Some(format!("Queued by MCR from the email: {subject}"));
+    new.queued_by_operator = true;
     let result = state
         .repo
         .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)

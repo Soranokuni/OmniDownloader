@@ -875,6 +875,32 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN retry_from TEXT;
         "#,
     ),
+    (
+        37,
+        // The autonomy report (P11.0): whether a person acted on the job and the first thing
+        // they did, the first error code it ever had, and one row per ending of a job. The
+        // outcome rows have no foreign key: a discarded job's row must outlive the job. `site`
+        // is the registrable domain only, never an address; `day` is the server's local day.
+        r#"
+        ALTER TABLE queue ADD COLUMN human_touched INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queue ADD COLUMN touch_reason TEXT;
+        ALTER TABLE queue ADD COLUMN first_error_code TEXT;
+        CREATE TABLE IF NOT EXISTS job_outcomes (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id           INTEGER NOT NULL,
+            ended_at         TEXT NOT NULL,
+            day              TEXT NOT NULL,
+            site             TEXT,
+            outcome          TEXT NOT NULL,
+            touched          INTEGER NOT NULL,
+            touch_reason     TEXT,
+            first_error_code TEXT,
+            from_mail        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_outcomes_day ON job_outcomes(day);
+        CREATE INDEX IF NOT EXISTS idx_job_outcomes_ended_at ON job_outcomes(ended_at);
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1653,6 +1679,43 @@ mod tests {
         assert!(columns_of(&conn, "queue").contains(&"retry_from".to_string()));
         let from: Option<String> = conn.query_row("SELECT retry_from FROM queue", [], |r| r.get(0)).unwrap();
         assert_eq!(from, None, "an existing job counts its age from created_at");
+    }
+
+    #[test]
+    fn migration_37_adds_the_touch_columns_and_outcomes_and_existing_rows_are_untouched() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 36) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, error_code) VALUES ('https://example.invalid/v', 'S', 'REQUIRES_REVIEW', 'NETWORK')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 36);
+        assert!(!columns_of(&conn, "queue").contains(&"human_touched".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        let row: (i64, Option<String>, Option<String>) = conn
+            .query_row("SELECT human_touched, touch_reason, first_error_code FROM queue", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, (0, None, None), "an existing job is untouched and has no first error yet");
+        let cols = columns_of(&conn, "job_outcomes");
+        for c in ["job_id", "ended_at", "day", "site", "outcome", "touched", "touch_reason", "first_error_code", "from_mail"] {
+            assert!(cols.contains(&c.to_string()), "job_outcomes.{c} missing: {cols:?}");
+        }
+        let fks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('job_outcomes')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fks, 0, "an outcome row must outlive a discarded job");
     }
 
     #[test]

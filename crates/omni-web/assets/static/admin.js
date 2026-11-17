@@ -827,6 +827,73 @@ async function loadReport() {
   render('report-body', sites.map((s) => row(s.domain, s)), row('All sites', total, true));
 }
 
+// The autonomy report (P11.0): the soak test's figure and why people were needed.
+const TOUCH_LABEL = {
+  retry: 'Retry', override: 'Retry with another link', rename: 'Rename', redownload: 'Download again',
+  manual_done: 'Put into Dalet by hand', approve: 'Approved a held video', reject: 'Rejected a held video',
+  next: 'Next choice', wrong_video: 'Wrong video', cancel: 'Cancel', now: 'Run now', discard: 'Discard',
+  queued: 'Queued by MCR from an offer or a skipped link',
+};
+
+const rate1 = (r) => (r === null || r === undefined ? '—' : `${(r * 100).toFixed(1)} %`);
+
+function autonomyTable(title, head, rows) {
+  return el('div', { class: 'stack' },
+    el('h3', { class: 'card-title', style: 'font-size:0.95rem' }, title),
+    el('div', { class: 'card flush' }, el('table', {},
+      el('thead', {}, el('tr', {}, head.map((h, i) => el('th', i > 0 ? { class: 'right' } : {}, h)))),
+      el('tbody', {}, rows.length > 0
+        ? rows
+        : el('tr', {}, el('td', { colspan: String(head.length), class: 'empty' }, 'None.'))))));
+}
+
+function splitLine(label, t) {
+  const aired = t.delivered + t.delivered_manual;
+  return `${label}: ${t.delivered_untouched} of ${aired} untouched (${t.ended} finished)`;
+}
+
+async function loadAutonomy() {
+  const days = document.getElementById('autonomy-days').value;
+  let data;
+  try {
+    data = await api(`/api/admin/autonomy-report?days=${encodeURIComponent(days)}`);
+  } catch (e) {
+    if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
+    return;
+  }
+  const t = data.totals;
+  const waiting = el('p', {}, el('strong', {}, `Waiting for a person now: ${data.waiting_now}`));
+  if (t.ended === 0) {
+    render('autonomy-figures', el('p', { class: 'note' }, 'No finished jobs in this period yet.'), waiting);
+    render('autonomy-tables');
+    return;
+  }
+  const aired = t.delivered + t.delivered_manual;
+  render('autonomy-figures',
+    el('p', { style: 'font-size:1.6rem;margin:0' }, el('strong', {},
+      `Delivered untouched: ${rate1(data.untouched_rate)} (${t.delivered_untouched} of ${aired} videos that reached air)`)),
+    el('p', { class: 'note' },
+      `Strict: ${rate1(data.strict_rate)} of all ${t.ended} finished jobs, counting ${t.cancelled} cancelled and ${t.discarded} discarded. ` +
+      `${t.delivered_manual} put into Dalet by hand.`),
+    el('p', { class: 'note' }, `${splitLine('From mail', data.from_mail)}. ${splitLine('Added on the desk or panel', data.manual)}.`),
+    waiting);
+  render('autonomy-tables',
+    autonomyTable('Why a person was needed', ['First error code', 'Jobs'],
+      (data.by_first_error || []).map((c) => el('tr', {},
+        el('td', { class: 'mono' }, c.key), el('td', { class: 'right' }, String(c.count))))),
+    autonomyTable('What the operator did', ['Action', 'Jobs'],
+      (data.by_touch_reason || []).map((c) => el('tr', {},
+        el('td', { title: c.key }, TOUCH_LABEL[c.key] || c.key), el('td', { class: 'right' }, String(c.count))))),
+    autonomyTable('Sites', ['Site', 'Untouched', 'Total'],
+      (data.by_site || []).map((s) => el('tr', {},
+        el('td', { class: 'mono' }, s.site),
+        el('td', { class: 'right' }, String(s.delivered_untouched)),
+        el('td', { class: 'right' }, String(s.total))))));
+}
+
+document.getElementById('autonomy-refresh').addEventListener('click', loadAutonomy);
+document.getElementById('autonomy-days').addEventListener('change', loadAutonomy);
+
 document.getElementById('sites-refresh').addEventListener('click', loadSites);
 document.getElementById('sites-more').addEventListener('click', () => {
   sitesView.shown += SITE_PAGE;
@@ -1841,6 +1908,7 @@ loadSelfcheck();
 loadSites();
 loadRecipes();
 loadReport();
+loadAutonomy();
 loadCookies();
 // The card refetches on every event of the server (a target finished), and every 20 s regardless.
 live(loadBenchmarks, 20000);

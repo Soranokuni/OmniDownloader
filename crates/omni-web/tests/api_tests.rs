@@ -183,6 +183,9 @@ async fn jobs_api_full_lifecycle() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     let job_id = json.get("job_id").unwrap().as_i64().unwrap();
     assert!(job_id > 0);
+    // The desk's add form is the normal start of a job, not a touch (P11.0).
+    let made = app.repo.get_job(job_id)?.unwrap();
+    assert_eq!((made.human_touched, made.touch_reason), (false, None));
 
     // 2. List
     let (status, json) = app.send("GET", "/api/jobs", &app.mcr_token, None).await?;
@@ -450,6 +453,9 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     assert_eq!((queued.url.as_str(), queued.slug.as_str()), (raw, "1D_MCR_SEISMOS"));
     assert_eq!(queued.status, JobStatus::Pending);
     assert_eq!(queued.parent_job_id, Some(id), "the mail view files it under its article (plan P7.6)");
+    // MCR had to queue it by hand (P11.0); the article's own job is untouched.
+    assert_eq!((queued.human_touched, queued.touch_reason.as_deref()), (true, Some("queued")));
+    assert!(!app.repo.get_job(id)?.unwrap().human_touched);
 
     // Twice: refused, and the offer remembers the job it became.
     let (status, body) = app.send("POST", &uri, &app.mcr_token, Some(json!({ "url": raw }))).await?;
@@ -583,6 +589,10 @@ async fn a_skipped_link_can_be_queued_from_its_mail_once() -> Result<()> {
     let job = app.repo.get_job(body["job_id"].as_i64().unwrap())?.unwrap();
     assert_eq!(job.email_message_id.as_deref(), Some("<m3@example.gr>"));
     assert_eq!(job.status, JobStatus::Pending);
+    // MCR queued a link the parser skipped (P11.0): touched. The mail's own job is not.
+    assert_eq!((job.human_touched, job.touch_reason.as_deref()), (true, Some("queued")));
+    let from_mail = app.repo.get_all_jobs()?.into_iter().find(|j| j.slug == "1_GEORGIOU_SEISMOS").unwrap();
+    assert_eq!((from_mail.human_touched, from_mail.touch_reason), (false, None));
 
     // Filed under its link in the view; a second click is refused.
     let (_, view) = app

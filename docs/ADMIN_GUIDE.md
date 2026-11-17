@@ -390,6 +390,7 @@ Prometheus handles as a counter reset.
 | **Toolchain** | install or repair ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno |
 | **Credentials** | set or clear the secrets above |
 | **Database maintenance** | purge completed jobs older than 7–90 days; vacuum |
+| **Autonomy** | how often a video reached air with nobody touching it, and why a person was needed (below) |
 | **Self-heal** | the last 30 days of overnight retries on news sites that stopped giving video (nothing is downloaded) |
 | **Self-check** | the daily check links ("a link that has a video" per site); add, remove, run now |
 | **Sites** | per-site health: recent success, last error, canary checks, **Run now** |
@@ -405,6 +406,29 @@ Prometheus handles as a counter reset.
 | **Audit log** | who did what |
 | **Scheduled maintenance** | the nightly tasks (§7), run one now |
 | **Mailbox test** | check Graph access with given or stored credentials |
+
+**Autonomy report.** The first card on the right. *Delivered untouched* is the
+share of the videos that reached air (delivered to the watchfolder, or put into
+Dalet by hand) that nobody touched: no retry, rename, approval or rejection,
+next choice, cancel, re-download, "wrong video", "run now", discard or manual
+completion. A video MCR queued by hand from an offered video or a skipped mail
+link starts touched (*Queued by MCR from an offer or a skipped link*); a link
+added on the desk or the journalist panel does not. Automatic retries and
+waiting for the watchfolder do not count as a touch. A video later marked as
+wrong counts as touched. This is the figure the 14-day soak test is judged on
+(95 % or more). The smaller *Strict* figure divides by every finished job, cancelled and discarded
+ones included. The tables show the first error code of the jobs that needed a
+person (*Why a person was needed*), the first thing the operator did (*What the
+operator did*) and the sites; *Waiting for a person now* counts the jobs in
+review, manual download or waiting for approval. Choose 7, 14 or 30 days. The
+same figures on the server, safe while the service runs:
+
+```powershell
+.\omni-ingest.exe report autonomy --days 14
+```
+
+The report keeps one small row per finished job for 400 days, with the site's
+domain only: never a link, file name or journalist.
 
 ### 6.1 Cookies for sites that need a login
 

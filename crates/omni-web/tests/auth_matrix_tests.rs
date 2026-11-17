@@ -855,6 +855,14 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // The autonomy report (P11.0): admin only.
+    ("GET", "/api/admin/autonomy-report", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // Cookie jars for login-walled sites (P3.5): admin only.
     ("GET", "/api/admin/cookies", &[
             (Anonymous, Denied),

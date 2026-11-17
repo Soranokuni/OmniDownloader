@@ -493,11 +493,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v28_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v29_and_login_v6() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=28"), "admin.html does not import admin.js?v=28");
-    assert!(!admin.contains("/static/admin.js?v=27"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=29"), "admin.html does not import admin.js?v=29");
+    assert!(!admin.contains("/static/admin.js?v=28"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
     assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
@@ -506,6 +506,29 @@ fn the_first_run_password_card_ships_with_admin_v28_and_login_v6() {
     assert!(js.contains("password_change_required"), "admin.js ignores the first-run flag");
     let login_js = assets.get("static/login.js").expect("login.js shipped");
     assert!(login_js.contains("password_change_required"), "login.js ignores the first-run flag");
+}
+
+/// The Autonomy card (P11.0) opens the right-hand column and its loader asks
+/// the admin endpoint, building nodes rather than writing HTML.
+#[test]
+fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
+    let assets = all_assets();
+    let admin = assets.get("admin.html").expect("admin.html shipped");
+    let right = admin.find(r#"<div class="stack" style="grid-column:span 2">"#).expect("the right-hand column");
+    let first = admin[right..].find("<section").map(|i| right + i).expect("a card in it");
+    assert!(admin[first..].starts_with(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not first");
+    assert!(admin.contains("A video later marked as wrong counts as touched."));
+    for id in ["autonomy-days", "autonomy-refresh", "autonomy-figures", "autonomy-tables"] {
+        assert!(admin.contains(&format!(r#"id="{id}""#)), "{id} missing");
+    }
+    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
+    let code = code.join("\n");
+    assert!(code.contains("/api/admin/autonomy-report?days="), "admin.js does not load the autonomy report");
+    assert!(code.contains("Delivered untouched"));
+    assert!(code.contains("No finished jobs in this period yet."));
+    assert!(code.contains("Queued by MCR from an offer or a skipped link"));
+    assert!(!code.contains("innerHTML"));
 }
 
 /// P7.12: the wizard is one module under one URL, built with el() only, and the
