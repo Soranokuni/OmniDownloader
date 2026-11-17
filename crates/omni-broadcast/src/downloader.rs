@@ -3,17 +3,19 @@
 //! Everything here goes through `omni_core::process::run`, so the download has a
 //! timeout and dies with its whole process tree — yt-dlp spawns ffmpeg to mux
 //! fragments, and an orphaned ffmpeg holds the job's workspace open (defect
-//! D-03).
+//! D-03). Every start goes through [`paced`] too: a run on a video platform
+//! waits for its turn there (P11.4).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use omni_core::process::{run, RunOpts};
+use omni_core::process::{run, RunOpts, RunOutcome};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::errors::{classify_download_error, ErrorCode};
+use crate::pacing::{platform_key, HostPacer, PacePermit, Refused, RATE_LIMIT_COOL_DOWN};
 
 pub struct DownloadProgress {
     pub percent: f64,
@@ -241,7 +243,7 @@ pub fn is_youtube(url: &str) -> bool {
         .any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     url.split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(url)
@@ -287,6 +289,143 @@ pub struct Downloader {
     /// download takes its own from `DownloadOpts::cookie_jar`.
     cookie_jar: Option<PathBuf>,
     cookie_values: Vec<String>,
+    /// Every run on a video platform waits here for its turn (P11.4).
+    pacer: HostPacer,
+    /// Told of a wait for a turn longer than [`crate::pacing::NOTE_WAIT_OVER`].
+    on_wait: Option<WaitNote>,
+    /// Not a job's: a cool-down is reported at once, not waited out (see [`paced`]).
+    fail_fast: bool,
+}
+
+/// Told the platform key and the wait when a run waited for its turn.
+pub type WaitNote = std::sync::Arc<dyn Fn(&'static str, Duration) + Send + Sync>;
+
+/// A run that never started because its wait for a turn was cancelled: read
+/// like a cancelled run by every caller.
+fn cancelled_before_start() -> RunOutcome {
+    RunOutcome {
+        exit_code: None,
+        success: false,
+        elapsed: Duration::ZERO,
+        stdout: String::new(),
+        stderr_tail: String::new(),
+        timed_out: false,
+        cancelled: true,
+    }
+}
+
+/// A run that was not started because `key` is cooling down for `left`: a
+/// failure whose error line classifies as RATE_LIMITED and says so.
+fn cooling_down(key: &str, left: Duration) -> RunOutcome {
+    RunOutcome { stderr_tail: crate::pacing::cooling_down_line(key, left), cancelled: false, ..cancelled_before_start() }
+}
+
+/// Where a download keeps its turn on the platform, so its stdout handler can
+/// give it back at the first progress line ([`release_turn`]).
+pub(crate) type TurnSlot = std::sync::Arc<std::sync::Mutex<Option<PacePermit>>>;
+
+/// Give back the turn in `slot`, if it is still there. Taking it out of the
+/// slot is what makes the release happen once, whoever comes first.
+pub(crate) fn release_turn(slot: &TurnSlot) {
+    let permit = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    drop(permit);
+}
+
+/// A progress line of the download (`rest` after `OMNIPROGRESS `), parsed. The
+/// first one parsed means extraction is over and bytes are flowing: the turn
+/// on the platform is given back then, not when the transfer ends (P11.4).
+fn progress_line(rest: &str, turn: &TurnSlot) -> Option<DownloadProgress> {
+    let p = parse_progress(rest)?;
+    release_turn(turn);
+    Some(p)
+}
+
+/// Run a yt-dlp process (`start`) whose target is `url`, paced (P11.4): on a
+/// video platform the turn is taken immediately before the start, so the
+/// process's own timeout does not count the wait, and held until the process
+/// ends. With `early`, the turn is kept in that slot instead, and whoever
+/// takes it out first gives it back: the download's first progress line
+/// (the platform's bot check reacts to the burst of page and API requests at
+/// the start of a run, not to the transfer), or the end of the process. The
+/// wait ends early with `cancel`, and the run then reads as cancelled. A run
+/// the platform refused as a rate limit holds every new start there for
+/// [`RATE_LIMIT_COOL_DOWN`], whether or not it still held its turn. Any other
+/// link starts at once.
+///
+/// `fail_fast` is for a caller that is not a job: during a cool-down with more
+/// than [`crate::pacing::FAIL_FAST_COOL_DOWN_OVER`] left the run is not started
+/// and comes back at once as a failure whose error line says the platform is
+/// cooling down (RATE_LIMITED), instead of waiting against the caller's own
+/// time limit. A job (`false`) waits the cool-down out.
+///
+/// Every yt-dlp start of this module goes through here.
+pub(crate) async fn paced<F, Fut>(
+    pacer: &HostPacer,
+    url: &str,
+    cancel: Option<&CancellationToken>,
+    on_wait: Option<&WaitNote>,
+    early: Option<&TurnSlot>,
+    fail_fast: bool,
+    start: F,
+) -> Result<RunOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<RunOutcome>>,
+{
+    let Some(key) = platform_key(url) else {
+        return start().await;
+    };
+    let never = CancellationToken::new();
+    let acquired = if fail_fast {
+        pacer.acquire_unless_cooling(key, cancel.unwrap_or(&never)).await
+    } else {
+        pacer.acquire(key, cancel.unwrap_or(&never)).await.map_err(|_| Refused::Cancelled)
+    };
+    let permit = match acquired {
+        Ok(p) => p,
+        Err(Refused::Cancelled) => return Ok(cancelled_before_start()),
+        Err(Refused::CoolingDown(left)) => {
+            info!("yt-dlp not started: {key} is cooling down for {} s", left.as_secs());
+            return Ok(cooling_down(key, left));
+        }
+    };
+    if permit.waited() > crate::pacing::NOTE_WAIT_OVER {
+        info!("yt-dlp waited {} s for its turn on {key}", permit.waited().as_secs());
+        if let Some(note) = on_wait {
+            note(key, permit.waited());
+        }
+    }
+    let held = match early {
+        Some(slot) => {
+            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(permit);
+            None
+        }
+        None => Some(permit),
+    };
+    // The slot's turn goes back when this run ends, or when it is dropped
+    // (cancelled) first, if no progress line gave it back already.
+    let give_back = GiveBackAtEnd(early);
+    let outcome = start().await;
+    if let Ok(o) = &outcome {
+        if !o.success && !o.timed_out && !o.cancelled && classify_download_error(&o.stderr_tail) == ErrorCode::RateLimited {
+            warn!("{key} is limiting our requests; no new yt-dlp start there for {} s", RATE_LIMIT_COOL_DOWN.as_secs());
+            pacer.penalize(key, RATE_LIMIT_COOL_DOWN);
+        }
+    }
+    drop(give_back);
+    drop(held);
+    outcome
+}
+
+/// Gives back the turn left in a download's slot when dropped.
+struct GiveBackAtEnd<'a>(Option<&'a TurnSlot>);
+
+impl Drop for GiveBackAtEnd<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            release_turn(slot);
+        }
+    }
 }
 
 /// `line` without any of the jar's `values` (and without query strings, see
@@ -317,7 +456,12 @@ fn js_runtime_args(deno: Option<&Path>) -> Vec<String> {
 }
 
 impl Downloader {
-    pub fn new<P: AsRef<Path>>(ytdl_path: P) -> Self {
+    /// A downloader whose runs on a video platform wait for their turn in
+    /// `pacer` (P11.4): the daemon's engine's, shared by everything that runs
+    /// yt-dlp in the process. It is not a job's: a platform cooling down after
+    /// a rate limit is reported at once ([`paced`]'s `fail_fast`), unless
+    /// [`Self::for_a_job`] says otherwise.
+    pub fn new<P: AsRef<Path>>(ytdl_path: P, pacer: &HostPacer) -> Self {
         let ytdl_path = ytdl_path.as_ref().to_path_buf();
         // bin/deno.exe sits next to the legacy bin/yt-dlp.exe, and one level
         // up from the folder build's bin/yt-dlp/yt-dlp.exe (plan P2.10).
@@ -327,7 +471,44 @@ impl Downloader {
             .take(2)
             .map(|d| d.join("deno.exe"))
             .find(|p| p.is_file());
-        Self { ytdl_path, deno, cookie_jar: None, cookie_values: Vec::new() }
+        Self { ytdl_path, deno, cookie_jar: None, cookie_values: Vec::new(), pacer: pacer.clone(), on_wait: None, fail_fast: true }
+    }
+
+    /// A job's runs: they wait out a cool-down like any other wait for a turn
+    /// (the job has no time limit of its own around them).
+    pub fn for_a_job(mut self) -> Self {
+        self.fail_fast = false;
+        self
+    }
+
+    /// Tell `note` of a wait for a turn longer than two seconds (the job's history, P11.4).
+    pub fn on_pace_wait(mut self, note: WaitNote) -> Self {
+        self.on_wait = Some(note);
+        self
+    }
+
+    /// One yt-dlp run at `url`, through [`paced`]; `early` as there (the
+    /// download's slot, `None` for a probe, which holds its turn to the end).
+    async fn run_ytdlp(
+        &self,
+        url: &str,
+        args: Vec<String>,
+        opts: RunOpts,
+        cancel: Option<&CancellationToken>,
+        early: Option<&TurnSlot>,
+    ) -> Result<RunOutcome> {
+        paced(&self.pacer, url, cancel, self.on_wait.as_ref(), early, self.fail_fast, || run(&self.ytdl_path, args, opts)).await
+    }
+
+    /// A probe's run, as `run_capture` runs it: stdout kept. The public probes
+    /// have no token (their callers drop the future to cancel them, which also
+    /// ends the wait); the download's own live probe passes the job's.
+    async fn capture(&self, url: &str, args: Vec<String>, timeout: Duration, cancel: Option<&CancellationToken>) -> Result<RunOutcome> {
+        let mut opts = RunOpts::new(timeout).capture_stdout();
+        if let Some(token) = cancel {
+            opts = opts.with_cancel(token.clone());
+        }
+        self.run_ytdlp(url, args, opts, cancel, None).await
     }
 
     /// Probes made through this value carry the jar file (plan P3.5). The caller
@@ -478,17 +659,21 @@ impl Downloader {
         // both are collected from the same stream.
         let printed_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = printed_paths.clone();
+        // The turn on the platform (P11.4), given back at the first progress
+        // line: extraction is over and the transfer has begun.
+        let turn: TurnSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let first_progress = turn.clone();
 
         let mut run_opts = RunOpts::new(opts.timeout).on_stdout_line(move |line| {
             if let Some(rest) = line.strip_prefix("OMNIPROGRESS ") {
-                if let Some(p) = parse_progress(rest) {
+                if let Some(p) = progress_line(rest, &first_progress) {
                     on_progress(p);
                 }
             } else if !line.trim().is_empty() {
                 sink.lock().unwrap().push(line.trim().to_string());
             }
         });
-        if let Some(token) = opts.cancel {
+        if let Some(token) = opts.cancel.clone() {
             run_opts = run_opts.with_cancel(token);
         }
 
@@ -501,7 +686,8 @@ impl Downloader {
             }
             .into());
         }
-        let outcome = run(&self.ytdl_path, &args, run_opts)
+        let outcome = self
+            .run_ytdlp(url, args, run_opts, opts.cancel.as_ref(), Some(&turn))
             .await
             .with_context(|| format!("Could not run yt-dlp at {:?}", self.ytdl_path))?;
 
@@ -540,9 +726,13 @@ impl Downloader {
             deno: self.deno.clone(),
             cookie_jar: opts.cookie_jar.map(Path::to_path_buf).or_else(|| self.cookie_jar.clone()),
             cookie_values: opts.cookie_values.to_vec(),
+            pacer: self.pacer.clone(),
+            on_wait: self.on_wait.clone(),
+            fail_fast: self.fail_fast,
         };
+        // Its wait for a turn ends with the job's token, like the download's.
         let live = empty_download_is_live(&candidates, || async {
-            prober.probe_media(url, Duration::from_secs(15)).await.ok().map(|i| i.live)
+            prober.probe_media_until(url, Duration::from_secs(15), opts.cancel.as_ref()).await.ok().map(|i| i.live)
         })
         .await;
         if live {
@@ -632,7 +822,7 @@ impl Downloader {
         args.extend(js_runtime_args(self.deno.as_deref()));
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
-        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+        match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
             Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
@@ -650,7 +840,7 @@ impl Downloader {
         args.extend(js_runtime_args(self.deno.as_deref()));
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
-        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+        match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => {
                 let json = serde_json::from_str::<serde_json::Value>(&o.stdout).ok();
                 let why = json.as_ref().and_then(|v| generic_why(v, url));
@@ -704,6 +894,16 @@ impl Downloader {
     /// Length, height and live flag of the video at `url` (a page or platform
     /// link), without downloading it. `Err` is the one-line reason.
     pub async fn probe_media(&self, url: &str, timeout: Duration) -> std::result::Result<PlatformInfo, String> {
+        self.probe_media_until(url, timeout, None).await
+    }
+
+    /// [`Self::probe_media`], its wait for a turn and its run ended by `cancel`.
+    async fn probe_media_until(
+        &self,
+        url: &str,
+        timeout: Duration,
+        cancel: Option<&CancellationToken>,
+    ) -> std::result::Result<PlatformInfo, String> {
         let mut args: Vec<String> = [
             "--simulate",
             "--no-playlist",
@@ -721,7 +921,7 @@ impl Downloader {
         args.extend(js_runtime_args(self.deno.as_deref()));
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
-        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+        match self.capture(url, args, timeout, cancel).await {
             Ok(o) if o.success => parse_platform_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
             Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
@@ -774,7 +974,7 @@ impl Downloader {
         }
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
-        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+        match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => Probe::from_length(parse_platform_line(&o.stdout)),
             Ok(o) if o.timed_out => Probe::Unknown,
             Ok(o) => {
@@ -833,7 +1033,7 @@ impl Downloader {
         args.extend(js_runtime_args(self.deno.as_deref()));
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
-        match omni_core::process::run_capture(&self.ytdl_path, args, timeout).await {
+        match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => parse_info_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
             Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
@@ -1511,13 +1711,13 @@ mod tests {
         assert!(!args_for(&DownloadOpts::default()).iter().any(|a| a == "--js-runtimes"));
 
         let dir = tempfile::tempdir().unwrap();
-        assert!(Downloader::new(dir.path().join("yt-dlp.exe")).deno.is_none());
+        assert!(Downloader::new(dir.path().join("yt-dlp.exe"), &HostPacer::default()).deno.is_none());
         std::fs::write(dir.path().join("deno.exe"), b"x").unwrap();
-        assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe")).deno, Some(dir.path().join("deno.exe")));
+        assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe"), &HostPacer::default()).deno, Some(dir.path().join("deno.exe")));
         // The folder build (P2.10) is one level down: without this YouTube
         // would lose its JavaScript runtime and 403 at random.
         assert_eq!(
-            Downloader::new(dir.path().join("yt-dlp").join("yt-dlp.exe")).deno,
+            Downloader::new(dir.path().join("yt-dlp").join("yt-dlp.exe"), &HostPacer::default()).deno,
             Some(dir.path().join("deno.exe"))
         );
     }
@@ -1561,14 +1761,14 @@ mod tests {
         let jar = crate::cookie_file::CookieFile::write(dir.path(), ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\tleaky-value-998877\n").unwrap();
         let quoted = "ERROR: invalid Netscape format cookies file: '.x.com\tFALSE\t/\tTRUE\t0\tauth_token\tleaky-value-998877'".to_string();
 
-        let dl = Downloader::new("yt-dlp").with_cookie_jar(Some(&jar));
+        let dl = Downloader::new("yt-dlp", &HostPacer::default()).with_cookie_jar(Some(&jar));
         let out = dl.scrubbed(quoted.clone());
         assert!(!out.contains("leaky-value-998877"), "{out}");
         assert!(out.contains("invalid Netscape format"));
         // The download path uses the same function with the values from its options.
         assert!(!scrub_error(quoted.clone(), jar.values()).contains("leaky-value-998877"));
         // Without a jar the line is left exactly as it was.
-        assert_eq!(Downloader::new("yt-dlp").scrubbed(quoted.clone()), quoted);
+        assert_eq!(Downloader::new("yt-dlp", &HostPacer::default()).scrubbed(quoted.clone()), quoted);
     }
 
     #[test]
@@ -2017,4 +2217,332 @@ mod platform_probe_tests {
         assert!(matches!(got, Choice::AllLive { .. }));
     }
 
+    // ------------------------------------------------------------ pacing (P11.4)
+
+    fn finished(success: bool, stderr: &str) -> Result<RunOutcome> {
+        Ok(RunOutcome {
+            success,
+            exit_code: Some(if success { 0 } else { 1 }),
+            stderr_tail: stderr.to_string(),
+            cancelled: false,
+            ..cancelled_before_start()
+        })
+    }
+
+    /// Every platform yt-dlp has its own extractor for is paced, under one key per family.
+    #[test]
+    fn every_video_platform_has_a_pacing_key() {
+        for d in VIDEO_PLATFORMS {
+            let url = format!("https://{d}/watch?v=1");
+            assert!(platform_key(&url).is_some(), "{d}");
+            assert!(is_video_platform(&url), "{d}");
+        }
+    }
+
+    /// A platform link's run holds a turn while it runs; a news page's takes none.
+    #[tokio::test(start_paused = true)]
+    async fn a_platform_run_takes_a_turn_and_a_news_page_does_not() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let p = pacer.clone();
+        let o = paced(&pacer, "https://youtu.be/abcdefghijk", None, None, None, false, || async move {
+            assert_eq!(p.running("youtube"), 1, "the run did not hold its turn");
+            finished(true, "")
+        })
+        .await
+        .unwrap();
+        assert!(o.success);
+        assert_eq!(pacer.running("youtube"), 0, "the turn outlived the run");
+        // The next start on YouTube waits for the gap: the run counted as a start.
+        let t0 = tokio::time::Instant::now();
+        paced(&pacer, "https://www.youtube.com/watch?v=abcdefghijk", None, None, None, false, || async move { finished(true, "") }).await.unwrap();
+        assert_eq!(tokio::time::Instant::now() - t0, Duration::from_secs(8));
+
+        let p = &pacer;
+        let t0 = tokio::time::Instant::now();
+        for page in ["https://www.news.example/story/1", "https://cdn.news.example/master.m3u8"] {
+            paced(&pacer, page, None, None, None, false, || async move {
+                for key in ["youtube", "x", "facebook", "instagram", "tiktok", "vimeo", "dailymotion", "streamable"] {
+                    assert_eq!(p.running(key), 0, "{page} took a turn on {key}");
+                }
+                finished(true, "")
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(tokio::time::Instant::now(), t0, "a news page waited for a platform's turn");
+    }
+
+    /// The production bot check holds every new YouTube start for two minutes;
+    /// an ordinary failure only the gap. Other platforms are not held.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_run_holds_the_platform_for_two_minutes() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let bot = "ERROR: [youtube] abc123: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication.";
+        paced(&pacer, "https://youtu.be/abc123", None, None, None, false, || async move { finished(false, bot) }).await.unwrap();
+        let t0 = tokio::time::Instant::now();
+        paced(&pacer, "https://x.com/a/status/1", None, None, None, false, || async move { finished(true, "") }).await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), t0, "another platform was held");
+        paced(&pacer, "https://youtu.be/def456", None, None, None, false, || async move { finished(false, "ERROR: Private video") }).await.unwrap();
+        assert_eq!(tokio::time::Instant::now() - t0, RATE_LIMIT_COOL_DOWN);
+        // An ordinary failure: the next start waits only the gap.
+        let t1 = tokio::time::Instant::now();
+        paced(&pacer, "https://youtu.be/ghi789", None, None, None, false, || async move { finished(true, "") }).await.unwrap();
+        assert_eq!(tokio::time::Instant::now() - t1, Duration::from_secs(8));
+    }
+
+    /// A wait cut short by the job's token never starts the run, reads as cancelled,
+    /// and is not told as a wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_wait_never_starts_the_run() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let _running = pacer.acquire("youtube", &CancellationToken::new()).await.unwrap();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            c.cancel();
+        });
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = told.clone();
+        let note: WaitNote = std::sync::Arc::new(move |k, w| t.lock().unwrap().push((k, w)));
+        let o = paced(&pacer, "https://youtu.be/abc", Some(&cancel), Some(&note), None, false, || async move { panic!("the run started") }).await.unwrap();
+        assert!(o.cancelled && !o.success);
+        assert!(told.lock().unwrap().is_empty());
+    }
+
+    /// A wait over two seconds is told once, with the key; a shorter one is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_over_two_seconds_is_told_once_with_its_key() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = told.clone();
+        let note: WaitNote = std::sync::Arc::new(move |k, w| t.lock().unwrap().push((k, w)));
+        paced(&pacer, "https://youtu.be/a", None, Some(&note), None, false, || async move { finished(true, "") }).await.unwrap();
+        assert!(told.lock().unwrap().is_empty(), "no wait, nothing told");
+        paced(&pacer, "https://youtu.be/b", None, Some(&note), None, false, || async move { finished(true, "") }).await.unwrap();
+        assert_eq!(*told.lock().unwrap(), vec![("youtube", Duration::from_secs(8))]);
+
+        let short = HostPacer::with_jitter(1, Duration::from_secs(2), || Duration::ZERO);
+        told.lock().unwrap().clear();
+        paced(&short, "https://youtu.be/a", None, Some(&note), None, false, || async move { finished(true, "") }).await.unwrap();
+        paced(&short, "https://youtu.be/b", None, Some(&note), None, false, || async move { finished(true, "") }).await.unwrap();
+        assert!(told.lock().unwrap().is_empty(), "a two-second wait was told");
+    }
+
+    /// The downloader's own probe goes through the pacer: a run that could not
+    /// even start (no yt-dlp here) still spaced the next YouTube start.
+    #[tokio::test(start_paused = true)]
+    async fn the_downloaders_probe_is_paced() {
+        let dir = tempfile::tempdir().unwrap();
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let dl = Downloader::new(dir.path().join("no-yt-dlp.exe"), &pacer);
+        assert!(dl.probe("https://youtu.be/abcdefghijk", Duration::from_secs(5)).await.is_err());
+        assert!(dl.probe_media("https://www.news.example/story/1", Duration::from_secs(5)).await.is_err());
+        let t0 = tokio::time::Instant::now();
+        drop(pacer.acquire("youtube", &CancellationToken::new()).await.unwrap());
+        assert_eq!(tokio::time::Instant::now() - t0, Duration::from_secs(8));
+    }
+
+    /// A download run on `pacer` started now: progress at `progress` (never
+    /// with `None`), the end at `end`, failing with `stderr` when it is not empty.
+    fn long_download(
+        pacer: &HostPacer,
+        progress: Option<Duration>,
+        end: Duration,
+        stderr: &'static str,
+    ) -> (tokio::task::JoinHandle<RunOutcome>, TurnSlot) {
+        let turn: TurnSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (p, slot) = (pacer.clone(), turn.clone());
+        let task = tokio::spawn(async move {
+            let handler = slot.clone();
+            paced(&p, "https://www.youtube.com/watch?v=longshow001", None, None, Some(&slot), false, || async move {
+                let t0 = tokio::time::Instant::now();
+                if let Some(at) = progress {
+                    tokio::time::sleep(at).await;
+                    // What the stdout handler does with yt-dlp's first progress line.
+                    assert!(progress_line("1048576 734003200 2097152.0 349", &handler).is_some());
+                }
+                tokio::time::sleep_until(t0 + end).await;
+                finished(stderr.is_empty(), stderr)
+            })
+            .await
+            .unwrap()
+        });
+        (task, turn)
+    }
+
+    /// When the next YouTube run on `pacer` starts, from now.
+    async fn next_start_after(pacer: &HostPacer) -> Duration {
+        let t0 = tokio::time::Instant::now();
+        let started = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = started.clone();
+        paced(pacer, "https://youtu.be/urgentclip1", None, None, None, false, || async move {
+            *s.lock().unwrap() = Some(tokio::time::Instant::now() - t0);
+            finished(true, "")
+        })
+        .await
+        .unwrap();
+        let at = started.lock().unwrap().expect("the run started");
+        at
+    }
+
+    /// P11.4: a download gives its turn back at its first progress line. One
+    /// that shows progress at 5 s and ends at 300 s lets the next YouTube run
+    /// start at max(5 s, gap + jitter), not at 300 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_download_gives_its_turn_back_at_its_first_progress() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::from_secs(3));
+        let (long, _) = long_download(&pacer, Some(Duration::from_secs(5)), Duration::from_secs(300), "");
+        tokio::task::yield_now().await;
+        assert_eq!(next_start_after(&pacer).await, Duration::from_secs(11), "gap 8 s + jitter 3 s");
+        assert!(!long.is_finished(), "the long download is still running");
+        assert!(long.await.unwrap().success);
+        assert_eq!(pacer.running("youtube"), 0);
+
+        // Gap shorter than the extraction: the progress line decides.
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(2), || Duration::ZERO);
+        let (long, _) = long_download(&pacer, Some(Duration::from_secs(5)), Duration::from_secs(300), "");
+        tokio::task::yield_now().await;
+        assert_eq!(next_start_after(&pacer).await, Duration::from_secs(5));
+        long.await.unwrap();
+    }
+
+    /// A run that never shows progress (it failed in extraction, or found the
+    /// file complete) holds the platform until it ends, and so does a probe.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_without_progress_and_a_probe_hold_the_turn_to_the_end() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let (long, _) = long_download(&pacer, None, Duration::from_secs(300), "ERROR: [youtube] x: Video unavailable");
+        tokio::task::yield_now().await;
+        assert_eq!(next_start_after(&pacer).await, Duration::from_secs(300));
+        assert!(!long.await.unwrap().success);
+
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        let p = pacer.clone();
+        let probe = tokio::spawn(async move {
+            paced(&p, "https://youtu.be/probe000001", None, None, None, false, || async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                finished(true, "")
+            })
+            .await
+            .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(next_start_after(&pacer).await, Duration::from_secs(60));
+        probe.await.unwrap();
+    }
+
+    /// A download refused as a rate limit after it gave its turn back still
+    /// holds the platform for the cool-down from its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_after_the_turn_was_given_back_still_cools_the_platform_down() {
+        let pacer = HostPacer::with_jitter(2, Duration::from_secs(8), || Duration::ZERO);
+        let bot = "ERROR: [youtube] longshow001: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies";
+        let (long, turn) = long_download(&pacer, Some(Duration::from_secs(5)), Duration::from_secs(300), bot);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(turn.lock().unwrap().is_none(), "the turn was not given back at the progress line");
+        assert_eq!(pacer.running("youtube"), 0);
+        assert!(!long.await.unwrap().success);
+        assert_eq!(next_start_after(&pacer).await, RATE_LIMIT_COOL_DOWN);
+    }
+
+    /// The turn goes back exactly once: at the progress line, not again at the
+    /// end; and a run dropped (cancelled) before or after its progress line
+    /// leaves nothing held.
+    #[tokio::test(start_paused = true)]
+    async fn the_turn_is_given_back_exactly_once_and_never_leaks() {
+        let never = CancellationToken::new();
+        // Two at a time, one held outside: a second release would take its count too.
+        let pacer = HostPacer::with_jitter(2, Duration::ZERO, || Duration::ZERO);
+        let outside = pacer.acquire("youtube", &never).await.unwrap();
+        let (long, turn) = long_download(&pacer, Some(Duration::from_secs(5)), Duration::from_secs(30), "");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(pacer.running("youtube"), 2);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(pacer.running("youtube"), 1, "given back at the progress line");
+        release_turn(&turn);
+        assert_eq!(pacer.running("youtube"), 1, "a second release took another run's count");
+        long.await.unwrap();
+        assert_eq!(pacer.running("youtube"), 1, "released again at the end");
+        // The handler's later progress lines change nothing either.
+        assert!(progress_line("2097152 734003200 2097152.0 300", &turn).is_some());
+        assert_eq!(pacer.running("youtube"), 1);
+        drop(outside);
+        assert_eq!(pacer.running("youtube"), 0);
+
+        // Dropped between the progress line and the end, and before any progress.
+        for progress in [Some(Duration::from_secs(5)), None] {
+            let (long, turn) = long_download(&pacer, progress, Duration::from_secs(300), "");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            long.abort();
+            assert!(long.await.unwrap_err().is_cancelled());
+            assert!(turn.lock().unwrap().is_none(), "{progress:?}: the turn was left in its slot");
+            assert_eq!(pacer.running("youtube"), 0, "{progress:?}: the turn leaked");
+        }
+    }
+
+    /// Only a parsed progress line gives the turn back: yt-dlp's "NA" before it
+    /// knows the size, or a malformed line, does not.
+    #[tokio::test]
+    async fn only_a_parsed_progress_line_gives_the_turn_back() {
+        let pacer = HostPacer::with_jitter(1, Duration::ZERO, || Duration::ZERO);
+        let turn: TurnSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        *turn.lock().unwrap() = Some(pacer.acquire("youtube", &CancellationToken::new()).await.unwrap());
+        assert!(progress_line("NA NA NA NA", &turn).is_none());
+        assert!(progress_line("garbage", &turn).is_none());
+        assert_eq!(pacer.running("youtube"), 1);
+        assert!(progress_line("1024 NA NA NA", &turn).is_some());
+        assert_eq!(pacer.running("youtube"), 0);
+    }
+
+    /// Review round 1: a caller that is not a job is answered at once during a
+    /// cool-down, with a failure that says so and reads as RATE_LIMITED; the
+    /// run is never started and the cool-down is not extended. It still waits
+    /// through the ordinary gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_fail_fast_run_is_answered_at_once_during_a_cool_down_and_waits_through_a_gap() {
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        pacer.penalize("youtube", RATE_LIMIT_COOL_DOWN);
+        let t0 = tokio::time::Instant::now();
+        let o = paced(&pacer, "https://youtu.be/abc", None, None, None, true, || async move { panic!("the run started") })
+            .await
+            .unwrap();
+        assert_eq!(tokio::time::Instant::now(), t0, "it waited for the cool-down");
+        assert!(!o.success && !o.cancelled && !o.timed_out);
+        assert!(o.stderr_tail.contains("youtube is cooling down for 120 s"), "{}", o.stderr_tail);
+        assert_eq!(classify_download_error(&o.stderr_tail), ErrorCode::RateLimited);
+        assert_eq!(pacer.cooling_down("youtube"), Some(RATE_LIMIT_COOL_DOWN), "the cool-down was extended");
+
+        let fresh = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        paced(&fresh, "https://youtu.be/a", None, None, None, true, || async move { finished(true, "") }).await.unwrap();
+        let t1 = tokio::time::Instant::now();
+        assert!(paced(&fresh, "https://youtu.be/b", None, None, None, true, || async move { finished(true, "") }).await.unwrap().success);
+        assert_eq!(tokio::time::Instant::now() - t1, Duration::from_secs(8), "the ordinary gap is waited");
+    }
+
+    /// The downloader's own probes: one that is not a job's reports the
+    /// cool-down at once (the Test URL, the ladder, the benchmark, the checks);
+    /// a job's waits it out.
+    #[tokio::test(start_paused = true)]
+    async fn a_downloader_that_is_not_a_jobs_reports_a_cool_down_and_a_jobs_waits_it_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+        pacer.penalize("youtube", RATE_LIMIT_COOL_DOWN);
+        let t0 = tokio::time::Instant::now();
+        let e = Downloader::new(dir.path().join("no-yt-dlp.exe"), &pacer)
+            .probe_info("https://youtu.be/abcdefghijk", Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(tokio::time::Instant::now(), t0);
+        assert!(e.contains("cooling down"), "{e}");
+        assert_eq!(classify_download_error(&e), ErrorCode::RateLimited);
+        // A job's probe waits the two minutes, then runs (no yt-dlp here: it fails to start).
+        let e = Downloader::new(dir.path().join("no-yt-dlp.exe"), &pacer)
+            .for_a_job()
+            .probe_info("https://youtu.be/abcdefghijk", Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(tokio::time::Instant::now() - t0, RATE_LIMIT_COOL_DOWN);
+        assert!(e.contains("could not run yt-dlp"), "{e}");
+    }
 }

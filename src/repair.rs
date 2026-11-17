@@ -284,7 +284,16 @@ pub trait Env: Send + Sync {
         None
     }
     fn fetcher(&self) -> &dyn Fetcher;
+    /// The gate's prober for a ladder that is not a job's (the admin's Test
+    /// URL, the nightly self-heal): a platform cooling down after a rate limit
+    /// is reported at once (P11.4).
     fn prober(&self) -> &dyn Prober;
+    /// The gate's prober for a ladder that runs inside a job: it waits out a
+    /// cool-down like the job's own runs, within the gate's deadline. The
+    /// default is [`Self::prober`].
+    fn job_prober(&self) -> &dyn Prober {
+        self.prober()
+    }
     fn resolver(&self) -> &dyn Resolver;
     fn is_ad(&self, url: &str) -> bool;
     /// Test only: accept a loopback answer from the resolver.
@@ -366,7 +375,10 @@ pub struct RealEnv {
     images: HttpImages,
     ffmpeg: std::path::PathBuf,
     ytdl: std::path::PathBuf,
+    /// Not a job's: the Test URL and the nightly self-heal (P11.4).
     prober: ToolProber,
+    /// A job's ladder: waits out a platform's cool-down.
+    job_prober: ToolProber,
     resolver: repair_gate::SystemResolver,
     model: Option<LlmModel>,
 }
@@ -388,13 +400,16 @@ impl RealEnv {
         ytdl: std::path::PathBuf,
         ffmpeg: std::path::PathBuf,
     ) -> Self {
+        // Every yt-dlp run of the ladder waits for its turn in the engine's pacer (P11.4).
+        let pacer = engine.pacer();
         Self {
             engine,
             fetcher: HttpFetcher::new(),
             images: HttpImages(HttpFetcher::new()),
             ffmpeg,
             ytdl: ytdl.clone(),
-            prober: ToolProber::new(ffprobe, Some(ytdl)),
+            prober: ToolProber::new(ffprobe.clone(), Some(ytdl.clone()), &pacer),
+            job_prober: ToolProber::new(ffprobe, Some(ytdl), &pacer).for_a_job(),
             resolver: repair_gate::SystemResolver,
             model: None,
         }
@@ -428,6 +443,9 @@ impl Env for RealEnv {
     fn prober(&self) -> &dyn Prober {
         &self.prober
     }
+    fn job_prober(&self) -> &dyn Prober {
+        &self.job_prober
+    }
     fn resolver(&self) -> &dyn Resolver {
         &self.resolver
     }
@@ -448,10 +466,10 @@ impl Env for RealEnv {
         }
     }
     async fn ytdl_probe(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
-        Downloader::new(&self.ytdl).probe_info(url, timeout).await
+        Downloader::new(&self.ytdl, &self.engine.pacer()).probe_info(url, timeout).await
     }
     async fn page_scan(&self, url: &str, timeout: Duration) -> omni_broadcast::downloader::PageScan {
-        Downloader::new(&self.ytdl).page_videos(url, timeout).await
+        Downloader::new(&self.ytdl, &self.engine.pacer()).page_videos(url, timeout).await
     }
     async fn final_url(&self, url: &str) -> Option<String> {
         final_page_url(url).await
@@ -992,11 +1010,13 @@ async fn find_and_verify(
         facts.ad_media.extend(lf.ad_media);
     }
     let is_ad = |u: &str| env.is_ad(u);
+    // A job's ladder waits out a platform's cool-down within the deadline (P11.4).
+    let prober = if job.id != NO_JOB { env.job_prober() } else { env.prober() };
     let gate = async {
         if env.allow_loopback() {
-            repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, env.prober(), env.resolver(), deadline).await
+            repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, prober, env.resolver(), deadline).await
         } else {
-            repair_gate::verify(cands, &facts, &is_ad, env.prober(), env.resolver(), deadline).await
+            repair_gate::verify(cands, &facts, &is_ad, prober, env.resolver(), deadline).await
         }
     };
     let (verified, rejected) = tokio::select! {
@@ -1469,11 +1489,13 @@ async fn llm_rung(
             }
             tried.extend(cands.iter().map(|c| c.url.clone()));
             let is_ad = |u: &str| ctx.env.is_ad(u);
+            // A job's ladder waits out a platform's cool-down within the deadline (P11.4).
+            let prober = if job_id != NO_JOB { ctx.env.job_prober() } else { ctx.env.prober() };
             let gate = async {
                 if ctx.env.allow_loopback() {
-                    repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, ctx.env.prober(), ctx.env.resolver(), deadline).await
+                    repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, prober, ctx.env.resolver(), deadline).await
                 } else {
-                    repair_gate::verify(cands, &facts, &is_ad, ctx.env.prober(), ctx.env.resolver(), deadline).await
+                    repair_gate::verify(cands, &facts, &is_ad, prober, ctx.env.resolver(), deadline).await
                 }
             };
             let (verified, rejected) = tokio::select! {

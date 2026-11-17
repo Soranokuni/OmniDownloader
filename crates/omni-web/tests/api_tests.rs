@@ -1609,3 +1609,35 @@ async fn a_completed_job_marked_auto_delivering_gets_the_card_and_wrong_video_wo
     assert_eq!(std::fs::read(&file)?, b"on air");
     Ok(())
 }
+
+/// P11.4 review round 1: a RATE_LIMITED job on a platform that ran out of
+/// retries shows the exhausted text followed by the site's cookie advice (the
+/// helper the worker's history line uses too); one still queued keeps the
+/// code's own «Γίνεται αυτόματη επανάληψη».
+#[tokio::test]
+async fn a_rate_limit_that_ran_out_of_retries_on_a_platform_shows_the_cookie_advice() -> Result<()> {
+    use omni_broadcast::errors::{exhausted_hint_el, login_hint_el, ErrorCode};
+    let app = App::new()?;
+    let new = |url: &str, slug: &str| {
+        app.repo
+            .enqueue(&omni_core::models::NewJob::new(url, slug, "NIKOLAOU"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+            .map(|e| e.job_id())
+    };
+    let id = new("https://x.com/someone/status/1", "1_NIKOLAOU_POST")?;
+    for _ in 0..4 {
+        assert_eq!(app.repo.lease_job("W", 180)?.unwrap().id, id);
+        assert!(app.repo.requeue_after(id, "W", chrono::Duration::seconds(-1), "RATE_LIMITED", "limited")?);
+    }
+    assert_eq!(app.repo.lease_job("W", 180)?.unwrap().id, id);
+    assert!(app.repo.finish(id, "W", JobStatus::RequiresReview, Some("RATE_LIMITED"), Some("limited"), None)?);
+    let (status, json) = app.send("GET", &format!("/api/jobs/{id}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["job"]["hint"], json!(format!("{} {}", exhausted_hint_el(5), login_hint_el("x.com", false))));
+
+    let waiting = new("https://x.com/someone/status/2", "2_NIKOLAOU_POST")?;
+    assert_eq!(app.repo.lease_job("W", 180)?.unwrap().id, waiting);
+    assert!(app.repo.requeue_after(waiting, "W", chrono::Duration::minutes(2), "RATE_LIMITED", "limited")?);
+    let (_, json) = app.send("GET", &format!("/api/jobs/{waiting}"), &app.mcr_token, None).await?;
+    assert_eq!(json["job"]["hint"], json!(ErrorCode::RateLimited.hint_el()));
+    Ok(())
+}

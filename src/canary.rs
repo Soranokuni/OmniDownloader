@@ -216,6 +216,8 @@ pub(crate) trait SiteProbe {
 
 pub(crate) struct LiveProbe {
     pub ytdl: PathBuf,
+    /// The daemon's pacer: a canary's yt-dlp waits for its turn like a job's (P11.4).
+    pub pacer: omni_broadcast::pacing::HostPacer,
     /// Where what the browser sees is remembered for the site (P3.16).
     pub repo: Repository,
     pub scratch: PathBuf,
@@ -226,7 +228,7 @@ impl SiteProbe for LiveProbe {
         omni_browser::pages::page_status(url).await
     }
     async fn check_link(&self, url: &str) -> LinkOutcome {
-        crate::selfcheck::check_link_recording(&self.ytdl, &self.repo, &self.scratch, url).await
+        crate::selfcheck::check_link_recording(&self.ytdl, &self.pacer, &self.repo, &self.scratch, url).await
     }
     async fn browser_works(&self, health: &HealthState) -> bool {
         crate::selfcheck::check_browser(health).await
@@ -388,6 +390,8 @@ pub struct CanaryEnv {
     outage: AtomicBool,
     /// Model calls the daytime heals made on this local day: (date, calls). In memory only.
     day_llm: Mutex<(String, u32)>,
+    /// Every check's yt-dlp waits for its turn here (P11.4); the daemon gives its engine's.
+    pacer: omni_broadcast::pacing::HostPacer,
 }
 
 impl CanaryEnv {
@@ -405,7 +409,20 @@ impl CanaryEnv {
             heal_limiter: Mutex::new(TriggerLimiter::default()),
             outage: AtomicBool::new(false),
             day_llm: Mutex::new((String::new(), 0)),
+            pacer: omni_broadcast::pacing::HostPacer::default(),
         }
+    }
+
+    /// Pace the checks' yt-dlp with `pacer`: the daemon's engine's, so a canary
+    /// and a job never start at one platform out of turn (P11.4).
+    pub fn with_pacer(mut self, pacer: omni_broadcast::pacing::HostPacer) -> Self {
+        self.pacer = pacer;
+        self
+    }
+
+    /// The pacer the checks use; the nightly self-check and tool updates use it too.
+    pub fn pacer(&self) -> omni_broadcast::pacing::HostPacer {
+        self.pacer.clone()
     }
 
     /// Calls of the daytime heals still allowed today (the count restarts with the local date).
@@ -512,7 +529,7 @@ impl CanaryEnv {
 
     /// The real outside world for a check, with the memory of what the browser sees on a site's pages.
     fn live_probe(&self) -> LiveProbe {
-        LiveProbe { ytdl: self.ytdl(), repo: self.repo.clone(), scratch: self.scratch.clone() }
+        LiveProbe { ytdl: self.ytdl(), pacer: self.pacer.clone(), repo: self.repo.clone(), scratch: self.scratch.clone() }
     }
 }
 

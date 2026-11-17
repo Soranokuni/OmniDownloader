@@ -361,6 +361,46 @@ mod waiting_rule_tests {
         let mins = |m: i64| engine.clone().with_retry_max_age(m).retry_max_age().num_minutes();
         assert_eq!((mins(90), mins(5), mins(-1), mins(10_000)), (90, 30, 30, 360));
     }
+
+    /// P11.4: one run per platform at a time and an 8 s gap unless set; set
+    /// values are read as 1..=4 and 0..=120 s; clones share one pacer, so a
+    /// turn held through one is seen through the other.
+    #[tokio::test]
+    async fn the_engine_paces_with_one_shared_pacer_and_clamps_its_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let engine = BroadcastEngine::new(repo, p("y"), p("f"), p("p"), p("b"), p("temp"), p("watch"));
+        assert_eq!((engine.pacer().per_key(), engine.pacer().min_gap()), (1, Duration::from_secs(8)));
+        let set = |c: i64, g: i64| {
+            let e = engine.clone().with_pacing(c, g);
+            (e.pacer().per_key(), e.pacer().min_gap().as_secs())
+        };
+        assert_eq!((set(2, 15), set(0, -5), set(9, 1_000)), ((2, 15), (1, 0), (4, 120)));
+        let engine = engine.with_pacing(1, 8);
+        let clone = engine.clone();
+        let _turn = engine.pacer().acquire("youtube", &CancellationToken::new()).await.unwrap();
+        assert_eq!(clone.pacer().running("youtube"), 1);
+    }
+
+    /// A wait over two seconds is one INFO line in the job's history, naming
+    /// only the platform.
+    #[test]
+    fn a_wait_for_a_turn_is_written_to_the_jobs_history() {
+        use omni_core::models::NewJob;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let id = repo
+            .enqueue(&NewJob::new("https://youtu.be/abcdefghijk", "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+            .unwrap()
+            .job_id();
+        let p = |n: &str| dir.path().join(n);
+        let engine = BroadcastEngine::new(repo.clone(), p("y"), p("f"), p("p"), p("b"), p("temp"), p("watch"));
+        (engine.pace_note(id, JobStage::Download))("youtube", Duration::from_millis(12_300));
+        let lines: Vec<_> = repo.get_job_events(id, 100).unwrap().into_iter().filter(|e| e.message.starts_with("Σε σειρά")).collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].level.as_str(), lines[0].message.as_str()), ("INFO", "Σε σειρά για youtube: 12″ αναμονή"));
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +489,9 @@ pub struct BroadcastEngine {
     waits: Arc<Mutex<HashMap<i64, (u32, String)>>>,
     /// No automatic retry for a job older than this (P11.3a, `retry.max_age_mins`).
     retry_max_age: chrono::Duration,
+    /// Every yt-dlp run on a video platform waits here for its turn (P11.4);
+    /// shared by clones, the repair ladder, the canaries and the self-check.
+    pacer: crate::pacing::HostPacer,
 }
 
 /// `retry.max_age_mins` when the daemon sets none: the owner's two hours.
@@ -465,6 +508,36 @@ impl BroadcastEngine {
     /// retry decision reads it.
     pub fn retry_max_age(&self) -> chrono::Duration {
         self.retry_max_age
+    }
+
+    /// Pace yt-dlp per platform (P11.4): at most `per_host_concurrency` runs at
+    /// a time (read as 1..=4), starts `min_gap_secs` plus jitter apart (read as
+    /// 0..=120; 0 switches the gap off). A new pacer: call it before the engine
+    /// is cloned or its pacer handed out.
+    pub fn with_pacing(mut self, per_host_concurrency: i64, min_gap_secs: i64) -> Self {
+        self.pacer = crate::pacing::HostPacer::new(
+            per_host_concurrency.clamp(1, 4) as usize,
+            std::time::Duration::from_secs(min_gap_secs.clamp(0, 120) as u64),
+        );
+        self
+    }
+
+    /// The pacer every yt-dlp run of this daemon shares.
+    pub fn pacer(&self) -> crate::pacing::HostPacer {
+        self.pacer.clone()
+    }
+
+    /// Writes a wait for a turn into job `job_id`'s history (P11.4).
+    fn pace_note(&self, job_id: i64, stage: JobStage) -> crate::downloader::WaitNote {
+        let repo = self.repo.clone();
+        Arc::new(move |key, waited| {
+            let _ = repo.record_event(job_id, "INFO", Some(stage), &crate::pacing::wait_line(key, waited));
+        })
+    }
+
+    /// A downloader on this engine's pacer, its waits written to job `job_id`'s history.
+    fn downloader_for(&self, job_id: i64, stage: JobStage) -> Downloader {
+        Downloader::new(&self.ytdl_path, &self.pacer).for_a_job().on_pace_wait(self.pace_note(job_id, stage))
     }
 
     /// Count one more wait of `job_id` (the first of a series when `first`).
@@ -579,6 +652,7 @@ impl BroadcastEngine {
             watchfolder_state: WatchfolderState::default(),
             waits: Arc::new(Mutex::new(HashMap::new())),
             retry_max_age: chrono::Duration::minutes(DEFAULT_RETRY_MAX_AGE_MINS),
+            pacer: crate::pacing::HostPacer::default(),
         }
     }
 
@@ -593,10 +667,13 @@ impl BroadcastEngine {
     /// The videos yt-dlp sees on a news page that holds several, in page
     /// order, and whether yt-dlp has no extractor for it. See
     /// [`crate::downloader::PageScan`].
-    pub async fn page_videos(&self, url: &str) -> crate::downloader::PageScan {
+    ///
+    /// This and the three probes below run for job `job_id`: a wait for a turn
+    /// on a video platform (P11.4) is written to its history.
+    pub async fn page_videos(&self, job_id: i64, url: &str) -> crate::downloader::PageScan {
         // The site's cookie jar, for the length of the call (P3.5).
         let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
-        crate::downloader::Downloader::new(&self.ytdl_path)
+        self.downloader_for(job_id, JobStage::Extract)
             .with_cookie_jar(jar.as_ref())
             .page_videos(url, std::time::Duration::from_secs(90))
             .await
@@ -606,9 +683,10 @@ impl BroadcastEngine {
     /// sees it without downloading (P3.13). `Some(false)` only when it says
     /// so ("No video could be found in this tweet"); a failure that proves
     /// nothing (network, login, timeout) is `None`.
-    pub async fn post_has_video(&self, url: &str) -> Option<bool> {
+    pub async fn post_has_video(&self, job_id: i64, url: &str) -> Option<bool> {
         let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
-        let probed = Downloader::new(&self.ytdl_path)
+        let probed = self
+            .downloader_for(job_id, JobStage::Extract)
             .with_cookie_jar(jar.as_ref())
             .probe(url, std::time::Duration::from_secs(60))
             .await;
@@ -623,9 +701,10 @@ impl BroadcastEngine {
     /// Length and live flag of the video at `url`, as yt-dlp's own extractor
     /// sees them without downloading (P3.14). `None` when it could not say
     /// (network, login, timeout): the caller treats the length as unknown.
-    pub async fn video_length(&self, url: &str) -> Option<crate::downloader::PlatformInfo> {
+    pub async fn video_length(&self, job_id: i64, url: &str) -> Option<crate::downloader::PlatformInfo> {
         let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
-        let probed = Downloader::new(&self.ytdl_path)
+        let probed = self
+            .downloader_for(job_id, JobStage::Extract)
             .with_cookie_jar(jar.as_ref())
             .probe_media(url, std::time::Duration::from_secs(15))
             .await;
@@ -637,13 +716,15 @@ impl BroadcastEngine {
     /// live, gone, readable or unknown, asked with the sniffer's referer, user agent and cookies.
     pub async fn probe_candidate(
         &self,
+        job_id: i64,
         url: &str,
         referer: Option<&str>,
         user_agent: Option<&str>,
         cookies: Option<&str>,
     ) -> crate::downloader::Probe {
         let jar = crate::cookie_file::for_url(&self.repo, url, &self.temp_dir, true);
-        let probed = Downloader::new(&self.ytdl_path)
+        let probed = self
+            .downloader_for(job_id, JobStage::Extract)
             .with_cookie_jar(jar.as_ref())
             .probe_candidate(url, referer, user_agent, cookies, std::time::Duration::from_secs(15))
             .await;
@@ -824,7 +905,7 @@ impl BroadcastEngine {
         }
 
         // 1. Download stage
-        let downloader = Downloader::new(&self.ytdl_path);
+        let downloader = self.downloader_for(job_id, JobStage::Download);
         let repo_clone = self.repo.clone();
         // The site's cookie jar (P3.5), a file in this job's workspace for the
         // length of the download only: the guard removes it on every way out.
@@ -937,8 +1018,9 @@ impl BroadcastEngine {
 
         // Room for this file before it is made (plan P1.4): a full disk
         // mid-encode fails late, after minutes of work, and can take the
-        // database down with it. Waiting is the fix (LOW_DISK retries in
-        // 10 min), so the job goes back to the queue, not to review.
+        // database down with it. Waiting may fix it: LOW_DISK goes back to
+        // the queue for 10 min, three times, and then to review (a clip that
+        // needs more room than the volume has fails the same way every run).
         if let Ok(probe) = transcoder.probe_source(&downloaded_file).await {
             if let Err(why) = room_for(probe.duration_secs, &job_temp, &self.watchfolder_dir) {
                 warn!("Job #{job_id}: {why}");

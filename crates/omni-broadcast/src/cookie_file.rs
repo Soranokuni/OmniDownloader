@@ -162,12 +162,65 @@ pub fn test_args(cookies: &Path, url: &str) -> Vec<String> {
 pub struct JarTest {
     pub ok: bool,
     pub detail: String,
+    /// The site was limiting requests (or cooling down after it did, P11.4):
+    /// nothing was learnt about the jar, and nothing was stored.
+    pub inconclusive: bool,
+}
+
+/// What a jar test says when the site was limiting requests (P11.4).
+pub const JAR_TEST_LIMITED: &str = "the site is limiting requests right now; try again in a few minutes";
+
+/// A jar test's run as its result, `values` scrubbed from any error text.
+///
+/// A jar the site no longer accepts is a failed test even when the run then
+/// ends in a rate limit: yt-dlp says "The provided YouTube account cookies are
+/// no longer valid" and goes on without them, and the anonymous request is
+/// what the platform's bot check refuses. Otherwise a rate limit (or a
+/// platform cooling down after one) is inconclusive: nothing was learnt about
+/// the jar.
+fn jar_test_result(outcome: anyhow::Result<omni_core::process::RunOutcome>, values: &[String]) -> JarTest {
+    let result = |ok: bool, detail: String| JarTest { ok, detail, inconclusive: false };
+    match outcome {
+        Ok(o) if o.success && !o.stdout.trim().is_empty() => result(true, "ok".to_string()),
+        Ok(o) if o.success => result(false, "yt-dlp found no video".to_string()),
+        Ok(o) if o.timed_out => result(false, "yt-dlp did not answer within 90 s".to_string()),
+        Ok(o) if o.stderr_tail.to_lowercase().contains("cookies are no longer valid") => {
+            let line = o
+                .stderr_tail
+                .lines()
+                .find(|l| l.to_lowercase().contains("cookies are no longer valid"))
+                .unwrap_or("the cookies are no longer valid")
+                .trim()
+                .chars()
+                .take(500)
+                .collect::<String>();
+            result(false, scrub_detail(&line, values))
+        }
+        Ok(o) if crate::errors::classify_download_error(&o.stderr_tail) == crate::errors::ErrorCode::RateLimited => {
+            JarTest { ok: false, detail: JAR_TEST_LIMITED.to_string(), inconclusive: true }
+        }
+        Ok(o) => result(false, scrub_detail(&crate::downloader::first_error_line(&o.stderr_tail), values)),
+        Err(e) => result(false, scrub_detail(&format!("could not run yt-dlp: {e:#}"), values)),
+    }
 }
 
 /// Test the jar for `domain` against `url` (`yt-dlp --cookies ... --skip-download
 /// --dump-json`), store the outcome with `url` as the nightly sample, and return it.
 /// `Err` only when the test could not be set up (no jar, bad link, cannot write).
-pub async fn test_jar(ytdl: &Path, temp_dir: &Path, repo: &Repository, domain: &str, url: &str) -> Result<JarTest, String> {
+///
+/// The run waits for its turn on the platform in `pacer` (the daemon's), as a
+/// caller that is not a job: a platform cooling down after a rate limit is
+/// answered at once. That, or the site refusing this run as a rate limit, is
+/// inconclusive ([`JAR_TEST_LIMITED`]): the jar's stored state and last result
+/// are left as they were.
+pub async fn test_jar(
+    ytdl: &Path,
+    temp_dir: &Path,
+    repo: &Repository,
+    domain: &str,
+    url: &str,
+    pacer: &crate::pacing::HostPacer,
+) -> Result<JarTest, String> {
     let url = validate_sample_url(domain, url).map_err(|e| e.to_string())?;
     let text = match repo.cookie_jar_text(domain) {
         Ok(Some(t)) => t,
@@ -177,16 +230,17 @@ pub async fn test_jar(ytdl: &Path, temp_dir: &Path, repo: &Repository, domain: &
     let values: Vec<String> = repo.cookie_values();
     let file = CookieFile::write_scratch(temp_dir, &text).map_err(|e| format!("Could not prepare the test: {e}"))?;
     let args = test_args(file.path(), &url);
-    let outcome = omni_core::process::run_capture(ytdl, args, Duration::from_secs(90)).await;
+    let outcome = crate::downloader::paced(pacer, &url, None, None, None, true, || {
+        omni_core::process::run_capture(ytdl, args, Duration::from_secs(90))
+    })
+    .await;
     drop(file);
 
-    let test = match outcome {
-        Ok(o) if o.success && !o.stdout.trim().is_empty() => JarTest { ok: true, detail: "ok".to_string() },
-        Ok(o) if o.success => JarTest { ok: false, detail: "yt-dlp found no video".to_string() },
-        Ok(o) if o.timed_out => JarTest { ok: false, detail: "yt-dlp did not answer within 90 s".to_string() },
-        Ok(o) => JarTest { ok: false, detail: scrub_detail(&crate::downloader::first_error_line(&o.stderr_tail), &values) },
-        Err(e) => JarTest { ok: false, detail: scrub_detail(&format!("could not run yt-dlp: {e:#}"), &values) },
-    };
+    let test = jar_test_result(outcome, &values);
+    if test.inconclusive {
+        tracing::info!("Cookie test for {domain} ({}): not judged, the site is limiting requests", host_and_path(&url));
+        return Ok(test);
+    }
     if let Err(e) = repo.record_cookie_test(domain, test.ok, &test.detail, &url, chrono::Utc::now()) {
         warn!("The result of the cookie test for {domain} was not stored: {e:#}");
     }
@@ -342,16 +396,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::new(dir.path().join("omni.db")).unwrap();
         let nowhere = dir.path().join("no-such-yt-dlp.exe");
-        let e = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1").await.unwrap_err();
+        let pacer = crate::pacing::HostPacer::default();
+        let e = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1", &pacer).await.unwrap_err();
         assert!(e.contains("no cookie jar"), "{e}");
         let jar = omni_core::cookies::parse_netscape("x.com", TEXT).unwrap();
         repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
-        assert!(test_jar(&nowhere, dir.path(), &repo, "x.com", "https://example.org/a").await.is_err());
+        assert!(test_jar(&nowhere, dir.path(), &repo, "x.com", "https://example.org/a", &pacer).await.is_err());
         // A missing yt-dlp is a failed test, stored, not a panic, and nothing is left behind.
-        let t = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1?s=20").await.unwrap();
-        assert!(!t.ok && !t.detail.contains("file-value-123456"));
+        let t = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1?s=20", &pacer).await.unwrap();
+        assert!(!t.ok && !t.inconclusive && !t.detail.contains("file-value-123456"));
         let stored = repo.list_cookie_jars().unwrap();
         assert_eq!(stored[0].last_test_ok, Some(false));
+        assert_eq!(std::fs::read_dir(dir.path().join("cookies")).unwrap().count(), 0, "the test left a jar behind");
+    }
+
+    fn ran(success: bool, stderr: &str) -> anyhow::Result<omni_core::process::RunOutcome> {
+        Ok(omni_core::process::RunOutcome {
+            exit_code: Some(if success { 0 } else { 1 }),
+            success,
+            elapsed: Duration::from_secs(3),
+            stdout: if success { "{\"id\":\"x\"}".into() } else { String::new() },
+            stderr_tail: stderr.to_string(),
+            timed_out: false,
+            cancelled: false,
+        })
+    }
+
+    /// P11.4 review round 2: a jar YouTube no longer accepts is a FAILED test,
+    /// even though the anonymous run that follows ends in the bot check; a bot
+    /// check alone is inconclusive; any other failure is failed as before.
+    #[test]
+    fn a_jar_youtube_no_longer_accepts_is_failed_even_behind_a_bot_check() {
+        let values = vec!["value-123456".to_string()];
+        let expired = "WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have likely been rotated in the browser as a security measure\nERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies";
+        let t = jar_test_result(ran(false, expired), &values);
+        assert!(!t.ok && !t.inconclusive, "{t:?}");
+        assert!(t.detail.contains("cookies are no longer valid"), "{}", t.detail);
+        let bot = "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies";
+        let t = jar_test_result(ran(false, bot), &values);
+        assert!(t.inconclusive && t.detail == JAR_TEST_LIMITED, "{t:?}");
+        let t = jar_test_result(ran(false, "ERROR: [twitter] 1: This post is unavailable"), &values);
+        assert!(!t.ok && !t.inconclusive && t.detail.contains("This post is unavailable"), "{t:?}");
+        assert!(jar_test_result(ran(true, ""), &values).ok);
+    }
+
+    /// P11.4 review round 1: a jar test while the platform cools down after a
+    /// rate limit is answered at once, inconclusive, and stores nothing: the
+    /// jar's last result stays what it was. A genuinely failing test is still
+    /// stored as failed (above).
+    #[tokio::test(start_paused = true)]
+    async fn a_jar_test_during_a_cool_down_is_inconclusive_and_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let nowhere = dir.path().join("no-such-yt-dlp.exe");
+        let jar = omni_core::cookies::parse_netscape("x.com", TEXT).unwrap();
+        repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
+        let before = repo.list_cookie_jars().unwrap()[0].clone();
+        let pacer = crate::pacing::HostPacer::default();
+        pacer.penalize("x", crate::pacing::RATE_LIMIT_COOL_DOWN);
+        let t0 = tokio::time::Instant::now();
+        let t = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1", &pacer).await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), t0, "the test waited for the cool-down");
+        assert!(t.inconclusive && !t.ok, "{t:?}");
+        assert_eq!(t.detail, JAR_TEST_LIMITED);
+        let after = repo.list_cookie_jars().unwrap()[0].clone();
+        assert_eq!((after.last_test_ok, after.last_sample_url.clone()), (before.last_test_ok, before.last_sample_url.clone()), "the jar's result changed");
+        assert_eq!(after.last_test_ok, None);
         assert_eq!(std::fs::read_dir(dir.path().join("cookies")).unwrap().count(), 0, "the test left a jar behind");
     }
 }

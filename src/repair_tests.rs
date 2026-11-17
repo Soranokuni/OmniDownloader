@@ -1335,9 +1335,10 @@ async fn a_repaired_video_goes_through_the_real_pipeline_and_waits_for_mcr() {
         root.join("temp"),
         root.join("watchfolder"),
     ));
+    let pacer = engine.pacer();
     let env = Local {
         engine,
-        prober: Rewriting { inner: ToolProber::new(ffprobe, Some(ytdlp)), addr },
+        prober: Rewriting { inner: ToolProber::new(ffprobe, Some(ytdlp), &pacer), addr },
         addr,
         fetch: NoFetch,
     };
@@ -2922,4 +2923,34 @@ async fn a_link_that_is_not_a_plain_web_address_ends_in_review_with_its_own_text
         let events: String = repo.get_job_events(id, 100).unwrap().iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(" ");
         assert!(!events.contains("hunter2") && !events.contains("admin"), "{events}");
     }
+}
+
+/// P11.4 review round 1: the ladder's world is not a job's. While a platform
+/// cools down after a rate limit, its yt-dlp probe (the admin's Test URL, the
+/// ladder) and its gate prober answer at once with the cool-down, never wait
+/// it out against their own time limits.
+#[tokio::test(start_paused = true)]
+async fn the_ladders_probes_report_a_cool_down_at_once_and_a_jobs_ladder_waits_it_out() {
+    let dir = Scratch::new();
+    let repo = Repository::new(dir.0.join("omni.db")).unwrap();
+    let p = |n: &str| dir.0.join(n);
+    let engine = Arc::new(BroadcastEngine::new(repo, p("no-yt-dlp.exe"), p("f.exe"), p("p.exe"), p("b.exe"), p("temp"), p("watch")));
+    let env = RealEnv::new(engine.clone(), p("no-ffprobe.exe"), p("no-yt-dlp.exe"), p("no-ffmpeg.exe"));
+    engine.pacer().penalize("youtube", omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN);
+    let yt = "https://www.youtube.com/watch?v=abcdefghijk";
+    let t0 = tokio::time::Instant::now();
+    let e = env.ytdl_probe(yt, Duration::from_secs(30)).await.unwrap_err();
+    assert!(e.contains("youtube is cooling down for 120 s"), "the Test URL shows: {e}");
+    assert_eq!(omni_broadcast::errors::classify_download_error(&e), ErrorCode::RateLimited);
+    let scan = env.page_scan(yt, Duration::from_secs(30)).await;
+    assert_eq!(scan, omni_broadcast::downloader::PageScan::default());
+    let cand = omni_broadcast::repair_gate::Candidate { url: yt.into(), referer: None, origin: "recipe:abcd1234".into(), position: None, in_article: None };
+    let e = env.prober().probe(&cand).await.unwrap_err();
+    assert_eq!(omni_broadcast::errors::classify_download_error(&e), ErrorCode::RateLimited, "{e}");
+    assert_eq!(tokio::time::Instant::now(), t0, "a probe waited for the cool-down");
+    // Review round 2: a job's ladder waits the cool-down out (the gate's
+    // deadline bounds it), then probes (no yt-dlp here: it cannot start).
+    let e = env.job_prober().probe(&cand).await.unwrap_err();
+    assert_eq!(tokio::time::Instant::now() - t0, omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN, "a job's probe did not wait");
+    assert!(e.contains("could not run yt-dlp"), "{e}");
 }

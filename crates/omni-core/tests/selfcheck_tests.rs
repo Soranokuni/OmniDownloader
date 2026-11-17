@@ -46,3 +46,29 @@ fn failing_since_is_the_first_failure_and_clears_when_it_works_again() {
     assert!(repo.delete_selfcheck_link(id).unwrap());
     assert!(!repo.delete_selfcheck_link(id).unwrap());
 }
+
+/// P11.4: a stored result is put back exactly as it was before, so a yt-dlp
+/// build that is not left live leaves no trace in the self-check.
+#[test]
+fn a_stored_result_is_put_back_exactly_as_it_was() {
+    let (_d, repo) = repo();
+    let id = repo.add_selfcheck_link("Test", "https://example.org/video/2").unwrap();
+    let get = || repo.list_selfcheck_links().unwrap().into_iter().find(|l| l.id == id).unwrap();
+    repo.record_selfcheck_result(id, true, "found x").unwrap();
+    let before = get();
+    repo.record_selfcheck_result(id, false, "broken by the new build").unwrap();
+    assert!(get().failing_since.is_some());
+    assert!(repo.restore_selfcheck_result(&before).unwrap());
+    let after = get();
+    assert_eq!(
+        (after.last_ok, after.failing_since, after.last_detail.clone(), after.last_checked_at, after.last_ok_at),
+        (before.last_ok, before.failing_since, before.last_detail.clone(), before.last_checked_at, before.last_ok_at)
+    );
+    // A link never checked is put back to never checked.
+    let fresh = repo.add_selfcheck_link("Fresh", "https://example.org/video/3").unwrap();
+    let untouched = repo.list_selfcheck_links().unwrap().into_iter().find(|l| l.id == fresh).unwrap();
+    repo.record_selfcheck_result(fresh, false, "x").unwrap();
+    repo.restore_selfcheck_result(&untouched).unwrap();
+    let back = repo.list_selfcheck_links().unwrap().into_iter().find(|l| l.id == fresh).unwrap();
+    assert_eq!((back.last_ok, back.last_checked_at, back.failing_since), (None, None, None));
+}

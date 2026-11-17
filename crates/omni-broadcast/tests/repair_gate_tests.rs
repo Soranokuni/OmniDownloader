@@ -108,7 +108,7 @@ async fn real_ffprobe_reads_the_clips_and_the_gate_keeps_the_long_one() {
     let addr = serve(dir.path().to_path_buf()).await;
 
     // The real prober, straight at the local server.
-    let tool = ToolProber::new(fp.clone(), None);
+    let tool = ToolProber::new(fp.clone(), None, &omni_broadcast::pacing::HostPacer::default());
     let info = tool.probe(&candidate(&format!("http://{addr}/long.mp4"))).await.unwrap();
     assert_eq!(info.height, 360);
     assert_eq!(info.video_streams, 1);
@@ -119,7 +119,7 @@ async fn real_ffprobe_reads_the_clips_and_the_gate_keeps_the_long_one() {
 
     // The gate, with the fake name mapped to the server.
     let facts = GateFacts { observed_hosts: BTreeSet::from([FAKE_HOST.to_string()]), ..Default::default() };
-    let prober = Rewriting { inner: ToolProber::new(fp, None), addr };
+    let prober = Rewriting { inner: ToolProber::new(fp, None, &omni_broadcast::pacing::HostPacer::default()), addr };
     let cands = vec![candidate(&format!("http://{FAKE_HOST}/short.mp4")), candidate(&format!("http://{FAKE_HOST}/long.mp4"))];
     let deadline = Instant::now() + Duration::from_secs(60);
     let (ok, rej) = verify_allowing_loopback_for_tests(cands.clone(), &facts, &|_| false, &prober, &MapsToLoopback, deadline).await;

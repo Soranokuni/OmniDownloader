@@ -275,6 +275,8 @@ with a placeholder until you add the person (§6.3).
 | `retry.max_age_mins` | 120 | no automatic retry for a job older than this, counted from when it was queued or from MCR's last «Δοκιμή ξανά» (read as 30 to 360); see §10 |
 | `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | when a job not yet delivered counts as late, ordinary and urgent; not used yet |
 | `retry.second_chance_window_mins` | 120 | how long after it failed a job may still get one more automatic try (for example after a yt-dlp update or a new cookie jar); not used yet |
+| `pacing.per_host_concurrency` | 1 | yt-dlp runs starting at one video platform (YouTube, X, Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) at a time, so a mail with many links does not trip the platform's bot check (read as 1 to 4). A download gives its turn back as soon as the video starts transferring, so downloads still overlap; a probe keeps it until it ends. A job waiting for its turn keeps its download slot; a wait over 2 s is written to its history |
+| `pacing.min_gap_secs` | 8 | seconds between two starts on one platform, plus up to 4 s at random (read as 0 to 120; 0 switches the gap off). After a platform refuses a run as a rate limit (`RATE_LIMITED`), nothing new starts there for 2 minutes |
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
 | `adblock_*` | on | blocklists for the page reader, updated nightly |
@@ -543,11 +545,14 @@ older than `retry.max_age_mins` (2 hours), counted from when it was queued
 or from MCR's last «Δοκιμή ξανά», is not retried. `LOW_DISK` retries after
 10 minutes three times (four tries), then goes to review: the clip may need
 more room than the temp or watchfolder volume has. While the disk check is
-red, no job is started at all; they wait in the queue.
+red, no job is started at all; they wait in the queue. `RATE_LIMITED`
+retries after 2, 5, 10 and 15 minutes (five tries, about half an hour),
+within the same age limit.
 
 | Code | Auto | Meaning / action |
 |---|---|---|
 | `NETWORK` | yes | network problem |
+| `RATE_LIMITED` | yes | the platform is refusing downloads for now (YouTube's bot check, HTTP 429, "try again later"); nothing new starts there for 2 minutes (§5.3 `pacing`). When the retries run out, the card adds the site's cookie advice (§6.1). The same bot check on X, Facebook or Instagram is `LOGIN_REQUIRED` |
 | `HTTP_403` | yes | the source refused; try later or another link |
 | `EXTRACT_TIMEOUT`, `DOWNLOAD_TIMEOUT` | yes | download timed out |
 | `DELIVERY_FAILED`, `DELIVER_TIMEOUT` | yes | could not write to the watchfolder: check the share and the service account's rights |

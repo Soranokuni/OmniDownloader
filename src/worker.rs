@@ -481,6 +481,20 @@ pub(crate) fn retry_by_policy(
     Ok(true)
 }
 
+/// The history's hint for job `job_id` going to review with `code`, as the
+/// desk's card shows it: a code whose own hint says a retry is under way
+/// gets the exhausted text with the job's attempts instead (P11.3a), since
+/// no retry follows, and a rate limit on a platform the site's cookie advice
+/// after it ([`omni_broadcast::errors::stopped_hint_el`], the card's helper).
+/// Every other code: [`omni_broadcast::errors::hint_for_job`] for `url`.
+pub(crate) fn review_hint(repo: &Repository, job_id: i64, code: ErrorCode, url: &str) -> String {
+    if code.uses_exhausted_hint() {
+        let attempts = repo.get_job(job_id).ok().flatten().map_or(1, |j| j.attempts);
+        return omni_broadcast::errors::stopped_hint_el(code, attempts, url, repo);
+    }
+    omni_broadcast::errors::hint_for_job(code, url, repo)
+}
+
 /// A waiting video the engine would not deliver on its own (P11.2a): its
 /// earlier rename may have landed, or the watchfolder changed
 /// (DELIVERY_UNCONFIRMED), or its file could not be read for too long
@@ -543,7 +557,7 @@ pub(crate) async fn run_waiting_delivery(
             // A full run next time: the requeue ends the wait.
             if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {
                 if still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
+                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, &job.url))?;
                 }
                 repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None)?;
             }
@@ -603,7 +617,7 @@ pub(crate) async fn run_approved_delivery(
             // A retry keeps the approval: the next lease delivers the same file.
             if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {
                 if still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
+                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, &job.url))?;
                 }
                 repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None)?;
             }
@@ -840,7 +854,7 @@ pub(crate) async fn run_job(
     let is_platform = omni_broadcast::downloader::is_video_platform(&orig_url);
     let mut scan = omni_broadcast::downloader::PageScan::default();
     if is_web && page_referer.is_none() && !is_platform {
-        scan = engine.page_videos(&orig_url).await;
+        scan = engine.page_videos(job_id, &orig_url).await;
         scanned_videos = scan.videos.len();
     }
     // yt-dlp reads this page only through its generic scan, which does not know
@@ -1052,7 +1066,7 @@ pub(crate) async fn run_job(
                         let cancel = &cancel;
                         async move {
                             tokio::select! {
-                                p = engine.probe_candidate(&u, Some(&session.referer), Some(&session.user_agent), session.cookies.as_deref()) => p,
+                                p = engine.probe_candidate(job_id, &u, Some(&session.referer), Some(&session.user_agent), session.cookies.as_deref()) => p,
                                 _ = cancel.cancelled() => omni_broadcast::downloader::Probe::Unknown,
                             }
                         }
@@ -1414,7 +1428,7 @@ pub(crate) async fn run_job(
 
                 // Nothing more is written for a job that is no longer ours.
                 if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, login_site.as_deref().unwrap_or(&job.url), repo))?;
+                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, login_site.as_deref().unwrap_or(&job.url)))?;
                 }
                 // Only the job's owner writes evidence: a job MCR cancelled
                 // or the reaper gave away has no business leaving a file.
@@ -1674,7 +1688,7 @@ async fn ytdlp_attempt(
             let cancel = &cancel;
             async move {
                 tokio::select! {
-                    i = engine.video_length(&u) => omni_broadcast::downloader::Probe::from_length(i),
+                    i = engine.video_length(job_id, &u) => omni_broadcast::downloader::Probe::from_length(i),
                     _ = cancel.cancelled() => omni_broadcast::downloader::Probe::Unknown,
                 }
             }
@@ -1949,7 +1963,7 @@ async fn article_facts(
     let count = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
     probe_siblings(&job.url, primary, streams, &job.index_str, count, &mut facts, |url| async move {
         let info = tokio::select! {
-            i = engine.video_length(&url) => i,
+            i = engine.video_length(job.id, &url) => i,
             _ = cancel.cancelled() => None,
         };
         info.map(|i| Probed { duration_secs: i.duration_secs, live: i.live })
@@ -2006,7 +2020,7 @@ async fn without_videoless_posts(
         let has_video = if ask {
             // Dropping the future kills yt-dlp (run_capture sets kill_on_drop).
             tokio::select! {
-                r = engine.post_has_video(url) => r,
+                r = engine.post_has_video(job_id, url) => r,
                 _ = cancel.cancelled() => break,
             }
         } else {

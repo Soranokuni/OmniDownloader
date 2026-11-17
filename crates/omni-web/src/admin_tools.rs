@@ -191,6 +191,8 @@ async fn run_install(state: &AppState, dir: &std::path::Path, group: &str, chann
                 mgr.discard_staged_ytdl();
                 return Err(e);
             }
+            // Installed by hand: no nightly update is waiting any more (P11.4).
+            mgr.forget_ytdl_postponed();
             "yt-dlp installed; the previous build is kept for a rollback.".to_string()
         }
         other => {

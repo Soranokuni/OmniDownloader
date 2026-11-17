@@ -23,6 +23,7 @@ use tracing::{info, warn};
 
 use omni_broadcast::downloader::{first_attempt_resolved, Choice, Probe, DownloadError, DownloadOpts, Downloader, FirstAttempt, PageScan};
 use omni_broadcast::errors::{classify_download_error, ErrorCode};
+use omni_broadcast::pacing::HostPacer;
 use omni_broadcast::rewrapper::Rewrapper;
 use omni_broadcast::transcoder::Transcoder;
 use omni_core::benchmark::{self, Mode, ResultRow, Summary, TargetRow, CORPUS};
@@ -547,11 +548,20 @@ pub struct RealStages {
     tools: Tools,
     /// Where a jar's scratch copy goes while a link is probed.
     scratch: PathBuf,
+    /// Every yt-dlp run waits for its turn on its platform here (P11.4): the
+    /// daemon's engine's in the daemon, one of its own on the command line.
+    pacer: HostPacer,
 }
 
 impl RealStages {
     pub fn new(repo: Repository, tools: Tools, scratch: PathBuf) -> Self {
-        Self { repo, tools, scratch }
+        Self { repo, tools, scratch, pacer: HostPacer::default() }
+    }
+
+    /// Share the daemon's pacer, so a benchmark run and the jobs take turns at a platform.
+    pub fn with_pacer(mut self, pacer: HostPacer) -> Self {
+        self.pacer = pacer;
+        self
     }
 
     fn slug(target: &TargetRow) -> String {
@@ -735,7 +745,7 @@ impl ExtractSteps for RealStages {
 
     async fn page_scan(&self, url: &str) -> PageScan {
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, url, &self.scratch, true);
-        let scan = Downloader::new(&self.tools.ytdl).with_cookie_jar(jar.as_ref()).page_videos(url, PROBE_TIMEOUT).await;
+        let scan = Downloader::new(&self.tools.ytdl, &self.pacer).with_cookie_jar(jar.as_ref()).page_videos(url, PROBE_TIMEOUT).await;
         drop(jar);
         scan
     }
@@ -747,7 +757,7 @@ impl ExtractSteps for RealStages {
     async fn ytdlp(&self, url: &str) -> std::result::Result<Option<f64>, String> {
         // yt-dlp's own extractors, with the site's cookie jar when there is one.
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, url, &self.scratch, true);
-        let probed = Downloader::new(&self.tools.ytdl).with_cookie_jar(jar.as_ref()).probe_info(url, PROBE_TIMEOUT).await;
+        let probed = Downloader::new(&self.tools.ytdl, &self.pacer).with_cookie_jar(jar.as_ref()).probe_info(url, PROBE_TIMEOUT).await;
         drop(jar);
         probed.map(|info| info.duration_secs)
     }
@@ -784,7 +794,7 @@ impl ExtractSteps for RealStages {
 
     async fn probe(&self, candidate: &str, session: &Sniff) -> Probe {
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, candidate, &self.scratch, true);
-        let probed = Downloader::new(&self.tools.ytdl)
+        let probed = Downloader::new(&self.tools.ytdl, &self.pacer)
             .with_cookie_jar(jar.as_ref())
             .probe_candidate(candidate, Some(&session.referer), Some(&session.user_agent), session.cookies.as_deref(), PROBE_TIMEOUT.min(Duration::from_secs(15)))
             .await;
@@ -801,7 +811,7 @@ impl BenchStages for RealStages {
 
     async fn download(&self, target: &TargetRow, found: &Extracted, dir: &Path) -> StageResult<PathBuf> {
         let jar = omni_broadcast::cookie_file::for_urls(&self.repo, &[found.stream.as_str()], dir, false);
-        let result = Downloader::new(&self.tools.ytdl)
+        let result = Downloader::new(&self.tools.ytdl, &self.pacer)
             .download(
                 Self::tool_id(target),
                 &found.stream,

@@ -30,6 +30,7 @@ mod selfcheck;
 mod site_memory;
 mod worker;
 
+use selfcheck::UpdateVerdict;
 #[cfg(debug_assertions)]
 use worker::finish_held;
 use worker::{run_job, wait_for_deliveries, LEASE_REAP_INTERVAL, LEASE_SECS, SHUTDOWN_DELIVERY_BUDGET};
@@ -866,14 +867,15 @@ async fn main() -> Result<()> {
             }
             let links = repo.list_selfcheck_links()?;
             println!("Checking {} link(s); each takes a few seconds…", links.len());
-            let mut failing = 0;
-            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, &links).await {
-                if !outcome.ok {
-                    failing += 1;
-                }
-                println!("  {} {:<32} {}", if outcome.ok { "✓" } else { "✗" }, link.label, outcome.detail);
+            let (mut working, mut unchecked) = (0, 0);
+            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, &omni_broadcast::pacing::HostPacer::default(), &links).await {
+                working += usize::from(outcome.ok);
+                unchecked += usize::from(outcome.inconclusive);
+                // Inconclusive: the site was limiting requests (P11.4); not counted either way.
+                let mark = if outcome.ok { "✓" } else if outcome.inconclusive { "–" } else { "✗" };
+                println!("  {mark} {:<32} {}", link.label, outcome.detail);
             }
-            println!("{} of {} links work.", links.len() - failing, links.len());
+            println!("{working} of {} links work; {unchecked} not checked this time.", links.len());
         }
         Some(Commands::Cookies { action }) => cookies_cli::run(&paths, action).await?,
         Some(Commands::Benchmark { action }) => {
@@ -1323,7 +1325,10 @@ async fn run_daemon(
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
     .with_archive(Some(archive_settings.clone()))
     .with_watchfolder_state(watchfolder_state.clone())
-    .with_retry_max_age(config.retry.max_age_mins));
+    .with_retry_max_age(config.retry.max_age_mins)
+    // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,
+    // the canaries, the self-check and the benchmark take turns at a platform.
+    .with_pacing(config.pacing.per_host_concurrency, config.pacing.min_gap_secs));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -1392,7 +1397,7 @@ async fn run_daemon(
 
     // The self-check's last results, and a browser launch in the background:
     // a broken browser is reported now, not when the first article fails.
-    selfcheck::refresh_health(&repo, &health);
+    selfcheck::refresh_health(&repo, &health, &bin_dir);
     omni_core::site_health::refresh_health(&repo, &health);
     {
         let health = health.clone();
@@ -1430,7 +1435,8 @@ async fn run_daemon(
     // daytime trigger and the admin's «Run now», so only one runs at a time.
     let canary_env = Arc::new(
         canary::CanaryEnv::new(repo.clone(), health.clone(), bin_dir.clone(), config.ytdl_channel.clone())
-            .with_scratch(temp_path.clone()),
+            .with_scratch(temp_path.clone())
+            .with_pacer(broadcast_engine.pacer()),
     );
     // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
     let url_tester = Arc::new(repair::AdminTester::new());
@@ -1467,12 +1473,13 @@ async fn run_daemon(
             repo: repo.clone(),
             bin_dir: bin_dir.clone(),
             temp_path: temp_path.clone(),
+            pacer: broadcast_engine.pacer(),
         }))
         .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
         .with_benchmark_starter(Arc::new(benchmark::Starter::new(Arc::new(benchmark::Benchmark::new(
             repo.clone(),
             paths.clone(),
-            Arc::new(benchmark::RealStages::new(repo.clone(), bench_tools, paths.benchmark_temp())),
+            Arc::new(benchmark::RealStages::new(repo.clone(), bench_tools, paths.benchmark_temp()).with_pacer(broadcast_engine.pacer())),
             "daemon",
         ).with_gate(update_gate.clone())))))
         .with_secret_store(secret_store.clone())
@@ -2103,6 +2110,7 @@ async fn nightly_ytdl_update(
     channel: &str,
     gate: &UpdateGate,
     repo: &Repository,
+    pacer: &omni_broadcast::pacing::HostPacer,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
 
@@ -2136,6 +2144,8 @@ async fn nightly_ytdl_update(
     if dep_mgr.ytdl_live_sha256().as_deref() == Some(staged.sha256.as_str()) {
         dep_mgr.discard_staged_ytdl();
         info!("yt-dlp is already the latest release");
+        // No update is waiting any more (P11.4).
+        selfcheck::note_postponed(&dep_mgr.get_bin_dir(), false);
         return TaskOutcome::Ok;
     }
 
@@ -2168,39 +2178,92 @@ async fn nightly_ytdl_update(
     // still paused. A link the new build fails and the old one passes means
     // the release broke it: the old build goes back and this one is marked
     // rejected. A link both fail is the site, not the update.
-    let verdict = verify_ytdl_update(dep_mgr, &installed, repo).await;
+    let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer).await;
     drop(swap);
+    let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
+    if act.reject {
+        let _ = std::fs::write(&rejected_marker, &staged.sha256);
+    }
+    if act.level == "INFO" {
+        info!("Nightly yt-dlp update: {}", act.audit);
+    } else {
+        warn!("Nightly yt-dlp update: {}", act.audit);
+    }
+    let _ = repo.log_audit(act.level, "SYSTEM", &act.audit);
+    if act.close_breakers {
+        // A new downloader may resolve what the model once could not be asked about.
+        if let Err(e) = repo.close_all_llm_breakers() {
+            warn!("The repair model breakers could not be closed after the update: {e:#}");
+        }
+    }
+    if let Some(postponed) = act.postponed_night {
+        selfcheck::note_postponed(&dep_mgr.get_bin_dir(), postponed);
+    }
+    act.outcome
+}
+
+/// What the nightly yt-dlp task does with a verdict (P11.4).
+#[derive(Debug, PartialEq)]
+struct VerdictAction {
+    /// Write `yt-dlp.exe.rejected`: this build is never tried again.
+    reject: bool,
+    /// The audit row's level and text.
+    level: &'static str,
+    audit: String,
+    outcome: omni_core::scheduler::TaskOutcome,
+    /// A new downloader is live: the repair model's breakers close.
+    close_breakers: bool,
+    /// One more postponed night (`Some(true)`), the run of them ends
+    /// (`Some(false)`), or unchanged (`None`).
+    postponed_night: Option<bool>,
+}
+
+/// [`VerdictAction`] for `verdict` on a build of `channel` whose hash begins `sha16`.
+fn ytdl_verdict_action(verdict: &UpdateVerdict, channel: &str, sha16: &str) -> VerdictAction {
+    use omni_core::scheduler::TaskOutcome;
     match verdict {
-        UpdateVerdict::Kept { checked } => {
-            info!("Nightly yt-dlp updated to {:?} ({checked} self-check link(s) still work)", installed);
-            let _ = repo.log_audit(
-                "INFO",
-                "SYSTEM",
-                &format!(
-                    "yt-dlp updated ({} channel, sha256 {}); {checked} self-check link(s) still work; previous build kept for rollback",
-                    channel,
-                    &staged.sha256[..16]
-                ),
-            );
-            // A new downloader may resolve what the model once could not be asked about.
-            if let Err(e) = repo.close_all_llm_breakers() {
-                warn!("The repair model breakers could not be closed after the update: {e:#}");
-            }
-            TaskOutcome::Ok
-        }
-        UpdateVerdict::RolledBack { broken } => {
-            let _ = std::fs::write(&rejected_marker, &staged.sha256);
-            warn!("yt-dlp update rolled back: it broke {}", broken.join(", "));
-            let _ = repo.log_audit(
-                "ERROR",
-                "SYSTEM",
-                &format!(
-                    "yt-dlp update rolled back automatically: the new build could not get {} while the previous one could. The previous build is in use; the next release will be tried.",
-                    broken.join(", ")
-                ),
-            );
-            TaskOutcome::Failed
-        }
+        UpdateVerdict::Kept { checked } => VerdictAction {
+            reject: false,
+            level: "INFO",
+            audit: format!(
+                "yt-dlp updated ({channel} channel, sha256 {sha16}); {checked} self-check link(s) still work; previous build kept for rollback"
+            ),
+            outcome: TaskOutcome::Ok,
+            close_breakers: true,
+            postponed_night: Some(false),
+        },
+        UpdateVerdict::RolledBack { broken } => VerdictAction {
+            reject: true,
+            level: "ERROR",
+            audit: format!(
+                "yt-dlp update rolled back automatically: the new build could not get {} while the previous one could. The previous build is in use; the next release will be tried.",
+                broken.join(", ")
+            ),
+            outcome: TaskOutcome::Failed,
+            close_breakers: false,
+            postponed_night: Some(false),
+        },
+        // Not judged: the previous build is live, this one is not marked
+        // rejected and is tried again the next night.
+        UpdateVerdict::Postponed { why } => VerdictAction {
+            reject: false,
+            level: "WARN",
+            audit: format!("yt-dlp update ({channel} channel, sha256 {sha16}) postponed to the next night: {why}. The previous build is in use."),
+            outcome: TaskOutcome::Skipped,
+            close_breakers: false,
+            postponed_night: Some(true),
+        },
+        // The new build is live but nobody could tell whether it works.
+        UpdateVerdict::Unverified { why } => VerdictAction {
+            reject: false,
+            level: "WARN",
+            audit: format!(
+                "yt-dlp ({channel} channel, sha256 {sha16}) is live but could not be verified: {why}. Check Administration → Download engine and roll back if downloads fail."
+            ),
+            outcome: TaskOutcome::Failed,
+            close_breakers: false,
+            postponed_night: None,
+        },
     }
 }
 
@@ -2256,6 +2319,7 @@ async fn nightly_deno_update(
     gate: &UpdateGate,
     repo: &Repository,
     health: &HealthState,
+    pacer: &omni_broadcast::pacing::HostPacer,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
     let Some(installed) = dep_mgr.deno_version() else {
@@ -2302,23 +2366,41 @@ async fn nightly_deno_update(
                 .filter(|l| l.last_ok == Some(true))
                 .collect();
             let ytdl = dep_mgr.ytdl_live();
-            let broken: Vec<String> = selfcheck::check_and_record(repo, &ytdl, &worked)
-                .await
-                .into_iter()
-                .filter(|(_, o)| !o.ok)
-                .map(|(l, _)| l.label)
-                .collect();
-            if broken.is_empty() {
-                let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
-                TaskOutcome::Ok
-            } else {
-                let _ = dep_mgr.rollback_deno();
-                let _ = repo.log_audit(
-                    "ERROR",
-                    "SYSTEM",
-                    &format!("Deno {new_version} rolled back to {installed}: {} stopped working with it", broken.join(", ")),
-                );
-                TaskOutcome::Failed
+            let results = selfcheck::check_and_record(repo, &ytdl, pacer, &worked).await;
+            // A rollback that fails leaves the new Deno live and unverified (P11.4).
+            let verdict = match selfcheck::judge_deno(&results) {
+                UpdateVerdict::RolledBack { broken } if dep_mgr.rollback_deno().is_err() => UpdateVerdict::Unverified {
+                    why: format!("{} stopped working with it, and Deno {installed} could not be put back", broken.join(", ")),
+                },
+                UpdateVerdict::Postponed { why } if dep_mgr.rollback_deno().is_err() => {
+                    UpdateVerdict::Unverified { why: format!("{why}, and Deno {installed} could not be put back") }
+                }
+                v => v,
+            };
+            match verdict {
+                UpdateVerdict::Kept { .. } => {
+                    let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                    TaskOutcome::Ok
+                }
+                UpdateVerdict::RolledBack { broken } => {
+                    let _ = repo.log_audit(
+                        "ERROR",
+                        "SYSTEM",
+                        &format!("Deno {new_version} rolled back to {installed}: {} stopped working with it", broken.join(", ")),
+                    );
+                    TaskOutcome::Failed
+                }
+                UpdateVerdict::Postponed { why } => {
+                    // Not judged (P11.4): the previous Deno is back, and the new one is tried again the next night.
+                    warn!("Deno update postponed: {why}");
+                    let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno {new_version} postponed to the next night: {why}. Deno {installed} is in use."));
+                    TaskOutcome::Skipped
+                }
+                UpdateVerdict::Unverified { why } => {
+                    warn!("Deno {new_version} is live but could not be verified: {why}");
+                    let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno {new_version} is live but could not be verified: {why}"));
+                    TaskOutcome::Failed
+                }
             }
         }
     };
@@ -2329,42 +2411,34 @@ async fn nightly_deno_update(
     outcome
 }
 
-enum UpdateVerdict {
-    Kept { checked: usize },
-    RolledBack { broken: Vec<String> },
-}
-
-async fn verify_ytdl_update(dep_mgr: &DependencyManager, live: &std::path::Path, repo: &Repository) -> UpdateVerdict {
+/// The new yt-dlp against the links that worked before it ([`selfcheck::verify_update`]):
+/// each round is a self-check of those links, and the swap is `rollback_ytdl`
+/// (it puts whichever build is not live back).
+async fn verify_ytdl_update(
+    dep_mgr: &DependencyManager,
+    live: &std::path::Path,
+    repo: &Repository,
+    pacer: &omni_broadcast::pacing::HostPacer,
+) -> UpdateVerdict {
     let worked: Vec<omni_core::models::SelfcheckLink> = repo
         .list_selfcheck_links()
         .unwrap_or_default()
         .into_iter()
         .filter(|l| l.last_ok == Some(true))
         .collect();
-    let results = selfcheck::check_and_record(repo, live, &worked).await;
-    let failed: Vec<omni_core::models::SelfcheckLink> =
-        results.into_iter().filter(|(_, o)| !o.ok).map(|(l, _)| l).collect();
-    if failed.is_empty() {
-        return UpdateVerdict::Kept { checked: worked.len() };
-    }
-
-    if let Err(e) = dep_mgr.rollback_ytdl() {
-        warn!("yt-dlp verification: could not put the previous build back to compare: {e:#}");
-        return UpdateVerdict::Kept { checked: worked.len() };
-    }
-    let with_old = selfcheck::check_and_record(repo, live, &failed).await;
-    let broken: Vec<String> = with_old.iter().filter(|(_, o)| o.ok).map(|(l, _)| l.label.clone()).collect();
-    if broken.is_empty() {
-        // Both builds fail those links: the sites changed or the network is
-        // down. The newer build is the better bet for a fix; put it back.
-        if let Err(e) = dep_mgr.rollback_ytdl() {
-            warn!("yt-dlp verification: could not reinstate the new build: {e:#}");
-        }
-        // Record what the build that stays in place sees.
-        selfcheck::check_and_record(repo, live, &failed).await;
-        return UpdateVerdict::Kept { checked: worked.len() };
-    }
-    UpdateVerdict::RolledBack { broken }
+    selfcheck::verify_update(
+        &worked,
+        |links| async move { selfcheck::check_and_record(repo, live, pacer, &links).await },
+        || match dep_mgr.rollback_ytdl() {
+            Ok(_) => true,
+            Err(e) => {
+                warn!("yt-dlp verification: could not swap the builds: {e:#}");
+                false
+            }
+        },
+        |links, why| selfcheck::withdraw_results(repo, links, why),
+    )
+    .await
 }
 
 /// Replace a one-file yt-dlp with the folder build of the *same release*
@@ -2433,13 +2507,19 @@ struct CookieJarTester {
     repo: Repository,
     bin_dir: PathBuf,
     temp_path: PathBuf,
+    /// The daemon's pacer (P11.4): the test takes its turn at the platform like everything else.
+    pacer: omni_broadcast::pacing::HostPacer,
 }
 
 impl omni_web::state::CookieTester for CookieJarTester {
     fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> omni_web::state::CookieTestFuture<'a> {
         Box::pin(async move {
             let ytdl = DependencyManager::new(&self.bin_dir).ytdl_live();
-            let t = omni_broadcast::cookie_file::test_jar(&ytdl, &self.temp_path, &self.repo, domain, url).await?;
+            let t = omni_broadcast::cookie_file::test_jar(&ytdl, &self.temp_path, &self.repo, domain, url, &self.pacer).await?;
+            // The site was limiting requests: nothing was learnt or stored; the admin is told to try later.
+            if t.inconclusive {
+                return Err(t.detail);
+            }
             Ok((t.ok, t.detail))
         })
     }
@@ -2542,12 +2622,12 @@ async fn run_one_task(
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
             // No canary run (its yt-dlp starts without a gate pass) overlaps the swap.
             let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
-                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
-                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health).await;
+                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer()).await;
+                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer()).await;
                 (ytdl, deno)
             })
             .await;
-            selfcheck::refresh_health(repo, &ctx.health);
+            selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
             // The worse of the two is what the maintenance panel shows.
             Ok(match (ytdl, deno) {
                 (TaskOutcome::Failed, _) | (_, TaskOutcome::Failed) => TaskOutcome::Failed,
@@ -2558,7 +2638,7 @@ async fn run_one_task(
 
         "selfcheck" => {
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
-            let failing = selfcheck::run(repo, &ytdl, &ctx.health).await?;
+            let failing = selfcheck::run(repo, &ytdl, &ctx.canary.pacer(), &ctx.health, &ctx.bin_dir).await?;
             // Then the recent articles of each frequent site (P10.4). Always
             // on; a site's verdict never changes this task's outcome.
             canary::nightly(&ctx.canary).await;
@@ -2580,8 +2660,10 @@ async fn run_one_task(
             for jar in &jars {
                 let Some(url) = omni_core::cookies::sample_url_for(&jar.domain, jar.last_sample_url.as_deref()) else { continue };
                 tested += 1;
-                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, &url).await {
+                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, &url, &ctx.canary.pacer()).await {
                     Ok(t) if t.ok => {}
+                    // The site was limiting requests: not a failed jar, and nothing was stored.
+                    Ok(t) if t.inconclusive => info!("Cookie test for {}: not judged tonight, {}", jar.domain, t.detail),
                     Ok(_) => failing.push(jar.domain.clone()),
                     Err(why) => {
                         warn!("Cookie test for {} could not run: {why}", jar.domain);
@@ -3168,5 +3250,50 @@ mod tests {
             ["UNSUPPORTED_URL", "HTTP_403", "NO_STREAM_FOUND", "VIDEO_UNRESOLVED"],
             "a new ErrorCode must be a conscious choice here"
         );
+    }
+
+    /// P11.4 review round 2: what the nightly yt-dlp task does with each verdict.
+    /// Only a rollback marks the build rejected; a postponed update writes no
+    /// marker, is Skipped and counts a postponed night; an unverified build is a
+    /// warning and a failed task, never the INFO "updated" row.
+    #[test]
+    fn the_nightly_update_maps_each_verdict_honestly() {
+        use omni_core::scheduler::TaskOutcome;
+        let kept = ytdl_verdict_action(&UpdateVerdict::Kept { checked: 4 }, "stable", "0123456789abcdef");
+        assert_eq!((kept.reject, kept.level, kept.outcome, kept.close_breakers, kept.postponed_night), (false, "INFO", TaskOutcome::Ok, true, Some(false)));
+        assert!(kept.audit.starts_with("yt-dlp updated (stable channel, sha256 0123456789abcdef); 4 self-check link(s) still work"));
+
+        let back = ytdl_verdict_action(&UpdateVerdict::RolledBack { broken: vec!["X video".into()] }, "stable", "0123456789abcdef");
+        assert_eq!((back.reject, back.level, back.outcome, back.postponed_night), (true, "ERROR", TaskOutcome::Failed, Some(false)));
+        assert!(back.audit.contains("could not get X video"));
+
+        let later = ytdl_verdict_action(&UpdateVerdict::Postponed { why: "no youtube link could be compared".into() }, "stable", "0123456789abcdef");
+        assert_eq!((later.reject, later.level, later.outcome, later.close_breakers, later.postponed_night), (false, "WARN", TaskOutcome::Skipped, false, Some(true)));
+        assert!(later.audit.contains("postponed to the next night: no youtube link could be compared"));
+
+        let unknown = ytdl_verdict_action(&UpdateVerdict::Unverified { why: "the swap failed".into() }, "stable", "0123456789abcdef");
+        assert_eq!((unknown.reject, unknown.level, unknown.outcome, unknown.close_breakers, unknown.postponed_night), (false, "WARN", TaskOutcome::Failed, false, None));
+        assert!(unknown.audit.contains("is live but could not be verified: the swap failed") && !unknown.audit.contains("updated"));
+    }
+
+    /// P11.4 review round 1: the admin's cookie «Test» while the platform cools
+    /// down after a rate limit says to try again in a few minutes (an error the
+    /// card shows), at once, and stores nothing about the jar.
+    #[tokio::test(start_paused = true)]
+    async fn the_admin_jar_test_during_a_cool_down_says_try_later_and_stores_nothing() {
+        use omni_web::state::CookieTester;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let jar = omni_core::cookies::parse_netscape("x.com", ".x.com\tTRUE\t/\tTRUE\t0\tn\tvalue-123456\n").unwrap();
+        repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
+        let pacer = omni_broadcast::pacing::HostPacer::default();
+        pacer.penalize("x", omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN);
+        std::fs::create_dir_all(dir.path().join("temp")).unwrap();
+        let tester = CookieJarTester { repo: repo.clone(), bin_dir: dir.path().join("bin"), temp_path: dir.path().join("temp"), pacer };
+        let t0 = tokio::time::Instant::now();
+        let got = tester.test("x.com", "https://x.com/someone/status/1").await;
+        assert_eq!(tokio::time::Instant::now(), t0);
+        assert_eq!(got, Err(omni_broadcast::cookie_file::JAR_TEST_LIMITED.to_string()));
+        assert_eq!(repo.list_cookie_jars().unwrap()[0].last_test_ok, None, "a result was stored");
     }
 }

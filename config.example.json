@@ -80,6 +80,12 @@
     "second_chance_window_mins": 120
   },
 
+  "pacing": {
+    "_comment": "yt-dlp per video platform (YouTube, X, Facebook, ...), so a burst of links does not trip the platform's bot check. At most per_host_concurrency runs starting at one platform at a time (1-4; a download gives its turn back once the video starts transferring); two starts on it at least min_gap_secs plus up to 4 s apart (0-120; 0 switches the gap off). After a platform refuses a run as a rate limit, nothing new starts there for 2 minutes.",
+    "per_host_concurrency": 1,
+    "min_gap_secs": 8
+  },
+
   "ytdl_channel": "stable",
   "ytdl_auto_update_nightly": true,
 

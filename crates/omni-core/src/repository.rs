@@ -4760,6 +4760,30 @@ impl Repository {
         Ok(previous.flatten().map(|v| v != 0))
     }
 
+    /// Put a self-check link's stored result back as `link` holds it (P11.4):
+    /// the result a yt-dlp build stored is withdrawn when that build is not
+    /// the one left live. `false` when the link is gone.
+    pub fn restore_selfcheck_result(&self, link: &crate::models::SelfcheckLink) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let at = |t: Option<DateTime<Utc>>| t.map(timestamps::format);
+        let changed = conn.execute(
+            r#"
+            UPDATE selfcheck_links
+            SET last_checked_at = ?1, last_ok = ?2, last_detail = ?3, last_ok_at = ?4, failing_since = ?5
+            WHERE id = ?6
+            "#,
+            params![
+                at(link.last_checked_at),
+                link.last_ok.map(i64::from),
+                link.last_detail,
+                at(link.last_ok_at),
+                at(link.failing_since),
+                link.id
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn list_processed_mail(&self, limit: i64) -> Result<Vec<ProcessedMail>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT * FROM processed_mail ORDER BY processed_at DESC LIMIT ?")?;

@@ -288,6 +288,8 @@ mod tests {
             "DISK_FULL",
             "TIMEOUT",
             "NETWORK_ERROR",
+            // A platform refusing us for now says nothing about a news site (P11.4).
+            "RATE_LIMITED",
             "",
         ] {
             assert!(!counts_against_site(c), "{c}");

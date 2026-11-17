@@ -327,3 +327,76 @@ fn every_failure_site_uses_the_retry_policy() {
     assert_eq!(src.matches(call).count(), 3, "`{call}` must be the decision at the three failure sites");
     assert_eq!(src.matches("attempts < max_attempts").count(), 0, "an old attempts rule is back");
 }
+
+/// P11.4: a platform's rate limit or bot check goes back to the queue for 2,
+/// 5, 10 and 15 minutes, showing five attempts; the fifth failure is not
+/// retried, and neither is a job past the age limit.
+#[test]
+fn a_rate_limited_failure_waits_two_minutes_and_counts_five_attempts() {
+    let r = rig();
+    let id = r.queue(1);
+    for (n, secs) in [120, 300, 600, 900].into_iter().enumerate() {
+        r.lease(id);
+        assert!(r.decide(id, ErrorCode::RateLimited), "failure {} was not retried", n + 1);
+        let job = r.row(id);
+        assert_eq!((job.status, job.attempts, job.max_attempts), (JobStatus::Pending, n as i32 + 1, 5));
+        assert_eq!(job.error_code.as_deref(), Some("RATE_LIMITED"));
+        let left = waits_secs(&job);
+        assert!(left > secs - 10 && left <= secs, "failure {}: {left} s, expected {secs}", n + 1);
+    }
+    r.lease(id);
+    assert!(!r.decide(id, ErrorCode::RateLimited), "a fifth try");
+
+    let old = r.queue(2);
+    r.queued_ago(old, 121);
+    r.lease(old);
+    assert!(!r.decide(old, ErrorCode::RateLimited), "a RATE_LIMITED job past the age limit was retried");
+}
+
+/// P11.4 follow-up: a job that stopped retrying a passing condition gets the
+/// exhausted hint in its history, as on its card, never «Γίνεται αυτόματη
+/// επανάληψη»; any other code keeps its own hint.
+#[test]
+fn the_review_hint_of_an_exhausted_retry_is_the_exhausted_text() {
+    let r = rig();
+    let id = r.queue(1);
+    for _ in 0..4 {
+        r.lease(id);
+        assert!(r.decide(id, ErrorCode::Network));
+    }
+    r.lease(id);
+    assert!(!r.decide(id, ErrorCode::Network));
+    assert_eq!(r.row(id).attempts, 5);
+    let url = "https://news.example/story-1";
+    let hint = review_hint(&r.repo, id, ErrorCode::Network, url);
+    assert_eq!(hint, omni_broadcast::errors::exhausted_hint_el(5));
+    assert!(!hint.contains("Γίνεται αυτόματη επανάληψη"), "{hint}");
+    assert_eq!(review_hint(&r.repo, id, ErrorCode::RateLimited, url), omni_broadcast::errors::exhausted_hint_el(5));
+    // A rate limit that outlasted its retries on a platform: the site's cookie advice follows.
+    assert_eq!(
+        review_hint(&r.repo, id, ErrorCode::RateLimited, "https://x.com/a/status/1"),
+        format!("{} {}", omni_broadcast::errors::exhausted_hint_el(5), omni_broadcast::errors::login_hint_el("x.com", false))
+    );
+    // Its own advice stays: the share, a 403, a full disk, a login wall.
+    for code in [ErrorCode::DeliveryFailed, ErrorCode::Http403, ErrorCode::LowDisk, ErrorCode::PrivateOrRemoved] {
+        assert_eq!(review_hint(&r.repo, id, code, url), code.hint_el(), "{code}");
+    }
+    assert_eq!(
+        review_hint(&r.repo, id, ErrorCode::LoginRequired, "https://x.com/a/status/1"),
+        omni_broadcast::errors::hint_for_job(ErrorCode::LoginRequired, "https://x.com/a/status/1", &r.repo)
+    );
+    // An old job that ran once: the age limit stopped it.
+    let old = r.queue(2);
+    r.queued_ago(old, 121);
+    r.lease(old);
+    assert!(!r.decide(old, ErrorCode::Network));
+    assert_eq!(review_hint(&r.repo, old, ErrorCode::Network, url), omni_broadcast::errors::exhausted_hint_el(1));
+}
+
+/// The three sites that send a job to review write its hint through `review_hint`.
+#[test]
+fn every_review_site_writes_the_review_hint() {
+    let src = include_str!("worker.rs");
+    assert_eq!(src.matches("&review_hint(repo, job_id, code, ").count(), 3, "the three review sites");
+    assert_eq!(src.matches("None, &omni_broadcast::errors::hint_for_job(").count(), 0, "a site writes the plain hint again");
+}

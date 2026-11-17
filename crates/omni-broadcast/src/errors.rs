@@ -75,11 +75,14 @@ pub enum ErrorCode {
     /// A delivery was interrupted and nobody can tell whether its file reached
     /// the watchfolder (P11.2b): MCR checks Dalet before anything is retried.
     DeliveryUnconfirmed,
+    /// The platform is refusing our requests for now: its bot check, HTTP 429,
+    /// "try again later" (P11.4). Waiting, longer than for a network fault, helps.
+    RateLimited,
 }
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 33] = [
+    pub const ALL: [ErrorCode; 34] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
@@ -113,6 +116,7 @@ impl ErrorCode {
         Self::RepairExhausted,
         Self::NonPublicAddress,
         Self::DeliveryUnconfirmed,
+        Self::RateLimited,
     ];
 
     /// The code stored on a job, back as a code.
@@ -155,6 +159,7 @@ impl ErrorCode {
             Self::RepairExhausted => "REPAIR_EXHAUSTED",
             Self::NonPublicAddress => "NON_PUBLIC_ADDRESS",
             Self::DeliveryUnconfirmed => "DELIVERY_UNCONFIRMED",
+            Self::RateLimited => "RATE_LIMITED",
         }
     }
 
@@ -193,6 +198,10 @@ impl ErrorCode {
                 | Self::ExtractTimeout
                 | Self::DeliverTimeout => &TRANSIENT_DELAYS,
             Self::LowDisk => &LOW_DISK_DELAYS,
+            // A platform's rate limit or bot check (P11.4) lasts minutes, not
+            // seconds: 2, 5, 10 and 15 minutes, while the pacer holds the
+            // platform's other jobs for two minutes after each refusal.
+            Self::RateLimited => &RATE_LIMITED_DELAYS,
             _ => &[],
         }
     }
@@ -210,7 +219,10 @@ impl ErrorCode {
     /// HTTP_403 (already says the retries failed) and LOW_DISK (tell the
     /// administrator) keep their own.
     pub fn uses_exhausted_hint(&self) -> bool {
-        matches!(self, Self::Network | Self::DownloadTimeout | Self::ExtractTimeout | Self::DeliverTimeout)
+        matches!(
+            self,
+            Self::Network | Self::DownloadTimeout | Self::ExtractTimeout | Self::DeliverTimeout | Self::RateLimited
+        )
     }
 
     /// What the MCR card tells the operator to do, in Greek.
@@ -248,6 +260,7 @@ impl ErrorCode {
             Self::RepairExhausted => "Η αυτόματη επισκευή δεν βρήκε το βίντεο μέσα στον χρόνο της. Ανοίξτε τον σύνδεσμο και κατεβάστε το χειροκίνητα.",
             Self::NonPublicAddress => "Ο σύνδεσμος δείχνει σε εσωτερική διεύθυνση· δεν κατεβαίνει αυτόματα.",
             Self::DeliveryUnconfirmed => "Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε. Ελέγξτε πρώτα στο Dalet αν υπάρχει ήδη: αν υπάρχει, πατήστε «Το έβαλα στο Dalet»· αν όχι, πατήστε «Δοκιμή ξανά».",
+            Self::RateLimited => "Ο ιστότοπος περιορίζει προσωρινά τις λήψεις. Γίνεται αυτόματη επανάληψη.",
         }
     }
 
@@ -273,6 +286,11 @@ impl ErrorCode {
         // A live video is live in the browser too: the sniffer would only find
         // the same stream, or a sibling that is already its own job (P1.18).
         if *self == Self::LiveStream {
+            return false;
+        }
+        // A platform refusing us for now (P11.4) refuses the browser's
+        // requests too; the retry is what helps.
+        if *self == Self::RateLimited {
             return false;
         }
         // A page that does not exist has no player to find.
@@ -304,6 +322,10 @@ static HTTP_403_DELAYS: [Duration; 2] = [Duration::seconds(30), Duration::minute
 /// 10 min three times: LOW_DISK's waits, then review.
 static LOW_DISK_DELAYS: [Duration; 3] = [Duration::minutes(10), Duration::minutes(10), Duration::minutes(10)];
 
+/// 2, 5, 10, 15 min: RATE_LIMITED's waits (P11.4), then review.
+static RATE_LIMITED_DELAYS: [Duration; 4] =
+    [Duration::minutes(2), Duration::minutes(5), Duration::minutes(10), Duration::minutes(15)];
+
 /// How long a job that failed with `code` waits before its automatic retry,
 /// or `None` when it goes to review instead (P11.3a). `attempts` is the
 /// job's count after the failed run (1 for the first; a value below 1 reads
@@ -333,11 +355,31 @@ pub fn exhausted_hint_el(attempts: i32) -> String {
     }
 }
 
+/// The hint of a job that stopped retrying `code` (one whose own hint says a
+/// retry is under way, [`ErrorCode::uses_exhausted_hint`]) after `attempts`,
+/// for the desk's card and the job's history alike, so the two cannot drift.
+/// A rate limit that outlasted its retries on a video platform (or on a site
+/// that has a jar) is followed by the same site's login hint a login wall
+/// gets: the station's cookies are what usually gets past it.
+pub fn stopped_hint_el(code: ErrorCode, attempts: i32, url: &str, repo: &omni_core::repository::Repository) -> String {
+    let exhausted = exhausted_hint_el(attempts);
+    if code == ErrorCode::RateLimited {
+        let login = hint_for_job(ErrorCode::LoginRequired, url, repo);
+        if login != ErrorCode::LoginRequired.hint_el() {
+            return format!("{exhausted} {login}");
+        }
+    }
+    exhausted
+}
+
 /// The codes [`code_in_text`] looks for in a failure's error chain, first
 /// match wins. The specific ones come before the generic: a chain that says
 /// both NO_STREAM_FOUND and NETWORK is a page without a video, and one that
 /// says both LOW_DISK and REWRAP_FAILED is a full disk. The two stage
 /// failures come last, so any more exact code a stage attached wins.
+/// RATE_LIMITED (P11.4) is appended after them: only a failed yt-dlp run
+/// attaches it, a job that has it is never sniffed and never reaches a stage,
+/// so no chain carries it with another code.
 pub const CLASSIFIED: &[ErrorCode] = &[
     ErrorCode::ManualDownload,
     ErrorCode::HeldFileChanged,
@@ -359,6 +401,7 @@ pub const CLASSIFIED: &[ErrorCode] = &[
     ErrorCode::Network,
     ErrorCode::TranscodeFailed,
     ErrorCode::RewrapFailed,
+    ErrorCode::RateLimited,
 ];
 
 /// Every other code, and why the text classifier does not look for it. A new
@@ -458,19 +501,33 @@ pub fn classify_download_error(stderr: &str) -> ErrorCode {
     {
         return ErrorCode::GeoBlocked;
     }
-    // YouTube's temporary rate limit also says "Video unavailable. This content isn't
-    // available, try again later.": waiting helps, the video is not gone. A bot check or a login wall stays
-    // a login wall.
+    // The platform refusing us for now (P11.4), before the login wall and the
+    // gone video: YouTube's bot check («Sign in to confirm you're not a bot.
+    // Use --cookies…», typographic apostrophe in production) came after a burst
+    // of downloads and passed one at a time, and its temporary limit also says
+    // "Video unavailable. This content isn't available, try again later.".
+    // Waiting helps; neither is a login wall nor a removed video.
     // Whole phrases only: a bare "rate-limit" also matches an article slug in the
     // URL ("…/ecb-rate-limit-story"), which would hide UNSUPPORTED_URL or a 404.
+    // The bot check is a passing refusal on YouTube only (its extractors tag
+    // their errors `[youtube]`, `[youtube:tab]`, …). On X the same words come
+    // with a post that never opens without the station's login: that stays a
+    // login wall, sent to review at once with the cookie advice.
+    if (s.contains("not a bot") && s.contains("[youtube"))
+        || s.contains("try again later")
+        || s.contains("rate-limited by")
+        || s.contains("rate limited by")
+        || s.contains("rate-limit exceeded")
+        || s.contains("rate limit exceeded")
+        || s.contains("http error 429")
+        || s.contains("too many requests")
+    {
+        return ErrorCode::RateLimited;
+    }
+    // Instagram words its limit and its login wall as one ("rate-limit reached
+    // or login required. Use --cookies"): that stays a login wall.
     if !(s.contains("sign in to confirm") || s.contains("login required") || s.contains("use --cookies"))
-        && (s.contains("try again later")
-            || s.contains("rate-limited by")
-            || s.contains("rate limited by")
-            || s.contains("rate-limit exceeded")
-            || s.contains("rate limit exceeded")
-            || s.contains("rate-limit reached")
-            || s.contains("rate limit reached"))
+        && (s.contains("rate-limit reached") || s.contains("rate limit reached"))
     {
         return ErrorCode::Network;
     }
@@ -558,16 +615,20 @@ mod tests {
     use super::*;
 
     /// YouTube's rate limit says "Video unavailable" too: it must wait, not read as a gone video.
+    /// P11.4: a rate limit or bot check is RATE_LIMITED (it was NETWORK, and the
+    /// bot check LOGIN_REQUIRED); a limit worded with a login wall stays NETWORK.
     #[test]
     fn a_rate_limit_is_network_and_a_gone_video_still_is_not() {
         let cases: &[(&str, ErrorCode)] = &[
-            ("ERROR: [youtube] abc: Video unavailable. This content isn't available, try again later.", ErrorCode::Network),
-            ("ERROR: [youtube] abc: The current session has been rate-limited by YouTube for up to an hour", ErrorCode::Network),
+            ("ERROR: [youtube] abc: Video unavailable. This content isn't available, try again later.", ErrorCode::RateLimited),
+            ("ERROR: [youtube] abc: The current session has been rate-limited by YouTube for up to an hour", ErrorCode::RateLimited),
             ("ERROR: [youtube] abc: Video unavailable", ErrorCode::PrivateOrRemoved),
             ("ERROR: [youtube] abc: This video is unavailable", ErrorCode::PrivateOrRemoved),
             ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", ErrorCode::PrivateOrRemoved),
-            ("ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies-from-browser", ErrorCode::LoginRequired),
-            ("ERROR: [twitter] 123: Rate limit exceeded", ErrorCode::Network),
+            ("ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies-from-browser", ErrorCode::RateLimited),
+            ("ERROR: [twitter] 123: Rate limit exceeded", ErrorCode::RateLimited),
+            ("ERROR: [generic] abc: Rate limit reached", ErrorCode::Network),
+            ("ERROR: unable to download video data: HTTP Error 429: Too Many Requests", ErrorCode::RateLimited),
             // A slug that merely says "rate-limit" is not a rate limit.
             ("ERROR: Unsupported URL: https://news.example/ecb-rate-limit-story", ErrorCode::UnsupportedUrl),
             (
@@ -603,8 +664,17 @@ mod tests {
                 ErrorCode::LiveStream,
             ),
             (
+                // P11.4 review: the bot check is a passing refusal on YouTube
+                // only. On X it does not clear without the station's login, so
+                // it stays a login wall (review at once, with the cookie hint)
+                // instead of four retries that hold every X job.
                 "ERROR: [twitter] 123: No video could be found in this tweet; Sign in to confirm you're not a bot. Use --cookies",
                 ErrorCode::LoginRequired,
+            ),
+            (
+                // Verbatim from production (2026-11), typographic apostrophe.
+                "ERROR: [youtube] abc123: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp for how to manually pass your cookies",
+                ErrorCode::RateLimited,
             ),
             (
                 "ERROR: unable to download video data: HTTP Error 403: Forbidden",
@@ -707,6 +777,8 @@ mod tests {
             ("ERROR: unable to download video data: HTTP Error 403: Forbidden", ErrorCode::LoginRequired),
             ("ERROR: [youtube] 1: Private video. Sign in if you've been granted access", ErrorCode::LoginRequired),
             ("ERROR: Unsupported URL: https://www.example.gr/a", ErrorCode::LoginRequired),
+            // P11.4: the bot check names cookies but is a temporary refusal.
+            ("ERROR: [youtube] 7: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies", ErrorCode::LoginRequired),
         ] {
             assert_ne!(classify_download_error(msg), not, "{msg}");
         }
@@ -760,10 +832,11 @@ mod tests {
             ErrorCode::DownloadTimeout,
             ErrorCode::ExtractTimeout,
             ErrorCode::DeliverTimeout,
+            ErrorCode::RateLimited,
         ] {
             assert!(retryable.is_retryable(), "{retryable} should retry");
         }
-        assert_eq!(ErrorCode::ALL.iter().filter(|c| c.is_retryable()).count(), 7, "the same seven codes as before");
+        assert_eq!(ErrorCode::ALL.iter().filter(|c| c.is_retryable()).count(), 8, "the seven codes as before, and RATE_LIMITED");
         for terminal in [
             ErrorCode::PrivateOrRemoved,
             ErrorCode::GeoBlocked,
@@ -839,6 +912,7 @@ mod tests {
                 | ErrorCode::DeliverTimeout
                 | ErrorCode::DeliveryFailed => &transient,
                 ErrorCode::LowDisk => &[Duration::minutes(10), Duration::minutes(10), Duration::minutes(10)],
+                ErrorCode::RateLimited => &[Duration::minutes(2), Duration::minutes(5), Duration::minutes(10), Duration::minutes(15)],
                 _ => &[],
             };
             assert_eq!(c.retry_delays(), want, "{c}");
@@ -928,7 +1002,13 @@ mod tests {
         let uses: Vec<ErrorCode> = ErrorCode::ALL.into_iter().filter(|c| c.uses_exhausted_hint()).collect();
         assert_eq!(
             uses,
-            vec![ErrorCode::Network, ErrorCode::ExtractTimeout, ErrorCode::DownloadTimeout, ErrorCode::DeliverTimeout]
+            vec![
+                ErrorCode::Network,
+                ErrorCode::ExtractTimeout,
+                ErrorCode::DownloadTimeout,
+                ErrorCode::DeliverTimeout,
+                ErrorCode::RateLimited
+            ]
         );
         for c in [ErrorCode::DeliveryFailed, ErrorCode::Http403, ErrorCode::LowDisk] {
             assert!(c.is_retryable() && !c.uses_exhausted_hint(), "{c}");
@@ -1002,6 +1082,7 @@ mod tests {
             ErrorCode::RepairExhausted,
             ErrorCode::NonPublicAddress,
             ErrorCode::DeliveryUnconfirmed,
+            ErrorCode::RateLimited,
         ] {
             let hint = code.hint_el();
             assert!(hint.len() > 20, "{code} has no useful hint");
@@ -1031,9 +1112,9 @@ mod tests {
             assert!(!c.should_try_sniffer());
             assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
         }
-        assert_eq!(ErrorCode::ALL.len(), 33);
+        assert_eq!(ErrorCode::ALL.len(), 34);
         let unique: std::collections::HashSet<_> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(unique.len(), 33);
+        assert_eq!(unique.len(), 34);
     }
 
     /// P11.2b: the code of a delivery whose result nobody knows. Appended last
@@ -1043,7 +1124,8 @@ mod tests {
     #[test]
     fn delivery_unconfirmed_is_the_last_code_terminal_and_says_check_dalet_first() {
         let c = ErrorCode::DeliveryUnconfirmed;
-        assert_eq!(ErrorCode::ALL.last(), Some(&c));
+        // Appended last in P11.2b; only RATE_LIMITED (P11.4) came after it.
+        assert_eq!(ErrorCode::ALL[32], c);
         assert_eq!(c.as_str(), "DELIVERY_UNCONFIRMED");
         assert_eq!(ErrorCode::from_code("DELIVERY_UNCONFIRMED"), Some(c));
         assert!(!c.is_retryable(), "a delivery that may be on air must not be retried on its own");
@@ -1059,6 +1141,104 @@ mod tests {
         assert_eq!(ErrorCode::DeliveryFailed.as_str(), "DELIVERY_FAILED");
         assert!(ErrorCode::DeliveryFailed.is_retryable());
         assert_eq!(code_in_text("x: DELIVERY_UNCONFIRMED: y"), None, "read out of text");
+    }
+
+    /// P11.4: the code of a platform refusing us for now. Appended last, stable,
+    /// read back out of a failure's chain, retried after 2, 5, 10 and 15 minutes
+    /// within the age limit (then the exhausted hint), never sniffed, and
+    /// never held against a site's health.
+    #[test]
+    fn rate_limited_is_the_last_code_retried_four_times_and_never_sniffed() {
+        let c = ErrorCode::RateLimited;
+        assert_eq!(ErrorCode::ALL.last(), Some(&c));
+        assert_eq!(c.as_str(), "RATE_LIMITED");
+        assert_eq!(ErrorCode::from_code("RATE_LIMITED"), Some(c));
+        assert_eq!(serde_json::to_string(&c).unwrap(), "\"RATE_LIMITED\"");
+        assert_eq!(serde_json::from_str::<ErrorCode>("\"RATE_LIMITED\"").unwrap(), c);
+        assert!(CLASSIFIED.contains(&c));
+        assert_eq!(code_in_text("RATE_LIMITED: RATE_LIMITED: ERROR: [youtube] abc: Sign in to confirm"), Some(c));
+
+        let max = Duration::minutes(120);
+        let young = Duration::minutes(1);
+        let got: Vec<_> = (1..=5).map(|n| retry_after(c, n, young, max)).collect();
+        assert_eq!(
+            got,
+            vec![Some(Duration::minutes(2)), Some(Duration::minutes(5)), Some(Duration::minutes(10)), Some(Duration::minutes(15)), None]
+        );
+        assert_eq!(c.retry_max_attempts(), Some(5));
+        assert_eq!(retry_after(c, 1, Duration::minutes(121), max), None, "the age limit holds for it too");
+        assert!(c.uses_exhausted_hint());
+        assert_eq!(c.hint_el(), "Ο ιστότοπος περιορίζει προσωρινά τις λήψεις. Γίνεται αυτόματη επανάληψη.");
+
+        assert!(!c.should_try_sniffer());
+        for url in ["https://www.youtube.com/watch?v=abc", "https://x.com/a/status/1", "https://www.news.example/story/1"] {
+            assert!(!c.should_sniff(url), "{url}");
+        }
+        assert!(!omni_core::site_health::counts_against_site(c.as_str()));
+        assert!(!crate::downloader::is_dead_candidate(c));
+    }
+
+    /// Review round 1: a rate limit that outlasted its retries on a platform
+    /// ends with the site's cookie advice after the exhausted text; on a news
+    /// page, and for any other code, the exhausted text alone.
+    #[test]
+    fn a_stopped_rate_limit_on_a_platform_adds_the_sites_cookie_advice() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let x = "https://x.com/someone/status/1";
+        assert_eq!(
+            stopped_hint_el(ErrorCode::RateLimited, 5, x, &repo),
+            format!("{} {}", exhausted_hint_el(5), login_hint_el("x.com", false))
+        );
+        let yt = "https://www.youtube.com/watch?v=abcdefghijk";
+        let got = stopped_hint_el(ErrorCode::RateLimited, 5, yt, &repo);
+        assert!(got.starts_with(&exhausted_hint_el(5)) && got.ends_with(&hint_for_job(ErrorCode::LoginRequired, yt, &repo)), "{got}");
+        assert!(got.contains("cookies"), "{got}");
+        // With a jar: the expired-jar wording, as a login wall gets it.
+        let jar = omni_core::cookies::parse_netscape("x.com", ".x.com\tTRUE\t/\tTRUE\t0\tn\tvalue-123456\n").unwrap();
+        repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
+        assert!(stopped_hint_el(ErrorCode::RateLimited, 3, x, &repo).ends_with(&login_hint_el("x.com", true)));
+        // A news page, and the other passing codes: the exhausted text only.
+        let article = "https://www.news.example/story/1";
+        assert_eq!(stopped_hint_el(ErrorCode::RateLimited, 5, article, &repo), exhausted_hint_el(5));
+        assert_eq!(stopped_hint_el(ErrorCode::Network, 5, x, &repo), exhausted_hint_el(5));
+        assert_eq!(stopped_hint_el(ErrorCode::DownloadTimeout, 1, yt, &repo), exhausted_hint_el(1));
+    }
+
+    /// P11.4: what a rate limit looks like, and what still is not one.
+    #[test]
+    fn a_bot_check_or_a_429_is_rate_limited_and_a_real_wall_or_a_gone_video_is_not() {
+        for msg in [
+            "ERROR: [youtube] abc123: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp for how to manually pass your cookies",
+            "ERROR: [youtube] abc123: Sign in to confirm you're not a bot",
+            "HTTP Error 429: Too Many Requests",
+            "ERROR: [instagram] abc: 429 Too Many Requests",
+            "ERROR: [facebook] 1: This content isn't available right now, try again later",
+        ] {
+            assert_eq!(classify_download_error(msg), ErrorCode::RateLimited, "{msg}");
+        }
+        for (msg, want) in [
+            ("ERROR: [youtube] 5: Sign in to confirm your age. This video may be inappropriate for some users.", ErrorCode::LoginRequired),
+            ("ERROR: [youtube] 6: This video is age-restricted", ErrorCode::LoginRequired),
+            ("ERROR: [youtube] 7: Join this channel to get access to members-only content", ErrorCode::LoginRequired),
+            ("ERROR: [twitter] 8: NSFW tweet requires authentication. Use --cookies", ErrorCode::LoginRequired),
+            ("ERROR: [Instagram] abc: Requested content is not available, rate-limit reached or login required. Use --cookies", ErrorCode::LoginRequired),
+            ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", ErrorCode::PrivateOrRemoved),
+            ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", ErrorCode::PrivateOrRemoved),
+            ("ERROR: [youtube] abc: The uploader has not made this video available in your country", ErrorCode::GeoBlocked),
+            ("ERROR: [youtube] abc: This live event will begin in 3 hours", ErrorCode::LiveStream),
+            ("ERROR: Unsupported URL: https://news.example/too-many-requests-story", ErrorCode::UnsupportedUrl),
+            // Review round 1: the bot check outside YouTube is a login wall.
+            ("ERROR: [twitter] 9: Sign in to confirm you're not a bot. Use --cookies", ErrorCode::LoginRequired),
+            ("ERROR: [Instagram] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser", ErrorCode::LoginRequired),
+            ("ERROR: Sign in to confirm you're not a bot. Use --cookies", ErrorCode::LoginRequired),
+            ("ERROR: [youtube:tab] UCabc: Sign in to confirm you’re not a bot. Use --cookies", ErrorCode::RateLimited),
+            // The explicit limits stay RATE_LIMITED on every platform.
+            ("ERROR: [twitter] 9: Rate limit exceeded", ErrorCode::RateLimited),
+            ("ERROR: [Instagram] abc: HTTP Error 429: Too Many Requests", ErrorCode::RateLimited),
+        ] {
+            assert_eq!(classify_download_error(msg), want, "{msg}");
+        }
     }
 
     #[test]

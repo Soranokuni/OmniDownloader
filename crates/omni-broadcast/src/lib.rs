@@ -5,6 +5,7 @@ pub mod delivery;
 pub mod errors;
 pub mod imagehash;
 pub mod downloader;
+pub mod pacing;
 pub mod pipeline;
 pub mod preview;
 pub mod probe;

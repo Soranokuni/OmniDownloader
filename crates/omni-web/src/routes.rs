@@ -473,7 +473,7 @@ fn job_for_desk(repo: &omni_core::repository::Repository, job: &omni_core::model
         // whose own hint says so swap it (`uses_exhausted_hint`).
         let stopped = !matches!(job.status, JobStatus::Pending | JobStatus::Running) && !job.delivery_wait;
         let hint = if code.uses_exhausted_hint() && stopped {
-            omni_broadcast::errors::exhausted_hint_el(job.attempts)
+            omni_broadcast::errors::stopped_hint_el(code, job.attempts, &job.url, repo)
         } else {
             // A login wall names the site and says whether its cookies are there (P3.5).
             omni_broadcast::errors::hint_for_job(code, &job.url, repo)
@@ -1853,6 +1853,7 @@ pub async fn api_admin_update_ytdl(
         tracing::error!(error = ?e, "yt-dlp update failed");
         ApiError::internal("yt-dlp update failed; see the log for detail.")
     })?;
+    dep_mgr.forget_ytdl_postponed();
     drop(locks);
     let _ = state.repo.log_audit(
         "INFO",

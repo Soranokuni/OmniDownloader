@@ -120,8 +120,10 @@ async fn sign_in(paths: &AppPaths, config: &AppConfig, repo: &Repository, raw_do
     match (ytdl.exists(), cookies::sample_url_for(&domain, stored.as_deref())) {
         (true, Some(url)) => {
             println!("Testing the login with yt-dlp on {}…", cookies::host_and_path(&url));
-            match omni_broadcast::cookie_file::test_jar(&ytdl, &paths.resolve(&config.temp_path), repo, &domain, &url).await {
+            let pacer = omni_broadcast::pacing::HostPacer::default();
+            match omni_broadcast::cookie_file::test_jar(&ytdl, &paths.resolve(&config.temp_path), repo, &domain, &url, &pacer).await {
                 Ok(t) if t.ok => println!("Test ok: yt-dlp reads a video with this login."),
+                Ok(t) if t.inconclusive => println!("Not tested: {}.", t.detail),
                 Ok(t) => println!("Test FAILED: {}", t.detail),
                 Err(why) => println!("The test could not run: {why}"),
             }
