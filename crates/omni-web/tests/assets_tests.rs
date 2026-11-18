@@ -493,11 +493,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v29_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v30_and_login_v6() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=29"), "admin.html does not import admin.js?v=29");
-    assert!(!admin.contains("/static/admin.js?v=28"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=30"), "admin.html does not import admin.js?v=30");
+    assert!(!admin.contains("/static/admin.js?v=29"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
     assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
@@ -538,9 +538,11 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
     let assets = all_assets();
     let wizard = assets.get("static/wizard.js").expect("wizard.js shipped");
     let code: String = wizard.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
-    for banned in ["innerHTML", "outerHTML", "document.write", "insertAdjacentHTML", "http://", "https://"] {
+    for banned in ["innerHTML", "outerHTML", "document.write", "insertAdjacentHTML", "http://", "https://", "service install --account"] {
         assert!(!code.contains(banned), "wizard.js contains {banned}");
     }
+    // P13.1f: the account is changed in place by Setup, not by re-registering the service.
+    assert!(code.contains("/change-account"), "the service-account hints do not point to Setup");
     assert!(code.contains("/api/setup/wizard/account"), "the account step is not wired");
     assert!(code.contains("/api/admin/settings/watchfolder/test"), "the watchfolder test is not wired");
     assert!(code.contains("/api/admin/settings/complete"), "Finish does not complete setup");
@@ -553,7 +555,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["3".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["4".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");

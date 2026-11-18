@@ -155,7 +155,7 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
       // Shown in every mode when the test says access denied: the usual cause is a service
       // that still runs as the default account, which a NAS or IP share does not accept.
       const advice = el('p', { class: 'note warn', hidden: true },
-        'Access denied usually means the service runs as an account the share does not accept (a NAS, or a share addressed by IP, does not know the computer account). Reinstall the service as a named account that has Modify on the share: omni-ingest.exe service install --account DOMAIN\\name (it asks for the password). Then test again. You can also skip this step for now and set the watchfolder later.');
+        'Access denied usually means the service runs as an account the share does not accept (a NAS, or a share addressed by IP, does not know the computer account). Change the account the service runs as to a Windows account that has Modify on the share: in Windows open Settings → Apps → Installed apps → OmniIngest → Modify (or run OmniIngest-Setup.exe /change-account from the installation folder) and choose "A Windows account…". Then test again. You can also skip this step for now and set the watchfolder later.');
       const paint = () => {
         result.className = `note ${S.watch.ok === true ? 'ok' : (S.watch.ok === false ? 'bad' : '')}`;
         result.textContent = S.watch.message;
@@ -292,7 +292,7 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
             } }, 'Leave the wizard and open the LLM card')),
           el('div', { class: 'card', style: 'margin:0' },
             el('strong', {}, 'Service account'),
-            el('p', { class: 'note' }, 'A watchfolder on a NAS or an IP share needs the service to run as a named account that has Modify on that share. Reinstall the service with: omni-ingest.exe service install --account DOMAIN\\name (it asks for the password). The Test button on the watchfolder step names the account to grant.')),
+            el('p', { class: 'note' }, 'A watchfolder on a NAS or an IP share needs the service to run as a Windows account that has Modify on that share. To change it: Windows Settings → Apps → Installed apps → OmniIngest → Modify (or OmniIngest-Setup.exe /change-account in the installation folder), then choose "A Windows account…". The Test button on the watchfolder step names the account to grant.')),
         ],
         valid: parseable,
         next: async () => {
