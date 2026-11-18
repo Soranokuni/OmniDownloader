@@ -311,11 +311,12 @@ mod windows_impl {
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE).is_ok()
     }
 
-    /// The executable the installed service runs, if it is installed.
+    /// The executable the installed service runs, if it is installed. The SCM
+    /// gives the whole command line (`… omni-ingest.exe run-service`); only the path is returned.
     pub fn installed_exe() -> Option<std::path::PathBuf> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
         let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
-        Some(service.query_config().ok()?.executable_path)
+        Some(super::exe_of_service_config(&service.query_config().ok()?.executable_path))
     }
 
     pub fn installed_account() -> Option<String> {
@@ -523,8 +524,36 @@ pub fn can_install_services() -> bool {
     return false;
 }
 
-/// The executable the installed service points at; `None` when the
-/// service is not installed.
+/// The executable of a service's registered command line, which the SCM
+/// stores whole: `"C:\Program Files\X\a.exe" run-service` → the quoted part;
+/// unquoted → the longest prefix ending in `.exe` (any case) before whitespace
+/// or the end, which also reads a path with spaces someone set by hand with
+/// `sc`; no `.exe` at all → the whole string; empty → empty.
+pub fn exe_of_service_command(command: &str) -> std::path::PathBuf {
+    let s = command.trim();
+    if let Some(rest) = s.strip_prefix('"') {
+        return std::path::PathBuf::from(rest.split('"').next().unwrap_or(rest));
+    }
+    let lower = s.to_ascii_lowercase();
+    let longest = lower
+        .match_indices(".exe")
+        .map(|(i, _)| i + 4)
+        .filter(|&end| s[end..].chars().next().map_or(true, char::is_whitespace))
+        .last();
+    std::path::PathBuf::from(match longest {
+        Some(end) => &s[..end],
+        None => s,
+    })
+}
+
+/// The executable in what `query_config` reports as `executable_path`, which
+/// windows-service fills with the SCM's whole command line.
+pub fn exe_of_service_config(executable_path: &Path) -> std::path::PathBuf {
+    exe_of_service_command(&executable_path.to_string_lossy())
+}
+
+/// The executable the installed service points at (its path, without the
+/// command line's arguments); `None` when the service is not installed.
 pub fn installed_service_exe() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     return windows_impl::installed_exe();
@@ -556,6 +585,48 @@ pub fn stop_service_and_wait(timeout: std::time::Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SCM returns the whole command line; comparing that with the install
+    /// folder's exe never matched, so every upgrade re-registered the service.
+    #[test]
+    fn the_installed_executable_is_the_path_not_the_command_line() {
+        let exe = |s: &str| exe_of_service_command(s);
+        assert_eq!(exe(r"C:\OmniIngest\omni-ingest.exe run-service"), Path::new(r"C:\OmniIngest\omni-ingest.exe"));
+        assert_eq!(
+            exe(r#""C:\Program Files\Omni Ingest\omni-ingest.exe" run-service"#),
+            Path::new(r"C:\Program Files\Omni Ingest\omni-ingest.exe")
+        );
+        assert_eq!(exe(r"C:\OmniIngest\omni-ingest.exe"), Path::new(r"C:\OmniIngest\omni-ingest.exe"));
+        assert_eq!(exe(r#""C:\OmniIngest\omni-ingest.exe""#), Path::new(r"C:\OmniIngest\omni-ingest.exe"));
+        assert_eq!(exe(""), Path::new(""));
+        assert_eq!(exe("   "), Path::new(""));
+    }
+
+    /// What `installed_exe` hands on is the path, for every form the SCM stores.
+    #[test]
+    fn the_service_config_s_executable_path_is_read_as_the_executable() {
+        for (raw, exe) in [
+            (r"C:\OmniIngest\omni-ingest.exe run-service", r"C:\OmniIngest\omni-ingest.exe"),
+            (r#""C:\Program Files\Omni Ingest\omni-ingest.exe" run-service"#, r"C:\Program Files\Omni Ingest\omni-ingest.exe"),
+            (r"C:\OmniIngest\omni-ingest.exe", r"C:\OmniIngest\omni-ingest.exe"),
+        ] {
+            assert_eq!(exe_of_service_config(Path::new(raw)), Path::new(exe), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_hand_edited_unquoted_path_with_spaces_is_read_to_its_last_exe() {
+        let exe = |s: &str| exe_of_service_command(s);
+        assert_eq!(
+            exe(r"C:\Program Files\Omni Ingest\omni-ingest.EXE run-service"),
+            Path::new(r"C:\Program Files\Omni Ingest\omni-ingest.EXE")
+        );
+        assert_eq!(exe(r"C:\tools.exe dir\omni-ingest.exe run-service"), Path::new(r"C:\tools.exe dir\omni-ingest.exe"));
+        // ".exe" inside a folder name is not the end of the path.
+        assert_eq!(exe(r"C:\a.exed\omni-ingest.exe run-service"), Path::new(r"C:\a.exed\omni-ingest.exe"));
+        // No .exe at all: the whole string.
+        assert_eq!(exe(r"C:\Omni Ingest\omni-ingest run-service"), Path::new(r"C:\Omni Ingest\omni-ingest run-service"));
+    }
 
     #[test]
     fn builtin_accounts_that_take_no_password_are_recognised() {
