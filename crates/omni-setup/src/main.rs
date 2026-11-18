@@ -1,36 +1,21 @@
-//! The console around the `omni_deploy` library: parse, run, print, exit.
+//! The windowed program around the `omni_deploy` library: parse, then either
+//! print (attached to the console it was started from) or show Setup's pages.
+//! A double-click shows no console. `console.rs` and `dialogs.rs` are this
+//! binary's own modules: the library never links the task dialog.
+#![windows_subsystem = "windows"]
 
-use std::io::BufRead;
+mod console;
+mod dialogs;
 
-use omni_deploy::args::{parse_args, Command, USAGE};
+use omni_deploy::args::{parse_args, Command, Face, USAGE};
+use omni_deploy::backend::DemoBackend;
 use omni_deploy::exit::{exit_code_for, ExitCode};
+use omni_deploy::flow;
 use omni_deploy::log::SetupLog;
-use omni_deploy::run::{flush, pack_self, run, verify_file, Console};
+use omni_deploy::run::{pack_self, run_pages, run_quiet, verify_file};
+use omni_deploy::texts::Lang;
 
-fn read_line() -> String {
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    line
-}
-
-/// Questions at this console; end of input is no answer.
-struct StdConsole;
-
-impl Console for StdConsole {
-    fn confirm(&mut self, prompt: &str) -> bool {
-        self.ask(prompt).is_some_and(|a| matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
-    }
-
-    fn ask(&mut self, prompt: &str) -> Option<String> {
-        print!("{prompt}");
-        flush();
-        let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line),
-        }
-    }
-}
+use dialogs::TaskDialogUi;
 
 fn main() {
     // First: every DLL loaded later (shell, COM, UAC) comes from System32, never
@@ -40,14 +25,31 @@ fn main() {
     let command = match parse_args(&args) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{e}");
-            eprintln!("See OmniIngest-Setup.exe /? for the switches.");
+            let text = format!("{e}\nSee OmniIngest-Setup.exe /? for the switches.");
+            if console::attach() {
+                eprintln!("{text}");
+            } else {
+                // Started without any console (a shortcut with a wrong switch).
+                dialogs::message_box(Lang::detect(), &text, true);
+            }
             std::process::exit(ExitCode::Usage.code() as i32);
+        }
+    };
+    // A printing command never shows a page; the pages never print.
+    let printing = match command.face() {
+        Face::Console => console::attach(),
+        Face::Pages => {
+            dialogs::prepare();
+            false
         }
     };
     let code = match command {
         Command::Help => {
-            print!("{USAGE}");
+            if printing {
+                print!("{USAGE}");
+            } else {
+                dialogs::message_box(Lang::detect(), USAGE, false);
+            }
             ExitCode::Ok.code()
         }
         Command::Pack { folder, out } => match pack_self(&folder, &out) {
@@ -70,7 +72,7 @@ fn main() {
                 exit_code_for(&e).code()
             }
         },
-        Command::Run { mode, quiet, elevated_child } => {
+        Command::Run { mode, quiet: true, elevated_child, .. } => {
             let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(r) => r,
                 Err(e) => {
@@ -78,18 +80,30 @@ fn main() {
                     std::process::exit(ExitCode::Failed.code() as i32);
                 }
             };
-            let mut log = SetupLog::new(!quiet);
-            let finished = runtime.block_on(run(&args, mode, quiet, elevated_child, &mut StdConsole, &mut log));
+            // As before: `/quiet` prints only its error; setup.log has every line.
+            let mut log = SetupLog::new(false);
+            let finished = runtime.block_on(run_quiet(mode, elevated_child, &mut log));
             if let Some(err) = &finished.error {
                 eprintln!("{err}");
             }
-            // The elevated child's own console closes when it exits: let the operator read it.
-            if elevated_child && !quiet {
-                print!("\nPress Enter to close.");
-                flush();
-                let _ = read_line();
-            }
             finished.code
+        }
+        Command::Run { mode, quiet: false, elevated_child, lang } => {
+            let lang = lang.unwrap_or_else(Lang::detect);
+            let mut new_ui = || -> Box<dyn omni_deploy::ui::Ui> { Box::new(TaskDialogUi::new(lang, false)) };
+            let mut tell = |text: &str| dialogs::message_box(lang, text, false);
+            run_pages(&args, mode, lang, elevated_child, &mut new_ui, &mut tell).code
+        }
+        Command::PagesDemo { scenario, auto, lang } => {
+            // Never elevated, never touching the machine: the fake backend.
+            let lang = lang.unwrap_or_else(Lang::detect);
+            let mut ui = TaskDialogUi::new(lang, auto);
+            let finished = flow::interactive(&mut ui, &mut DemoBackend::new(scenario), scenario.start());
+            if finished.code == scenario.expected_code() {
+                ExitCode::Ok.code()
+            } else {
+                ExitCode::Failed.code()
+            }
         }
     };
     std::process::exit(code as i32);

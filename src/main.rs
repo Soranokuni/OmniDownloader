@@ -781,6 +781,8 @@ async fn main() -> Result<()> {
                 no_firewall: *no_firewall,
                 import: import.clone(),
                 base_config: None,
+                // `--account` names an account knowingly: as before (P13.1c).
+                confirm_share_for_passwordless: false,
             })
             .await;
         }

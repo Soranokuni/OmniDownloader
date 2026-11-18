@@ -43,7 +43,12 @@ pub fn remove_entry() -> anyhow::Result<()> {
 
 /// The entry's `InstallLocation`; `None` when the entry or the value is missing.
 pub fn read_install_location() -> Option<std::path::PathBuf> {
-    sys::read_install_location()
+    sys::read_value("InstallLocation").map(std::path::PathBuf::from)
+}
+
+/// The entry's `DisplayVersion` (the version Setup installed); `None` when missing.
+pub fn read_display_version() -> Option<String> {
+    sys::read_value("DisplayVersion")
 }
 
 #[cfg(windows)]
@@ -99,10 +104,10 @@ mod sys {
         }
     }
 
-    pub fn read_install_location() -> Option<std::path::PathBuf> {
+    pub fn read_value(value: &str) -> Option<String> {
         use windows::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY};
         let path = wide(UNINSTALL_KEY);
-        let name = wide("InstallLocation");
+        let name = wide(value);
         let mut buf = vec![0u16; 1024];
         let mut bytes = (buf.len() * 2) as u32;
         // SAFETY: the buffer and its size in bytes are passed together.
@@ -122,7 +127,7 @@ mod sys {
         }
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         let s = String::from_utf16_lossy(&buf[..end]);
-        (!s.trim().is_empty()).then(|| std::path::PathBuf::from(s))
+        (!s.trim().is_empty()).then_some(s)
     }
 
     pub fn remove() -> Result<()> {
@@ -147,7 +152,7 @@ mod sys {
         Ok(())
     }
 
-    pub fn read_install_location() -> Option<std::path::PathBuf> {
+    pub fn read_value(_value: &str) -> Option<String> {
         None
     }
 }

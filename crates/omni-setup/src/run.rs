@@ -1,27 +1,31 @@
 //! What Setup does once its command line is parsed: elevate (or ask the
 //! unelevated parent to), then install, change the account or uninstall by
-//! driving `omni_cli::install`, and end with one exit code.
+//! driving `omni_cli::install`, and end with one exit code. `/quiet` runs
+//! [`run_quiet`]; everything else is Setup's pages ([`run_pages`], P13.1c).
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use omni_cli::install::{
-    execute, install_console, plan_answered, plan_install, remove_firewall_rule, remove_service_registration,
-    rolled_back_message, same_dir, Answers, Cancelled, InstallKind, InstallOptions, InstallReport, Probe, Question, Refusal,
-    SystemProbe,
+    execute, plan_answered, remove_firewall_rule, remove_service_registration, rolled_back_message, same_dir, Answers,
+    InstallKind, InstallOptions, InstallReport, Probe, Progress, Question, Refusal, Step, SystemProbe,
 };
+use omni_core::answer_file::Applied;
 use omni_core::config::AppConfig;
 use omni_core::paths::{AppPaths, DriveLookup};
 
 use crate::args::{command_line, relaunch_args, Mode};
+use crate::backend::Backend;
 use crate::elevate::{self, Relaunch};
 use crate::exit::{admin_url, coded, decode_child_exit, encode_open, exit_code_for, fail, ChildResult, ExitCode};
+use crate::flow::{self, Start};
 use crate::log::{append_setup_log, now_unix, yyyymmdd, SetupLog};
-use crate::payload::{self, open_setup, PayloadError};
+use crate::payload::{self, open_setup, PayloadError, VerifiedPayload};
 use crate::registry::{self, SETUP_EXE};
 use crate::removal::{execute_removals, removal_plan, Removal};
-use crate::workdir::create_secure_work_dir;
+use crate::texts::{tr, Lang, T};
+use crate::ui::Ui;
+use crate::workdir::{create_secure_work_dir, WorkDir};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -118,7 +122,7 @@ pub fn unanswerable(questions: &[Question]) -> Option<String> {
     questions.iter().find_map(|q| match q {
         Question::NeedPassword { account } => Some(format!(
             "{account} needs a password, which an unattended install is never given. Run Setup without /quiet \
-             to type it at the prompt, or use the virtual account (/account default)."
+             to type it in the Windows credential prompt, or use the virtual account (/account default)."
         )),
         Question::ConfirmUncWithoutAccount { prompt, .. } => {
             Some(format!("Setup would have to ask \"{prompt}\"; an unattended install cannot. Give /account."))
@@ -150,16 +154,6 @@ async fn quiet_install(o: &InstallOptions, probe: &dyn Probe, log: &mut SetupLog
     execute(&plan, &Answers::default(), log).await
 }
 
-/// The installer, quiet or at the console, with the plan checked first (read-only)
-/// so a refusal exits as one.
-async fn install_with(o: &InstallOptions, probe: &dyn Probe, quiet: bool, log: &mut SetupLog) -> Result<InstallReport> {
-    if quiet {
-        return quiet_install(o, probe, log).await;
-    }
-    plan_install(o, probe).map_err(|e| refused(e, log))?;
-    install_console(o, probe, log).await
-}
-
 /// A rolled-back run as an error: exit 7 when the previous state is back and
 /// running, 1 when the way back itself did not get there (`account_change`:
 /// `/change-account`'s wording).
@@ -169,7 +163,7 @@ pub fn rolled_back(report: &InstallReport, account_change: bool) -> anyhow::Erro
 }
 
 /// Replace `<dir>\OmniIngest-Setup.exe` with `write`'s bytes, through a temporary name.
-fn replace_setup_exe(dir: &Path, write: &mut dyn FnMut(&mut std::fs::File) -> std::result::Result<u64, PayloadError>) -> Result<()> {
+pub fn replace_setup_exe(dir: &Path, write: &mut dyn FnMut(&mut std::fs::File) -> std::result::Result<u64, PayloadError>) -> Result<()> {
     let target = dir.join(SETUP_EXE);
     let staged = dir.join(format!("{SETUP_EXE}.new"));
     let result = (|| -> Result<()> {
@@ -193,63 +187,92 @@ fn write_apps_entry(dir: &Path, log: &mut SetupLog) {
     }
 }
 
-async fn install(
-    exe: &Path,
-    dir: &Path,
-    account: Option<String>,
-    no_firewall: bool,
-    answer: Option<&Path>,
-    quiet: bool,
-    log: &mut SetupLog,
-) -> Result<Done> {
-    let answered = match answer {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("Cannot read the answer file {}", path.display()))
-                .map_err(|e| coded(ExitCode::Refused, e))?;
-            let doc: serde_json::Value = serde_json::from_str(&text)
-                .with_context(|| format!("The answer file {} is not JSON", path.display()))
-                .map_err(|e| coded(ExitCode::Refused, e))?;
-            Some(omni_core::answer_file::apply(&doc, AppConfig::default())?)
-        }
-        None => None,
-    };
+/// `/answer`'s file read and applied to the defaults; `None` without one.
+pub fn read_answer(answer: Option<&Path>) -> Result<Option<Applied>> {
+    let Some(path) = answer else { return Ok(None) };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Cannot read the answer file {}", path.display()))
+        .map_err(|e| coded(ExitCode::Refused, e))?;
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("The answer file {} is not JSON", path.display()))
+        .map_err(|e| coded(ExitCode::Refused, e))?;
+    Ok(Some(omni_core::answer_file::apply(&doc, AppConfig::default())?))
+}
+
+/// The answer file's configuration for a new installation in `dir`. The rule
+/// is "no config.json yet", not "nothing installed": an uninstall that kept
+/// the data leaves one behind (R7).
+pub fn with_answer(o: InstallOptions, applied: Option<&Applied>, dir: &Path, probe: &dyn Probe, log: &mut SetupLog) -> InstallOptions {
+    let Some(applied) = applied else { return o };
+    if probe.exists(&AppPaths::with_root(dir, "config.json").config) {
+        log.say("  The answer file is used only for a new installation (no config.json yet); the existing configuration is kept.");
+        return o;
+    }
+    for note in &applied.notes {
+        log.say(&format!("  {note}"));
+    }
+    o.with_base_config(applied.config.clone())
+}
+
+/// The payload checked and unpacked into a new work folder: the verified
+/// payload (for the stub copy), the folder, and the release's executable.
+pub fn unpack(exe: &Path) -> Result<(VerifiedPayload<std::fs::File>, WorkDir, PathBuf)> {
     let mut verified = open_setup(exe)?.verify()?;
-    let mut work = create_secure_work_dir().context("Cannot create Setup's work folder").map_err(|e| coded(ExitCode::Failed, e))?;
-    let result = async {
-        verified.extract(work.path())?;
-        let release_exe = work.path().join("omni-ingest.exe");
+    let work = create_secure_work_dir().context("Cannot create Setup's work folder").map_err(|e| coded(ExitCode::Failed, e))?;
+    let extract = |dir: &Path| -> Result<PathBuf> {
+        verified.extract(dir)?;
+        let release_exe = dir.join("omni-ingest.exe");
         if !release_exe.is_file() {
             return Err(PayloadError::Archive("it holds no omni-ingest.exe".into()).into());
         }
+        Ok(release_exe)
+    };
+    let (work, release_exe) = extract_in(work, extract, &|p| std::fs::remove_dir_all(p))?;
+    Ok((verified, work, release_exe))
+}
+
+/// Run `extract` in `work`. When it fails, the folder is removed now, and a
+/// line saying it could not be is carried in the error, which `/quiet`
+/// prints and the pages show (P13.1c Y2); the exit code is the error's own.
+pub fn extract_in(
+    mut work: WorkDir,
+    extract: impl FnOnce(&Path) -> Result<PathBuf>,
+    remove: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<(WorkDir, PathBuf)> {
+    match extract(work.path()) {
+        Ok(exe) => Ok((work, exe)),
+        Err(e) => Err(match work.remove_with(remove) {
+            None => e,
+            Some(line) => fail(exit_code_for(&e), format!("{e:#}\n{line}")),
+        }),
+    }
+}
+
+/// After an install that did not roll back: this Setup's stub into the
+/// folder, the Apps & Features entry, and whether to open the admin page.
+pub fn after_install(report: &InstallReport, dir: &Path, verified: &mut VerifiedPayload<std::fs::File>, log: &mut SetupLog) -> Done {
+    if let Err(e) = replace_setup_exe(dir, &mut |f| verified.write_stub(f)) {
+        log.say(&format!("! {SETUP_EXE} was not copied to {} ({e:#}); keep this Setup to uninstall later.", dir.display()));
+    }
+    write_apps_entry(dir, log);
+    match (report.kind, parse_admin_url(&report.admin_url)) {
+        (InstallKind::Fresh, Some((tls, port))) => Done::OpenAdmin { tls, port },
+        _ => Done::Ok,
+    }
+}
+
+async fn install(exe: &Path, dir: &Path, account: Option<String>, no_firewall: bool, answer: Option<&Path>, log: &mut SetupLog) -> Result<Done> {
+    let answered = read_answer(answer)?;
+    let (mut verified, mut work, release_exe) = unpack(exe)?;
+    let result = async {
         let probe = ExeProbe { exe: release_exe };
-        let mut o = InstallOptions { dir: Some(dir.to_path_buf()), account, yes: quiet, no_firewall, ..Default::default() };
-        if let Some(applied) = answered {
-            // The rule is "no config.json yet", not "nothing installed": an
-            // uninstall that kept the data leaves one behind (R7).
-            if probe.exists(&AppPaths::with_root(dir, "config.json").config) {
-                log.say(
-                    "  The answer file is used only for a new installation (no config.json yet); the existing configuration is kept.",
-                );
-            } else {
-                for note in &applied.notes {
-                    log.say(&format!("  {note}"));
-                }
-                o = o.with_base_config(applied.config);
-            }
-        }
-        let report = install_with(&o, &probe, quiet, log).await?;
+        let o = InstallOptions { dir: Some(dir.to_path_buf()), account, yes: true, no_firewall, ..Default::default() };
+        let o = with_answer(o, answered.as_ref(), dir, &probe, log);
+        let report = quiet_install(&o, &probe, log).await?;
         if report.rolled_back {
             return Err(rolled_back(&report, false));
         }
-        if let Err(e) = replace_setup_exe(dir, &mut |f| verified.write_stub(f)) {
-            log.say(&format!("! {SETUP_EXE} was not copied to {} ({e:#}); keep this Setup to uninstall later.", dir.display()));
-        }
-        write_apps_entry(dir, log);
-        Ok(match (report.kind, parse_admin_url(&report.admin_url)) {
-            (InstallKind::Fresh, Some((tls, port))) => Done::OpenAdmin { tls, port },
-            _ => Done::Ok,
-        })
+        Ok(after_install(&report, dir, &mut verified, log))
     }
     .await;
     if let Some(line) = work.remove() {
@@ -258,62 +281,48 @@ async fn install(
     result
 }
 
-/// The account `/change-account` was given, or asked for at the console:
-/// empty means the virtual account; no answer at all cancels.
-pub fn account_to_use(given: Option<&str>, console: &mut dyn Console) -> Result<String> {
-    if let Some(a) = given {
-        return Ok(a.to_string());
-    }
-    let answer = console
-        .ask("Account the service should run as (empty = the built-in service account): ")
-        .ok_or(Cancelled)?;
-    let answer = answer.trim();
-    Ok(if answer.is_empty() || answer.eq_ignore_ascii_case("default") {
-        omni_service::DEFAULT_SERVICE_ACCOUNT.to_string()
-    } else {
-        answer.to_string()
-    })
-}
-
-async fn change_account(
-    account: Option<&str>,
-    no_firewall: bool,
-    quiet: bool,
-    running: &Path,
-    console: &mut dyn Console,
-    log: &mut SetupLog,
-) -> Result<(PathBuf, Done)> {
+/// The registered service's executable and folder, for `/change-account`.
+pub fn installed_target() -> Result<(PathBuf, PathBuf)> {
     let Some(exe) = omni_service::installed_service_exe() else {
         return Err(fail(ExitCode::Refused, "The OmniIngest service is not installed on this computer; there is no account to change."));
     };
-    let account = account_to_use(account, console)?;
     let dir = exe.parent().context("The installed service has no folder").map_err(|e| coded(ExitCode::Refused, e))?.to_path_buf();
     if !exe.is_file() {
         return Err(fail(ExitCode::Refused, format!("The service points at {}, which does not exist.", exe.display())));
     }
+    Ok((exe, dir))
+}
+
+async fn change_account(account: &str, no_firewall: bool, running: &Path, log: &mut SetupLog) -> Result<(PathBuf, Done)> {
+    let (exe, dir) = installed_target()?;
     let probe = ExeProbe { exe };
-    let o = InstallOptions { dir: Some(dir.clone()), account: Some(account), yes: quiet, no_firewall, ..Default::default() };
-    let report = install_with(&o, &probe, quiet, log).await?;
+    let o = InstallOptions { dir: Some(dir.clone()), account: Some(account.to_string()), yes: true, no_firewall, ..Default::default() };
+    let report = quiet_install(&o, &probe, log).await?;
     if report.rolled_back {
         return Err(rolled_back(&report, true));
     }
-    // An installation made by `omni-ingest install` has no Setup in it yet; the
-    // Apps & Features entry would point at nothing (R11).
+    after_change_account(&dir, running, log);
+    Ok((dir, Done::Ok))
+}
+
+/// After an account change that did not roll back: an installation made by
+/// `omni-ingest install` has no Setup in it yet; the Apps & Features entry
+/// would point at nothing (R11).
+pub fn after_change_account(dir: &Path, running: &Path, log: &mut SetupLog) {
     let stub = dir.join(SETUP_EXE);
     if !same_dir(&stub, running) {
         let copied = open_setup(running)
             .map_err(anyhow::Error::from)
-            .and_then(|mut me| replace_setup_exe(&dir, &mut |f| me.write_stub(f)));
+            .and_then(|mut me| replace_setup_exe(dir, &mut |f| me.write_stub(f)));
         if let Err(e) = copied {
             log.say(&format!("! {SETUP_EXE} was not copied to {} ({e:#}).", dir.display()));
         }
     }
     if stub.is_file() {
-        write_apps_entry(&dir, log);
+        write_apps_entry(dir, log);
     } else {
         log.say(&format!("  No {SETUP_EXE} in {}: the Apps & Features entry was not written.", dir.display()));
     }
-    Ok((dir, Done::Ok))
 }
 
 /// Two folders are the same: canonically when both exist, by name (case-folded,
@@ -455,14 +464,20 @@ pub fn prepare_uninstall(root: &Path, remove_data: bool) -> Result<(AppPaths, Ve
     Ok((paths, plan))
 }
 
-async fn uninstall(
-    dir: Option<&Path>,
-    remove_data: bool,
-    quiet: bool,
-    running: &Path,
-    console: &mut dyn Console,
-    log: &mut SetupLog,
-) -> Result<(Option<PathBuf>, Done)> {
+/// What `/uninstall` works on, decided before anything is touched.
+#[derive(Debug, Clone)]
+pub struct UninstallScope {
+    pub root: PathBuf,
+    pub owned: Ownership,
+    /// The program files are removed too: they are there, or `/dir` named the folder.
+    pub with_files: bool,
+    /// The removal plan as it stands now, for the confirmation.
+    pub shown: Vec<Removal>,
+}
+
+/// The installation `/uninstall` removes and every refusal, before the
+/// service is touched. Reads the machine; changes nothing.
+pub fn uninstall_scope(dir: Option<&Path>, remove_data: bool, running: &Path) -> Result<UninstallScope> {
     let service_exe = omni_service::installed_service_exe();
     let key_location = registry::read_install_location();
     let service_dir = service_exe.as_deref().and_then(Path::parent);
@@ -474,23 +489,30 @@ async fn uninstall(
     // only the files are skipped. A folder named with /dir must be an installation.
     let files_present = root.join("omni-ingest.exe").is_file();
     let with_files = files_present || dir.is_some();
-    // Every refusal before the service is touched.
     let shown = if with_files { prepare_uninstall(&root, remove_data)?.1 } else { Vec::new() };
-    if !with_files {
-        log.say(&format!("  {} holds no OmniIngest program files; only its registration is removed.", root.display()));
+    Ok(UninstallScope { root, owned, with_files, shown })
+}
+
+/// Remove what `scope` names: the folder to write setup.log into (none after
+/// `/remove-data`), and the closing sentence ([`uninstall_outcome`]).
+pub async fn uninstall_execute(
+    scope: &UninstallScope,
+    remove_data: bool,
+    running: &Path,
+    log: &mut dyn Progress,
+) -> Result<(Option<PathBuf>, String)> {
+    fn say(p: &mut dyn Progress, text: &str) {
+        p.line(Step::Plan, text);
     }
-    if !quiet {
-        for l in uninstall_summary(&root, &shown, remove_data, &owned) {
-            log.say(&l);
-        }
-        if !console.confirm("Remove OmniIngest from this computer? [y/N] ") {
-            return Err(fail(ExitCode::Cancelled, "Nothing was removed."));
-        }
+    let UninstallScope { root, owned, with_files, .. } = scope;
+    let (root, with_files) = (root.as_path(), *with_files);
+    if !with_files {
+        say(log, &format!("  {} holds no OmniIngest program files; only its registration is removed.", root.display()));
     }
     if owned.service {
         remove_service_registration(log)?;
     } else if let Some(other) = &owned.other {
-        log.say(&format!("  The Windows service belongs to the installation in {}; it is kept.", other.display()));
+        say(log, &format!("  The Windows service belongs to the installation in {}; it is kept.", other.display()));
     }
     if owned.firewall {
         remove_firewall_rule().await;
@@ -498,8 +520,8 @@ async fn uninstall(
     // The plan that runs is made now, with the service stopped: what was shown
     // could have changed under a running service (R3).
     let failed = if with_files {
-        let (_paths, plan) = prepare_uninstall(&root, remove_data)?;
-        execute_removals(&plan, &root, running, &omni_core::fsutil::is_link, &mut elevate::delete_at_restart, log)
+        let (_paths, plan) = prepare_uninstall(root, remove_data)?;
+        execute_removals(&plan, root, running, &omni_core::fsutil::is_link, &mut elevate::delete_at_restart, log)
     } else {
         0
     };
@@ -509,92 +531,60 @@ async fn uninstall(
     }
     if owned.key {
         if let Err(e) = registry::remove_entry() {
-            log.say(&format!("! The Apps & Features entry was not removed ({e:#})."));
+            say(log, &format!("! The Apps & Features entry was not removed ({e:#})."));
         }
     } else {
-        log.say("  The Apps & Features entry belongs to another installation; it is kept.");
+        say(log, "  The Apps & Features entry belongs to another installation; it is kept.");
     }
     if !remove_data && with_files {
-        log.say(&format!("  The configuration, database and logs stay in {}.", root.display()));
+        say(log, &format!("  The configuration, database and logs stay in {}.", root.display()));
     }
-    log.say(&uninstall_outcome(&root, &owned, with_files));
+    let outcome = uninstall_outcome(root, owned, with_files);
+    say(log, &outcome);
     // After /remove-data the folder is going; a new setup.log would keep it.
-    Ok(((!remove_data && with_files).then_some(root), Done::Ok))
+    Ok(((!remove_data && with_files).then(|| root.to_path_buf()), outcome))
 }
 
-/// The questions Setup itself asks at the console (the installer's own go
-/// through `inquire`).
-pub trait Console {
-    /// Yes or no; anything but yes is no.
-    fn confirm(&mut self, prompt: &str) -> bool;
-    /// One line of text; `None` when there is no answer (end of input).
-    fn ask(&mut self, prompt: &str) -> Option<String>;
+async fn uninstall(dir: Option<&Path>, remove_data: bool, running: &Path, log: &mut SetupLog) -> Result<(Option<PathBuf>, Done)> {
+    let scope = uninstall_scope(dir, remove_data, running)?;
+    let (root, _) = uninstall_execute(&scope, remove_data, running, log).await?;
+    Ok((root, Done::Ok))
 }
 
-/// A whole elevated-or-not run of a mode. `args` are the original arguments
-/// (for the relaunch).
-pub async fn run(
-    args: &[String],
-    mode: Mode,
-    quiet: bool,
-    elevated_child: bool,
-    console: &mut dyn Console,
-    log: &mut SetupLog,
-) -> Finished {
+const NEEDS_ELEVATION: &str =
+    "Setup needs administrator rights: start it from an elevated prompt, or from a deployment tool running as administrator.";
+
+/// `/quiet`: a whole run of a mode with nothing asked and no page shown (it
+/// has no [`Ui`] to show one with). Never relaunches itself: not elevated is exit 3.
+pub async fn run_quiet(mode: Mode, elevated_child: bool, log: &mut SetupLog) -> Finished {
     let running = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => return Finished { code: ExitCode::Failed.code(), error: Some(format!("Setup cannot find its own file: {e}")) },
     };
     if !omni_service::can_install_services() {
-        if elevated_child || quiet {
-            return Finished {
-                code: ExitCode::NeedsElevation.code(),
-                error: Some(
-                    "Setup needs administrator rights: start it from an elevated prompt, or from a deployment tool running as administrator."
-                        .into(),
-                ),
-            };
-        }
-        // The child starts in another folder (an elevated session may not even
-        // have this one's mapped drive): relative paths are made absolute here (R10, S7).
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let child = relaunch_args(args, &cwd);
-        return match elevate::relaunch_elevated(&running, &command_line(&child)) {
-            Ok(Relaunch::Declined) => Finished {
-                code: ExitCode::Cancelled.code(),
-                error: Some("Setup needs administrator rights; the Windows prompt was declined. Nothing was changed.".into()),
-            },
-            Ok(Relaunch::Exited(code)) => match decode_child_exit(code) {
-                ChildResult::Exit(c) => Finished { code: c.code(), error: None },
-                ChildResult::OpenAdmin { tls, port } => {
-                    let url = admin_url(tls, port);
-                    if !elevate::open_url(&url) {
-                        log.say(&format!("Open {url} in a browser on this computer."));
-                    }
-                    Finished { code: ExitCode::Ok.code(), error: None }
-                }
-            },
-            Err(e) => Finished { code: ExitCode::Failed.code(), error: Some(format!("{e:#}")) },
-        };
+        return Finished { code: ExitCode::NeedsElevation.code(), error: Some(NEEDS_ELEVATION.into()) };
     }
 
     let (name, root, result) = match &mode {
         Mode::Install { dir, account, no_firewall, answer } => {
-            let r = install(&running, dir, account.clone(), *no_firewall, answer.as_deref(), quiet, log).await;
+            let r = install(&running, dir, account.clone(), *no_firewall, answer.as_deref(), log).await;
             ("install", Some(dir.clone()), r)
         }
         Mode::ChangeAccount { account, no_firewall } => {
-            match change_account(account.as_deref(), *no_firewall, quiet, &running, console, log).await {
+            // `parse_args` refuses `/change-account /quiet` without `/account`.
+            let r = match account.as_deref() {
+                Some(a) => change_account(a, *no_firewall, &running, log).await,
+                None => Err(fail(ExitCode::Usage, "/change-account /quiet needs /account <name>.")),
+            };
+            match r {
                 Ok((dir, done)) => ("change-account", Some(dir), Ok(done)),
                 Err(e) => ("change-account", None, Err(e)),
             }
         }
-        Mode::Uninstall { dir, remove_data } => {
-            match uninstall(dir.as_deref(), *remove_data, quiet, &running, console, log).await {
-                Ok((root, done)) => ("uninstall", root, Ok(done)),
-                Err(e) => ("uninstall", None, Err(e)),
-            }
-        }
+        Mode::Uninstall { dir, remove_data } => match uninstall(dir.as_deref(), *remove_data, &running, log).await {
+            Ok((root, done)) => ("uninstall", root, Ok(done)),
+            Err(e) => ("uninstall", None, Err(e)),
+        },
     };
     let finished = match result {
         Ok(Done::Ok) => Finished { code: ExitCode::Ok.code(), error: None },
@@ -612,6 +602,95 @@ pub async fn run(
         let _ = append_setup_log(&root, &format!("OmniIngest Setup {VERSION} {name}"), &log.lines, now_unix());
     }
     finished
+}
+
+/// Setup's pages (P13.1c). Not elevated: relaunch elevated and wait (the
+/// child shows the pages), then open the admin page for a new installation
+/// as this unelevated user. Elevated: the pages over the real machine.
+/// `new_ui` is called only when pages are shown; `tell` shows one message
+/// without a console (a declined UAC prompt).
+pub fn run_pages(
+    args: &[String],
+    mode: Mode,
+    lang: Lang,
+    elevated_child: bool,
+    new_ui: &mut dyn FnMut() -> Box<dyn Ui>,
+    tell: &mut dyn FnMut(&str),
+) -> Finished {
+    let running = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            let error = format!("Setup cannot find its own file: {e}");
+            tell(&error);
+            return Finished { code: ExitCode::Failed.code(), error: Some(error) };
+        }
+    };
+    if !omni_service::can_install_services() {
+        if elevated_child {
+            tell(tr(lang, T::BoxNotElevated));
+            return Finished { code: ExitCode::NeedsElevation.code(), error: Some(NEEDS_ELEVATION.into()) };
+        }
+        // The child starts in another folder (an elevated session may not even
+        // have this one's mapped drive): relative paths are made absolute here (R10, S7).
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let child = relaunch_args(args, &cwd, lang);
+        return match elevate::relaunch_elevated(&running, &command_line(&child)) {
+            Ok(Relaunch::Declined) => {
+                tell(tr(lang, T::BoxDeclined));
+                Finished { code: ExitCode::Cancelled.code(), error: Some(tr(lang, T::BoxDeclined).into()) }
+            }
+            Ok(Relaunch::Exited(code)) => match decode_child_exit(code) {
+                ChildResult::Exit(c) => Finished { code: c.code(), error: None },
+                ChildResult::OpenAdmin { tls, port } => {
+                    // The Finished page told the address too.
+                    let _ = elevate::open_url(&admin_url(tls, port));
+                    Finished { code: ExitCode::Ok.code(), error: None }
+                }
+            },
+            Err(e) => {
+                let error = format!("{} {e:#}", tr(lang, T::BoxNoStart));
+                tell(&error);
+                Finished { code: ExitCode::Failed.code(), error: Some(error) }
+            }
+        };
+    }
+    let (no_firewall, answer) = match &mode {
+        Mode::Install { no_firewall, answer, .. } => (*no_firewall, answer.clone()),
+        Mode::ChangeAccount { no_firewall, .. } => (*no_firewall, None),
+        Mode::Uninstall { .. } => (false, None),
+    };
+    let mut backend = match crate::real::RealBackend::new(running, no_firewall, answer) {
+        Ok(b) => b,
+        Err(e) => {
+            let error = format!("{e:#}");
+            tell(&error);
+            return Finished { code: ExitCode::Failed.code(), error: Some(error) };
+        }
+    };
+    pages_with(&mut *new_ui(), &mut backend, Start::from_mode(&mode), elevated_child, tell)
+}
+
+/// The pages over `backend`. However they end (Cancel, refusal, failure,
+/// success), the backend's work folder is removed then, and a line saying it
+/// could not be is told (`tell`: a message box once the pages are closed; Y2).
+/// An elevated run that is nobody's child has no unelevated parent to open
+/// the admin page for it: the page told the address, and it exits 0 (an
+/// elevated browser is not opened).
+pub fn pages_with(
+    ui: &mut dyn Ui,
+    backend: &mut dyn Backend,
+    start: Start,
+    elevated_child: bool,
+    tell: &mut dyn FnMut(&str),
+) -> Finished {
+    let finished = flow::interactive(ui, backend, start);
+    if let Some(line) = backend.cleanup() {
+        tell(&line);
+    }
+    match decode_child_exit(finished.code) {
+        ChildResult::OpenAdmin { .. } if !elevated_child => Finished { code: ExitCode::Ok.code(), error: None },
+        _ => finished,
+    }
 }
 
 /// Whether a run ending with `code` is written to setup.log: only one that
@@ -636,47 +715,10 @@ pub fn verify_file(file: &Path) -> Result<payload::PayloadSpan> {
     Ok(v.span())
 }
 
-/// Flush stdout before a prompt (for main's console questions).
-pub fn flush() {
-    let _ = std::io::stdout().flush();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use omni_cli::install::{RegistrationRestore, Restore, WayBack};
-
-    /// A console with scripted answers that records what was asked.
-    struct Scripted {
-        answers: Vec<Option<String>>,
-        asked: Vec<String>,
-    }
-
-    impl Console for Scripted {
-        fn confirm(&mut self, prompt: &str) -> bool {
-            self.asked.push(prompt.to_string());
-            false
-        }
-        fn ask(&mut self, prompt: &str) -> Option<String> {
-            self.asked.push(prompt.to_string());
-            self.answers.remove(0)
-        }
-    }
-
-    #[test]
-    fn change_account_without_an_account_asks_and_empty_means_the_virtual_account() {
-        let mut c = Scripted { answers: vec![Some("  \n".into()), Some(r"DOMAIN\svc_test".into()), None], asked: vec![] };
-        assert_eq!(account_to_use(None, &mut c).unwrap(), omni_service::DEFAULT_SERVICE_ACCOUNT);
-        assert_eq!(account_to_use(None, &mut c).unwrap(), r"DOMAIN\svc_test");
-        // No answer (end of input) cancels: exit 6.
-        let e = account_to_use(None, &mut c).unwrap_err();
-        assert_eq!(exit_code_for(&e), ExitCode::Cancelled);
-        assert_eq!(c.asked.len(), 3);
-        assert!(c.asked[0].starts_with("Account the service should run as (empty = the built-in service account):"));
-        // Given on the command line: nothing is asked.
-        assert_eq!(account_to_use(Some("LocalSystem"), &mut c).unwrap(), "LocalSystem");
-        assert_eq!(c.asked.len(), 3);
-    }
 
     #[test]
     fn uninstall_refusals_come_from_the_preparation_before_anything_is_touched() {
@@ -694,6 +736,28 @@ mod tests {
         let e = prepare_uninstall(&d.path().join("Photos"), false).unwrap_err();
         assert_eq!(exit_code_for(&e), ExitCode::Refused);
         assert!(root.join("config.json").exists() && root.join("omni-ingest.exe").exists());
+    }
+
+    /// Y2: a failed extraction removes the work folder now; a folder that
+    /// cannot be removed is said in the error `/quiet` prints, whose exit code
+    /// stays the extraction's.
+    #[test]
+    fn a_failed_extraction_says_when_its_work_folder_cannot_be_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let new_work = || crate::workdir::create_work_dir(d.path(), &|p: &Path| std::fs::create_dir(p)).unwrap();
+        let corrupt = |_: &Path| -> Result<PathBuf> { Err(PayloadError::Corrupt.into()) };
+        let denied = |_: &Path| -> std::io::Result<()> { Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) };
+        let e = extract_in(new_work(), corrupt, &denied).map(|_| ()).unwrap_err();
+        assert_eq!(exit_code_for(&e), ExitCode::BadPayload);
+        let text = format!("{e:#}");
+        assert!(text.contains("delete it by hand"), "{text}");
+        assert!(text.starts_with(&PayloadError::Corrupt.to_string()), "{text}");
+        // Removed: the error is the extraction's own, and the folder is gone.
+        let w = new_work();
+        let path = w.path().to_path_buf();
+        let e = extract_in(w, corrupt, &|p| std::fs::remove_dir_all(p)).map(|_| ()).unwrap_err();
+        assert_eq!(format!("{e:#}"), PayloadError::Corrupt.to_string());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -818,6 +882,7 @@ mod tests {
             admin_url: "http://127.0.0.1:8080/admin".into(),
             health: Vec::new(),
             logs: PathBuf::from(r"C:\OmniTest\logs"),
+            existing_database: true,
         };
         let e = rolled_back(&report, false);
         assert_eq!(exit_code_for(&e), ExitCode::RolledBack);

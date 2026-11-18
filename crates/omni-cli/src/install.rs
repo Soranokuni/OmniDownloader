@@ -76,6 +76,12 @@ pub struct InstallOptions {
     /// used instead of the defaults only when there is no config.json and no import.
     /// Holds no secret: the answer file cannot carry one.
     pub base_config: Option<AppConfig>,
+    /// Ask [`Question::ConfirmUncWithoutAccount`] for a passwordless account
+    /// given by name too (with `yes`: the same refusal), not only for the
+    /// defaulted one. Setup's pages set it: picking "the built-in account
+    /// (recommended)" is not naming an account knowingly the way `--account`
+    /// is (P13.1c). `omni-ingest install` and `/quiet` never set it.
+    pub confirm_share_for_passwordless: bool,
 }
 
 impl InstallOptions {
@@ -352,6 +358,9 @@ pub struct InstallPlan {
     /// Where the service answers after a way back (P13.1b2 V2/V3).
     pub previous: PreviousEndpoints,
     pub questions: Vec<Question>,
+    /// `<root>\data\omni.db` is there already (a reinstall over kept data):
+    /// the first-run Admin / Admin account will not exist (P13.1c Y6).
+    pub existing_database: bool,
 }
 
 /// Where a service answers and which firewall rule it needs, read from one
@@ -409,6 +418,7 @@ impl fmt::Debug for InstallPlan {
             .field("tls", &self.tls)
             .field("previous", &self.previous)
             .field("questions", &self.questions)
+            .field("existing_database", &self.existing_database)
             .finish()
     }
 }
@@ -470,6 +480,22 @@ impl fmt::Debug for Answers {
 pub struct Refusal {
     pub notice: Vec<String>,
     pub message: String,
+    /// The refusal is about the service account (unknown, wrong password,
+    /// logon not allowed, no domain controller): Setup's pages ask for the
+    /// account again instead of ending (P13.1c).
+    pub account: bool,
+}
+
+impl Refusal {
+    /// A refusal that is not about the account, without notice lines.
+    pub fn new(message: impl Into<String>) -> Self {
+        Refusal { notice: Vec::new(), message: message.into(), account: false }
+    }
+
+    /// A refusal about the service account.
+    pub fn about_account(message: impl Into<String>) -> Self {
+        Refusal { notice: Vec::new(), message: message.into(), account: true }
+    }
 }
 
 impl fmt::Display for Refusal {
@@ -534,7 +560,7 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
     let paths = AppPaths::with_root(&dir, "config.json");
     // Every later write and grant would follow a link (P13.1b, S2).
     if let Some(link) = paths.root.ancestors().find(|a| probe.is_link(a)) {
-        return Err(Refusal { notice: Vec::new(), message: link_refusal(&paths.root, link) }.into());
+        return Err(Refusal::new(link_refusal(&paths.root, link)).into());
     }
     let target_exe = paths.root.join(EXE);
     let service_exe = probe.installed_exe();
@@ -557,7 +583,7 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
         // Whoever owns the folder can always rewrite its rights, whatever the
         // lockdown sets, and replace what is in it (P13.1b, R2/S4).
         if let Some(owner) = probe.foreign_owner(&paths.root) {
-            return Err(Refusal { notice: Vec::new(), message: foreign_owner_refusal(&paths.root, &owner) }.into());
+            return Err(Refusal::new(foreign_owner_refusal(&paths.root, &owner)).into());
         }
         // An existing folder that holds no installation keeps whatever rights it
         // was made with until the lockdown: nobody else may be able to put a file
@@ -570,7 +596,7 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
                     Some(owner) => untrusted_exe_refusal(&target_exe, owner, &paths.root),
                     None => writable_refusal(&paths.root, &who),
                 };
-                return Err(Refusal { notice: Vec::new(), message }.into());
+                return Err(Refusal::new(message).into());
             }
         }
         // A folder above the root that someone else may rename or owns lets
@@ -580,7 +606,7 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
         if let Some((ancestor, who)) = probe.swappable_ancestor(&paths.root) {
             let text = swappable_refusal(&ancestor, &who);
             if !had_previous_exe {
-                return Err(Refusal { notice: Vec::new(), message: text }.into());
+                return Err(Refusal::new(text).into());
             }
             warnings.push(format!("! {text}"));
         }
@@ -833,12 +859,14 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
         // The decision `choose_account` makes, with its prompts turned into questions.
         let choice = default_or_given(o.account.as_deref());
         let defaulted = o.account.as_deref().map_or(true, |s| s.trim().is_empty());
-        // `network_share_warning_applies`, judged with the probe's drives.
-        if defaulted && network_watch && !matches!(choice, AccountChoice::NeedsPassword(_)) {
+        // `network_share_warning_applies`, judged with the probe's drives. A
+        // passwordless account picked on Setup's pages is asked about too (P13.1c).
+        let asks = defaulted || o.confirm_share_for_passwordless;
+        if asks && network_watch && !matches!(choice, AccountChoice::NeedsPassword(_)) {
             let who = choice_name(&choice);
             let text = share_warning(&config.watchfolder_path, who);
             if o.yes {
-                return Err(Refusal { notice: text, message: SHARE_REFUSAL.into() }.into());
+                return Err(Refusal { notice: text, message: SHARE_REFUSAL.into(), account: false }.into());
             }
             questions.push(Question::ConfirmUncWithoutAccount { text, prompt: format!("Install as {who} anyway?") });
         }
@@ -849,7 +877,7 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
                 // A misspelt account would leave the machine without a service:
                 // the old registration is removed before the new one (P13.1b, R5).
                 if !probe.account_exists(&name) {
-                    return Err(Refusal { notice: Vec::new(), message: unknown_account_refusal(&name) }.into());
+                    return Err(Refusal::about_account(unknown_account_refusal(&name)).into());
                 }
                 questions.push(Question::NeedPassword { account: name.clone() });
                 AccountDecision::NeedsPassword(name)
@@ -876,7 +904,7 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
     // permissions of must hold no link (T3/T7). The execute-time guards stay
     // as the backstop for a link made in between.
     if let Some(link) = planned_link(&target, &grants, account.registers(), probe) {
-        return Err(Refusal { notice: Vec::new(), message: link_inside_refusal(&link) }.into());
+        return Err(Refusal::new(link_inside_refusal(&link)).into());
     }
     // A path outside the root reached through a link or a mounted volume is
     // skipped at the grant: say so before anything happens (P13.1b2 V4).
@@ -916,8 +944,10 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
         PreviousEndpoints { elsewhere, here, there }
     };
     let paths = &target.paths;
+    let existing_database = probe.exists(&paths.data.join("omni.db"));
 
     Ok(InstallPlan {
+        existing_database,
         previous,
         import: o.import.clone(),
         write_config: fresh_config || o.watchfolder.is_some() || o.port.is_some(),
@@ -1001,7 +1031,7 @@ pub(crate) fn check_config_watchfolder(
     let judged = if raw.is_empty() { String::new() } else { paths.resolve(raw).to_string_lossy().into_owned() };
     match omni_core::paths::watchfolder_problem_with(&judged, drives) {
         // A refusal, so every front end reports "nothing was changed" (exit 5 in Setup).
-        Some(problem) => Err(Refusal { notice: Vec::new(), message: format!("Cannot install: {problem}") }.into()),
+        Some(problem) => Err(Refusal::new(format!("Cannot install: {problem}")).into()),
         None => Ok(()),
     }
 }
@@ -1088,6 +1118,8 @@ pub struct InstallReport {
     pub health: Vec<String>,
     /// The log folder, for a failure.
     pub logs: PathBuf,
+    /// The plan's [`InstallPlan::existing_database`].
+    pub existing_database: bool,
 }
 
 /// The machine steps of an install, one method per step, so the order of
@@ -1132,6 +1164,8 @@ pub(crate) trait Machine {
     fn start_service(&mut self) -> Result<()>;
     fn wait_for_health(&mut self, addr: SocketAddr, tls: bool, timeout: Duration) -> Option<String>;
     fn restore_previous(&mut self, target_exe: &Path) -> Result<()>;
+    /// This computer's name, so `<COMPUTERNAME>\svc` reads as the local `svc`.
+    fn computer_name(&self) -> Option<String>;
 }
 
 struct SystemMachine;
@@ -1142,7 +1176,7 @@ impl Machine for SystemMachine {
         let name = account.name.as_str();
         if let Err(e) = grant_service_logon_right(name) {
             let message = format!("Setup could not give {name} the right to log on as a service ({e:#}). Nothing was changed.");
-            return Err(Refusal { notice: Vec::new(), message }.into());
+            return Err(Refusal::about_account(message).into());
         }
         progress.line(Step::Account, &format!("  {name} may log on as a service."));
         match check_service_logon(name, password).operator_text(name) {
@@ -1155,7 +1189,7 @@ impl Machine for SystemMachine {
                     Step::Account,
                     &format!("  {name} keeps the right to log on as a service; Setup changed nothing else."),
                 );
-                Err(Refusal { notice: Vec::new(), message: format!("{text} Nothing else was changed.") }.into())
+                Err(Refusal::about_account(format!("{text} Nothing else was changed.")).into())
             }
         }
     }
@@ -1232,6 +1266,9 @@ impl Machine for SystemMachine {
         std::fs::copy(target_exe.with_extension("exe.prev"), target_exe)?;
         Ok(())
     }
+    fn computer_name(&self) -> Option<String> {
+        std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty())
+    }
 }
 
 /// `config.json.prev` beside `config.json`.
@@ -1268,6 +1305,7 @@ pub(crate) async fn execute_with<M: Machine>(
         failure: None,
         restored_running: false,
         way_back: None,
+        existing_database: plan.existing_database,
     };
 
     // A named account's logon right and password, before anything is changed
@@ -1358,6 +1396,9 @@ struct Changed {
     reconfigured: bool,
     /// The firewall rule was replaced for this run's executable and port.
     firewall: bool,
+    /// ... and Windows took the new rule. When it did not, the old rule is
+    /// gone too (it is deleted first), whatever the port and program.
+    firewall_added: bool,
 }
 
 /// `/api/health` gave no answer in time.
@@ -1424,7 +1465,7 @@ async fn forward_steps<M: Machine>(
     }
     if let Some(port) = plan.firewall {
         // As before: a rule that could not be added is said and the run goes on.
-        let _ = m.open_firewall(&t.target_exe, port, progress).await;
+        changed.firewall_added = m.open_firewall(&t.target_exe, port, progress).await;
         changed.firewall = true;
     }
 
@@ -1462,11 +1503,20 @@ fn previous_registration(previous: Option<&str>) -> PreviousRegistration {
 
 /// Whether two account names are the same account, as the plan reads them
 /// ([`default_or_given`]: trimmed; the LocalSystem spellings are one), compared
-/// without case.
-fn same_account(a: &str, b: &str) -> bool {
+/// without case. A local account is one under `.\svc`, `<computer>\svc` and the
+/// bare `svc` (P13.1c A2); any other prefix (a domain) is compared as written.
+fn same_account(a: &str, b: &str, computer: Option<&str>) -> bool {
+    let computer = computer.map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty());
     let norm = |s: &str| match default_or_given(Some(s)) {
         AccountChoice::LocalSystem => "localsystem".to_string(),
-        AccountChoice::Passwordless(n) | AccountChoice::NeedsPassword(n) => n.to_ascii_lowercase(),
+        AccountChoice::Passwordless(n) | AccountChoice::NeedsPassword(n) => {
+            let n = n.to_lowercase();
+            match n.split_once('\\') {
+                Some((".", user)) => user.to_string(),
+                Some((prefix, user)) if computer.as_deref() == Some(prefix) => user.to_string(),
+                _ => n,
+            }
+        }
     };
     norm(a) == norm(b)
 }
@@ -1490,6 +1540,8 @@ async fn way_back<M: Machine>(
     failure: &str,
 ) -> WayBack {
     let t = &plan.target;
+    let computer = m.computer_name();
+    let same_account = |a: &str, b: &str| same_account(a, b, computer.as_deref());
     let mut say = |text: &str| progress.line(Step::Rollback, text);
     say("");
     say(&format!("✗ {failure}"));
@@ -1591,7 +1643,8 @@ async fn way_back<M: Machine>(
                 "the previous configuration could not be read; the rule opens port {new_port} for {}",
                 t.target_exe.display()
             )),
-            Some(Some(port)) if port == new_port && now_exe == t.target_exe => None,
+            // The same rule, unless the forward add failed after deleting it (P13.1c A1).
+            Some(Some(port)) if port == new_port && now_exe == t.target_exe && changed.firewall_added => None,
             Some(Some(port)) => {
                 if m.open_firewall(&now_exe, port, progress).await {
                     back.firewall = Restore::Restored;
@@ -1770,6 +1823,12 @@ fn closing_lines(plan: &InstallPlan, host: &str, exe_replaced: bool) -> Vec<Stri
         if exe_replaced {
             lines.push(format!("  Previous version kept as {}.", t.target_exe.with_extension("exe.prev").display()));
         }
+    } else if plan.existing_database {
+        // A reinstall over kept data: the first-run account exists only on a
+        // database with no users, and the wizard has run (P13.1c Y6).
+        lines.push(String::new());
+        lines.push(format!("  Next: on THIS computer, open {scheme}://127.0.0.1:{port}/admin and sign in"));
+        lines.push("  with the administrator account of this installation: its database was kept.".into());
     } else {
         lines.push(String::new());
         lines.push(format!("  Next: on THIS computer, open {scheme}://127.0.0.1:{port}/admin and sign in"));
@@ -2334,7 +2393,8 @@ pub(crate) async fn strip_outside_on<A: AclOps>(
     ops: &mut A,
 ) {
     let inside = lexical(root);
-    let mut done: Vec<PathBuf> = Vec::new();    for (path, rights) in grants {
+    let mut done: Vec<PathBuf> = Vec::new();
+    for (path, rights) in grants {
         let s = path.to_string_lossy();
         let share = s.starts_with(r"\\") || s.starts_with("//");
         if share || !matches!(rights, Rights::ModifyDir | Rights::ModifyFile) || lexical(path).starts_with(&inside) {
@@ -2466,7 +2526,7 @@ fn create_install_dir(t: &Target) -> Result<()> {
     if new_dir_rights(t.development) == NewDirRights::Plain {
         let recheck = Recheck::system();
         if let Some(message) = changed_since_plan(t, &recheck) {
-            return Err(Refusal { notice: Vec::new(), message }.into());
+            return Err(Refusal::new(message).into());
         }
         return Ok(std::fs::create_dir_all(&t.paths.root)?);
     }
@@ -2489,7 +2549,7 @@ pub(crate) fn create_install_dir_with(
     let mut missing: Vec<PathBuf> = dir.ancestors().take_while(|a| !(r.is_dir)(a)).map(Path::to_path_buf).collect();
     missing.reverse();
     if let Some(message) = changed_since_plan(t, r) {
-        return Err(Refusal { notice: Vec::new(), message }.into());
+        return Err(Refusal::new(message).into());
     }
     if existed {
         return Ok(());
@@ -2506,7 +2566,7 @@ pub(crate) fn create_install_dir_with(
                     },
                 };
                 let message = format!("{} changed while Setup was running: {why}; nothing was installed.", d.display());
-                return Err(Refusal { notice: Vec::new(), message }.into());
+                return Err(Refusal::new(message).into());
             }
             Err(e) => return Err(anyhow::Error::new(e).context(format!("Cannot create {}", d.display()))),
         }
@@ -3337,6 +3397,45 @@ mod tests {
         assert_eq!(choose_account(None, r"\\dalet\ingest", true).unwrap_err().to_string(), SHARE_REFUSAL);
     }
 
+    /// P13.1c round 4: a passwordless account given by name on a share
+    /// watchfolder is asked about only with `confirm_share_for_passwordless`
+    /// (Setup's pages); the command line's behaviour is pinned as it was.
+    #[test]
+    fn a_named_passwordless_account_on_a_share_is_asked_about_only_on_the_pages() {
+        let watch = r"\\192.168.4.50\ingest";
+        let on_share = |account: &str| {
+            let mut p = installed(account);
+            p.configs[0].1.watchfolder_path = watch.into();
+            p
+        };
+        let asks = |plan: &InstallPlan| plan.questions.iter().any(|q| matches!(q, Question::ConfirmUncWithoutAccount { .. }));
+        // The virtual account by name, re-registering a LocalSystem service.
+        let named = InstallOptions { account: Some(DEFAULT_SERVICE_ACCOUNT.into()), ..opts() };
+        let plan = plan_install(&named, &on_share("LocalSystem")).unwrap();
+        assert!(plan.account.registers());
+        assert!(!asks(&plan), "today's behaviour: --account names it knowingly");
+        let pages = InstallOptions { confirm_share_for_passwordless: true, ..named.clone() };
+        let plan = plan_install(&pages, &on_share("LocalSystem")).unwrap();
+        assert_eq!(
+            plan.questions,
+            [Question::ConfirmUncWithoutAccount {
+                text: share_warning(watch, DEFAULT_SERVICE_ACCOUNT),
+                prompt: format!("Install as {DEFAULT_SERVICE_ACCOUNT} anyway?"),
+            }]
+        );
+        // Under `yes`: the same refusal as the defaulted account's.
+        let err = plan_install(&InstallOptions { yes: true, ..pages.clone() }, &on_share("LocalSystem")).unwrap_err();
+        assert_eq!(err.to_string(), SHARE_REFUSAL);
+        assert_eq!(err.downcast_ref::<Refusal>().unwrap().notice, share_warning(watch, DEFAULT_SERVICE_ACCOUNT));
+        // LocalSystem by name, too.
+        let system = InstallOptions { account: Some("LocalSystem".into()), confirm_share_for_passwordless: true, ..opts() };
+        assert!(asks(&plan_install(&system, &on_share(DEFAULT_SERVICE_ACCOUNT)).unwrap()));
+        // A password account is never asked: it carries its own identity.
+        let user = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), confirm_share_for_passwordless: true, ..opts() };
+        let plan = plan_install(&user, &on_share(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        assert_eq!(plan.questions, [Question::NeedPassword { account: r"NEWSROOM\svc_test".into() }]);
+    }
+
     #[test]
     fn a_mapped_drive_watchfolder_is_refused_with_today_s_text() {
         let o = InstallOptions { watchfolder: Some(r"Z:\Dalet".into()), yes: true, ..opts() };
@@ -3375,7 +3474,7 @@ mod tests {
         let e = plan_install(&InstallOptions { yes: true, ..opts() }, &probe)
             .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()))
             .unwrap_err();
-        assert!(e.downcast_ref::<Refusal>().is_some());
+        assert!(e.downcast_ref::<Refusal>().is_some_and(|r| !r.account), "a folder refusal ends the pages");
         assert_eq!(
             e.to_string(),
             r#"C:\OmniTest exists and belongs to NEWSROOM\someone, not to Administrators. Setup does not install into a folder another account controls. Remove the folder or choose another one; if it is yours, run: icacls "C:\OmniTest" /setowner Administrators /T"#
@@ -3399,7 +3498,8 @@ mod tests {
         let e = plan_install(&o, &probe)
             .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()))
             .unwrap_err();
-        assert!(e.downcast_ref::<Refusal>().is_some());
+        // About the account: Setup's pages ask for it again (P13.1c).
+        assert!(e.downcast_ref::<Refusal>().is_some_and(|r| r.account), "{e}");
         assert_eq!(e.to_string(), r"Windows does not know the account DOMAIN\svc_tset; check the spelling (DOMAIN\user or .\user).");
         assert!(log.lines().is_empty());
         // Built-in and virtual accounts are never looked up.
@@ -4159,6 +4259,8 @@ mod tests {
         calls: std::collections::HashMap<&'static str, usize>,
         /// Whether a config.json is there for `keep_config` to copy.
         config_exists: bool,
+        /// This computer's name, for local account spellings.
+        computer: Option<String>,
     }
 
     impl FakeMachine {
@@ -4170,6 +4272,7 @@ mod tests {
                 fail: Vec::new(),
                 calls: Default::default(),
                 config_exists: true,
+                computer: None,
             }
         }
 
@@ -4199,7 +4302,7 @@ mod tests {
             self.log.push(format!("#prepare_account {} password={}", account.name, pw(Some(account))));
             if self.fails("prepare_account") {
                 let message = format!("Windows did not accept the password given for {}; check it and run Setup again. Nothing else was changed.", account.name);
-                return Err(Refusal { notice: Vec::new(), message }.into());
+                return Err(Refusal::about_account(message).into());
             }
             Ok(())
         }
@@ -4283,6 +4386,9 @@ mod tests {
         fn restore_previous(&mut self, target_exe: &Path) -> Result<()> {
             self.log.push(format!("#restore_previous {}", target_exe.display()));
             self.step("restore_previous")
+        }
+        fn computer_name(&self) -> Option<String> {
+            self.computer.clone()
         }
     }
 
@@ -4477,6 +4583,56 @@ mod tests {
         }
         let upgrade = plan_install(&opts(), &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
         assert!(!closing_lines(&upgrade, "NEWSROOM-PC", true).join("\n").contains("setup wizard"));
+    }
+
+    /// P13.1c Y6: a "new" installation over a kept database has no first-run
+    /// account; the first installation's text stays exactly as it was.
+    #[test]
+    fn a_reinstall_over_a_kept_database_is_not_sent_to_admin_admin() {
+        let o = InstallOptions { yes: true, port: Some(8091), ..opts() };
+        let first = plan_install(&o, &new_machine()).unwrap();
+        assert!(!first.existing_database);
+        let pinned = [
+            "",
+            "  MCR desk:  http://NEWSROOM-PC:8091/mcr",
+            "  Admin:     http://NEWSROOM-PC:8091/admin",
+            r"  Files:     C:\OmniTest",
+            r"  Watchfolder: C:\OmniTest\watchfolder",
+            "",
+            "  Next: on THIS computer, open http://127.0.0.1:8091/admin and sign in",
+            "  as Admin / Admin, the first-run account, which works only from this computer.",
+            "  The setup wizard then opens by itself; it replaces that account with your own",
+            "  administrator and walks you through the watchfolder and the mailbox.",
+            "  To let the MCR desks open the panel without signing in, choose Intermediate",
+            "  in the wizard and enter the newsroom network in its Network step (you can",
+            "  run the wizard again later from the admin page).",
+            "  A watchfolder on a NAS or an IP-addressed share needs the service to run",
+            "  under an account; the wizard tells you what to do.",
+        ];
+        assert_eq!(closing_lines(&first, "NEWSROOM-PC", false), pinned);
+        // The uninstall that kept the data left the database (and maybe no exe, no service).
+        let mut kept = new_machine();
+        kept.files.push((root_paths().data.join("omni.db"), 4096));
+        let plan = plan_install(&o, &kept).unwrap();
+        assert_eq!(plan.target.kind, InstallKind::Fresh);
+        assert!(plan.existing_database);
+        let text = closing_lines(&plan, "NEWSROOM-PC", false);
+        assert_eq!(
+            text[5..],
+            [
+                "",
+                "  Next: on THIS computer, open http://127.0.0.1:8091/admin and sign in",
+                "  with the administrator account of this installation: its database was kept.",
+            ]
+        );
+        let all = text.join("\n");
+        assert!(!all.contains("Admin / Admin") && !all.contains("wizard"), "{all}");
+        // Carried to the report for the front ends.
+        let log = Log::default();
+        let report = run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap();
+        assert!(report.existing_database);
+        let log = Log::default();
+        assert!(!run(&first, &Answers::default(), &log, FakeMachine::new(&log)).unwrap().existing_database);
     }
 
     #[test]
@@ -5077,7 +5233,7 @@ mod tests {
         let lines = log.lines();
         assert!(lines.contains(&r"#grant NT SERVICE\OmniIngestService C:\Dalet\ingest".to_string()), "{lines:#?}");
         assert!(!lines.iter().any(|l| l.starts_with(r"#remove_grants C:\Dalet")), "{lines:#?}");
-        assert!(same_account("LocalSystem", r"NT AUTHORITY\SYSTEM") && !same_account(r"NEWSROOM\a", r"NEWSROOM\b"));
+        assert!(same_account("LocalSystem", r"NT AUTHORITY\SYSTEM", None) && !same_account(r"NEWSROOM\a", r"NEWSROOM\b", None));
     }
 
     /// W2: the plan never asks for a config.json that is not there (loading one
@@ -5128,6 +5284,86 @@ mod tests {
         probe.configs.push((PathBuf::from(r"C:\OldOmni\config.json"), loopback));
         let lines = run_old(&probe);
         assert!(lines.contains(&r"  The firewall rule was not put back: the rule opens port 8080 for C:\OmniTest\omni-ingest.exe; the previous configuration needs none.".to_string()), "{lines:#?}");
+    }
+
+    /// P13.1c A1: the forward add deletes the old rule first; when the add then
+    /// fails, the way back opens the rule again even for the same program and
+    /// port, and says whether Windows took it.
+    #[test]
+    fn a_rule_whose_forward_add_failed_is_opened_again_on_the_way_back() {
+        let plan = plan_install(&opts(), &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        assert_eq!(plan.firewall, Some(8090));
+        let rule = r"#open_firewall C:\OmniTest\omni-ingest.exe 8090".to_string();
+        let back = |fail: Vec<(&'static str, usize)>| {
+            let log = Log::default();
+            let mut machine = FakeMachine::new(&log);
+            machine.had_previous = true;
+            machine.fail = fail;
+            let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+            assert!(report.rolled_back);
+            (report, steps(&log), log.lines())
+        };
+        let (report, s, _) = back(vec![("open_firewall", 1), ("start_service", 1)]);
+        assert_eq!(s.iter().filter(|l| **l == rule).count(), 2, "{s:#?}");
+        let wb = report.way_back.as_ref().unwrap();
+        assert_eq!(wb.firewall, Restore::Restored);
+        assert!(report.restored_running);
+        // Windows refuses it again: said, and not counted as the previous state.
+        let (report, _, lines) = back(vec![("open_firewall", 1), ("start_service", 1), ("open_firewall", 2)]);
+        let why = r"Windows did not take the rule for port 8090 and C:\OmniTest\omni-ingest.exe";
+        assert_eq!(report.way_back.as_ref().unwrap().firewall, Restore::NotRestored { why: why.into() });
+        assert!(!report.restored_running);
+        assert!(lines.contains(&format!("  The firewall rule was not put back: {why}.")), "{lines:#?}");
+        // A forward add that worked leaves the same rule alone, as before.
+        let (report, s, _) = back(vec![("start_service", 1)]);
+        assert_eq!(s.iter().filter(|l| **l == rule).count(), 1, "{s:#?}");
+        assert_eq!(report.way_back.unwrap().firewall, Restore::NotChanged);
+    }
+
+    /// P13.1c A2: `.\svc`, `<COMPUTERNAME>\svc` and `svc` are one local
+    /// account; a domain account is only itself.
+    #[test]
+    fn local_account_spellings_are_the_same_account() {
+        let pc = Some("PC-MCR01");
+        let table: &[(&str, &str, Option<&str>, bool)] = &[
+            (r".\svc_test", r"PC-MCR01\svc_test", pc, true),
+            (r".\svc_test", "svc_test", pc, true),
+            (r"pc-mcr01\SVC_TEST", "svc_test", pc, true),
+            (r" .\svc_test ", r"PC-MCR01\Svc_Test", pc, true),
+            (r".\svc_test", r".\svc_other", pc, false),
+            (r"NEWSROOM\svc_test", "svc_test", pc, false),
+            (r"NEWSROOM\svc_test", r".\svc_test", pc, false),
+            (r"NEWSROOM\svc_test", r"PC-MCR01\svc_test", pc, false),
+            (r"NEWSROOM\svc_test", r"newsroom\SVC_TEST", pc, true),
+            (r"OTHER-PC\svc_test", r".\svc_test", pc, false),
+            // Without the computer's name, only `.\` and the bare name meet.
+            (r".\svc_test", "svc_test", None, true),
+            (r".\svc_test", r"PC-MCR01\svc_test", None, false),
+            ("LocalSystem", r"NT AUTHORITY\SYSTEM", pc, true),
+            (DEFAULT_SERVICE_ACCOUNT, r"nt service\omniingestservice", pc, true),
+            (DEFAULT_SERVICE_ACCOUNT, "OmniIngestService", pc, false),
+        ];
+        for (a, b, computer, want) in table {
+            assert_eq!(same_account(a, b, *computer), *want, "{a} vs {b} on {computer:?}");
+            assert_eq!(same_account(b, a, *computer), *want, "{b} vs {a} on {computer:?}");
+        }
+    }
+
+    /// P13.1c A2: the way back knows the local account it registers again
+    /// under any spelling: its grants are kept and the password run is "kept as entered".
+    #[test]
+    fn the_way_back_knows_a_local_account_under_another_spelling() {
+        // `<COMPUTERNAME>\svc` against `.\svc`: equal only through the computer's name.
+        let o = InstallOptions { account: Some(r"PC-MCR01\svc_test".into()), ..opts() };
+        let plan = plan_install(&o, &installed(r".\svc_test")).unwrap();
+        let answers = Answers { password: Some(PASSWORD.into()), ..Default::default() };
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        machine.computer = Some("PC-MCR01".into());
+        machine.fail = vec![("wait_for_health", 1)];
+        let report = run(&plan, &answers, &log, machine).unwrap();
+        assert_eq!(report.way_back.unwrap().registration, RegistrationRestore::KeptAsEntered { account: r"PC-MCR01\svc_test".into() });
     }
 
     /// W5: the same password account, rewritten with this run's password: told

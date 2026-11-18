@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use omni_service::DEFAULT_SERVICE_ACCOUNT;
 
+use crate::backend::Scenario;
+use crate::texts::Lang;
+
 /// A wrong command line. The text never repeats a plain argument (it might be
 /// a password typed in the wrong place).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -16,7 +19,7 @@ pub struct UsageError(pub String);
 pub enum Mode {
     /// Install or upgrade from the payload.
     Install { dir: PathBuf, account: Option<String>, no_firewall: bool, answer: Option<PathBuf> },
-    /// Register the installed service under another account; `None` = ask at the console.
+    /// Register the installed service under another account; `None` = ask on the Account page.
     ChangeAccount { account: Option<String>, no_firewall: bool },
     /// Remove the service and the program files; the data too with `remove_data`.
     Uninstall { dir: Option<PathBuf>, remove_data: bool },
@@ -29,7 +32,30 @@ pub enum Command {
     Pack { folder: PathBuf, out: PathBuf },
     /// Check a packed Setup's payload (hidden; for the packaging script).
     Verify { file: PathBuf },
-    Run { mode: Mode, quiet: bool, elevated_child: bool },
+    /// `lang`: `/lang`, or `None` for the Windows display language.
+    Run { mode: Mode, quiet: bool, elevated_child: bool, lang: Option<Lang> },
+    /// The pages over a harmless fake (hidden; P13.1c): never elevated, never
+    /// touches the machine. `auto`: every page answers itself.
+    PagesDemo { scenario: Scenario, auto: bool, lang: Option<Lang> },
+}
+
+/// How a command talks to the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Face {
+    /// Prints to the console it was started from (or a redirect); never shows a page.
+    Console,
+    /// Setup's pages.
+    Pages,
+}
+
+impl Command {
+    /// `/quiet`, `--pack`, `--verify` and `/?` print; everything else is pages.
+    pub fn face(&self) -> Face {
+        match self {
+            Command::Run { quiet: false, .. } | Command::PagesDemo { .. } => Face::Pages,
+            Command::Run { quiet: true, .. } | Command::Help | Command::Pack { .. } | Command::Verify { .. } => Face::Console,
+        }
+    }
 }
 
 pub const USAGE: &str = r#"OmniIngest Setup
@@ -53,14 +79,17 @@ pub const USAGE: &str = r#"OmniIngest Setup
   OmniIngest-Setup.exe --pack <release folder> --out <file>
       Build a Setup that carries the release folder.
 
-  A password is never given on the command line: Setup asks for it at the prompt.
+  /lang el|en   the language of Setup's pages (default: the Windows display language)
+
+  A password is never given on the command line: Setup asks for it in the Windows
+  credential prompt.
 
 Exit codes: 0 done, 1 failed, 2 wrong command line, 3 needs administrator rights,
 4 damaged Setup file, 5 refused (nothing changed), 6 cancelled, 7 upgrade rolled back.
 "#;
 
 const NO_PASSWORD: &str =
-    "There is no password switch: a password is only ever typed at Setup's prompt, never given on the command line.";
+    "There is no password switch: a password is only ever typed in Setup's Windows credential prompt, never given on the command line.";
 
 fn usage(text: impl Into<String>) -> UsageError {
     UsageError(text.into())
@@ -74,8 +103,10 @@ fn switch_name(arg: &str) -> Option<String> {
 
 /// The arguments after the program name.
 pub fn parse_args(args: &[String]) -> Result<Command, UsageError> {
-    const WITH_VALUE: &[&str] = &["dir", "account", "answer", "pack", "out", "verify"];
-    const FLAGS: &[&str] = &["no-firewall", "quiet", "change-account", "uninstall", "remove-data", "elevated-child"];
+    const WITH_VALUE: &[&str] = &["dir", "account", "answer", "pack", "out", "verify", "lang"];
+    const FLAGS: &[&str] = &["no-firewall", "quiet", "change-account", "uninstall", "remove-data", "elevated-child", "auto"];
+    // A switch whose value may be left out.
+    const OPTIONAL_VALUE: &[&str] = &["pages-demo"];
 
     let mut seen: Vec<(String, Option<String>)> = Vec::new();
     let mut i = 0;
@@ -99,6 +130,14 @@ pub fn parse_args(args: &[String]) -> Result<Command, UsageError> {
                     Some(v.clone())
                 }
                 _ => return Err(usage(format!("/{name} needs a value."))),
+            }
+        } else if OPTIONAL_VALUE.contains(&name.as_str()) {
+            match args.get(i + 1) {
+                Some(v) if switch_name(v).is_none() => {
+                    i += 1;
+                    Some(v.clone())
+                }
+                _ => None,
             }
         } else if FLAGS.contains(&name.as_str()) {
             None
@@ -129,6 +168,25 @@ pub fn parse_args(args: &[String]) -> Result<Command, UsageError> {
             return Err(usage("--verify cannot be combined with any other switch."));
         }
         return Ok(Command::Verify { file: value("verify").unwrap_or_default().into() });
+    }
+    let lang = match value("lang") {
+        Some(l) => Some(Lang::parse(&l).ok_or_else(|| usage("/lang takes el or en."))?),
+        None => None,
+    };
+    if has("pages-demo") {
+        if seen.iter().any(|(n, _)| !matches!(n.as_str(), "pages-demo" | "auto" | "lang")) {
+            return Err(usage("/pages-demo takes only a scenario, /auto and /lang."));
+        }
+        let scenario = match value("pages-demo") {
+            Some(s) => Scenario::parse(&s).ok_or_else(|| {
+                usage("/pages-demo takes fresh, upgrade, account, remove, refused, failed, rolledback or share.")
+            })?,
+            None => Scenario::Fresh,
+        };
+        return Ok(Command::PagesDemo { scenario, auto: has("auto"), lang });
+    }
+    if has("auto") {
+        return Err(usage("/auto is only for /pages-demo."));
     }
 
     let quiet = has("quiet");
@@ -179,14 +237,16 @@ pub fn parse_args(args: &[String]) -> Result<Command, UsageError> {
             answer: value("answer").map(PathBuf::from),
         },
     };
-    Ok(Command::Run { mode, quiet, elevated_child })
+    Ok(Command::Run { mode, quiet, elevated_child, lang })
 }
 
 /// The arguments of the elevated relaunch: `args` with `/answer`'s file made
 /// absolute against `cwd` (the elevated child starts elsewhere, usually in
-/// System32), then `/elevated-child`.
-pub fn relaunch_args(args: &[String], cwd: &std::path::Path) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len() + 1);
+/// System32), `/lang` with the parent's language when it was not given (an
+/// administrator's account may have another display language), then
+/// `/elevated-child`.
+pub fn relaunch_args(args: &[String], cwd: &std::path::Path, lang: Lang) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 3);
     let mut answer_next = false;
     for a in args {
         if answer_next && switch_name(a).is_none() {
@@ -196,6 +256,10 @@ pub fn relaunch_args(args: &[String], cwd: &std::path::Path) -> Vec<String> {
             out.push(a.clone());
         }
         answer_next = switch_name(a).as_deref() == Some("answer");
+    }
+    if !args.iter().any(|a| switch_name(a).as_deref() == Some("lang")) {
+        out.push("/lang".into());
+        out.push(lang.code().into());
     }
     out.push("/elevated-child".into());
     out
@@ -246,7 +310,7 @@ mod tests {
     }
 
     fn run(mode: Mode, quiet: bool) -> Command {
-        Command::Run { mode, quiet, elevated_child: false }
+        Command::Run { mode, quiet, elevated_child: false, lang: None }
     }
 
     fn install() -> Mode {
@@ -296,7 +360,98 @@ mod tests {
         assert_eq!(parse(&["--verify", "x.exe"]).unwrap(), Command::Verify { file: "x.exe".into() });
         assert_eq!(
             parse(&["/uninstall", "/elevated-child"]).unwrap(),
-            Command::Run { mode: Mode::Uninstall { dir: None, remove_data: false }, quiet: false, elevated_child: true }
+            Command::Run { mode: Mode::Uninstall { dir: None, remove_data: false }, quiet: false, elevated_child: true, lang: None }
+        );
+    }
+
+    /// P13.1c: `/lang`, the hidden `/pages-demo` with its scenarios, and `/auto` only with it.
+    #[test]
+    fn lang_and_the_pages_demo_parse_and_auto_needs_the_demo() {
+        assert_eq!(
+            parse(&["/lang", "el"]).unwrap(),
+            Command::Run { mode: install(), quiet: false, elevated_child: false, lang: Some(Lang::El) }
+        );
+        assert_eq!(
+            parse(&["/uninstall", "--LANG", "EN", "/quiet"]).unwrap(),
+            Command::Run { mode: Mode::Uninstall { dir: None, remove_data: false }, quiet: true, elevated_child: false, lang: Some(Lang::En) }
+        );
+        assert_eq!(parse(&["/pages-demo"]).unwrap(), Command::PagesDemo { scenario: Scenario::Fresh, auto: false, lang: None });
+        for (word, scenario) in [
+            ("fresh", Scenario::Fresh),
+            ("Upgrade", Scenario::Upgrade),
+            ("account", Scenario::Account),
+            ("remove", Scenario::Remove),
+            ("refused", Scenario::Refused),
+            ("failed", Scenario::Failed),
+            ("ROLLEDBACK", Scenario::RolledBack),
+            ("share", Scenario::Share),
+        ] {
+            assert_eq!(
+                parse(&["/pages-demo", word, "/auto", "/lang", "el"]).unwrap(),
+                Command::PagesDemo { scenario, auto: true, lang: Some(Lang::El) },
+                "{word}"
+            );
+        }
+        assert_eq!(parse(&["/auto", "/pages-demo"]).unwrap(), Command::PagesDemo { scenario: Scenario::Fresh, auto: true, lang: None });
+        let refused: &[&[&str]] = &[
+            &["/auto"],
+            &["/quiet", "/auto"],
+            &["/uninstall", "/auto"],
+            &["/lang"],
+            &["/lang", "de"],
+            &["/lang", "el", "/lang", "en"],
+            &["/pages-demo", "nosuch"],
+            &["/pages-demo", "fresh", "/quiet"],
+            &["/pages-demo", "/uninstall"],
+            &["/pages-demo", "/dir", r"C:\x"],
+            &["--pack", r"C:\release", "--out", r"C:\x.exe", "/lang", "el"],
+            &["--verify", "x.exe", "/lang", "el"],
+        ];
+        for line in refused {
+            assert!(parse(line).is_err(), "{line:?} was accepted");
+        }
+        assert!(USAGE.contains("/lang el|en"));
+        assert!(!USAGE.contains("pages-demo"), "the demo switch is hidden");
+    }
+
+    /// `/quiet` never builds a page: it prints, like `--pack`, `--verify` and `/?`.
+    #[test]
+    fn quiet_and_the_printing_commands_never_show_a_page() {
+        let console: &[&[&str]] = &[
+            &["/quiet"],
+            &["/quiet", "/dir", r"D:\Omni", "/account", "default"],
+            &["/change-account", "/account", "default", "/quiet"],
+            &["/uninstall", "/quiet", "/lang", "el"],
+            &["/uninstall", "/quiet", "/elevated-child"],
+            &["/?"],
+            &["--pack", r"C:\release", "--out", r"C:\x.exe"],
+            &["--verify", "x.exe"],
+        ];
+        for line in console {
+            assert_eq!(parse(line).unwrap().face(), Face::Console, "{line:?}");
+        }
+        for line in [&[][..], &["/uninstall"], &["/change-account"], &["/elevated-child"], &["/pages-demo", "remove", "/auto"]] {
+            assert_eq!(parse(line).unwrap().face(), Face::Pages, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_relaunch_carries_the_language_of_the_parent() {
+        let cwd = Path::new(r"C:\Users\op\Downloads");
+        let args: Vec<String> = ["/change-account"].map(String::from).to_vec();
+        assert_eq!(relaunch_args(&args, cwd, Lang::El), ["/change-account", "/lang", "el", "/elevated-child"]);
+        // A /lang given is passed on as it is, never twice.
+        let args: Vec<String> = ["/Lang", "en", "/uninstall"].map(String::from).to_vec();
+        assert_eq!(relaunch_args(&args, cwd, Lang::El), ["/Lang", "en", "/uninstall", "/elevated-child"]);
+        let child = relaunch_args(&["/dir".to_string(), r"D:\Omni".to_string()], cwd, Lang::El);
+        assert_eq!(
+            parse(&child.iter().map(String::as_str).collect::<Vec<_>>()).unwrap(),
+            Command::Run {
+                mode: Mode::Install { dir: PathBuf::from(r"D:\Omni"), account: None, no_firewall: false, answer: None },
+                quiet: false,
+                elevated_child: true,
+                lang: Some(Lang::El)
+            }
         );
     }
 
@@ -373,11 +528,11 @@ mod tests {
         let cwd = Path::new(r"C:\Users\op\Downloads");
         let args: Vec<String> = ["/quiet", "/ANSWER", r"answers\omni.json", "/dir", r"D:\Omni"].map(String::from).to_vec();
         assert_eq!(
-            relaunch_args(&args, cwd),
-            ["/quiet", "/ANSWER", r"C:\Users\op\Downloads\answers\omni.json", "/dir", r"D:\Omni", "/elevated-child"]
+            relaunch_args(&args, cwd, Lang::En),
+            ["/quiet", "/ANSWER", r"C:\Users\op\Downloads\answers\omni.json", "/dir", r"D:\Omni", "/lang", "en", "/elevated-child"]
         );
         let abs: Vec<String> = ["--answer", r"E:\a.json"].map(String::from).to_vec();
-        assert_eq!(relaunch_args(&abs, cwd), ["--answer", r"E:\a.json", "/elevated-child"]);
+        assert_eq!(relaunch_args(&abs, cwd, Lang::En), ["--answer", r"E:\a.json", "/lang", "en", "/elevated-child"]);
     }
 
     #[test]

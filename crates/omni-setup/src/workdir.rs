@@ -43,13 +43,25 @@ impl WorkDir {
 
     /// Remove the folder and everything in it. `Some(line)` says why it could not be.
     pub fn remove(&mut self) -> Option<String> {
+        self.remove_with(&|p| std::fs::remove_dir_all(p))
+    }
+
+    /// [`WorkDir::remove`] with the remover given (tests inject one that
+    /// fails). A folder that could not be removed is tried once more when
+    /// dropped, silently: the caller has the line to show.
+    pub fn remove_with(&mut self, remove: &dyn Fn(&Path) -> io::Result<()>) -> Option<String> {
         if self.removed {
             return None;
         }
-        self.removed = true;
-        match std::fs::remove_dir_all(&self.path) {
-            Ok(()) => None,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        match remove(&self.path) {
+            Ok(()) => {
+                self.removed = true;
+                None
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.removed = true;
+                None
+            }
             Err(e) => Some(format!("! Could not remove Setup's work folder {} ({e}); delete it by hand.", self.path.display())),
         }
     }
@@ -162,5 +174,18 @@ mod tests {
         assert!(!path.exists());
         // A creator that never succeeds gives up.
         assert!(create_work_dir(d.path(), &|_: &Path| Err(io::Error::from(io::ErrorKind::AlreadyExists))).is_err());
+    }
+
+    /// Y2: a folder that cannot be removed is said, and the drop still tries.
+    #[test]
+    fn a_work_folder_that_cannot_be_removed_is_said_and_the_drop_tries_again() {
+        let d = tempfile::tempdir().unwrap();
+        let mut w = create_work_dir(d.path(), &|p: &Path| std::fs::create_dir(p)).unwrap();
+        let path = w.path().to_path_buf();
+        let line = w.remove_with(&|_| Err(io::Error::from(io::ErrorKind::PermissionDenied))).unwrap();
+        assert!(line.starts_with("! Could not remove Setup's work folder") && line.ends_with("delete it by hand."), "{line}");
+        assert!(path.exists());
+        drop(w);
+        assert!(!path.exists(), "the safety net");
     }
 }

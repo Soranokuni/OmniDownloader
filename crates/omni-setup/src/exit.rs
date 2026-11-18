@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn errors_map_to_their_exit_codes() {
         use anyhow::anyhow;
-        let refusal = Refusal { notice: vec![], message: "no".into() };
+        let refusal = Refusal::new("no");
         let cases: Vec<(anyhow::Error, ExitCode)> = vec![
             (anyhow!("disk full"), ExitCode::Failed),
             (anyhow::Error::new(UsageError("bad".into())), ExitCode::Usage),

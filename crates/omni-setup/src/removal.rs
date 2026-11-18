@@ -72,7 +72,7 @@ fn within(a: &Path, b: &Path) -> bool {
 }
 
 fn refuse(message: String) -> Refusal {
-    Refusal { notice: Vec::new(), message }
+    Refusal::new(message)
 }
 
 /// Whether `root` may be uninstalled from at all. Checked before the service is touched.
