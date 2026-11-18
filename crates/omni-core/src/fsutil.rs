@@ -29,9 +29,220 @@ pub fn rename_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
     std::fs::remove_file(src)
 }
 
+/// Whether a reparse tag names another place (the name-surrogate bit,
+/// `IsReparseTagNameSurrogate`): a symbolic link (0xA000000C), a junction or
+/// volume mount point (0xA0000003). Not a deduplicated file (0x80000013), a
+/// WOF-compressed one (0x80000017) or a cloud placeholder, which are ordinary
+/// files that only store their data differently.
+pub fn is_name_surrogate(reparse_tag: u32) -> bool {
+    reparse_tag & 0x2000_0000 != 0
+}
+
+/// Whether `path` is a link: a symbolic link, junction or volume mount point,
+/// judged on the entry itself, never on where it points ([`is_name_surrogate`]).
+/// A missing path and an ordinary file that happens to be a reparse point
+/// (Data Deduplication, `compact /exe`, cloud files) are not.
+pub fn is_link(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return false };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+            return false;
+        }
+        // The tag cannot be read: treated as a link, the safe reading for an elevated writer.
+        reparse_tag(path).map_or(true, is_name_surrogate)
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// The reparse tag of `path` (`WIN32_FIND_DATAW.dwReserved0` of the entry itself).
+#[cfg(windows)]
+fn reparse_tag(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut data = WIN32_FIND_DATAW::default();
+    // SAFETY: the name is NUL-terminated and `data` outlives the call; the handle is closed once.
+    unsafe {
+        let handle = FindFirstFileW(PCWSTR(name.as_ptr()), &mut data).ok()?;
+        let _ = FindClose(handle);
+    }
+    Some(data.dwReserved0)
+}
+
+/// The first link (by `is_link`) on the way from below `root` down to `path`
+/// itself, `root` excluded; `path` itself when it is not under `root` at all.
+/// `None` means an elevated process may write or delete there without being
+/// sent somewhere else by a folder the service account could have replaced.
+pub fn link_below(root: &Path, path: &Path, is_link: &dyn Fn(&Path) -> bool) -> Option<std::path::PathBuf> {
+    if !path.starts_with(root) || path == root {
+        return (path != root).then(|| path.to_path_buf());
+    }
+    let mut chain: Vec<&Path> = path.ancestors().take_while(|a| *a != root).collect();
+    chain.reverse();
+    chain.into_iter().find(|p| is_link(p)).map(Path::to_path_buf)
+}
+
+/// The first link (by `is_link`) at `path` or anywhere below it, never
+/// descending into a link it finds. What `icacls /T` or a recursive grant
+/// would follow out of the tree. A missing path has none.
+pub fn first_link_in_tree(path: &Path, is_link: &dyn Fn(&Path) -> bool) -> Option<std::path::PathBuf> {
+    first_link_in_tree_with(path, is_link, &list_dir)
+}
+
+/// The sorted entries of a real folder (not a link); `None` for anything else.
+fn list_dir(path: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(path).ok()?.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    Some(entries)
+}
+
+/// [`first_link_in_tree`] with the folder lister injected. Depth-first in the
+/// lister's order, with an explicit stack: a deliberately deep chain of folders
+/// (a watchfolder anyone may write) cannot overflow the call stack.
+pub fn first_link_in_tree_with(
+    path: &Path,
+    is_link: &dyn Fn(&Path) -> bool,
+    list: &dyn Fn(&Path) -> Option<Vec<std::path::PathBuf>>,
+) -> Option<std::path::PathBuf> {
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        if is_link(&p) {
+            return Some(p);
+        }
+        if let Some(entries) = list(&p) {
+            // Reversed, so the first entry is looked at first.
+            stack.extend(entries.into_iter().rev());
+        }
+    }
+    None
+}
+
+/// Refuse to write into `dir` (one the service account can write: `bin`,
+/// `data`…) when it is a link: the files would land wherever it points.
+pub fn ensure_not_link(dir: &Path, is_link: &dyn Fn(&Path) -> bool) -> io::Result<()> {
+    if is_link(dir) {
+        return Err(io::Error::other(format!(
+            "{} is a link (junction or symbolic link), not a folder; Setup does not write through it. Remove the link and run Setup again.",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_anywhere_below_the_root_is_found_and_the_root_itself_is_not_judged() {
+        let root = Path::new(r"C:\Omni");
+        let item = root.join("data").join("adblock").join("list.txt");
+        let links = |names: &'static [&'static str]| move |p: &Path| names.iter().any(|n| p.ends_with(n));
+        assert_eq!(link_below(root, &item, &links(&[])), None);
+        assert_eq!(link_below(root, &item, &links(&["data"])), Some(root.join("data")));
+        assert_eq!(link_below(root, &item, &links(&["adblock"])), Some(root.join("data").join("adblock")));
+        assert_eq!(link_below(root, &item, &links(&["list.txt"])), Some(item.clone()));
+        assert_eq!(link_below(root, &item, &links(&["Omni"])), None, "the root is checked elsewhere (its owner)");
+        // Not under the root: refused as if it were a link.
+        assert_eq!(link_below(root, Path::new(r"D:\x"), &links(&[])), Some(std::path::PathBuf::from(r"D:\x")));
+        assert!(ensure_not_link(&root.join("bin"), &links(&["bin"])).is_err());
+        assert!(ensure_not_link(&root.join("bin"), &links(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_link_deep_in_a_tree_is_found_and_never_entered() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("data");
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::create_dir_all(root.join("link").join("inside")).unwrap();
+        std::fs::write(root.join("a").join("b").join("f.txt"), b"x").unwrap();
+        let none = |_: &Path| false;
+        assert_eq!(first_link_in_tree(&root, &none), None);
+        let b = root.join("a").join("b");
+        assert_eq!(first_link_in_tree(&root, &|p: &Path| p == b), Some(b.clone()));
+        // Inside a link nothing is looked at.
+        let link = root.join("link");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let probe = |p: &Path| {
+            seen.borrow_mut().push(p.to_path_buf());
+            p == link
+        };
+        assert_eq!(first_link_in_tree(&root, &probe), Some(link.clone()));
+        assert!(!seen.borrow().iter().any(|p| p.starts_with(&link) && *p != link), "{:?}", seen.borrow());
+        assert_eq!(first_link_in_tree(&root, &|p: &Path| p == root), Some(root.clone()));
+        assert_eq!(first_link_in_tree(&d.path().join("missing"), &none), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_directory_symlink_is_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("plain.txt"), b"x").unwrap();
+        let link = d.path().join("link");
+        if let Err(e) = std::os::windows::fs::symlink_dir(&target, &link) {
+            eprintln!("SKIPPED a_real_directory_symlink_is_a_link: this account may not create symbolic links ({e})");
+            return;
+        }
+        assert!(is_link(&link));
+        assert!(!is_link(&target));
+        assert!(!is_link(&target.join("plain.txt")));
+        assert!(!is_link(&d.path().join("missing")));
+        // The same answer as std, which reads the tag the same way.
+        for p in [&link, &target] {
+            assert_eq!(is_link(p), std::fs::symlink_metadata(p).unwrap().file_type().is_symlink(), "{p:?}");
+        }
+        assert_eq!(link_below(d.path(), &link.join("x"), &is_link), Some(link.clone()));
+        assert_eq!(first_link_in_tree(d.path(), &is_link), Some(link.clone()));
+        assert_eq!(first_link_in_tree(&target, &is_link), None);
+    }
+
+    /// U2: only a name surrogate sends a path elsewhere; a deduplicated or
+    /// compressed file is an ordinary file that happens to be a reparse point.
+    #[test]
+    fn only_name_surrogate_tags_are_links() {
+        assert!(is_name_surrogate(0xA000_000C), "symbolic link");
+        assert!(is_name_surrogate(0xA000_0003), "junction / volume mount point");
+        assert!(!is_name_surrogate(0x8000_0013), "Data Deduplication");
+        assert!(!is_name_surrogate(0x8000_0017), "WOF (compact /exe)");
+        assert!(!is_name_surrogate(0x9000_601A), "cloud files placeholder");
+        assert!(!is_name_surrogate(0x8000_001B), "AppExecLink is not a folder link either");
+    }
+
+    /// U5: an explicit stack, so a chain far deeper than any call stack holds is walked.
+    #[test]
+    fn a_very_deep_chain_is_walked_without_recursion() {
+        const DEPTH: usize = 200_000;
+        let node = |k: usize| std::path::PathBuf::from(format!("n{k}"));
+        let list = |p: &Path| {
+            let k: usize = p.to_str()?.strip_prefix('n')?.parse().ok()?;
+            (k < DEPTH).then(|| vec![node(k + 1)])
+        };
+        let last = node(DEPTH);
+        assert_eq!(first_link_in_tree_with(&node(0), &|p: &Path| p == last, &list), Some(last.clone()));
+        assert_eq!(first_link_in_tree_with(&node(0), &|_: &Path| false, &list), None);
+        // Depth-first in the lister's order.
+        let wide = |p: &Path| match p.to_str()? {
+            "r" => Some(vec!["r/a".into(), "r/b".into()]),
+            "r/a" => Some(vec!["r/a/x".into()]),
+            _ => None,
+        };
+        let order = std::cell::RefCell::new(Vec::new());
+        first_link_in_tree_with(Path::new("r"), &|p: &Path| { order.borrow_mut().push(p.to_string_lossy().into_owned()); false }, &wide);
+        assert_eq!(*order.borrow(), ["r", "r/a", "r/a/x", "r/b"]);
+    }
 
     #[test]
     fn an_existing_target_is_refused_untouched_and_a_free_one_is_taken() {

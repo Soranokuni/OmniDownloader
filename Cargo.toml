@@ -7,6 +7,7 @@ members = [
     "crates/omni-web",
     "crates/omni-service",
     "crates/omni-cli",
+    "crates/omni-setup",
 ]
 resolver = "2"
 

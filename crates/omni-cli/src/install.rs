@@ -71,6 +71,20 @@ pub struct InstallOptions {
     /// An existing installation (or a dev checkout) whose configuration,
     /// database, secrets and seeds move into this new one.
     pub import: Option<PathBuf>,
+    /// The starting configuration of a new installation (an answer file, P13.1b),
+    /// used instead of the defaults only when there is no config.json and no import.
+    /// Holds no secret: the answer file cannot carry one.
+    pub base_config: Option<AppConfig>,
+}
+
+impl InstallOptions {
+    /// Start a new installation from `config`. Used only when there is no
+    /// config.json and no import; its watchfolder is then judged like
+    /// `--watchfolder`'s, so the same refusals apply to it.
+    pub fn with_base_config(mut self, config: AppConfig) -> Self {
+        self.base_config = Some(config);
+        self
+    }
 }
 
 // ---- what the plan looks at --------------------------------------------------
@@ -97,6 +111,26 @@ pub trait Probe {
     /// Drive letters, for the mapped-drive refusal (`watchfolder_problem_with`)
     /// and the network-share test (`needs_network_identity_with`).
     fn drives(&self) -> &dyn DriveLookup;
+    /// For an existing folder, its owner when that is none of Administrators,
+    /// SYSTEM, TrustedInstaller or this process's user; `None` otherwise.
+    fn foreign_owner(&self, dir: &Path) -> Option<String>;
+    /// Whether Windows knows the account `name`.
+    fn account_exists(&self, name: &str) -> bool;
+    /// Whether `path` is a link (junction, symbolic link, mount point); not
+    /// any other reparse point (`fsutil::is_link`).
+    fn is_link(&self, path: &Path) -> bool;
+    /// The first existing folder strictly between the volume root and `root`
+    /// that someone besides Administrators, SYSTEM and TrustedInstaller may
+    /// rename or re-permission (or that such an account owns), with its name.
+    fn swappable_ancestor(&self, root: &Path) -> Option<(PathBuf, String)>;
+    /// The first link at or anywhere below `dir`, never entering one; `None`
+    /// for a missing `dir`.
+    fn first_link_under(&self, dir: &Path) -> Option<PathBuf>;
+    /// Whether a file's owner is Administrators, SYSTEM or TrustedInstaller.
+    fn trusted_owner(&self, path: &Path) -> bool;
+    /// Who besides those (and CREATOR OWNER) may put files into `dir` or take
+    /// it over, inherit-only entries included.
+    fn writable_by(&self, dir: &Path) -> Option<String>;
 }
 
 /// The real machine.
@@ -132,6 +166,31 @@ impl Probe for SystemProbe {
     }
     fn drives(&self) -> &dyn DriveLookup {
         &omni_core::paths::SystemDrives
+    }
+    fn foreign_owner(&self, dir: &Path) -> Option<String> {
+        omni_core::lockdown::foreign_owner(dir)
+    }
+    fn account_exists(&self, name: &str) -> bool {
+        omni_core::lockdown::account_exists(name)
+    }
+    fn is_link(&self, path: &Path) -> bool {
+        omni_core::fsutil::is_link(path)
+    }
+    fn swappable_ancestor(&self, root: &Path) -> Option<(PathBuf, String)> {
+        // Strictly between the volume root (no parent) and `root`: owner and entries.
+        root.ancestors()
+            .skip(1)
+            .filter(|a| a.parent().is_some() && a.is_dir())
+            .find_map(|a| omni_core::lockdown::folder_swapper(a).map(|who| (a.to_path_buf(), who)))
+    }
+    fn first_link_under(&self, dir: &Path) -> Option<PathBuf> {
+        omni_core::fsutil::first_link_in_tree(dir, &omni_core::fsutil::is_link)
+    }
+    fn trusted_owner(&self, path: &Path) -> bool {
+        omni_core::lockdown::owner_sid(path).is_some_and(|sid| omni_core::lockdown::is_trusted_owner(&sid))
+    }
+    fn writable_by(&self, dir: &Path) -> Option<String> {
+        omni_core::lockdown::writable_by(dir)
     }
 }
 
@@ -212,23 +271,37 @@ pub struct Target {
     /// before a new registration.
     pub service_exe: Option<PathBuf>,
     pub kind: InstallKind,
+    /// What an upgrade carries on despite (a folder above the root others may
+    /// swap); printed after the header.
+    pub warnings: Vec<String>,
+    /// A cargo build run in place (see [`is_cargo_build`]): never locked or
+    /// judged, created plainly. Decided by the executable, never by the root's
+    /// surroundings (a `Cargo.toml` anyone may write).
+    pub development: bool,
 }
 
 impl Target {
     /// What the console prints before anything else.
     pub fn header(&self) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             String::new(),
             format!("OmniDownloader {} → {}", env!("CARGO_PKG_VERSION"), self.paths.root.display()),
             format!(
                 "  {}",
                 if self.is_upgrade() { "Upgrading the existing installation." } else { "New installation." }
             ),
-        ]
+        ];
+        lines.extend(self.warnings.iter().cloned());
+        lines
     }
 
     pub fn is_upgrade(&self) -> bool {
         matches!(self.kind, InstallKind::Upgrade { .. })
+    }
+
+    /// The install folder already holds an installation (its `omni-ingest.exe`).
+    pub fn installed_here(&self) -> bool {
+        matches!(self.kind, InstallKind::Upgrade { had_previous_exe: true })
     }
 }
 
@@ -305,7 +378,7 @@ impl InstallPlan {
                 Question::NeedWatchfolder { .. } => {
                     bail!("The watchfolder was not given; plan again with the answer.")
                 }
-                Question::ConfirmUncWithoutAccount { .. } if !answers.confirm_unc => bail!("Installation cancelled."),
+                Question::ConfirmUncWithoutAccount { .. } if !answers.confirm_unc => return Err(Cancelled.into()),
                 _ => {}
             }
         }
@@ -356,8 +429,44 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// The operator said no, or aborted a prompt (Esc, Ctrl-C): nothing was changed.
+/// Its `Display` is the line the console always printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Installation cancelled.")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// A prompt's answer; Esc or Ctrl-C is [`Cancelled`], any other failure is `what`.
+fn answered<T>(r: std::result::Result<T, inquire::InquireError>, what: &'static str) -> Result<T> {
+    use inquire::InquireError::{OperationCanceled, OperationInterrupted};
+    match r {
+        Ok(v) => Ok(v),
+        Err(OperationCanceled | OperationInterrupted) => Err(Cancelled.into()),
+        Err(e) => Err(anyhow::Error::new(e).context(what)),
+    }
+}
+
 const SHARE_REFUSAL: &str =
     "A network watchfolder needs --account (a domain account), or the computer account granted on the share.";
+
+fn foreign_owner_refusal(dir: &Path, owner: &str) -> String {
+    format!(
+        "{} exists and belongs to {owner}, not to Administrators. Setup does not install into a folder another \
+         account controls. Remove the folder or choose another one; if it is yours, run: icacls \"{}\" /setowner Administrators /T",
+        dir.display(),
+        dir.display()
+    )
+}
+
+fn unknown_account_refusal(name: &str) -> String {
+    format!("Windows does not know the account {name}; check the spelling (DOMAIN\\user or .\\user).")
+}
 
 /// Where the install goes: the administrator check, the release folder, the
 /// install folder and whether something is installed there already.
@@ -372,16 +481,127 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
     let source_dir = source_exe.parent().context("No release folder")?.to_path_buf();
     let dir = o.dir.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
     let paths = AppPaths::with_root(&dir, "config.json");
-    let in_place = probe.same_dir(&source_dir, &paths.root);
+    // Every later write and grant would follow a link (P13.1b, S2).
+    if let Some(link) = paths.root.ancestors().find(|a| probe.is_link(a)) {
+        return Err(Refusal { notice: Vec::new(), message: link_refusal(&paths.root, link) }.into());
+    }
     let target_exe = paths.root.join(EXE);
     let service_exe = probe.installed_exe();
-    let had_previous_exe = probe.exists(&target_exe);
+    let in_place = probe.same_dir(&source_dir, &paths.root);
+    // A cargo build run in place is never locked, so it is not judged either (T1).
+    let development = in_place && is_cargo_build(&source_exe, &|p| probe.is_file(p));
+    // An installation is here only when its executable is one an administrator
+    // put there: a planted one makes nothing an upgrade (U3).
+    let had_previous_exe = probe.exists(&target_exe) && (development || probe.trusted_owner(&target_exe));
     let kind = if had_previous_exe || service_exe.is_some() {
         InstallKind::Upgrade { had_previous_exe }
     } else {
         InstallKind::Fresh
     };
-    Ok(Target { dir, paths, source_exe, source_dir, target_exe, in_place, service_exe, kind })
+    let mut warnings = Vec::new();
+    if !development {
+        // Whoever owns the folder can always rewrite its rights, whatever the
+        // lockdown sets, and replace what is in it (P13.1b, R2/S4).
+        if let Some(owner) = probe.foreign_owner(&paths.root) {
+            return Err(Refusal { notice: Vec::new(), message: foreign_owner_refusal(&paths.root, &owner) }.into());
+        }
+        // An existing folder that holds no installation keeps whatever rights it
+        // was made with until the lockdown: nobody else may be able to put a file
+        // in it meanwhile (U3). A locked leftover of an uninstall passes.
+        if !had_previous_exe && probe.exists(&paths.root) {
+            if let Some(who) = probe.writable_by(&paths.root) {
+                return Err(Refusal { notice: Vec::new(), message: writable_refusal(&paths.root, &who) }.into());
+            }
+        }
+        // A folder above the root that someone else may rename or owns lets
+        // them swap the whole installation (S2c, T6). An installation already
+        // in this folder is never blocked for a condition it already had: it is
+        // told (T5).
+        if let Some((ancestor, who)) = probe.swappable_ancestor(&paths.root) {
+            let text = swappable_refusal(&ancestor, &who);
+            if !had_previous_exe {
+                return Err(Refusal { notice: Vec::new(), message: text }.into());
+            }
+            warnings.push(format!("! {text}"));
+        }
+    }
+    Ok(Target { dir, paths, source_exe, source_dir, target_exe, in_place, service_exe, kind, warnings, development })
+}
+
+/// Whether `exe` is cargo's output: some folder above it is named `target` and
+/// that folder's parent holds a `Cargo.toml` (`<repo>\target\…\omni-ingest.exe`).
+/// Judged on the executable only, never on the install root's surroundings,
+/// where anyone may put a `Cargo.toml` (T1). Pure but for `is_file`.
+pub fn is_cargo_build(exe: &Path, is_file: &dyn Fn(&Path) -> bool) -> bool {
+    exe.ancestors().skip(1).any(|a| {
+        a.file_name().is_some_and(|n| n.eq_ignore_ascii_case("target"))
+            && a.parent().is_some_and(|repo| is_file(&repo.join("Cargo.toml")))
+    })
+}
+
+fn writable_refusal(dir: &Path, who: &str) -> String {
+    format!(
+        "{} already exists and {who} can write to it, so files could be planted in it before Setup secures it. Remove \
+         the folder and let Setup create it, or choose another folder. Nothing was changed.",
+        dir.display()
+    )
+}
+
+fn link_inside_refusal(link: &Path) -> String {
+    format!(
+        "{} is a link inside the installation. Setup does not copy or change permissions through a link. Remove it, \
+         or give the real folder in config.json, and run Setup again. Nothing was changed.",
+        link.display()
+    )
+}
+
+/// The first link this run would write or change permissions through (T3/T7):
+/// always, the state folders it creates or copies into (`bin`, `data`, `logs`,
+/// `temp`, `archive` and what `ensure_dirs` makes in them) and the way down to
+/// them; when it changes permissions (`registers`), also anything in the
+/// root's tree and in the tree of every path it grants on (a local watchfolder
+/// outside the root included; a share is not walked). A cargo build in place
+/// is never locked, so its (large) root tree is not walked.
+fn planned_link(t: &Target, grants: &[(PathBuf, Rights)], registers: bool, probe: &dyn Probe) -> Option<PathBuf> {
+    let p = &t.paths;
+    let state = [&p.bin, &p.data, &p.logs, &p.temp, &p.archive, &p.temp.join("jobs"), &p.data.join("adblock")];
+    let is_link = |x: &Path| probe.is_link(x);
+    for d in state {
+        if let Some(link) = omni_core::fsutil::link_below(&p.root, d, &is_link) {
+            return Some(link);
+        }
+    }
+    if !registers {
+        return None;
+    }
+    if !t.development {
+        if let Some(link) = probe.first_link_under(&p.root) {
+            return Some(link);
+        }
+    }
+    // What lies inside the root was walked with it (or, for a cargo build in
+    // place, is never locked): only the paths outside it, each once (U4).
+    let mut outside: Vec<&PathBuf> = Vec::new();
+    for (path, _) in grants {
+        let s = path.to_string_lossy();
+        let share = s.starts_with(r"\\") || s.starts_with("//");
+        if !share && !path.starts_with(&p.root) && !outside.contains(&path) {
+            outside.push(path);
+        }
+    }
+    outside.into_iter().find_map(|path| probe.first_link_under(path))
+}
+
+fn link_refusal(dir: &Path, link: &Path) -> String {
+    format!("{} is reached through a link ({}). Give the real folder with /dir.", dir.display(), link.display())
+}
+
+fn swappable_refusal(ancestor: &Path, who: &str) -> String {
+    format!(
+        "{} can be renamed or re-permissioned by {who}, so the service's folder could be swapped. Install directly on a \
+         drive (for example D:\\OmniIngest) or under Program Files, or remove that permission.",
+        ancestor.display()
+    )
 }
 
 /// Decide the whole install without changing the machine. A fresh
@@ -409,12 +629,15 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
     let mut config = if let Some(c) = imported.clone() {
         c
     } else if fresh_config {
-        AppConfig::default()
+        o.base_config.clone().unwrap_or_default()
     } else {
         probe.load_config(&paths.config).context("The existing config.json cannot be read")?
     };
     let default_watch = paths.root.join("watchfolder").display().to_string();
-    let watchfolder_source = if let Some(w) = &o.watchfolder {
+    // An answer file's watchfolder counts only when its configuration is the one used.
+    let base_used = imported.is_none() && fresh_config && o.base_config.is_some();
+    let given_watch = o.watchfolder.clone().or_else(|| base_used.then(|| config.watchfolder_path.clone()));
+    let watchfolder_source = if let Some(w) = &given_watch {
         config.watchfolder_path = w.clone();
         WatchfolderSource::Options
     } else if imported.is_some() {
@@ -476,6 +699,11 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
             AccountChoice::LocalSystem => AccountDecision::LocalSystem,
             AccountChoice::Passwordless(name) => AccountDecision::Passwordless(name),
             AccountChoice::NeedsPassword(name) => {
+                // A misspelt account would leave the machine without a service:
+                // the old registration is removed before the new one (P13.1b, R5).
+                if !probe.account_exists(&name) {
+                    return Err(Refusal { notice: Vec::new(), message: unknown_account_refusal(&name) }.into());
+                }
                 questions.push(Question::NeedPassword { account: name.clone() });
                 AccountDecision::NeedsPassword(name)
             }
@@ -489,6 +717,12 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
     } else {
         Vec::new()
     };
+    // Before the service is stopped: what this run writes into or changes the
+    // permissions of must hold no link (T3/T7). The execute-time guards stay
+    // as the backstop for a link made in between.
+    if let Some(link) = planned_link(&target, &grants, account.registers(), probe) {
+        return Err(Refusal { notice: Vec::new(), message: link_inside_refusal(&link) }.into());
+    }
 
     Ok(InstallPlan {
         import: o.import.clone(),
@@ -571,7 +805,8 @@ pub(crate) fn check_config_watchfolder(
     let raw = config.watchfolder_path.trim();
     let judged = if raw.is_empty() { String::new() } else { paths.resolve(raw).to_string_lossy().into_owned() };
     match omni_core::paths::watchfolder_problem_with(&judged, drives) {
-        Some(problem) => anyhow::bail!("Cannot install: {problem}"),
+        // A refusal, so every front end reports "nothing was changed" (exit 5 in Setup).
+        Some(problem) => Err(Refusal { notice: Vec::new(), message: format!("Cannot install: {problem}") }.into()),
         None => Ok(()),
     }
 }
@@ -654,7 +889,8 @@ pub struct InstallReport {
 /// The machine steps of an install, one method per step, so the order of
 /// [`execute`] is tested without touching the machine.
 pub(crate) trait Machine {
-    fn create_dir(&mut self, dir: &Path) -> Result<()>;
+    /// The install folder, checked again first (T2).
+    fn create_dir(&mut self, t: &Target) -> Result<()>;
     fn import(&mut self, old: &Path, new: &AppPaths, progress: &mut dyn Progress) -> Result<()>;
     fn stop_service(&mut self) -> Result<()>;
     fn copy_executable(&mut self, source: &Path, target: &Path, progress: &mut dyn Progress) -> Result<bool>;
@@ -679,8 +915,8 @@ pub(crate) trait Machine {
 struct SystemMachine;
 
 impl Machine for SystemMachine {
-    fn create_dir(&mut self, dir: &Path) -> Result<()> {
-        Ok(std::fs::create_dir_all(dir)?)
+    fn create_dir(&mut self, t: &Target) -> Result<()> {
+        create_install_dir(t)
     }
     fn import(&mut self, old: &Path, new: &AppPaths, progress: &mut dyn Progress) -> Result<()> {
         import_from(old, new, progress).map(|_| ())
@@ -696,7 +932,7 @@ impl Machine for SystemMachine {
         copy_missing(&source_dir.join("data"), &paths.data, SEEDS, progress)
     }
     fn ensure_dirs(&mut self, paths: &AppPaths) -> Result<()> {
-        Ok(paths.ensure_dirs()?)
+        ensure_dirs_with(paths, &omni_core::fsutil::is_link)
     }
     fn create_watchfolder(&mut self, dir: &Path) {
         let _ = std::fs::create_dir_all(dir);
@@ -712,14 +948,17 @@ impl Machine for SystemMachine {
     }
     async fn apply_acls(&mut self, plan: &InstallPlan, account: Option<&ServiceAccount>, progress: &mut dyn Progress) {
         let t = &plan.target;
-        apply_acls_with(
+        // The installer's own executable is put directly in the root: only a cargo
+        // build run in place is left unlocked (T1).
+        apply_acls_on(
             &t.paths,
             &plan.config,
             account,
             plan.previous_account.as_deref(),
-            &t.target_exe,
+            !t.development,
             &plan.grants,
             progress,
+            &mut SystemAcl,
         )
         .await;
     }
@@ -764,7 +1003,7 @@ pub(crate) async fn execute_with<M: Machine>(
         logs: paths.logs.clone(),
     };
 
-    m.create_dir(&t.dir).with_context(|| format!("Cannot create {}", t.dir.display()))?;
+    m.create_dir(t).with_context(|| format!("Cannot create {}", t.dir.display()))?;
     if let Some(old) = &plan.import {
         m.import(old, paths, progress)?;
     }
@@ -891,56 +1130,7 @@ fn closing_lines(plan: &InstallPlan, host: &str) -> Vec<String> {
 
 /// The console installer: plan, ask the plan's questions, execute.
 pub async fn install(o: InstallOptions) -> Result<()> {
-    let probe = SystemProbe;
-    let mut out = ConsoleProgress;
-    let target = locate(&o, &probe)?;
-    for l in target.header() {
-        out.line(Step::Plan, &l);
-    }
-    let console_plan = |answers: &Answers, out: &mut ConsoleProgress| {
-        plan_from(target.clone(), &o, answers, &probe).inspect_err(|e| {
-            if let Some(r) = e.downcast_ref::<Refusal>() {
-                out.line(Step::Account, "");
-                for l in &r.notice {
-                    out.line(Step::Account, l);
-                }
-            }
-        })
-    };
-    let mut answers = Answers::default();
-    let mut plan = console_plan(&answers, &mut out)?;
-    if let Some(default) = plan.needs_watchfolder() {
-        let answer = Text::new("Dalet watchfolder (local folder or \\\\server\\share):")
-            .with_default(default)
-            .prompt()
-            .context("No watchfolder given")?;
-        answers.watchfolder = Some(answer);
-        plan = console_plan(&answers, &mut out)?;
-    }
-    for q in &plan.questions {
-        match q {
-            Question::NeedWatchfolder { .. } => bail!("No watchfolder given"),
-            Question::ConfirmUncWithoutAccount { text, prompt } => {
-                out.line(Step::Account, "");
-                for l in text {
-                    out.line(Step::Account, l);
-                }
-                let go = inquire::Confirm::new(prompt).with_default(false).prompt()?;
-                if !go {
-                    bail!("Installation cancelled.");
-                }
-                answers.confirm_unc = true;
-            }
-            Question::NeedPassword { account } => {
-                let password = inquire::Password::new(&format!("Password for {account}:"))
-                    .without_confirmation()
-                    .prompt()
-                    .context("No password given")?;
-                answers.password = Some(password);
-            }
-        }
-    }
-    let report = execute(&plan, &answers, &mut out).await?;
+    let report = install_console(&o, &SystemProbe, &mut ConsoleProgress).await?;
     if report.rolled_back {
         bail!(
             "Upgrade rolled back; the previous version is running. See {} for why the new one failed.",
@@ -950,25 +1140,128 @@ pub async fn install(o: InstallOptions) -> Result<()> {
     Ok(())
 }
 
+/// [`install`] with the probe and the output given, and a rolled-back upgrade
+/// returned in the report rather than as an error: locate, plan, ask the
+/// plan's questions at the console (`inquire`), execute. Setup (P13.1b)
+/// runs it with the release it carries as the probe's executable.
+pub async fn install_console(o: &InstallOptions, probe: &dyn Probe, out: &mut dyn Progress) -> Result<InstallReport> {
+    let target = locate(o, probe)?;
+    for l in target.header() {
+        out.line(Step::Plan, &l);
+    }
+    let console_plan = |answers: &Answers, out: &mut dyn Progress| {
+        plan_from(target.clone(), o, answers, probe).inspect_err(|e| {
+            if let Some(r) = e.downcast_ref::<Refusal>() {
+                out.line(Step::Account, "");
+                for l in &r.notice {
+                    out.line(Step::Account, l);
+                }
+            }
+        })
+    };
+    let mut answers = Answers::default();
+    let mut plan = console_plan(&answers, out)?;
+    if let Some(default) = plan.needs_watchfolder() {
+        let answer = answered(
+            Text::new("Dalet watchfolder (local folder or \\\\server\\share):").with_default(default).prompt(),
+            "No watchfolder given",
+        )?;
+        answers.watchfolder = Some(answer);
+        plan = console_plan(&answers, out)?;
+    }
+    for q in &plan.questions {
+        match q {
+            Question::NeedWatchfolder { .. } => bail!("No watchfolder given"),
+            Question::ConfirmUncWithoutAccount { text, prompt } => {
+                out.line(Step::Account, "");
+                for l in text {
+                    out.line(Step::Account, l);
+                }
+                let go = answered(inquire::Confirm::new(prompt).with_default(false).prompt(), "No answer given")?;
+                if !go {
+                    return Err(Cancelled.into());
+                }
+                answers.confirm_unc = true;
+            }
+            Question::NeedPassword { account } => {
+                let password = answered(
+                    inquire::Password::new(&format!("Password for {account}:")).without_confirmation().prompt(),
+                    "No password given",
+                )?;
+                answers.password = Some(password);
+            }
+        }
+    }
+    execute(&plan, &answers, out).await
+}
+
 /// Remove the service and the firewall rule; leave every file in place.
 pub async fn uninstall(dir: Option<PathBuf>) -> Result<()> {
     if !can_install_services() {
         bail!("Uninstalling needs administrator rights (run Uninstall.cmd or an elevated terminal).");
     }
-    if installed_service_exe().is_some() {
-        let _ = stop_service_and_wait(Duration::from_secs(120));
-        uninstall_service()?;
-        println!("✓ Service removed.");
-    } else {
-        println!("  The service was not installed.");
-    }
-    let _ = netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).await;
+    remove_service(&mut ConsoleProgress).await?;
     let dir = dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DIR));
     println!(
         "  The files are still in {} (database, configuration, logs). Delete that folder to remove them too.",
         dir.display()
     );
     Ok(())
+}
+
+/// Stop and remove the registered service, then the firewall rule; every
+/// line goes to `progress`. Shared by `uninstall` and Setup's `/uninstall`.
+pub async fn remove_service(progress: &mut dyn Progress) -> Result<()> {
+    remove_service_registration(progress)?;
+    remove_firewall_rule().await;
+    Ok(())
+}
+
+/// Stop and remove the registered service only.
+pub fn remove_service_registration(progress: &mut dyn Progress) -> Result<()> {
+    if installed_service_exe().is_some() {
+        let _ = stop_service_and_wait(Duration::from_secs(120));
+        uninstall_service()?;
+        progress.line(Step::Register, "✓ Service removed.");
+    } else {
+        progress.line(Step::Register, "  The service was not installed.");
+    }
+    Ok(())
+}
+
+/// Remove the panel's firewall rule; a missing rule is fine.
+pub async fn remove_firewall_rule() {
+    let _ = netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).await;
+}
+
+/// Every file or folder the installer can have put into `root` itself, for
+/// an uninstaller that removes exactly those: the executable with its
+/// `.prev` and staged `.exe.new` copies (`copy_executable`) and the tools in
+/// `bin` with the DLLs found there (`copy_tools`). The paths may not exist.
+/// Not the seeds in `data` (the station's roster and taxonomy once the
+/// service has read them), `config.json`, the database or anything else the
+/// service writes.
+pub fn program_files(root: &Path) -> Vec<PathBuf> {
+    let paths = AppPaths::with_root(root, "config.json");
+    let exe = paths.root.join(EXE);
+    let mut files = vec![exe.with_extension("exe.prev"), exe.with_extension("exe.new"), exe];
+    files.extend(TOOLS.iter().chain(SELF_UPDATING).map(|t| paths.bin.join(t)));
+    if let Ok(entries) = std::fs::read_dir(&paths.bin) {
+        // DLLs, and what `replace_file` left half-done (`*.omni-new`).
+        let mut more: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+                n.ends_with(".dll") || (n.ends_with(&format!(".{STAGED}")) && !files.contains(&paths.bin.join(e.file_name())))
+            })
+            .map(|e| paths.bin.join(e.file_name()))
+            .collect();
+        more.sort();
+        files.extend(more);
+    }
+    // A seed staged but never renamed into place is installer debris, not data.
+    files.extend(SEEDS.iter().map(|s| staged_name(&paths.data.join(s))));
+    files
 }
 
 /// Decide the service account (P2.16: the virtual account unless told
@@ -989,19 +1282,19 @@ pub(crate) fn choose_account(account: Option<&str>, watchfolder: &str, yes: bool
         if yes {
             bail!(SHARE_REFUSAL);
         }
-        let go = inquire::Confirm::new(&format!("Install as {who} anyway?")).with_default(false).prompt()?;
+        let go = answered(inquire::Confirm::new(&format!("Install as {who} anyway?")).with_default(false).prompt(), "No answer given")?;
         if !go {
-            bail!("Installation cancelled.");
+            return Err(Cancelled.into());
         }
     }
     match choice {
         AccountChoice::LocalSystem => Ok(None),
         AccountChoice::Passwordless(name) => Ok(Some(ServiceAccount { name, password: None })),
         AccountChoice::NeedsPassword(name) => {
-            let password = inquire::Password::new(&format!("Password for {name}:"))
-                .without_confirmation()
-                .prompt()
-                .context("No password given")?;
+            let password = answered(
+                inquire::Password::new(&format!("Password for {name}:")).without_confirmation().prompt(),
+                "No password given",
+            )?;
             Ok(Some(ServiceAccount::with_password(name, password)))
         }
     }
@@ -1169,17 +1462,96 @@ pub(crate) async fn apply_acls_with(
     grants: &[(PathBuf, Rights)],
     progress: &mut dyn Progress,
 ) {
-    let named = account.map(|a| a.name.as_str());
-    let temp = paths.resolve(&config.temp_path);
-    // A development tree (the exe in `target\release`, the root the repo) is never locked: it
-    // would take write access from the developer's own non-elevated account (UAC).
     let lock_root = is_installed_root(service_exe, &paths.root);
+    apply_acls_on(paths, config, account, previous_account, lock_root, grants, progress, &mut SystemAcl).await
+}
+
+/// The permission changes of [`apply_acls_with`], one method per icacls run, so
+/// which paths get one is tested without changing the machine.
+pub(crate) trait AclOps {
+    fn is_link(&self, path: &Path) -> bool;
+    /// The first link at or below `path`, never entering one (`fsutil::first_link_in_tree`).
+    fn first_link_in_tree(&self, path: &Path) -> Option<PathBuf>;
+    /// The entries directly in `dir`.
+    fn entries(&self, dir: &Path) -> Vec<PathBuf>;
+    async fn remove_grants(&mut self, path: &Path, account: &str, recursive: bool) -> Result<()>;
+    async fn lock_root(&mut self, root: &Path, account: Option<&str>) -> Result<()>;
+    /// Create `path` when `rights` is a folder grant, then grant.
+    async fn grant_modify(&mut self, account: &str, path: &Path, rights: Rights, progress: &mut dyn Progress) -> bool;
+    async fn lock_dirs(&mut self, dirs: &[PathBuf], account: omni_core::lockdown::Account) -> Result<()>;
+}
+
+struct SystemAcl;
+
+impl AclOps for SystemAcl {
+    fn is_link(&self, path: &Path) -> bool {
+        omni_core::fsutil::is_link(path)
+    }
+    fn first_link_in_tree(&self, path: &Path) -> Option<PathBuf> {
+        omni_core::fsutil::first_link_in_tree(path, &omni_core::fsutil::is_link)
+    }
+    fn entries(&self, dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+    async fn remove_grants(&mut self, path: &Path, account: &str, recursive: bool) -> Result<()> {
+        omni_core::lockdown::remove_grants_with(path, account, recursive).await
+    }
+    async fn lock_root(&mut self, root: &Path, account: Option<&str>) -> Result<()> {
+        omni_core::lockdown::lock_root(root, account).await
+    }
+    async fn grant_modify(&mut self, account: &str, path: &Path, rights: Rights, progress: &mut dyn Progress) -> bool {
+        grant_modify(account, path, rights, progress).await
+    }
+    async fn lock_dirs(&mut self, dirs: &[PathBuf], account: omni_core::lockdown::Account) -> Result<()> {
+        omni_core::lockdown::apply(dirs, account).await
+    }
+}
+
+/// A link that an elevated, recursive permission change on `path` would follow:
+/// on the way down from `root` (for a path inside it) or at `path`, or anywhere
+/// in its tree (P13.1b, S1). The service account may write these folders.
+fn link_in<A: AclOps>(ops: &A, root: &Path, path: &Path) -> Option<PathBuf> {
+    let on_the_way = if path.starts_with(root) {
+        omni_core::fsutil::link_below(root, path, &|p| ops.is_link(p))
+    } else {
+        ops.is_link(path).then(|| path.to_path_buf())
+    };
+    on_the_way.or_else(|| ops.first_link_in_tree(path))
+}
+
+fn link_line(path: &Path, link: &Path) -> String {
+    format!(
+        "✗ {} contains a link ({}): its permissions were NOT changed. Remove the link and run the installer again.",
+        path.display(),
+        link.display()
+    )
+}
+
+pub(crate) async fn apply_acls_on<A: AclOps>(
+    paths: &AppPaths,
+    config: &AppConfig,
+    account: Option<&ServiceAccount>,
+    previous_account: Option<&str>,
+    // False for a development tree (the exe in `target\release`, the root the repo): it is
+    // never locked, which would take write access from the developer's own account (UAC).
+    lock_root: bool,
+    grants: &[(PathBuf, Rights)],
+    progress: &mut dyn Progress,
+    ops: &mut A,
+) {
+    let named = account.map(|a| a.name.as_str());
+    let root = &paths.root;
+    let temp = paths.resolve(&config.temp_path);
     if !lock_root {
         progress.line(
             Step::Rights,
-            &format!("  {} is not an installed root (development tree); not restricting it.", paths.root.display()),
+            &format!("  {} is not an installed root (development tree); not restricting it.", root.display()),
         );
     }
+    // A named account without rights on data\ or temp\ cannot start.
+    let mut service_blocked = false;
     // 1. An older installer granted the account Modify on the whole root and every file.
     let mut stale: Vec<&str> = Vec::new();
     for a in [previous_account, named].into_iter().flatten() {
@@ -1187,17 +1559,47 @@ pub(crate) async fn apply_acls_with(
             stale.push(a);
         }
     }
+    let root_link = if lock_root && !stale.is_empty() { ops.first_link_in_tree(root) } else { None };
     for a in stale.into_iter().filter(|_| lock_root) {
-        if let Err(e) = omni_core::lockdown::remove_grants(&paths.root, a).await {
+        let result = match &root_link {
+            None => ops.remove_grants(root, a, true).await,
+            // `/T` would follow the link: the root alone, then each link-free entry.
+            Some(_) => {
+                let mut r = ops.remove_grants(root, a, false).await;
+                for entry in ops.entries(root) {
+                    match link_in(ops, root, &entry) {
+                        None => {
+                            if let Err(e) = ops.remove_grants(&entry, a, true).await {
+                                r = Err(e);
+                            }
+                        }
+                        Some(link) => progress.line(Step::Rights, &link_line(&entry, &link)),
+                    }
+                }
+                r
+            }
+        };
+        if let Err(e) = result {
             progress.line(Step::Rights, &format!("! Could not remove the old rights of {a} ({e:#}); set it by hand."));
         }
     }
     // 2. Root, then the folders the daemon writes.
-    let mut service_blocked = false;
     for (path, rights) in grants.iter().cloned() {
+        if rights == Rights::LockRoot && !lock_root {
+            continue;
+        }
+        if rights != Rights::ModifyAuthenticatedUsers && rights != Rights::LockRoot && named.is_none() {
+            continue;
+        }
+        if let Some(link) = link_in(ops, root, &path) {
+            progress.line(Step::Rights, &link_line(&path, &link));
+            if named.is_some() && (path == paths.data || path == temp) {
+                service_blocked = true;
+            }
+            continue;
+        }
         match (rights, named) {
-            (Rights::LockRoot, _) if !lock_root => {}
-            (Rights::LockRoot, _) => match omni_core::lockdown::lock_root(&path, named).await {
+            (Rights::LockRoot, _) => match ops.lock_root(&path, named).await {
                 Ok(()) => progress.line(
                     Step::Rights,
                     "  Install folder restricted: Users may read, only SYSTEM and Administrators may change it.",
@@ -1205,15 +1607,33 @@ pub(crate) async fn apply_acls_with(
                 Err(e) => progress.line(Step::Rights, &format!("! Could not restrict the install folder ({e:#}); set it by hand.")),
             },
             (Rights::ModifyAuthenticatedUsers, _) => {
-                grant_modify(AUTHENTICATED_USERS, &path, Rights::ModifyDir, progress).await;
+                ops.grant_modify(AUTHENTICATED_USERS, &path, Rights::ModifyDir, progress).await;
             }
             (_, Some(name)) => {
-                let ok = grant_modify(name, &path, rights, progress).await;
+                let ok = ops.grant_modify(name, &path, rights, progress).await;
                 if !ok && (path == paths.data || path == temp) {
                     service_blocked = true;
                 }
             }
             _ => {}
+        }
+    }
+    // 3. data\ and temp\ hold the sealed secrets and cookie jars (P3.5): after the
+    //    grants, so the service account keeps Modify on them.
+    let account_arg = match account {
+        Some(a) => omni_core::lockdown::Account::Named(a.name.clone()),
+        None => omni_core::lockdown::Account::System,
+    };
+    let mut dirs = Vec::new();
+    for d in [paths.data.clone(), temp] {
+        match link_in(ops, root, &d) {
+            None => dirs.push(d),
+            Some(link) => {
+                if !grants.iter().any(|(p, _)| *p == d) || named.is_none() {
+                    progress.line(Step::Rights, &link_line(&d, &link));
+                }
+                service_blocked |= named.is_some();
+            }
         }
     }
     if service_blocked {
@@ -1225,20 +1645,173 @@ pub(crate) async fn apply_acls_with(
             ),
         );
     }
-    // 3. data\ and temp\ hold the sealed secrets and cookie jars (P3.5): after the
-    //    grants, so the service account keeps Modify on them.
-    let account_arg = match account {
-        Some(a) => omni_core::lockdown::Account::Named(a.name.clone()),
-        None => omni_core::lockdown::Account::System,
-    };
-    let dirs = [paths.data.clone(), temp];
-    match omni_core::lockdown::apply(&dirs, account_arg).await {
+    if dirs.is_empty() {
+        return;
+    }
+    match ops.lock_dirs(&dirs, account_arg).await {
         Ok(()) => progress.line(
             Step::Rights,
             "  data and temp folders restricted to SYSTEM, Administrators and the service account.",
         ),
         Err(e) => progress.line(Step::Rights, &format!("! Could not restrict the data and temp folders ({e:#}); set it by hand.")),
     }
+}
+
+/// [`AppPaths::ensure_dirs`] for the installer: nothing is created through a
+/// link below the root (P13.1b, S1).
+fn ensure_dirs_with(paths: &AppPaths, is_link: &dyn Fn(&Path) -> bool) -> Result<()> {
+    let dirs = [
+        paths.data.clone(),
+        paths.temp.clone(),
+        paths.logs.clone(),
+        paths.archive.clone(),
+        paths.temp.join("jobs"),
+        paths.data.join("adblock"),
+    ];
+    for d in &dirs {
+        if let Some(link) = omni_core::fsutil::link_below(&paths.root, d, is_link) {
+            bail!("{} is reached through a link ({}); Setup does not create folders through it. Remove the link and run Setup again.", d.display(), link.display());
+        }
+    }
+    for d in &dirs {
+        std::fs::create_dir_all(d).with_context(|| format!("Cannot create {}", d.display()))?;
+    }
+    Ok(())
+}
+
+/// Which descriptor a new install folder and its missing parents get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewDirRights {
+    /// [`omni_core::lockdown::INSTALL_ROOT_SDDL`] from the moment it exists.
+    InstallRoot,
+    /// Inherited as usual: a development tree, which is never locked.
+    Plain,
+}
+
+/// The rights a new root (and each missing parent) is created with (S5): only
+/// a cargo build run in place ([`Target::development`]) is created plainly.
+pub(crate) fn new_dir_rights(development: bool) -> NewDirRights {
+    if development {
+        NewDirRights::Plain
+    } else {
+        NewDirRights::InstallRoot
+    }
+}
+
+/// What execute-time checks read from the machine (T2); tests inject them.
+pub(crate) struct Recheck<'a> {
+    pub is_dir: &'a dyn Fn(&Path) -> bool,
+    pub is_link: &'a dyn Fn(&Path) -> bool,
+    /// The owner's name when it is not trusted.
+    pub foreign_owner: &'a dyn Fn(&Path) -> Option<String>,
+    /// Who besides the trusted accounts may rename, re-permission or owns a folder.
+    pub swapper: &'a dyn Fn(&Path) -> Option<String>,
+    /// Who besides the trusted accounts may put files into a folder (U3).
+    pub writable: &'a dyn Fn(&Path) -> Option<String>,
+}
+
+impl Recheck<'static> {
+    /// The real machine.
+    pub(crate) fn system() -> Self {
+        Recheck {
+            is_dir: &Path::is_dir,
+            is_link: &omni_core::fsutil::is_link,
+            foreign_owner: &omni_core::lockdown::foreign_owner,
+            swapper: &omni_core::lockdown::folder_swapper,
+            writable: &omni_core::lockdown::writable_by,
+        }
+    }
+}
+
+/// What changed about the root's existing path since `locate` judged it (the
+/// prompts lie in between): a component that became a link; the root, a new
+/// owner; a parent below the volume root, a new owner or swap right (unless an
+/// installation is already in the folder, as in `locate`). `None`: unchanged.
+pub(crate) fn changed_since_plan(t: &Target, r: &Recheck) -> Option<String> {
+    let root = &t.paths.root;
+    let changed = |p: &Path, why: String| {
+        Some(format!("{} changed while Setup was running: {why}; nothing was installed.", p.display()))
+    };
+    for a in root.ancestors().filter(|a| (r.is_dir)(a)) {
+        if (r.is_link)(a) {
+            return changed(a, "it is now a link".into());
+        }
+        if t.development {
+            continue;
+        }
+        if a == root.as_path() {
+            if let Some(owner) = (r.foreign_owner)(a) {
+                return changed(a, format!("it now belongs to {owner}"));
+            }
+            // As in `locate` (U3): a folder that is no installation must stay closed.
+            if !t.installed_here() {
+                if let Some(who) = (r.writable)(a) {
+                    return changed(a, format!("{who} can now write to it"));
+                }
+            }
+        } else if a.parent().is_some() && !t.installed_here() {
+            if let Some(who) = (r.swapper)(a) {
+                return changed(a, format!("{who} may rename or re-permission it"));
+            }
+        }
+    }
+    None
+}
+
+/// The install folder, after [`changed_since_plan`]. An existing one is used
+/// as it is. A new one, and every missing parent, gets the P2.16 baseline from
+/// the moment it exists (`lockdown::create_install_root_dir`: Administrators
+/// and SYSTEM Full, Users Read & execute), so nothing can be planted in it and
+/// nobody can swap it before the lockdown step; the service account can still
+/// run the executable if that step fails. A cargo build in place is created plainly.
+fn create_install_dir(t: &Target) -> Result<()> {
+    if new_dir_rights(t.development) == NewDirRights::Plain {
+        let recheck = Recheck::system();
+        if let Some(message) = changed_since_plan(t, &recheck) {
+            return Err(Refusal { notice: Vec::new(), message }.into());
+        }
+        return Ok(std::fs::create_dir_all(&t.dir)?);
+    }
+    create_install_dir_with(t, &Recheck::system(), &mut |d: &Path| omni_core::lockdown::create_install_root_dir(d))
+}
+
+/// [`create_install_dir`] with the machine injected. What exists and what is
+/// missing is read BEFORE the re-check (U1): only a root that existed then is
+/// used as it is; every missing folder (parents and root) must be created by
+/// this run, and one that appears in between is refused, never adopted.
+pub(crate) fn create_install_dir_with(
+    t: &Target,
+    r: &Recheck,
+    create: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let dir = t.dir.as_path();
+    let existed = (r.is_dir)(dir);
+    let mut missing: Vec<PathBuf> = dir.ancestors().take_while(|a| !(r.is_dir)(a)).map(Path::to_path_buf).collect();
+    missing.reverse();
+    if let Some(message) = changed_since_plan(t, r) {
+        return Err(Refusal { notice: Vec::new(), message }.into());
+    }
+    if existed {
+        return Ok(());
+    }
+    for d in &missing {
+        match create(d) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let why = match (r.foreign_owner)(d) {
+                    Some(owner) => format!("it appeared and belongs to {owner}"),
+                    None => match (d != dir).then(|| (r.swapper)(d)).flatten() {
+                        Some(who) => format!("it appeared and {who} may rename or re-permission it"),
+                        None => "it appeared while Setup was creating it".into(),
+                    },
+                };
+                let message = format!("{} changed while Setup was running: {why}; nothing was installed.", d.display());
+                return Err(Refusal { notice: Vec::new(), message }.into());
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("Cannot create {}", d.display()))),
+        }
+    }
+    Ok(())
 }
 
 /// Replace the installed executable with this one, keeping the old one as
@@ -1256,19 +1829,35 @@ fn copy_executable(source: &Path, target: &Path, progress: &mut dyn Progress) ->
     Ok(had)
 }
 
+/// Refuse to write into `dir`, or onto `file` in it, when either is a link: the
+/// service account may write `bin` and `data`, and this runs elevated (P13.1b, R2).
+fn refuse_links(dir: &Path, file: Option<&Path>, is_link: &dyn Fn(&Path) -> bool) -> Result<()> {
+    omni_core::fsutil::ensure_not_link(dir, is_link)?;
+    if let Some(f) = file {
+        omni_core::fsutil::ensure_not_link(f, is_link)?;
+    }
+    Ok(())
+}
+
 /// The release's tools into `bin/`: replaced when different, self-updating
 /// ones only when missing, DLLs alongside.
 fn copy_tools(from: &Path, to: &Path, progress: &mut dyn Progress) -> Result<()> {
+    copy_tools_with(from, to, progress, &omni_core::fsutil::is_link)
+}
+
+fn copy_tools_with(from: &Path, to: &Path, progress: &mut dyn Progress, is_link: &dyn Fn(&Path) -> bool) -> Result<()> {
     if !from.is_dir() {
         progress.line(Step::Copy, "  (No bin/ in this release folder: tools left as they are.)");
         return Ok(());
     }
+    refuse_links(to, None, is_link)?;
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let src = entry.path();
         let dst = to.join(&name);
+        refuse_links(to, Some(&dst), is_link)?;
         let is_tool = TOOLS.contains(&name.as_str()) || name.to_ascii_lowercase().ends_with(".dll");
         if SELF_UPDATING.contains(&name.as_str()) {
             if !dst.exists() {
@@ -1276,20 +1865,68 @@ fn copy_tools(from: &Path, to: &Path, progress: &mut dyn Progress) -> Result<()>
                 progress.line(Step::Copy, &format!("  Installed bin\\{name}."));
             }
         } else if is_tool && differs(&src, &dst) {
-            std::fs::copy(&src, &dst).with_context(|| format!("Cannot copy {name}"))?;
+            replace_file(&src, &dst).with_context(|| format!("Cannot install bin\\{name}"))?;
             progress.line(Step::Copy, &format!("  Installed bin\\{name}."));
         }
     }
     Ok(())
 }
 
+/// The suffix of a file being put in place by [`replace_file`].
+pub(crate) const STAGED: &str = "omni-new";
+
+/// `<name>.omni-new` beside `dst`.
+fn staged_name(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{STAGED}"));
+    dst.with_file_name(name)
+}
+
+/// Put `src` in place of `dst` by writing a new file beside it and renaming it
+/// over: a hard link at `dst` (made by the account that may write the folder)
+/// is replaced, never written through (S9). The staged file is created fresh
+/// (an existing one is removed first, a link at it included) and removed on
+/// any failure.
+fn replace_file(src: &Path, dst: &Path) -> Result<()> {
+    let staged = staged_name(dst);
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let result = (|| -> Result<()> {
+        let mut input = std::fs::File::open(src)?;
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&staged)?;
+        std::io::copy(&mut input, &mut out)?;
+        out.sync_all()?;
+        drop(out);
+        std::fs::rename(&staged, dst)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    result
+}
+
 fn copy_missing(from: &Path, to: &Path, names: &[&str], progress: &mut dyn Progress) -> Result<()> {
+    copy_missing_with(from, to, names, progress, &omni_core::fsutil::is_link)
+}
+
+fn copy_missing_with(
+    from: &Path,
+    to: &Path,
+    names: &[&str],
+    progress: &mut dyn Progress,
+    is_link: &dyn Fn(&Path) -> bool,
+) -> Result<()> {
     for name in names {
         let src = from.join(name);
         let dst = to.join(name);
+        refuse_links(to, Some(&dst), is_link)?;
         if src.is_file() && !dst.exists() {
             std::fs::create_dir_all(to)?;
-            std::fs::copy(&src, &dst)?;
+            replace_file(&src, &dst).with_context(|| format!("Cannot install data\\{name}"))?;
             progress.line(Step::Copy, &format!("  Installed data\\{name}."));
         }
     }
@@ -1319,18 +1956,16 @@ fn differs(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Whether `root` is an installed root: the service's executable sits directly in it. A cargo
-/// build (`<repo>\target\release\omni-ingest.exe`, root `<repo>`) is not.
+/// Whether `root` is an installed root: the service's executable sits directly in it and is
+/// not a cargo build ([`is_cargo_build`]: `<repo>\target\release\omni-ingest.exe`, whose root
+/// is the repo or the profile folder). Judged on the executable, never on a `Cargo.toml`
+/// near the root, which anyone may write (T1).
 pub(crate) fn is_installed_root(service_exe: &Path, root: &Path) -> bool {
-    // Nor any other cargo output (`target\gate\release`, `target\<triple>\release`): a folder named
-    // `target`, or a `Cargo.toml`, at or above the root.
-    let in_cargo_tree = root
-        .ancestors()
-        .any(|a| a.file_name().is_some_and(|n| n.eq_ignore_ascii_case("target")) || a.join("Cargo.toml").is_file());
-    !in_cargo_tree && service_exe.parent().is_some_and(|dir| same_dir(dir, root))
+    service_exe.parent().is_some_and(|dir| same_dir(dir, root)) && !is_cargo_build(service_exe, &|p| p.is_file())
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
+/// Whether two paths name the same existing file or folder (canonical, case-folded).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
     match (dunce(a), dunce(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
@@ -1353,7 +1988,14 @@ async fn grant_modify(account: &str, path: &Path, rights: Rights, progress: &mut
         let _ = std::fs::create_dir_all(path);
     }
     let args = [path.as_os_str().to_os_string(), "/grant".into(), grant_spec(account, rights).into(), "/T".into(), "/Q".into()];
-    match omni_core::process::run_capture(Path::new("icacls"), args, Duration::from_secs(120)).await {
+    let icacls = match omni_core::lockdown::icacls() {
+        Ok(p) => p,
+        Err(e) => {
+            progress.line(Step::Rights, &format!("! icacls.exe was not found ({e}); give {account} Modify on {} by hand.", path.display()));
+            return false;
+        }
+    };
+    match omni_core::process::run_capture(&icacls, args, Duration::from_secs(120)).await {
         Ok(o) if o.success => {
             progress.line(Step::Rights, &format!("  {account} may modify {}.", path.display()));
             true
@@ -1365,9 +2007,17 @@ async fn grant_modify(account: &str, path: &Path, rights: Rights, progress: &mut
     }
 }
 
+/// `netsh.exe` by its full path: this runs elevated, and a bare name is looked
+/// up beside the running executable first. Never a bare name.
+fn netsh_program() -> std::io::Result<PathBuf> {
+    omni_core::paths::system_tool("netsh.exe")
+}
+
+/// `false` when netsh failed or cannot be found; the callers say what that means.
 async fn netsh(args: &[&str]) -> bool {
+    let Ok(program) = netsh_program() else { return false };
     matches!(
-        omni_core::process::run_capture(Path::new("netsh"), args, Duration::from_secs(30)).await,
+        omni_core::process::run_capture(&program, args, Duration::from_secs(30)).await,
         Ok(o) if o.success
     )
 }
@@ -1472,7 +2122,7 @@ mod tests {
     fn account_plan(i: Option<&Path>, t: &Path, a: Option<&str>, c: Option<&str>) -> AccountPlan {
         account_plan_with(i, t, a, c, &same_dir)
     }
-    fn copy_tools(from: &Path, to: &Path) -> Result<()> {
+    fn copy_tools_plain(from: &Path, to: &Path) -> Result<()> {
         super::copy_tools(from, to, &mut Log::default())
     }
     fn copy_executable(source: &Path, target: &Path) -> Result<bool> {
@@ -1512,13 +2162,18 @@ mod tests {
         let repo = dir.path().join("repo");
         assert!(!is_installed_root(&release.join("omni-ingest.exe"), &repo), "a cargo build's root is the repo");
         assert!(!is_installed_root(&root.join("sub").join("omni-ingest.exe"), &root));
-        // Another cargo output, where the discovered root is the profile folder itself.
+        // Another cargo output, where the discovered root is the profile folder itself: a
+        // `target` folder whose parent is a checkout (T1: judged on the executable).
+        std::fs::write(repo.join("Cargo.toml"), "").unwrap();
         let gate = dir.path().join("repo").join("target").join("gate").join("release");
         std::fs::create_dir_all(&gate).unwrap();
         assert!(!is_installed_root(&gate.join("omni-ingest.exe"), &gate), "target\\gate\\release is a build, not an install");
-        // A checkout (Cargo.toml) whose exe was copied to its top.
-        std::fs::write(repo.join("Cargo.toml"), "").unwrap();
-        assert!(!is_installed_root(&repo.join("omni-ingest.exe"), &repo));
+        // T1: an exe copied to the top of a checkout is not a cargo build, so it is locked: a
+        // `Cargo.toml` beside the root, which anyone may write, never switches the lock off.
+        assert!(is_installed_root(&repo.join("omni-ingest.exe"), &repo));
+        // Without the checkout's Cargo.toml a folder named `target` is just a folder.
+        std::fs::remove_file(repo.join("Cargo.toml")).unwrap();
+        assert!(is_installed_root(&gate.join("omni-ingest.exe"), &gate));
     }
 
     #[test]
@@ -1657,7 +2312,7 @@ mod tests {
         std::fs::write(to.join("ffmpeg.exe"), b"old ffmpeg").unwrap();
         std::fs::write(to.join("deno.exe"), b"nightly-updated deno").unwrap();
 
-        copy_tools(&from, &to).unwrap();
+        copy_tools_plain(&from, &to).unwrap();
         assert_eq!(std::fs::read(to.join("ffmpeg.exe")).unwrap(), b"new ffmpeg");
         assert_eq!(std::fs::read(to.join("avcodec.dll")).unwrap(), b"dll");
         assert_eq!(std::fs::read(to.join("deno.exe")).unwrap(), b"nightly-updated deno", "never downgraded");
@@ -1744,6 +2399,24 @@ mod tests {
         files: Vec<(PathBuf, u64)>,
         configs: Vec<(PathBuf, AppConfig)>,
         service: Option<(PathBuf, String)>,
+        /// The install folder's owner, when it is not one we trust.
+        owner: Option<String>,
+        /// Accounts Windows would not find.
+        unknown_accounts: Vec<String>,
+        /// Paths that are reparse points.
+        links: Vec<PathBuf>,
+        /// A folder above the root that someone else may swap.
+        swappable: Option<(PathBuf, String)>,
+        /// The executable being installed, when not the release folder's.
+        exe: Option<PathBuf>,
+        /// Existing folders.
+        dirs: Vec<PathBuf>,
+        /// Files whose owner is not trusted.
+        untrusted: Vec<PathBuf>,
+        /// Who may write into an existing root.
+        writable: Option<String>,
+        /// Every tree walk asked for.
+        walks: std::cell::RefCell<Vec<PathBuf>>,
     }
 
     fn key(p: &Path) -> String {
@@ -1755,7 +2428,7 @@ mod tests {
             self.admin
         }
         fn current_exe(&self) -> std::io::Result<PathBuf> {
-            Ok(PathBuf::from(RELEASE_EXE))
+            Ok(self.exe.clone().unwrap_or_else(|| PathBuf::from(RELEASE_EXE)))
         }
         fn installed_exe(&self) -> Option<PathBuf> {
             self.service.as_ref().map(|s| s.0.clone())
@@ -1764,7 +2437,7 @@ mod tests {
             self.service.as_ref().map(|s| s.1.clone())
         }
         fn exists(&self, path: &Path) -> bool {
-            self.is_file(path)
+            self.is_file(path) || self.dirs.iter().any(|d| key(d) == key(path))
         }
         fn is_file(&self, path: &Path) -> bool {
             self.file_len(path).is_some() || self.configs.iter().any(|(p, _)| key(p) == key(path))
@@ -1784,10 +2457,47 @@ mod tests {
         fn drives(&self) -> &dyn DriveLookup {
             &MappedZ
         }
+        fn foreign_owner(&self, dir: &Path) -> Option<String> {
+            self.owner.clone().filter(|_| key(dir) == key(Path::new(ROOT)))
+        }
+        fn account_exists(&self, name: &str) -> bool {
+            !self.unknown_accounts.iter().any(|a| a.eq_ignore_ascii_case(name))
+        }
+        fn is_link(&self, path: &Path) -> bool {
+            self.links.iter().any(|l| key(l) == key(path))
+        }
+        fn swappable_ancestor(&self, _root: &Path) -> Option<(PathBuf, String)> {
+            self.swappable.clone()
+        }
+        fn first_link_under(&self, dir: &Path) -> Option<PathBuf> {
+            self.walks.borrow_mut().push(dir.to_path_buf());
+            let dir = PathBuf::from(key(dir));
+            self.links.iter().find(|l| PathBuf::from(key(l)).starts_with(&dir)).cloned()
+        }
+        fn trusted_owner(&self, path: &Path) -> bool {
+            !self.untrusted.iter().any(|u| key(u) == key(path))
+        }
+        fn writable_by(&self, dir: &Path) -> Option<String> {
+            self.writable.clone().filter(|_| key(dir) == key(Path::new(ROOT)))
+        }
     }
 
     fn new_machine() -> FakeProbe {
-        FakeProbe { admin: true, files: Vec::new(), configs: Vec::new(), service: None }
+        FakeProbe {
+            admin: true,
+            files: Vec::new(),
+            configs: Vec::new(),
+            service: None,
+            owner: None,
+            unknown_accounts: Vec::new(),
+            links: Vec::new(),
+            swappable: None,
+            exe: None,
+            dirs: Vec::new(),
+            untrusted: Vec::new(),
+            writable: None,
+            walks: std::cell::RefCell::new(Vec::new()),
+        }
     }
 
     fn root_paths() -> AppPaths {
@@ -1801,10 +2511,10 @@ mod tests {
         c.watchfolder_path = r"C:\Dalet\ingest".into();
         c.web_port = 8090;
         FakeProbe {
-            admin: true,
             files: vec![(paths.root.join(EXE), 1)],
             configs: vec![(paths.config.clone(), c)],
             service: Some((paths.root.join(EXE), account.into())),
+            ..new_machine()
         }
     }
 
@@ -1901,6 +2611,7 @@ mod tests {
         let log = Log::default();
         let err = run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap_err();
         assert_eq!(err.to_string(), "Installation cancelled.");
+        assert!(err.downcast_ref::<Cancelled>().is_some(), "a cancel is a type, not a text");
         assert!(log.lines().is_empty(), "{:?}", log.lines());
         // Yes goes on with the virtual account.
         let yes = Answers { confirm_unc: true, ..Default::default() };
@@ -1923,9 +2634,620 @@ mod tests {
     #[test]
     fn a_mapped_drive_watchfolder_is_refused_with_today_s_text() {
         let o = InstallOptions { watchfolder: Some(r"Z:\Dalet".into()), yes: true, ..opts() };
-        let err = plan_install(&o, &new_machine()).unwrap_err().to_string();
+        let e = plan_install(&o, &new_machine()).unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some(), "a refusal, so Setup exits 5 (R12)");
+        let err = e.to_string();
         assert!(err.starts_with("Cannot install: "), "{err}");
         assert!(err.contains(r"use \\192.168.4.42\FileIngest\Dalet instead"), "{err}");
+    }
+
+    /// R7: after an uninstall that kept the data, the folder still has a
+    /// config.json; an answer file must then change nothing at all.
+    #[test]
+    fn an_answer_file_with_a_config_json_left_in_the_folder_changes_nothing() {
+        let mut existing = installed(DEFAULT_SERVICE_ACCOUNT);
+        existing.service = None;
+        existing.files.clear();
+        let kept = existing.configs[0].1.clone();
+        let mut answered = AppConfig::default();
+        answered.watchfolder_path = r"\\other\ingest".into();
+        answered.web_port = 8095;
+        answered.setup_mode = "it".into();
+        let o = InstallOptions { yes: true, ..opts() }.with_base_config(answered);
+        let plan = plan_install(&o, &existing).unwrap();
+        assert_eq!(plan.target.kind, InstallKind::Fresh, "no exe, no service: the case of the finding");
+        assert_eq!(serde_json::to_value(&plan.config).unwrap(), serde_json::to_value(&kept).unwrap());
+        assert_eq!(plan.watchfolder_source, WatchfolderSource::ExistingConfig);
+        assert!(!plan.write_config);
+    }
+
+    /// R2: whoever owns the folder can rewrite its rights after the lockdown.
+    #[test]
+    fn a_folder_another_account_owns_is_refused_before_anything_is_touched() {
+        let probe = FakeProbe { owner: Some(r"NEWSROOM\someone".into()), ..new_machine() };
+        let log = Log::default();
+        let e = plan_install(&InstallOptions { yes: true, ..opts() }, &probe)
+            .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()))
+            .unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        assert_eq!(
+            e.to_string(),
+            r#"C:\OmniTest exists and belongs to NEWSROOM\someone, not to Administrators. Setup does not install into a folder another account controls. Remove the folder or choose another one; if it is yours, run: icacls "C:\OmniTest" /setowner Administrators /T"#
+        );
+        assert!(log.lines().is_empty());
+        // An upgrade or an account change meets the same check: it is in `locate`.
+        let mut upgrade = installed(DEFAULT_SERVICE_ACCOUNT);
+        upgrade.owner = Some(r"NEWSROOM\someone".into());
+        let o = InstallOptions { account: Some(r"DOMAIN\svc_test".into()), ..opts() };
+        assert!(plan_install(&o, &upgrade).unwrap_err().downcast_ref::<Refusal>().is_some());
+    }
+
+    /// R5: until the account is changed in place, a typo must not reach the step
+    /// that removes the old registration.
+    #[test]
+    fn an_account_windows_does_not_know_is_refused_before_anything_is_touched() {
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.unknown_accounts = vec![r"DOMAIN\svc_tset".into()];
+        let o = InstallOptions { account: Some(r"DOMAIN\svc_tset".into()), ..opts() };
+        let log = Log::default();
+        let e = plan_install(&o, &probe)
+            .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()))
+            .unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        assert_eq!(e.to_string(), r"Windows does not know the account DOMAIN\svc_tset; check the spelling (DOMAIN\user or .\user).");
+        assert!(log.lines().is_empty());
+        // Built-in and virtual accounts are never looked up.
+        probe.unknown_accounts = vec!["LocalSystem".into(), DEFAULT_SERVICE_ACCOUNT.into(), r"NT AUTHORITY\NetworkService".into()];
+        for a in ["LocalSystem", DEFAULT_SERVICE_ACCOUNT, r"NT AUTHORITY\NetworkService"] {
+            let o = InstallOptions { account: Some(a.into()), ..opts() };
+            assert!(plan_install(&o, &probe).is_ok(), "{a}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_installer_runs_icacls_and_netsh_by_full_path() {
+        let system = omni_core::paths::system_tool("kernel32.dll").unwrap();
+        for (tool, name) in [(netsh_program().unwrap(), "netsh.exe"), (omni_core::lockdown::icacls().unwrap(), "icacls.exe")] {
+            assert!(tool.is_absolute(), "{tool:?}");
+            assert_eq!(tool.parent(), system.parent(), "{tool:?}");
+            assert_eq!(tool.file_name().unwrap(), name);
+        }
+    }
+
+    /// S2a: every write and grant would follow a link to the root or above it.
+    #[test]
+    fn a_root_reached_through_a_link_is_refused_before_anything_is_touched() {
+        for link in [r"C:\OmniTest", r"C:\"] {
+            let probe = FakeProbe { links: vec![PathBuf::from(link)], ..new_machine() };
+            let log = Log::default();
+            let e = plan_install(&InstallOptions { yes: true, ..opts() }, &probe)
+                .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()))
+                .unwrap_err();
+            assert!(e.downcast_ref::<Refusal>().is_some());
+            assert_eq!(e.to_string(), format!(r"C:\OmniTest is reached through a link ({link}). Give the real folder with /dir."));
+            assert!(log.lines().is_empty());
+        }
+        // An upgrade too.
+        let mut upgrade = installed(DEFAULT_SERVICE_ACCOUNT);
+        upgrade.links = vec![PathBuf::from(ROOT)];
+        assert!(plan_install(&opts(), &upgrade).unwrap_err().downcast_ref::<Refusal>().is_some());
+    }
+
+    /// S2c: a fresh install is refused under a folder someone else may swap; an
+    /// upgrade of a running system is told, never blocked.
+    #[test]
+    fn a_swappable_parent_refuses_a_new_installation_and_warns_an_upgrade() {
+        let swappable = Some((PathBuf::from(r"C:\Tools"), r"NT AUTHORITY\Authenticated Users".to_string()));
+        let probe = FakeProbe { swappable: swappable.clone(), ..new_machine() };
+        let e = plan_install(&InstallOptions { yes: true, ..opts() }, &probe).unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        let text = r"C:\Tools can be renamed or re-permissioned by NT AUTHORITY\Authenticated Users, so the service's folder could be swapped. Install directly on a drive (for example D:\OmniIngest) or under Program Files, or remove that permission.";
+        assert_eq!(e.to_string(), text);
+        let mut upgrade = installed(DEFAULT_SERVICE_ACCOUNT);
+        upgrade.swappable = swappable.clone();
+        let plan = plan_install(&opts(), &upgrade).unwrap();
+        assert_eq!(plan.target.warnings, [format!("! {text}")]);
+        assert_eq!(plan.target.header().last().unwrap(), &format!("! {text}"));
+        // T5: a service registered elsewhere does not make a new folder an upgrade.
+        let elsewhere = FakeProbe {
+            swappable,
+            service: Some((PathBuf::from(r"D:\OtherOmni\omni-ingest.exe"), DEFAULT_SERVICE_ACCOUNT.into())),
+            ..new_machine()
+        };
+        let e = plan_install(&InstallOptions { yes: true, ..opts() }, &elsewhere).unwrap_err();
+        assert_eq!(e.to_string(), text, "no installation in this folder: refused");
+    }
+
+    /// T1: a development run is decided by the executable being installed (cargo's
+    /// `<repo>\target\…\omni-ingest.exe`, run in place), never by a `Cargo.toml`
+    /// near the root, which anyone may write.
+    #[test]
+    fn only_a_cargo_build_run_in_place_is_exempt_never_a_planted_cargo_toml() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        let release = repo.join("target").join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), b"[workspace]").unwrap();
+        let built = release.join(EXE);
+        let is_file = |p: &Path| p.is_file();
+        assert!(is_cargo_build(&built, &is_file));
+        assert!(!is_cargo_build(&d.path().join("Omni").join(EXE), &is_file));
+        // A folder above every root here is swappable: whatever is judged is refused.
+        let judged = || Some((d.path().to_path_buf(), "someone".to_string()));
+        let owned = |exe: Option<PathBuf>, dir: PathBuf| {
+            let mut files = vec![(repo.join("Cargo.toml"), 1)];
+            files.extend(exe.iter().map(|e| (e.clone(), 1)));
+            FakeProbe { swappable: judged(), files, exe, ..new_machine() }.pipe_locate(dir)
+        };
+        // The build, in place: exempt (not judged; created plainly; not locked).
+        let t = owned(Some(built.clone()), release.clone()).expect("a cargo build in place is not judged");
+        assert!(t.development && t.in_place);
+        assert_eq!(new_dir_rights(t.development), NewDirRights::Plain);
+        // The same exe installed into another root: judged.
+        assert!(owned(Some(built.clone()), d.path().join("Omni")).is_err());
+        // A planted Cargo.toml above or inside a normal root: still judged, locked and created protected.
+        let root = d.path().join("Omni");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), b"").unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"").unwrap();
+        let planted = |exe: PathBuf| FakeProbe { swappable: judged(), exe: Some(exe), ..new_machine() };
+        assert!(planted(PathBuf::from(RELEASE_EXE)).pipe_locate(root.clone()).is_err());
+        assert!(planted(root.join(EXE)).pipe_locate(root.clone()).is_err(), "in place, but not a cargo build");
+        assert!(is_installed_root(&root.join(EXE), &root), "locked");
+        assert_eq!(new_dir_rights(false), NewDirRights::InstallRoot);
+    }
+
+    impl FakeProbe {
+        fn pipe_locate(self, dir: PathBuf) -> Result<Target> {
+            locate(&InstallOptions { dir: Some(dir), yes: true, ..Default::default() }, &self)
+        }
+    }
+
+    /// S5: a new root (and its missing parents) starts with the P2.16 baseline.
+    #[test]
+    fn a_new_root_gets_the_baseline_descriptor() {
+        assert_eq!(new_dir_rights(false), NewDirRights::InstallRoot);
+        assert_eq!(new_dir_rights(true), NewDirRights::Plain);
+        assert!(omni_core::lockdown::INSTALL_ROOT_SDDL.contains("(A;OICI;0x1200a9;;;BU)"));
+        assert!(!omni_core::lockdown::PROTECTED_SDDL.contains(";;;BU)"), "Setup's work folder stays Administrators+SYSTEM");
+    }
+
+    /// T2: the prompts lie between `locate` and the first machine step; what
+    /// changed in between is refused before anything is copied.
+    #[test]
+    fn a_root_or_parent_that_changed_after_planning_is_refused() {
+        let fresh = locate(&InstallOptions { yes: true, ..opts() }, &new_machine()).unwrap();
+        let root = PathBuf::from(ROOT);
+        let parent_root = PathBuf::from(r"C:\");
+        let exists = |p: &Path| p == root.as_path() || p == parent_root.as_path();
+        let none = |_: &Path| None::<String>;
+        let no = |_: &Path| false;
+        let unchanged = Recheck { is_dir: &exists, is_link: &no, foreign_owner: &none, swapper: &none, writable: &none };
+        assert_eq!(changed_since_plan(&fresh, &unchanged), None);
+        let user_owned = |p: &Path| (p == root.as_path()).then(|| r"NEWSROOM\someone".to_string());
+        let r = Recheck { foreign_owner: &user_owned, ..unchanged };
+        assert_eq!(
+            changed_since_plan(&fresh, &r).as_deref(),
+            Some(r"C:\OmniTest changed while Setup was running: it now belongs to NEWSROOM\someone; nothing was installed.")
+        );
+        let link = |p: &Path| p == root.as_path();
+        let r = Recheck { is_link: &link, ..unchanged };
+        assert!(changed_since_plan(&fresh, &r).unwrap().contains("it is now a link"));
+        // U3: a root opened to others meanwhile; an installation already there is not judged on it.
+        let open = |p: &Path| (p == root.as_path()).then(|| r"NT AUTHORITY\Authenticated Users".to_string());
+        let r = Recheck { writable: &open, ..unchanged };
+        assert_eq!(
+            changed_since_plan(&fresh, &r).as_deref(),
+            Some(r"C:\OmniTest changed while Setup was running: NT AUTHORITY\Authenticated Users can now write to it; nothing was installed.")
+        );
+        let upgrade = locate(&opts(), &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        assert!(upgrade.installed_here());
+        assert_eq!(changed_since_plan(&upgrade, &r), None);
+        // A parent below the volume root that became swappable.
+        let deep = locate(&InstallOptions { dir: Some(r"C:\Tools\Omni".into()), yes: true, ..Default::default() }, &new_machine()).unwrap();
+        let tools = PathBuf::from(r"C:\Tools");
+        let exists_tools = |p: &Path| p == tools.as_path() || p == parent_root.as_path();
+        let swappable = |p: &Path| (p == tools.as_path()).then(|| "Authenticated Users".to_string());
+        let r = Recheck { is_dir: &exists_tools, is_link: &no, foreign_owner: &none, swapper: &swappable, writable: &none };
+        assert!(changed_since_plan(&deep, &r).unwrap().starts_with(r"C:\Tools changed while Setup was running"));
+        // The volume root itself is never judged for owner or entries.
+        let volume = |p: &Path| (p == parent_root.as_path()).then(|| "someone".to_string());
+        let r = Recheck { is_dir: &exists_tools, is_link: &no, foreign_owner: &volume, swapper: &volume, writable: &volume };
+        assert_eq!(changed_since_plan(&deep, &r), None);
+    }
+
+    /// U1: what was missing at the re-check is created by this run or refused,
+    /// never adopted.
+    #[test]
+    fn a_folder_that_appears_after_the_recheck_is_refused_never_adopted() {
+        let deep = locate(&InstallOptions { dir: Some(r"C:\Tools\Omni".into()), yes: true, ..Default::default() }, &new_machine()).unwrap();
+        let (root, tools, volume) = (PathBuf::from(r"C:\Tools\Omni"), PathBuf::from(r"C:\Tools"), PathBuf::from(r"C:\"));
+        let only_volume = |p: &Path| p == volume.as_path();
+        let none = |_: &Path| None::<String>;
+        let no = |_: &Path| false;
+        let r = Recheck { is_dir: &only_volume, is_link: &no, foreign_owner: &none, swapper: &none, writable: &none };
+        // Unchanged: both created by us, parent first.
+        let made = std::cell::RefCell::new(Vec::new());
+        create_install_dir_with(&deep, &r, &mut |d: &Path| {
+            made.borrow_mut().push(d.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*made.borrow(), [tools.clone(), root.clone()]);
+        // The root appears between the re-check and its creation.
+        let appears = |at: PathBuf| move |d: &Path| {
+            if d == at { Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)) } else { Ok(()) }
+        };
+        let e = create_install_dir_with(&deep, &r, &mut appears(root.clone())).unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        assert!(e.to_string().starts_with(r"C:\Tools\Omni changed while Setup was running: it appeared"), "{e}");
+        // A missing parent appears (made by someone who may swap it).
+        let swaps = |p: &Path| (p == tools.as_path()).then(|| "Authenticated Users".to_string());
+        let r2 = Recheck { swapper: &swaps, ..r };
+        let e = create_install_dir_with(&deep, &r2, &mut appears(tools.clone())).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r"C:\Tools changed while Setup was running: it appeared and Authenticated Users may rename or re-permission it; nothing was installed."
+        );
+        // An existing root (before the re-check) is used as it is; nothing is created.
+        let exists_all = |_: &Path| true;
+        let r3 = Recheck { is_dir: &exists_all, ..r };
+        let made = std::cell::RefCell::new(0);
+        create_install_dir_with(&deep, &r3, &mut |_: &Path| {
+            *made.borrow_mut() += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(*made.borrow(), 0);
+    }
+
+    /// U3: an existing folder with no installation in it must not be open to others.
+    #[test]
+    fn an_existing_open_folder_without_an_installation_is_refused() {
+        let root = PathBuf::from(ROOT);
+        // Empty folder made by an administrator's mkdir: inherits Authenticated Users Modify.
+        let weak = FakeProbe { dirs: vec![root.clone()], writable: Some(r"NT AUTHORITY\Authenticated Users".into()), ..new_machine() };
+        let log = Log::default();
+        let e = plan_install(&InstallOptions { yes: true, ..opts() }, &weak)
+            .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()))
+            .unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        assert_eq!(
+            e.to_string(),
+            r"C:\OmniTest already exists and NT AUTHORITY\Authenticated Users can write to it, so files could be planted in it before Setup secures it. Remove the folder and let Setup create it, or choose another folder. Nothing was changed."
+        );
+        assert!(log.lines().is_empty());
+        // A pre-lockdown installation (trusted exe, weak ACL): upgraded as before.
+        let mut old = installed(DEFAULT_SERVICE_ACCOUNT);
+        old.dirs = vec![root.clone()];
+        old.writable = Some(r"NT AUTHORITY\Authenticated Users".into());
+        let plan = plan_install(&opts(), &old).unwrap();
+        assert!(plan.target.installed_here());
+        let log = Log::default();
+        run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap();
+        assert!(log.lines().iter().any(|l| l == "#stop_service"), "{:?}", log.lines());
+        // A planted exe (untrusted owner) in a weak folder: refused, and no upgrade.
+        let mut planted = old;
+        planted.service = None;
+        planted.configs.clear();
+        planted.untrusted = vec![root.join(EXE)];
+        let target = locate(&InstallOptions { yes: true, ..opts() }, &FakeProbe { writable: None, ..planted.clone_probe() }).unwrap();
+        assert_eq!(target.kind, InstallKind::Fresh, "a planted exe is not an installation");
+        let e = plan_install(&InstallOptions { yes: true, ..opts() }, &planted).unwrap_err();
+        assert!(e.to_string().contains("can write to it"), "{e}");
+        // A locked leftover (no exe, closed ACL) passes.
+        let leftover = FakeProbe { dirs: vec![root], ..new_machine() };
+        plan_install(&InstallOptions { yes: true, ..opts() }, &leftover).unwrap();
+    }
+
+    impl FakeProbe {
+        fn clone_probe(&self) -> FakeProbe {
+            FakeProbe {
+                files: self.files.clone(),
+                configs: self.configs.clone(),
+                service: self.service.clone(),
+                untrusted: self.untrusted.clone(),
+                dirs: self.dirs.clone(),
+                writable: self.writable.clone(),
+                ..new_machine()
+            }
+        }
+    }
+
+    /// U4: the root tree is walked once, the paths outside it once each, and a
+    /// cargo build in place not at all.
+    #[test]
+    fn each_tree_is_walked_once() {
+        let o = InstallOptions { watchfolder: Some(r"C:\Dalet\ingest".into()), yes: true, ..opts() };
+        let probe = new_machine();
+        plan_install(&o, &probe).unwrap();
+        assert_eq!(*probe.walks.borrow(), [PathBuf::from(ROOT), PathBuf::from(r"C:\Dalet\ingest")]);
+        // A cargo build run in place: the root is never walked.
+        let d = tempfile::tempdir().unwrap();
+        let repo = d.path().join("repo");
+        let release = repo.join("target").join("release");
+        let probe = FakeProbe { files: vec![(repo.join("Cargo.toml"), 1)], exe: Some(release.join(EXE)), ..new_machine() };
+        plan_install(&InstallOptions { dir: Some(release.clone()), yes: true, ..Default::default() }, &probe).unwrap();
+        assert!(probe.walks.borrow().iter().all(|w| !w.starts_with(&release)), "{:?}", probe.walks.borrow());
+    }
+
+    /// T3/T7: links are refused at plan time, before the service is stopped.
+    #[test]
+    fn a_link_where_this_run_writes_or_grants_is_refused_before_the_service_is_stopped() {
+        let paths = root_paths();
+        let refused = |probe: &FakeProbe, o: InstallOptions| {
+            let log = Log::default();
+            let r = plan_install(&o, probe).and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()));
+            (r, log.lines())
+        };
+        // A junction at archive on a plain upgrade.
+        let mut upgrade = installed(DEFAULT_SERVICE_ACCOUNT);
+        upgrade.links = vec![paths.archive.clone()];
+        let (r, lines) = refused(&upgrade, opts());
+        let e = r.unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        assert_eq!(
+            e.to_string(),
+            r"C:\OmniTest\archive is a link inside the installation. Setup does not copy or change permissions through a link. Remove it, or give the real folder in config.json, and run Setup again. Nothing was changed."
+        );
+        assert!(lines.is_empty(), "the machine was touched: {lines:?}");
+        // A link deep in data on a plain upgrade (account kept): nothing walks there.
+        upgrade.links = vec![paths.data.join("adblock").join("lists")];
+        let (r, lines) = refused(&upgrade, opts());
+        r.unwrap();
+        assert!(lines.iter().any(|l| l == "#stop_service"));
+        // The same link when this run changes permissions.
+        let (r, lines) = refused(&upgrade, InstallOptions { account: Some(r"DOMAIN\svc_test".into()), ..opts() });
+        assert!(r.unwrap_err().to_string().starts_with(r"C:\OmniTest\data\adblock\lists is a link inside the installation."));
+        assert!(lines.is_empty());
+        // A link in a local watchfolder outside the root, with an account change.
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.links = vec![PathBuf::from(r"C:\Dalet\ingest\old")];
+        let (r, lines) = refused(&probe, InstallOptions { account: Some(r"DOMAIN\svc_test".into()), ..opts() });
+        assert!(r.unwrap_err().to_string().starts_with(r"C:\Dalet\ingest\old is a link inside the installation."));
+        assert!(lines.is_empty());
+    }
+
+    /// S9: a tool is replaced through a new file and a rename: a hard link at the
+    /// destination is cut loose, never written through, and nothing is left behind.
+    #[test]
+    fn a_tool_is_replaced_by_rename_and_a_hard_link_is_not_written_through() {
+        let d = tempfile::tempdir().unwrap();
+        let (src, dst, other) = (d.path().join("new.exe"), d.path().join("ffmpeg.exe"), d.path().join("elsewhere.exe"));
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&other, b"someone else's file").unwrap();
+        std::fs::hard_link(&other, &dst).unwrap();
+        replace_file(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        assert_eq!(std::fs::read(&other).unwrap(), b"someone else's file", "written through a hard link");
+        assert!(!staged_name(&dst).exists());
+        // A failed copy leaves no staged file and names nothing it did not touch.
+        let e = replace_file(&d.path().join("missing.exe"), &dst).unwrap_err();
+        assert!(!staged_name(&dst).exists(), "{e}");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        // A destination that cannot be replaced (a folder): the staged file is removed.
+        let folder = d.path().join("bmxtranswrap.exe");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(replace_file(&src, &folder).is_err());
+        assert!(!staged_name(&folder).exists());
+        // Through copy_tools the error names the tool.
+        let (from, to) = (d.path().join("from"), d.path().join("to"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(to.join("ffprobe.exe")).unwrap();
+        std::fs::write(from.join("ffprobe.exe"), b"probe").unwrap();
+        let e = copy_tools(&from, &to, &mut Log::default()).unwrap_err();
+        assert!(format!("{e:#}").contains(r"bin\ffprobe.exe"), "{e:#}");
+        assert!(!to.join("ffprobe.exe.omni-new").exists());
+        // Leftovers are program files.
+        assert!(program_files(&to).iter().any(|p| p.ends_with("journalists.seed.json.omni-new")));
+    }
+
+    /// S1: nothing is created through a link below the root.
+    #[test]
+    fn the_state_folders_are_not_created_through_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_root(d.path().join("Omni"), "config.json");
+        let data = paths.data.clone();
+        let e = ensure_dirs_with(&paths, &|p: &Path| p == data).unwrap_err();
+        assert!(e.to_string().contains("is reached through a link"), "{e}");
+        assert!(!paths.temp.exists(), "nothing was created");
+        ensure_dirs_with(&paths, &|_: &Path| false).unwrap();
+        assert!(paths.data.join("adblock").is_dir() && paths.temp.join("jobs").is_dir());
+    }
+
+    /// The permission changes a fake records, and the links it pretends exist.
+    struct FakeAcl {
+        log: Log,
+        links: Vec<PathBuf>,
+        entries: Vec<PathBuf>,
+    }
+
+    impl AclOps for FakeAcl {
+        fn is_link(&self, path: &Path) -> bool {
+            self.links.iter().any(|l| l == path)
+        }
+        fn first_link_in_tree(&self, path: &Path) -> Option<PathBuf> {
+            self.links.iter().find(|l| l.starts_with(path)).cloned()
+        }
+        fn entries(&self, _dir: &Path) -> Vec<PathBuf> {
+            self.entries.clone()
+        }
+        async fn remove_grants(&mut self, path: &Path, account: &str, recursive: bool) -> Result<()> {
+            self.log.push(format!("#remove_grants {} {account} {}", path.display(), if recursive { "/T" } else { "here" }));
+            Ok(())
+        }
+        async fn lock_root(&mut self, root: &Path, _account: Option<&str>) -> Result<()> {
+            self.log.push(format!("#lock_root {}", root.display()));
+            Ok(())
+        }
+        async fn grant_modify(&mut self, account: &str, path: &Path, _rights: Rights, _p: &mut dyn Progress) -> bool {
+            self.log.push(format!("#grant {account} {}", path.display()));
+            true
+        }
+        async fn lock_dirs(&mut self, dirs: &[PathBuf], _account: omni_core::lockdown::Account) -> Result<()> {
+            for d in dirs {
+                self.log.push(format!("#lock_dir {}", d.display()));
+            }
+            Ok(())
+        }
+    }
+
+    /// S1: the service account may write temp, data, archive...; a link there
+    /// must not turn an elevated grant into Modify on something else.
+    #[test]
+    fn no_permission_change_goes_through_a_link_and_the_rest_still_does() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("OmniTest");
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = AppPaths::with_root(&root, "config.json");
+        let mut config = AppConfig::default();
+        config.watchfolder_path = r"D:\Dalet".into();
+        let account = ServiceAccount { name: DEFAULT_SERVICE_ACCOUNT.into(), password: None };
+        let grants = grant_plan_with(&paths, &config, true, &MappedZ);
+        let links = vec![paths.temp.clone(), paths.data.join("adblock"), paths.archive.join("2026")];
+        let log = Log::default();
+        let mut acl = FakeAcl {
+            log: log.clone(),
+            links: links.clone(),
+            entries: ["archive", "bin", "data", "logs", "omni-ingest.exe", "temp"].iter().map(|e| root.join(e)).collect(),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(apply_acls_on(&paths, &config, Some(&account), Some("LocalSystem"), true, &grants, &mut log.clone(), &mut acl));
+        let lines = log.lines();
+        let touched = |p: &Path| {
+            let p = p.display().to_string();
+            lines.iter().any(|l| l.starts_with('#') && (l.ends_with(&p) || l.contains(&format!("{p} "))))
+        };
+        for bad in [&paths.temp, &paths.data, &paths.archive] {
+            assert!(!touched(bad), "{bad:?} was changed through a link: {lines:#?}");
+            assert!(lines.iter().any(|l| l.starts_with(&format!("✗ {} contains a link", bad.display()))), "{lines:#?}");
+        }
+        for good in [&paths.logs, &paths.bin] {
+            assert!(lines.iter().any(|l| *l == format!(r"#grant NT SERVICE\OmniIngestService {}", good.display())), "{good:?}: {lines:#?}");
+        }
+        assert!(lines.contains(&format!(r"#grant NT SERVICE\OmniIngestService {}", paths.config.display())));
+        // The root tree holds links: no /T over it, the root alone, each clean entry recursively.
+        assert!(lines.contains(&format!(r"#remove_grants {} NT SERVICE\OmniIngestService here", root.display())), "{lines:#?}");
+        assert!(lines.contains(&format!(r"#remove_grants {} NT SERVICE\OmniIngestService /T", paths.logs.display())));
+        assert!(!lines.contains(&format!(r"#remove_grants {} NT SERVICE\OmniIngestService /T", root.display())));
+        assert!(!lines.iter().any(|l| l.starts_with("#lock_root")), "the root's tree holds a link: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.starts_with("#lock_dir")), "data and temp both hold links: {lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("! The service will NOT start")), "{lines:#?}");
+
+        // Without links everything is changed as before.
+        let log = Log::default();
+        let mut acl = FakeAcl { log: log.clone(), links: Vec::new(), entries: Vec::new() };
+        rt.block_on(apply_acls_on(&paths, &config, Some(&account), None, true, &grants, &mut log.clone(), &mut acl));
+        let lines = log.lines();
+        assert!(lines.contains(&format!("#lock_root {}", root.display())), "{lines:#?}");
+        assert!(lines.contains(&format!("#lock_dir {}", paths.temp.display())));
+        assert!(lines.contains(&format!(r"#remove_grants {} NT SERVICE\OmniIngestService /T", root.display())));
+        assert!(!lines.iter().any(|l| l.contains("contains a link") || l.contains("NOT start")), "{lines:#?}");
+    }
+
+    /// R2c: `bin` and `data` are writable by the service account; an elevated
+    /// copy must not be sent elsewhere by a link there.
+    #[test]
+    fn copying_into_a_linked_folder_or_onto_a_linked_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let (from, to) = (d.path().join("from"), d.path().join("to"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("ffmpeg.exe"), b"new").unwrap();
+        std::fs::write(from.join("journalists.seed.json"), b"[]").unwrap();
+        let link = |names: &'static [&'static str]| move |p: &Path| names.iter().any(|n| p.ends_with(n));
+        let e = copy_tools_with(&from, &to, &mut Log::default(), &link(&["to"])).unwrap_err();
+        assert!(e.to_string().contains("is a link"), "{e}");
+        assert!(!to.exists(), "nothing was written");
+        let e = copy_tools_with(&from, &to, &mut Log::default(), &link(&["ffmpeg.exe"])).unwrap_err();
+        assert!(e.to_string().contains("is a link"), "{e}");
+        assert!(!to.join("ffmpeg.exe").exists());
+        assert!(copy_missing_with(&from, &to, SEEDS, &mut Log::default(), &link(&["to"])).is_err());
+        assert!(!to.join("journalists.seed.json").exists());
+        copy_tools_with(&from, &to, &mut Log::default(), &link(&[])).unwrap();
+        assert_eq!(std::fs::read(to.join("ffmpeg.exe")).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copying_into_a_real_directory_symlink_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let (from, elsewhere, bin) = (d.path().join("from"), d.path().join("elsewhere"), d.path().join("bin"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(from.join("ffmpeg.exe"), b"new").unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_dir(&elsewhere, &bin) {
+            eprintln!("SKIPPED copying_into_a_real_directory_symlink_is_refused: this account may not create symbolic links ({e})");
+            return;
+        }
+        assert!(copy_tools(&from, &bin, &mut Log::default()).is_err());
+        assert!(!elsewhere.join("ffmpeg.exe").exists());
+    }
+
+    /// P13.1b: an answer file's watchfolder on a mapped drive letter is refused with
+    /// `watchfolder_problem`'s own text, before the machine is touched.
+    #[test]
+    fn an_answer_file_watchfolder_on_a_mapped_drive_is_refused_before_anything_is_touched() {
+        let mut answered = AppConfig::default();
+        answered.watchfolder_path = r"Z:\Dalet\Ingest".into();
+        answered.web_port = 8095;
+        for yes in [true, false] {
+            let o = InstallOptions { yes, ..opts() }.with_base_config(answered.clone());
+            let log = Log::default();
+            let result = plan_install(&o, &new_machine())
+                .and_then(|plan| run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).map(|_| ()));
+            let err = result.unwrap_err().to_string();
+            let problem = omni_core::paths::watchfolder_problem_with(r"Z:\Dalet\Ingest", &MappedZ).unwrap();
+            assert_eq!(err, format!("Cannot install: {problem}"));
+            assert!(log.lines().is_empty(), "the machine was touched: {:?}", log.lines());
+        }
+    }
+
+    #[test]
+    fn an_answer_file_is_the_starting_config_of_a_new_installation_only() {
+        let mut answered = AppConfig::default();
+        answered.watchfolder_path = r"\\dalet\ingest".into();
+        answered.web_port = 8095;
+        answered.setup_mode = "it".into();
+        let o = InstallOptions { account: Some(r"DOMAIN\svc_test".into()), ..opts() }.with_base_config(answered);
+        let plan = plan_install(&o, &new_machine()).unwrap();
+        assert_eq!(plan.watchfolder_source, WatchfolderSource::Options);
+        assert_eq!(plan.config.watchfolder_path, r"\\dalet\ingest");
+        assert_eq!((plan.port, plan.config.setup_mode.as_str()), (8095, "it"));
+        assert!(plan.write_config && !plan.config.setup_completed);
+        // An existing config.json wins over it.
+        let mut existing = installed(DEFAULT_SERVICE_ACCOUNT);
+        existing.service = None;
+        existing.files.clear();
+        let mut base = AppConfig::default();
+        base.web_port = 8095;
+        let plan = plan_install(&InstallOptions { base_config: Some(base), ..opts() }, &existing).unwrap();
+        assert_eq!(plan.port, 8090);
+    }
+
+    #[test]
+    fn program_files_are_what_the_installer_copies_and_never_the_state() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("Omni");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin").join("avcodec-61.dll"), b"x").unwrap();
+        std::fs::write(root.join("bin").join("notes.txt"), b"x").unwrap();
+        let files = program_files(&root);
+        for f in ["omni-ingest.exe", "omni-ingest.exe.prev", "omni-ingest.exe.new"] {
+            assert!(files.contains(&root.join(f)), "{f}");
+        }
+        for t in TOOLS.iter().chain(SELF_UPDATING).chain(&["avcodec-61.dll"]) {
+            assert!(files.contains(&root.join("bin").join(t)), "{t}");
+        }
+        // The seeds are the station's data once read: never a program file (R4).
+        for s in SEEDS {
+            assert!(!files.contains(&root.join("data").join(s)), "{s}");
+        }
+        assert!(!files.contains(&root.join("bin").join("notes.txt")));
+        for state in ["config.json", "data", "logs", "temp", "archive", "watchfolder", "bin"] {
+            assert!(!files.contains(&root.join(state)), "{state}");
+        }
+        assert!(files.iter().all(|f| f.starts_with(&root)));
     }
 
     #[test]
@@ -1952,6 +3274,40 @@ mod tests {
         // A kept LocalSystem service gets the hint.
         let plan = plan_install(&opts(), &installed("LocalSystem")).unwrap();
         assert!(!plan.account.registers() && plan.switch_hint);
+    }
+
+    /// The SCM reports the service's whole command line. Read as a path it never
+    /// matched the install folder's exe, so every upgrade re-registered the service
+    /// (and moved a named or LocalSystem service to the default account).
+    #[test]
+    fn an_in_place_upgrade_of_a_service_registered_with_its_arguments_keeps_its_account() {
+        let raw = r"C:\OmniTest\omni-ingest.exe run-service";
+        let target = root_paths().root.join(EXE);
+        let same = |a: &Path, b: &Path| key(a) == key(b);
+        // What was wrong: the raw command line re-registers.
+        let wrong = account_plan_with(Some(Path::new(raw)), &target, None, Some(r"DOMAIN\svc_test"), &same);
+        assert!(wrong.register, "control: the raw command line never matches");
+        // The path the service now reports.
+        let mut probe = installed(r"DOMAIN\svc_test");
+        probe.service = Some((omni_service::exe_of_service_command(raw), r"DOMAIN\svc_test".into()));
+        let plan = plan_install(&opts(), &probe).unwrap();
+        assert_eq!(plan.account, AccountDecision::Keep { current: Some(r"DOMAIN\svc_test".into()) });
+        assert!(plan.questions.is_empty(), "no password is asked for a kept account");
+        assert!(plan.grants.is_empty());
+        assert_eq!(plan.target.kind, InstallKind::Upgrade { had_previous_exe: true });
+    }
+
+    #[test]
+    fn an_aborted_prompt_is_a_cancel_and_other_prompt_failures_are_not() {
+        use inquire::InquireError;
+        for e in [InquireError::OperationCanceled, InquireError::OperationInterrupted] {
+            let err = answered::<String>(Err(e), "No password given").unwrap_err();
+            assert!(err.downcast_ref::<Cancelled>().is_some());
+            assert_eq!(err.to_string(), "Installation cancelled.");
+        }
+        let err = answered::<String>(Err(InquireError::NotTTY), "No password given").unwrap_err();
+        assert!(err.downcast_ref::<Cancelled>().is_none());
+        assert_eq!(err.to_string(), "No password given");
     }
 
     #[test]
@@ -2094,8 +3450,8 @@ mod tests {
     const HEALTHY: &str = r#"{"status":"ok","checks":{"database":"ok","watchfolder":"warn"}}"#;
 
     impl Machine for FakeMachine {
-        fn create_dir(&mut self, dir: &Path) -> Result<()> {
-            self.log.push(format!("#create_dir {}", dir.display()));
+        fn create_dir(&mut self, t: &Target) -> Result<()> {
+            self.log.push(format!("#create_dir {}", t.dir.display()));
             Ok(())
         }
         fn import(&mut self, old: &Path, _new: &AppPaths, _p: &mut dyn Progress) -> Result<()> {

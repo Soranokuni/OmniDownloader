@@ -780,6 +780,7 @@ async fn main() -> Result<()> {
                 yes: *yes,
                 no_firewall: *no_firewall,
                 import: import.clone(),
+                base_config: None,
             })
             .await;
         }

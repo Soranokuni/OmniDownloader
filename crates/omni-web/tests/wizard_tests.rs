@@ -362,6 +362,94 @@ async fn completing_setup_records_the_mode_and_the_answer_file_has_no_secret() -
     Ok(())
 }
 
+/// Every leaf of a JSON document with its dotted path.
+fn leaves(v: &Value, prefix: &str, out: &mut Vec<(String, Value)>) {
+    match v.as_object() {
+        Some(m) => {
+            for (k, v) in m {
+                let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                leaves(v, &key, out);
+            }
+        }
+        None => out.push((prefix.to_string(), v.clone())),
+    }
+}
+
+/// P13.1b: what the admin page exports, Setup reads back. A key added to the
+/// export without an import mapping (or a mapping dropped) fails here.
+#[tokio::test]
+async fn the_answer_file_reads_back_into_every_exported_setting() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let export = |cfg: AppConfig| {
+        let (app, tok) = (&app, tok.clone());
+        async move {
+            *app.state.config.write().await = cfg;
+            let r = send(app, "GET", "/api/admin/settings/answer-file", Some(&tok), None).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+            r.json()
+        }
+    };
+
+    let mut c = AppConfig::default();
+    c.setup_completed = true;
+    c.setup_mode = "it".into();
+    c.watchfolder_path = r"\\dalet-test\ingest".into();
+    c.web_port = 8443;
+    c.security.mcr_open_networks = vec!["10.20.0.0/16".into()];
+    c.archive.enabled = false;
+    c.archive.retention_days = 30;
+    c.tls.cert_path = Some(r"C:\certs\panel.pfx".into());
+    c.security.trust_proxy_header = true;
+    c.security.trusted_proxies = vec!["10.0.0.5/32".into()];
+    c.security.allowed_hosts = vec!["ingest.newsroom.example".into()];
+    c.metrics.enabled = true;
+    c.metrics.allow_networks = vec!["10.9.0.0/24".into()];
+    c.graph.tenant_id = "tenant-test".into();
+    c.graph.client_id = "client-test".into();
+    c.graph.mailbox = "ingest@newsroom.example".into();
+    c.graph.client_secret = "zzz-graph-secret".into();
+    c.llm.mode = omni_core::config::LlmMode::Off;
+    c.llm.provider = "openai".into();
+    c.ollama_endpoint = "http://llm.example/v1".into();
+    c.ollama_model = "model-test".into();
+
+    let defaults = export(AppConfig::default()).await;
+    let doc = export(c).await;
+    let (mut set, mut default_leaves) = (Vec::new(), Vec::new());
+    leaves(&doc, "", &mut set);
+    leaves(&defaults, "", &mut default_leaves);
+    // The test sets every exported setting away from its default, so a missing mapping shows.
+    for (key, value) in &set {
+        if key == "answer_file_version" {
+            continue;
+        }
+        let default = default_leaves.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        assert_ne!(Some(value), default, "set {key} to a non-default value in this test");
+    }
+
+    let applied = omni_core::answer_file::apply(&doc, AppConfig::default())?;
+    assert!(!applied.config.setup_completed, "a new installation starts with the wizard pending");
+    assert!(applied.config.graph.client_secret.is_empty());
+    assert_eq!(applied.notes, [omni_core::answer_file::TLS_NOTE]);
+    let back = export(applied.config).await;
+    let mut back_leaves = Vec::new();
+    leaves(&back, "", &mut back_leaves);
+    for (key, value) in &set {
+        let got = back_leaves.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        if key == "setup_completed" {
+            assert_eq!(got, Some(&json!(false)));
+        } else if key == "tls.cert_path" {
+            // Not applied on purpose: the certificate and its passphrase are not on the
+            // new machine, and a panel that cannot start leaves the wizard unreachable.
+            assert_eq!(got, Some(&Value::Null));
+        } else {
+            assert_eq!(got, Some(value), "{key} did not survive the answer file");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn two_concurrent_account_steps_create_exactly_one_administrator() -> Result<()> {
     let app = app(true)?;
