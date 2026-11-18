@@ -60,20 +60,62 @@ pub fn is_link(path: &Path) -> bool {
     }
 }
 
-/// The reparse tag of `path` (`WIN32_FIND_DATAW.dwReserved0` of the entry itself).
+/// The reparse tag of the entry `path` itself (0 for one that is no reparse
+/// point), read from a handle opened on the entry, never on its target
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`). The name is given in its `\\?\` form, so
+/// a path of 260 characters or more is read like any other.
 #[cfg(windows)]
 fn reparse_tag(path: &Path) -> Option<u32> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
-    let name: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let mut data = WIN32_FIND_DATAW::default();
-    // SAFETY: the name is NUL-terminated and `data` outlives the call; the handle is closed once.
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let name: Vec<u16> = verbatim(path)?.into_iter().chain(std::iter::once(0)).collect();
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: the name is NUL-terminated and outlives the call; `info` is the
+    // buffer of the size given; the handle is closed once.
     unsafe {
-        let handle = FindFirstFileW(PCWSTR(name.as_ptr()), &mut data).ok()?;
-        let _ = FindClose(handle);
+        let handle = CreateFileW(
+            PCWSTR(name.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+        .ok()?;
+        let read = GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            &mut info as *mut FILE_ATTRIBUTE_TAG_INFO as *mut core::ffi::c_void,
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        );
+        let _ = CloseHandle(handle);
+        read.ok()?;
     }
-    Some(data.dwReserved0)
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    Some(if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 { 0 } else { info.ReparseTag })
+}
+
+/// `path` made absolute and in its `\\?\` (or `\\?\UNC\`) form, which Windows
+/// takes at any length. `std::path::absolute` resolves `.`, `..` and `/` first,
+/// which the verbatim form would not.
+#[cfg(windows)]
+fn verbatim(path: &Path) -> Option<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let abs: Vec<u16> = std::path::absolute(path).ok()?.as_os_str().encode_wide().collect();
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+    if abs.starts_with(&wide(r"\\?\")) || abs.starts_with(&wide(r"\\.\")) {
+        return Some(abs);
+    }
+    if abs.starts_with(&wide(r"\\")) {
+        return Some(wide(r"\\?\UNC\").into_iter().chain(abs[2..].iter().copied()).collect());
+    }
+    Some(wide(r"\\?\").into_iter().chain(abs).collect())
 }
 
 /// The first link (by `is_link`) on the way from below `root` down to `path`
@@ -207,6 +249,39 @@ mod tests {
         assert_eq!(link_below(d.path(), &link.join("x"), &is_link), Some(link.clone()));
         assert_eq!(first_link_in_tree(d.path(), &is_link), Some(link.clone()));
         assert_eq!(first_link_in_tree(&target, &is_link), None);
+    }
+
+    /// P13.1b2 A5: the tag was read with `FindFirstFileW` on the plain name, which
+    /// fails at 260 characters, and an unreadable tag counts as a link.
+    #[cfg(windows)]
+    #[test]
+    fn the_tag_of_an_entry_at_a_long_path_is_read() {
+        let d = tempfile::tempdir().unwrap();
+        let mut dir = d.path().to_path_buf();
+        for i in 0..4 {
+            dir.push(format!("{}{i}", "a".repeat(80)));
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("SKIPPED the_tag_of_an_entry_at_a_long_path_is_read: Windows refused a long path here ({e})");
+            return;
+        }
+        let file = dir.join("plain.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(file.as_os_str().len() > 260, "{}", file.as_os_str().len());
+        assert_eq!(reparse_tag(&file), Some(0), "the tag of an ordinary file at a long path was not read");
+        assert_eq!(reparse_tag(&dir), Some(0));
+        assert!(!is_link(&file) && !is_link(&dir));
+        assert_eq!(reparse_tag(&dir.join("missing")), None);
+        // A real link at a long path is still one.
+        let link = dir.join("link");
+        match std::os::windows::fs::symlink_dir(d.path(), &link) {
+            Ok(()) => {
+                assert!(is_link(&link));
+                assert!(reparse_tag(&link).is_some_and(is_name_surrogate));
+                std::fs::remove_dir(&link).unwrap();
+            }
+            Err(e) => eprintln!("SKIPPED the long-path symbolic link half: this account may not create symbolic links ({e})"),
+        }
     }
 
     /// U2: only a name surrogate sends a path elsewhere; a deduplicated or

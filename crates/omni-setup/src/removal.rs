@@ -127,7 +127,12 @@ pub fn removal_plan(root: &Path, paths: &AppPaths, config: Option<&AppConfig>, r
 
     // ---- data ----------------------------------------------------------------
     if remove_data {
-        for f in [paths.config.clone(), paths.root.join(SETUP_LOG)] {
+        // `config.json.prev`: the copy an upgrade keeps before rewriting it (P13.1b2), configuration too.
+        let config_prev = paths.config.with_file_name(format!(
+            "{}.prev",
+            paths.config.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        for f in [paths.config.clone(), config_prev, paths.root.join(SETUP_LOG)] {
             if f.is_file() && strictly_inside(&f, &paths.root) && !touches_watch(&f) {
                 plan.push(Removal::File(f));
             }
@@ -260,7 +265,7 @@ mod tests {
         for dir in ["bin", "data", "logs", "temp", "archive", "watchfolder"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        for f in ["omni-ingest.exe", "omni-ingest.exe.prev", "OmniIngest-Setup.exe", "config.json", "notes-by-admin.txt"] {
+        for f in ["omni-ingest.exe", "omni-ingest.exe.prev", "OmniIngest-Setup.exe", "config.json", "config.json.prev", "notes-by-admin.txt"] {
             std::fs::write(root.join(f), b"x").unwrap();
         }
         for f in [
@@ -299,7 +304,7 @@ mod tests {
         for f in ["omni-ingest.exe", "omni-ingest.exe.prev", "OmniIngest-Setup.exe", r"bin\ffmpeg.exe", r"bin\yt-dlp.exe"] {
             assert!(gone.contains(&root.join(f)), "{f}: {plan:?}");
         }
-        for state in ["config.json", "data", "logs", "temp", "archive", "notes-by-admin.txt"] {
+        for state in ["config.json", "config.json.prev", "data", "logs", "temp", "archive", "notes-by-admin.txt"] {
             assert!(!gone.iter().any(|g| within(g, &root.join(state))), "{state} would go: {plan:?}");
         }
         assert!(gone.iter().all(|g| strictly_inside(g, &root) || *g == root), "{plan:?}");
@@ -346,6 +351,7 @@ mod tests {
         let plan = removal_plan(&root, &paths(&root), Some(&c), true).unwrap();
         let gone = removed(&plan);
         assert!(gone.contains(&root.join("config.json")));
+        assert!(gone.contains(&root.join("config.json.prev")), "{plan:?}");
         for dir in ["data", "logs", "temp"] {
             assert!(plan.contains(&Removal::Tree(root.join(dir))), "{dir}: {plan:?}");
         }
@@ -418,7 +424,7 @@ mod tests {
         assert!(running.exists());
         assert!(root.join("watchfolder").join("CLIP.mxf").exists(), "a delivered video is never removed");
         assert!(root.join("notes-by-admin.txt").exists(), "what the installer did not put there stays");
-        for gone in ["omni-ingest.exe", "omni-ingest.exe.prev", "config.json", "bin", "data", "logs", "temp", "archive"] {
+        for gone in ["omni-ingest.exe", "omni-ingest.exe.prev", "config.json", "config.json.prev", "bin", "data", "logs", "temp", "archive"] {
             assert!(!root.join(gone).exists(), "{gone}");
         }
         assert!(d.path().exists());

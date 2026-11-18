@@ -39,9 +39,10 @@ use inquire::Text;
 use omni_core::config::AppConfig;
 use omni_core::paths::{AppPaths, DriveLookup};
 use omni_service::{
-    can_install_services, default_or_given, install_service, installed_service_account, installed_service_exe,
-    needs_network_identity_with, network_share_warning_applies, start_service,
-    stop_service_and_wait, uninstall_service, AccountChoice, ServiceAccount, DEFAULT_SERVICE_ACCOUNT,
+    can_install_services, check_service_logon, default_or_given, grant_service_logon_right, install_service,
+    installed_service_account, installed_service_exe, needs_network_identity_with, network_share_warning_applies,
+    reconfigure_service, start_service, stop_service_and_wait, uninstall_service, AccountChoice, ServiceAccount,
+    DEFAULT_SERVICE_ACCOUNT,
 };
 
 pub const DEFAULT_DIR: &str = r"C:\OmniIngest";
@@ -126,8 +127,9 @@ pub trait Probe {
     /// The first link at or anywhere below `dir`, never entering one; `None`
     /// for a missing `dir`.
     fn first_link_under(&self, dir: &Path) -> Option<PathBuf>;
-    /// Whether a file's owner is Administrators, SYSTEM or TrustedInstaller.
-    fn trusted_owner(&self, path: &Path) -> bool;
+    /// A file's owner when it is not Administrators, SYSTEM or TrustedInstaller
+    /// (an owner that cannot be read is not trusted); `None` for a trusted one.
+    fn untrusted_owner(&self, path: &Path) -> Option<String>;
     /// Who besides those (and CREATOR OWNER) may put files into `dir` or take
     /// it over, inherit-only entries included.
     fn writable_by(&self, dir: &Path) -> Option<String>;
@@ -186,8 +188,14 @@ impl Probe for SystemProbe {
     fn first_link_under(&self, dir: &Path) -> Option<PathBuf> {
         omni_core::fsutil::first_link_in_tree(dir, &omni_core::fsutil::is_link)
     }
-    fn trusted_owner(&self, path: &Path) -> bool {
-        omni_core::lockdown::owner_sid(path).is_some_and(|sid| omni_core::lockdown::is_trusted_owner(&sid))
+    fn untrusted_owner(&self, path: &Path) -> Option<String> {
+        match omni_core::lockdown::owner_sid(path) {
+            Some(sid) if omni_core::lockdown::is_trusted_owner(&sid) => None,
+            _ => Some(
+                omni_core::lockdown::foreign_owner(path)
+                    .unwrap_or_else(|| "an account whose ownership Setup cannot read".into()),
+            ),
+        }
     }
     fn writable_by(&self, dir: &Path) -> Option<String> {
         omni_core::lockdown::writable_by(dir)
@@ -330,12 +338,53 @@ pub struct InstallPlan {
     pub previous_account: Option<String>,
     /// The ACL steps when the service is registered (`grant_plan`); empty otherwise.
     pub grants: Vec<(PathBuf, Rights)>,
+    /// The previous account's ACL steps, for putting an existing service's
+    /// registration back after a failed change (P13.1b2): planned like `grants`,
+    /// for the previous account and the configuration that was there. Empty
+    /// when nothing is re-registered, no service existed, or the previous
+    /// account cannot be restored (it needs a password, or it is unknown).
+    pub rollback_grants: Vec<(PathBuf, Rights)>,
     /// The firewall rule's port, unless `--no-firewall` or a loopback panel.
     pub firewall: Option<u16>,
     /// Where `/api/health` is asked, and whether the panel speaks TLS.
     pub health: SocketAddr,
     pub tls: bool,
+    /// Where the service answers after a way back (P13.1b2 V2/V3).
+    pub previous: PreviousEndpoints,
     pub questions: Vec<Question>,
+}
+
+/// Where a service answers and which firewall rule it needs, read from one
+/// configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Endpoint {
+    pub health: SocketAddr,
+    pub tls: bool,
+    /// The firewall rule's port, by the same rule as [`InstallPlan::firewall`].
+    pub firewall: Option<u16>,
+}
+
+impl Endpoint {
+    fn of(config: &AppConfig, no_firewall: bool) -> Self {
+        Endpoint {
+            health: health_address(config),
+            tls: config.tls.is_enabled(),
+            firewall: (!no_firewall && !is_loopback(&config.web_host)).then_some(config.web_port),
+        }
+    }
+}
+
+/// The endpoints a way back can leave the service on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousEndpoints {
+    /// The service registered for another folder's executable before this run.
+    pub elsewhere: bool,
+    /// This root's configuration as it was before the run (the new one when
+    /// there was none).
+    pub here: Endpoint,
+    /// The other folder's configuration, when the service was registered
+    /// there; `None` when it could not be read.
+    pub there: Option<Endpoint>,
 }
 
 impl fmt::Debug for InstallPlan {
@@ -354,9 +403,11 @@ impl fmt::Debug for InstallPlan {
             .field("switch_hint", &self.switch_hint)
             .field("previous_account", &self.previous_account)
             .field("grants", &self.grants)
+            .field("rollback_grants", &self.rollback_grants)
             .field("firewall", &self.firewall)
             .field("health", &self.health)
             .field("tls", &self.tls)
+            .field("previous", &self.previous)
             .field("questions", &self.questions)
             .finish()
     }
@@ -491,8 +542,11 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
     // A cargo build run in place is never locked, so it is not judged either (T1).
     let development = in_place && is_cargo_build(&source_exe, &|p| probe.is_file(p));
     // An installation is here only when its executable is one an administrator
-    // put there: a planted one makes nothing an upgrade (U3).
-    let had_previous_exe = probe.exists(&target_exe) && (development || probe.trusted_owner(&target_exe));
+    // put there: a planted one makes nothing an upgrade (U3). A link is no
+    // executable at all: its owner would be read through it (P13.1b2 A4).
+    let exe_here = probe.exists(&target_exe) && !probe.is_link(&target_exe);
+    let exe_owner = if exe_here && !development { probe.untrusted_owner(&target_exe) } else { None };
+    let had_previous_exe = exe_here && exe_owner.is_none();
     let kind = if had_previous_exe || service_exe.is_some() {
         InstallKind::Upgrade { had_previous_exe }
     } else {
@@ -510,7 +564,13 @@ pub fn locate(o: &InstallOptions, probe: &dyn Probe) -> Result<Target> {
         // in it meanwhile (U3). A locked leftover of an uninstall passes.
         if !had_previous_exe && probe.exists(&paths.root) {
             if let Some(who) = probe.writable_by(&paths.root) {
-                return Err(Refusal { notice: Vec::new(), message: writable_refusal(&paths.root, &who) }.into());
+                // A folder that holds an executable may hold the station's data
+                // too: never tell the operator to remove it (P13.1b2 A2).
+                let message = match &exe_owner {
+                    Some(owner) => untrusted_exe_refusal(&target_exe, owner, &paths.root),
+                    None => writable_refusal(&paths.root, &who),
+                };
+                return Err(Refusal { notice: Vec::new(), message }.into());
             }
         }
         // A folder above the root that someone else may rename or owns lets
@@ -543,6 +603,15 @@ fn writable_refusal(dir: &Path, who: &str) -> String {
     format!(
         "{} already exists and {who} can write to it, so files could be planted in it before Setup secures it. Remove \
          the folder and let Setup create it, or choose another folder. Nothing was changed.",
+        dir.display()
+    )
+}
+
+fn untrusted_exe_refusal(exe: &Path, owner: &str, dir: &Path) -> String {
+    format!(
+        "{} belongs to {owner}, not to Administrators, so Setup cannot tell whether this installation is the one you \
+         made. If it is yours, run: icacls \"{}\" /setowner Administrators /T  and start Setup again. Nothing was changed.",
+        exe.display(),
         dir.display()
     )
 }
@@ -580,16 +649,92 @@ fn planned_link(t: &Target, grants: &[(PathBuf, Rights)], registers: bool, probe
         }
     }
     // What lies inside the root was walked with it (or, for a cargo build in
-    // place, is never locked): only the paths outside it, each once (U4).
-    let mut outside: Vec<&PathBuf> = Vec::new();
+    // place, is never locked): only the paths outside it, each once (U4). A
+    // path written with `..` (`<root>\..\Archive`) is judged where it leads.
+    let root = lexical(&p.root);
+    let mut outside: Vec<PathBuf> = Vec::new();
     for (path, _) in grants {
         let s = path.to_string_lossy();
         let share = s.starts_with(r"\\") || s.starts_with("//");
-        if !share && !path.starts_with(&p.root) && !outside.contains(&path) {
+        let path = lexical(path);
+        if !share && !path.starts_with(&root) && !outside.contains(&path) {
             outside.push(path);
         }
     }
-    outside.into_iter().find_map(|path| probe.first_link_under(path))
+    outside.into_iter().find_map(|path| probe.first_link_under(&path))
+}
+
+/// `path` with its `.` and `..` components resolved by name alone, without
+/// touching the disk. A `..` at the volume root stays there, as Windows reads it.
+pub(crate) fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Who a grant goes to: the service account, or Authenticated Users for the
+/// watchfolder inside the root; `None` for the root's lockdown or a grant a
+/// LocalSystem service does not get.
+fn grant_principal(rights: Rights, account: Option<&str>) -> Option<String> {
+    match rights {
+        Rights::LockRoot => None,
+        Rights::ModifyAuthenticatedUsers => Some(AUTHENTICATED_USERS.to_string()),
+        Rights::ModifyDir | Rights::ModifyFile => account.map(String::from),
+    }
+}
+
+/// For a local path outside `root`, the first folder strictly above it (the
+/// volume root excluded) that is a link or a mounted volume, which Setup cannot
+/// tell apart (P13.1b2 V4). `None` inside the root, for a share, or when none is.
+fn link_above_outside(root: &Path, path: &Path, is_link: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\") || s.starts_with("//") {
+        return None;
+    }
+    let path = lexical(path);
+    if path.starts_with(lexical(root)) {
+        return None;
+    }
+    path.ancestors().skip(1).filter(|a| a.parent().is_some()).find(|a| is_link(a)).map(Path::to_path_buf)
+}
+
+/// What the operator is told about a grant skipped for [`link_above_outside`].
+fn mounted_line(path: &Path, link: &Path, principal: &str, rights: Rights) -> String {
+    let rights = if rights == Rights::ModifyAuthenticatedUsers { Rights::ModifyDir } else { rights };
+    format!(
+        "! {} is reached through a link or a mounted volume ({}): Setup did not change its permissions. If that is \
+         intended, grant them yourself: icacls \"{}\" /grant \"{}\"",
+        path.display(),
+        link.display(),
+        quotable_path(path),
+        grant_spec(principal, rights)
+    )
+}
+
+/// `path` for inside double quotes on a command line that cmd and PowerShell
+/// both hand on intact: no trailing separator (`\"` would escape the quote); a
+/// drive root keeps its backslash doubled (`"D:\\"` reaches the program as `D:\`).
+fn quotable_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    let trimmed = s.trim_end_matches(['\\', '/']);
+    if trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!(r"{trimmed}\\")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn link_refusal(dir: &Path, link: &Path) -> String {
@@ -633,6 +778,8 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
     } else {
         probe.load_config(&paths.config).context("The existing config.json cannot be read")?
     };
+    // The configuration that was there before this run, as it was.
+    let existing_config = (imported.is_none() && !fresh_config).then(|| config.clone());
     let default_watch = paths.root.join("watchfolder").display().to_string();
     // An answer file's watchfolder counts only when its configuration is the one used.
     let base_used = imported.is_none() && fresh_config && o.base_config.is_some();
@@ -717,14 +864,61 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
     } else {
         Vec::new()
     };
+    // The way back of a failed change of an existing registration (P13.1b2 C):
+    // the previous account's grants, on the configuration that was there.
+    let rollback_grants = match previous_registration(previous_account.as_deref()) {
+        PreviousRegistration::Restorable(prev) if account.registers() && target.service_exe.is_some() => {
+            grant_plan_with(paths, existing_config.as_ref().unwrap_or(&config), prev.is_some(), probe.drives())
+        }
+        _ => Vec::new(),
+    };
     // Before the service is stopped: what this run writes into or changes the
     // permissions of must hold no link (T3/T7). The execute-time guards stay
     // as the backstop for a link made in between.
     if let Some(link) = planned_link(&target, &grants, account.registers(), probe) {
         return Err(Refusal { notice: Vec::new(), message: link_inside_refusal(&link) }.into());
     }
+    // A path outside the root reached through a link or a mounted volume is
+    // skipped at the grant: say so before anything happens (P13.1b2 V4).
+    let mut target = target;
+    if account.registers() {
+        let principal = match &account {
+            AccountDecision::Passwordless(n) | AccountDecision::NeedsPassword(n) => Some(n.as_str()),
+            _ => None,
+        };
+        for (path, rights) in &grants {
+            let Some(who) = grant_principal(*rights, principal) else { continue };
+            if let Some(link) = link_above_outside(&target.paths.root, path, &|p| probe.is_link(p)) {
+                let line = mounted_line(path, &link, &who, *rights);
+                if !target.warnings.contains(&line) {
+                    target.warnings.push(line);
+                }
+            }
+        }
+    }
+    // Where the service answers after a way back (V2/V3).
+    let previous = {
+        let here = Endpoint::of(existing_config.as_ref().unwrap_or(&config), o.no_firewall);
+        let elsewhere = target
+            .service_exe
+            .as_deref()
+            .is_some_and(|s| !same_file_with(s, &target.target_exe, &same));
+        let there = target
+            .service_exe
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|_| elsewhere)
+            .map(|dir| AppPaths::with_root(dir, "config.json").config)
+            // Loading a missing config.json creates one: the plan never writes (W2).
+            .filter(|cfg| probe.exists(cfg))
+            .and_then(|cfg| probe.load_config(&cfg).ok())
+            .map(|c| Endpoint::of(&c, o.no_firewall));
+        PreviousEndpoints { elsewhere, here, there }
+    };
+    let paths = &target.paths;
 
     Ok(InstallPlan {
+        previous,
         import: o.import.clone(),
         write_config: fresh_config || o.watchfolder.is_some() || o.port.is_some(),
         watchfolder_source,
@@ -735,6 +929,7 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
         switch_hint: decision.switch_hint,
         previous_account,
         grants,
+        rollback_grants,
         firewall: (!o.no_firewall && !is_loopback(&config.web_host)).then_some(config.web_port),
         health: health_address(&config),
         tls: config.tls.is_enabled(),
@@ -876,8 +1071,17 @@ impl Progress for ConsoleProgress {
 #[derive(Debug, Clone)]
 pub struct InstallReport {
     pub kind: InstallKind,
-    /// The new version did not answer and the previous one was put back and started.
+    /// The run failed after an existing service was stopped (or an upgrade did
+    /// not answer) and the previous state was put back and started.
     pub rolled_back: bool,
+    /// With `rolled_back`: what failed, in one line.
+    pub failure: Option<String>,
+    /// With `rolled_back`: the previous state was put back whole, started and
+    /// answered. False when any step of the way back failed.
+    pub restored_running: bool,
+    /// With `rolled_back` after a service existed: what the way back did, item
+    /// by item (P13.1b2 V1). `restored_running` is derived from it.
+    pub way_back: Option<WayBack>,
     /// Where the operator goes next, on this computer.
     pub admin_url: String,
     /// The health summary lines the service reported (empty under TLS).
@@ -889,6 +1093,10 @@ pub struct InstallReport {
 /// The machine steps of an install, one method per step, so the order of
 /// [`execute`] is tested without touching the machine.
 pub(crate) trait Machine {
+    /// A named account with a password: give it the right to log on as a
+    /// service and check that Windows takes the password for a service logon.
+    /// A [`Refusal`] when it does not. Runs before anything else is changed.
+    fn prepare_account(&mut self, account: &ServiceAccount, progress: &mut dyn Progress) -> Result<()>;
     /// The install folder, checked again first (T2).
     fn create_dir(&mut self, t: &Target) -> Result<()>;
     fn import(&mut self, old: &Path, new: &AppPaths, progress: &mut dyn Progress) -> Result<()>;
@@ -897,16 +1105,30 @@ pub(crate) trait Machine {
     fn copy_release(&mut self, source_dir: &Path, paths: &AppPaths, progress: &mut dyn Progress) -> Result<()>;
     fn ensure_dirs(&mut self, paths: &AppPaths) -> Result<()>;
     fn create_watchfolder(&mut self, dir: &Path);
+    /// Copy an existing config.json to `config.json.prev` before it is
+    /// rewritten; whether there was one.
+    fn keep_config(&mut self, path: &Path) -> Result<bool>;
     fn save_config(&mut self, config: &AppConfig, path: &Path) -> Result<()>;
-    fn uninstall_service(&mut self) -> Result<()>;
+    /// Put `config.json.prev` back as config.json.
+    fn restore_config(&mut self, path: &Path) -> Result<()>;
     fn install_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()>;
+    /// Change the existing registration in place (`None` = LocalSystem).
+    fn reconfigure_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()>;
+    /// The ACL work for `account`: strip the explicit grants of `strip` and of
+    /// `account`, lock the root, apply `grants`.
     async fn apply_acls(
         &mut self,
         plan: &InstallPlan,
         account: Option<&ServiceAccount>,
+        strip: Option<&str>,
+        grants: &[(PathBuf, Rights)],
         progress: &mut dyn Progress,
     );
-    async fn open_firewall(&mut self, exe: &Path, port: u16, progress: &mut dyn Progress);
+    /// The way back only: remove `account`'s explicit grants from every path
+    /// outside the root that `plan.grants` gave it (P13.1b2 V5).
+    async fn strip_outside(&mut self, plan: &InstallPlan, account: &str, progress: &mut dyn Progress);
+    /// Replace the panel's rule; whether the new rule is in place.
+    async fn open_firewall(&mut self, exe: &Path, port: u16, progress: &mut dyn Progress) -> bool;
     fn start_service(&mut self) -> Result<()>;
     fn wait_for_health(&mut self, addr: SocketAddr, tls: bool, timeout: Duration) -> Option<String>;
     fn restore_previous(&mut self, target_exe: &Path) -> Result<()>;
@@ -915,6 +1137,28 @@ pub(crate) trait Machine {
 struct SystemMachine;
 
 impl Machine for SystemMachine {
+    fn prepare_account(&mut self, account: &ServiceAccount, progress: &mut dyn Progress) -> Result<()> {
+        let Some(password) = account.password.as_deref() else { return Ok(()) };
+        let name = account.name.as_str();
+        if let Err(e) = grant_service_logon_right(name) {
+            let message = format!("Setup could not give {name} the right to log on as a service ({e:#}). Nothing was changed.");
+            return Err(Refusal { notice: Vec::new(), message }.into());
+        }
+        progress.line(Step::Account, &format!("  {name} may log on as a service."));
+        match check_service_logon(name, password).operator_text(name) {
+            None => {
+                progress.line(Step::Account, &format!("  Windows accepted the password of {name}."));
+                Ok(())
+            }
+            Some(text) => {
+                progress.line(
+                    Step::Account,
+                    &format!("  {name} keeps the right to log on as a service; Setup changed nothing else."),
+                );
+                Err(Refusal { notice: Vec::new(), message: format!("{text} Nothing else was changed.") }.into())
+            }
+        }
+    }
     fn create_dir(&mut self, t: &Target) -> Result<()> {
         create_install_dir(t)
     }
@@ -937,33 +1181,46 @@ impl Machine for SystemMachine {
     fn create_watchfolder(&mut self, dir: &Path) {
         let _ = std::fs::create_dir_all(dir);
     }
+    fn keep_config(&mut self, path: &Path) -> Result<bool> {
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let prev = config_prev(path);
+        std::fs::copy(path, &prev).with_context(|| format!("Cannot keep a copy as {}", prev.display()))?;
+        Ok(true)
+    }
     fn save_config(&mut self, config: &AppConfig, path: &Path) -> Result<()> {
         config.save_to_file(path)
     }
-    fn uninstall_service(&mut self) -> Result<()> {
-        uninstall_service()
+    fn restore_config(&mut self, path: &Path) -> Result<()> {
+        let prev = config_prev(path);
+        std::fs::copy(&prev, path).with_context(|| format!("Cannot copy {} back", prev.display()))?;
+        Ok(())
     }
     fn install_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()> {
         install_service(exe, account)
     }
-    async fn apply_acls(&mut self, plan: &InstallPlan, account: Option<&ServiceAccount>, progress: &mut dyn Progress) {
+    fn reconfigure_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()> {
+        reconfigure_service(exe, account)
+    }
+    async fn apply_acls(
+        &mut self,
+        plan: &InstallPlan,
+        account: Option<&ServiceAccount>,
+        strip: Option<&str>,
+        grants: &[(PathBuf, Rights)],
+        progress: &mut dyn Progress,
+    ) {
         let t = &plan.target;
         // The installer's own executable is put directly in the root: only a cargo
         // build run in place is left unlocked (T1).
-        apply_acls_on(
-            &t.paths,
-            &plan.config,
-            account,
-            plan.previous_account.as_deref(),
-            !t.development,
-            &plan.grants,
-            progress,
-            &mut SystemAcl,
-        )
-        .await;
+        apply_acls_on(&t.paths, &plan.config, account, strip, !t.development, grants, progress, &mut SystemAcl).await;
     }
-    async fn open_firewall(&mut self, exe: &Path, port: u16, progress: &mut dyn Progress) {
-        open_firewall(exe, port, progress).await;
+    async fn strip_outside(&mut self, plan: &InstallPlan, account: &str, progress: &mut dyn Progress) {
+        strip_outside_on(&plan.target.paths.root, &plan.grants, account, progress, &mut SystemAcl).await;
+    }
+    async fn open_firewall(&mut self, exe: &Path, port: u16, progress: &mut dyn Progress) -> bool {
+        open_firewall(exe, port, progress).await
     }
     fn start_service(&mut self) -> Result<()> {
         start_service()
@@ -975,6 +1232,13 @@ impl Machine for SystemMachine {
         std::fs::copy(target_exe.with_extension("exe.prev"), target_exe)?;
         Ok(())
     }
+}
+
+/// `config.json.prev` beside `config.json`.
+fn config_prev(config: &Path) -> PathBuf {
+    let mut name = config.file_name().unwrap_or_default().to_os_string();
+    name.push(".prev");
+    config.with_file_name(name)
 }
 
 /// Perform a plan: copy, configure, register, grant, open the firewall, start,
@@ -1001,8 +1265,18 @@ pub(crate) async fn execute_with<M: Machine>(
         admin_url: format!("{scheme}://127.0.0.1:{}/admin", plan.port),
         health: Vec::new(),
         logs: paths.logs.clone(),
+        failure: None,
+        restored_running: false,
+        way_back: None,
     };
 
+    // A named account's logon right and password, before anything is changed
+    // (P13.1b2 B3): a wrong password must not leave a stopped service behind.
+    if plan.account.registers() {
+        if let Some(a) = account.as_ref().filter(|a| a.password.is_some()) {
+            m.prepare_account(a, progress)?;
+        }
+    }
     m.create_dir(t).with_context(|| format!("Cannot create {}", t.dir.display()))?;
     if let Some(old) = &plan.import {
         m.import(old, paths, progress)?;
@@ -1015,13 +1289,106 @@ pub(crate) async fn execute_with<M: Machine>(
         );
     }
 
-    // ---- stop, copy -------------------------------------------------------
-    if t.service_exe.is_some() {
+    // ---- stop ---------------------------------------------------------------
+    // From here until the health check passes, a service that existed before
+    // this run is never left stopped: any error takes the way back (P13.1b2 C).
+    let service_existed = t.service_exe.is_some();
+    if service_existed {
         progress.line(Step::Stop, "  Stopping the service…");
         m.stop_service().context("The running service would not stop")?;
     }
-    let had_previous = if t.in_place { false } else { m.copy_executable(&t.source_exe, &t.target_exe, progress)? };
+    let mut changed = Changed::default();
+    let forward = forward_steps(plan, account.as_ref(), progress, m, &mut changed).await;
+    match forward {
+        Ok(body) => {
+            progress.line(Step::Health, "");
+            progress.line(Step::Health, "✓ OmniDownloader is running.");
+            report.health = health_lines(&body);
+            for l in &report.health {
+                progress.line(Step::Health, l);
+            }
+        }
+        Err(e) if service_existed => {
+            let back = way_back(plan, account.as_ref(), changed, progress, m, &one_line(&e)).await;
+            report.rolled_back = true;
+            report.failure = Some(one_line(&e));
+            report.restored_running = back.restored_running();
+            report.way_back = Some(back);
+            return Ok(report);
+        }
+        Err(e) => match e.downcast_ref::<NoAnswer>() {
+            // The executable of an installation whose service was gone: as before.
+            Some(no) if t.is_upgrade() && changed.exe_replaced => {
+                progress.line(Step::Rollback, "");
+                progress.line(
+                    Step::Rollback,
+                    &format!("✗ The new version did not answer within {} s. Putting the previous one back…", HEALTH_WAIT.as_secs()),
+                );
+                let _ = m.stop_service();
+                m.restore_previous(&t.target_exe).context("Rollback failed")?;
+                m.start_service().context("The previous version would not start either")?;
+                report.rolled_back = true;
+                report.failure = Some(no.to_string());
+                report.restored_running = true;
+                return Ok(report);
+            }
+            Some(no) => {
+                bail!("{no}. See {} and Event Viewer → Windows Logs → Application.", paths.logs.display());
+            }
+            None => return Err(e),
+        },
+    }
+
+    // ---- what next ---------------------------------------------------------
+    let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "this-pc".into());
+    for l in closing_lines(plan, &host, changed.exe_replaced) {
+        progress.line(Step::Done, &l);
+    }
+    Ok(report)
+}
+
+/// What this run has changed since the service was stopped, for the way back.
+#[derive(Debug, Default, Clone, Copy)]
+struct Changed {
+    /// The executable was replaced; the previous one is `omni-ingest.exe.prev`.
+    exe_replaced: bool,
+    /// An existing config.json was copied to `config.json.prev` before it was rewritten.
+    config_kept: bool,
+    /// The existing registration was changed in place.
+    reconfigured: bool,
+    /// The firewall rule was replaced for this run's executable and port.
+    firewall: bool,
+}
+
+/// `/api/health` gave no answer in time.
+#[derive(Debug)]
+struct NoAnswer {
+    addr: SocketAddr,
+    secs: u64,
+}
+
+impl fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "The service did not answer on {} within {} s", self.addr, self.secs)
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
+/// Copy, configure, register, grant, open the firewall, start and wait for
+/// `/api/health`; the health answer's body. Records in `changed` what it did.
+async fn forward_steps<M: Machine>(
+    plan: &InstallPlan,
+    account: Option<&ServiceAccount>,
+    progress: &mut dyn Progress,
+    m: &mut M,
+    changed: &mut Changed,
+) -> Result<String> {
+    let t = &plan.target;
+    let paths = &t.paths;
+    // ---- copy -------------------------------------------------------------
     if !t.in_place {
+        changed.exe_replaced = m.copy_executable(&t.source_exe, &t.target_exe, progress)?;
         m.copy_release(&t.source_dir, paths, progress)?;
     }
     m.ensure_dirs(paths).context("Cannot create the data, temp and log folders")?;
@@ -1029,6 +1396,9 @@ pub(crate) async fn execute_with<M: Machine>(
         m.create_watchfolder(&plan.watchfolder);
     }
     if plan.write_config {
+        if t.service_exe.is_some() {
+            changed.config_kept = m.keep_config(&paths.config).context("Cannot keep a copy of config.json")?;
+        }
         m.save_config(&plan.config, &paths.config).context("Cannot write config.json")?;
         progress.line(Step::Config, &format!("  Configuration written to {}", paths.config.display()));
     }
@@ -1036,20 +1406,26 @@ pub(crate) async fn execute_with<M: Machine>(
     // ---- service, rights, firewall -----------------------------------------
     if plan.account.registers() {
         if t.service_exe.is_some() {
-            m.uninstall_service().context("Cannot remove the old service registration")?;
+            // In place: a refused change leaves the old registration as it was.
+            m.reconfigure_service(&t.target_exe, account).context("Cannot change the service registration")?;
+            changed.reconfigured = true;
+            progress.line(Step::Register, &format!("  Service account changed: runs as {}.", account_label(account)));
+        } else {
+            m.install_service(&t.target_exe, account).context("Cannot register the service")?;
+            progress.line(
+                Step::Register,
+                &format!(
+                    "  Service registered: automatic (delayed) start, restarts after a failure, runs as {}.",
+                    account_label(account)
+                ),
+            );
         }
-        m.install_service(&t.target_exe, account.as_ref()).context("Cannot register the service")?;
-        progress.line(
-            Step::Register,
-            &format!(
-                "  Service registered: automatic (delayed) start, restarts after a failure, runs as {}.",
-                account_label(account.as_ref())
-            ),
-        );
-        m.apply_acls(plan, account.as_ref(), progress).await;
+        m.apply_acls(plan, account, plan.previous_account.as_deref(), &plan.grants, progress).await;
     }
     if let Some(port) = plan.firewall {
-        m.open_firewall(&t.target_exe, port, progress).await;
+        // As before: a rule that could not be added is said and the run goes on.
+        let _ = m.open_firewall(&t.target_exe, port, progress).await;
+        changed.firewall = true;
     }
 
     // ---- start and verify --------------------------------------------------
@@ -1058,49 +1434,328 @@ pub(crate) async fn execute_with<M: Machine>(
         "  Starting the service and waiting for it to answer (first start can take a few minutes)…",
     );
     m.start_service().context("The service would not start")?;
-    match m.wait_for_health(plan.health, plan.tls, HEALTH_WAIT) {
-        Some(body) => {
-            progress.line(Step::Health, "");
-            progress.line(Step::Health, "✓ OmniDownloader is running.");
-            report.health = health_lines(&body);
-            for l in &report.health {
-                progress.line(Step::Health, l);
-            }
-        }
-        None if t.is_upgrade() && had_previous => {
-            progress.line(Step::Rollback, "");
-            progress.line(
-                Step::Rollback,
-                &format!("✗ The new version did not answer within {} s. Putting the previous one back…", HEALTH_WAIT.as_secs()),
-            );
-            let _ = m.stop_service();
-            m.restore_previous(&t.target_exe).context("Rollback failed")?;
-            m.start_service().context("The previous version would not start either")?;
-            report.rolled_back = true;
-            return Ok(report);
-        }
-        None => {
-            bail!(
-                "The service did not answer on {} within {} s. See {} and Event Viewer → Windows Logs → Application.",
-                plan.health,
-                HEALTH_WAIT.as_secs(),
-                paths.logs.display()
-            );
-        }
-    }
+    m.wait_for_health(plan.health, plan.tls, HEALTH_WAIT)
+        .ok_or_else(|| NoAnswer { addr: plan.health, secs: HEALTH_WAIT.as_secs() }.into())
+}
 
-    // ---- what next ---------------------------------------------------------
-    let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "this-pc".into());
-    for l in closing_lines(plan, &host) {
-        progress.line(Step::Done, &l);
+/// How the registration that existed before this run can be put back.
+#[derive(Debug, Clone)]
+enum PreviousRegistration {
+    /// An account Windows takes no password for (`None` = LocalSystem).
+    Restorable(Option<ServiceAccount>),
+    /// A user account: its password is not known to Setup.
+    NeedsPassword,
+    /// The account could not be read.
+    Unknown,
+}
+
+fn previous_registration(previous: Option<&str>) -> PreviousRegistration {
+    let Some(name) = previous.map(str::trim).filter(|p| !p.is_empty()) else {
+        return PreviousRegistration::Unknown;
+    };
+    match default_or_given(Some(name)) {
+        AccountChoice::LocalSystem => PreviousRegistration::Restorable(None),
+        AccountChoice::Passwordless(n) => PreviousRegistration::Restorable(Some(ServiceAccount { name: n, password: None })),
+        AccountChoice::NeedsPassword(_) => PreviousRegistration::NeedsPassword,
     }
-    Ok(report)
+}
+
+/// Whether two account names are the same account, as the plan reads them
+/// ([`default_or_given`]: trimmed; the LocalSystem spellings are one), compared
+/// without case.
+fn same_account(a: &str, b: &str) -> bool {
+    let norm = |s: &str| match default_or_given(Some(s)) {
+        AccountChoice::LocalSystem => "localsystem".to_string(),
+        AccountChoice::Passwordless(n) | AccountChoice::NeedsPassword(n) => n.to_ascii_lowercase(),
+    };
+    norm(a) == norm(b)
+}
+
+/// `e` as one line.
+fn one_line(e: &anyhow::Error) -> String {
+    format!("{e:#}").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Put back what [`forward_steps`] changed after the service was stopped,
+/// then start it: the executable, config.json, the registration with its
+/// permissions (when the previous account needs no password), the firewall
+/// rule. Every step is tried even when one fails. What happened to each, and
+/// whether the service answers where its configuration says it will.
+async fn way_back<M: Machine>(
+    plan: &InstallPlan,
+    account: Option<&ServiceAccount>,
+    changed: Changed,
+    progress: &mut dyn Progress,
+    m: &mut M,
+    failure: &str,
+) -> WayBack {
+    let t = &plan.target;
+    let mut say = |text: &str| progress.line(Step::Rollback, text);
+    say("");
+    say(&format!("✗ {failure}"));
+    say("  Putting the previous state back…");
+    let mut back = WayBack {
+        exe: Restore::NotChanged,
+        config: Restore::NotChanged,
+        registration: RegistrationRestore::NotChanged,
+        firewall: Restore::NotChanged,
+        running: false,
+    };
+    let _ = m.stop_service();
+    if changed.exe_replaced {
+        back.exe = match m.restore_previous(&t.target_exe) {
+            Ok(()) => Restore::Restored,
+            Err(e) => {
+                say(&format!("! The previous {EXE} was not put back ({}).", one_line(&e)));
+                Restore::NotRestored { why: one_line(&e) }
+            }
+        };
+    }
+    if changed.config_kept {
+        back.config = match m.restore_config(&t.paths.config) {
+            Ok(()) => Restore::Restored,
+            Err(e) => {
+                say(&format!("! The previous config.json was not put back ({}).", one_line(&e)));
+                Restore::NotRestored { why: one_line(&e) }
+            }
+        };
+    }
+    let prev_exe = t.service_exe.clone().unwrap_or_else(|| t.target_exe.clone());
+    if changed.reconfigured {
+        let new = account_label(account).to_string();
+        let previous = plan.previous_account.as_deref().unwrap_or("an account Setup could not read");
+        // Where the registration stays when it cannot be changed back.
+        let kept = |why: String| RegistrationRestore::NotRestored { exe: t.target_exe.clone(), account: new.clone(), why };
+        let was = if plan.previous.elsewhere {
+            format!("; it was registered for {} as {previous}", prev_exe.display())
+        } else {
+            String::new()
+        };
+        back.registration = match previous_registration(plan.previous_account.as_deref()) {
+            PreviousRegistration::Restorable(prev) => match m.reconfigure_service(&prev_exe, prev.as_ref()) {
+                Ok(()) => {
+                    progress.line(Step::Rollback, &format!("  The service runs as {} again.", account_label(prev.as_ref())));
+                    // The new account's grants go, unless it is the account
+                    // registered again: its grants are the ones it keeps (W1).
+                    let strip = account
+                        .map(|a| a.name.as_str())
+                        .filter(|n| !same_account(n, prev.as_ref().map_or("LocalSystem", |p| p.name.as_str())));
+                    m.apply_acls(plan, prev.as_ref(), strip, &plan.rollback_grants, progress).await;
+                    // The new account's grants outside the root (V5).
+                    if let Some(a) = strip {
+                        m.strip_outside(plan, a, progress).await;
+                    }
+                    RegistrationRestore::Restored
+                }
+                Err(e) => {
+                    let why = format!("Windows refused to register it as before ({}){was}", one_line(&e));
+                    progress.line(Step::Rollback, &format!("! The service stays registered for {} as {new}: {why}.", t.target_exe.display()));
+                    kept(why)
+                }
+            },
+            // The same account where it was, rewritten with the password typed
+            // in this run (checked by a service logon): neither put back nor lost (W5).
+            PreviousRegistration::NeedsPassword
+                if !plan.previous.elsewhere && account.is_some_and(|a| same_account(&a.name, previous)) =>
+            {
+                progress.line(Step::Rollback, &format!("  The service stays registered as {new} with the password entered in this run."));
+                RegistrationRestore::KeptAsEntered { account: new.clone() }
+            }
+            PreviousRegistration::NeedsPassword => {
+                let why = format!("the previous account's password is not known to Setup{was}");
+                progress.line(Step::Rollback, &format!("  The service stays registered for {} as {new}: {why}.", t.target_exe.display()));
+                kept(why)
+            }
+            PreviousRegistration::Unknown => {
+                let why = format!("Setup could not read the previous account{was}");
+                progress.line(Step::Rollback, &format!("  The service stays registered for {} as {new}: {why}.", t.target_exe.display()));
+                kept(why)
+            }
+        };
+    }
+    // Which executable the service is registered for now, and the
+    // configuration it reads (V2).
+    let there = plan.previous.elsewhere && !matches!(back.registration, RegistrationRestore::NotRestored { .. });
+    let (now_exe, endpoint) = if there {
+        (prev_exe.clone(), plan.previous.there)
+    } else if matches!(back.config, Restore::NotRestored { .. }) {
+        (t.target_exe.clone(), Some(Endpoint { health: plan.health, tls: plan.tls, firewall: plan.firewall }))
+    } else {
+        (t.target_exe.clone(), Some(plan.previous.here))
+    };
+    // The firewall rule, when this run moved it to another program or port (V3).
+    if changed.firewall {
+        let new_port = plan.firewall.unwrap_or(plan.port);
+        let why = match endpoint.map(|e| e.firewall) {
+            None => Some(format!(
+                "the previous configuration could not be read; the rule opens port {new_port} for {}",
+                t.target_exe.display()
+            )),
+            Some(Some(port)) if port == new_port && now_exe == t.target_exe => None,
+            Some(Some(port)) => {
+                if m.open_firewall(&now_exe, port, progress).await {
+                    back.firewall = Restore::Restored;
+                    None
+                } else {
+                    Some(format!("Windows did not take the rule for port {port} and {}", now_exe.display()))
+                }
+            }
+            Some(None) => Some(format!(
+                "the rule opens port {new_port} for {}; the previous configuration needs none",
+                t.target_exe.display()
+            )),
+        };
+        // Every fact that is not the previous state has its line (W4).
+        if let Some(why) = why {
+            progress.line(Step::Rollback, &format!("  The firewall rule was not put back: {why}."));
+            back.firewall = Restore::NotRestored { why };
+        }
+    }
+    let mut say = |text: &str| progress.line(Step::Rollback, text);
+    say("  Starting the service and waiting for it to answer…");
+    back.running = match m.start_service() {
+        Err(e) => {
+            say(&format!("! The service would not start ({}).", one_line(&e)));
+            false
+        }
+        Ok(()) => match endpoint {
+            Some(ep) => match m.wait_for_health(ep.health, ep.tls, HEALTH_WAIT) {
+                Some(_) => true,
+                None => {
+                    say(&format!("! The service did not answer on {} within {} s either.", ep.health, HEALTH_WAIT.as_secs()));
+                    false
+                }
+            },
+            None => {
+                say("  The service was started; Setup could not check that it answers (its configuration could not be read).");
+                true
+            }
+        },
+    };
+    if back.restored_running() {
+        say("✓ The previous state is running.");
+    } else if back.running {
+        say("! The service is running, but not in its previous state; see the lines above.");
+    } else {
+        say(&format!(
+            "✗ The service is NOT running. See {} and Event Viewer → Windows Logs → Application.",
+            t.paths.logs.display()
+        ));
+    }
+    back
+}
+
+/// What the way back did with one thing this run had changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restore {
+    NotChanged,
+    Restored,
+    NotRestored { why: String },
+}
+
+/// What the way back did with the service registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationRestore {
+    NotChanged,
+    Restored,
+    /// The same account as before, rewritten with the password entered in this
+    /// run: neither put back nor lost; does not count against `restored_running`.
+    KeptAsEntered { account: String },
+    /// The service stays registered for `exe` as `account`.
+    NotRestored { exe: PathBuf, account: String, why: String },
+}
+
+/// The facts of a way back (P13.1b2 V1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WayBack {
+    pub exe: Restore,
+    pub config: Restore,
+    pub registration: RegistrationRestore,
+    pub firewall: Restore,
+    /// The service answered its health check (or, when its configuration could
+    /// not be read, started).
+    pub running: bool,
+}
+
+impl WayBack {
+    /// Running, with nothing left that was not put back.
+    pub fn restored_running(&self) -> bool {
+        self.running
+            && !matches!(self.registration, RegistrationRestore::NotRestored { .. })
+            && [&self.exe, &self.config, &self.firewall].iter().all(|r| !matches!(r, Restore::NotRestored { .. }))
+    }
+}
+
+/// What a front end says about a rolled-back run (`account_change`: Setup's
+/// `/change-account`), built from the way back's facts: what failed, what was
+/// put back, what is there now for what was not, and whether it runs.
+pub fn rolled_back_message(report: &InstallReport, account_change: bool) -> String {
+    let failure = report.failure.as_deref().unwrap_or("the new version did not come up");
+    let failure = failure.trim_end_matches('.');
+    let what = if account_change { "The account change" } else { "The upgrade" };
+    // A registration kept as entered is told as such, never as "undone" (W5).
+    let complete = report.way_back.as_ref().map_or(true, |b| {
+        !matches!(b.registration, RegistrationRestore::NotRestored { .. } | RegistrationRestore::KeptAsEntered { .. })
+            && [&b.exe, &b.config, &b.firewall].iter().all(|r| !matches!(r, Restore::NotRestored { .. }))
+    });
+    if complete {
+        let state = if report.restored_running {
+            "; it is running".to_string()
+        } else {
+            format!("; it did NOT start — see {}", report.logs.display())
+        };
+        return if account_change {
+            format!("{what} failed ({failure}) and was undone{state}.")
+        } else {
+            format!("{what} failed ({failure}) and the previous version was put back{state}.")
+        };
+    }
+    let b = report.way_back.as_ref().expect("an incomplete way back has its facts");
+    let mut text = format!("{what} failed ({failure}).");
+    let mut put_back = Vec::new();
+    if b.exe == Restore::Restored {
+        put_back.push(format!("the previous {EXE}"));
+    }
+    if b.config == Restore::Restored {
+        put_back.push("config.json".to_string());
+    }
+    if b.registration == RegistrationRestore::Restored {
+        put_back.push("the service registration".to_string());
+    }
+    if b.firewall == Restore::Restored {
+        put_back.push("the firewall rule".to_string());
+    }
+    if !put_back.is_empty() {
+        text.push_str(&format!(" Put back: {}.", put_back.join(", ")));
+    }
+    if let Restore::NotRestored { why } = &b.exe {
+        text.push_str(&format!(" The previous {EXE} was not put back: {why}."));
+    }
+    if let Restore::NotRestored { why } = &b.config {
+        text.push_str(&format!(" config.json was not put back: {why}."));
+    }
+    if let RegistrationRestore::KeptAsEntered { account } = &b.registration {
+        text.push_str(&format!(" The service stays registered as {account} with the password entered in this run."));
+    }
+    if let RegistrationRestore::NotRestored { exe, account, why } = &b.registration {
+        text.push_str(&format!(" The service is registered for {} as {account}: {why}.", exe.display()));
+    }
+    if let Restore::NotRestored { why } = &b.firewall {
+        text.push_str(&format!(" The firewall rule was not put back: {why}."));
+    }
+    if b.running {
+        text.push_str(" The service is running.");
+    } else {
+        text.push_str(&format!(" The service did NOT start — see {}.", report.logs.display()));
+    }
+    text
 }
 
 /// What the operator does next. A new installation is finished in the browser,
 /// on this computer: the setup wizard creates the administrator and asks for the
-/// watchfolder and the mailbox.
-fn closing_lines(plan: &InstallPlan, host: &str) -> Vec<String> {
+/// watchfolder and the mailbox. `exe_replaced`: this run replaced the
+/// executable and kept the previous one.
+fn closing_lines(plan: &InstallPlan, host: &str, exe_replaced: bool) -> Vec<String> {
     let t = &plan.target;
     let scheme = if plan.tls { "https" } else { "http" };
     let port = plan.port;
@@ -1112,7 +1767,9 @@ fn closing_lines(plan: &InstallPlan, host: &str) -> Vec<String> {
         format!("  Watchfolder: {}", plan.watchfolder.display()),
     ];
     if t.is_upgrade() {
-        lines.push(format!("  Previous version kept as {}.", t.target_exe.with_extension("exe.prev").display()));
+        if exe_replaced {
+            lines.push(format!("  Previous version kept as {}.", t.target_exe.with_extension("exe.prev").display()));
+        }
     } else {
         lines.push(String::new());
         lines.push(format!("  Next: on THIS computer, open {scheme}://127.0.0.1:{port}/admin and sign in"));
@@ -1132,10 +1789,7 @@ fn closing_lines(plan: &InstallPlan, host: &str) -> Vec<String> {
 pub async fn install(o: InstallOptions) -> Result<()> {
     let report = install_console(&o, &SystemProbe, &mut ConsoleProgress).await?;
     if report.rolled_back {
-        bail!(
-            "Upgrade rolled back; the previous version is running. See {} for why the new one failed.",
-            report.logs.display()
-        );
+        bail!(rolled_back_message(&report, false));
     }
     Ok(())
 }
@@ -1168,6 +1822,10 @@ pub async fn install_console(o: &InstallOptions, probe: &dyn Probe, out: &mut dy
         )?;
         answers.watchfolder = Some(answer);
         plan = console_plan(&answers, out)?;
+    }
+    // What the plan added to the header after it was printed (V4).
+    for w in plan.target.warnings.iter().filter(|w| !target.warnings.contains(w)) {
+        out.line(Step::Plan, w);
     }
     for q in &plan.questions {
         match q {
@@ -1511,14 +2169,17 @@ impl AclOps for SystemAcl {
 
 /// A link that an elevated, recursive permission change on `path` would follow:
 /// on the way down from `root` (for a path inside it) or at `path`, or anywhere
-/// in its tree (P13.1b, S1). The service account may write these folders.
+/// in its tree (P13.1b, S1). The service account may write these folders. For
+/// a path outside the root, every folder above it up to the volume root is
+/// looked at too, and a path written with `..` is judged where it leads (P13.1b2).
 fn link_in<A: AclOps>(ops: &A, root: &Path, path: &Path) -> Option<PathBuf> {
-    let on_the_way = if path.starts_with(root) {
-        omni_core::fsutil::link_below(root, path, &|p| ops.is_link(p))
+    let (root, path) = (lexical(root), lexical(path));
+    let on_the_way = if path.starts_with(&root) {
+        omni_core::fsutil::link_below(&root, &path, &|p| ops.is_link(p))
     } else {
-        ops.is_link(path).then(|| path.to_path_buf())
+        path.ancestors().filter(|a| a.parent().is_some()).find(|a| ops.is_link(a)).map(Path::to_path_buf)
     };
-    on_the_way.or_else(|| ops.first_link_in_tree(path))
+    on_the_way.or_else(|| ops.first_link_in_tree(&path))
 }
 
 fn link_line(path: &Path, link: &Path) -> String {
@@ -1592,7 +2253,12 @@ pub(crate) async fn apply_acls_on<A: AclOps>(
             continue;
         }
         if let Some(link) = link_in(ops, root, &path) {
-            progress.line(Step::Rights, &link_line(&path, &link));
+            // Above a path outside the root: perhaps a mounted volume (V4).
+            let above = link_above_outside(root, &path, &|p| ops.is_link(p)).filter(|a| *a == link);
+            match (above, grant_principal(rights, named)) {
+                (Some(_), Some(who)) => progress.line(Step::Rights, &mounted_line(&path, &link, &who, rights)),
+                _ => progress.line(Step::Rights, &link_line(&path, &link)),
+            }
             if named.is_some() && (path == paths.data || path == temp) {
                 service_blocked = true;
             }
@@ -1654,6 +2320,38 @@ pub(crate) async fn apply_acls_on<A: AclOps>(
             "  data and temp folders restricted to SYSTEM, Administrators and the service account.",
         ),
         Err(e) => progress.line(Step::Rights, &format!("! Could not restrict the data and temp folders ({e:#}); set it by hand.")),
+    }
+}
+
+/// The way back's removal of `account`'s explicit grants on the local paths
+/// outside `root` that `grants` gave it (the root's tree is stripped by
+/// [`apply_acls_on`]); a path behind a link is left alone, loudly (P13.1b2 V5).
+pub(crate) async fn strip_outside_on<A: AclOps>(
+    root: &Path,
+    grants: &[(PathBuf, Rights)],
+    account: &str,
+    progress: &mut dyn Progress,
+    ops: &mut A,
+) {
+    let inside = lexical(root);
+    let mut done: Vec<PathBuf> = Vec::new();    for (path, rights) in grants {
+        let s = path.to_string_lossy();
+        let share = s.starts_with(r"\\") || s.starts_with("//");
+        if share || !matches!(rights, Rights::ModifyDir | Rights::ModifyFile) || lexical(path).starts_with(&inside) {
+            continue;
+        }
+        let key = lexical(path);
+        if done.contains(&key) {
+            continue;
+        }
+        done.push(key);
+        if let Some(link) = link_in(ops, root, path) {
+            progress.line(Step::Rollback, &link_line(path, &link));
+            continue;
+        }
+        if let Err(e) = ops.remove_grants(path, account, true).await {
+            progress.line(Step::Rollback, &format!("! Could not remove the rights of {account} on {} ({e:#}); set it by hand.", path.display()));
+        }
     }
 }
 
@@ -1770,7 +2468,7 @@ fn create_install_dir(t: &Target) -> Result<()> {
         if let Some(message) = changed_since_plan(t, &recheck) {
             return Err(Refusal { notice: Vec::new(), message }.into());
         }
-        return Ok(std::fs::create_dir_all(&t.dir)?);
+        return Ok(std::fs::create_dir_all(&t.paths.root)?);
     }
     create_install_dir_with(t, &Recheck::system(), &mut |d: &Path| omni_core::lockdown::create_install_root_dir(d))
 }
@@ -1784,7 +2482,9 @@ pub(crate) fn create_install_dir_with(
     r: &Recheck,
     create: &mut dyn FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
-    let dir = t.dir.as_path();
+    // The absolute root: a relative `--dir Omni` would end its ancestors in an
+    // empty path, which cannot be created (P13.1b2 A3).
+    let dir = t.paths.root.as_path();
     let existed = (r.is_dir)(dir);
     let mut missing: Vec<PathBuf> = dir.ancestors().take_while(|a| !(r.is_dir)(a)).map(Path::to_path_buf).collect();
     missing.reverse();
@@ -2024,7 +2724,8 @@ async fn netsh(args: &[&str]) -> bool {
 
 /// One inbound rule for this executable on the panel's port, on the domain
 /// and private networks (not public Wi-Fi). Replaced on every install.
-async fn open_firewall(exe: &Path, port: u16, progress: &mut dyn Progress) {
+/// Whether the new rule was added.
+async fn open_firewall(exe: &Path, port: u16, progress: &mut dyn Progress) -> bool {
     let _ = netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]).await;
     let ok = netsh(&[
         "advfirewall",
@@ -2045,6 +2746,7 @@ async fn open_firewall(exe: &Path, port: u16, progress: &mut dyn Progress) {
     } else {
         progress.line(Step::Firewall, &format!("! Could not add the firewall rule; the desks may not reach port {port}."));
     }
+    ok
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -2411,12 +3113,14 @@ mod tests {
         exe: Option<PathBuf>,
         /// Existing folders.
         dirs: Vec<PathBuf>,
-        /// Files whose owner is not trusted.
-        untrusted: Vec<PathBuf>,
+        /// Files whose owner is not trusted, with that owner's name.
+        untrusted: Vec<(PathBuf, String)>,
         /// Who may write into an existing root.
         writable: Option<String>,
         /// Every tree walk asked for.
         walks: std::cell::RefCell<Vec<PathBuf>>,
+        /// Every config.json asked for.
+        loads: std::cell::RefCell<Vec<PathBuf>>,
     }
 
     fn key(p: &Path) -> String {
@@ -2446,6 +3150,7 @@ mod tests {
             self.files.iter().find(|(p, _)| key(p) == key(path)).map(|f| f.1)
         }
         fn load_config(&self, path: &Path) -> Result<AppConfig> {
+            self.loads.borrow_mut().push(path.to_path_buf());
             match self.configs.iter().find(|(p, _)| key(p) == key(path)) {
                 Some((_, c)) => Ok(c.clone()),
                 None => bail!("no such config {}", path.display()),
@@ -2474,8 +3179,8 @@ mod tests {
             let dir = PathBuf::from(key(dir));
             self.links.iter().find(|l| PathBuf::from(key(l)).starts_with(&dir)).cloned()
         }
-        fn trusted_owner(&self, path: &Path) -> bool {
-            !self.untrusted.iter().any(|u| key(u) == key(path))
+        fn untrusted_owner(&self, path: &Path) -> Option<String> {
+            self.untrusted.iter().find(|u| key(&u.0) == key(path)).map(|u| u.1.clone())
         }
         fn writable_by(&self, dir: &Path) -> Option<String> {
             self.writable.clone().filter(|_| key(dir) == key(Path::new(ROOT)))
@@ -2497,6 +3202,7 @@ mod tests {
             untrusted: Vec::new(),
             writable: None,
             walks: std::cell::RefCell::new(Vec::new()),
+            loads: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -2931,11 +3637,18 @@ mod tests {
         let mut planted = old;
         planted.service = None;
         planted.configs.clear();
-        planted.untrusted = vec![root.join(EXE)];
+        planted.untrusted = vec![(root.join(EXE), r"NEWSROOM\someone".into())];
         let target = locate(&InstallOptions { yes: true, ..opts() }, &FakeProbe { writable: None, ..planted.clone_probe() }).unwrap();
         assert_eq!(target.kind, InstallKind::Fresh, "a planted exe is not an installation");
         let e = plan_install(&InstallOptions { yes: true, ..opts() }, &planted).unwrap_err();
-        assert!(e.to_string().contains("can write to it"), "{e}");
+        assert!(e.downcast_ref::<Refusal>().is_some());
+        // P13.1b2 A2: a folder with an executable in it may hold the station's
+        // data: the operator is never told to remove it.
+        assert_eq!(
+            e.to_string(),
+            r#"C:\OmniTest\omni-ingest.exe belongs to NEWSROOM\someone, not to Administrators, so Setup cannot tell whether this installation is the one you made. If it is yours, run: icacls "C:\OmniTest" /setowner Administrators /T  and start Setup again. Nothing was changed."#
+        );
+        assert!(!e.to_string().contains("Remove the folder"), "{e}");
         // A locked leftover (no exe, closed ACL) passes.
         let leftover = FakeProbe { dirs: vec![root], ..new_machine() };
         plan_install(&InstallOptions { yes: true, ..opts() }, &leftover).unwrap();
@@ -3321,13 +4034,14 @@ mod tests {
         assert_eq!(plan.account, AccountDecision::Passwordless(DEFAULT_SERVICE_ACCOUNT.into()));
         assert!(!plan.switch_hint);
         assert_eq!(plan.previous_account.as_deref(), Some("LocalSystem"), "its old grants are stripped");
-        // The old registration is stopped and removed before the new one.
+        // The old registration is stopped, then changed in place to point here (P13.1b2).
         let log = Log::default();
         run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap();
         let steps: Vec<String> = log.lines().into_iter().filter(|l| l.starts_with('#')).collect();
         let at = |s: &str| steps.iter().position(|l| l.starts_with(s)).unwrap_or_else(|| panic!("no {s}: {steps:?}"));
         assert!(at("#stop_service") < at("#copy_executable"));
-        assert!(at("#uninstall_service") < at("#install_service"));
+        assert!(at("#copy_executable") < at(r"#reconfigure_service C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService"));
+        assert!(!steps.iter().any(|l| l.starts_with("#install_service") || l.starts_with("#uninstall_service")), "{steps:?}");
     }
 
     /// An old installation at E:\OldOmni with a relative watchfolder and its database.
@@ -3438,21 +4152,60 @@ mod tests {
     struct FakeMachine {
         log: Log,
         had_previous: bool,
+        /// The answer of every health check that is not made to fail.
         health: Option<String>,
+        /// Steps that fail, by name and call number (1 = the first call).
+        fail: Vec<(&'static str, usize)>,
+        calls: std::collections::HashMap<&'static str, usize>,
+        /// Whether a config.json is there for `keep_config` to copy.
+        config_exists: bool,
     }
 
     impl FakeMachine {
         fn new(log: &Log) -> Self {
-            FakeMachine { log: log.clone(), had_previous: false, health: Some(HEALTHY.into()) }
+            FakeMachine {
+                log: log.clone(),
+                had_previous: false,
+                health: Some(HEALTHY.into()),
+                fail: Vec::new(),
+                calls: Default::default(),
+                config_exists: true,
+            }
         }
+
+        /// Count a call of `step`; whether this call is made to fail.
+        fn fails(&mut self, step: &'static str) -> bool {
+            let n = self.calls.entry(step).or_default();
+            *n += 1;
+            self.fail.contains(&(step, *n))
+        }
+
+        fn step(&mut self, step: &'static str) -> Result<()> {
+            if self.fails(step) {
+                bail!("{step} failed (test)");
+            }
+            Ok(())
+        }
+    }
+
+    fn pw(account: Option<&ServiceAccount>) -> &'static str {
+        if account.is_some_and(|a| a.password.as_deref() == Some(PASSWORD)) { "given" } else { "none" }
     }
 
     const HEALTHY: &str = r#"{"status":"ok","checks":{"database":"ok","watchfolder":"warn"}}"#;
 
     impl Machine for FakeMachine {
+        fn prepare_account(&mut self, account: &ServiceAccount, _p: &mut dyn Progress) -> Result<()> {
+            self.log.push(format!("#prepare_account {} password={}", account.name, pw(Some(account))));
+            if self.fails("prepare_account") {
+                let message = format!("Windows did not accept the password given for {}; check it and run Setup again. Nothing else was changed.", account.name);
+                return Err(Refusal { notice: Vec::new(), message }.into());
+            }
+            Ok(())
+        }
         fn create_dir(&mut self, t: &Target) -> Result<()> {
             self.log.push(format!("#create_dir {}", t.dir.display()));
-            Ok(())
+            self.step("create_dir")
         }
         fn import(&mut self, old: &Path, _new: &AppPaths, _p: &mut dyn Progress) -> Result<()> {
             self.log.push(format!("#import {}", old.display()));
@@ -3460,53 +4213,76 @@ mod tests {
         }
         fn stop_service(&mut self) -> Result<()> {
             self.log.push("#stop_service");
-            Ok(())
+            self.step("stop_service")
         }
         fn copy_executable(&mut self, source: &Path, target: &Path, _p: &mut dyn Progress) -> Result<bool> {
             self.log.push(format!("#copy_executable {} -> {}", source.display(), target.display()));
+            self.step("copy_executable")?;
             Ok(self.had_previous)
         }
         fn copy_release(&mut self, source_dir: &Path, _paths: &AppPaths, _p: &mut dyn Progress) -> Result<()> {
             self.log.push(format!("#copy_release {}", source_dir.display()));
-            Ok(())
+            self.step("copy_release")
         }
         fn ensure_dirs(&mut self, _paths: &AppPaths) -> Result<()> {
             self.log.push("#ensure_dirs");
-            Ok(())
+            self.step("ensure_dirs")
         }
         fn create_watchfolder(&mut self, dir: &Path) {
             self.log.push(format!("#create_watchfolder {}", dir.display()));
         }
+        fn keep_config(&mut self, path: &Path) -> Result<bool> {
+            self.log.push(format!("#keep_config {}", path.display()));
+            self.step("keep_config")?;
+            Ok(self.config_exists)
+        }
         fn save_config(&mut self, _config: &AppConfig, path: &Path) -> Result<()> {
             self.log.push(format!("#save_config {}", path.display()));
-            Ok(())
+            self.step("save_config")
         }
-        fn uninstall_service(&mut self) -> Result<()> {
-            self.log.push("#uninstall_service");
-            Ok(())
+        fn restore_config(&mut self, path: &Path) -> Result<()> {
+            self.log.push(format!("#restore_config {}", path.display()));
+            self.step("restore_config")
         }
         fn install_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()> {
-            let pw = if account.is_some_and(|a| a.password.as_deref() == Some(PASSWORD)) { "given" } else { "none" };
-            self.log.push(format!("#install_service {} as {} password={pw}", exe.display(), account_label(account)));
-            Ok(())
+            self.log.push(format!("#install_service {} as {} password={}", exe.display(), account_label(account), pw(account)));
+            self.step("install_service")
         }
-        async fn apply_acls(&mut self, plan: &InstallPlan, _a: Option<&ServiceAccount>, _p: &mut dyn Progress) {
-            self.log.push(format!("#apply_acls {} grants", plan.grants.len()));
+        fn reconfigure_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()> {
+            self.log.push(format!("#reconfigure_service {} as {} password={}", exe.display(), account_label(account), pw(account)));
+            self.step("reconfigure_service")
         }
-        async fn open_firewall(&mut self, exe: &Path, port: u16, _p: &mut dyn Progress) {
+        async fn apply_acls(
+            &mut self,
+            _plan: &InstallPlan,
+            account: Option<&ServiceAccount>,
+            strip: Option<&str>,
+            grants: &[(PathBuf, Rights)],
+            _p: &mut dyn Progress,
+        ) {
+            self.log.push(format!("#apply_acls {} grants for {} strip {}", grants.len(), account_label(account), strip.unwrap_or("-")));
+        }
+        async fn strip_outside(&mut self, _plan: &InstallPlan, account: &str, _p: &mut dyn Progress) {
+            self.log.push(format!("#strip_outside {account}"));
+        }
+        async fn open_firewall(&mut self, exe: &Path, port: u16, _p: &mut dyn Progress) -> bool {
             self.log.push(format!("#open_firewall {} {port}", exe.display()));
+            !self.fails("open_firewall")
         }
         fn start_service(&mut self) -> Result<()> {
             self.log.push("#start_service");
-            Ok(())
+            self.step("start_service")
         }
         fn wait_for_health(&mut self, addr: SocketAddr, tls: bool, timeout: Duration) -> Option<String> {
             self.log.push(format!("#wait_for_health {addr} tls={tls} {}s", timeout.as_secs()));
+            if self.fails("wait_for_health") {
+                return None;
+            }
             self.health.clone()
         }
         fn restore_previous(&mut self, target_exe: &Path) -> Result<()> {
             self.log.push(format!("#restore_previous {}", target_exe.display()));
-            Ok(())
+            self.step("restore_previous")
         }
     }
 
@@ -3539,7 +4315,7 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        expected.push(format!("#apply_acls {} grants", plan.grants.len()));
+        expected.push(format!(r"#apply_acls {} grants for NT SERVICE\OmniIngestService strip -", plan.grants.len()));
         expected.push(r"#open_firewall C:\OmniTest\omni-ingest.exe 8080".into());
         expected.extend(
             [
@@ -3554,7 +4330,7 @@ mod tests {
             ]
             .map(String::from),
         );
-        expected.extend(closing_lines(&plan, &host()));
+        expected.extend(closing_lines(&plan, &host(), false));
         assert_eq!(log.lines(), expected);
         assert_eq!(report.kind, InstallKind::Fresh);
         assert!(!report.rolled_back);
@@ -3590,7 +4366,7 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        expected.extend(closing_lines(&plan, &host()));
+        expected.extend(closing_lines(&plan, &host(), true));
         assert_eq!(log.lines(), expected);
         assert_eq!(
             log.lines().last().unwrap(),
@@ -3604,10 +4380,45 @@ mod tests {
         let log = Log::default();
         let mut machine = FakeMachine::new(&log);
         machine.had_previous = true;
+        // P13.1b2: the first answer is missing; the way back waits for one again.
+        machine.fail = vec![("wait_for_health", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.rolled_back && report.restored_running);
+        assert_eq!(report.failure.as_deref(), Some("The service did not answer on 127.0.0.1:8090 within 240 s"));
+        assert_eq!(report.logs, root_paths().logs);
+        let lines = log.lines();
+        let tail: Vec<&str> = lines[lines.len() - 10..].iter().map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            [
+                "#wait_for_health 127.0.0.1:8090 tls=false 240s",
+                "",
+                "✗ The service did not answer on 127.0.0.1:8090 within 240 s",
+                "  Putting the previous state back…",
+                "#stop_service",
+                r"#restore_previous C:\OmniTest\omni-ingest.exe",
+                "  Starting the service and waiting for it to answer…",
+                "#start_service",
+                "#wait_for_health 127.0.0.1:8090 tls=false 240s",
+                "✓ The previous state is running.",
+            ]
+        );
+    }
+
+    /// The executable of an installation whose service is gone: no answer puts it
+    /// back as before (no service existed, so this is not the P13.1b2 way back).
+    #[test]
+    fn an_upgrade_without_a_service_that_does_not_answer_puts_the_executable_back_as_before() {
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.service = None;
+        let plan = plan_install(&opts(), &probe).unwrap();
+        assert_eq!(plan.target.kind, InstallKind::Upgrade { had_previous_exe: true });
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
         machine.health = None;
         let report = run(&plan, &Answers::default(), &log, machine).unwrap();
-        assert!(report.rolled_back);
-        assert_eq!(report.logs, root_paths().logs);
+        assert!(report.rolled_back && report.restored_running);
         let lines = log.lines();
         let tail: Vec<&str> = lines[lines.len() - 6..].iter().map(String::as_str).collect();
         assert_eq!(
@@ -3638,10 +4449,10 @@ mod tests {
     #[test]
     fn a_new_installation_is_sent_to_the_setup_wizard_on_this_computer() {
         let plan = plan_install(&InstallOptions { yes: true, port: Some(8091), ..opts() }, &new_machine()).unwrap();
-        let text = closing_lines(&plan, "NEWSROOM-PC").join("\n");
+        let text = closing_lines(&plan, "NEWSROOM-PC", false).join("\n");
         assert!(text.contains("  Admin:     http://NEWSROOM-PC:8091/admin"), "{text}");
         // Each sentence whole, however it is wrapped, and in this order.
-        let flat = closing_lines(&plan, "NEWSROOM-PC").iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        let flat = closing_lines(&plan, "NEWSROOM-PC", false).iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
         let sentences = [
             "Next: on THIS computer, open http://127.0.0.1:8091/admin and sign in as Admin / Admin, \
              the first-run account, which works only from this computer.",
@@ -3665,12 +4476,682 @@ mod tests {
             assert!(!text.contains(old), "still says {old:?}: {text}");
         }
         let upgrade = plan_install(&opts(), &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
-        assert!(!closing_lines(&upgrade, "NEWSROOM-PC").join("\n").contains("setup wizard"));
+        assert!(!closing_lines(&upgrade, "NEWSROOM-PC", true).join("\n").contains("setup wizard"));
     }
 
     #[test]
     fn the_health_summary_is_what_the_console_printed() {
         assert_eq!(health_lines(HEALTHY), ["  Health: ok", "    ✓ database: ok", "    ! watchfolder: warn"]);
         assert!(health_lines("").is_empty(), "TLS: an accepted connection, no body");
+    }
+
+    // ---- P13.1b2 ---------------------------------------------------------------------
+
+    /// A1: `<root>\..\Archive` starts with the root by `Path::starts_with` and was
+    /// walked by neither the root walk nor the outside walk.
+    #[test]
+    fn a_granted_path_written_with_dotdot_is_walked_where_it_leads() {
+        let o = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), ..opts() };
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.configs[0].1.archive.path = r"..\Archive".into();
+        let plan = plan_install(&o, &probe).unwrap();
+        assert!(plan.grants.contains(&(PathBuf::from(r"C:\OmniTest\..\Archive"), Rights::ModifyDir)));
+        assert_eq!(*probe.walks.borrow(), [PathBuf::from(ROOT), PathBuf::from(r"C:\Archive"), PathBuf::from(r"C:\Dalet\ingest")]);
+        probe.links = vec![PathBuf::from(r"C:\Archive\old")];
+        let e = plan_install(&o, &probe).unwrap_err();
+        assert!(e.to_string().starts_with(r"C:\Archive\old is a link inside the installation."), "{e}");
+        // Pure: resolved by name, never past the volume root.
+        assert_eq!(lexical(Path::new(r"C:\OmniTest\.\data\..\..\Archive")), PathBuf::from(r"C:\Archive"));
+        assert_eq!(lexical(Path::new(r"C:\..\x")), PathBuf::from(r"C:\x"));
+        assert_eq!(lexical(Path::new(r"..\a\..\..\b")), PathBuf::from(r"..\..\b"));
+        assert_eq!(lexical(Path::new(r"\\nas\share\a\..\b")), PathBuf::from(r"\\nas\share\b"));
+    }
+
+    /// A3: a relative `--dir` ended its ancestors in an empty path: "Cannot create".
+    #[test]
+    fn a_relative_dir_creates_the_same_folders_as_its_absolute_form() {
+        let cwd = std::env::current_dir().unwrap();
+        let located = |dir: PathBuf| locate(&InstallOptions { dir: Some(dir), yes: true, ..Default::default() }, &new_machine()).unwrap();
+        let (rel, abs) = (located(PathBuf::from("OmniRelTest")), located(cwd.join("OmniRelTest")));
+        let is_dir = |p: &Path| !p.as_os_str().is_empty() && cwd.starts_with(p);
+        let none = |_: &Path| None::<String>;
+        let no = |_: &Path| false;
+        let r = Recheck { is_dir: &is_dir, is_link: &no, foreign_owner: &none, swapper: &none, writable: &none };
+        let made = |t: &Target| {
+            let made = std::cell::RefCell::new(Vec::new());
+            create_install_dir_with(t, &r, &mut |d: &Path| {
+                made.borrow_mut().push(d.to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+            made.into_inner()
+        };
+        assert_eq!(made(&rel), [cwd.join("OmniRelTest")]);
+        assert_eq!(made(&rel), made(&abs));
+    }
+
+    /// A4: the owner of an executable that is a link is its target's.
+    #[test]
+    fn an_executable_that_is_a_link_is_no_installation() {
+        let exe = root_paths().root.join(EXE);
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.service = None;
+        let t = locate(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        assert_eq!(t.kind, InstallKind::Upgrade { had_previous_exe: true }, "control: a real executable is an installation");
+        probe.links = vec![exe.clone()];
+        let t = locate(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        assert_eq!(t.kind, InstallKind::Fresh);
+        assert!(!t.installed_here());
+        // With the service registered it is an upgrade, but not of an executable here.
+        probe.service = Some((exe, DEFAULT_SERVICE_ACCOUNT.into()));
+        let t = locate(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        assert_eq!(t.kind, InstallKind::Upgrade { had_previous_exe: false });
+    }
+
+    /// A6: an elevated `/T` grant on a folder outside the root follows a link
+    /// above it as well as one in it.
+    #[test]
+    fn a_grant_under_a_linked_folder_outside_the_root_is_skipped_loudly() {
+        let paths = root_paths();
+        let mut config = AppConfig::default();
+        config.watchfolder_path = r"C:\Dalet\ingest".into();
+        config.archive.path = r"..\Archive".into();
+        let account = ServiceAccount { name: DEFAULT_SERVICE_ACCOUNT.into(), password: None };
+        let grants = grant_plan_with(&paths, &config, true, &MappedZ);
+        let log = Log::default();
+        let mut acl = FakeAcl { log: log.clone(), links: vec![PathBuf::from(r"C:\Dalet"), PathBuf::from(r"C:\Archive")], entries: Vec::new() };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(apply_acls_on(&paths, &config, Some(&account), None, true, &grants, &mut log.clone(), &mut acl));
+        let lines = log.lines();
+        // V4: a link above a path outside the root may be a mounted volume: the actionable line.
+        assert!(
+            lines.iter().any(|l| l.starts_with(r"! C:\Dalet\ingest is reached through a link or a mounted volume (C:\Dalet)")),
+            "{lines:#?}"
+        );
+        assert!(!lines.iter().any(|l| l.starts_with("#grant") && l.ends_with(r"C:\Dalet\ingest")), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.starts_with("#grant") && l.contains("Archive")), "{lines:#?}");
+        // The rest is still granted.
+        assert!(lines.contains(&format!(r"#grant NT SERVICE\OmniIngestService {}", paths.logs.display())), "{lines:#?}");
+    }
+
+    /// Steps the fake machine logged, without the progress lines.
+    fn steps(log: &Log) -> Vec<String> {
+        log.lines().into_iter().filter(|l| l.starts_with('#')).collect()
+    }
+
+    /// B3: an account change of an existing service changes it in place; a
+    /// new installation still registers one.
+    #[test]
+    fn an_account_change_of_an_existing_service_changes_the_registration_in_place() {
+        let o = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), ..opts() };
+        let plan = plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let answers = Answers { password: Some(PASSWORD.into()), ..Default::default() };
+        let log = Log::default();
+        let report = run(&plan, &answers, &log, FakeMachine::new(&log)).unwrap();
+        assert!(!report.rolled_back);
+        let s = steps(&log);
+        assert!(s.contains(&r"#reconfigure_service C:\OmniTest\omni-ingest.exe as NEWSROOM\svc_test password=given".to_string()), "{s:#?}");
+        assert!(!s.iter().any(|l| l.starts_with("#install_service") || l.starts_with("#uninstall_service")), "{s:#?}");
+        assert!(s.contains(&format!(r"#apply_acls {} grants for NEWSROOM\svc_test strip NT SERVICE\OmniIngestService", plan.grants.len())));
+        let lines = log.lines();
+        assert!(lines.contains(&r"  Service account changed: runs as NEWSROOM\svc_test.".to_string()), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.starts_with("  Service registered")));
+        // Nothing shown holds the password.
+        for shown in [lines.join("\n"), format!("{report:?}"), format!("{plan:?}"), format!("{answers:?}")] {
+            assert!(!shown.contains(PASSWORD), "{shown}");
+        }
+        // A new installation registers the service.
+        let plan = plan_install(&InstallOptions { yes: true, ..opts() }, &new_machine()).unwrap();
+        let log = Log::default();
+        run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap();
+        let s = steps(&log);
+        assert!(s.iter().any(|l| l.starts_with("#install_service")) && !s.iter().any(|l| l.starts_with("#reconfigure_service")), "{s:#?}");
+    }
+
+    /// B3: a named account's right and password are checked before the folder
+    /// is made or the service stopped; a refusal changes nothing else.
+    #[test]
+    fn a_named_account_is_prepared_before_anything_else_and_a_refusal_stops_there() {
+        let o = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), ..opts() };
+        let plan = plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let answers = Answers { password: Some(PASSWORD.into()), ..Default::default() };
+        let log = Log::default();
+        run(&plan, &answers, &log, FakeMachine::new(&log)).unwrap();
+        let s = steps(&log);
+        assert_eq!(s[0], r"#prepare_account NEWSROOM\svc_test password=given");
+        assert_eq!(s[1], format!("#create_dir {ROOT}"));
+        assert!(s.iter().position(|l| l == "#stop_service").unwrap() > 1);
+        // Refused: nothing else is called.
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.fail = vec![("prepare_account", 1)];
+        let e = run(&plan, &answers, &log, machine).unwrap_err();
+        assert!(e.downcast_ref::<Refusal>().is_some(), "{e}");
+        assert!(e.to_string().ends_with("Nothing else was changed."), "{e}");
+        assert_eq!(log.lines(), [r"#prepare_account NEWSROOM\svc_test password=given"]);
+        // Never for an account without a password, nor for a kept one.
+        for (probe, account) in [
+            (installed("LocalSystem"), Some(DEFAULT_SERVICE_ACCOUNT)),
+            (installed(DEFAULT_SERVICE_ACCOUNT), Some("LocalSystem")),
+            (installed(r"NEWSROOM\svc_test"), None),
+            (new_machine(), None),
+        ] {
+            let o = InstallOptions { account: account.map(String::from), yes: true, ..opts() };
+            let plan = plan_install(&o, &probe).unwrap();
+            let log = Log::default();
+            run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap();
+            assert!(!log.lines().iter().any(|l| l.starts_with("#prepare_account")), "{account:?}: {:#?}", log.lines());
+        }
+    }
+
+    /// C: an upgrade that also moves the service from the virtual account to
+    /// LocalSystem and rewrites config.json, made to fail at each step after the
+    /// stop: what was changed is put back, then the service is started.
+    #[test]
+    fn a_failed_upgrade_puts_back_what_it_changed_at_every_step() {
+        let o = InstallOptions { account: Some("LocalSystem".into()), port: Some(8092), ..opts() };
+        let plan = plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        assert!(plan.write_config && plan.account.registers());
+        assert_eq!(plan.rollback_grants, grant_plan_with(&plan.target.paths, &installed(DEFAULT_SERVICE_ACCOUNT).configs[0].1, true, &MappedZ));
+        let exe = r"C:\OmniTest\omni-ingest.exe";
+        // V2: the way back waits where the restored config.json says, 8090, not on --port 8092.
+        assert_eq!(plan.previous.here.health.to_string(), "127.0.0.1:8090");
+        let health = "#wait_for_health 127.0.0.1:8090 tls=false 240s";
+        let reconfigure_back = [
+            format!(r"#reconfigure_service {exe} as NT SERVICE\OmniIngestService password=none"),
+            r"  The service runs as NT SERVICE\OmniIngestService again.".to_string(),
+            format!(r"#apply_acls {} grants for NT SERVICE\OmniIngestService strip -", plan.rollback_grants.len()),
+        ];
+        // (step, its error, exe put back, config put back, registration and firewall put back)
+        let cases = [
+            ("copy_executable", "copy_executable failed (test)", false, false, false),
+            ("copy_release", "copy_release failed (test)", true, false, false),
+            ("ensure_dirs", "Cannot create the data, temp and log folders: ensure_dirs failed (test)", true, false, false),
+            ("save_config", "Cannot write config.json: save_config failed (test)", true, true, false),
+            ("reconfigure_service", "Cannot change the service registration: reconfigure_service failed (test)", true, true, false),
+            ("start_service", "The service would not start: start_service failed (test)", true, true, true),
+            ("wait_for_health", "The service did not answer on 127.0.0.1:8092 within 240 s", true, true, true),
+        ];
+        for (step, error, exe_back, config_back, registration_back) in cases {
+            let firewall_back = registration_back;
+            let log = Log::default();
+            let mut machine = FakeMachine::new(&log);
+            machine.had_previous = true;
+            machine.fail = vec![(step, 1)];
+            let report = run(&plan, &Answers::default(), &log, machine).unwrap_or_else(|e| panic!("{step}: {e:#}"));
+            assert!(report.rolled_back && report.restored_running, "{step}");
+            assert_eq!(report.failure.as_deref(), Some(error), "{step}");
+            let lines = log.lines();
+            let at = lines.iter().position(|l| l.starts_with(&format!("#{step}"))).unwrap();
+            let mut expected: Vec<String> =
+                ["", &format!("✗ {error}"), "  Putting the previous state back…", "#stop_service"].map(String::from).to_vec();
+            if exe_back {
+                expected.push(format!("#restore_previous {exe}"));
+            }
+            if config_back {
+                expected.push(r"#restore_config C:\OmniTest\config.json".into());
+            }
+            if registration_back {
+                expected.extend(reconfigure_back.iter().cloned());
+            }
+            // V3: the rule was moved to 8092; it goes back to 8090.
+            if firewall_back {
+                expected.push(format!("#open_firewall {exe} 8090"));
+            }
+            expected.extend(
+                ["  Starting the service and waiting for it to answer…", "#start_service", health, "✓ The previous state is running."]
+                    .map(String::from),
+            );
+            assert_eq!(lines[at + 1..], expected, "{step}");
+            let back = report.way_back.as_ref().unwrap();
+            assert_eq!(back.firewall, if firewall_back { Restore::Restored } else { Restore::NotChanged }, "{step}");
+            assert_eq!(rolled_back_message(&report, false), format!("The upgrade failed ({error}) and the previous version was put back; it is running."));
+        }
+    }
+
+    /// V1 (a): the service was registered for another folder as an account
+    /// whose password Setup does not know; the run re-pointed it here and
+    /// failed. The way back cannot re-point it: the report and the message say
+    /// where it runs now, and the exit is not "rolled back".
+    #[test]
+    fn a_registration_moved_from_another_folder_that_cannot_go_back_is_reported_as_it_is() {
+        let mut probe = new_machine();
+        probe.service = Some((PathBuf::from(r"C:\OldOmni\omni-ingest.exe"), r"NEWSROOM\svc_old".into()));
+        let plan = plan_install(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        assert!(plan.previous.elsewhere && plan.previous.there.is_none(), "{:?}", plan.previous);
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.config_exists = false;
+        machine.fail = vec![("start_service", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.rolled_back && !report.restored_running);
+        let back = report.way_back.clone().unwrap();
+        assert!(back.running);
+        assert_eq!(
+            back.registration,
+            RegistrationRestore::NotRestored {
+                exe: PathBuf::from(r"C:\OmniTest\omni-ingest.exe"),
+                account: DEFAULT_SERVICE_ACCOUNT.into(),
+                why: r"the previous account's password is not known to Setup; it was registered for C:\OldOmni\omni-ingest.exe as NEWSROOM\svc_old".into(),
+            }
+        );
+        let lines = log.lines();
+        assert!(!lines.iter().any(|l| l.contains("previous state is running")), "{lines:#?}");
+        assert!(lines.contains(&"! The service is running, but not in its previous state; see the lines above.".to_string()));
+        // It runs here, with this root's (new) configuration: waited for there.
+        assert!(lines.ends_with(&[
+            "  Starting the service and waiting for it to answer…".to_string(),
+            "#start_service".into(),
+            "#wait_for_health 127.0.0.1:8080 tls=false 240s".into(),
+            "! The service is running, but not in its previous state; see the lines above.".into(),
+        ]), "{lines:#?}");
+        let message = rolled_back_message(&report, false);
+        assert_eq!(
+            message,
+            r"The upgrade failed (The service would not start: start_service failed (test)). The service is registered for C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService: the previous account's password is not known to Setup; it was registered for C:\OldOmni\omni-ingest.exe as NEWSROOM\svc_old. The service is running."
+        );
+        assert!(!message.contains("was put back") && !message.contains("previous state is running"), "{message}");
+    }
+
+    /// V1 (b): the executable was not put back but the service answers: both
+    /// facts, never "put back" nor "did NOT start".
+    #[test]
+    fn an_executable_not_put_back_with_the_service_answering_is_reported_as_it_is() {
+        let plan = plan_install(&opts(), &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        machine.fail = vec![("start_service", 1), ("restore_previous", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.rolled_back && !report.restored_running);
+        assert_eq!(report.way_back.as_ref().unwrap().exe, Restore::NotRestored { why: "restore_previous failed (test)".into() });
+        assert!(report.way_back.as_ref().unwrap().running);
+        assert_eq!(
+            rolled_back_message(&report, false),
+            "The upgrade failed (The service would not start: start_service failed (test)). The previous omni-ingest.exe was not put back: restore_previous failed (test). The service is running."
+        );
+        assert_eq!(log.lines().last().unwrap(), "! The service is running, but not in its previous state; see the lines above.");
+    }
+
+    /// V2: a previous folder's configuration that cannot be read: the way back
+    /// does not wait on a guessed address; the start counts.
+    #[test]
+    fn a_way_back_to_another_folder_whose_configuration_cannot_be_read_does_not_wait() {
+        let mut probe = new_machine();
+        probe.service = Some((PathBuf::from(r"C:\OldOmni\omni-ingest.exe"), "LocalSystem".into()));
+        let plan = plan_install(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.config_exists = false;
+        machine.fail = vec![("start_service", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        let lines = log.lines();
+        assert!(lines.contains(&r"#reconfigure_service C:\OldOmni\omni-ingest.exe as LocalSystem password=none".to_string()), "{lines:#?}");
+        assert_eq!(steps(&log).iter().filter(|l| l.starts_with("#wait_for_health")).count(), 0, "{lines:#?}");
+        assert!(lines.contains(&"  The service was started; Setup could not check that it answers (its configuration could not be read).".to_string()));
+        let back = report.way_back.unwrap();
+        assert!(back.running);
+        assert_eq!(back.registration, RegistrationRestore::Restored);
+        assert!(matches!(back.firewall, Restore::NotRestored { .. }), "the old folder's port is unknown: {:?}", back.firewall);
+        // With the old folder's configuration readable, it waits there and the rule follows the old program.
+        let mut old = AppConfig::default();
+        old.web_port = 8070;
+        probe.configs.push((PathBuf::from(r"C:\OldOmni\config.json"), old));
+        let plan = plan_install(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.config_exists = false;
+        machine.fail = vec![("start_service", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        let lines = log.lines();
+        assert!(lines.contains(&r"#open_firewall C:\OldOmni\omni-ingest.exe 8070".to_string()), "{lines:#?}");
+        assert!(lines.contains(&"#wait_for_health 127.0.0.1:8070 tls=false 240s".to_string()), "{lines:#?}");
+        assert!(report.restored_running);
+    }
+
+    /// V4: a mounted volume (or link) above a watchfolder outside the root: the
+    /// grant is skipped with an actionable line, and the plan says so first.
+    #[test]
+    fn a_path_outside_the_root_under_a_link_or_mounted_volume_is_told_with_the_grant_to_make() {
+        let o = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), ..opts() };
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.links = vec![PathBuf::from(r"C:\Dalet")];
+        let plan = plan_install(&o, &probe).unwrap();
+        let line = r#"! C:\Dalet\ingest is reached through a link or a mounted volume (C:\Dalet): Setup did not change its permissions. If that is intended, grant them yourself: icacls "C:\Dalet\ingest" /grant "NEWSROOM\svc_test:(OI)(CI)M""#;
+        assert!(plan.target.warnings.contains(&line.to_string()), "{:#?}", plan.target.warnings);
+        assert_eq!(plan.target.header().last().unwrap(), line);
+        // At execution.
+        let paths = root_paths();
+        let account = ServiceAccount { name: r"NEWSROOM\svc_test".into(), password: None };
+        let log = Log::default();
+        let mut acl = FakeAcl { log: log.clone(), links: vec![PathBuf::from(r"C:\Dalet")], entries: Vec::new() };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(apply_acls_on(&paths, &plan.config, Some(&account), None, true, &plan.grants, &mut log.clone(), &mut acl));
+        let lines = log.lines();
+        assert!(lines.contains(&line.to_string()), "{lines:#?}");
+        // A link at the path itself keeps today's wording; no warning is planned for it.
+        let log = Log::default();
+        let mut acl = FakeAcl { log: log.clone(), links: vec![PathBuf::from(r"C:\Dalet\ingest")], entries: Vec::new() };
+        rt.block_on(apply_acls_on(&paths, &plan.config, Some(&account), None, true, &plan.grants, &mut log.clone(), &mut acl));
+        assert!(log.lines().iter().any(|l| l.starts_with(r"✗ C:\Dalet\ingest contains a link (C:\Dalet\ingest)")), "{:#?}", log.lines());
+        assert!(!log.lines().iter().any(|l| l.contains("mounted volume")));
+        // W7b: a link at the path itself AND one above it: the link at the path wins, today's wording.
+        let log = Log::default();
+        let both = vec![PathBuf::from(r"C:\Dalet\ingest"), PathBuf::from(r"C:\Dalet")];
+        let mut acl = FakeAcl { log: log.clone(), links: both, entries: Vec::new() };
+        rt.block_on(apply_acls_on(&paths, &plan.config, Some(&account), None, true, &plan.grants, &mut log.clone(), &mut acl));
+        assert!(log.lines().iter().any(|l| l.starts_with(r"✗ C:\Dalet\ingest contains a link (C:\Dalet\ingest)")), "{:#?}", log.lines());
+        assert!(!log.lines().iter().any(|l| l.contains("mounted volume")), "{:#?}", log.lines());
+        // W6: the printed command survives pasting: no trailing separator; a drive root doubled.
+        let spec = |p: &str| mounted_line(Path::new(p), Path::new(r"D:\mnt"), r"NEWSROOM\svc_test", Rights::ModifyDir);
+        assert!(spec(r"D:\Dalet\ingest\").ends_with(r#"icacls "D:\Dalet\ingest" /grant "NEWSROOM\svc_test:(OI)(CI)M""#), "{}", spec(r"D:\Dalet\ingest\"));
+        assert!(spec(r"D:\Dalet\ingest").ends_with(r#"icacls "D:\Dalet\ingest" /grant "NEWSROOM\svc_test:(OI)(CI)M""#));
+        assert!(spec(r"E:\").ends_with(r#"icacls "E:\\" /grant "NEWSROOM\svc_test:(OI)(CI)M""#), "{}", spec(r"E:\"));
+        assert_eq!(quotable_path(Path::new(r"E:\")), r"E:\\");
+        // Without the link no warning.
+        assert!(plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap().target.warnings.is_empty());
+    }
+
+    /// V5: on the way back the new account's grants outside the root go too.
+    #[test]
+    fn the_way_back_strips_the_new_account_outside_the_root_behind_the_link_guard() {
+        let paths = root_paths();
+        let mut config = AppConfig::default();
+        config.watchfolder_path = r"C:\Dalet\ingest".into();
+        config.archive.path = r"E:\Archive".into();
+        let mut grants = grant_plan_with(&paths, &config, true, &MappedZ);
+        // W7a: a share is never stripped (it is not ours).
+        grants.push((PathBuf::from(r"\\nas\archive"), Rights::ModifyDir));
+        let log = Log::default();
+        let mut acl = FakeAcl { log: log.clone(), links: vec![PathBuf::from(r"E:\Archive")], entries: Vec::new() };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(strip_outside_on(&paths.root, &grants, r"NEWSROOM\svc_test", &mut log.clone(), &mut acl));
+        assert!(!log.lines().iter().any(|l| l.contains(r"\\nas\archive")), "{:#?}", log.lines());
+        let lines = log.lines();
+        let removed: Vec<&String> = lines.iter().filter(|l| l.starts_with("#remove_grants")).collect();
+        assert_eq!(removed, [r"#remove_grants C:\Dalet\ingest NEWSROOM\svc_test /T"], "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with(r"✗ E:\Archive contains a link")), "{lines:#?}");
+        // Through the way back: after the registration is put back.
+        let o = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), ..opts() };
+        let plan = plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let answers = Answers { password: Some(PASSWORD.into()), ..Default::default() };
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.fail = vec![("wait_for_health", 1)];
+        run(&plan, &answers, &log, machine).unwrap();
+        let s = steps(&log);
+        let back = s.iter().rposition(|l| l.starts_with(r"#reconfigure_service C:\OmniTest\omni-ingest.exe as NT SERVICE")).unwrap();
+        assert_eq!(s[back + 2], r"#strip_outside NEWSROOM\svc_test", "{s:#?}");
+    }
+
+    /// C: a previous account that needs a password cannot be registered again.
+    #[test]
+    fn a_failed_change_from_a_password_account_keeps_the_new_registration_and_says_so() {
+        let o = InstallOptions { account: Some(DEFAULT_SERVICE_ACCOUNT.into()), ..opts() };
+        let plan = plan_install(&o, &installed(r"NEWSROOM\svc_old")).unwrap();
+        assert!(plan.rollback_grants.is_empty());
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        machine.fail = vec![("wait_for_health", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.rolled_back);
+        let lines = log.lines();
+        let at = lines.iter().position(|l| l == "  Putting the previous state back…").unwrap();
+        assert_eq!(
+            lines[at + 1..],
+            [
+                "#stop_service",
+                r"#restore_previous C:\OmniTest\omni-ingest.exe",
+                r"  The service stays registered for C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService: the previous account's password is not known to Setup.",
+                "  Starting the service and waiting for it to answer…",
+                "#start_service",
+                "#wait_for_health 127.0.0.1:8090 tls=false 240s",
+                "! The service is running, but not in its previous state; see the lines above.",
+            ]
+        );
+        assert_eq!(steps(&log).iter().filter(|l| l.starts_with("#reconfigure_service")).count(), 1, "never back");
+        // V1: not the previous state, so not "rolled back" (exit 1), and the message says what is there.
+        assert!(!report.restored_running);
+        assert_eq!(
+            report.way_back.as_ref().unwrap().registration,
+            RegistrationRestore::NotRestored {
+                exe: PathBuf::from(r"C:\OmniTest\omni-ingest.exe"),
+                account: DEFAULT_SERVICE_ACCOUNT.into(),
+                why: "the previous account's password is not known to Setup".into()
+            }
+        );
+        assert_eq!(
+            rolled_back_message(&report, false),
+            r"The upgrade failed (The service did not answer on 127.0.0.1:8090 within 240 s). Put back: the previous omni-ingest.exe. The service is registered for C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService: the previous account's password is not known to Setup. The service is running."
+        );
+        assert_eq!(
+            rolled_back_message(&report, true),
+            r"The account change failed (The service did not answer on 127.0.0.1:8090 within 240 s). Put back: the previous omni-ingest.exe. The service is registered for C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService: the previous account's password is not known to Setup. The service is running."
+        );
+        let mut down = report.clone();
+        down.way_back.as_mut().unwrap().running = false;
+        assert!(rolled_back_message(&down, true).ends_with(r"The service did NOT start — see C:\OmniTest\logs."));
+        for r in [&report, &down] {
+            for change in [true, false] {
+                let m = rolled_back_message(r, change);
+                assert!(!m.contains("undone") && !m.contains("previous version was put back"), "{m}");
+            }
+        }
+    }
+
+    /// C: the way back goes on past its own failures and reports them.
+    #[test]
+    fn a_way_back_whose_start_fails_reports_the_previous_state_not_running() {
+        let plan = plan_install(&opts(), &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        machine.fail = vec![("start_service", 1), ("restore_previous", 1), ("start_service", 2)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.rolled_back && !report.restored_running);
+        let lines = log.lines();
+        let at = lines.iter().position(|l| l == "  Putting the previous state back…").unwrap();
+        assert_eq!(
+            lines[at + 1..],
+            [
+                "#stop_service",
+                r"#restore_previous C:\OmniTest\omni-ingest.exe",
+                "! The previous omni-ingest.exe was not put back (restore_previous failed (test)).",
+                "  Starting the service and waiting for it to answer…",
+                "#start_service",
+                "! The service would not start (start_service failed (test)).",
+                r"✗ The service is NOT running. See C:\OmniTest\logs and Event Viewer → Windows Logs → Application.",
+            ]
+        );
+        assert_eq!(
+            rolled_back_message(&report, false),
+            r"The upgrade failed (The service would not start: start_service failed (test)). The previous omni-ingest.exe was not put back: restore_previous failed (test). The service did NOT start — see C:\OmniTest\logs."
+        );
+        // A clean way back keeps the existing sentences.
+        let clean = WayBack {
+            exe: Restore::Restored,
+            config: Restore::NotChanged,
+            registration: RegistrationRestore::Restored,
+            firewall: Restore::NotChanged,
+            running: true,
+        };
+        assert!(clean.restored_running());
+        let ok = InstallReport {
+            restored_running: true,
+            failure: Some("The service did not answer on 127.0.0.1:8090 within 240 s".into()),
+            way_back: Some(clean.clone()),
+            ..report.clone()
+        };
+        assert_eq!(
+            rolled_back_message(&ok, true),
+            "The account change failed (The service did not answer on 127.0.0.1:8090 within 240 s) and was undone; it is running."
+        );
+        let not_started = InstallReport { restored_running: false, way_back: Some(WayBack { running: false, ..clean }), ..ok };
+        assert_eq!(
+            rolled_back_message(&not_started, false),
+            r"The upgrade failed (The service did not answer on 127.0.0.1:8090 within 240 s) and the previous version was put back; it did NOT start — see C:\OmniTest\logs."
+        );
+    }
+
+    /// C: an in-place account change (nothing copied) that gets no answer: the
+    /// registration and its permissions go back, the executable is not touched.
+    #[test]
+    fn an_in_place_account_change_without_an_answer_registers_the_previous_account_again() {
+        let paths = root_paths();
+        let mut probe = installed(DEFAULT_SERVICE_ACCOUNT);
+        probe.exe = Some(paths.root.join(EXE));
+        let o = InstallOptions { account: Some("LocalSystem".into()), ..opts() };
+        let plan = plan_install(&o, &probe).unwrap();
+        assert!(plan.target.in_place);
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.fail = vec![("wait_for_health", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.rolled_back && report.restored_running);
+        let s = steps(&log);
+        assert_eq!(
+            s,
+            [
+                format!("#create_dir {ROOT}"),
+                "#stop_service".into(),
+                "#ensure_dirs".into(),
+                r"#create_watchfolder C:\Dalet\ingest".into(),
+                r"#reconfigure_service C:\OmniTest\omni-ingest.exe as LocalSystem password=none".into(),
+                format!(r"#apply_acls {} grants for LocalSystem strip NT SERVICE\OmniIngestService", plan.grants.len()),
+                r"#open_firewall C:\OmniTest\omni-ingest.exe 8090".into(),
+                "#start_service".into(),
+                "#wait_for_health 127.0.0.1:8090 tls=false 240s".into(),
+                "#stop_service".into(),
+                r"#reconfigure_service C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService password=none".into(),
+                format!(r"#apply_acls {} grants for NT SERVICE\OmniIngestService strip -", plan.rollback_grants.len()),
+                "#start_service".into(),
+                "#wait_for_health 127.0.0.1:8090 tls=false 240s".into(),
+            ]
+        );
+        // The same change that answers: no "previous version kept" line, nothing was replaced.
+        let log = Log::default();
+        run(&plan, &Answers::default(), &log, FakeMachine::new(&log)).unwrap();
+        assert!(!log.lines().iter().any(|l| l.contains("Previous version kept")), "{:#?}", log.lines());
+        assert!(log.lines().contains(&"  Service account changed: runs as LocalSystem.".to_string()));
+    }
+
+    /// C: a new installation that fails propagates the error as before; there is
+    /// no previous state to put back.
+    #[test]
+    fn a_fresh_install_that_fails_to_start_is_an_error_and_takes_no_way_back() {
+        let plan = plan_install(&InstallOptions { yes: true, ..opts() }, &new_machine()).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.fail = vec![("start_service", 1)];
+        let e = run(&plan, &Answers::default(), &log, machine).unwrap_err();
+        assert_eq!(format!("{e:#}"), "The service would not start: start_service failed (test)");
+        assert_eq!(log.lines().last().unwrap(), "#start_service");
+        assert!(!log.lines().iter().any(|l| l.contains("Putting the previous") || l.starts_with("#restore")));
+        assert_eq!(steps(&log).iter().filter(|l| *l == "#stop_service").count(), 0);
+    }
+
+    // ---- P13.1b2 round 4 -------------------------------------------------------------
+
+    /// W1: the account registered again is the one this run asked for: its
+    /// grants are the ones it keeps; nothing of it is stripped.
+    #[test]
+    fn the_way_back_keeps_the_grants_of_the_account_it_registers_again() {
+        let o = InstallOptions { account: Some(r" nt service\omniingestservice ".into()), ..opts() };
+        let plan = plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.fail = vec![("start_service", 1)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(report.restored_running);
+        let s = steps(&log);
+        assert!(!s.iter().any(|l| l.starts_with("#strip_outside")), "{s:#?}");
+        let back = s.iter().rposition(|l| l.starts_with("#apply_acls")).unwrap();
+        assert!(s[back].ends_with(" strip -"), "the restoring apply_acls strips nothing: {s:#?}");
+        // What that restoring apply_acls does: the watchfolder outside the root is granted, never stripped.
+        let account = ServiceAccount { name: DEFAULT_SERVICE_ACCOUNT.into(), password: None };
+        let log = Log::default();
+        let mut acl = FakeAcl { log: log.clone(), links: Vec::new(), entries: Vec::new() };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(apply_acls_on(&plan.target.paths, &plan.config, Some(&account), None, true, &plan.rollback_grants, &mut log.clone(), &mut acl));
+        let lines = log.lines();
+        assert!(lines.contains(&r"#grant NT SERVICE\OmniIngestService C:\Dalet\ingest".to_string()), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.starts_with(r"#remove_grants C:\Dalet")), "{lines:#?}");
+        assert!(same_account("LocalSystem", r"NT AUTHORITY\SYSTEM") && !same_account(r"NEWSROOM\a", r"NEWSROOM\b"));
+    }
+
+    /// W2: the plan never asks for a config.json that is not there (loading one
+    /// creates it).
+    #[test]
+    fn the_plan_never_loads_a_config_json_that_is_not_there() {
+        let mut probe = new_machine();
+        probe.service = Some((PathBuf::from(r"C:\OldOmni\omni-ingest.exe"), "LocalSystem".into()));
+        let plan = plan_install(&InstallOptions { yes: true, ..opts() }, &probe).unwrap();
+        assert!(plan.previous.elsewhere && plan.previous.there.is_none());
+        for p in probe.loads.borrow().iter() {
+            assert!(probe.exists(p), "asked to load {p:?}, which does not exist");
+        }
+    }
+
+    /// W3/W4: a rule that could not be added back is not "put back", and every
+    /// firewall fact that is not the previous state has its line.
+    #[test]
+    fn a_firewall_rule_that_is_not_back_is_said_and_not_counted_as_restored() {
+        let o = InstallOptions { account: Some("LocalSystem".into()), port: Some(8092), ..opts() };
+        let plan = plan_install(&o, &installed(DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        machine.fail = vec![("start_service", 1), ("open_firewall", 2)];
+        let report = run(&plan, &Answers::default(), &log, machine).unwrap();
+        assert!(!report.restored_running);
+        let why = r"Windows did not take the rule for port 8090 and C:\OmniTest\omni-ingest.exe";
+        assert_eq!(report.way_back.as_ref().unwrap().firewall, Restore::NotRestored { why: why.into() });
+        assert!(log.lines().contains(&format!("  The firewall rule was not put back: {why}.")), "{:#?}", log.lines());
+        assert!(rolled_back_message(&report, false).contains(&format!("The firewall rule was not put back: {why}.")));
+        // The other two arms: the previous folder's configuration unreadable, and one that needs no rule.
+        let mut probe = new_machine();
+        probe.service = Some((PathBuf::from(r"C:\OldOmni\omni-ingest.exe"), "LocalSystem".into()));
+        let run_old = |probe: &FakeProbe| {
+            let plan = plan_install(&InstallOptions { yes: true, ..opts() }, probe).unwrap();
+            let log = Log::default();
+            let mut machine = FakeMachine::new(&log);
+            machine.config_exists = false;
+            machine.fail = vec![("start_service", 1)];
+            run(&plan, &Answers::default(), &log, machine).unwrap();
+            log.lines()
+        };
+        let lines = run_old(&probe);
+        assert!(lines.contains(&r"  The firewall rule was not put back: the previous configuration could not be read; the rule opens port 8080 for C:\OmniTest\omni-ingest.exe.".to_string()), "{lines:#?}");
+        let mut loopback = AppConfig::default();
+        loopback.web_host = "127.0.0.1".into();
+        probe.configs.push((PathBuf::from(r"C:\OldOmni\config.json"), loopback));
+        let lines = run_old(&probe);
+        assert!(lines.contains(&r"  The firewall rule was not put back: the rule opens port 8080 for C:\OmniTest\omni-ingest.exe; the previous configuration needs none.".to_string()), "{lines:#?}");
+    }
+
+    /// W5: the same password account, rewritten with this run's password: told
+    /// as it is, never "put back" and never "undone".
+    #[test]
+    fn a_failed_change_to_the_same_password_account_is_kept_as_entered() {
+        let o = InstallOptions { account: Some(r"NEWSROOM\svc_test".into()), ..opts() };
+        let plan = plan_install(&o, &installed(r"newsroom\SVC_TEST")).unwrap();
+        let answers = Answers { password: Some(PASSWORD.into()), ..Default::default() };
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        machine.fail = vec![("wait_for_health", 1)];
+        let report = run(&plan, &answers, &log, machine).unwrap();
+        assert!(report.restored_running, "kept as entered does not count against it");
+        assert_eq!(report.way_back.as_ref().unwrap().registration, RegistrationRestore::KeptAsEntered { account: r"NEWSROOM\svc_test".into() });
+        assert!(log.lines().contains(&r"  The service stays registered as NEWSROOM\svc_test with the password entered in this run.".to_string()));
+        let message = rolled_back_message(&report, true);
+        assert_eq!(
+            message,
+            r"The account change failed (The service did not answer on 127.0.0.1:8090 within 240 s). Put back: the previous omni-ingest.exe. The service stays registered as NEWSROOM\svc_test with the password entered in this run. The service is running."
+        );
+        assert!(!message.contains("undone") && !message.contains("registration"), "{message}");
+        assert!(!rolled_back_message(&report, false).contains("previous version was put back"));
+        assert!(!log.lines().iter().any(|l| l.contains(PASSWORD)));
     }
 }

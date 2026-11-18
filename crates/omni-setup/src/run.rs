@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use omni_cli::install::{
-    execute, install_console, plan_answered, plan_install, remove_firewall_rule, remove_service_registration, same_dir, Answers,
-    Cancelled, InstallKind, InstallOptions, InstallReport, Probe, Question, Refusal, SystemProbe,
+    execute, install_console, plan_answered, plan_install, remove_firewall_rule, remove_service_registration,
+    rolled_back_message, same_dir, Answers, Cancelled, InstallKind, InstallOptions, InstallReport, Probe, Question, Refusal,
+    SystemProbe,
 };
 use omni_core::config::AppConfig;
 use omni_core::paths::{AppPaths, DriveLookup};
@@ -91,8 +92,8 @@ impl Probe for ExeProbe {
     fn first_link_under(&self, dir: &Path) -> Option<PathBuf> {
         SystemProbe.first_link_under(dir)
     }
-    fn trusted_owner(&self, path: &Path) -> bool {
-        SystemProbe.trusted_owner(path)
+    fn untrusted_owner(&self, path: &Path) -> Option<String> {
+        SystemProbe.untrusted_owner(path)
     }
     fn writable_by(&self, dir: &Path) -> Option<String> {
         SystemProbe.writable_by(dir)
@@ -159,14 +160,12 @@ async fn install_with(o: &InstallOptions, probe: &dyn Probe, quiet: bool, log: &
     install_console(o, probe, log).await
 }
 
-fn rolled_back(report: &InstallReport) -> anyhow::Error {
-    fail(
-        ExitCode::RolledBack,
-        format!(
-            "Upgrade rolled back; the previous version is running. See {} for why the new one failed.",
-            report.logs.display()
-        ),
-    )
+/// A rolled-back run as an error: exit 7 when the previous state is back and
+/// running, 1 when the way back itself did not get there (`account_change`:
+/// `/change-account`'s wording).
+pub fn rolled_back(report: &InstallReport, account_change: bool) -> anyhow::Error {
+    let code = if report.restored_running { ExitCode::RolledBack } else { ExitCode::Failed };
+    fail(code, rolled_back_message(report, account_change))
 }
 
 /// Replace `<dir>\OmniIngest-Setup.exe` with `write`'s bytes, through a temporary name.
@@ -241,7 +240,7 @@ async fn install(
         }
         let report = install_with(&o, &probe, quiet, log).await?;
         if report.rolled_back {
-            return Err(rolled_back(&report));
+            return Err(rolled_back(&report, false));
         }
         if let Err(e) = replace_setup_exe(dir, &mut |f| verified.write_stub(f)) {
             log.say(&format!("! {SETUP_EXE} was not copied to {} ({e:#}); keep this Setup to uninstall later.", dir.display()));
@@ -296,7 +295,7 @@ async fn change_account(
     let o = InstallOptions { dir: Some(dir.clone()), account: Some(account), yes: quiet, no_firewall, ..Default::default() };
     let report = install_with(&o, &probe, quiet, log).await?;
     if report.rolled_back {
-        return Err(rolled_back(&report));
+        return Err(rolled_back(&report, true));
     }
     // An installation made by `omni-ingest install` has no Setup in it yet; the
     // Apps & Features entry would point at nothing (R11).
@@ -645,6 +644,7 @@ pub fn flush() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omni_cli::install::{RegistrationRestore, Restore, WayBack};
 
     /// A console with scripted answers that records what was asked.
     struct Scripted {
@@ -803,6 +803,62 @@ mod tests {
         // The entry points elsewhere: kept.
         assert!(!o(None, Some(Path::new(r"D:\OtherOmni"))).key);
         assert!(!o(Some(here), Some(Path::new(r"D:\OtherOmni"))).key);
+    }
+
+    /// P13.1b2 C: a way back that got the previous state running is exit 7;
+    /// one that did not is exit 1, and the message says why the run failed.
+    #[test]
+    fn a_rolled_back_run_says_what_failed_and_exits_by_whether_the_previous_state_runs() {
+        let report = InstallReport {
+            kind: InstallKind::Upgrade { had_previous_exe: true },
+            rolled_back: true,
+            failure: Some("Cannot write config.json: access denied".into()),
+            restored_running: true,
+            way_back: None,
+            admin_url: "http://127.0.0.1:8080/admin".into(),
+            health: Vec::new(),
+            logs: PathBuf::from(r"C:\OmniTest\logs"),
+        };
+        let e = rolled_back(&report, false);
+        assert_eq!(exit_code_for(&e), ExitCode::RolledBack);
+        assert_eq!(
+            e.to_string(),
+            "The upgrade failed (Cannot write config.json: access denied) and the previous version was put back; it is running."
+        );
+        let e = rolled_back(&report, true);
+        assert_eq!(e.to_string(), "The account change failed (Cannot write config.json: access denied) and was undone; it is running.");
+        let down = InstallReport { restored_running: false, ..report.clone() };
+        let e = rolled_back(&down, true);
+        assert_eq!(exit_code_for(&e), ExitCode::Failed);
+        assert_eq!(
+            e.to_string(),
+            r"The account change failed (Cannot write config.json: access denied) and was undone; it did NOT start — see C:\OmniTest\logs."
+        );
+        // V1: the registration could not be put back; the service runs, but not
+        // in its previous state: exit 1, and the message says what is there now.
+        let back = WayBack {
+            exe: Restore::Restored,
+            config: Restore::Restored,
+            registration: RegistrationRestore::NotRestored {
+                exe: PathBuf::from(r"C:\OmniTest\omni-ingest.exe"),
+                account: r"NT SERVICE\OmniIngestService".into(),
+                why: "the previous account's password is not known to Setup".into(),
+            },
+            firewall: Restore::NotChanged,
+            running: true,
+        };
+        let report = InstallReport { restored_running: back.restored_running(), way_back: Some(back), ..report };
+        assert!(!report.restored_running);
+        let e = rolled_back(&report, true);
+        assert_eq!(exit_code_for(&e), ExitCode::Failed);
+        assert_eq!(
+            e.to_string(),
+            r"The account change failed (Cannot write config.json: access denied). Put back: the previous omni-ingest.exe, config.json. The service is registered for C:\OmniTest\omni-ingest.exe as NT SERVICE\OmniIngestService: the previous account's password is not known to Setup. The service is running."
+        );
+        let e = rolled_back(&report, false);
+        assert_eq!(exit_code_for(&e), ExitCode::Failed);
+        assert!(e.to_string().starts_with("The upgrade failed (Cannot write config.json: access denied). Put back:"), "{e}");
+        assert!(!e.to_string().contains("undone") && !e.to_string().contains("previous version was put back"), "{e}");
     }
 
     #[test]
