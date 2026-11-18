@@ -406,10 +406,10 @@ impl RealEnv {
             engine,
             fetcher: HttpFetcher::new(),
             images: HttpImages(HttpFetcher::new()),
-            ffmpeg,
             ytdl: ytdl.clone(),
-            prober: ToolProber::new(ffprobe.clone(), Some(ytdl.clone()), &pacer),
-            job_prober: ToolProber::new(ffprobe, Some(ytdl), &pacer).for_a_job(),
+            prober: ToolProber::new(ffprobe.clone(), Some(ytdl.clone()), Some(&ffmpeg), &pacer),
+            job_prober: ToolProber::new(ffprobe, Some(ytdl), Some(&ffmpeg), &pacer).for_a_job(),
+            ffmpeg,
             resolver: repair_gate::SystemResolver,
             model: None,
         }
@@ -466,10 +466,10 @@ impl Env for RealEnv {
         }
     }
     async fn ytdl_probe(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
-        Downloader::new(&self.ytdl, &self.engine.pacer()).probe_info(url, timeout).await
+        Downloader::new(&self.ytdl, Some(&self.ffmpeg), &self.engine.pacer()).probe_info(url, timeout).await
     }
     async fn page_scan(&self, url: &str, timeout: Duration) -> omni_broadcast::downloader::PageScan {
-        Downloader::new(&self.ytdl, &self.engine.pacer()).page_videos(url, timeout).await
+        Downloader::new(&self.ytdl, Some(&self.ffmpeg), &self.engine.pacer()).page_videos(url, timeout).await
     }
     async fn final_url(&self, url: &str) -> Option<String> {
         final_page_url(url).await

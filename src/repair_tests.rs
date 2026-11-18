@@ -1329,7 +1329,7 @@ async fn a_repaired_video_goes_through_the_real_pipeline_and_waits_for_mcr() {
     let engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdlp.clone(),
-        ffmpeg,
+        ffmpeg.clone(),
         ffprobe.clone(),
         bmx,
         root.join("temp"),
@@ -1338,7 +1338,7 @@ async fn a_repaired_video_goes_through_the_real_pipeline_and_waits_for_mcr() {
     let pacer = engine.pacer();
     let env = Local {
         engine,
-        prober: Rewriting { inner: ToolProber::new(ffprobe, Some(ytdlp), &pacer), addr },
+        prober: Rewriting { inner: ToolProber::new(ffprobe, Some(ytdlp), Some(&ffmpeg), &pacer), addr },
         addr,
         fetch: NoFetch,
     };

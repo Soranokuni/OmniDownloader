@@ -537,7 +537,7 @@ impl BroadcastEngine {
 
     /// A downloader on this engine's pacer, its waits written to job `job_id`'s history.
     fn downloader_for(&self, job_id: i64, stage: JobStage) -> Downloader {
-        Downloader::new(&self.ytdl_path, &self.pacer).for_a_job().on_pace_wait(self.pace_note(job_id, stage))
+        Downloader::new(&self.ytdl_path, Some(&self.ffmpeg_path), &self.pacer).for_a_job().on_pace_wait(self.pace_note(job_id, stage))
     }
 
     /// Count one more wait of `job_id` (the first of a series when `first`).

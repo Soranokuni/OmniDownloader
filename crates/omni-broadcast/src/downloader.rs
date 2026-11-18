@@ -61,6 +61,9 @@ pub struct DownloadOpts<'a> {
     /// Deno, for YouTube's JavaScript challenge (plan P6.8). `download`
     /// fills it from `bin/` when the caller leaves it empty.
     pub js_runtime: Option<&'a Path>,
+    /// The pinned ffmpeg for the merge (P11.4e). `download` fills it from
+    /// the downloader when the caller leaves it empty.
+    pub ffmpeg: Option<&'a Path>,
 }
 
 impl Default for DownloadOpts<'_> {
@@ -77,6 +80,7 @@ impl Default for DownloadOpts<'_> {
             timeout: Duration::from_secs(1800),
             cancel: None,
             js_runtime: None,
+            ffmpeg: None,
         }
     }
 }
@@ -285,6 +289,8 @@ pub struct Downloader {
     ytdl_path: PathBuf,
     /// `deno.exe` next to yt-dlp, when it is there.
     deno: Option<PathBuf>,
+    /// The ffmpeg the daemon resolved, handed to every run ([`hardening_args`]).
+    ffmpeg: Option<PathBuf>,
     /// The site's cookie jar file for the probes of this value (P3.5); a
     /// download takes its own from `DownloadOpts::cookie_jar`.
     cookie_jar: Option<PathBuf>,
@@ -455,13 +461,49 @@ fn js_runtime_args(deno: Option<&Path>) -> Vec<String> {
     }
 }
 
+/// The flags every yt-dlp run of an extraction, a probe or a download starts
+/// with (P11.4e): no `yt-dlp.conf` and no plugin folder of the account's
+/// profile changes what it does, and the merge uses the pinned ffmpeg, not
+/// whichever one yt-dlp finds.
+///
+/// `--ffmpeg-location` is decided from the path's text alone (no disk access).
+/// yt-dlp looks for `ffmpeg` inside a folder it is given, and checks that a
+/// file it is given exists:
+/// - a bare name with no folder part (`ffmpeg.exe`, found on PATH): no
+///   location, yt-dlp finds it the way the encoder does;
+/// - `…\ffmpeg.exe` or `…\ffmpeg` (any case): its folder;
+/// - any other name: the path as it is, a renamed binary
+///   (`ffmpeg-arm64.exe`) or a folder (`…\bin`, `…\ffmpeg-7.1`).
+///
+/// `None` leaves the location to yt-dlp.
+pub fn hardening_args(ffmpeg: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["--ignore-config".to_string(), "--no-plugin-dirs".to_string()];
+    if let Some(p) = ffmpeg {
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty());
+        let named_ffmpeg = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.eq_ignore_ascii_case("ffmpeg.exe") || n.eq_ignore_ascii_case("ffmpeg")
+        });
+        let location = match dir {
+            None => None,
+            Some(dir) if named_ffmpeg => Some(dir),
+            Some(_) => Some(p),
+        };
+        if let Some(location) = location {
+            args.push("--ffmpeg-location".into());
+            args.push(location.to_string_lossy().into_owned());
+        }
+    }
+    args
+}
+
 impl Downloader {
     /// A downloader whose runs on a video platform wait for their turn in
     /// `pacer` (P11.4): the daemon's engine's, shared by everything that runs
     /// yt-dlp in the process. It is not a job's: a platform cooling down after
     /// a rate limit is reported at once ([`paced`]'s `fail_fast`), unless
     /// [`Self::for_a_job`] says otherwise.
-    pub fn new<P: AsRef<Path>>(ytdl_path: P, pacer: &HostPacer) -> Self {
+    /// `ffmpeg` is the path the daemon resolved for its own ffmpeg (P11.4e).
+    pub fn new<P: AsRef<Path>>(ytdl_path: P, ffmpeg: Option<&Path>, pacer: &HostPacer) -> Self {
         let ytdl_path = ytdl_path.as_ref().to_path_buf();
         // bin/deno.exe sits next to the legacy bin/yt-dlp.exe, and one level
         // up from the folder build's bin/yt-dlp/yt-dlp.exe (plan P2.10).
@@ -471,7 +513,16 @@ impl Downloader {
             .take(2)
             .map(|d| d.join("deno.exe"))
             .find(|p| p.is_file());
-        Self { ytdl_path, deno, cookie_jar: None, cookie_values: Vec::new(), pacer: pacer.clone(), on_wait: None, fail_fast: true }
+        Self {
+            ytdl_path,
+            deno,
+            ffmpeg: ffmpeg.map(Path::to_path_buf),
+            cookie_jar: None,
+            cookie_values: Vec::new(),
+            pacer: pacer.clone(),
+            on_wait: None,
+            fail_fast: true,
+        }
     }
 
     /// A job's runs: they wait out a cool-down like any other wait for a turn
@@ -531,7 +582,8 @@ impl Downloader {
     /// without a network.
     pub fn build_args(url: &str, output_dir: &Path, opts: &DownloadOpts<'_>) -> Vec<String> {
         let h = opts.max_height;
-        let mut args: Vec<String> = vec![
+        let mut args = hardening_args(opts.ffmpeg);
+        args.extend::<Vec<String>>(vec![
             // Never pull 4K to downscale it to 1080 (defect D-18): on a news
             // deadline that is minutes of wasted download for no visible gain,
             // since the output is 1080i50 either way. Prefer H.264/AAC so the
@@ -597,7 +649,7 @@ impl Downloader {
                 .join("source.%(ext)s")
                 .to_string_lossy()
                 .into_owned(),
-        ];
+        ]);
 
         if opts.insecure_tls {
             args.push("--no-check-certificates".into());
@@ -631,6 +683,17 @@ impl Downloader {
         args
     }
 
+    /// `opts` with this downloader's Deno and ffmpeg where the caller left them empty.
+    fn own_tools<'a>(&'a self, mut opts: DownloadOpts<'a>) -> DownloadOpts<'a> {
+        if opts.js_runtime.is_none() {
+            opts.js_runtime = self.deno.as_deref();
+        }
+        if opts.ffmpeg.is_none() {
+            opts.ffmpeg = self.ffmpeg.as_deref();
+        }
+        opts
+    }
+
     /// Download `url` into `output_dir`, reporting progress.
     ///
     /// Returns the downloaded file, or a [`DownloadError`] carrying the
@@ -647,10 +710,7 @@ impl Downloader {
         F: FnMut(DownloadProgress) + Send + 'static,
     {
         tokio::fs::create_dir_all(output_dir).await?;
-        let mut opts = opts;
-        if opts.js_runtime.is_none() {
-            opts.js_runtime = self.deno.as_deref();
-        }
+        let opts = self.own_tools(opts);
         let args = Self::build_args(url, output_dir, &opts);
 
         info!("Job #{job_id}: downloading {}", omni_core::cookies::host_and_path(url));
@@ -724,6 +784,7 @@ impl Downloader {
         let prober = Downloader {
             ytdl_path: self.ytdl_path.clone(),
             deno: self.deno.clone(),
+            ffmpeg: opts.ffmpeg.map(Path::to_path_buf),
             cookie_jar: opts.cookie_jar.map(Path::to_path_buf).or_else(|| self.cookie_jar.clone()),
             cookie_values: opts.cookie_values.to_vec(),
             pacer: self.pacer.clone(),
@@ -805,23 +866,7 @@ impl Downloader {
     /// it (`--simulate`: the page is read and the formats are chosen). The
     /// self-check (plan P6.7) uses this. `Err` is the one-line reason.
     pub async fn probe(&self, url: &str, timeout: Duration) -> std::result::Result<Probed, String> {
-        let mut args: Vec<String> = [
-            "--simulate",
-            "--no-playlist",
-            "--playlist-items",
-            "1",
-            "--no-warnings",
-            "--socket-timeout",
-            "30",
-            "--print",
-            "%(extractor)s %(id)s",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        args.extend(js_runtime_args(self.deno.as_deref()));
-        args.extend(cookie_args(self.cookie_jar.as_deref()));
-        args.push(url.to_string());
+        let args = self.probe_args(url);
         match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => parse_probe_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
@@ -830,16 +875,36 @@ impl Downloader {
         }
     }
 
+    /// [`Self::probe`]'s arguments.
+    fn probe_args(&self, url: &str) -> Vec<String> {
+        let mut args = hardening_args(self.ffmpeg.as_deref());
+        args.extend(
+            [
+                "--simulate",
+                "--no-playlist",
+                "--playlist-items",
+                "1",
+                "--no-warnings",
+                "--socket-timeout",
+                "30",
+                "--print",
+                "%(extractor)s %(id)s",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        args
+    }
+
     /// The videos on a news page, when yt-dlp reads it as several (see
     /// [`parse_page_videos`]), and whether yt-dlp said it has no extractor
     /// for the page at all. Any other failure is no videos: the download
     /// that follows reports it properly.
     pub async fn page_videos(&self, url: &str, timeout: Duration) -> PageScan {
-        let mut args: Vec<String> =
-            ["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()).collect();
-        args.extend(js_runtime_args(self.deno.as_deref()));
-        args.extend(cookie_args(self.cookie_jar.as_deref()));
-        args.push(url.to_string());
+        let args = self.page_videos_args(url);
         match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => {
                 let json = serde_json::from_str::<serde_json::Value>(&o.stdout).ok();
@@ -861,6 +926,16 @@ impl Downloader {
             },
             _ => PageScan::default(),
         }
+    }
+
+    /// [`Self::page_videos`]'s arguments.
+    fn page_videos_args(&self, url: &str) -> Vec<String> {
+        let mut args = hardening_args(self.ffmpeg.as_deref());
+        args.extend(["--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "30"].iter().map(|s| s.to_string()));
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        args
     }
 }
 
@@ -904,29 +979,37 @@ impl Downloader {
         timeout: Duration,
         cancel: Option<&CancellationToken>,
     ) -> std::result::Result<PlatformInfo, String> {
-        let mut args: Vec<String> = [
-            "--simulate",
-            "--no-playlist",
-            "--playlist-items",
-            "1",
-            "--no-warnings",
-            "--socket-timeout",
-            "15",
-            "--print",
-            "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        args.extend(js_runtime_args(self.deno.as_deref()));
-        args.extend(cookie_args(self.cookie_jar.as_deref()));
-        args.push(url.to_string());
+        let args = self.probe_media_args(url);
         match self.capture(url, args, timeout, cancel).await {
             Ok(o) if o.success => parse_platform_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
             Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
+    }
+
+    /// [`Self::probe_media_until`]'s arguments.
+    fn probe_media_args(&self, url: &str) -> Vec<String> {
+        let mut args = hardening_args(self.ffmpeg.as_deref());
+        args.extend(
+            [
+                "--simulate",
+                "--no-playlist",
+                "--playlist-items",
+                "1",
+                "--no-warnings",
+                "--socket-timeout",
+                "15",
+                "--print",
+                "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        args
     }
 }
 
@@ -943,20 +1026,36 @@ impl Downloader {
         cookie_header: Option<&str>,
         timeout: Duration,
     ) -> Probe {
-        let mut args: Vec<String> = [
-            "--simulate",
-            "--no-playlist",
-            "--playlist-items",
-            "1",
-            "--no-warnings",
-            "--socket-timeout",
-            "15",
-            "--print",
-            "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let args = self.probe_candidate_args(url, referer, user_agent, cookie_header);
+        match self.capture(url, args, timeout, None).await {
+            Ok(o) if o.success => Probe::from_length(parse_platform_line(&o.stdout)),
+            Ok(o) if o.timed_out => Probe::Unknown,
+            Ok(o) => {
+                let code = crate::errors::classify_download_error(&o.stderr_tail);
+                if is_dead_candidate(code) { Probe::Dead(code) } else { Probe::Unknown }
+            }
+            Err(_) => Probe::Unknown,
+        }
+    }
+
+    /// [`Self::probe_candidate`]'s arguments.
+    fn probe_candidate_args(&self, url: &str, referer: Option<&str>, user_agent: Option<&str>, cookie_header: Option<&str>) -> Vec<String> {
+        let mut args = hardening_args(self.ffmpeg.as_deref());
+        args.extend(
+            [
+                "--simulate",
+                "--no-playlist",
+                "--playlist-items",
+                "1",
+                "--no-warnings",
+                "--socket-timeout",
+                "15",
+                "--print",
+                "%(duration)s|%(height)s|%(is_live)s|%(live_status)s",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
         args.extend(js_runtime_args(self.deno.as_deref()));
         if !is_video_platform(url) {
             if let Some(r) = referer {
@@ -974,15 +1073,7 @@ impl Downloader {
         }
         args.extend(cookie_args(self.cookie_jar.as_deref()));
         args.push(url.to_string());
-        match self.capture(url, args, timeout, None).await {
-            Ok(o) if o.success => Probe::from_length(parse_platform_line(&o.stdout)),
-            Ok(o) if o.timed_out => Probe::Unknown,
-            Ok(o) => {
-                let code = crate::errors::classify_download_error(&o.stderr_tail);
-                if is_dead_candidate(code) { Probe::Dead(code) } else { Probe::Unknown }
-            }
-            Err(_) => Probe::Unknown,
-        }
+        args
     }
 }
 
@@ -1016,29 +1107,37 @@ impl Downloader {
     /// Extractor, title, length and number of formats of the video at `url`, without
     /// downloading it (`--simulate`). `Err` is the one-line reason.
     pub async fn probe_info(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
-        let mut args: Vec<String> = [
-            "--simulate",
-            "--no-playlist",
-            "--playlist-items",
-            "1",
-            "--no-warnings",
-            "--socket-timeout",
-            "15",
-            "--print",
-            "%(extractor)s|%(duration)s|%(formats.:.format_id)j|%(title)s",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        args.extend(js_runtime_args(self.deno.as_deref()));
-        args.extend(cookie_args(self.cookie_jar.as_deref()));
-        args.push(url.to_string());
+        let args = self.probe_info_args(url);
         match self.capture(url, args, timeout, None).await {
             Ok(o) if o.success => parse_info_line(&o.stdout).ok_or_else(|| "yt-dlp found no video".to_string()),
             Ok(o) if o.timed_out => Err(format!("yt-dlp did not answer within {} s", timeout.as_secs())),
             Ok(o) => Err(self.scrubbed(first_error_line(&o.stderr_tail))),
             Err(e) => Err(format!("could not run yt-dlp: {e:#}")),
         }
+    }
+
+    /// [`Self::probe_info`]'s arguments.
+    fn probe_info_args(&self, url: &str) -> Vec<String> {
+        let mut args = hardening_args(self.ffmpeg.as_deref());
+        args.extend(
+            [
+                "--simulate",
+                "--no-playlist",
+                "--playlist-items",
+                "1",
+                "--no-warnings",
+                "--socket-timeout",
+                "15",
+                "--print",
+                "%(extractor)s|%(duration)s|%(formats.:.format_id)j|%(title)s",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        args.extend(js_runtime_args(self.deno.as_deref()));
+        args.extend(cookie_args(self.cookie_jar.as_deref()));
+        args.push(url.to_string());
+        args
     }
 }
 
@@ -1711,13 +1810,13 @@ mod tests {
         assert!(!args_for(&DownloadOpts::default()).iter().any(|a| a == "--js-runtimes"));
 
         let dir = tempfile::tempdir().unwrap();
-        assert!(Downloader::new(dir.path().join("yt-dlp.exe"), &HostPacer::default()).deno.is_none());
+        assert!(Downloader::new(dir.path().join("yt-dlp.exe"), None, &HostPacer::default()).deno.is_none());
         std::fs::write(dir.path().join("deno.exe"), b"x").unwrap();
-        assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe"), &HostPacer::default()).deno, Some(dir.path().join("deno.exe")));
+        assert_eq!(Downloader::new(dir.path().join("yt-dlp.exe"), None, &HostPacer::default()).deno, Some(dir.path().join("deno.exe")));
         // The folder build (P2.10) is one level down: without this YouTube
         // would lose its JavaScript runtime and 403 at random.
         assert_eq!(
-            Downloader::new(dir.path().join("yt-dlp").join("yt-dlp.exe"), &HostPacer::default()).deno,
+            Downloader::new(dir.path().join("yt-dlp").join("yt-dlp.exe"), None, &HostPacer::default()).deno,
             Some(dir.path().join("deno.exe"))
         );
     }
@@ -1761,14 +1860,14 @@ mod tests {
         let jar = crate::cookie_file::CookieFile::write(dir.path(), ".x.com\tTRUE\t/\tTRUE\t0\tauth_token\tleaky-value-998877\n").unwrap();
         let quoted = "ERROR: invalid Netscape format cookies file: '.x.com\tFALSE\t/\tTRUE\t0\tauth_token\tleaky-value-998877'".to_string();
 
-        let dl = Downloader::new("yt-dlp", &HostPacer::default()).with_cookie_jar(Some(&jar));
+        let dl = Downloader::new("yt-dlp", None, &HostPacer::default()).with_cookie_jar(Some(&jar));
         let out = dl.scrubbed(quoted.clone());
         assert!(!out.contains("leaky-value-998877"), "{out}");
         assert!(out.contains("invalid Netscape format"));
         // The download path uses the same function with the values from its options.
         assert!(!scrub_error(quoted.clone(), jar.values()).contains("leaky-value-998877"));
         // Without a jar the line is left exactly as it was.
-        assert_eq!(Downloader::new("yt-dlp", &HostPacer::default()).scrubbed(quoted.clone()), quoted);
+        assert_eq!(Downloader::new("yt-dlp", None, &HostPacer::default()).scrubbed(quoted.clone()), quoted);
     }
 
     #[test]
@@ -1857,6 +1956,96 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(args.last().unwrap(), "https://www.youtube.com/watch?v=abc");
+    }
+
+    /// P11.4e: a `yt-dlp.conf` or plugin folder in the service account's
+    /// profile changed what yt-dlp did, and the merge used whatever ffmpeg it
+    /// found. Every list a yt-dlp run is started with, with and without the
+    /// daemon's ffmpeg.
+    #[test]
+    fn every_yt_dlp_run_starts_with_the_hardening_flags() {
+        let ffmpeg = PathBuf::from(r"C:\omni\bin\ffmpeg.exe");
+        let url = "https://www.example.gr/news/1";
+        let dir = Path::new("C:/temp/jobs/7");
+        let jar = Path::new("C:/temp/jobs/7/cookies.txt");
+        for ffmpeg in [Some(ffmpeg.as_path()), None] {
+            let dl = Downloader::new("yt-dlp", ffmpeg, &HostPacer::default());
+            // (builder, the flag the list started with before the hardening flags)
+            let table: Vec<(&str, Vec<String>, &str)> = vec![
+                ("download", Downloader::build_args(url, dir, &dl.own_tools(DownloadOpts::default())), "-f"),
+                ("probe", dl.probe_args(url), "--simulate"),
+                ("page_videos", dl.page_videos_args(url), "--flat-playlist"),
+                ("probe_media", dl.probe_media_args(url), "--simulate"),
+                ("probe_candidate", dl.probe_candidate_args(url, Some("https://r.example"), Some("UA"), Some("a=1")), "--simulate"),
+                ("probe_info", dl.probe_info_args(url), "--simulate"),
+                ("cookie test", crate::cookie_file::test_args(ffmpeg, jar, url), "--cookies"),
+            ];
+            for (name, args, first) in table {
+                assert_eq!(&args[..2], ["--ignore-config", "--no-plugin-dirs"], "{name}: {args:?}");
+                let rest = match ffmpeg {
+                    Some(_) => {
+                        assert_eq!(&args[2..4], ["--ffmpeg-location", r"C:\omni\bin"], "{name}: {args:?}");
+                        4
+                    }
+                    None => 2,
+                };
+                assert_eq!(args.iter().filter(|a| *a == "--ffmpeg-location").count(), usize::from(ffmpeg.is_some()), "{name}: {args:?}");
+                assert_eq!(args[rest], first, "{name}: the rest of the list follows the hardening flags: {args:?}");
+                assert_eq!(args.last().unwrap(), url, "{name}: the link stays last");
+            }
+        }
+    }
+
+    #[test]
+    fn the_ffmpeg_location_is_one_yt_dlp_finds_the_same_ffmpeg_at() {
+        let exe = |p: &str| hardening_args(Some(Path::new(p)));
+        // Named ffmpeg: its folder (yt-dlp looks for `ffmpeg` inside).
+        assert_eq!(exe(r"C:\omni\bin\ffmpeg.exe"), ["--ignore-config", "--no-plugin-dirs", "--ffmpeg-location", r"C:\omni\bin"]);
+        assert_eq!(exe(r"\\server\tools\ffmpeg\FFMPEG.EXE")[3], r"\\server\tools\ffmpeg");
+        assert_eq!(exe(r"C:\omni\bin\ffmpeg")[3], r"C:\omni\bin");
+        // A renamed binary (a config override): the binary itself, since its
+        // folder holds no `ffmpeg.exe`.
+        assert_eq!(exe(r"D:\tools\ffmpeg-arm64.exe")[3], r"D:\tools\ffmpeg-arm64.exe");
+        // A folder is passed as it is.
+        assert_eq!(exe(r"C:\omni\bin")[3], r"C:\omni\bin");
+        assert_eq!(exe(r"C:\tools\ffmpeg-7.1")[3], r"C:\tools\ffmpeg-7.1");
+        // A bare name (found on PATH) names no location: none is given, and
+        // yt-dlp finds it as before.
+        assert_eq!(exe("ffmpeg.exe"), ["--ignore-config", "--no-plugin-dirs"]);
+        assert_eq!(exe("ffmpeg"), ["--ignore-config", "--no-plugin-dirs"]);
+        assert_eq!(hardening_args(None), ["--ignore-config", "--no-plugin-dirs"]);
+    }
+
+    /// The pinned yt-dlp knows the three flags by these names: a `--simulate`
+    /// of an address that is not a URL (refused at once, no network) ends the
+    /// same with them as without. An unknown flag ends otherwise, checked too:
+    /// `--version` would not do, it exits 0 even with an unknown flag.
+    #[tokio::test]
+    async fn the_pinned_yt_dlp_accepts_the_hardening_flags() {
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin");
+        let ytdl = omni_core::dependencies::ytdl_exe_in(&bin);
+        let ffmpeg = bin.join("ffmpeg.exe");
+        if !ytdl.is_file() || !ffmpeg.is_file() {
+            eprintln!("WARNING: skipped, no yt-dlp or ffmpeg in {bin:?}");
+            return;
+        }
+        let simulate = |pre: Vec<String>| {
+            let ytdl = ytdl.clone();
+            async move {
+                let mut args = pre;
+                args.extend(["--simulate".to_string(), "omni-not-a-url".to_string()]);
+                let o = run(&ytdl, args, RunOpts::new(Duration::from_secs(120))).await.unwrap();
+                (o.exit_code, o.stderr_tail)
+            }
+        };
+        let plain = simulate(Vec::new()).await;
+        assert!(plain.1.contains("is not a valid URL"), "{plain:?}");
+        let hardened = simulate(hardening_args(Some(&ffmpeg))).await;
+        assert_eq!(hardened.0, plain.0, "{hardened:?}");
+        assert!(hardened.1.contains("is not a valid URL"), "{hardened:?}");
+        let unknown = simulate(vec!["--no-such-flag-omni".to_string()]).await;
+        assert_ne!(unknown.0, plain.0, "an unknown flag is refused, so the comparison above means something: {unknown:?}");
+        assert!(unknown.1.contains("no such option"), "{unknown:?}");
     }
 
     #[test]
@@ -2335,7 +2524,7 @@ mod platform_probe_tests {
     async fn the_downloaders_probe_is_paced() {
         let dir = tempfile::tempdir().unwrap();
         let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
-        let dl = Downloader::new(dir.path().join("no-yt-dlp.exe"), &pacer);
+        let dl = Downloader::new(dir.path().join("no-yt-dlp.exe"), None, &pacer);
         assert!(dl.probe("https://youtu.be/abcdefghijk", Duration::from_secs(5)).await.is_err());
         assert!(dl.probe_media("https://www.news.example/story/1", Duration::from_secs(5)).await.is_err());
         let t0 = tokio::time::Instant::now();
@@ -2529,7 +2718,7 @@ mod platform_probe_tests {
         let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
         pacer.penalize("youtube", RATE_LIMIT_COOL_DOWN);
         let t0 = tokio::time::Instant::now();
-        let e = Downloader::new(dir.path().join("no-yt-dlp.exe"), &pacer)
+        let e = Downloader::new(dir.path().join("no-yt-dlp.exe"), None, &pacer)
             .probe_info("https://youtu.be/abcdefghijk", Duration::from_secs(30))
             .await
             .unwrap_err();
@@ -2537,7 +2726,7 @@ mod platform_probe_tests {
         assert!(e.contains("cooling down"), "{e}");
         assert_eq!(classify_download_error(&e), ErrorCode::RateLimited);
         // A job's probe waits the two minutes, then runs (no yt-dlp here: it fails to start).
-        let e = Downloader::new(dir.path().join("no-yt-dlp.exe"), &pacer)
+        let e = Downloader::new(dir.path().join("no-yt-dlp.exe"), None, &pacer)
             .for_a_job()
             .probe_info("https://youtu.be/abcdefghijk", Duration::from_secs(30))
             .await

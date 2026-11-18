@@ -121,7 +121,8 @@ async fn sign_in(paths: &AppPaths, config: &AppConfig, repo: &Repository, raw_do
         (true, Some(url)) => {
             println!("Testing the login with yt-dlp on {}…", cookies::host_and_path(&url));
             let pacer = omni_broadcast::pacing::HostPacer::default();
-            match omni_broadcast::cookie_file::test_jar(&ytdl, &paths.resolve(&config.temp_path), repo, &domain, &url, &pacer).await {
+            let ffmpeg = crate::resolve_ffmpeg(config, &DependencyManager::new(paths.resolve(&config.bin_dir)));
+            match omni_broadcast::cookie_file::test_jar(&ytdl, Some(&ffmpeg), &paths.resolve(&config.temp_path), repo, &domain, &url, &pacer).await {
                 Ok(t) if t.ok => println!("Test ok: yt-dlp reads a video with this login."),
                 Ok(t) if t.inconclusive => println!("Not tested: {}.", t.detail),
                 Ok(t) => println!("Test FAILED: {}", t.detail),

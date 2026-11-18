@@ -57,6 +57,8 @@ pub(crate) trait LinkTools {
 
 struct LiveTools {
     ytdl: std::path::PathBuf,
+    /// The daemon's ffmpeg, handed to yt-dlp (P11.4e).
+    ffmpeg: Option<std::path::PathBuf>,
     /// The daemon's pacer (P11.4): a check's yt-dlp waits for its turn like a job's.
     pacer: HostPacer,
     /// The site's cookie jars, and where a run's copy of one is written; none for the self-check's own links.
@@ -65,7 +67,7 @@ struct LiveTools {
 
 impl LiveTools {
     fn dl(&self) -> Downloader {
-        Downloader::new(&self.ytdl, &self.pacer)
+        Downloader::new(&self.ytdl, self.ffmpeg.as_deref(), &self.pacer)
     }
 }
 
@@ -128,8 +130,13 @@ async fn probe_twice(tools: &impl LinkTools, url: &str, give_up_early: impl Fn(&
 /// [`check_link_with`] for the nightly canary pass: what the browser sees on the page is
 /// remembered for the site (P3.16), as a job's sniff does, and a video the site shows
 /// on its other articles does not count as the page's video.
-pub async fn check_link_recording(ytdl: &Path, pacer: &HostPacer, repo: &Repository, scratch: &Path, url: &str) -> LinkOutcome {
-    let tools = LiveTools { ytdl: ytdl.to_path_buf(), pacer: pacer.clone(), jars: Some((repo.clone(), scratch.to_path_buf())) };
+pub async fn check_link_recording(ytdl: &Path, ffmpeg: Option<&Path>, pacer: &HostPacer, repo: &Repository, scratch: &Path, url: &str) -> LinkOutcome {
+    let tools = LiveTools {
+        ytdl: ytdl.to_path_buf(),
+        ffmpeg: ffmpeg.map(Path::to_path_buf),
+        pacer: pacer.clone(),
+        jars: Some((repo.clone(), scratch.to_path_buf())),
+    };
     check_link_with(&tools, Some(repo), url).await
 }
 
@@ -308,11 +315,17 @@ pub fn summary(links: &[SelfcheckLink], now: DateTime<Utc>, postponed_nights: u3
     }
 }
 
-/// Check `links` with the yt-dlp at `ytdl` and store each result. Returns
-/// the outcomes in order. A link that changes state is written to the audit
-/// log; one that stays broken is not repeated there every night.
-pub async fn check_and_record(repo: &Repository, ytdl: &Path, pacer: &HostPacer, links: &[SelfcheckLink]) -> Vec<(SelfcheckLink, LinkOutcome)> {
-    let tools = LiveTools { ytdl: ytdl.to_path_buf(), pacer: pacer.clone(), jars: None };
+/// Check `links` with the yt-dlp at `ytdl` (handed `ffmpeg`, P11.4e) and store
+/// each result. Returns the outcomes in order. A link that changes state is
+/// written to the audit log; one that stays broken is not repeated there every night.
+pub async fn check_and_record(
+    repo: &Repository,
+    ytdl: &Path,
+    ffmpeg: Option<&Path>,
+    pacer: &HostPacer,
+    links: &[SelfcheckLink],
+) -> Vec<(SelfcheckLink, LinkOutcome)> {
+    let tools = LiveTools { ytdl: ytdl.to_path_buf(), ffmpeg: ffmpeg.map(Path::to_path_buf), pacer: pacer.clone(), jars: None };
     check_and_record_with(repo, &tools, links).await
 }
 
@@ -404,10 +417,17 @@ fn browser_check(result: anyhow::Result<String>) -> Check {
 }
 
 /// The whole nightly run: browser, then every link.
-pub async fn run(repo: &Repository, ytdl: &Path, pacer: &HostPacer, health: &HealthState, bin_dir: &Path) -> anyhow::Result<usize> {
+pub async fn run(
+    repo: &Repository,
+    ytdl: &Path,
+    ffmpeg: Option<&Path>,
+    pacer: &HostPacer,
+    health: &HealthState,
+    bin_dir: &Path,
+) -> anyhow::Result<usize> {
     check_browser(health).await;
     let links = repo.list_selfcheck_links()?;
-    let results = check_and_record(repo, ytdl, pacer, &links).await;
+    let results = check_and_record(repo, ytdl, ffmpeg, pacer, &links).await;
     refresh_health(repo, health, bin_dir);
     let failing = results.iter().filter(|(_, o)| !o.ok && !o.inconclusive).count();
     let unchecked = results.iter().filter(|(_, o)| o.inconclusive).count();

@@ -138,23 +138,27 @@ pub fn for_urls(repo: &Repository, urls: &[&str], dir: &Path, scratch: bool) -> 
 }
 
 /// The yt-dlp arguments of a jar test: no download, one video's metadata.
-pub fn test_args(cookies: &Path, url: &str) -> Vec<String> {
-    [
-        "--cookies",
-        &cookies.to_string_lossy(),
-        "--skip-download",
-        "--dump-json",
-        "--no-playlist",
-        "--playlist-items",
-        "1",
-        "--no-warnings",
-        "--socket-timeout",
-        "15",
-        url,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+/// `ffmpeg` as in [`crate::downloader::hardening_args`].
+pub fn test_args(ffmpeg: Option<&Path>, cookies: &Path, url: &str) -> Vec<String> {
+    let mut args = crate::downloader::hardening_args(ffmpeg);
+    args.extend(
+        [
+            "--cookies",
+            &cookies.to_string_lossy(),
+            "--skip-download",
+            "--dump-json",
+            "--no-playlist",
+            "--playlist-items",
+            "1",
+            "--no-warnings",
+            "--socket-timeout",
+            "15",
+            url,
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    args
 }
 
 /// The result of one jar test, as stored: `ok`, or the first error line with no query strings.
@@ -212,9 +216,10 @@ fn jar_test_result(outcome: anyhow::Result<omni_core::process::RunOutcome>, valu
 /// caller that is not a job: a platform cooling down after a rate limit is
 /// answered at once. That, or the site refusing this run as a rate limit, is
 /// inconclusive ([`JAR_TEST_LIMITED`]): the jar's stored state and last result
-/// are left as they were.
+/// are left as they were. `ffmpeg` is the daemon's (P11.4e).
 pub async fn test_jar(
     ytdl: &Path,
+    ffmpeg: Option<&Path>,
     temp_dir: &Path,
     repo: &Repository,
     domain: &str,
@@ -229,7 +234,7 @@ pub async fn test_jar(
     };
     let values: Vec<String> = repo.cookie_values();
     let file = CookieFile::write_scratch(temp_dir, &text).map_err(|e| format!("Could not prepare the test: {e}"))?;
-    let args = test_args(file.path(), &url);
+    let args = test_args(ffmpeg, file.path(), &url);
     let outcome = crate::downloader::paced(pacer, &url, None, None, None, true, || {
         omni_core::process::run_capture(ytdl, args, Duration::from_secs(90))
     })
@@ -384,7 +389,7 @@ mod tests {
 
     #[test]
     fn the_test_command_never_downloads_and_names_the_jar_by_path_only() {
-        let args = test_args(Path::new("C:/t/cookies.txt"), "https://x.com/a/status/1");
+        let args = test_args(None, Path::new("C:/t/cookies.txt"), "https://x.com/a/status/1");
         let joined = args.join(" ");
         assert!(joined.contains("--cookies C:/t/cookies.txt"));
         assert!(args.contains(&"--skip-download".to_string()) && args.contains(&"--dump-json".to_string()));
@@ -397,13 +402,13 @@ mod tests {
         let repo = Repository::new(dir.path().join("omni.db")).unwrap();
         let nowhere = dir.path().join("no-such-yt-dlp.exe");
         let pacer = crate::pacing::HostPacer::default();
-        let e = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1", &pacer).await.unwrap_err();
+        let e = test_jar(&nowhere, None, dir.path(), &repo, "x.com", "https://x.com/a/status/1", &pacer).await.unwrap_err();
         assert!(e.contains("no cookie jar"), "{e}");
         let jar = omni_core::cookies::parse_netscape("x.com", TEXT).unwrap();
         repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
-        assert!(test_jar(&nowhere, dir.path(), &repo, "x.com", "https://example.org/a", &pacer).await.is_err());
+        assert!(test_jar(&nowhere, None, dir.path(), &repo, "x.com", "https://example.org/a", &pacer).await.is_err());
         // A missing yt-dlp is a failed test, stored, not a panic, and nothing is left behind.
-        let t = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1?s=20", &pacer).await.unwrap();
+        let t = test_jar(&nowhere, None, dir.path(), &repo, "x.com", "https://x.com/a/status/1?s=20", &pacer).await.unwrap();
         assert!(!t.ok && !t.inconclusive && !t.detail.contains("file-value-123456"));
         let stored = repo.list_cookie_jars().unwrap();
         assert_eq!(stored[0].last_test_ok, Some(false));
@@ -455,7 +460,7 @@ mod tests {
         let pacer = crate::pacing::HostPacer::default();
         pacer.penalize("x", crate::pacing::RATE_LIMIT_COOL_DOWN);
         let t0 = tokio::time::Instant::now();
-        let t = test_jar(&nowhere, dir.path(), &repo, "x.com", "https://x.com/a/status/1", &pacer).await.unwrap();
+        let t = test_jar(&nowhere, None, dir.path(), &repo, "x.com", "https://x.com/a/status/1", &pacer).await.unwrap();
         assert_eq!(tokio::time::Instant::now(), t0, "the test waited for the cool-down");
         assert!(t.inconclusive && !t.ok, "{t:?}");
         assert_eq!(t.detail, JAR_TEST_LIMITED);

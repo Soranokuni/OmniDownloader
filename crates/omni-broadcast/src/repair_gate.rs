@@ -227,9 +227,10 @@ pub struct ToolProber {
 }
 
 impl ToolProber {
-    /// yt-dlp's probes of a platform link wait for their turn in `pacer` (P11.4).
-    pub fn new(ffprobe: PathBuf, ytdl: Option<PathBuf>, pacer: &crate::pacing::HostPacer) -> Self {
-        Self { ffprobe, downloader: ytdl.map(|y| Downloader::new(y, pacer)) }
+    /// yt-dlp's probes of a platform link wait for their turn in `pacer` (P11.4);
+    /// `ffmpeg` is the daemon's, handed to yt-dlp (P11.4e).
+    pub fn new(ffprobe: PathBuf, ytdl: Option<PathBuf>, ffmpeg: Option<&std::path::Path>, pacer: &crate::pacing::HostPacer) -> Self {
+        Self { ffprobe, downloader: ytdl.map(|y| Downloader::new(y, ffmpeg, pacer)) }
     }
 
     /// For a ladder that runs inside a job: its yt-dlp probes wait out a

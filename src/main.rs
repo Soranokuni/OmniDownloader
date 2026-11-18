@@ -863,6 +863,7 @@ async fn main() -> Result<()> {
             let repo = Repository::new(paths.resolve(&config.database_path))?;
             let health = HealthState::new();
             let ytdl = DependencyManager::new(&paths.bin).ytdl_live();
+            let ffmpeg = resolve_ffmpeg(&config, &DependencyManager::new(paths.resolve(&config.bin_dir)));
             let deps = DependencyManager::new(&paths.bin);
             if !ensure_deno(&deps, &health, config.ytdl_auto_update_nightly).await {
                 println!("  ✗ Deno: {}", health.get(omni_core::health::checks::DENO).and_then(|c| c.detail).unwrap_or_default());
@@ -877,7 +878,7 @@ async fn main() -> Result<()> {
             let links = repo.list_selfcheck_links()?;
             println!("Checking {} link(s); each takes a few seconds…", links.len());
             let (mut working, mut unchecked) = (0, 0);
-            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, &omni_broadcast::pacing::HostPacer::default(), &links).await {
+            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, Some(&ffmpeg), &omni_broadcast::pacing::HostPacer::default(), &links).await {
                 working += usize::from(outcome.ok);
                 unchecked += usize::from(outcome.inconclusive);
                 // Inconclusive: the site was limiting requests (P11.4); not counted either way.
@@ -1231,12 +1232,7 @@ async fn run_daemon(
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
-    let ffmpeg_path = config
-        .ffmpeg_path
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| dep_mgr.find_binary("ffmpeg"))
-        .unwrap_or_else(|| dep_mgr.unresolved_path("ffmpeg"));
+    let ffmpeg_path = resolve_ffmpeg(&config, &dep_mgr);
     let ffprobe_path = config
         .ffprobe_path
         .as_ref()
@@ -1319,6 +1315,8 @@ async fn run_daemon(
     let archive_shares_temp = omni_core::archive::same_volume(&archive_settings.root, &temp_path);
     let repair_ffprobe = ffprobe_path.clone();
     let repair_ffmpeg = ffmpeg_path.clone();
+    // Handed to the yt-dlp runs outside the engine: canaries, self-check, cookie tests (P11.4e).
+    let ytdl_ffmpeg = ffmpeg_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
     // Whether the watchfolder answers (P11.2a): the start-up probe sets it, the
     // share watch and every delivery keep it current, the worker loop reads it.
@@ -1446,7 +1444,8 @@ async fn run_daemon(
     let canary_env = Arc::new(
         canary::CanaryEnv::new(repo.clone(), health.clone(), bin_dir.clone(), config.ytdl_channel.clone())
             .with_scratch(temp_path.clone())
-            .with_pacer(broadcast_engine.pacer()),
+            .with_pacer(broadcast_engine.pacer())
+            .with_ffmpeg(ytdl_ffmpeg.clone()),
     );
     // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
     let url_tester = Arc::new(repair::AdminTester::new());
@@ -1484,6 +1483,7 @@ async fn run_daemon(
             bin_dir: bin_dir.clone(),
             temp_path: temp_path.clone(),
             pacer: broadcast_engine.pacer(),
+            ffmpeg: Some(ytdl_ffmpeg),
         }))
         .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
         .with_benchmark_starter(Arc::new(benchmark::Starter::new(Arc::new(benchmark::Benchmark::new(
@@ -2109,6 +2109,17 @@ fn hostname_for_lease() -> String {
         .unwrap_or_else(|_| "unknown-host".to_string())
 }
 
+/// The ffmpeg the daemon runs: `config.json`'s path, else `bin/`'s. Every
+/// yt-dlp run is handed the same one for its merge (P11.4e).
+pub(crate) fn resolve_ffmpeg(config: &AppConfig, dep_mgr: &DependencyManager) -> PathBuf {
+    config
+        .ffmpeg_path
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| dep_mgr.find_binary("ffmpeg"))
+        .unwrap_or_else(|| dep_mgr.unresolved_path("ffmpeg"))
+}
+
 /// One nightly yt-dlp update: verify, wait for the pool, swap (plan P2.9).
 ///
 /// Every step can decline without consequence. A checksum mismatch, a pool that
@@ -2121,6 +2132,7 @@ async fn nightly_ytdl_update(
     gate: &UpdateGate,
     repo: &Repository,
     pacer: &omni_broadcast::pacing::HostPacer,
+    ffmpeg: Option<&std::path::Path>,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
 
@@ -2188,7 +2200,7 @@ async fn nightly_ytdl_update(
     // still paused. A link the new build fails and the old one passes means
     // the release broke it: the old build goes back and this one is marked
     // rejected. A link both fail is the site, not the update.
-    let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer).await;
+    let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer, ffmpeg).await;
     drop(swap);
     let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
     if act.reject {
@@ -2330,6 +2342,7 @@ async fn nightly_deno_update(
     repo: &Repository,
     health: &HealthState,
     pacer: &omni_broadcast::pacing::HostPacer,
+    ffmpeg: Option<&std::path::Path>,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
     let Some(installed) = dep_mgr.deno_version() else {
@@ -2376,7 +2389,7 @@ async fn nightly_deno_update(
                 .filter(|l| l.last_ok == Some(true))
                 .collect();
             let ytdl = dep_mgr.ytdl_live();
-            let results = selfcheck::check_and_record(repo, &ytdl, pacer, &worked).await;
+            let results = selfcheck::check_and_record(repo, &ytdl, ffmpeg, pacer, &worked).await;
             // A rollback that fails leaves the new Deno live and unverified (P11.4).
             let verdict = match selfcheck::judge_deno(&results) {
                 UpdateVerdict::RolledBack { broken } if dep_mgr.rollback_deno().is_err() => UpdateVerdict::Unverified {
@@ -2429,6 +2442,7 @@ async fn verify_ytdl_update(
     live: &std::path::Path,
     repo: &Repository,
     pacer: &omni_broadcast::pacing::HostPacer,
+    ffmpeg: Option<&std::path::Path>,
 ) -> UpdateVerdict {
     let worked: Vec<omni_core::models::SelfcheckLink> = repo
         .list_selfcheck_links()
@@ -2438,7 +2452,7 @@ async fn verify_ytdl_update(
         .collect();
     selfcheck::verify_update(
         &worked,
-        |links| async move { selfcheck::check_and_record(repo, live, pacer, &links).await },
+        |links| async move { selfcheck::check_and_record(repo, live, ffmpeg, pacer, &links).await },
         || match dep_mgr.rollback_ytdl() {
             Ok(_) => true,
             Err(e) => {
@@ -2519,13 +2533,15 @@ struct CookieJarTester {
     temp_path: PathBuf,
     /// The daemon's pacer (P11.4): the test takes its turn at the platform like everything else.
     pacer: omni_broadcast::pacing::HostPacer,
+    /// The daemon's ffmpeg, handed to yt-dlp (P11.4e).
+    ffmpeg: Option<PathBuf>,
 }
 
 impl omni_web::state::CookieTester for CookieJarTester {
     fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> omni_web::state::CookieTestFuture<'a> {
         Box::pin(async move {
             let ytdl = DependencyManager::new(&self.bin_dir).ytdl_live();
-            let t = omni_broadcast::cookie_file::test_jar(&ytdl, &self.temp_path, &self.repo, domain, url, &self.pacer).await?;
+            let t = omni_broadcast::cookie_file::test_jar(&ytdl, self.ffmpeg.as_deref(), &self.temp_path, &self.repo, domain, url, &self.pacer).await?;
             // The site was limiting requests: nothing was learnt or stored; the admin is told to try later.
             if t.inconclusive {
                 return Err(t.detail);
@@ -2632,8 +2648,9 @@ async fn run_one_task(
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
             // No canary run (its yt-dlp starts without a gate pass) overlaps the swap.
             let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
-                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer()).await;
-                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer()).await;
+                let ffmpeg = ctx.canary.ffmpeg();
+                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
+                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
                 (ytdl, deno)
             })
             .await;
@@ -2648,7 +2665,7 @@ async fn run_one_task(
 
         "selfcheck" => {
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
-            let failing = selfcheck::run(repo, &ytdl, &ctx.canary.pacer(), &ctx.health, &ctx.bin_dir).await?;
+            let failing = selfcheck::run(repo, &ytdl, ctx.canary.ffmpeg().as_deref(), &ctx.canary.pacer(), &ctx.health, &ctx.bin_dir).await?;
             // Then the recent articles of each frequent site (P10.4). Always
             // on; a site's verdict never changes this task's outcome.
             canary::nightly(&ctx.canary).await;
@@ -2666,11 +2683,12 @@ async fn run_one_task(
             // expired login is seen overnight and not by a journalist.
             let jars = repo.list_cookie_jars()?;
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
+            let ffmpeg = ctx.canary.ffmpeg();
             let (mut tested, mut failing) = (0usize, Vec::<String>::new());
             for jar in &jars {
                 let Some(url) = omni_core::cookies::sample_url_for(&jar.domain, jar.last_sample_url.as_deref()) else { continue };
                 tested += 1;
-                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, &url, &ctx.canary.pacer()).await {
+                match omni_broadcast::cookie_file::test_jar(&ytdl, ffmpeg.as_deref(), &ctx.temp_path, repo, &jar.domain, &url, &ctx.canary.pacer()).await {
                     Ok(t) if t.ok => {}
                     // The site was limiting requests: not a failed jar, and nothing was stored.
                     Ok(t) if t.inconclusive => info!("Cookie test for {}: not judged tonight, {}", jar.domain, t.detail),
@@ -3299,7 +3317,7 @@ mod tests {
         let pacer = omni_broadcast::pacing::HostPacer::default();
         pacer.penalize("x", omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN);
         std::fs::create_dir_all(dir.path().join("temp")).unwrap();
-        let tester = CookieJarTester { repo: repo.clone(), bin_dir: dir.path().join("bin"), temp_path: dir.path().join("temp"), pacer };
+        let tester = CookieJarTester { repo: repo.clone(), bin_dir: dir.path().join("bin"), temp_path: dir.path().join("temp"), pacer, ffmpeg: None };
         let t0 = tokio::time::Instant::now();
         let got = tester.test("x.com", "https://x.com/someone/status/1").await;
         assert_eq!(tokio::time::Instant::now(), t0);

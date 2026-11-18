@@ -216,6 +216,8 @@ pub(crate) trait SiteProbe {
 
 pub(crate) struct LiveProbe {
     pub ytdl: PathBuf,
+    /// The daemon's ffmpeg, handed to yt-dlp (P11.4e).
+    pub ffmpeg: Option<PathBuf>,
     /// The daemon's pacer: a canary's yt-dlp waits for its turn like a job's (P11.4).
     pub pacer: omni_broadcast::pacing::HostPacer,
     /// Where what the browser sees is remembered for the site (P3.16).
@@ -228,7 +230,7 @@ impl SiteProbe for LiveProbe {
         omni_browser::pages::page_status(url).await
     }
     async fn check_link(&self, url: &str) -> LinkOutcome {
-        crate::selfcheck::check_link_recording(&self.ytdl, &self.pacer, &self.repo, &self.scratch, url).await
+        crate::selfcheck::check_link_recording(&self.ytdl, self.ffmpeg.as_deref(), &self.pacer, &self.repo, &self.scratch, url).await
     }
     async fn browser_works(&self, health: &HealthState) -> bool {
         crate::selfcheck::check_browser(health).await
@@ -392,6 +394,9 @@ pub struct CanaryEnv {
     day_llm: Mutex<(String, u32)>,
     /// Every check's yt-dlp waits for its turn here (P11.4); the daemon gives its engine's.
     pacer: omni_broadcast::pacing::HostPacer,
+    /// The daemon's ffmpeg, handed to every yt-dlp run of a check, the nightly
+    /// self-check and the tool updates (P11.4e).
+    ffmpeg: Option<PathBuf>,
 }
 
 impl CanaryEnv {
@@ -410,7 +415,19 @@ impl CanaryEnv {
             outage: AtomicBool::new(false),
             day_llm: Mutex::new((String::new(), 0)),
             pacer: omni_broadcast::pacing::HostPacer::default(),
+            ffmpeg: None,
         }
+    }
+
+    /// Hand `ffmpeg` (the daemon's) to every yt-dlp run made with this value (P11.4e).
+    pub fn with_ffmpeg(mut self, ffmpeg: PathBuf) -> Self {
+        self.ffmpeg = Some(ffmpeg);
+        self
+    }
+
+    /// The ffmpeg handed to yt-dlp; the nightly self-check and tool updates use it too.
+    pub fn ffmpeg(&self) -> Option<PathBuf> {
+        self.ffmpeg.clone()
     }
 
     /// Pace the checks' yt-dlp with `pacer`: the daemon's engine's, so a canary
@@ -529,7 +546,13 @@ impl CanaryEnv {
 
     /// The real outside world for a check, with the memory of what the browser sees on a site's pages.
     fn live_probe(&self) -> LiveProbe {
-        LiveProbe { ytdl: self.ytdl(), pacer: self.pacer.clone(), repo: self.repo.clone(), scratch: self.scratch.clone() }
+        LiveProbe {
+            ytdl: self.ytdl(),
+            ffmpeg: self.ffmpeg.clone(),
+            pacer: self.pacer.clone(),
+            repo: self.repo.clone(),
+            scratch: self.scratch.clone(),
+        }
     }
 }
 

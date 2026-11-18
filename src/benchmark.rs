@@ -745,7 +745,7 @@ impl ExtractSteps for RealStages {
 
     async fn page_scan(&self, url: &str) -> PageScan {
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, url, &self.scratch, true);
-        let scan = Downloader::new(&self.tools.ytdl, &self.pacer).with_cookie_jar(jar.as_ref()).page_videos(url, PROBE_TIMEOUT).await;
+        let scan = Downloader::new(&self.tools.ytdl, Some(&self.tools.ffmpeg), &self.pacer).with_cookie_jar(jar.as_ref()).page_videos(url, PROBE_TIMEOUT).await;
         drop(jar);
         scan
     }
@@ -757,7 +757,7 @@ impl ExtractSteps for RealStages {
     async fn ytdlp(&self, url: &str) -> std::result::Result<Option<f64>, String> {
         // yt-dlp's own extractors, with the site's cookie jar when there is one.
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, url, &self.scratch, true);
-        let probed = Downloader::new(&self.tools.ytdl, &self.pacer).with_cookie_jar(jar.as_ref()).probe_info(url, PROBE_TIMEOUT).await;
+        let probed = Downloader::new(&self.tools.ytdl, Some(&self.tools.ffmpeg), &self.pacer).with_cookie_jar(jar.as_ref()).probe_info(url, PROBE_TIMEOUT).await;
         drop(jar);
         probed.map(|info| info.duration_secs)
     }
@@ -794,7 +794,7 @@ impl ExtractSteps for RealStages {
 
     async fn probe(&self, candidate: &str, session: &Sniff) -> Probe {
         let jar = omni_broadcast::cookie_file::for_url(&self.repo, candidate, &self.scratch, true);
-        let probed = Downloader::new(&self.tools.ytdl, &self.pacer)
+        let probed = Downloader::new(&self.tools.ytdl, Some(&self.tools.ffmpeg), &self.pacer)
             .with_cookie_jar(jar.as_ref())
             .probe_candidate(candidate, Some(&session.referer), Some(&session.user_agent), session.cookies.as_deref(), PROBE_TIMEOUT.min(Duration::from_secs(15)))
             .await;
@@ -811,7 +811,7 @@ impl BenchStages for RealStages {
 
     async fn download(&self, target: &TargetRow, found: &Extracted, dir: &Path) -> StageResult<PathBuf> {
         let jar = omni_broadcast::cookie_file::for_urls(&self.repo, &[found.stream.as_str()], dir, false);
-        let result = Downloader::new(&self.tools.ytdl, &self.pacer)
+        let result = Downloader::new(&self.tools.ytdl, Some(&self.tools.ffmpeg), &self.pacer)
             .download(
                 Self::tool_id(target),
                 &found.stream,
