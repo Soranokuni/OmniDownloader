@@ -944,7 +944,8 @@ fn plan_from(target: Target, o: &InstallOptions, answers: &Answers, probe: &dyn 
         PreviousEndpoints { elsewhere, here, there }
     };
     let paths = &target.paths;
-    let existing_database = probe.exists(&paths.data.join("omni.db"));
+    // The database the daemon will open: the configuration's, resolved as it does.
+    let existing_database = probe.exists(&paths.resolve(&config.database_path));
 
     Ok(InstallPlan {
         existing_database,
@@ -3183,8 +3184,9 @@ mod tests {
         loads: std::cell::RefCell<Vec<PathBuf>>,
     }
 
+    /// A path as Windows compares it: case-insensitive, `/` and `\` alike.
     fn key(p: &Path) -> String {
-        p.to_string_lossy().to_ascii_lowercase()
+        p.to_string_lossy().to_ascii_lowercase().replace('/', "\\")
     }
 
     impl Probe for FakeProbe {
@@ -4633,6 +4635,38 @@ mod tests {
         assert!(report.existing_database);
         let log = Log::default();
         assert!(!run(&first, &Answers::default(), &log, FakeMachine::new(&log)).unwrap().existing_database);
+    }
+
+    /// P13.1d: the kept database is the one the kept config.json names, as
+    /// the daemon resolves it, not always `data\omni.db`.
+    #[test]
+    fn the_kept_database_is_the_one_the_kept_config_names() {
+        let o = InstallOptions { yes: true, port: Some(8091), ..opts() };
+        let elsewhere = PathBuf::from(r"E:\OmniDb\omni.db");
+        let kept = |db_present: bool, leftover: bool| {
+            let mut m = new_machine();
+            let mut c = AppConfig::default();
+            c.watchfolder_path = r"C:\Dalet\ingest".into();
+            c.database_path = elsewhere.display().to_string();
+            m.configs.push((root_paths().config.clone(), c));
+            if db_present {
+                m.files.push((elsewhere.clone(), 4096));
+            }
+            if leftover {
+                m.files.push((root_paths().data.join("omni.db"), 4096));
+            }
+            m
+        };
+        assert!(plan_install(&o, &kept(true, false)).unwrap().existing_database, "the configured database exists");
+        assert!(!plan_install(&o, &kept(false, true)).unwrap().existing_database, "a leftover data\\omni.db is not the database");
+        // A relative value resolves against the installation folder.
+        let mut m = new_machine();
+        let mut c = AppConfig::default();
+        c.watchfolder_path = r"C:\Dalet\ingest".into();
+        c.database_path = r"db\omni.db".into();
+        m.configs.push((root_paths().config.clone(), c));
+        m.files.push((root_paths().root.join(r"db\omni.db"), 4096));
+        assert!(plan_install(&o, &m).unwrap().existing_database);
     }
 
     #[test]

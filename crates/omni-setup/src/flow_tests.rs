@@ -793,6 +793,26 @@ fn an_upgrade_registers_the_built_in_account_only_when_it_was_chosen() {
     assert_eq!(b.machine_calls(), [r"run Install E:\Omni account=- pw=-"], "kept: no Account page was shown");
 }
 
+/// P13.1d: an account picked on the change-account path and backed out of to
+/// the Welcome page is not carried into a later upgrade, which keeps the account.
+#[test]
+fn an_account_backed_out_of_to_the_welcome_page_is_not_carried_into_an_upgrade() {
+    let mut ui = Scripted {
+        welcome: [WelcomeChoice::ChangeAccount, WelcomeChoice::Upgrade].into(),
+        account: [AccountAnswer::BuiltIn, AccountAnswer::Back].into(),
+        summary: [Nav::Back, Nav::Confirm].into(),
+        ..Default::default()
+    };
+    let mut b = Recorder::installed();
+    b.runs.push_back(Outcome::Done(Done::Ok));
+    let f = interactive(&mut ui, &mut b, start());
+    assert_eq!(f.code, 0);
+    assert_eq!(ui.shown, ["welcome", "account", "summary", "account", "welcome", "summary", "progress", "finished"]);
+    assert_eq!(ui.summaries[1].kind, SummaryKind::Upgrade);
+    assert!(ui.summaries[1].account_kept, "the upgrade's summary says the account is kept");
+    assert_eq!(b.machine_calls(), [r"run Install E:\Omni account=- pw=-"], "the upgrade keeps the account");
+}
+
 /// Y6: a new installation over a kept database is not told to use Admin / Admin.
 #[test]
 fn a_new_installation_over_a_kept_database_says_to_sign_in_as_its_administrator() {

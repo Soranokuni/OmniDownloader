@@ -58,7 +58,11 @@ impl Command {
     }
 }
 
-pub const USAGE: &str = r#"OmniIngest Setup
+/// The first line names the version: `scripts\package.ps1` reads it there.
+pub const USAGE: &str = concat!(
+    "OmniIngest Setup ",
+    env!("CARGO_PKG_VERSION"),
+    r#"
 
   OmniIngest-Setup.exe [/dir <folder>] [/account <name>] [/no-firewall] [/answer <file>] [/quiet]
       Install OmniIngest, or upgrade the installation that is there.
@@ -86,7 +90,8 @@ pub const USAGE: &str = r#"OmniIngest Setup
 
 Exit codes: 0 done, 1 failed, 2 wrong command line, 3 needs administrator rights,
 4 damaged Setup file, 5 refused (nothing changed), 6 cancelled, 7 upgrade rolled back.
-"#;
+"#
+);
 
 const NO_PASSWORD: &str =
     "There is no password switch: a password is only ever typed in Setup's Windows credential prompt, never given on the command line.";
@@ -533,6 +538,14 @@ mod tests {
         );
         let abs: Vec<String> = ["--answer", r"E:\a.json"].map(String::from).to_vec();
         assert_eq!(relaunch_args(&abs, cwd, Lang::En), ["--answer", r"E:\a.json", "/lang", "en", "/elevated-child"]);
+    }
+
+    /// P13.1d: the packaging script reads Setup's version from the first line
+    /// of `/?` and refuses a Setup whose version is not the packaged release's.
+    #[test]
+    fn the_usage_text_starts_with_the_setup_version() {
+        assert_eq!(USAGE.lines().next(), Some(format!("OmniIngest Setup {}", crate::run::VERSION).as_str()));
+        assert!(USAGE.contains("\n  OmniIngest-Setup.exe [/dir <folder>]"), "the rest of the text is unchanged");
     }
 
     #[test]

@@ -245,7 +245,11 @@ pub fn interactive(ui: &mut dyn Ui, backend: &mut dyn Backend, start: Start) -> 
                             None => Page::Account(target),
                         }
                     }
-                    AccountAnswer::Back => Page::Welcome,
+                    // Backed out of: a later upgrade keeps the account again.
+                    AccountAnswer::Back => {
+                        accounts.chosen = false;
+                        Page::Welcome
+                    }
                     AccountAnswer::Cancel => return cancelled(),
                 }
             }
