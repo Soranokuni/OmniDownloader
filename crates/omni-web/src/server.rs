@@ -92,6 +92,7 @@ impl WebServer {
             .route("/api/mails/view", get(api_get_mail_view))
             .route("/api/mails/queue-link", post(api_mail_queue_link))
             .route("/api/mails/reprocess", post(api_mail_reprocess))
+            .route("/api/mails/remember-sender", post(api_mail_remember_sender))
             // ---- Admin ----
             .route("/admin", get(view_admin))
             .route(

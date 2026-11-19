@@ -570,6 +570,12 @@ const MATRIX: &[Row] = &[
         "/api/mails/reprocess",
         &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
     ),
+    // «Να το θυμάμαι για αυτή τη διεύθυνση» (P11.11a): the policy of the mail routes.
+    (
+        "POST",
+        "/api/mails/remember-sender",
+        &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached), (Admin, Reached)],
+    ),
     // ---- Logged in ----
     (
         "GET",

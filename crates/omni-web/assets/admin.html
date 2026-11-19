@@ -616,7 +616,7 @@
     </section>
 
     <section class="card">
-      <h2 class="card-title">Mailbox test</h2>
+      <h2 class="card-title">Mailbox</h2>
       <div>
         <div>
           <label for="test-mail-tenant">Directory (tenant) ID</label>
@@ -625,9 +625,16 @@
           <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
           <label for="test-mail-user" style="margin-top:8px">Mailbox</label>
           <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
-          <label for="test-mail-secret" style="margin-top:8px">Client secret (blank: test the stored one)</label>
+          <label for="test-mail-secret" style="margin-top:8px">Client secret (blank: keep and test the stored one)</label>
           <input type="password" id="test-mail-secret" autocomplete="off">
-          <button class="btn btn-block" type="button" id="test-mail-btn" style="margin-top:10px">Test mailbox</button>
+          <label for="test-mail-expires" style="margin-top:8px">Client secret expires on</label>
+          <input type="date" id="test-mail-expires">
+          <p class="note" style="margin:4px 0 0">The "Expires" date Entra shows for this secret under Certificates &amp; secrets; the mail status turns amber 30 days before and red 7 days before.</p>
+          <div class="row" style="margin-top:10px">
+            <button class="btn" type="button" id="test-mail-btn">Test mailbox</button>
+            <button class="btn btn-primary" type="button" id="save-mail-btn">Save</button>
+          </div>
+          <p class="note" style="margin:4px 0 0">Saved settings are used from the next mail check; no restart.</p>
         </div>
       </div>
       <p id="test-result" class="note" style="margin-top:10px"></p>
@@ -674,6 +681,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=30"></script>
+<script type="module" src="/static/admin.js?v=31"></script>
 </body>
 </html>

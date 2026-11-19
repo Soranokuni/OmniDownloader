@@ -1440,6 +1440,9 @@ async fn run_daemon(
     // One LLM assist for the watcher, the admin panel and the health check;
     // the panel swaps it when the settings are saved (plan P4.22).
     let live_llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
+    // The mailbox the watcher reads, which the admin panel swaps when the mail settings
+    // are saved (P11.11c); a tool update asks it to read the failed mail again (P11.11b).
+    let live_mail = omni_email::watcher::LiveMail::new(omni_email::watcher::MailSettings::graph(&config.graph));
     // Jobs a worker is still busy with: a retry from MCR waits for them.
     let busy_jobs = omni_core::busy::BusyJobs::new();
     // Site canaries (plan P10.4): shared by the nightly check, the workers'
@@ -1501,6 +1504,7 @@ async fn run_daemon(
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
         .with_llm(live_llm.clone())
+        .with_mail(live_mail.clone())
         .with_busy_jobs(busy_jobs.clone())
         .with_update_gate(update_gate.clone())
         .with_tool_dirs(bin_dir.clone(), tools_missing_at_start)
@@ -1535,10 +1539,20 @@ async fn run_daemon(
     });
 
     // 2. Start Email Monitoring Watchdog
-    // The Office 365 mailbox through Microsoft Graph; see EmailWatcher::new.
-    if config.graph.is_configured() {
+    // The Office 365 mailbox through Microsoft Graph; see EmailWatcher::new. Started
+    // even with no mailbox configured: saving the mail settings in the admin panel
+    // swaps its source (P11.11c), and until then it reports "not configured".
+    {
+        if !config.graph.is_configured() {
+            info!("Email monitoring waits for the mailbox settings (tenant id, client id, mailbox and client secret).");
+            health.set(
+                omni_core::health::checks::MAIL,
+                omni_core::health::Check::disabled("Mailbox"),
+            );
+        }
         let email_watcher = Arc::new(
             EmailWatcher::new(config.clone(), repo.clone())
+                .with_live_mail(live_mail.clone())
                 .with_attachments_dir(temp_path.join("attachments"))
                 .with_health(health.clone())
                 .with_live_assist(live_llm.clone()),
@@ -1547,12 +1561,6 @@ async fn run_daemon(
         tokio::spawn(async move {
             email_watcher.start_polling_loop(email_rx).await;
         });
-    } else {
-        info!("Email monitoring disabled (the Graph mailbox is not configured: tenant id, client id, mailbox and client secret).");
-        health.set(
-            omni_core::health::checks::MAIL,
-            omni_core::health::Check::disabled("Mailbox"),
-        );
     }
 
     // 2b. LLM reachability.
@@ -1621,6 +1629,7 @@ async fn run_daemon(
             evidence_days: config.repair.evidence_days.max(1),
             evidence_max_bytes: config.repair.evidence_max_mb.saturating_mul(1024 * 1024),
             early_ytdl: early_ytdl.clone(),
+            mail: live_mail.clone(),
         };
         let mut early_ytdl_rx = early_ytdl_rx;
 
@@ -2387,6 +2396,7 @@ async fn nightly_deno_update(
     health: &HealthState,
     pacer: &omni_broadcast::pacing::HostPacer,
     ffmpeg: Option<&std::path::Path>,
+    mail: &omni_email::watcher::LiveMail,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
     let Some(installed) = dep_mgr.deno_version() else {
@@ -2449,6 +2459,7 @@ async fn nightly_deno_update(
                     let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
                     // yt-dlp reads YouTube through Deno: a second chance for extraction failures (P11.5).
                     omni_core::second_chance::after_deno_update(repo, &new_version);
+                    mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
                     TaskOutcome::Ok
                 }
                 UpdateVerdict::RolledBack { broken } => {
@@ -2614,6 +2625,13 @@ struct MaintenanceContext {
     canary: Arc<canary::CanaryEnv>,
     /// The early yt-dlp update (P11.4d); the nightly run holds its running lock.
     early_ytdl: Arc<early_update::EarlyYtdlUpdate>,
+    /// The mail watcher's settings: a kept tool update asks it to read the failed mail again (P11.11b).
+    mail: omni_email::watcher::LiveMail,
+}
+
+/// A new yt-dlp build was kept: a tool update, for the failed mail's one more reading (P11.11b).
+fn ytdl_kept(run: &early_update::UpdateRun) -> bool {
+    run.reason == verdict_reason(&UpdateVerdict::Kept { checked: 0 })
 }
 
 /// The early yt-dlp update (P11.4d): the nightly task's own update, under the
@@ -2626,6 +2644,9 @@ async fn early_ytdl_update(repo: &Repository, ctx: &MaintenanceContext, drain: D
     })
     .await;
     selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
+    if ytdl_kept(&run) {
+        ctx.mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
+    }
     run
 }
 
@@ -2713,10 +2734,12 @@ async fn run_one_task(
             let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
                 let ffmpeg = ctx.canary.ffmpeg();
                 let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref(), early_update::NIGHTLY_DRAIN)
-                    .await
-                    .outcome;
-                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
-                (ytdl, deno)
+                    .await;
+                if ytdl_kept(&ytdl) {
+                    ctx.mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
+                }
+                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref(), &ctx.mail).await;
+                (ytdl.outcome, deno)
             })
             .await;
             selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
@@ -3401,6 +3424,20 @@ mod tests {
         assert_eq!(ytdl_second_chance(&repo, &kept), 1);
         assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Pending);
         assert_eq!(repo.second_chances(id).unwrap(), vec!["ytdlp:0123456789abcdef".to_string()]);
+    }
+
+    /// P11.11b: only a kept yt-dlp build counts as the tool update that gives the
+    /// failed mail its one more reading.
+    #[test]
+    fn only_a_kept_ytdlp_build_is_a_tool_update_for_the_failed_mail() {
+        use omni_core::scheduler::TaskOutcome;
+        let run = |v: UpdateVerdict| early_update::UpdateRun::new(TaskOutcome::Ok, verdict_reason(&v));
+        assert!(ytdl_kept(&run(UpdateVerdict::Kept { checked: 3 })));
+        assert!(!ytdl_kept(&run(UpdateVerdict::RolledBack { broken: vec![] })));
+        assert!(!ytdl_kept(&run(UpdateVerdict::Postponed { why: "busy".into() })));
+        assert!(!ytdl_kept(&run(UpdateVerdict::Unverified { why: "x".into() })));
+        assert!(!ytdl_kept(&early_update::UpdateRun::drain_postponed()));
+        assert!(!ytdl_kept(&early_update::UpdateRun::new(TaskOutcome::Ok, "already the latest")));
     }
 
     /// P11.4 review round 1: the admin's cookie «Test» while the platform cools

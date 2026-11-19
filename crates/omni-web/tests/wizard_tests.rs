@@ -281,6 +281,74 @@ async fn the_mail_secret_goes_to_the_store_and_is_never_returned() -> Result<()>
     Ok(())
 }
 
+/// P11.11c/d: in the daemon, saved mail settings are what the watcher reads with from
+/// the next poll, with no restart; the secret's expiry date is kept and checked.
+#[tokio::test]
+async fn saved_mail_settings_reach_the_running_watcher_without_a_restart() -> Result<()> {
+    use omni_email::watcher::{LiveMail, MailSettings};
+    let base = app(false)?;
+    let live = LiveMail::new(MailSettings::graph(&AppConfig::default().graph));
+    let state = base.state.clone().with_mail(live.clone());
+    let app = App { router: WebServer::build_router(state.clone()), repo: base.repo.clone(), state, dir: base.dir };
+    let tok = session_for(&app, "it@newsroom.local");
+    let mail = |expires: &str| {
+        json!({"tenant_id": "t-1", "client_id": "c-1", "mailbox": "ingest@station.example",
+               "client_secret": "live-secret-1", "client_secret_expires": expires})
+    };
+
+    let r = send(&app, "POST", "/api/admin/settings/mail", Some(&tok), Some(mail("31/01/2027"))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body.contains("graph.client_secret_expires") && r.body.contains("YYYY-MM-DD"), "{}", r.body);
+    assert!(!live.current().source.is_configured(), "a refused save changes nothing");
+
+    let r = send(&app, "POST", "/api/admin/settings/mail", Some(&tok), Some(mail("2027-01-31"))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["restart_required"], false);
+    let now = live.current();
+    assert!(now.source.is_configured());
+    assert_eq!(now.source.describe(), "graph ingest@station.example");
+    assert_eq!(now.secret_expires, chrono::NaiveDate::from_ymd_opt(2027, 1, 31));
+    let saved = AppConfig::load_from_file(app.dir.path().join("config.json"))?;
+    assert_eq!(saved.graph.client_secret_expires, chrono::NaiveDate::from_ymd_opt(2027, 1, 31));
+    let g = send(&app, "GET", "/api/admin/settings", Some(&tok), None).await;
+    assert_eq!(g.json()["graph"]["client_secret_expires"], "2027-01-31");
+    // The date belongs to this machine's secret: not in the answer file.
+    let a = send(&app, "GET", "/api/admin/settings/answer-file", Some(&tok), None).await;
+    assert!(a.json()["graph"].get("client_secret_expires").is_none(), "{}", a.body);
+
+    // Absent keeps the date; blank clears it.
+    let mut keep = mail("");
+    keep.as_object_mut().unwrap().remove("client_secret_expires");
+    send(&app, "POST", "/api/admin/settings/mail", Some(&tok), Some(keep)).await;
+    assert_eq!(live.current().secret_expires, chrono::NaiveDate::from_ymd_opt(2027, 1, 31));
+    let r = send(&app, "POST", "/api/admin/settings/mail", Some(&tok), Some(mail(""))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(live.current().secret_expires, None);
+    assert_eq!(app.state.config.read().await.graph.client_secret_expires, None);
+    Ok(())
+}
+
+/// Review round 2: a client secret set on the Credentials card reaches the running
+/// watcher too, from its next check.
+#[tokio::test]
+async fn a_secret_set_on_the_credentials_card_reaches_the_running_watcher() -> Result<()> {
+    use omni_email::watcher::{LiveMail, MailSettings};
+    let base = app(false)?;
+    let live = LiveMail::new(MailSettings::graph(&AppConfig::default().graph));
+    let state = base.state.clone().with_mail(live.clone());
+    let app = App { router: WebServer::build_router(state.clone()), repo: base.repo.clone(), state, dir: base.dir };
+    let tok = session_for(&app, "it@newsroom.local");
+    let r = send(&app, "POST", "/api/admin/settings/mail", Some(&tok),
+        Some(json!({"tenant_id": "t-1", "client_id": "c-1", "mailbox": "ingest@station.example"}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(!live.current().source.is_configured(), "no secret yet");
+
+    let r = send(&app, "POST", "/api/secrets", Some(&tok), Some(json!({"key": "graph.client_secret", "value": "card-secret-1"}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(live.current().source.is_configured(), "the watcher reads with the new secret");
+    Ok(())
+}
+
 // ---- advanced, complete, answer file ----
 
 #[tokio::test]

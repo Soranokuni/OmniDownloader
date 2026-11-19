@@ -1938,6 +1938,7 @@ pub async fn api_admin_update_ytdl(
         "ADMIN",
         &format!("{} updated yt-dlp ({} channel)", admin.email, channel),
     );
+    state.tools_changed();
     Ok(Json(
         serde_json::json!({ "status": "ok", "path": path.to_string_lossy() }),
     ))
@@ -2175,6 +2176,8 @@ pub async fn api_secrets_set(
     if payload.key == omni_core::secrets::keys::GRAPH_CLIENT_SECRET {
         let mut cfg = state.config.write().await;
         cfg.graph.client_secret = payload.value.trim().to_string();
+        // And to the watcher, which reads with its own copy from the next check (P11.11c).
+        state.apply_mail_settings(&cfg.graph);
     }
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
@@ -2585,8 +2588,24 @@ pub async fn api_get_mail_view(
     }
 
     let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
+    let is_mail = query.kind.as_deref() != Some("manual");
+    // Whether «Να το θυμάμαι για αυτή τη διεύθυνση» has anything to remember (P11.11a).
+    let sender_on_roster = match mail.from_address.as_deref().filter(|a| is_mail && a.contains('@')) {
+        Some(a) => state.repo.find_journalist_by_email(a).map_err(internal_error("Could not read the roster."))?.is_some(),
+        None => true,
+    };
+    // The extra reading of a mail given up on (P11.11b): automatic once
+    // (`restart`, `tool update`) or asked by a person (`person`).
+    let read_again = if is_mail {
+        state.repo.mail_auto_retry(&mail.internet_message_id).ok().flatten()
+    } else {
+        None
+    };
     Ok(Json(serde_json::json!({
-        "kind": if query.kind.as_deref() == Some("manual") { "manual" } else { "mail" },
+        "kind": if is_mail { "mail" } else { "manual" },
+        "sender_on_roster": sender_on_roster,
+        "needs_person": is_mail && mail.outcome == "FAILED",
+        "read_again": read_again.map(|(at, cause)| serde_json::json!({ "at": at, "cause": cause })),
         "key": query.key,
         "subject": mail.subject,
         "from_name": mail.from_name,
@@ -2742,6 +2761,66 @@ pub async fn api_mail_reprocess(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+#[derive(Deserialize)]
+pub struct RememberSenderPayload {
+    /// The mail's Message-ID, as the mail view names it.
+    key: String,
+    /// The journalist MCR filed the mail under.
+    surname: String,
+}
+
+/// «Να το θυμάμαι για αυτή τη διεύθυνση» (P11.11a): add the sender of the mail
+/// `key` to the addresses of `surname`, so their next mail is filed under them.
+///
+/// Only the mail's own sender, never a typed address; never `MCR`, which is
+/// where unknown mail goes; and never an address already on someone, which
+/// would silently refile that person's mail. Jobs already made keep their names.
+pub async fn api_mail_remember_sender(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    Json(payload): Json<RememberSenderPayload>,
+) -> JsonResult {
+    use omni_core::repository::AddressAdded;
+    let mail = state
+        .repo
+        .get_processed_mail(payload.key.trim())
+        .map_err(internal_error("Could not read the mail."))?
+        .ok_or_else(ApiError::not_found)?;
+    let address = mail.from_address.as_deref().unwrap_or("").trim().to_lowercase();
+    if address.is_empty() || !address.contains('@') {
+        return Err(ApiError::bad_request("Αυτό το email δεν έχει διεύθυνση αποστολέα για να τη θυμηθεί το σύστημα."));
+    }
+    let surname = payload.surname.trim().to_uppercase();
+    if surname.is_empty() || surname == "MCR" {
+        return Err(ApiError::bad_request("Επιλέξτε πρώτα τον δημοσιογράφο του email."));
+    }
+    let added = state
+        .repo
+        .add_journalist_email(&surname, &address)
+        .map_err(internal_error("Could not save the address."))?;
+    let already = match added {
+        AddressAdded::Added => false,
+        AddressAdded::AlreadyTheirs => true,
+        AddressAdded::TakenBy(other) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "ADDRESS_TAKEN",
+                format!("Η διεύθυνση {address} ανήκει ήδη στον/στην {other}. Αλλάξτε τη στη λίστα δημοσιογράφων, αν χρειάζεται."),
+            ))
+        }
+        AddressAdded::NoSuchJournalist => {
+            return Err(ApiError::bad_request("Αυτός ο δημοσιογράφος δεν υπάρχει στη λίστα."))
+        }
+        AddressAdded::Full => {
+            return Err(ApiError::bad_request("Αυτός ο δημοσιογράφος έχει ήδη 20 διευθύνσεις· αφαιρέστε μία στη λίστα δημοσιογράφων."))
+        }
+    };
+    if !already {
+        audit_action(&state, &principal, &format!("Journalist {surname}: the address of the email '{}' remembered", mail.subject.unwrap_or_default()));
+    }
+    Ok(Json(serde_json::json!({ "status": "ok", "surname": surname, "address": address, "already": already })))
+}
+
 // ==========================================
 // Handled mail and reprocess (plan P4.25)
 // ==========================================
@@ -2759,7 +2838,12 @@ pub async fn api_admin_mail_history(RequireAdmin(_): RequireAdmin, State(state):
         .into_iter()
         .map(|m| {
             let jobs = serde_json::from_str::<Vec<serde_json::Value>>(&m.jobs_json).map(|v| v.len()).unwrap_or(0);
+            // Read again once already, automatically or on request (P11.11b), and still
+            // failed: the system leaves it to a person.
+            let read_again = m.outcome == "FAILED"
+                && state.repo.mail_auto_retry(&m.internet_message_id).ok().flatten().is_some();
             serde_json::json!({
+                "read_again": read_again,
                 "internet_message_id": m.internet_message_id,
                 "subject": m.subject,
                 "from_address": m.from_address,
@@ -3128,6 +3212,7 @@ pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response 
             return ApiError::internal("Could not save the configuration.").into_response();
         }
         state.llm.replace(omni_email::assist::Assist::from_config(&cfg));
+        state.apply_mail_settings(&cfg.graph);
     }
     let _ = state
         .repo

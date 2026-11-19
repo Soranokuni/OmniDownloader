@@ -6,7 +6,7 @@
  */
 
 import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=4';
+import { runWizard } from '/static/wizard.js?v=5';
 
 /* ------------------------------------------------------------------ *
  * First-run account (P2.14) and the setup wizard (P7.12)
@@ -1302,7 +1302,11 @@ async function loadMail() {
       el('td', { class: 'num' }, fmtTime(m.processed_at)),
       el('td', {}, m.subject || '(no subject)'),
       el('td', { class: 'mono' }, m.from_address || ''),
-      el('td', {}, el('span', { class: m.outcome === 'JOBS' ? 'badge ok' : (m.outcome === 'FAILED' ? 'badge bad' : 'badge warn') }, m.outcome)),
+      el('td', {}, el('span', { class: m.outcome === 'JOBS' ? 'badge ok' : (m.outcome === 'FAILED' ? 'badge bad' : 'badge warn') }, m.outcome), ' ',
+        // Read again once already (P11.11b) and still failed: the system leaves it to a person.
+        m.read_again && !m.reprocess_pending
+          ? el('span', { class: 'badge warn', title: 'Read again once (after a restart, a tool update or on request); it still failed. The system will not try it again on its own.' }, 'needs a person')
+          : ''),
       el('td', { class: 'num' }, String(m.jobs)),
       el('td', { class: 'right' }, m.reprocess_pending
         ? el('span', { class: 'badge info' }, 'next poll')
@@ -1452,16 +1456,43 @@ llm('llm-save').addEventListener('click', (event) => llmCall(event.currentTarget
   loadSecrets();
 }));
 
-// The mailbox test starts from the saved settings; edit a field to try
-// another value before saving it on /setup.
-api('/api/setup/state')
-  .then((state) => {
-    if (!state.graph) return;
-    document.getElementById('test-mail-tenant').value = state.graph.tenant_id || '';
-    document.getElementById('test-mail-client').value = state.graph.client_id || '';
-    document.getElementById('test-mail-user').value = state.graph.mailbox || '';
-  })
-  .catch(() => { /* the fields stay blank; the server falls back to the saved values */ });
+// The mailbox card starts from the saved settings; edit a field to test
+// another value, and Save to use it from the next mail check (P11.11c).
+function loadMailbox() {
+  api('/api/admin/settings')
+    .then((state) => {
+      if (!state.graph) return;
+      document.getElementById('test-mail-tenant').value = state.graph.tenant_id || '';
+      document.getElementById('test-mail-client').value = state.graph.client_id || '';
+      document.getElementById('test-mail-user').value = state.graph.mailbox || '';
+      document.getElementById('test-mail-expires').value = state.graph.client_secret_expires || '';
+    })
+    .catch(() => { /* the fields stay blank; the server falls back to the saved values */ });
+}
+loadMailbox();
+
+document.getElementById('save-mail-btn').addEventListener('click', async (event) => {
+  const btn = event.currentTarget;
+  btn.disabled = true;
+  try {
+    const res = await api('/api/admin/settings/mail', {
+      method: 'POST',
+      body: {
+        tenant_id: document.getElementById('test-mail-tenant').value.trim(),
+        client_id: document.getElementById('test-mail-client').value.trim(),
+        mailbox: document.getElementById('test-mail-user').value.trim(),
+        client_secret: document.getElementById('test-mail-secret').value,
+        client_secret_expires: document.getElementById('test-mail-expires').value,
+      },
+    });
+    showTest(res.restart_required
+      ? 'Saved. Restart the service to use these settings.'
+      : 'Saved. The next mail check uses these settings.', true);
+    loadMailbox();
+  } catch (e) { showTest(e.message, false); }
+  document.getElementById('test-mail-secret').value = '';
+  btn.disabled = false;
+});
 
 document.getElementById('test-mail-btn').addEventListener('click', async () => {
   showTest('Testing…', true);

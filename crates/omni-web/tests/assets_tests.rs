@@ -508,11 +508,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v30_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v31_and_login_v6() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=30"), "admin.html does not import admin.js?v=30");
-    assert!(!admin.contains("/static/admin.js?v=29"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=31"), "admin.html does not import admin.js?v=31");
+    assert!(!admin.contains("/static/admin.js?v=30"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
     assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
@@ -546,6 +546,26 @@ fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
     assert!(!code.contains("innerHTML"));
 }
 
+/// P11.11c/d: the wizard and the admin's Mailbox card both ask for the secret's
+/// expiry date, and the card saves the mailbox (used from the next poll).
+#[test]
+fn the_wizard_and_the_mailbox_card_ask_for_the_secret_expiry() {
+    let assets = all_assets();
+    let code = |name: &str| -> String {
+        let src = assets.get(name).unwrap_or_else(|| panic!("{name} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    let wizard = code("static/wizard.js");
+    assert!(wizard.contains("client_secret_expires: expires.value"), "the wizard does not send the expiry");
+    let admin = code("static/admin.js");
+    assert!(admin.contains("'/api/admin/settings/mail'"), "the Mailbox card does not save");
+    assert!(admin.contains("client_secret_expires: document.getElementById('test-mail-expires').value"));
+    assert!(!admin.contains("/api/setup/state"), "the Mailbox card must not read the first-run endpoint");
+    let html = assets.get("admin.html").expect("admin.html shipped");
+    assert!(html.contains(r#"<input type="date" id="test-mail-expires">"#));
+    assert!(html.contains(r#"id="save-mail-btn""#));
+}
+
 /// P7.12: the wizard is one module under one URL, built with el() only, and the
 /// admin page still hands the first-run session to it.
 #[test]
@@ -570,7 +590,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["4".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["5".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");

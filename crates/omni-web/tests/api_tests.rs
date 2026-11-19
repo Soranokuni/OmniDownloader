@@ -658,6 +658,58 @@ async fn only_a_mail_the_watcher_gave_up_on_can_be_read_again_from_the_desk() ->
     Ok(())
 }
 
+/// P11.11a: MCR filed a mail from an unknown sender under a journalist and asks the
+/// system to remember the address. The next mail from it is filed under them; an
+/// address that is someone else's is never moved.
+#[tokio::test]
+async fn mcr_remembers_an_unknown_sender_for_the_journalist_it_chose() -> Result<()> {
+    let app = App::new()?;
+    app.repo.save_journalist("GEORGIOU", "Eleni Georgiou", &["e.georgiou@example.gr".into()], 0)?;
+    app.repo.save_journalist("NIKOLAOU", "Giorgos Nikolaou", &[], 0)?;
+    let mail = |key: &str, from: &str| omni_core::models::ProcessedMail {
+        internet_message_id: key.into(),
+        source_id: Some("AAMk-x".into()),
+        outcome: "JOBS".into(),
+        from_address: Some(from.into()),
+        subject: Some("Πλάνα".into()),
+        ..Default::default()
+    };
+    app.repo.record_processed_mail(&mail("<new@example.gr>", "Freelance.Crew@Example.net"))?;
+    app.repo.record_processed_mail(&mail("<known@example.gr>", "e.georgiou@example.gr"))?;
+    let view = |key: &str| format!("/api/mails/view?key={}", q(key));
+    let ask = |key: &str, surname: &str| json!({ "key": key, "surname": surname });
+
+    let (_, v) = app.send("GET", &view("<new@example.gr>"), &app.mcr_token, None).await?;
+    assert_eq!(v["sender_on_roster"], false, "the desk offers the button: {v}");
+
+    // MCR is where unknown mail goes, never a journalist to remember.
+    let (status, _) = app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<new@example.gr>", "MCR"))).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<nope@example.gr>", "NIKOLAOU"))).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) =
+        app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<new@example.gr>", "nikolaou"))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["surname"].as_str(), body["already"].as_bool()), (Some("NIKOLAOU"), Some(false)));
+    assert_eq!(app.repo.find_journalist_by_email("freelance.crew@example.net")?.as_deref(), Some("NIKOLAOU"));
+    let (_, v) = app.send("GET", &view("<new@example.gr>"), &app.mcr_token, None).await?;
+    assert_eq!(v["sender_on_roster"], true);
+    // A second click changes nothing.
+    let (status, body) =
+        app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<new@example.gr>", "NIKOLAOU"))).await?;
+    assert_eq!((status, body["already"].as_bool()), (StatusCode::OK, Some(true)));
+
+    // GEORGIOU's address is not moved to NIKOLAOU.
+    let (status, body) =
+        app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<known@example.gr>", "NIKOLAOU"))).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(app.repo.find_journalist_by_email("e.georgiou@example.gr")?.as_deref(), Some("GEORGIOU"));
+    let nikolaou = app.repo.list_journalists()?.into_iter().find(|j| j.surname == "NIKOLAOU").unwrap();
+    assert_eq!(nikolaou.emails, vec!["freelance.crew@example.net"]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_link_added_by_hand_is_an_entry_of_its_own_with_a_timeline() -> Result<()> {
     let app = App::new()?;

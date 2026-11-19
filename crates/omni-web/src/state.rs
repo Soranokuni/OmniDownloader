@@ -127,6 +127,11 @@ pub struct AppState {
     /// The LLM assist in use, shared with the mail watcher: saving LLM
     /// settings in the admin panel swaps it without a restart (plan P4.22).
     pub llm: omni_email::assist::LiveAssist,
+    /// The mail settings the watcher reads with: saving the mail settings swaps
+    /// them without a restart (P11.11c), and a tool update asks for the mail
+    /// given up on to be read again (P11.11b). `None` in tests that have none;
+    /// a save then says a restart is needed.
+    pub mail: Option<omni_email::watcher::LiveMail>,
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
@@ -214,6 +219,7 @@ impl AppState {
             health: omni_core::health::HealthState::new(),
             tls_enabled,
             llm,
+            mail: None,
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
             site_runner: None,
@@ -442,6 +448,32 @@ impl AppState {
     pub fn with_llm(mut self, llm: omni_email::assist::LiveAssist) -> Self {
         self.llm = llm;
         self
+    }
+
+    /// Share the mail watcher's live settings with the admin panel.
+    pub fn with_mail(mut self, mail: omni_email::watcher::LiveMail) -> Self {
+        self.mail = Some(mail);
+        self
+    }
+
+    /// Use the mailbox `graph` names from the next poll on (P11.11c). `false`
+    /// when there is no running watcher to tell: the change waits for a restart.
+    pub fn apply_mail_settings(&self, graph: &omni_core::config::GraphConfig) -> bool {
+        match &self.mail {
+            Some(live) => {
+                live.replace(omni_email::watcher::MailSettings::graph(graph));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A tool was updated or installed: the mail given up on gets its one more
+    /// reading after the next good poll (P11.11b).
+    pub fn tools_changed(&self) {
+        if let Some(live) = &self.mail {
+            live.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
+        }
     }
 
     /// Point the state at the daemon's real secret store.

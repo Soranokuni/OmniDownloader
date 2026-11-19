@@ -197,7 +197,7 @@ Back and Next move between screens; Next stays disabled until the screen is vali
 1. **Welcome.** Pick the mode.
 2. **Administrator account** (only while the first-run account still works). Enter a full name, a login (at least 3 characters, no spaces, not `admin`) and a password (at least 12 characters, typed twice; the ticks turn green as the rules are met). On Next the new administrator is created, the first-run `admin` account is switched off and its sessions end, and this browser is signed in as the new administrator. If anything fails, the first-run account stays as it was and you can try again. A link on this screen offers the older route: keep `admin` and only change its password.
 3. **Watchfolder.** Enter the share's `\\server\share` path (placeholder `\\192.168.4.42\FileIngest`), never a mapped drive letter. **Test** runs in the daemon itself, as the account the service runs as: it creates the folder if it is missing, writes a probe file, renames it and deletes it, within 15 seconds. On "access denied" it names the account to grant **Modify** on the share and the folder. Next saves the path and is enabled only after a passing test; it starts filled with where the current setting resolves. When the test says access denied, the screen explains the cause (the service is not running as an account the share accepts) and how to run the service as a named account; on an installation made with Setup, do that with Apps & Features → OmniIngest → Modify (§2.2a). **Skip for now** changes nothing: files keep going to the current watchfolder (the local default folder next to the program on a new installation) until you set the share, and the warning says so. See 2.1a.
-4. **Mail (Microsoft 365).** Tenant ID, client ID, mailbox and client secret of the app registration (see 5.2). **Test connection** reads the mailbox. The secret goes to the encrypted store and is never shown again; leave it blank later to keep the stored one. **Skip for now** warns that no email is ingested until a mailbox is set.
+4. **Mail (Microsoft 365).** Tenant ID, client ID, mailbox, client secret of the app registration and the day the secret expires (see 5.2). **Test connection** reads the mailbox. The secret goes to the encrypted store and is never shown again; leave it blank later to keep the stored one. The expiry date is the "Expires" column Entra shows under Certificates & secrets: `Mail.Read` cannot read it, so it is asked here, and the `mail` health line turns amber 30 days before it and red 7 days before. **Skip for now** warns that no email is ingested until a mailbox is set.
 5. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the LLM card (5.4); a button leaves the wizard and opens it. A short note explains that a NAS or IP share needs the service to run as a named account (§2.2a).
 6. **TLS, reverse proxy and metrics** (IT only). The `.pfx` certificate path and passphrase, whether to trust the proxy header and from which networks, extra allowed host names, `/metrics` on/off and its networks, and **Download answer file**. A trusted-proxy range wider than /24 (IPv4) or /64 (IPv6) is flagged: every machine in it could speak for any client address. The certificate is opened with its passphrase before it is saved; a file that is not a PKCS#12 bundle, or a wrong passphrase, is refused, because it would stop the web listener at the next start.
 7. **Check and finish.** The daemon's current health lines, green, amber or red, each with its hint, and a notice if a restart is needed. **Finish** records `setup_completed` and the mode, and opens the normal panel.
@@ -206,7 +206,7 @@ Which settings apply at once and which wait for a restart of the service:
 
 | Applies at once | Needs a restart |
 |---|---|
-| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks | watchfolder, mailbox settings, web port, TLS, allowed hosts, metrics on/off, archive |
+| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks, mailbox settings (used from the next mail check) | watchfolder, web port, TLS, allowed hosts, metrics on/off, archive |
 
 The wizard tells you after each save, and again on the last screen, when a restart is needed.
 
@@ -569,15 +569,31 @@ For HTTPS set `tls.cert_path` to a `.pfx`; store its passphrase with
 | `tenant_id`, `client_id` | the Entra ID app registration |
 | `mailbox` | the ingest mailbox address |
 | `write_access` | `false` (default): the mailbox is never changed. `true` (needs `Mail.ReadWrite`): processed mail is marked read and moved to `processed_folder`, failed mail to `failed_folder` |
+| `client_secret_expires` | the day the client secret expires, `YYYY-MM-DD` (absent: not entered). The `mail` health line turns amber 30 days before and red 7 days before and after. Not a secret, and not in the answer file |
 
 The client secret goes into the secret store, never into `config.json`:
-**Admin → Credentials → Microsoft Graph client secret**, or
-`omni-ingest secrets set graph.client_secret`. Use **Admin → Mailbox test**
-to check access. Mail is polled every `email_poll_interval_secs` (30 s).
+**Admin → Mailbox** (with its expiry date), **Admin → Credentials → Microsoft
+Graph client secret**, or `omni-ingest secrets set graph.client_secret`.
+**Admin → Mailbox** tests access and saves the settings; the daemon uses them
+from the next mail check, without a restart. Mail is polled every
+`email_poll_interval_secs` (30 s).
 
 The deterministic parser handles every mail on its own. Mail from an address
 that matches nobody in the roster still gets processed; the files are named
 with a placeholder until you add the person (§6.3).
+
+**A mail that could not be read.** The watcher tries a mail three times, then
+records it as failed and leaves it for a person (the Email tab's «Θέλουν
+προσοχή» filter). Once, automatically, it reads such a mail again: after the
+first good mail check that follows a restart of the service or a tool update
+(yt-dlp or Deno kept after the nightly check, or a tool installed or updated
+from the Admin page). Only mail received within `retry.max_age_mins` (2 hours)
+gets this chance, never a mail that made any video before it failed, and a
+link already delivered in the last 24 hours, under any journalist, is not
+queued again by it. Nor is it given to a mail a person already asked to read again
+(**Reprocess** here, or «Να διαβαστεί ξανά» on the desk). If it fails again it
+stays failed, marked **needs a person** in **Recent mail**, and is not tried
+again on its own.
 
 ### 5.3 Processing
 
@@ -717,12 +733,12 @@ Prometheus handles as a counter reset.
 | **Cookies** | per-site login cookies (§6.1) |
 | **Benchmarks** | run the 65-link corpus, extraction only or full pipeline |
 | **User accounts** | create users, set role, link to a journalist, reset password, deactivate |
-| **Recent mail** | handled mail, reprocess one |
+| **Recent mail** | handled mail, reprocess one; **needs a person** on a failed mail already read again automatically (§5.2) |
 | **LLM assist** | §5.4 |
 | **Newsroom taxonomy** | groups and people (roster), import/export, backups (§6.3) |
 | **Audit log** | who did what |
 | **Scheduled maintenance** | the nightly tasks (§7), run one now |
-| **Mailbox test** | check Graph access with given or stored credentials |
+| **Mailbox** | check Graph access with given or stored credentials; save the mailbox, a new client secret and its expiry date (used from the next mail check) |
 
 **Autonomy report.** The first card on the right. *Delivered untouched* is the
 share of the videos that reached air (delivered to the watchfolder, or put into
@@ -829,7 +845,7 @@ Green = ok, amber = degraded, red = down.
 
 | Line | Amber / red means |
 |---|---|
-| `mail` | the mailbox cannot be read |
+| `mail` | the mailbox cannot be read; or the client secret expires within 30 days (amber) or 7 days, or has expired (red): make a new one in Entra and enter it with its date under **Admin → Mailbox** |
 | `llm` | the LLM endpoint does not answer (amber; jobs are unaffected) |
 | `tools` | a tool is missing (red) |
 | `pinned_tools` | a tool is missing or not the pinned build: **Admin → Toolchain → Install / Repair**, then restart the service if it was missing |
@@ -953,7 +969,7 @@ may go back to the queue on its own: the second chance of §5.3
 | Symptom | Check |
 |---|---|
 | Panel does not open | service running (`omni-ingest service status`), firewall, port |
-| Nothing arrives from mail | `mail` health line; **Mailbox test**; the client secret has not expired in Entra ID |
+| Nothing arrives from mail | `mail` health line; **Admin → Mailbox → Test mailbox**; the client secret has not expired in Entra ID |
 | YouTube LOGIN_REQUIRED | update yt-dlp (**Download engine**); if it persists, add `youtube.com` cookies |
 | X / Instagram posts fail | upload that site's cookies and **Test** |
 | Wrong video from a news site | **Test URL** on the article; report the article link |

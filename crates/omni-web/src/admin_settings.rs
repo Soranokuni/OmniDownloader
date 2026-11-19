@@ -12,10 +12,10 @@
 //! Each change reports `restart_required`: true when the running daemon read the
 //! setting once at start-up and will use the saved value only after a restart.
 //! Live: `setup_*`, `security.mcr_open_networks`, `security.trust_proxy_header`,
-//! `security.trusted_proxies`, `metrics.allow_networks` (read per request).
+//! `security.trusted_proxies`, `metrics.allow_networks` (read per request), mail
+//! settings (the watcher's source is rebuilt, P11.11c).
 //! Restart: watchfolder (the worker pool, recovery and the disk checks captured
-//! the path), mail settings (the watcher is built at start), web port, TLS,
-//! `security.allowed_hosts`, `metrics.enabled`, archive.
+//! the path), web port, TLS, `security.allowed_hosts`, `metrics.enabled`, archive.
 
 use std::path::Path;
 use std::time::Duration;
@@ -285,6 +285,7 @@ fn settings_json(cfg: &AppConfig) -> serde_json::Value {
             "mailbox": cfg.graph.mailbox,
             // Whether, never what.
             "secret_set": !cfg.graph.client_secret.is_empty(),
+            "client_secret_expires": cfg.graph.client_secret_expires,
         },
         "llm": { "mode": cfg.llm.mode, "provider": cfg.llm.provider, "endpoint": cfg.ollama_endpoint, "model": cfg.ollama_model },
     })
@@ -300,6 +301,8 @@ pub async fn api_admin_answer_file(RequireAdmin(_): RequireAdmin, State(state): 
     let mut doc = settings_json(&*state.config.read().await);
     if let Some(graph) = doc.get_mut("graph").and_then(|g| g.as_object_mut()) {
         graph.remove("secret_set");
+        // Belongs to the secret, which is entered again on the new machine.
+        graph.remove("client_secret_expires");
     }
     doc["answer_file_version"] = serde_json::json!(1);
     let mut response = Json(doc).into_response();
@@ -467,8 +470,28 @@ pub struct MailPayload {
     /// Blank keeps the stored secret.
     #[serde(default)]
     client_secret: Option<String>,
+    /// `YYYY-MM-DD`, the day the client secret expires (P11.11d). Absent keeps
+    /// the stored date; blank clears it.
+    #[serde(default)]
+    client_secret_expires: Option<String>,
 }
 
+/// The expiry date as typed: `Ok(None)` for blank.
+fn secret_expiry(raw: &str) -> Result<Option<chrono::NaiveDate>, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map(Some).map_err(|_| {
+        ApiError::bad_request(format!(
+            "graph.client_secret_expires: \"{}\" is not a date. Enter it as YYYY-MM-DD, as Entra shows it under Certificates & secrets.",
+            raw.chars().take(20).collect::<String>()
+        ))
+    })
+}
+
+/// Save the mailbox settings and, in the daemon, read with them from the next
+/// poll on (P11.11c): the watcher's source is rebuilt, no restart.
 pub async fn api_admin_save_mail(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
@@ -487,11 +510,15 @@ pub async fn api_admin_save_mail(
         return Err(ApiError::bad_request("The mailbox must be an email address."));
     }
     let secret = payload.client_secret.as_deref().map(str::trim).unwrap_or("");
+    let expires = payload.client_secret_expires.as_deref().map(secret_expiry).transpose()?;
     let mut cfg = state.config.write().await;
     let mut next = cfg.clone();
     next.graph.tenant_id = tenant;
     next.graph.client_id = client;
     next.graph.mailbox = mailbox;
+    if let Some(expires) = expires {
+        next.graph.client_secret_expires = expires;
+    }
     // The secret first: if it cannot be stored nothing changes. Never in config.json.
     if !secret.is_empty() {
         state
@@ -503,16 +530,23 @@ pub async fn api_admin_save_mail(
     let changed = next.graph.tenant_id != cfg.graph.tenant_id
         || next.graph.client_id != cfg.graph.client_id
         || next.graph.mailbox != cfg.graph.mailbox
+        || next.graph.client_secret_expires != cfg.graph.client_secret_expires
         || !secret.is_empty();
     next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
     let secret_set = !next.graph.client_secret.is_empty();
+    // Under the config lock, so two saves reach the watcher in the order they were saved.
+    let live = changed && state.apply_mail_settings(&next.graph);
     *cfg = next;
     drop(cfg);
-    let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Mail settings changed by {} (settings)", admin.email));
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("Mail settings changed by {} (settings){}", admin.email, if live { "; in use from the next poll" } else { "" }),
+    );
     Ok(Json(serde_json::json!({
         "status": "ok",
         "secret_set": secret_set,
-        "restart_required": changed,
+        "restart_required": changed && !live,
     })))
 }
 

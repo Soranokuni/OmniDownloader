@@ -209,6 +209,7 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
       const mailbox = textInput('wz-mailbox', S.cfg.graph.mailbox, 'ingest@yourstation.example');
       const secret = textInput('wz-secret', '', S.cfg.graph.secret_set ? '(stored; leave blank to keep it)' : '', 'password',
         { autocomplete: 'new-password' });
+      const expires = textInput('wz-secret-expires', S.cfg.graph.client_secret_expires || '', 'YYYY-MM-DD', 'date');
       const result = el('p', { class: 'note', style: 'white-space:pre-line' });
       const filled = () => [tenant, client, mailbox].map((i) => i.value.trim());
       const complete = () => filled().every(Boolean) && (secret.value.trim() || S.cfg.graph.secret_set);
@@ -240,6 +241,8 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
           field('wz-client', 'Client ID', client, 'The application (client) ID of the same registration.'),
           field('wz-mailbox', 'Mailbox', mailbox, 'The address the newsroom sends links to.'),
           field('wz-secret', 'Client secret', secret, 'Stored encrypted on this machine; never shown again and never written to config.json.'),
+          field('wz-secret-expires', 'Client secret expires on', expires,
+            'The "Expires" date Entra shows for this secret under Certificates & secrets. Mail.Read cannot read it, so it is asked here: the mail status turns amber 30 days before and red 7 days before.'),
           el('div', { class: 'row' }, test,
             skip),
           result, warn,
@@ -249,12 +252,12 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
           if (filled().every((v) => !v)) return;   // blank: no mail, nothing to save
           const r = await api('/api/admin/settings/mail', { method: 'POST', body: {
             tenant_id: tenant.value.trim(), client_id: client.value.trim(),
-            mailbox: mailbox.value.trim(), client_secret: secret.value,
+            mailbox: mailbox.value.trim(), client_secret: secret.value, client_secret_expires: expires.value,
           } });
           secret.value = '';
           if (r.restart_required) S.restart = true;
           S.cfg.graph = { ...S.cfg.graph, tenant_id: tenant.value.trim(), client_id: client.value.trim(),
-            mailbox: mailbox.value.trim(), secret_set: r.secret_set };
+            mailbox: mailbox.value.trim(), secret_set: r.secret_set, client_secret_expires: expires.value || null };
         },
       };
     },

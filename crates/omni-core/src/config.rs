@@ -311,6 +311,12 @@ pub struct GraphConfig {
     /// records what was handled (plan P4.8).
     #[serde(default)]
     pub write_access: bool,
+    /// The day the client secret expires, as the administrator read it in Entra
+    /// (P11.11d): `Mail.Read` cannot read it. The `mail` health line turns amber
+    /// [`SECRET_WARN_DAYS`] days before and red [`SECRET_RED_DAYS`] days before.
+    /// Not a secret; absent when nobody entered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_expires: Option<chrono::NaiveDate>,
     /// Client secret — **runtime only**, loaded from the secret store
     /// (`graph.client_secret`). Never read from or written to config.json.
     #[serde(skip)]
@@ -334,10 +340,16 @@ impl Default for GraphConfig {
             processed_folder: default_processed_folder(),
             failed_folder: default_failed_folder(),
             write_access: false,
+            client_secret_expires: None,
             client_secret: String::new(),
         }
     }
 }
+
+/// Days before the Graph client secret expires that the `mail` health line turns amber.
+pub const SECRET_WARN_DAYS: i64 = 30;
+/// Days before it expires that the line turns red.
+pub const SECRET_RED_DAYS: i64 = 7;
 
 impl GraphConfig {
     /// Everything needed to log in is present, secret included.
