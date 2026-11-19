@@ -377,7 +377,15 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 #[test]
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
-    for (module, version) in [("desk.js", 14), ("inbox.js", 20), ("approval.js", 9), ("notify.js", 11), ("mcr.js", 46)] {
+    for (module, version) in [
+        ("desk.js", 15),
+        ("inbox.js", 21),
+        ("approval.js", 10),
+        ("notify.js", 11),
+        ("mcr.js", 47),
+        ("status.js", 1),
+        ("status.css", 1),
+    ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
         for s in assets.values() {
@@ -490,12 +498,92 @@ fn mcr_lists_are_reconciled_not_rebuilt_every_refresh() {
     }
 }
 
+/// P12.1: one vocabulary. Every status the server sends has its words, its colour family and a
+/// mark in `status.js`, and every colour family has its badge, tag and legend colour. Approval is
+/// violet everywhere (it was amber on the badges, violet in the rail), a cancelled job no longer
+/// shares the waiting colour, and no page keeps a status table of its own (/user's `statusClass`
+/// listed statuses that do not exist, so RUNNING was grey there).
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
+fn every_status_has_one_word_one_colour_and_a_mark_in_status_js() {
+    let assets = all_assets();
+    let js = assets.get("static/status.js").expect("status.js shipped");
+    let css = format!(
+        "{}\n{}",
+        assets.get("static/app.css").expect("app.css shipped"),
+        assets.get("static/status.css").expect("status.css shipped")
+    );
+    // A one-line table row, `NAME: { key: '…', … }`, and one of its fields.
+    let row = |block: &str, name: &str| -> String {
+        let head = format!("{name}: {{");
+        block
+            .lines()
+            .find(|l| l.trim_start().starts_with(&head))
+            .unwrap_or_else(|| panic!("status.js has no row for {name}"))
+            .to_string()
+    };
+    let field = |row: &str, key: &str| -> String {
+        let pat = format!("{key}: '");
+        row.split(pat.as_str()).nth(1).and_then(|s| s.split('\'').next()).unwrap_or("").to_string()
+    };
+    let tones = js
+        .split("export const TONES = {")
+        .nth(1)
+        .and_then(|s| s.split("};").next())
+        .expect("status.js has a TONES table");
+    let statuses = js
+        .split("export const STATUS = {")
+        .nth(1)
+        .and_then(|s| s.split("};").next())
+        .expect("status.js has a STATUS table");
+
+    for status in JobStatus::ALL {
+        let name = status.as_str();
+        let r = row(statuses, name);
+        for key in ["label", "short", "phrase", "user"] {
+            assert!(!field(&r, key).is_empty(), "{name} has no `{key}` text in status.js");
+        }
+        let tone = field(&r, "tone");
+        let t = row(tones, &tone);
+        assert!(!field(&t, "mark").is_empty(), "tone {tone} ({name}) has no mark beside its colour");
+        for selector in [format!(".badge.{tone} "), format!(".tag.{tone} "), format!(".legend i.{tone} ")] {
+            assert!(css.contains(&selector), "tone {tone} ({name}) has no `{selector}` colour rule");
+        }
+    }
+    let tone_of = |name: &str| field(&row(statuses, name), "tone");
+    assert_eq!(tone_of("AWAITING_APPROVAL"), "approval", "approval is not its own (violet) colour");
+    assert_ne!(tone_of("CANCELLED"), tone_of("PENDING"), "a cancelled job looks like a waiting one");
+    assert!(css.contains(".badge.approval") && css.contains("var(--busy)"), "the approval badge is not violet");
+
+    // Everyone reads the one table; nobody keeps a status table of their own.
+    for module in ["desk.js", "inbox.js", "approval.js", "mcr.js", "user.js"] {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        assert!(src.contains("/static/status.js?v="), "{module} does not read status.js");
+        let code: String = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+        for own in [
+            "statusClass(",
+            "STATUS_TEXT",
+            "function statusBadge",
+            "function tone(",
+            "case 'CANCELLED': return",
+            "'Για έγκριση'",
+        ] {
+            assert!(!code.contains(own), "{module} keeps its own status words or colours: {own}");
+        }
+    }
+    for page in ["mcr.html", "user.html"] {
+        let html = assets.get(page).unwrap_or_else(|| panic!("{page} shipped"));
+        let app = html.find("/static/app.css?v=").expect("links app.css");
+        let status = html.find("/static/status.css?v=").unwrap_or_else(|| panic!("{page} does not link status.css"));
+        assert!(app < status, "{page} links status.css before app.css, so app.css would win");
+    }
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v8() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=7"), "user.html does not import user.js?v=7");
-    assert!(!page.contains("/static/user.js?v=6"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=8"), "user.html does not import user.js?v=8");
+    assert!(!page.contains("/static/user.js?v=7"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

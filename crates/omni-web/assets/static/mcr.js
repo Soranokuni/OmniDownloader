@@ -16,14 +16,15 @@ import {
   api, el, render, toast, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
 import {
-  stageLine, waitLine, stepTimeNode, statusBadge, limitNote, fileName, deliveredName, pager,
+  stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=14';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=20';
+} from '/static/desk.js?v=15';
+import { STATUS, statusBadge } from '/static/status.js?v=1';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=21';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=11';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=9';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=10';
 
 let journalists = [];
 
@@ -201,7 +202,7 @@ async function loadStatusOnce() {
 
   const queue = data.queue;
   document.getElementById('queue-status').textContent = queue
-    ? `Ουρά: ${queue.pending} σε αναμονή · ${queue.running} σε εξέλιξη${queue.approval > 0 ? ` · Για έγκριση ${queue.approval}` : ''}`
+    ? `Ουρά: ${queue.pending} ${STATUS.PENDING.phrase} · ${queue.running} ${STATUS.RUNNING.phrase}${queue.approval > 0 ? ` · ${queue.approval} ${STATUS.AWAITING_APPROVAL.phrase}` : ''}`
     : 'Ουρά: —';
   const tempFree = data.disk?.temp?.free_gb;
   document.getElementById('temp-status').textContent =

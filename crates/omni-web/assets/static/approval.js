@@ -10,7 +10,8 @@
  */
 
 import { api, el, fmtDuration, safeHref, toast } from '/static/app.js?v=6';
-import { fileName, clock } from '/static/desk.js?v=14';
+import { fileName, clock } from '/static/desk.js?v=15';
+import { statusBadge } from '/static/status.js?v=1';
 
 const cards = new Map(); // job id -> { node, job, expiry }
 let wantedFocus = null;
@@ -227,7 +228,7 @@ function buildCard(job, ctx) {
             `Δημοσιογράφος: ${job.journalist} · από ${clock(job.updated_at || held.created_at)}`),
           ctx.mailLink(job),
         )),
-      el('span', { class: 'badge warn' }, 'Για έγκριση')),
+      statusBadge({ status: 'AWAITING_APPROVAL' })),
     media,
     pvArticle(job, held, repair, media.querySelector('video')),
     pvChecks(repair),

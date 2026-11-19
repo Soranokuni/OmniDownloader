@@ -1,5 +1,6 @@
 /* What the MCR desk's lists share (plan P7.1, P7.10): the words for a job's
- * state, its file name, the pager, and the actions on a job. Moved out of
+ * step, its file name, the pager, and the actions on a job. The words and
+ * colours of a job's status are in status.js (P12.1). Moved out of
  * mcr.js when the Email tab (inbox.js) came to need the same ones; the
  * confirmations and messages are the same wherever a job is acted on.
  *
@@ -7,6 +8,7 @@
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
+import { STATUS } from '/static/status.js?v=1';
 
 /** What a job is doing, for a person. */
 export const STAGE_TEXT = {
@@ -24,8 +26,8 @@ export const STAGE_TEXT = {
 export const STAGE_ORDER = ['EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER'];
 
 export function stageLine(job) {
-  if (job.status === 'PENDING') return 'Σε αναμονή';
-  const text = STAGE_TEXT[job.stage] || 'Σε επεξεργασία';
+  if (job.status === 'PENDING') return STATUS.PENDING.label;
+  const text = STAGE_TEXT[job.stage] || STATUS.RUNNING.label;
   const step = STAGE_ORDER.indexOf(job.stage);
   return step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ${text}` : text;
 }
@@ -73,7 +75,7 @@ export function waitLine(job, now = Date.now()) {
     }
     const pos = Number(job.queue_position);
     if (pos > 0) return `Σε αναμονή · ${pos}ο στη σειρά`;
-    return 'Σε αναμονή';
+    return STATUS.PENDING.label;
   }
   if (job.status === 'RUNNING') {
     const ms = msSince(job.stage_started_at, now);
@@ -100,7 +102,7 @@ export function lateReason(job, now = Date.now()) {
     }
     case 'running': {
       const ms = msSince(job.stage_started_at, now);
-      return ms === null ? 'Σε επεξεργασία' : `Σε επεξεργασία · στο τρέχον βήμα εδώ και ${Math.max(0, Math.floor(ms / 60000))}′`;
+      return ms === null ? STATUS.RUNNING.label : `${STATUS.RUNNING.label} · στο τρέχον βήμα εδώ και ${Math.max(0, Math.floor(ms / 60000))}′`;
     }
     default:
       return 'Σε αναμονή στη σειρά';
@@ -127,41 +129,6 @@ export function stepTimeNode(job, now = Date.now()) {
   return el('span', long
     ? { class: 'warn', style: 'color:var(--warn);margin-left:6px', title: 'Ασυνήθιστα πολλή ώρα στο ίδιο βήμα' }
     : { style: 'margin-left:6px' }, text);
-}
-
-export function statusBadge(job) {
-  switch (job.status) {
-    case 'PENDING': return el('span', { class: 'badge' }, 'Σε αναμονή');
-    case 'RUNNING': return el('span', { class: 'badge info' }, 'Σε επεξεργασία');
-    case 'COMPLETED': return el('span', { class: 'badge ok' }, 'Παραδόθηκε');
-    case 'COMPLETED_MANUAL': return el('span', { class: 'badge ok' }, 'Παραδόθηκε χειροκίνητα');
-    case 'MANUAL_DOWNLOAD': return el('span', { class: 'badge warn' }, 'Χειροκίνητη λήψη');
-    case 'FAILED': return el('span', { class: 'badge bad' }, 'Απέτυχε');
-    case 'CANCELLED': return el('span', { class: 'badge' }, 'Ακυρώθηκε');
-    case 'AWAITING_APPROVAL': return el('span', { class: 'badge warn' }, 'Για έγκριση');
-    default: return el('span', { class: 'badge warn' }, 'Χρειάζεται έλεγχο');
-  }
-}
-
-/** The colour family of a job's state: ok, run, wait, warn, bad. */
-export function tone(job) {
-  switch (job.status) {
-    case 'COMPLETED':
-    case 'COMPLETED_MANUAL':
-      return 'ok';
-    case 'RUNNING': return 'run';
-    case 'PENDING':
-    case 'CANCELLED':
-      return 'wait';
-    case 'FAILED': return 'bad';
-    case 'AWAITING_APPROVAL': return 'approval';
-    default: return 'warn';
-  }
-}
-
-/** Needs a person: review, a file-locker download, a failure. */
-export function needsAttention(job) {
-  return job.status === 'REQUIRES_REVIEW' || job.status === 'MANUAL_DOWNLOAD' || job.status === 'FAILED';
 }
 
 /** "Μόνο τα 2 πρώτα βίντεο", when the journalist asked for that. */

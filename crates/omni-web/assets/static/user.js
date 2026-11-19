@@ -1,21 +1,11 @@
 /* Journalist panel behaviour (plan P2.3, P2.5), in Greek. */
 
 import {
-  api, el, render, live, toast, fmtTime, statusClass, logout,
+  api, el, render, live, toast, fmtTime, logout,
 } from '/static/app.js?v=6';
-
-/** A job's state, for the journalist who sent it. */
-const STATUS_TEXT = {
-  PENDING: 'Σε αναμονή',
-  RUNNING: 'Σε επεξεργασία',
-  COMPLETED: 'Παραδόθηκε',
-  COMPLETED_MANUAL: 'Παραδόθηκε',
-  REQUIRES_REVIEW: 'Το εξετάζει το MCR',
-  MANUAL_DOWNLOAD: 'Το κατεβάζει το MCR',
-  AWAITING_APPROVAL: 'Το βλέπει το MCR',
-  FAILED: 'Απέτυχε',
-  CANCELLED: 'Ακυρώθηκε',
-};
+// A job's state, for the journalist who sent it: the `user` words of the
+// one table the desk uses too (P12.1), in the same colours.
+import { statusBadge } from '/static/status.js?v=1';
 
 /** Where a working video is, in words a journalist knows. */
 const STAGE_TEXT = {
@@ -83,7 +73,7 @@ function jobCard(job) {
           el('p', { class: 'job-url', title: job.url }, job.url),
         ),
       ),
-      el('span', { class: `badge ${statusClass(job.status)}` }, STATUS_TEXT[job.status] || job.status),
+      statusBadge(job, 'user'),
     ),
     !finished && el('div', { class: 'progress' },
       el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),

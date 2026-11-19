@@ -1,0 +1,35 @@
+/* The colours of status.js's tones (plan P12.1), one family per tone:
+ *   ok green · run blue · wait grey · approval violet · warn amber ·
+ *   bad red · off (cancelled) grey, dashed.
+ * app.css already colours ok, info, warn and bad; this adds what the one
+ * vocabulary needs on top: approval violet wherever it shows, a cancelled
+ * job that no longer looks like a waiting one, and the mark beside a colour.
+ * Loaded after app.css by the pages that show job statuses.
+ */
+
+.badge .mark { margin-right: 5px; font-weight: 700; }
+
+.badge.wait     { color: var(--text-dim); }
+.badge.run      { color: var(--info); background: rgba(96, 165, 250, 0.1);  border-color: rgba(96, 165, 250, 0.22); }
+.badge.approval { color: var(--busy); background: rgba(167, 139, 250, 0.1); border-color: rgba(167, 139, 250, 0.3); }
+.badge.off      { color: var(--text-dim); background: transparent; border-style: dashed; border-color: #3a4762; }
+
+.tag .mark { margin-right: 3px; }
+.tag.off  { background: transparent; color: var(--text-dim); border: 1px dashed #3a4762; }
+
+.seg.off { background: repeating-linear-gradient(135deg, #2a3346 0 2px, transparent 2px 5px); }
+
+.legend i {
+  width: auto; height: auto; min-width: 14px;
+  padding: 0 2px;
+  font-style: normal; font-size: 10px; font-weight: 800; line-height: 14px;
+  text-align: center;
+}
+.legend i.ok   { color: #03281a; }
+.legend i.run  { color: #061631; }
+.legend i.wait { color: var(--text-dim); }
+.legend i.warn { color: #241800; }
+.legend i.bad  { color: #2e0812; }
+.legend i.approval { background: var(--busy); color: #1a0f3a; }
+.legend i.off  { border: 1px dashed #3a4762; color: var(--text-dim); }
+.legend i.skip { min-width: 14px; }

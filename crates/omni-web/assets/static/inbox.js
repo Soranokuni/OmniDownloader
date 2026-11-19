@@ -18,10 +18,13 @@
 
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
 import {
-  STAGE_TEXT, STAGE_ORDER, clock, timelineNode, tone, needsAttention, limitNote, fileName, deliveredName,
+  STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
   autoDeliveredNode,
-} from '/static/desk.js?v=14';
+} from '/static/desk.js?v=15';
+import {
+  STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
+} from '/static/status.js?v=1';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -83,17 +86,8 @@ const STAGE_SHORT = {
 };
 
 function shortStatus(j) {
-  switch (j.status) {
-    case 'RUNNING': return `${STAGE_SHORT[j.stage] || 'σε επεξεργασία'} ${pct(j)}%`;
-    case 'PENDING': return 'σε αναμονή';
-    case 'COMPLETED': return 'παραδόθηκε';
-    case 'COMPLETED_MANUAL': return 'παραδόθηκε χειροκίνητα';
-    case 'MANUAL_DOWNLOAD': return 'χειροκίνητη λήψη';
-    case 'FAILED': return 'απέτυχε';
-    case 'CANCELLED': return 'ακυρώθηκε';
-    case 'AWAITING_APPROVAL': return 'για έγκριση';
-    default: return 'χρειάζεται έλεγχο';
-  }
+  if (j.status === 'RUNNING') return `${STAGE_SHORT[j.stage] || STATUS.RUNNING.phrase} ${pct(j)}%`;
+  return statusInfo(j.status).phrase;
 }
 
 const pct = (j) => Math.max(0, Math.min(100, Math.round(Number(j.progress) || 0)));
@@ -101,40 +95,32 @@ const pct = (j) => Math.max(0, Math.min(100, Math.round(Number(j.progress) || 0)
 /** The state in a word or two: the rail is narrow, and the file name
  *  beside it is what an operator reads first. */
 function railBadge(j) {
-  const [cls, text] = {
-    PENDING: ['', 'Αναμονή'],
-    RUNNING: ['info', 'Σε εξέλιξη'],
-    COMPLETED: ['ok', 'Παραδόθηκε'],
-    COMPLETED_MANUAL: ['ok', 'Παραδόθηκε'],
-    MANUAL_DOWNLOAD: ['warn', 'Χειροκίνητα'],
-    FAILED: ['bad', 'Απέτυχε'],
-    CANCELLED: ['', 'Ακυρώθηκε'],
-    AWAITING_APPROVAL: ['warn', 'Για έγκριση'],
-  }[j.status] || ['warn', 'Έλεγχος'];
-  return el('span', { class: `badge ${cls}`.trim() }, text);
+  return statusBadge(j, 'short');
 }
 
-/** "3 βίντεο · 1 απέτυχε · 1B: μετατροπή 63% · 1 παραδόθηκε" */
+/** "3 βίντεο · 1 απέτυχε · 1B: μετατροπή 63% · 1 παραδόθηκε". Counted by
+ *  tone, so a cancelled video is never counted as one still waiting. */
 function summary(e) {
   if (e.state === 'failed') return [el('b', {}, 'Δεν διαβάστηκε'), ' · ανοίξτε το για να διαβαστεί ξανά'];
   const js = e.jobs || [];
   if (!js.length) {
     return [e.outcome === 'PHOTOS_ONLY' ? 'Μόνο φωτογραφίες· τίποτα για λήψη' : 'Δεν βρέθηκε βίντεο'];
   }
-  const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0, approval: 0 };
+  const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0, approval: 0, off: 0 };
   for (const j of js) c[tone(j)] += 1;
   const head = el('b', {}, js.length === 1 ? '1 βίντεο' : `${js.length} βίντεο`);
   if (c.ok === js.length) return [head, js.length === 1 ? ' · παραδόθηκε' : ' · όλα παραδόθηκαν'];
   const parts = [];
-  if (c.bad) parts.push(c.bad === 1 ? '1 απέτυχε' : `${c.bad} απέτυχαν`);
-  if (c.approval) parts.push(`${c.approval} για έγκριση`);
+  if (c.bad) parts.push(c.bad === 1 ? `1 ${STATUS.FAILED.phrase}` : `${c.bad} απέτυχαν`);
+  if (c.approval) parts.push(`${c.approval} ${STATUS.AWAITING_APPROVAL.phrase}`);
   if (c.warn) parts.push(c.warn === 1 ? '1 θέλει έλεγχο' : `${c.warn} θέλουν έλεγχο`);
   if (c.run) {
     const r = js.find((j) => j.status === 'RUNNING');
-    parts.push(c.run === 1 ? `${r.index_str}: ${shortStatus(r)}` : `${c.run} σε εξέλιξη`);
+    parts.push(c.run === 1 ? `${r.index_str}: ${shortStatus(r)}` : `${c.run} ${STATUS.RUNNING.phrase}`);
   }
-  if (c.wait) parts.push(`${c.wait} σε αναμονή`);
-  if (c.ok) parts.push(c.ok === 1 ? '1 παραδόθηκε' : `${c.ok} παραδόθηκαν`);
+  if (c.wait) parts.push(`${c.wait} ${STATUS.PENDING.phrase}`);
+  if (c.off) parts.push(c.off === 1 ? `1 ${STATUS.CANCELLED.phrase}` : `${c.off} ακυρώθηκαν`);
+  if (c.ok) parts.push(c.ok === 1 ? `1 ${STATUS.COMPLETED.phrase}` : `${c.ok} παραδόθηκαν`);
   return [head, ' · ', parts.join(' · ')];
 }
 
@@ -631,10 +617,7 @@ async function reprocess(button) {
 }
 
 function legend() {
-  const item = (cls, text) => el('span', {}, el('i', { class: cls }), text);
-  return el('span', { class: 'legend', 'aria-hidden': 'true' },
-    item('ok', 'παραδόθηκε'), item('run', 'σε εξέλιξη'), item('wait', 'αναμονή'),
-    item('warn', 'έλεγχος'), item('bad', 'απέτυχε'), item('skip', 'δεν κατέβηκε'));
+  return legendNode();
 }
 
 /* The text, block by block: what the parser read; a forward's headers,
@@ -712,7 +695,7 @@ function paintChip(chip) {
     ? jobs.map((j) => `${j.index_str}: ${shortStatus(j)}`).join(' · ')
     : (link && link.skip ? link.skip.reason : 'Δεν κατέβηκε');
   const tags = jobs.length
-    ? jobs.map((j) => el('span', { class: `tag ${tone(j)}` }, j.index_str))
+    ? jobs.map((j) => statusTag(j, j.index_str))
     : [el('span', { class: 'tag' }, '—')];
   chip.replaceChildren(...tags, chip.dataset.text);
 }
@@ -787,11 +770,10 @@ function paintJob(card, j, force) {
   card.classList.toggle('sel', sel);
   card.setAttribute('aria-pressed', String(sel));
 
-  const t = tone(j);
   const done = j.status === 'COMPLETED' || j.status === 'COMPLETED_MANUAL';
   const parts = [
     el('div', { class: 'jc-top' },
-      el('span', { class: `tag ${t}` }, j.index_str),
+      statusTag(j, j.index_str),
       el('span', { class: 'jc-name', title: done ? deliveredName(j) : fileName(j) }, done ? deliveredName(j) : fileName(j)),
       railBadge(j)),
     subLine(j),
@@ -815,7 +797,7 @@ function subLine(j) {
   switch (j.status) {
     case 'RUNNING': {
       const step = STAGE_ORDER.indexOf(j.stage);
-      left = [step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ` : '', el('span', { class: 'st' }, STAGE_TEXT[j.stage] || 'Σε επεξεργασία')];
+      left = [step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ` : '', el('span', { class: 'st' }, STAGE_TEXT[j.stage] || STATUS.RUNNING.label)];
       if (j.stage === 'DOWNLOAD' && j.speed && !/^0(\.0+)? /.test(j.speed)) left.push(` · ${j.speed}`);
       left.push(stepTimeNode(j));
       right = j.stage === 'DOWNLOAD' && j.eta && j.eta !== '--:--' ? `${pct(j)}% · ${j.eta}` : `${pct(j)}%`;
@@ -834,17 +816,17 @@ function subLine(j) {
       left = [el('span', { class: 'st' }, 'Χρειάζεται χειροκίνητη λήψη')];
       break;
     case 'CANCELLED':
-      left = ['Ακυρώθηκε'];
+      left = [STATUS.CANCELLED.label];
       break;
     case 'AWAITING_APPROVAL':
       // To the review tab, with this video's card in view (mcr.js listens).
       left = [el('button', {
-        class: 'badge warn', type: 'button', title: 'Άνοιγμα στην καρτέλα «Χρειάζονται έλεγχο»',
+        class: 'badge approval', type: 'button', title: 'Άνοιγμα στην καρτέλα «Χρειάζονται έλεγχο»',
         onClick: (ev) => {
           ev.stopPropagation();
           window.dispatchEvent(new CustomEvent('desk:approval', { detail: { id: j.id } }));
         },
-      }, 'Για έγκριση')];
+      }, markNode('approval'), STATUS.AWAITING_APPROVAL.label)];
       break;
     default:
       left = [el('span', { class: 'st' }, 'Δεν κατέβηκε αυτόματα')];

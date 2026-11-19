@@ -146,6 +146,21 @@ Labels you may see on a mail:
 - «Μόνο φωτογραφίες· τίποτα για λήψη» — only photos, nothing to download.
 - «Δεν διαβάστηκε» — the mail could not be read; open it to have it read again.
 
+A video's state has the same word, colour and mark everywhere: the desk's
+badges, the small tags beside the links in a mail's text, the summary line
+of a mail and the journalist's `/user` page. The key is shown above the
+mail text.
+
+| Mark | Colour | State |
+|---|---|---|
+| ✓ | green | «Παραδόθηκε» (also «Παραδόθηκε χειροκίνητα») |
+| ↻ | blue | «Σε εξέλιξη» |
+| ◷ | grey | «Σε αναμονή» |
+| ◉ | violet | «Για έγκριση» |
+| ! | amber | «Χρειάζεται έλεγχο», «Χειροκίνητη λήψη» |
+| ✕ | red | «Απέτυχε» |
+| ⊘ | grey, dashed outline | «Ακυρώθηκε» |
+
 **Opening a mail** shows the mail text and, under
 «Βίντεο από αυτό το email · N», one card per video. Below that:
 
