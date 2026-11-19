@@ -378,17 +378,17 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 16),
-        ("inbox.js", 23),
-        ("approval.js", 11),
-        ("notify.js", 11),
-        ("mcr.js", 49),
+        ("desk.js", 17),
+        ("inbox.js", 24),
+        ("approval.js", 12),
+        ("notify.js", 12),
+        ("mcr.js", 50),
         ("status.js", 1),
-        ("status.css", 3),
+        ("status.css", 4),
         ("worklist.js", 1),
         ("undo.js", 1),
         ("dialog.js", 1),
-        ("user.js", 9),
+        ("user.js", 10),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -751,12 +751,137 @@ fn the_desk_uses_no_native_dialogs() {
     }
 }
 
+/// `(selector, font-size in px)` of every CSS rule that sets a px font size.
+/// Comments are dropped; a rule inside `@media` keeps its own selector.
+fn css_font_sizes(css: &str) -> Vec<(String, f64)> {
+    let mut text = String::new();
+    let mut rest = css;
+    while let Some(i) = rest.find("/*") {
+        text.push_str(&rest[..i]);
+        rest = rest[i..].find("*/").map_or("", |j| &rest[i + j + 2..]);
+    }
+    text.push_str(rest);
+    let mut out = Vec::new();
+    for chunk in text.split('}') {
+        let Some((pre, body)) = chunk.rsplit_once('{') else { continue };
+        let selector = pre.rsplit('{').next().unwrap_or(pre).trim().to_string();
+        for decl in body.split(';') {
+            let Some(value) = decl.trim().strip_prefix("font-size:") else { continue };
+            if let Some(px) = value.trim().strip_suffix("px").and_then(|n| n.trim().parse::<f64>().ok()) {
+                out.push((selector.clone(), px));
+            }
+        }
+    }
+    out
+}
+
+/// WCAG relative luminance of `#rrggbb`.
+fn luminance(hex: &str) -> f64 {
+    let hex = hex.trim().trim_start_matches('#');
+    let channel = |i: usize| {
+        let c = f64::from(u8::from_str_radix(&hex[i..i + 2], 16).expect("hex colour")) / 255.0;
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
+}
+
+fn contrast(a: &str, b: &str) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The last `--name: #rrggbb;` in `css`.
+fn css_var(css: &str, name: &str) -> String {
+    let needle = format!("--{name}:");
+    let at = css.rfind(&needle).unwrap_or_else(|| panic!("no --{name}"));
+    css[at + needle.len()..].split(';').next().unwrap().trim().to_string()
+}
+
+/// P12.5: the desk laid out for the control room. One page width on every tab (fluid to 1760 px);
+/// a header with the product, one health pill, sound and account, on one line; nothing under
+/// 12 px on the desk's pages and the dim text readable at 4.5:1; no static inline styles left in
+/// the desk's JS and pages.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v9() {
+fn the_desk_is_laid_out_for_the_control_room() {
+    let assets = all_assets();
+    let app_css = assets.get("static/app.css").expect("app.css shipped");
+    let desk_css = assets.get("static/status.css").expect("status.css shipped");
+
+    // Nothing under 12 px: every smaller size of app.css is raised in status.css (which /mcr and
+    // /user load after it), and status.css itself has none.
+    let raised: BTreeMap<String, f64> = css_font_sizes(desk_css).into_iter().collect();
+    for (selector, px) in css_font_sizes(desk_css) {
+        assert!(px >= 12.0, "status.css sets {selector} to {px}px");
+    }
+    for (selector, px) in css_font_sizes(app_css) {
+        if px >= 12.0 {
+            continue;
+        }
+        let to = raised.get(&selector).unwrap_or_else(|| panic!("{selector} is {px}px in app.css and not raised on the desk"));
+        assert!(*to >= 12.0, "{selector} is raised to only {to}px");
+    }
+    let base = css_font_sizes(desk_css).into_iter().find(|(s, _)| s == "body").expect("status.css sets the body size").1;
+    assert!((15.0..=16.0).contains(&base), "body text is {base}px, not 15–16");
+
+    // Contrast: text, dim and faint against the page and a card, at least 4.5:1.
+    let both = format!("{app_css}\n{desk_css}");
+    let background = css_var(&both, "bg");
+    for name in ["text", "text-dim", "text-faint"] {
+        let colour = css_var(&both, name);
+        for (surface, bg) in [("the page", background.as_str()), ("a card", "#12141d")] {
+            let ratio = contrast(&colour, bg);
+            assert!(ratio >= 4.5, "--{name} {colour} on {surface} is {ratio:.2}:1");
+        }
+    }
+
+    // One width on every tab.
+    assert!(desk_css.contains(".desk-page main { max-width: 1760px;"), "the desk is not fluid to 1760 px");
+    let page = assets.get("mcr.html").expect("mcr.html shipped");
+    assert!(page.contains("<body class=\"desk-page\">"), "mcr.html is not a desk page");
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    assert!(!mcr.contains("desk-wide"), "one tab is still wider than the others");
+
+    // The header: product, health pill, sound, account; on one line.
+    let header = page.split("<header").nth(1).and_then(|s| s.split("</header>").next()).expect("header");
+    for needle in ["OmniDownloader", "id=\"health-pill\"", "id=\"sound-slot\"", "href=\"/admin\"", "id=\"logout-btn\"", "id=\"health-panel\""] {
+        assert!(header.contains(needle), "the header lost {needle}");
+    }
+    for old in ["mail-status", "llm-status", "queue-status", "storage-status", "temp-status"] {
+        assert!(!header.contains(old), "the header still carries the old status line {old}");
+    }
+    assert!(desk_css.contains(".desk-page .topbar-status { flex-wrap: nowrap;"), "the header can wrap");
+    let notify = assets.get("static/notify.js").expect("notify.js shipped");
+    let summary = function_body(notify, "healthSummary");
+    assert!(summary.contains("'Όλα καλά'") && summary.contains("προβλήματα"), "the pill does not say «Όλα καλά» / «N προβλήματα»");
+    assert!(mcr.contains("paintHealth(data)") && mcr.contains("'Φάκελος παράδοσης (Dalet)'"), "the panel has no free space");
+
+    // No static inline styles: only a progress width, a CSS variable and a computed scroll margin.
+    for module in ["desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js", "dialog.js"] {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        for (i, _) in src.match_indices("style: ") {
+            let value = &src[i + "style: ".len()..];
+            assert!(value.starts_with("`width:${"), "{module} has a static inline style: {}", &value[..value.len().min(60)]);
+        }
+        for (i, _) in src.match_indices(".style.") {
+            let value = &src[i + ".style.".len()..];
+            assert!(
+                value.starts_with("setProperty('--p'") || value.starts_with("scrollMarginTop"),
+                "{module} sets a style property: {}",
+                &value[..value.len().min(60)]
+            );
+        }
+    }
+    for page in ["mcr.html", "user.html"] {
+        assert!(!assets.get(page).unwrap().contains("style=\""), "{page} has an inline style");
+    }
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v10() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=9"), "user.html does not import user.js?v=9");
-    assert!(!page.contains("/static/user.js?v=8"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=10"), "user.html does not import user.js?v=10");
+    assert!(!page.contains("/static/user.js?v=9"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

@@ -129,15 +129,15 @@ export function stepTimeNode(job, now = Date.now()) {
   if (!text) return null;
   const long = stepIsLong(job, now);
   return el('span', long
-    ? { class: 'warn', style: 'color:var(--warn);margin-left:6px', title: 'Ασυνήθιστα πολλή ώρα στο ίδιο βήμα' }
-    : { style: 'margin-left:6px' }, text);
+    ? { class: 'step-time warn', title: 'Ασυνήθιστα πολλή ώρα στο ίδιο βήμα' }
+    : { class: 'step-time' }, text);
 }
 
 /** "Μόνο τα 2 πρώτα βίντεο", when the journalist asked for that. */
 export function limitNote(job) {
   const n = Number(job.max_videos) || 0;
   if (!n) return null;
-  return el('span', { class: 'badge', style: 'margin-left:8px', title: 'Όπως ζήτησε ο δημοσιογράφος· τα υπόλοιπα βίντεο του άρθρου προτείνονται για προσθήκη' },
+  return el('span', { class: 'badge gap-left', title: 'Όπως ζήτησε ο δημοσιογράφος· τα υπόλοιπα βίντεο του άρθρου προτείνονται για προσθήκη' },
     n === 1 ? 'Μόνο το πρώτο βίντεο' : `Μόνο τα ${n} πρώτα βίντεο`);
 }
 
@@ -165,12 +165,12 @@ export function pager(targetId, state, total, onChange) {
   const first = (state.page - 1) * state.perPage + 1;
   const last = Math.min(total, state.page * state.perPage);
   const go = (p) => { state.page = p; onChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  render(targetId, el('div', { class: 'section-head card', style: 'padding:10px 14px' },
+  render(targetId, el('div', { class: 'section-head card pager' },
     el('span', { class: 'note' }, `Εμφανίζονται ${first}–${last} από ${total}`),
     el('div', { class: 'row tight' },
       el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(1) }, '« Πρώτη'),
       el('button', { class: 'btn', type: 'button', disabled: state.page <= 1, onClick: () => go(state.page - 1) }, '‹ Προηγούμενη'),
-      el('span', { class: 'note', style: 'padding:0 8px' }, `Σελίδα ${state.page} από ${pageCount}`),
+      el('span', { class: 'note pager-page' }, `Σελίδα ${state.page} από ${pageCount}`),
       el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(state.page + 1) }, 'Επόμενη ›'),
       el('button', { class: 'btn', type: 'button', disabled: state.page >= pageCount, onClick: () => go(pageCount) }, 'Τελευταία »'),
     ),
@@ -365,9 +365,9 @@ export function autoDeliveredNode(job, after) {
   return el('div', { class: 'jc-found auto-delivered' },
     el('span', {}, `Αυτόματη παράδοση — έμπιστη συνταγή (${n} εγκρίσεις)`),
     repair.wrong_video
-      ? el('span', { class: 'badge bad', style: 'margin-left:8px' }, 'Λάθος βίντεο — η εμπιστοσύνη αφαιρέθηκε')
+      ? el('span', { class: 'badge bad gap-left' }, 'Λάθος βίντεο — η εμπιστοσύνη αφαιρέθηκε')
       : el('button', {
-        class: 'btn btn-danger', type: 'button', style: 'margin-left:8px',
+        class: 'btn btn-danger gap-left', type: 'button',
         title: 'Το βίντεο που παραδόθηκε χωρίς έγκριση ήταν λάθος',
         onClick: () => wrongVideoJob(job, after),
       }, 'Λάθος βίντεο'));

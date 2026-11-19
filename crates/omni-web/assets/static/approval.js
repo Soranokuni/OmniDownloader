@@ -10,7 +10,7 @@
  */
 
 import { api, el, fmtDuration, safeHref, toast } from '/static/app.js?v=6';
-import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=16';
+import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=17';
 import { confirmDialog } from '/static/dialog.js?v=1';
 import { statusBadge } from '/static/status.js?v=1';
 
@@ -234,11 +234,11 @@ function buildCard(job, ctx) {
 
   const node = el('div', { class: 'card attention stack ap-card', 'data-job': String(job.id), tabindex: '-1' },
     el('div', { class: 'job-head' },
-      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+      el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
           el('h3', { class: 'job-name' }, fileName(job)),
-          el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
+          el('p', { class: 'job-meta under-name' },
             `Δημοσιογράφος: ${job.journalist} · από ${clock(job.updated_at || held.created_at)}`),
           ctx.mailLink(job),
         )),

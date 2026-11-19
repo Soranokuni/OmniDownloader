@@ -141,6 +141,23 @@ export const CHECK_INFO = {
   },
 };
 
+/** The checks that are not OK, as `[name, check]`, for the banner and the
+ *  header's pill. The LLM is left out: without it the parser still works,
+ *  and no video waits on it (its line is in the panel all the same). */
+export function healthProblems(checks) {
+  return Object.entries(checks || {}).filter(([name, c]) => c && c.state !== 'ok' && name !== 'llm');
+}
+
+/** The header's pill (P12.5): «Όλα καλά», or how many problems, in the
+ *  colour of the worst. */
+export function healthSummary(checks) {
+  const problems = healthProblems(checks);
+  const count = problems.length;
+  if (!count) return { count, tone: 'ok', text: 'Όλα καλά' };
+  const tone = problems.some(([, c]) => c.state === 'down') ? 'bad' : 'warn';
+  return { count, tone, text: count === 1 ? '1 πρόβλημα' : `${count} προβλήματα` };
+}
+
 const SEVERITY = { ok: 0, degraded: 1, down: 2 };
 const SILENT_CHECKS = ['llm', 'accounts', 'sites'];
 
@@ -315,11 +332,14 @@ function paintButton() {
   if (!button) return;
   const on = soundOn();
   const locked = on && (!ctx || ctx.state !== 'running');
-  button.textContent = on ? (locked ? '🔔 Ήχος: πατήστε για ενεργοποίηση' : '🔔 Ήχος: ενεργός') : '🔕 Ήχος: σίγαση';
+  // Short, so the header stays on one line at 1366 px (P12.5); the tooltip says the rest.
+  button.textContent = on ? (locked ? '🔔 Ενεργοποίηση ήχου' : '🔔 Ήχος') : '🔕 Σίγαση';
   button.setAttribute('aria-pressed', String(on));
   button.title = on
-    ? 'Μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email. Πατήστε για σίγαση.'
-    : 'Πατήστε για μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email.';
+    ? (locked
+      ? 'Ο browser παίζει ήχο μόνο μετά από ένα πάτημα στη σελίδα. Πατήστε για να ενεργοποιηθεί.'
+      : 'Μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email. Πατήστε για σίγαση.')
+    : 'Σίγαση. Πατήστε για μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email.';
 }
 
 /**

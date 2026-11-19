@@ -5,30 +5,33 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>OmniDownloader — MCR</title>
 <link rel="stylesheet" href="/static/app.css?v=12">
-<link rel="stylesheet" href="/static/status.css?v=3">
+<link rel="stylesheet" href="/static/status.css?v=4">
 <link rel="icon" href="data:,">
 </head>
-<body>
+<body class="desk-page">
 
+<!-- The control-room header (plan P12.5): the product, one health pill that
+     opens every line of the system's health, sound and account. One line at 1366 px. -->
 <header class="topbar">
   <div class="topbar-inner">
     <div class="brand">
-      <div class="brand-mark">O</div>
+      <div class="brand-mark" aria-hidden="true">O</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p>Master Control Room · Λήψη βίντεο</p>
+        <p>Λήψη βίντεο για το MCR</p>
       </div>
     </div>
     <div class="topbar-status">
-      <span class="status-item"><span id="mail-dot" class="dot"></span><span id="mail-status">Email: —</span></span>
-      <span class="status-item"><span id="llm-dot" class="dot"></span><span id="llm-status">LLM: —</span></span>
-      <span class="status-item" id="queue-status">Ουρά: —</span>
-      <span class="status-item" id="storage-status">Watchfolder: —</span>
-      <span class="status-item" id="temp-status">Temp: —</span>
+      <button class="health-pill" type="button" id="health-pill" aria-expanded="false" aria-controls="health-panel">
+        <span id="health-dot" class="dot" aria-hidden="true"></span><span id="health-text">Έλεγχος…</span>
+      </button>
+      <span id="sound-slot" class="sound-slot"></span>
       <a class="btn" href="/admin">Διαχείριση</a>
       <button class="btn" type="button" id="logout-btn">Αποσύνδεση</button>
     </div>
   </div>
+  <!-- Every health line, free space and what to do; filled by mcr.js. -->
+  <section id="health-panel" class="health-panel" aria-label="Κατάσταση του συστήματος" hidden></section>
 </header>
 
 <main>
@@ -42,7 +45,7 @@
   <section id="late-strip" class="late-strip" aria-label="Καθυστερούν" hidden></section>
 
   <div class="tabs">
-  <div role="tablist" style="display:flex;gap:4px;flex-wrap:wrap">
+  <div role="tablist" class="tablist">
     <button class="tab" type="button" role="tab" id="tabbtn-email" data-tab="email" aria-controls="tab-email" aria-selected="true" tabindex="0">
       Email <span id="email-count" class="badge info" hidden>0</span>
     </button>
@@ -58,7 +61,7 @@
     <button class="tab" type="button" role="tab" id="tabbtn-journalists" data-tab="journalists" aria-controls="tab-journalists" aria-selected="false" tabindex="-1">Δημοσιογράφοι</button>
     <button class="tab" type="button" role="tab" id="tabbtn-manual" data-tab="manual" aria-controls="tab-manual" aria-selected="false" tabindex="-1">Προσθήκη συνδέσμου</button>
   </div>
-    <button class="tab" type="button" id="specs-btn" style="margin-left:auto">Προδιαγραφές εκπομπής</button>
+    <button class="tab tab-end" type="button" id="specs-btn">Προδιαγραφές εκπομπής</button>
   </div>
 
   <!-- Every mail and every link added by hand, each with its videos (plan P7.10) -->
@@ -67,7 +70,7 @@
       <div class="ib-filters" id="inbox-filters" role="group" aria-label="Φίλτρο"></div>
       <input type="search" id="inbox-search" placeholder="Αναζήτηση θέματος, αποστολέα, δημοσιογράφου ή συνδέσμου…" aria-label="Αναζήτηση">
     </div>
-    <p class="note" style="margin:0">
+    <p class="note flat">
       Κάθε email που ήρθε, με τα βίντεο που βγήκαν από αυτό. Ανοίξτε ένα για να δείτε το κείμενό του:
       κάθε σύνδεσμος έχει δίπλα τον αριθμό του αρχείου που έγινε και το χρώμα της κατάστασής του.
     </p>
@@ -80,7 +83,7 @@
   <!-- Live queue -->
   <section id="tab-queue" class="stack" role="tabpanel" aria-labelledby="tabbtn-queue" hidden>
     <div class="section-head">
-      <p class="note" style="margin:0">
+      <p class="note flat">
         Πρώτα όσα βίντεο περιμένουν ή μετατρέπονται, μετά όσα έχουν ήδη παραδοθεί.
         Τα παραδοθέντα μένουν και στα <b>Ολοκληρωμένα</b>.
       </p>
@@ -99,13 +102,13 @@
     <!-- Videos made and held until MCR approves them (plan P10.7); hidden when none -->
     <div id="approval-section" class="stack" hidden>
       <h2 class="ap-title">Για έγκριση (0)</h2>
-      <p class="note" style="margin:0">
+      <p class="note flat">
         Αυτά τα βίντεο είναι έτοιμα αλλά δεν έχουν σταλεί στο Dalet. Δείτε το βίντεο και πατήστε
         <b>Έγκριση → Dalet</b> μόνο αν είναι το σωστό.
       </p>
       <div class="ap-list stack"></div>
     </div>
-    <p class="note" style="margin:0">
+    <p class="note flat">
       Αυτά τα βίντεο περιμένουν εσάς, ομαδοποιημένα κατά το τι χρειάζεται να γίνει. Κάθε κάρτα λέει γιατί
       και έχει μπροστά την κύρια ενέργεια· οι υπόλοιπες είναι στο <b>Περισσότερα</b>.
       Όσα θα ξαναδοκιμαστούν αυτόματα δεν είναι εδώ: είναι στο <b>Σε εξέλιξη</b>.
@@ -113,15 +116,15 @@
     <div class="card">
       <div class="section-head">
         <div class="row">
-          <label for="review-journalist" style="margin:0">Δημοσιογράφος</label>
-          <select id="review-journalist" style="width:auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
+          <label for="review-journalist" class="inline-label">Δημοσιογράφος</label>
+          <select id="review-journalist" class="auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
         </div>
-        <input type="search" id="review-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" style="width:320px">
+        <input type="search" id="review-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" class="search-wide">
       </div>
-      <div class="section-head" style="margin-top:10px">
+      <div class="section-head spaced-top">
         <button class="btn" type="button" id="hide-old-review">Απόκρυψη παλαιότερων από 3 ημέρες</button>
-        <label id="review-hidden-label" class="row" style="margin:0;gap:6px" hidden>
-          <input type="checkbox" id="review-show-hidden" style="width:auto">
+        <label id="review-hidden-label" class="row inline-check" hidden>
+          <input type="checkbox" id="review-show-hidden" class="auto">
           <span id="review-hidden-text">Εμφάνιση κρυμμένων</span>
         </label>
       </div>
@@ -137,14 +140,14 @@
     <div class="card">
       <div class="section-head">
         <div class="row">
-          <label for="journalist-filter" style="margin:0">Δημοσιογράφος</label>
-          <select id="journalist-filter" style="width:auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
-          <label for="group-filter" style="margin:0 0 0 12px">Ομάδα</label>
-          <select id="group-filter" style="width:auto"><option value="">Όλες οι ομάδες</option></select>
+          <label for="journalist-filter" class="inline-label">Δημοσιογράφος</label>
+          <select id="journalist-filter" class="auto"><option value="">Όλοι οι δημοσιογράφοι</option></select>
+          <label for="group-filter" class="inline-label spaced">Ομάδα</label>
+          <select id="group-filter" class="auto"><option value="">Όλες οι ομάδες</option></select>
         </div>
-        <input type="search" id="completed-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" style="width:320px">
+        <input type="search" id="completed-search" placeholder="Αναζήτηση ονόματος αρχείου, λέξης ή συνδέσμου…" class="search-wide">
       </div>
-      <p class="note" style="margin:10px 0 0">
+      <p class="note flat spaced-top">
         Όλα τα βίντεο που παραδόθηκαν, τα νεότερα πρώτα. Αν ένα αρχείο σβήστηκε ή βγήκε λάθος,
         πατήστε <b>Νέα λήψη</b>: το βίντεο κατεβαίνει ξανά από τον σύνδεσμό του και παραδίδεται
         πάλι, δίπλα στο παλιό αρχείο αν υπάρχει ακόμη, ποτέ πάνω του.
@@ -209,9 +212,9 @@
 
   <!-- Add a link -->
   <section id="tab-manual" class="stack" role="tabpanel" aria-labelledby="tabbtn-manual" hidden>
-    <div class="card" style="max-width:680px;margin:0 auto">
+    <div class="card form-card">
       <h2 class="card-title">Χειροκίνητη προσθήκη συνδέσμου</h2>
-      <p class="note" style="margin-bottom:12px">
+      <p class="note form-intro">
         Για βίντεο που δεν ήρθε με email. Επικολλήστε τον σύνδεσμο του βίντεο ή του άρθρου
         που το περιέχει. Το αρχείο ονομάζεται <span class="mono">ΑΡΙΘΜΟΣ_ΔΗΜΟΣΙΟΓΡΑΦΟΣ_ΛΕΞΗ.mxf</span>.
       </p>
@@ -245,7 +248,7 @@
           <input type="checkbox" id="m-priority">
           <label for="m-priority">Επείγον (μπαίνει πριν από τα άλλα)</label>
         </div>
-        <p class="note" id="m-preview" style="margin:0"></p>
+        <p class="note flat" id="m-preview"></p>
         <button class="btn btn-primary btn-block" type="submit">Προσθήκη στην ουρά</button>
       </form>
     </div>
@@ -255,8 +258,8 @@
 <!-- Broadcast format -->
 <div class="modal" id="specs-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="specs-title">
-    <div class="section-head" style="border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px">
-      <h2 id="specs-title" style="margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.07em">
+    <div class="section-head modal-head">
+      <h2 id="specs-title" class="modal-title">
         Προδιαγραφές κάθε αρχείου που παραδίδεται
       </h2>
       <button class="btn btn-icon" type="button" id="specs-close" aria-label="Κλείσιμο">✕</button>
@@ -270,10 +273,10 @@
     <div class="spec-row"><span>Κωδικοποίηση ήχου</span><span>PCM 24-bit @ 48 kHz</span></div>
     <div class="spec-row"><span>Αντιστοίχιση καναλιών</span><span>1 Αριστερό, 2 Δεξί, 3–8 σιωπή</span></div>
     <div class="spec-row"><span>Περιτύλιγμα</span><span>SMPTE RDD9 OP1a (bmxtranswrap)</span></div>
-    <button class="btn btn-block" type="button" id="specs-close-2" style="margin-top:14px">Κλείσιμο</button>
+    <button class="btn btn-block spaced-top" type="button" id="specs-close-2">Κλείσιμο</button>
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=49"></script>
+<script type="module" src="/static/mcr.js?v=50"></script>
 </body>
 </html>

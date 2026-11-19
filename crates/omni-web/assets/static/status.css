@@ -4,9 +4,10 @@
  * app.css already colours ok, info, warn and bad; this adds what the one
  * vocabulary needs on top: approval violet wherever it shows, a cancelled
  * job that no longer looks like a waiting one, and the mark beside a colour.
- * Loaded after app.css by the pages that show job statuses. Also holds the
- * desk's work-list rules (P12.2) and its undo strip, dialog and rename field
- * (P12.4) until all fold into app.css with its next version bump.
+ * Loaded after app.css by the pages that show job statuses (/mcr, /user).
+ * Also holds the desk's work-list rules (P12.2), its undo strip, dialog and
+ * rename field (P12.4) and the control-room layout (P12.5) until all fold
+ * into app.css with its next version bump.
  */
 
 .badge .mark { margin-right: 5px; font-weight: 700; }
@@ -24,7 +25,7 @@
 .legend i {
   width: auto; height: auto; min-width: 14px;
   padding: 0 2px;
-  font-style: normal; font-size: 10px; font-weight: 800; line-height: 14px;
+  font-style: normal; font-size: 12px; font-weight: 800; line-height: 15px;
   text-align: center;
 }
 .legend i.ok   { color: #03281a; }
@@ -75,3 +76,152 @@
 .rename-form { display: flex; flex-direction: column; gap: 6px; }
 .rename-form label { margin: 0; }
 .rename-preview { margin: 0; }
+
+/* ================================================================== *
+ * Layout for the control room (plan P12.5)
+ * ================================================================== */
+
+/* Type and contrast. Body text 15 px; nothing under 12 px; the faint grey
+ * is lighter so it reads at 4.5:1 on the page and on a card (app.css's
+ * #64718a was about 4:1). */
+:root { --text-faint: #7a879f; }
+body { font-size: 15px; }
+
+/* One page width on every tab: fluid, up to 1760 px. */
+.desk-page .topbar-inner,
+.desk-page main { max-width: 1760px; padding-left: 24px; padding-right: 24px; }
+
+/* The header: product, one health pill, sound, account. One line at 1366 px. */
+/* (app.css's sticky .topbar is the panel's anchor.) */
+.desk-page .topbar-status { flex-wrap: nowrap; white-space: nowrap; gap: 10px; font-size: 14px; }
+.brand p { font-size: 12px; }
+.health-pill {
+  appearance: none;
+  display: inline-flex; align-items: center; gap: 8px;
+  font: inherit; font-size: 14px; font-weight: 700;
+  color: var(--text);
+  background: #0e1220;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.health-pill:hover { background: #141a2b; }
+.health-pill[data-tone="ok"]   { border-color: rgba(52, 211, 153, 0.4); }
+.health-pill[data-tone="warn"] { border-color: rgba(251, 191, 36, 0.55); color: var(--warn); }
+.health-pill[data-tone="bad"]  { border-color: rgba(251, 113, 133, 0.6); color: var(--bad); }
+.sound-slot { display: inline-flex; }
+.health-panel {
+  position: absolute;
+  right: max(24px, calc((100vw - 1760px) / 2 + 24px));
+  top: 100%;
+  width: min(560px, calc(100vw - 48px));
+  max-height: calc(100vh - 90px);
+  overflow: auto;
+  background: #0b0e17;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.6);
+  white-space: normal;
+  z-index: 50;
+}
+.hp-title { margin: 0 0 10px; font-size: 16px; }
+.hp-checks { list-style: none; margin: 0; padding: 0; }
+.hp-check {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+.hp-name { font-weight: 600; }
+.hp-state { color: var(--text-dim); font-size: 13px; }
+.hp-check.bad .hp-state { color: var(--warn); }
+.hp-action, .hp-detail { grid-column: 2 / 4; font-size: 13px; color: var(--text-dim); }
+.hp-detail { font-size: 12px; overflow-wrap: anywhere; }
+.hp-facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 12px 0 0; font-size: 14px; }
+.hp-facts dt { color: var(--text-dim); }
+.hp-facts dd { margin: 0; }
+.hp-note { margin: 12px 0 0; }
+
+/* Tabs. */
+.tablist { display: flex; gap: 4px; flex-wrap: wrap; }
+.tab { font-size: 15px; }
+.tab-end { margin-left: auto; }
+
+/* The lists use the width: two columns of cards on a wide monitor. A group
+ * heading spans the row. The approval cards (with their video) stay one per row. */
+@media (min-width: 1400px) {
+  #queue-cards, #review-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  #queue-cards > *, #review-cards > * { margin-top: 0; }
+  #queue-cards > .card.center, #review-cards > .card.center, #review-cards > .wl-group { grid-column: 1 / -1; }
+}
+
+/* What used to be inline styles in the desk's JS and pages. */
+.note.flat, p.flat { margin: 0; }
+.spaced-top { margin-top: 10px; }
+.search-wide { width: 320px; max-width: 100%; }
+select.auto, input.auto { width: auto; }
+.inline-label { margin: 0; }
+.inline-label.spaced { margin-left: 12px; }
+.inline-check { margin: 0; gap: 6px; }
+.form-card { max-width: 680px; margin: 0 auto; }
+.form-intro { margin-bottom: 12px; }
+.modal-head { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 12px; }
+.modal-title { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 0.07em; }
+.card-title.bare { border: none; margin: 0; padding: 0; }
+.step-time { margin-left: 6px; }
+.step-time.warn { color: var(--warn); }
+.gap-left { margin-left: 8px; }
+.card.pager { padding: 10px 14px; }
+.pager-page { padding: 0 8px; }
+.banner-line { margin-top: 8px; }
+.banner-line .note { font-size: 13px; }
+.offer-row { border-top: 1px solid var(--line); padding-top: 10px; }
+.row.head-row { gap: 10px; align-items: flex-start; }
+.under-name { margin: 2px 0 0; }
+.url-cell { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.row-end { justify-content: flex-end; flex-wrap: nowrap; }
+strong.block { display: block; }
+.fchip .pip.run  { background: var(--info); }
+.fchip .pip.warn { background: var(--warn); }
+.fchip .pip.ok   { background: var(--ok); }
+.fchip .pip.none { background: #3a4762; }
+
+/* Nothing under 12 px: app.css's smaller sizes, raised on these pages. */
+thead th { font-size: 12px; }
+.badge { font-size: 12px; }
+.job-id { font-size: 12px; }
+.job-url { font-size: 12px; }
+.job-meta { font-size: 12.5px; }
+.reason { font-size: 12.5px; }
+.fchip .n { font-size: 12px; }
+.ib-day { font-size: 12px; }
+.mail-from .clip { font-size: 12px; }
+.new-pill { font-size: 12px; }
+.mail-sum { font-size: 12.5px; }
+.pane-title { font-size: 12px; }
+.legend { font-size: 12px; }
+.tag { font-size: 12px; }
+.jc-sub { font-size: 12.5px; }
+.jc-found { font-size: 12px; }
+.jc-hint .note { font-size: 12px; }
+.jc-override input { font-size: 12.5px; }
+.timeline li { font-size: 12.5px; }
+.tech { font-size: 12px; }
+.tech-log { font-size: 12px; }
+.rail-sep { font-size: 12px; }
+.skipcard .u { font-size: 12.5px; }
+.skipcard .why { font-size: 12.5px; }
+.mail-link { font-size: 12.5px; }
+@media (max-width: 760px) {
+  .avatar { font-size: 12px; }
+}

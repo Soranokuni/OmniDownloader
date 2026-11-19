@@ -20,14 +20,16 @@ import {
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=16';
+} from '/static/desk.js?v=17';
 import { deferAction, visible } from '/static/undo.js?v=1';
 import { confirmDialog } from '/static/dialog.js?v=1';
 import { STATUS, statusBadge } from '/static/status.js?v=1';
 import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=1';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=23';
-import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=11';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=11';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=24';
+import {
+  initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
+} from '/static/notify.js?v=12';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=12';
 
 let journalists = [];
 
@@ -57,7 +59,6 @@ function switchTab(name) {
     }
     if (section) section.hidden = tab !== name;
   }
-  document.body.classList.toggle('desk-wide', name === 'email');
   // A held video keeps playing behind a hidden tab otherwise.
   if (name !== 'review') {
     for (const m of document.querySelectorAll('#approval-section video, #approval-section audio')) m.pause();
@@ -140,7 +141,7 @@ function showOutage() {
   render(banner, el('div', { class: 'card attention' },
     el('strong', {}, 'Η υπηρεσία λήψης δεν απαντά'),
     ` από ${at}`,
-    el('div', { style: 'margin-top:8px' },
+    el('div', { class: 'banner-line' },
       'Οι λίστες δεν ενημερώνονται και οι λήψεις μπορεί να έχουν σταματήσει. Αν δεν επανέλθει σε λίγα λεπτά, ενημερώστε τον διαχειριστή.'),
   ));
 }
@@ -184,49 +185,18 @@ async function loadStatusOnce() {
   try {
     data = await statusWithDeadline();
   } catch (e) {
-    setStatus('mail', 'Email: άγνωστο', 'bad', '');
-    setStatus('llm', 'LLM: άγνωστο', 'bad', '');
     noteStatusFailure(e);
+    if (outageShown) paintHealth(null);
     return;
   }
   noteStatusSuccess();
 
   const checks = data.checks || {};
+  paintHealth(data);
 
-  // The detail goes in the tooltip, so the bar stays readable but the reason
-  // is one hover away. These used to be the string literals "Active" and
-  // "Ready", which said the mailbox was fine while it was refusing the
-  // password (defect W-09).
-  const mail = checks.mail || { state: 'ok' };
-  setStatus('mail', `Email: ${label(mail)}`, DOT[mail.state] || '', mail.detail || '');
-
-  const llm = checks.llm || { state: 'ok' };
-  setStatus('llm', `LLM: ${label(llm)}`, DOT[llm.state] || '', llm.detail || '');
-
-  const queue = data.queue;
-  document.getElementById('queue-status').textContent = queue
-    ? `Ουρά: ${queue.pending} ${STATUS.PENDING.phrase} · ${queue.running} ${STATUS.RUNNING.phrase}${queue.approval > 0 ? ` · ${queue.approval} ${STATUS.AWAITING_APPROVAL.phrase}` : ''}`
-    : 'Ουρά: —';
-  const tempFree = data.disk?.temp?.free_gb;
-  document.getElementById('temp-status').textContent =
-    tempFree === undefined || tempFree === null
-      ? 'Temp: άγνωστο'
-      : `Temp: ${tempFree.toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`;
-
-  const free = data.disk?.watchfolder?.free_gb;
-  const storage = document.getElementById('storage-status');
-  storage.textContent =
-    free === undefined || free === null
-      ? 'Watchfolder: άγνωστο'
-      : `Watchfolder: ${free.toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`;
-  // Whatever the watchfolder check says is the authoritative word on whether
-  // delivery will work at all.
-  const wf = checks.watchfolder;
-  storage.title = wf?.detail || '';
-
-  // Anything not already on the bar — tools, disk, queue, self-check —
-  // surfaces here rather than staying invisible until a job fails on it.
-  const problems = Object.entries(checks).filter(([name, c]) => c.state !== 'ok' && name !== 'llm');
+  // Anything that is not OK also gets the banner above the tabs, so it is
+  // not one click away while it stops videos.
+  const problems = healthProblems(checks);
   const banner = document.getElementById('health-banner');
   if (problems.length === 0) {
     banner.hidden = true;
@@ -236,10 +206,10 @@ async function loadStatusOnce() {
       el('strong', {}, problems.some(([name, c]) => name !== 'mail' && c.state === 'down') ? 'Η λήψη βίντεο έχει σταματήσει' : 'Προσοχή'),
       ...problems.map(([name, c]) => {
         const info = CHECK_INFO[name];
-        return el('div', { style: 'margin-top:8px' },
+        return el('div', { class: 'banner-line' },
           el('div', {}, info ? info.name : name),
           info?.action ? el('div', {}, info.action) : null,
-          el('div', { class: 'note mono', style: 'font-size:12px' }, c.detail || c.state),
+          el('div', { class: 'note mono' }, c.detail || c.state),
         );
       }),
     ));
@@ -247,6 +217,73 @@ async function loadStatusOnce() {
   renderSelfheal(data.selfheal);
   watchStatus(data);
 }
+
+/* ------------------------------------------------------------------ *
+ * The health pill and its panel (P12.5): one word in the header, every
+ * line one click away. The old status bar (mail, LLM, queue, free space)
+ * lives in the panel.
+ * ------------------------------------------------------------------ */
+
+const healthPill = document.getElementById('health-pill');
+const healthPanel = document.getElementById('health-panel');
+
+const STATE_WORD = { ok: 'εντάξει', degraded: 'με πρόβλημα', down: 'εκτός λειτουργίας' };
+const gb = (v) => (v === undefined || v === null
+  ? 'άγνωστο'
+  : `${Number(v).toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`);
+
+/** The pill and the panel from a status payload; `null` while the service does not answer. */
+function paintHealth(data) {
+  const s = data ? healthSummary(data.checks || {}) : { tone: 'bad', text: 'Η υπηρεσία δεν απαντά' };
+  document.getElementById('health-dot').className = `dot ${s.tone}`;
+  document.getElementById('health-text').textContent = s.text;
+  healthPill.dataset.tone = s.tone;
+  if (!data) {
+    render(healthPanel, el('p', { class: 'hp-line' },
+      'Η υπηρεσία λήψης δεν απαντά: οι λίστες δεν ενημερώνονται. Αν δεν επανέλθει σε λίγα λεπτά, ενημερώστε τον διαχειριστή.'));
+    return;
+  }
+  const checks = data.checks || {};
+  const q = data.queue;
+  const lines = Object.entries(checks).map(([name, c]) => {
+    const info = CHECK_INFO[name];
+    const bad = c.state !== 'ok';
+    return el('li', { class: `hp-check ${bad ? 'bad' : ''}`.trim() },
+      el('span', { class: `dot ${DOT[c.state] || ''}`.trim(), 'aria-hidden': 'true' }),
+      el('span', { class: 'hp-name' }, info ? info.name : name),
+      el('span', { class: 'hp-state' }, STATE_WORD[c.state] || 'άγνωστο'),
+      bad && info?.action ? el('span', { class: 'hp-action' }, info.action) : null,
+      c.detail ? el('span', { class: 'hp-detail mono' }, c.detail) : null);
+  });
+  render(healthPanel,
+    el('h2', { class: 'hp-title' }, s.text),
+    el('ul', { class: 'hp-checks' }, lines),
+    el('dl', { class: 'hp-facts' },
+      el('dt', {}, 'Φάκελος παράδοσης (Dalet)'), el('dd', {}, gb(data.disk?.watchfolder?.free_gb)),
+      el('dt', {}, 'Προσωρινός φάκελος'), el('dd', {}, gb(data.disk?.temp?.free_gb)),
+      el('dt', {}, 'Ουρά'), el('dd', {}, q
+        ? `${q.pending} ${STATUS.PENDING.phrase} · ${q.running} ${STATUS.RUNNING.phrase}${q.approval > 0 ? ` · ${q.approval} ${STATUS.AWAITING_APPROVAL.phrase}` : ''}`
+        : '—')),
+    el('p', { class: 'note hp-note' },
+      s.count ? 'Κάθε γραμμή με πρόβλημα λέει τι σημαίνει και τι να κάνετε.' : 'Δεν χρειάζεται κάτι από εσάς.'));
+}
+
+function setHealthOpen(open) {
+  healthPanel.hidden = !open;
+  healthPill.setAttribute('aria-expanded', String(open));
+}
+healthPill.addEventListener('click', () => setHealthOpen(healthPanel.hidden));
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && !healthPanel.hidden) {
+    setHealthOpen(false);
+    healthPill.focus();
+  }
+});
+document.addEventListener('pointerdown', (ev) => {
+  if (healthPanel.hidden) return;
+  if (healthPanel.contains(ev.target) || healthPill.contains(ev.target)) return;
+  setHealthOpen(false);
+});
 
 // One line per site the overnight self-heal found a new way for in the last 24 h
 // (P10.14). A line only: a broken site is the banner's, never a chime. The
@@ -263,22 +300,6 @@ function renderSelfheal(list) {
   render(box, el('div', { class: 'card' },
     ...[...found].map((domain) => el('div', {}, `${domain}: η σελίδα άλλαξε· βρέθηκε νέος τρόπος (θα ζητηθεί έγκριση)`)),
   ));
-}
-
-function label(check) {
-  switch (check.state) {
-    case 'ok': return 'OK';
-    case 'degraded': return 'με πρόβλημα';
-    case 'down': return 'εκτός λειτουργίας';
-    default: return 'άγνωστο';
-  }
-}
-
-function setStatus(prefix, text, dotClass, title) {
-  const node = document.getElementById(`${prefix}-status`);
-  node.textContent = text;
-  node.title = title || '';
-  document.getElementById(`${prefix}-dot`).className = `dot ${dotClass}`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -403,11 +424,11 @@ function renderOffers(targetId, jobs) {
   }
   render(targetId, el('div', { class: 'card stack' },
     el('h3', { class: 'job-name' }, 'Βρέθηκαν κι άλλα βίντεο σε αυτά τα άρθρα'),
-    el('p', { class: 'note', style: 'margin:0' },
+    el('p', { class: 'note flat' },
       'Δεν προστέθηκαν αυτόματα. Ανοίξτε ένα για να το δείτε και προσθέστε το αν ανήκει στο θέμα.'),
     ...withOffers.flatMap((job) => offersOf(job).map((offer) => {
       const href = safeHref(offer.url);
-      return el('div', { class: 'job-head', style: 'border-top:1px solid var(--line);padding-top:10px' },
+      return el('div', { class: 'job-head offer-row' },
         el('div', {},
           el('p', { class: 'job-meta' },
             `Από την εργασία #${job.id} (${fileName(job)}) — θα γίνει ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
@@ -486,7 +507,7 @@ function activeCard(job) {
   const running = job.status === 'RUNNING';
   return el('div', { class: 'card stack' },
     el('div', { class: 'job-head' },
-      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+      el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
           el('h3', { class: 'job-name' }, fileName(job)),
@@ -525,7 +546,7 @@ function activeCard(job) {
         : null,
       el('div', { class: 'job-meta' },
         el('span', {}, `Δημοσιογράφος: ${job.journalist}`,
-          job.group_code ? el('span', { class: 'badge info', style: 'margin-left:8px', title: groupName(job.group_code) }, job.group_code) : null,
+          job.group_code ? el('span', { class: 'badge info gap-left', title: groupName(job.group_code) }, job.group_code) : null,
           limitNote(job)),
         el('span', {}, running && job.eta && job.eta !== '--:--' ? `Απομένουν περίπου ${job.eta}` : ''),
       ),
@@ -536,11 +557,11 @@ function activeCard(job) {
 function deliveredCard(job) {
   return el('div', { class: 'card' },
     el('div', { class: 'job-head' },
-      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+      el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
           el('h3', { class: 'job-name' }, deliveredName(job)),
-          el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
+          el('p', { class: 'job-meta under-name' },
             `Παραδόθηκε ${fmtTime(job.completed_at || job.updated_at)} · ${fmtDuration(job.duration_secs)} · ${job.journalist}`,
             limitNote(job)),
           mailLink(job),
@@ -971,12 +992,12 @@ function reviewCard(job) {
 
   return el('div', { class: 'card attention stack', 'data-job': String(job.id) },
     el('div', { class: 'job-head' },
-      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+      el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
           el('h3', { class: 'job-name' }, fileName(job)),
           el('p', { class: 'job-url', title: job.url }, job.url),
-          el('p', { class: 'job-meta', style: 'margin:2px 0 0' },
+          el('p', { class: 'job-meta under-name' },
             `Δημοσιογράφος: ${job.journalist} · από ${fmtTime(job.updated_at)}`),
           mailLink(job),
         ),
@@ -1097,9 +1118,9 @@ function completedRow(job) {
       el('div', { class: 'strong' }, deliveredName(job), limitNote(job),
         // No file was made here: the name is the slug, not a file in the watchfolder (P7.16).
         job.status === 'COMPLETED_MANUAL'
-          ? el('span', { class: 'badge', style: 'margin-left:8px', title: 'Το βίντεο μπήκε στο Dalet από το MCR, όχι από εδώ' }, 'χειροκίνητα')
+          ? el('span', { class: 'badge gap-left', title: 'Το βίντεο μπήκε στο Dalet από το MCR, όχι από εδώ' }, 'χειροκίνητα')
           : null),
-      el('div', { class: 'note mono', title: job.url, style: 'max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, job.url),
+      el('div', { class: 'note mono url-cell', title: job.url }, job.url),
       mailLink(job),
       autoDeliveredNode(job, refresh),
     ),
@@ -1110,7 +1131,7 @@ function completedRow(job) {
     el('td', { class: 'num' }, fmtTime(job.completed_at || job.delivered_at)),
     el('td', {}, fmtDuration(job.duration_secs)),
     el('td', { class: 'right' },
-      el('div', { class: 'row tight', style: 'justify-content:flex-end;flex-wrap:nowrap' },
+      el('div', { class: 'row tight row-end' },
         href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Άνοιγμα του αρχικού συνδέσμου' }, 'Άνοιγμα') : null,
         el('button', { class: 'btn btn-primary', type: 'button', onClick: () => redownload(job) }, 'Νέα λήψη'),
       ),
@@ -1251,7 +1272,7 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 
 initInbox({ onCounts: showCounts, refresh: () => refresh(), groupName, onLoadError: failed });
 // Jingle and notification when every video of an email has finished (P5.4).
-initNotify(document.querySelector('.topbar-status'), (id) => {
+initNotify(document.getElementById('sound-slot'), (id) => {
   const cut = id.indexOf(':');
   switchTab('email');
   openMail(id.slice(0, cut), id.slice(cut + 1));

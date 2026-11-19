@@ -67,7 +67,7 @@ function jobCard(job) {
 
   return el('div', { class: 'card stack' },
     el('div', { class: 'job-head' },
-      el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
+      el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
           el('h3', { class: 'job-name' }, `${job.slug}.mxf`),
@@ -79,7 +79,7 @@ function jobCard(job) {
     !finished && el('div', { class: 'progress' },
       el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),
     (job.status === 'REQUIRES_REVIEW' || job.status === 'FAILED')
-      && el('div', { class: 'reason' }, el('strong', { style: 'display:block' },
+      && el('div', { class: 'reason' }, el('strong', { class: 'block' },
         'Δεν κατέβηκε αυτόματα· το MCR το έχει δει. Αν έχετε άλλον σύνδεσμο για το ίδιο βίντεο, στείλτε τον.')),
     done && job.delivered_name
       && el('div', { class: 'job-meta' }, el('span', {}, `Αρχείο: ${job.delivered_name}`)),

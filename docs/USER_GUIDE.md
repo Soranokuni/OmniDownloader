@@ -106,9 +106,14 @@ switched on yet at every station; ask MCR.
 
 ### 4.1 The header
 
-- **«Ουρά: …»** — the queue's state at a glance.
-- **«Προδιαγραφές εκπομπής»** — the broadcast specification every delivered
-  file meets.
+- **The health pill** — «Όλα καλά» (all fine) in green, or «N προβλήματα» in
+  amber or red. Press it for every line of the system's health: what is wrong
+  and what to do, the free space of the Dalet watchfolder and of the temporary
+  folder, and the queue («N σε αναμονή · N σε εξέλιξη»). Escape or a click
+  elsewhere closes it.
+- **«🔔 Ήχος»** — sound on or off (§4.7).
+- **«Προδιαγραφές εκπομπής»** — at the end of the tab row: the broadcast
+  specification every delivered file meets.
 - **«Διαχείριση»** — the admin page (administrators only).
 - **«Καθυστερούν»** — a strip above the tabs, only while some video is late
   (§4.9).

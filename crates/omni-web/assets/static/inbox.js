@@ -21,7 +21,7 @@ import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=16';
+} from '/static/desk.js?v=17';
 import { visible } from '/static/undo.js?v=1';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
@@ -271,12 +271,13 @@ async function loadOnce() {
  * Filter chips
  * ------------------------------------------------------------------ */
 
+// The pip's colour is a class (`pip run` …, status.css), not an inline style (P12.5).
 const FILTERS = [
   ['all', 'Όλα', null],
-  ['active', 'Σε εξέλιξη', 'var(--info)'],
-  ['attention', 'Θέλουν προσοχή', 'var(--warn)'],
-  ['done', 'Ολοκληρώθηκαν', 'var(--ok)'],
-  ['empty', 'Χωρίς βίντεο', '#3a4762'],
+  ['active', 'Σε εξέλιξη', 'run'],
+  ['attention', 'Θέλουν προσοχή', 'warn'],
+  ['done', 'Ολοκληρώθηκαν', 'ok'],
+  ['empty', 'Χωρίς βίντεο', 'none'],
 ];
 let filtersSig = '';
 
@@ -294,7 +295,7 @@ function renderFilters(counts) {
       list.page = 1;
       loadInbox();
     },
-  }, color ? el('span', { class: 'pip', style: `background:${color}` }) : null, label,
+  }, color ? el('span', { class: `pip ${color}`, 'aria-hidden': 'true' }) : null, label,
   el('span', { class: 'n' }, String(counts[key] ?? 0)))));
 }
 
