@@ -21,6 +21,7 @@ use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
+mod alerts;
 mod benchmark;
 mod canary;
 mod cookies_cli;
@@ -1647,6 +1648,44 @@ async fn run_daemon(
                         ctx.early_ytdl
                             .run_requested(&repo_sched, platform, chrono::Utc::now(), |drain| early_ytdl_update(&repo_sched, &ctx, drain))
                             .await;
+                    }
+                }
+            }
+        });
+    }
+
+    // 3b. Alerts beyond the open tab (P11.14): a red health line, jobs waiting for a
+    // person, a silent mailbox, written to the Event Log once per transition. A console
+    // run writes them to the file log only.
+    {
+        let (repo_alerts, health_alerts) = (repo.clone(), health.clone());
+        let mut alerts_rx = shutdown_tx.subscribe();
+        let event_log = service_shutdown_rx.is_some();
+        let mut alerter = alerts::Alerter::new(config.alerts.waiting_for_person_mins);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = alerts_rx.recv() => break,
+                    _ = tick.tick() => {
+                        let waiting = match repo_alerts.jobs_waiting_for_person() {
+                            Ok(w) => Some(w),
+                            Err(e) => {
+                                warn!("Alerts: could not read the jobs waiting for a person: {e:#}");
+                                None
+                            }
+                        };
+                        let checks = health_alerts.all();
+                        let snapshot = alerts::Snapshot {
+                            now: chrono::Utc::now(),
+                            checks: &checks,
+                            last_mail_poll: health_alerts.last_mail_poll(),
+                            started_at: health_alerts.started_at(),
+                            waiting: waiting.as_deref(),
+                        };
+                        for alert in alerter.tick(&snapshot) {
+                            alerts::write(&alert, event_log);
+                        }
                     }
                 }
             }

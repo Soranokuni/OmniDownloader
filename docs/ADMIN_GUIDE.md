@@ -596,6 +596,17 @@ with a placeholder until you add the person (§6.3).
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
 | `adblock_*` | on | blocklists for the page reader, updated nightly |
+| `alerts.waiting_for_person_mins` | 15 | a video waiting for a person (in review, for a manual download, or held for approval) longer than this is written to the Windows Event Log once (read as 1 to 1440) |
+
+The service writes to the Windows **Application** log (source `OmniIngestService`)
+when nobody has the panel open, once when a condition starts and once when it
+ends, never repeatedly: a health line turning red (Error, event id 3000; back
+to normal: Information, 1000), videos waiting for a person past
+`alerts.waiting_for_person_mins` (Warning, 2000; one entry naming them), and
+the mailbox not answering for 10 minutes (Error, 3000; answering again:
+Information, 1000). After a restart a condition that still holds is written
+once more. A console run (`omni-ingest.exe run`) writes these lines to its log
+file only.
 
 ### 5.4 LLM assist (optional)
 

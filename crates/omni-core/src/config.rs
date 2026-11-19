@@ -629,6 +629,26 @@ impl Default for RetryConfig {
     }
 }
 
+/// Alerts written to the Windows Event Log (`alerts` in config.json, P11.14).
+/// Old files without the section load with these defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsConfig {
+    /// A job waiting for a person (review, manual download, approval) longer
+    /// than this many minutes gets one Event Log warning (read as 1..=1440).
+    #[serde(default = "default_waiting_for_person_mins")]
+    pub waiting_for_person_mins: i64,
+}
+
+fn default_waiting_for_person_mins() -> i64 {
+    15
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self { waiting_for_person_mins: default_waiting_for_person_mins() }
+    }
+}
+
 /// Pacing of yt-dlp per video platform (`pacing` in config.json, P11.4). Old
 /// files without the section load with these defaults. Values are read where
 /// they are used, not checked at load.
@@ -884,6 +904,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub retry: RetryConfig,
 
+    /// Event Log alerts (P11.14).
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+
     /// yt-dlp paced per video platform (P11.4).
     #[serde(default)]
     pub pacing: PacingConfig,
@@ -1005,6 +1029,7 @@ impl Default for AppConfig {
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             retry: RetryConfig::default(),
+            alerts: AlertsConfig::default(),
             pacing: PacingConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),

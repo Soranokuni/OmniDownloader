@@ -748,6 +748,16 @@ enum Duplicate {
     Recent(i64),
 }
 
+/// A job that waits for a person (P11.14), and since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingForPerson {
+    pub id: i64,
+    pub slug: String,
+    /// `REQUIRES_REVIEW`, `MANUAL_DOWNLOAD` or `AWAITING_APPROVAL`.
+    pub status: String,
+    pub since: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
@@ -3786,6 +3796,37 @@ impl Repository {
             .context("could not finish the backup file")?;
         copy.close().map_err(|(_, e)| e).context("could not close the backup file")?;
         Ok(())
+    }
+
+    /// Jobs waiting for a person (P11.14): in review, for a manual download, or
+    /// held for approval, not cleared from the desk, with when they started
+    /// waiting (held: when the video was held; otherwise when the job ended
+    /// there). A row whose time cannot be read is left out. At most 500, the
+    /// longest waiting first.
+    pub fn jobs_waiting_for_person(&self) -> Result<Vec<WaitingForPerson>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT q.id, q.slug, q.status,
+                    CASE WHEN q.status = 'AWAITING_APPROVAL' THEN COALESCE(h.created_at, q.updated_at)
+                         ELSE COALESCE(q.completed_at, q.updated_at) END AS since
+               FROM queue q
+               LEFT JOIN held_outputs h ON h.job_id = q.id
+              WHERE q.status IN ('REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'AWAITING_APPROVAL')
+                AND q.cleared_at IS NULL
+              ORDER BY since ASC
+              LIMIT 500",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, slug, status, since) = row?;
+            if let Some(since) = since.as_deref().and_then(timestamps::parse) {
+                out.push(WaitingForPerson { id, slug, status, since });
+            }
+        }
+        Ok(out)
     }
 
     /// `PRAGMA quick_check` of the live database (P11.13): `["ok"]` when it
