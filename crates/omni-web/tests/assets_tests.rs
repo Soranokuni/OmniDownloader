@@ -379,12 +379,13 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
         ("desk.js", 15),
-        ("inbox.js", 21),
+        ("inbox.js", 22),
         ("approval.js", 10),
         ("notify.js", 11),
-        ("mcr.js", 47),
+        ("mcr.js", 48),
         ("status.js", 1),
-        ("status.css", 1),
+        ("status.css", 2),
+        ("worklist.js", 1),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -575,6 +576,89 @@ fn every_status_has_one_word_one_colour_and_a_mark_in_status_js() {
         let app = html.find("/static/app.css?v=").expect("links app.css");
         let status = html.find("/static/status.css?v=").unwrap_or_else(|| panic!("{page} does not link status.css"));
         assert!(app < status, "{page} links status.css before app.css, so app.css would win");
+    }
+}
+
+/// P12.2: the review tab is a work list grouped by what the operator has to do. «Για έγκριση»
+/// first (the approval section), then cookies, no video, manual download, other; a job that will
+/// retry by itself is not in it; one sentence why, one primary action, the rest folded, and the
+/// code and the tool's own words only under «Τεχνικές λεπτομέρειες».
+#[test]
+fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
+    use omni_broadcast::errors::ErrorCode;
+    let assets = all_assets();
+    let wl = assets.get("static/worklist.js").expect("worklist.js shipped");
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    let page = assets.get("mcr.html").expect("mcr.html shipped");
+
+    // The groups, in order, after the approval section.
+    let groups = wl.split("export const GROUPS = [").nth(1).and_then(|s| s.split("];").next()).expect("GROUPS");
+    let at = |label: &str| groups.find(label).unwrap_or_else(|| panic!("no group «{label}»"));
+    let order = ["Χρειάζεται σύνδεση (cookies)", "Δεν βρέθηκε βίντεο", "Χειροκίνητη λήψη", "Άλλο"].map(at);
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "the groups are not in the agreed order");
+    let review = page.find("id=\"tab-review\"").expect("review tab");
+    let approval = page[review..].find("id=\"approval-section\"").expect("approval section in the review tab");
+    let cards = page[review..].find("id=\"review-cards\"").expect("review cards");
+    assert!(approval < cards, "«Για έγκριση» is not the first group");
+
+    // Only what waits for a person; never a job that retries by itself.
+    let needs = wl.split("const NEEDS_YOU = [").nth(1).and_then(|s| s.split("];").next()).expect("NEEDS_YOU");
+    for status in ["'REQUIRES_REVIEW'", "'MANUAL_DOWNLOAD'", "'FAILED'"] {
+        assert!(needs.contains(status), "{status} is missing from the work list");
+    }
+    for status in ["PENDING", "RUNNING", "AWAITING_APPROVAL", "COMPLETED", "CANCELLED"] {
+        assert!(!needs.contains(status), "{status} would be in the work list");
+    }
+    // Every code the groups name is a real one (a typo would silently land in «Άλλο»).
+    for list in ["COOKIE_CODES", "NO_VIDEO_CODES", "MANUAL_CODES"] {
+        let body = wl.split(&format!("const {list} = [")).nth(1).and_then(|s| s.split("];").next()).expect(list);
+        for code in body.split(',').map(|c| c.trim().trim_matches('\'')).filter(|c| !c.is_empty()) {
+            assert!(ErrorCode::from_code(code).is_some(), "{list} names {code}, which is not an error code");
+        }
+    }
+    // The state decides before the code: a file-locker link is a manual download.
+    let group_of = wl.split("export function groupOf").nth(1).and_then(|s| s.split("\n}").next()).expect("groupOf");
+    let state = group_of.find("job.status === 'MANUAL_DOWNLOAD'").expect("groupOf does not look at the state");
+    assert!(state < group_of.find("includes(code)").unwrap(), "groupOf reads the code before the state");
+    // A job in the list never says it is being retried.
+    let why = wl.split("export function whyText").nth(1).and_then(|s| s.split("\n}").next()).expect("whyText");
+    assert!(why.contains("αυτόματη επανάληψη") && why.contains("STOPPED_TEXT"), "a stopped job can say it retries by itself");
+
+    // mcr.js: the list is grouped, still reconciled in place (P12.3), with the panels kept open.
+    assert!(mcr.contains("const jobs = inGroupOrder(data.jobs || []);"), "the review list is not grouped");
+    assert!(mcr.contains("heading: (job) => groupLabel(groupOf(job)) || null"), "the headings are not the groups");
+    assert!(!mcr.contains("dayHeading"), "the review list is still grouped by date");
+    let card = mcr.split("function reviewCard(job)").nth(1).and_then(|s| s.split("\n}\n").next()).expect("reviewCard");
+    assert!(card.contains("whyText(job)") && !card.contains("job.hint"), "the card does not use the one why-sentence");
+    assert!(card.contains("primaryOf(job)"), "the card has no primary action");
+    assert!(card.contains("keptDetails(moreOpen, job.id, 'wl-more', 'Περισσότερα'"), "no «Περισσότερα» that stays open");
+    let tech = card
+        .split("keptDetails(techOpen, job.id, 'tech', 'Τεχνικές λεπτομέρειες',")
+        .nth(1)
+        .and_then(|s| s.split("    : null;").next())
+        .expect("no «Τεχνικές λεπτομέρειες» that stays open on the card");
+    for (shown, field) in [("Κωδικός:", "job.error_code"), ("Αιτία:", "job.error_message")] {
+        assert!(tech.contains(shown) && tech.contains(field), "«Τεχνικές λεπτομέρειες» no longer shows {shown}");
+        assert_eq!(card.matches(shown).count(), 1, "{shown} is shown outside «Τεχνικές λεπτομέρειες»");
+    }
+
+    // Every button a hint names by «…» is on the card (or its history panel).
+    let history = mcr.split("function historyPanel(job)").nth(1).and_then(|s| s.split("\n}\n").next()).expect("historyPanel");
+    let panel = format!("{history}\n{card}");
+    let quoted = |text: &str| -> Vec<String> {
+        text.split('«').skip(1).filter_map(|s| s.split('»').next()).map(str::to_string).collect()
+    };
+    let mut hints: Vec<String> = ErrorCode::ALL.iter().map(|c| c.hint_el().to_string()).collect();
+    hints.push(omni_broadcast::errors::exhausted_hint_el(3));
+    hints.push(omni_broadcast::errors::LIVE_STREAM_EXHAUSTED_EL.to_string());
+    hints.extend(wl.lines().filter(|l| l.starts_with("const LOCKER_TEXT") || l.starts_with("const STOPPED_TEXT")).map(str::to_string));
+    for hint in &hints {
+        for name in quoted(hint) {
+            if name.starts_with('-') {
+                continue; // an example of a link's tail, not a button
+            }
+            assert!(panel.contains(&name), "a hint names «{name}», which the review card does not have:\n{hint}");
+        }
     }
 }
 

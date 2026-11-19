@@ -210,7 +210,7 @@ does.
 | On the card | Meaning |
 |---|---|
 | «Σε αναμονή» | waiting in the queue |
-| «Σε επεξεργασία» | being processed |
+| «Σε εξέλιξη» | being processed |
 | «Παραδόθηκε» | delivered to Dalet |
 | «Παραδόθηκε χειροκίνητα» | you marked it as put into Dalet by hand |
 | «Χρειάζεται έλεγχο» | stopped; the card says why |
@@ -232,6 +232,26 @@ does.
 | «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the Email tab) | use a link you pasted instead of the one found |
 | «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the Email tab the history shows under a selected card. |
 | «Τώρα» | in the «Καθυστερούν» strip: try now instead of waiting for the next retry (§4.9) |
+
+**The «Χρειάζονται έλεγχο» tab is a work list.** It holds only what waits for
+you, grouped by what you have to do, not by date:
+
+| Group | What you do first |
+|---|---|
+| «Για έγκριση» | watch the video and approve it (§4.5) |
+| «Χρειάζεται σύνδεση (cookies)» | paste another link for the same video; if it happens often with that site, ask the administrator for cookies |
+| «Δεν βρέθηκε βίντεο» | paste the link of the video itself, or remove the card |
+| «Χειροκίνητη λήψη» | download the file by hand, put it into Dalet and press «Το έβαλα στο Dalet» |
+| «Άλλο» | usually «Δοκιμή ξανά»; the card says what to do |
+
+Each card says in one sentence why the video waits, and shows one main
+action. Everything else («Δοκιμή ξανά», «Το έβαλα στο Dalet», «Μετονομασία…»,
+«Αφαίρεση», «Ιστορικό», another link) is under **«Περισσότερα»**. The error
+code and the tool's own message are under **«Τεχνικές λεπτομέρειες»**, for
+support. When a delivery was interrupted (`DELIVERY_UNCONFIRMED`) the main
+action is «Το έβαλα στο Dalet»: check Dalet first, so the video does not go
+in twice. A video the system will try again by itself is not in this list;
+it is on «Σε εξέλιξη».
 
 ### 4.5 Approvals
 
@@ -293,7 +313,7 @@ Each row has the file name, «Επείγον» for an urgent video, the reason, 
 | «Περιμένει τον φάκελο παράδοσης» | the video is ready, but the Dalet watchfolder does not answer; it is delivered by itself when it does (§4.10) |
 | «Νέα προσπάθεια στις HH:MM · …» | an automatic retry at that time, followed by the reason in Greek |
 | «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» | the link is still a live broadcast; it is checked again at that time. Listed whatever its age. |
-| «Σε επεξεργασία · στο τρέχον βήμα εδώ και N′» | being processed, N minutes on its current step |
+| «Σε εξέλιξη · στο τρέχον βήμα εδώ και N′» | being processed, N minutes on its current step |
 | «Σε αναμονή στη σειρά» | waiting for its turn in the queue |
 
 **«Τώρα»** (now), on a retry or live-broadcast row, makes the system try at

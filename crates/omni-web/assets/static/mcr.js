@@ -22,7 +22,8 @@ import {
   canRename, renameJob as deskRename, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
 } from '/static/desk.js?v=15';
 import { STATUS, statusBadge } from '/static/status.js?v=1';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=21';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=1';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=22';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=11';
 import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=10';
 
@@ -285,7 +286,8 @@ function setStatus(prefix, text, dotClass, title) {
 /** Page state per list. */
 const pages = {
   live: { page: 1, perPage: 15 },
-  review: { page: 1, perPage: 20 },
+  // The work list is grouped within a page (P12.2): one page holds a normal day's work.
+  review: { page: 1, perPage: 100 },
   approval: { page: 1, perPage: 100 },
   completed: { page: 1, perPage: 25 },
 };
@@ -568,7 +570,7 @@ document.getElementById('clear-finished').addEventListener('click', async (event
  * Needs attention
  * ------------------------------------------------------------------ */
 
-/* The review tab's own filters, tidy-up and day headings (P7.21). */
+/* The review tab's own filters and tidy-up (P7.21); its groups are worklist.js's (P12.2). */
 const reviewJournalist = document.getElementById('review-journalist');
 const reviewSearch = document.getElementById('review-search');
 const reviewShowHidden = document.getElementById('review-show-hidden');
@@ -612,19 +614,6 @@ document.getElementById('hide-old-review').addEventListener('click', async () =>
     refresh();
   } catch (e) { toast(e.message, 'bad'); }
 });
-
-/* Cards in order, with a small heading before the first of each local day of
- * `updated_at` (same look as the Email tab's day headers). */
-function dayHeading(at) {
-  const d = new Date(at);
-  if (Number.isNaN(d.getTime())) return null;
-  const now = new Date();
-  const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-  if (sameDay(d, now)) return 'Σήμερα';
-  if (sameDay(d, new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) return 'Χθες';
-  const long = d.toLocaleDateString('el-GR', { weekday: 'long', day: 'numeric', month: 'long' });
-  return long.charAt(0).toLocaleUpperCase('el-GR') + long.slice(1);
-}
 
 /* Keyed lists (P12.3). The lists refresh every 5 s; rebuilding every card
  * threw away what an operator was typing, the focus and the open panels. Each
@@ -702,25 +691,42 @@ function reconcileChildren(host, wanted) {
 }
 
 /** Show `jobs` in `host`, one keyed node each (`build(job)`), reusing the node
- *  of every job whose `sig(job)` is unchanged. With `headings`, a small day
- *  heading precedes the first job of each local day of `updated_at`. */
-function syncKeyedList(list, host, jobs, { build, sig, headings = false }) {
+ *  of every job whose `sig(job)` is unchanged. With `heading(job)` (a label,
+ *  or null), a small heading precedes the first job of each run of one label;
+ *  `headingText(label, n)` words it, with `n` the jobs under it. */
+function syncKeyedList(list, host, jobs, { build, sig, heading = null, headingText = (label) => label }) {
   if (!host) return;
   const wanted = [];
   const restores = [];
   const seen = new Set();
   const days = new Map();
   const dayCount = new Map();
+  const runs = new Map();
+  if (heading) {
+    let prev;
+    let key;
+    for (const job of jobs) {
+      const label = heading(job);
+      if (label && label !== prev) {
+        key = `${label}#${(runs.get(`${label}#`) || 0)}`;
+        runs.set(`${label}#`, (runs.get(`${label}#`) || 0) + 1);
+      }
+      if (label) runs.set(key, (runs.get(key) || 0) + 1);
+      prev = label;
+    }
+  }
   let day;
   for (const job of jobs) {
-    if (headings) {
-      const label = job.updated_at ? dayHeading(job.updated_at) : null;
+    if (heading) {
+      const label = heading(job);
       if (label && label !== day) {
-        // Counted, so a day that comes back later in the list gets its own node.
+        // Counted, so a label that comes back later in the list gets its own node.
         const n = dayCount.get(label) || 0;
         dayCount.set(label, n + 1);
         const key = `${label}#${n}`;
-        const node = list.days.get(key) || el('div', { class: 'ib-day' }, label);
+        const node = list.days.get(key) || el('h2', { class: 'wl-group' });
+        const text = headingText(label, runs.get(key) || 0);
+        if (node.textContent !== text) node.textContent = text;
         days.set(key, node);
         wanted.push(node);
       }
@@ -769,24 +775,28 @@ async function loadReview() {
     data = await fetchPage('review', extra);
   } catch (e) { failed(e); return; }
   showCounts(data.counts);
-  const jobs = data.jobs || [];
-  // Forget the history of jobs that left the page; keep the rest.
+  // Grouped by what the operator has to do (P12.2); a job that will retry by
+  // itself is not in this list.
+  const jobs = inGroupOrder(data.jobs || []);
+  // Forget the history and the open panels of jobs that left the page; keep the rest.
   const here = new Set([...jobs.map((j) => j.id), ...approvalIds()]);
-  for (const id of [...historyState.keys(), ...historyBox.keys(), ...historyOpen, ...historyTech]) {
+  for (const id of [...historyState.keys(), ...historyBox.keys(), ...historyOpen, ...historyTech, ...moreOpen, ...techOpen]) {
     if (here.has(id)) continue;
     historyState.delete(id); historyBox.delete(id); historyOpen.delete(id); historyTech.delete(id);
+    moreOpen.delete(id); techOpen.delete(id);
   }
   if (jobs.length === 0) {
     const filtered = reviewSearch.value.trim() || reviewJournalist.value;
     reviewList.cards.clear();
     reviewList.days.clear();
     render('review-cards', el('div', { class: 'card center' },
-      filtered ? 'Κανένα βίντεο δεν ταιριάζει με την αναζήτηση.' : 'Δεν υπάρχει κάτι για έλεγχο.'));
+      filtered ? 'Κανένα βίντεο δεν ταιριάζει με την αναζήτηση.' : 'Δεν υπάρχει κάτι που να περιμένει εσάς.'));
   } else {
     syncKeyedList(reviewList, document.getElementById('review-cards'), jobs, {
       build: reviewCard,
       sig: (job) => JSON.stringify(job),
-      headings: true,
+      heading: (job) => groupLabel(groupOf(job)) || null,
+      headingText: (label, n) => `${label} · ${n}`,
     });
     for (const id of historyOpen) restoreHistoryScroll(id);
   }
@@ -877,25 +887,80 @@ function historyPanel(job) {
   return [toggle, box];
 }
 
+/* The «Περισσότερα» and «Τεχνικές λεπτομέρειες» panels a person opened, by
+ * job id: a card rebuilt by the 5 s refresh opens them again (P12.3). */
+const moreOpen = new Set();
+const techOpen = new Set();
+
+/** A `<details>` whose open state lives in `set` under the job's id. */
+function keptDetails(set, id, cls, summary, ...body) {
+  const node = el('details', { class: cls }, el('summary', {}, summary), ...body);
+  if (set.has(id)) node.open = true;
+  node.addEventListener('toggle', () => { if (node.open) set.add(id); else set.delete(id); });
+  return node;
+}
+
+/**
+ * A card of the work list (P12.2): why it waits, in one sentence; one
+ * primary action; everything else under «Περισσότερα»; the code and the
+ * tool's own (English) words under «Τεχνικές λεπτομέρειες».
+ */
 function reviewCard(job) {
-  const input = el('input', {
-    type: 'url',
-    class: 'mono',
-    id: `override-${job.id}`,
-    value: job.url,
-  });
-  // Enter in the field does what the button beside it does.
-  input.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.isComposing) return;
-    event.preventDefault();
-    overrideJob(job, input.value);
-  });
   const href = safeHref(job.url);
   const locker = job.status === 'MANUAL_DOWNLOAD';
+  const primary = primaryOf(job);
   const history = historyPanel(job);
 
-  return el('div', { class: 'card attention stack' },
-    el('div', { class: 'job-head', style: 'border-bottom:1px solid var(--line);padding-bottom:12px' },
+  // Another link for the same video: the primary action of the cookies and
+  // no-video groups, otherwise under «Περισσότερα». A file-locker link has none.
+  const overrideForm = () => {
+    const input = el('input', { type: 'url', class: 'mono', id: `override-${job.id}`, value: job.url });
+    // Enter in the field does what the button beside it does.
+    input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.isComposing) return;
+      event.preventDefault();
+      overrideJob(job, input.value);
+    });
+    return el('div', { class: 'wl-override' },
+      el('label', { for: `override-${job.id}` },
+        'Επικολλήστε άλλον σύνδεσμο για το ίδιο βίντεο (την ίδια την ανάρτηση, ή απευθείας σύνδεσμο .mp4 / .m3u8):'),
+      el('div', { class: 'row' },
+        el('div', { class: 'grow' }, input),
+        el('button', {
+          class: primary === 'override' ? 'btn btn-primary' : 'btn btn-warn',
+          type: 'button',
+          onClick: () => overrideJob(job, input.value),
+        }, 'Χρήση αυτού του συνδέσμου')));
+  };
+  const retry = (cls) => el('button', { class: cls, type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά');
+  const markDone = (cls) => el('button', { class: cls, type: 'button', onClick: () => markDoneJob(job) }, 'Το έβαλα στο Dalet');
+
+  let main;
+  if (primary === 'override' && !locker) main = overrideForm();
+  else if (primary === 'markdone' || locker) main = el('div', { class: 'row' }, markDone('btn btn-primary'));
+  else main = el('div', { class: 'row' }, retry('btn btn-primary'));
+
+  const more = keptDetails(moreOpen, job.id, 'wl-more', 'Περισσότερα',
+    el('div', { class: 'row' },
+      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
+      !locker && primary !== 'retry' ? retry('btn') : null,
+      primary !== 'markdone' && !locker ? markDone('btn') : null,
+      canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, 'Μετονομασία…') : null,
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
+      history[0]),
+    history[1],
+    !locker && primary !== 'override' ? overrideForm() : null);
+
+  const tech = job.error_code || (job.error_message && job.error_message !== job.error_code)
+    ? keptDetails(techOpen, job.id, 'tech', 'Τεχνικές λεπτομέρειες',
+      job.error_code ? el('p', { class: 'mono' }, `Κωδικός: ${job.error_code}`) : null,
+      job.error_message && job.error_message !== job.error_code
+        ? el('p', { class: 'mono wl-cause' }, `Αιτία: ${job.error_message}`)
+        : null)
+    : null;
+
+  return el('div', { class: 'card attention stack', 'data-job': String(job.id) },
+    el('div', { class: 'job-head' },
       el('div', { class: 'row', style: 'gap:10px;align-items:flex-start' },
         el('span', { class: 'job-id' }, String(job.id)),
         el('div', {},
@@ -911,41 +976,10 @@ function reviewCard(job) {
         statusBadge(job),
       ),
     ),
-    el('div', { class: 'reason' },
-      el('strong', { style: 'display:block' }, job.hint
-        || (locker
-          ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet, και πατήστε «Το έβαλα στο Dalet».'
-          : 'Το βίντεο δεν ελήφθη αυτόματα.')),
-      job.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${job.error_code}`) : null,
-      job.error_message && job.error_message !== job.error_code
-        ? el('p', {
-          class: 'note mono',
-          title: job.error_message,
-          style: 'margin:4px 0 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere',
-        }, `Αιτία: ${job.error_message}`)
-        : null,
-    ),
-    el('div', { class: 'row' },
-      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
-      locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά'),
-      el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(job) }, 'Το έβαλα στο Dalet'),
-      canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, 'Μετονομασία…') : null,
-      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
-      history[0],
-    ),
-    history[1],
-    locker ? null : el('div', {},
-      el('label', { for: `override-${job.id}` },
-        'Ή επικολλήστε άλλον σύνδεσμο για το ίδιο βίντεο (την ίδια την ανάρτηση, ή απευθείας σύνδεσμο .mp4 / .m3u8):'),
-      el('div', { class: 'row' },
-        el('div', { class: 'grow' }, input),
-        el('button', {
-          class: 'btn btn-warn',
-          type: 'button',
-          onClick: () => overrideJob(job, input.value),
-        }, 'Χρήση αυτού του συνδέσμου'),
-      ),
-    ),
+    el('p', { class: 'wl-why' }, whyText(job)),
+    main,
+    more,
+    tech,
   );
 }
 

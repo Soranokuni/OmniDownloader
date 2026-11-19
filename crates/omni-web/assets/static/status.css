@@ -4,7 +4,9 @@
  * app.css already colours ok, info, warn and bad; this adds what the one
  * vocabulary needs on top: approval violet wherever it shows, a cancelled
  * job that no longer looks like a waiting one, and the mark beside a colour.
- * Loaded after app.css by the pages that show job statuses.
+ * Loaded after app.css by the pages that show job statuses. Also holds the
+ * desk's work-list rules (P12.2) until both fold into app.css with its next
+ * version bump.
  */
 
 .badge .mark { margin-right: 5px; font-weight: 700; }
@@ -33,3 +35,20 @@
 .legend i.approval { background: var(--busy); color: #1a0f3a; }
 .legend i.off  { border: 1px dashed #3a4762; color: var(--text-dim); }
 .legend i.skip { min-width: 14px; }
+
+/* The review tab as a work list (plan P12.2, worklist.js): a heading per
+ * group, one sentence saying why, one primary action, the rest folded. */
+.wl-group {
+  margin: 18px 2px 4px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+#review-cards > .wl-group:first-child { margin-top: 4px; }
+.wl-why { margin: 0; font-size: 14px; font-weight: 600; color: var(--warn); line-height: 1.45; }
+.wl-override label { margin-bottom: 6px; }
+.wl-more > summary,
+.card .tech > summary { cursor: pointer; color: var(--text-dim); font-size: 13px; }
+.wl-more > .row,
+.wl-more > .wl-override { margin-top: 10px; }
+.card .tech p { margin: 6px 0 0; font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; }

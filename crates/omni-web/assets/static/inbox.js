@@ -25,6 +25,7 @@ import {
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
 } from '/static/status.js?v=1';
+import { whyText } from '/static/worklist.js?v=1';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -858,9 +859,8 @@ function moreNode(j, sel) {
   if (needsAttention(j)) {
     const locker = j.status === 'MANUAL_DOWNLOAD';
     box.append(el('div', { class: `jc-hint ${j.status === 'FAILED' ? 'bad' : ''}`.trim() },
-      el('strong', {}, j.hint || (locker
-        ? 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο και ρίξτε το στο Dalet, και πατήστε «Το έβαλα στο Dalet».'
-        : 'Το βίντεο δεν παραδόθηκε αυτόματα.')),
+      // The same sentence as the review tab's card: by state as well as code (P12.2).
+      el('strong', {}, whyText(j)),
       j.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${j.error_code}`) : null));
     // What fixes it is always there; opening and removing it, once the
     // card is selected, so a mail with many failures stays readable.
