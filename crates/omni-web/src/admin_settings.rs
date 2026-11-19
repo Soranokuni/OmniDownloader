@@ -371,7 +371,7 @@ fn probe_watchfolder_blocking(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The trimmed path as the rules of `/api/setup` read it: judged after it is
+/// The trimmed path as the watchfolder rules read it: judged after it is
 /// resolved against the install folder, so the default `watchfolder` passes.
 async fn judged_watchfolder(state: &AppState, raw: &str) -> Result<(String, std::path::PathBuf), String> {
     let watch = raw.trim().to_string();
@@ -600,7 +600,9 @@ async fn check_pkcs12(path: std::path::PathBuf, password: String) -> Result<(), 
         let bytes = std::fs::read(&path).map_err(|e| format!("The TLS certificate {} cannot be read: {e}", path.display()))?;
         native_tls::Identity::from_pkcs12(&bytes, &password).map(|_| ()).map_err(|_| {
             format!(
-                "{} does not open as a PKCS#12 certificate with that passphrase. It must be a .pfx/.p12 file                  holding the certificate and its private key (not a .cer or .pem), and the passphrase must be right.                  Nothing was saved.",
+                "{} does not open as a PKCS#12 certificate with that passphrase. It must be a .pfx/.p12 file \
+                 holding the certificate and its private key (not a .cer or .pem), and the passphrase must be right. \
+                 Nothing was saved.",
                 path.display()
             )
         })

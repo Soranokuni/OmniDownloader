@@ -64,8 +64,13 @@ enum Commands {
     Run,
     /// Run as Windows Service entry point (invoked by Windows SCM)
     RunService,
-    /// Run the interactive CLI setup wizard
-    Setup,
+    /// Apply an answer file (Admin → Setup → Download answer file) to this
+    /// installation's config.json. The interactive setup is the wizard on /admin.
+    Setup {
+        /// The answer file (omni-answers.json)
+        #[arg(long)]
+        answer: std::path::PathBuf,
+    },
     /// Install (or upgrade) from this release folder: copy to the install
     /// directory, register and start the Windows service, check it answers
     Install {
@@ -237,6 +242,14 @@ enum AdminAction {
     /// Set a new password for an account (prompted, never on the command
     /// line) and end all of its sessions
     ResetPassword { email: String },
+    /// Create an administrator when none can sign in (the password is prompted
+    /// twice, never on the command line). Refused while an active administrator
+    /// exists, unless --force
+    CreateAdmin {
+        username: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Sign an account out and refuse its sign-in until reactivated
     Deactivate { email: String },
     /// Let a deactivated account sign in again
@@ -835,8 +848,10 @@ async fn main() -> Result<()> {
                 rt.shutdown_timeout(Duration::from_secs(20));
             })?;
         }
-        Some(Commands::Setup) => {
-            omni_cli::run_setup_wizard(Some(&cli.config)).await?;
+        Some(Commands::Setup { answer }) => {
+            for line in omni_cli::apply_answer_file(&paths, &answer)? {
+                println!("{line}");
+            }
         }
         Some(Commands::Install { .. } | Commands::Uninstall { .. }) => unreachable!("handled before paths"),
         Some(Commands::Service { action }) => {
@@ -1024,6 +1039,7 @@ async fn main() -> Result<()> {
             let sub = match action {
                 AdminAction::ListUsers => omni_cli::AdminSubcommand::ListUsers,
                 AdminAction::ResetPassword { email } => omni_cli::AdminSubcommand::ResetPassword { email },
+                AdminAction::CreateAdmin { username, force } => omni_cli::AdminSubcommand::CreateAdmin { username, force },
                 AdminAction::Deactivate { email } => omni_cli::AdminSubcommand::SetActive { email, active: false },
                 AdminAction::Activate { email } => omni_cli::AdminSubcommand::SetActive { email, active: true },
             };
@@ -1159,8 +1175,9 @@ async fn run_daemon(
     }
     if !repo.has_active_admin().unwrap_or(true) {
         warn!(
-            "No administrator account exists. Open http://127.0.0.1:{}/setup from this machine, \
-             or run `omni-ingest setup`, to create one.",
+            "No active administrator account exists. See `omni-ingest admin list-users`, then \
+             `omni-ingest admin activate <login>` and `omni-ingest admin reset-password <login>` \
+             (or `omni-ingest admin create-admin <login>` when there is none), and sign in at http://127.0.0.1:{}/admin.",
             config.web_port
         );
     }

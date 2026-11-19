@@ -171,7 +171,7 @@ configure the network for MCR desks (§5.1) and optionally the LLM (§5.4).
 
 ### 2.1a The watchfolder and its share
 
-Use the share's `\\server\share` path, never a mapped drive letter: a mapping belongs to your Windows session and the service cannot see it. The installer, the setup page and the health page refuse a mapped letter. They show the exact path to use wherever the mapping can be resolved: an elevated installer cannot see your desktop's drives, so it reads the mapping your Windows account remembers; the service itself cannot, and then only says that the letter is not usable and asks for the `\\server\share` path.
+Use the share's `\\server\share` path, never a mapped drive letter: a mapping belongs to your Windows session and the service cannot see it. The installer, the setup wizard and the health page refuse a mapped letter. They show the exact path to use wherever the mapping can be resolved: an elevated installer cannot see your desktop's drives, so it reads the mapping your Windows account remembers; the service itself cannot, and then only says that the letter is not usable and asks for the `\\server\share` path.
 
 Share permissions:
 
@@ -214,7 +214,7 @@ The wizard tells you after each save, and again on the last screen, when a resta
 
 **Running it again.** The Admin page has a **Setup** card with **Run setup wizard again**. The account step is skipped when the first-run account no longer exists. The settings the wizard writes are also available on their own, to an administrator, at `GET /api/admin/settings` and the `POST /api/admin/settings/...` routes the screens use.
 
-**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation, and Setup reads it back for a new installation with `/answer` (§2.4).
+**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation, and Setup reads it back for a new installation with `/answer` (§2.4); on an installed machine, `omni-ingest setup --answer <file>` applies it to the existing `config.json` (§9). The wizard is the only interactive setup: there is no separate setup page.
 
 ### 2.1c What Setup refuses
 
@@ -874,10 +874,11 @@ Run from the install folder (elevated on an installed service).
 | `omni-ingest run [--config <file>]` | run in a console window instead of as a service |
 | `omni-ingest install …` / `uninstall` | what `Install.cmd` / `Uninstall.cmd` call (§2.5) |
 | `omni-ingest service install\|start\|stop\|status\|uninstall` | the Windows service |
-| `omni-ingest setup` | interactive setup wizard |
+| `omni-ingest setup --answer <file>` | apply an answer file (§2.1b) to this installation's `config.json`, by Setup's rules; the old file is kept as `config.json.prev`. No secrets; restart the service afterwards. The interactive setup is the wizard on `/admin` |
 | `omni-ingest admin list-users` | list accounts |
 | `omni-ingest admin reset-password <email>` | new password (prompted), signs the user out |
 | `omni-ingest admin activate\|deactivate <email>` | enable / disable an account |
+| `omni-ingest admin create-admin <username> [--force]` | create an administrator when none can sign in (password prompted twice, never shown or logged); refused while an active administrator exists unless `--force` |
 | `omni-ingest secrets list\|set <key>\|clear <key>` | the secret store (values prompted, never shown) |
 | `omni-ingest cookies sign-in <domain> [--browser edge\|chrome]` | sign in once and store the site's cookies |
 | `omni-ingest cookies list` | the cookie jars (no contents) |
@@ -969,6 +970,7 @@ may go back to the queue on its own: the second chance of §5.3
 | Symptom | Check |
 |---|---|
 | Panel does not open | service running (`omni-ingest service status`), firewall, port |
+| No administrator can sign in | on the server, in an elevated terminal: `omni-ingest admin list-users`, then `admin reset-password` or `admin activate`; if there is no administrator account at all, `omni-ingest admin create-admin <username>` |
 | Nothing arrives from mail | `mail` health line; **Admin → Mailbox → Test mailbox**; the client secret has not expired in Entra ID |
 | YouTube LOGIN_REQUIRED | update yt-dlp (**Download engine**); if it persists, add `youtube.com` cookies |
 | X / Instagram posts fail | upload that site's cookies and **Test** |

@@ -267,7 +267,6 @@ const MATRIX: &[Row] = &[
             (Admin, NotFound),
         ],
     ),
-    ("GET", "/api/setup/state", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/login", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/logout", &[(Anonymous, Reached)]),
     // `/` always answers, but with a redirect that depends on the caller; it
@@ -1012,8 +1011,8 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
-    // ---- First-run only. With an admin present this is a 404 for everyone
-    //      who is not one, including a loopback client.
+    // ---- The first-run page and its endpoints are gone (P13.3): a 404 for
+    //      everyone, an administrator and a loopback client included.
     (
         "GET",
         "/setup",
@@ -1022,7 +1021,8 @@ const MATRIX: &[Row] = &[
             (Loopback, NotFound),
             (AllowlistedIp, NotFound),
             (Caller::User, NotFound),
-            (Admin, Reached),
+            (Mcr, NotFound),
+            (Admin, NotFound),
         ],
     ),
     (
@@ -1034,7 +1034,13 @@ const MATRIX: &[Row] = &[
             (AllowlistedIp, NotFound),
             (Caller::User, NotFound),
             (Mcr, NotFound),
+            (Admin, NotFound),
         ],
+    ),
+    (
+        "GET",
+        "/api/setup/state",
+        &[(Anonymous, NotFound), (Loopback, NotFound), (Admin, NotFound)],
     ),
     // ---- Static assets carry no data ----
     ("GET", "/static/app.css", &[(Anonymous, Reached)]),
@@ -1103,8 +1109,8 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
                     !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
                     "{route}: the default session must reach it, got {status}"
                 );
-            } else if *uri == "/api/setup" {
-                // Closed for this session, as for anyone once an admin exists.
+            } else if matches!(*uri, "/api/setup" | "/api/setup/state") {
+                // Removed (P13.3): nothing answers there, for anyone.
                 assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
             } else if uri.starts_with("/api/") {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
@@ -1112,7 +1118,7 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
                 refused_api += 1;
             } else {
                 // Pages: the admin page is served (it shows the change form), the
-                // first-run page is closed, everything else bounces.
+                // removed first-run page is a 404, everything else bounces.
                 match *uri {
                     "/admin" => assert_eq!(status, StatusCode::OK, "{route}"),
                     "/setup" => assert_eq!(status, StatusCode::NOT_FOUND, "{route}"),
@@ -1196,7 +1202,7 @@ async fn w01_anonymous_callers_cannot_repoint_the_watchfolder() -> Result<()> {
         assert_eq!(
             res.status(),
             StatusCode::NOT_FOUND,
-            "{caller:?} must not reach /api/setup once an admin exists"
+            "{caller:?} must not reach /api/setup: the route is gone (P13.3)"
         );
     }
 
@@ -1205,61 +1211,31 @@ async fn w01_anonymous_callers_cannot_repoint_the_watchfolder() -> Result<()> {
     Ok(())
 }
 
+/// P13.3: a database with no administrator has no first-run page, not even from this
+/// machine. The way in is the first-run account the daemon creates on a new database,
+/// which signs in from this machine only; the wizard on /admin takes it from there.
 #[tokio::test]
-async fn the_first_run_window_is_loopback_only_and_closes_once_an_admin_exists() -> Result<()> {
+async fn a_new_database_has_no_setup_page_and_the_first_run_account_is_the_way_in() -> Result<()> {
     let h = Harness::new(false)?;
     assert!(!h.repo.has_active_admin()?);
+    for caller in [Loopback, AllowlistedIp, Anonymous] {
+        assert_eq!(h.request("GET", "/setup", caller).await, StatusCode::NOT_FOUND, "{caller:?}");
+        assert_eq!(h.request("POST", "/api/setup", caller).await, StatusCode::NOT_FOUND, "{caller:?}");
+    }
 
-    // A caller on the newsroom subnet cannot claim the first admin account,
-    // even though `mcr_open_networks` covers them: an allowlisted IP is a
-    // statement about a room, not an authorisation to administer the station.
-    assert_eq!(
-        h.request("GET", "/setup", AllowlistedIp).await,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        h.request("GET", "/setup", Anonymous).await,
-        StatusCode::NOT_FOUND
-    );
-    // From the machine itself, it is open.
-    assert_eq!(h.request("GET", "/setup", Loopback).await, StatusCode::OK);
-
-    // Claim it.
-    let payload = serde_json::json!({
-        "graph_tenant_id": "",
-        "graph_client_id": "",
-        "graph_mailbox": "ingest@station.gr",
-        "graph_client_secret": "",
-        "ollama_endpoint": "http://localhost:11434/v1",
-        "ollama_model": "gemma",
-        "watchfolder_path": "C:/watch",
-        "admin_email": "it@station.gr",
-        "admin_password": "correct-horse-battery",
-        "admin_full_name": "Administrator"
-    });
-    let res = h
-        .router
-        .clone()
-        .layer(MockConnectInfo(LOOPBACK.parse::<SocketAddr>().unwrap()))
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/setup")
-                .header("content-type", "application/json")
-                .header("x-omni-request", "1")
-                .header("host", "127.0.0.1:8080")
-                .header("origin", "http://127.0.0.1:8080")
-                .body(Body::from(payload.to_string()))?,
-        )
-        .await?;
-    assert_eq!(res.status(), StatusCode::OK);
-    assert!(h.repo.has_active_admin()?);
-
-    // The window is now shut, for loopback too.
-    assert_eq!(
-        h.request("GET", "/setup", Loopback).await,
-        StatusCode::NOT_FOUND
-    );
+    // What the daemon does at start on a database with no users and no history.
+    let dir = TempDir::new()?;
+    let fresh = Repository::new(dir.path().join("omni.db"))?;
+    assert!(fresh.ensure_default_admin()?, "a brand-new database gets the first-run account");
+    // ...which is how the harness below starts.
+    let h = Harness::with_default_admin()?;
+    let login = r#"{"email":"admin","password":"Admin"}"#;
+    let (status, body) = h.request_full("POST", "/api/auth/login", Loopback, login).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(r#""password_change_required":true"#), "{body}");
+    // From the newsroom network it is refused like a wrong password.
+    let (status, _) = h.request_full("POST", "/api/auth/login", AllowlistedIp, login).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     Ok(())
 }
 

@@ -396,6 +396,8 @@ async fn advanced_settings_are_validated_and_say_what_needs_a_restart() -> Resul
     let r = post(json!({"tls_cert_path": pfx.to_string_lossy(), "tls_password": "pfx-pass-9"})).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
     assert!(!r.body.contains("pfx-pass-9"));
+    // P13.3: one sentence after another, not a run of source indentation.
+    assert!(r.body.contains("PKCS#12") && !r.body.contains("  "), "{}", r.body);
     assert!(app.state.secrets.get(omni_core::secrets::keys::TLS_PASSWORD)?.is_none(), "a refused passphrase must not be stored");
     assert!(app.state.config.read().await.tls.cert_path.is_none(), "a refused certificate must not be saved");
     assert!(!std::fs::read_to_string(app.dir.path().join("config.json"))?.contains("site.pfx"));

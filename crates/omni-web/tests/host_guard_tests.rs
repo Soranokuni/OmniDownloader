@@ -65,6 +65,9 @@ async fn a_foreign_host_gets_421_on_get_and_post_and_the_body_names_the_key() {
     let (s, body) = send(&r, "GET", "/api/jobs", OTHER, &[("host", "evil.example")]).await;
     assert_eq!(s, StatusCode::MISDIRECTED_REQUEST);
     assert!(body.contains("security.allowed_hosts"), "body: {body}");
+    // P13.3: the form field that edits it, not config.json.
+    assert!(body.contains("Allowed host names") && body.contains("Run setup wizard again"), "body: {body}");
+    assert!(!body.contains("config.json"), "body: {body}");
     assert!(!body.contains("evil.example"), "the refused host is not echoed");
 
     // Even from loopback (the DNS-rebinding case: the peer is the victim's browser).

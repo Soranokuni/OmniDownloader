@@ -508,14 +508,14 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v31_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v31_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
     assert!(admin.contains("/static/admin.js?v=31"), "admin.html does not import admin.js?v=31");
     assert!(!admin.contains("/static/admin.js?v=30"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
-    assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
-    assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
+    assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
+    assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
 
     let js = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(js.contains("password_change_required"), "admin.js ignores the first-run flag");
@@ -544,6 +544,19 @@ fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
     assert!(code.contains("No finished jobs in this period yet."));
     assert!(code.contains("Queued by MCR from an offer or a skipped link"));
     assert!(!code.contains("innerHTML"));
+}
+
+/// P13.3: the wizard is the one setup path. No first-run page ships, and nothing
+/// points at one or at the endpoints it used.
+#[test]
+fn no_first_run_page_ships_and_nothing_points_at_it() {
+    let assets = all_assets();
+    assert!(!assets.contains_key("setup.html") && !assets.contains_key("static/setup.js"));
+    for (name, text) in &assets {
+        for gone in ["/setup\"", "/setup'", "<strong>/setup</strong>", "/api/setup/state", "'/api/setup'", "setup-hint"] {
+            assert!(!text.contains(gone), "{name} still mentions {gone}");
+        }
+    }
 }
 
 /// P11.11c/d: the wizard and the admin's Mailbox card both ask for the secret's

@@ -847,9 +847,9 @@ impl Repository {
         // credentials on a box that can repoint the playout watchfolder is not
         // a convenience, it is a back door, and nothing ever removed it.
         //
-        // First run is instead: `omni-ingest setup`, or `/setup` served to a
-        // loopback client while no admin exists. Once an admin exists, that
-        // window closes.
+        // First run is instead the daemon's `Admin` / `Admin` account on a brand-new
+        // database (`ensure_default_admin`), which signs in only from this machine
+        // and is replaced by the setup wizard (P13.3: there is no /setup page).
         let admin_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1",
             [],
@@ -857,9 +857,9 @@ impl Repository {
         )?;
         if admin_count == 0 {
             warn!(
-                "No administrator account exists. Run `omni-ingest setup`, or open /setup in a \
-                 browser ON THIS MACHINE, to create one. Until then the panels cannot be \
-                 administered."
+                "No active administrator account exists yet. A new installation gets the \
+                 first-run account when the service starts; otherwise reactivate one with \
+                 `omni-ingest admin activate <login>`. Until then the panels cannot be administered."
             );
         }
 
@@ -3939,10 +3939,8 @@ impl Repository {
 
     /// Whether any active administrator exists.
     ///
-    /// The `/setup` first-run window is open exactly while this is false, so it
-    /// is asked on every request to that route rather than cached: an admin
-    /// created through the CLI while the daemon runs must close the window
-    /// immediately, without a restart.
+    /// Asked, not cached: an account reactivated from the command line while the
+    /// daemon runs counts at once.
     pub fn has_active_admin(&self) -> Result<bool> {
         let conn = self.pool.get()?;
         let count: i64 = conn.query_row(

@@ -284,8 +284,9 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe run
 
 # first run: open http://127.0.0.1:8080/admin from this machine and sign in
-# as Admin / Admin (the setup wizard opens), or use the console wizard
-.\target\release\omni-ingest.exe setup
+# as Admin / Admin (the setup wizard opens); or apply an answer file exported
+# from another installation (Admin → Setup → Download answer file)
+.\target\release\omni-ingest.exe setup --answer omni-answers.json
 
 # what the daemon made of each mail; read one again on its next poll
 .\target\release\omni-ingest.exe mail-history
@@ -374,8 +375,8 @@ source; IMAP support has been removed.
    .\target\release\omni-ingest.exe secrets set graph.client_secret
    ```
 
-   Or use `/setup` in the browser, which stores the secret the same way, then
-   **Test mailbox** on `/admin`.
+   Or enter it in the setup wizard's Mail step, or the **Mailbox** card on
+   `/admin`, which store it the same way and use it from the next mail check.
 
    For a console or development run you can instead set `OMNI_GRAPH_TENANT_ID`,
    `OMNI_GRAPH_CLIENT_ID`, `OMNI_GRAPH_MAILBOX` and `OMNI_GRAPH_CLIENT_SECRET`

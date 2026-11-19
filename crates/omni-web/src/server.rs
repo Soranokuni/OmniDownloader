@@ -40,10 +40,8 @@ impl WebServer {
             .route("/metrics", get(crate::scrape::api_metrics))
             .route("/api/auth/login", post(api_login))
             .route("/api/auth/logout", post(api_logout))
-            .route("/api/setup/state", get(api_setup_state))
-            // ---- First run only (loopback, while no admin exists) ----
-            .route("/setup", get(view_setup))
-            .route("/api/setup", post(api_setup))
+            // There is no first-run page (P13.3): a new database gets the loopback-only
+            // first-run account, and the setup wizard on /admin is the one setup path.
             // ---- Logged in (any role) ----
             .route("/user", get(view_user))
             .route("/api/user/jobs", post(user_jobs::api_user_submit))

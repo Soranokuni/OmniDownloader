@@ -354,8 +354,10 @@ pub async fn host_guard(
         StatusCode::MISDIRECTED_REQUEST,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         "421 Misdirected Request: the Host of this request is not one this server answers to. \
-         If the panel is reached through a DNS alias or a reverse-proxy name, add that name to \
-         security.allowed_hosts in config.json and restart the service.\n",
+         If the panel is reached through a DNS alias or a reverse-proxy name, open the panel at \
+         http://127.0.0.1 on the server itself, choose Admin -> Run setup wizard again with \
+         the IT / sysadmin mode, add that name under \"Allowed host names\" on the TLS, \
+         reverse proxy and metrics step (security.allowed_hosts) and restart the service.\n",
     )
         .into_response()
 }
