@@ -6,6 +6,7 @@ import {
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
 import { statusBadge } from '/static/status.js?v=1';
+import { deferAction, hiddenNow } from '/static/undo.js?v=1';
 
 /** Where a working video is, in words a journalist knows. */
 const STAGE_TEXT = {
@@ -89,19 +90,25 @@ function jobCard(job) {
     ),
     el('div', { class: 'job-meta' },
       el('span', {}, job.notes ? `Σημείωση: ${job.notes}` : ''),
-      job.status === 'PENDING'
-        && el('button', { class: 'btn btn-danger', type: 'button', onclick: () => cancelJob(job.id) }, 'Ακύρωση'),
+      job.status === 'PENDING' && hiddenNow(CANCELLING, job)
+        ? el('span', { class: 'note' }, 'Ακυρώνεται…')
+        : job.status === 'PENDING'
+          && el('button', { class: 'btn btn-danger', type: 'button', onclick: () => cancelJob(job) }, 'Ακύρωση'),
     ),
   );
 }
 
-async function cancelJob(id) {
-  if (!window.confirm('Να ακυρωθεί αυτή η αποστολή;')) return;
-  try {
-    await api(`/api/user/jobs/${id}/cancel`, { method: 'POST', body: {} });
-    toast('Η αποστολή ακυρώθηκε.', 'ok');
-  } catch (e) { toast(e.message, 'bad'); }
-  loadMyJobs();
+/* A journalist's cancel (P12.4): no «Are you sure?»; the card says
+ * «Ακυρώνεται…» and the cancel is sent once its 8 s of «Αναίρεση» are over. */
+const CANCELLING = 'user-cancelling';
+function cancelJob(job) {
+  deferAction({
+    text: 'Η αποστολή ακυρώνεται.',
+    hides: (view, j) => view === CANCELLING && j.id === job.id,
+    run: () => api(`/api/user/jobs/${job.id}/cancel`, { method: 'POST', body: {} }),
+    after: loadMyJobs,
+    done: 'Η αποστολή ακυρώθηκε.',
+  });
 }
 
 const multi = document.getElementById('multi');

@@ -10,7 +10,8 @@
  */
 
 import { api, el, fmtDuration, safeHref, toast } from '/static/app.js?v=6';
-import { fileName, clock } from '/static/desk.js?v=15';
+import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=16';
+import { confirmDialog } from '/static/dialog.js?v=1';
 import { statusBadge } from '/static/status.js?v=1';
 
 const cards = new Map(); // job id -> { node, job, expiry }
@@ -172,7 +173,11 @@ function buildCard(job, ctx) {
   };
 
   const approve = mk('btn btn-primary', 'Έγκριση → Dalet', guarded(async () => {
-    if (!confirm(`Να σταλεί αυτό το βίντεο στο Dalet ως ${fileName(job)};`)) return false;
+    if (!(await confirmDialog({
+      title: `Να σταλεί στο Dalet ως ${fileName(job)};`,
+      body: 'Το βίντεο που βλέπετε παραδίδεται στο watchfolder και μπαίνει στο Dalet. Εγκρίνετε μόνο αν είναι το σωστό.',
+      confirm: 'Έγκριση → Dalet',
+    }))) return false;
     try {
       await api(`/api/jobs/${job.id}/approve`, { method: 'POST', body: { sha256: held.sha256 } });
       return done(`Το ${fileName(job)} εγκρίθηκε και στέλνεται στο Dalet.`, 'Στάλθηκε…');
@@ -186,14 +191,23 @@ function buildCard(job, ctx) {
       return done(`Το ${fileName(job)} απορρίφθηκε.`, 'Απορρίφθηκε');
     } catch (e) { failedAction(e); return false; }
   };
-  const wrong = mk('btn btn-danger', 'Λάθος βίντεο', guarded(() => reject('wrong_video')));
+  // «Λάθος βίντεο» asks in the same dialog as on a delivered card (desk.js).
+  const wrong = mk('btn btn-danger', 'Λάθος βίντεο', guarded(async () => {
+    if (!(await confirmWrongVideo(fileName(job), [
+      'Το βίντεο απορρίπτεται, το αρχείο του σβήνεται και ΔΕΝ στέλνεται στο Dalet.',
+      'Η εργασία πηγαίνει στη λίστα «Χρειάζονται έλεγχο», για χειροκίνητη λήψη ή άλλον σύνδεσμο.',
+    ]))) return false;
+    return reject('wrong_video');
+  }));
   // «Επόμενη επιλογή»: only while the repair verified another video after this
   // one. The held one counts as wrong; the next is downloaded and held again.
   const repair = job.repair || null;
   const nextLeft = repair && Number(repair.next_left) > 0 ? Number(repair.next_left) : 0;
   const next = nextLeft > 0
     ? mk('btn', `Επόμενη επιλογή (${nextLeft})`, guarded(async () => {
-      if (!confirm('Το τρέχον βίντεο απορρίπτεται ως λάθος και κατεβαίνει η επόμενη επιλογή.')) return false;
+      if (!(await confirmWrongVideo(fileName(job), [
+        'Το τρέχον βίντεο απορρίπτεται ως λάθος και κατεβαίνει η επόμενη επιλογή, που θα περιμένει ξανά έγκριση.',
+      ]))) return false;
       try {
         await api(`/api/jobs/${job.id}/next`, { method: 'POST', body: { sha256: held.sha256 } });
         return done('Η επόμενη επιλογή κατεβαίνει.', 'Επόμενη επιλογή…');

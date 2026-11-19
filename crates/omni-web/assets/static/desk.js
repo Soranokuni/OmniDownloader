@@ -9,6 +9,8 @@
 
 import { api, el, render, toast } from '/static/app.js?v=6';
 import { STATUS } from '/static/status.js?v=1';
+import { deferAction, undoToast } from '/static/undo.js?v=1';
+import { confirmDialog } from '/static/dialog.js?v=1';
 
 /** What a job is doing, for a person. */
 export const STAGE_TEXT = {
@@ -176,8 +178,10 @@ export function pager(targetId, state, total, onChange) {
 }
 
 /* ------------------------------------------------------------------ *
- * Actions. Each confirms what cannot be undone, says what happened, and
- * calls `after` so the list it came from refreshes.
+ * Actions. What can be taken back acts at once with «Αναίρεση»
+ * (undo.js); what sends a video on air or closes a job for good asks in
+ * the page's dialog (dialog.js). Each says what happened and calls `after`
+ * so the list it came from refreshes. No confirm() or prompt() (P12.4).
  * ------------------------------------------------------------------ */
 
 export async function retryJob(job, after) {
@@ -206,57 +210,105 @@ export function canRename(job) {
   return job.status === 'RUNNING' && ['QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE'].includes(job.stage);
 }
 
-/** Give a video a better keyword before it is delivered: the last part of
- *  its file name, typed in Greek or Latin. */
-export async function renameJob(job, after) {
-  const now = job.keyword || '';
-  const typed = prompt(
-    `Νέα λέξη-κλειδί για το ${fileName(job)}\n\n` +
-    `Γράψτε το θέμα του βίντεο, ελληνικά ή λατινικά (π.χ. ΣΕΙΣΜΟΣ ΣΗΤΕΙΑ). ` +
-    `Το αρχείο θα παραδοθεί ως ${job.index_str}_${job.journalist}_ΛΕΞΗ.mxf.`,
-    now,
-  );
-  if (typed === null || !typed.trim() || typed.trim() === now) return;
-  try {
-    const r = await api(`/api/jobs/${job.id}/rename`, { method: 'POST', body: { keyword: typed } });
-    toast(`Θα παραδοθεί ως ${r.slug}.mxf.`, 'ok');
-    after();
-  } catch (e) { toast(e.message, 'bad'); }
+/* Rename in place (P12.4): the card shows a field instead of a prompt(),
+ * with the file name it will get, as the server makes it, under it. The
+ * lists keep a card's field open across their refreshes by this set. */
+export const renameOpen = new Set();
+
+/** The inline rename field of a card. `after` refreshes the list once saved;
+ *  `rerender` redraws the card when the field closes unsaved. */
+export function renameForm(job, after, rerender) {
+  const id = `rename-${job.id}`;
+  const input = el('input', {
+    type: 'text', id, value: job.keyword || '', maxlength: '60', autocomplete: 'off', class: 'mono',
+    'aria-describedby': `${id}-preview`,
+  });
+  const preview = el('p', { class: 'note mono rename-preview', id: `${id}-preview`, 'aria-live': 'polite' },
+    `Θα παραδοθεί ως ${fileName(job)}`);
+  let timer = null;
+  let asked = 0;
+  // The page does not guess the Latin form of a Greek word (ELOT 743): the
+  // server answers with the keyword it would store.
+  const update = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const mine = ++asked;
+      try {
+        const r = await api(`/api/keyword-preview?text=${encodeURIComponent(input.value)}`);
+        if (mine !== asked) return;
+        preview.textContent = r.keyword
+          ? `Θα παραδοθεί ως ${job.index_str}_${job.journalist}_${r.keyword}.mxf`
+          : 'Γράψτε τουλάχιστον 2 γράμματα ή ψηφία.';
+      } catch { /* the preview is a help; the save says what is wrong */ }
+    }, 200);
+  };
+  const close = () => { renameOpen.delete(job.id); rerender(); };
+  const save = async () => {
+    const typed = input.value.trim();
+    if (!typed || typed === (job.keyword || '')) { close(); return; }
+    try {
+      const r = await api(`/api/jobs/${job.id}/rename`, { method: 'POST', body: { keyword: typed } });
+      renameOpen.delete(job.id);
+      toast(`Θα παραδοθεί ως ${r.slug}.mxf.`, 'ok');
+      after();
+    } catch (e) { toast(e.message, 'bad'); }
+  };
+  input.addEventListener('input', update);
+  input.addEventListener('keydown', (ev) => {
+    if (ev.isComposing) return;
+    if (ev.key === 'Enter') { ev.preventDefault(); save(); }
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); close(); }
+  });
+  // Read once the list has put back what was typed before a refresh.
+  update();
+  return el('div', { class: 'rename-form' },
+    el('label', { for: id }, 'Νέα λέξη-κλειδί, ελληνικά ή λατινικά (π.χ. ΣΕΙΣΜΟΣ ΣΗΤΕΙΑ)'),
+    el('div', { class: 'row' },
+      el('div', { class: 'grow' }, input),
+      el('button', { class: 'btn btn-primary', type: 'button', onClick: save }, 'Αποθήκευση'),
+      el('button', { class: 'btn', type: 'button', onClick: close }, 'Άκυρο')),
+    preview);
 }
 
-export async function discardJob(job, after) {
-  if (!confirm(
-    `Να αφαιρεθεί το ${fileName(job)} (εργασία #${job.id});\n\n` +
-    'Φεύγει οριστικά από τις λίστες. Ένα αρχείο που έχει ήδη παραδοθεί στο Dalet δεν επηρεάζεται.',
-  )) return;
-  try {
-    await api(`/api/jobs/${job.id}/discard`, { method: 'POST' });
-    toast(`Η εργασία #${job.id} αφαιρέθηκε.`, 'ok');
-    after();
-  } catch (e) { toast(e.message, 'bad'); }
+/** Remove a job from the lists: gone from the screen now, sent after the
+ *  8 seconds of «Αναίρεση» (the server keeps no way back). */
+export function discardJob(job, after) {
+  deferAction({
+    text: `Το ${fileName(job)} αφαιρέθηκε από τις λίστες.`,
+    hides: (_view, j) => j.id === job.id,
+    run: () => api(`/api/jobs/${job.id}/discard`, { method: 'POST' }),
+    after,
+  });
 }
 
-/** MCR cancels a waiting or running video; the row and its history stay (P7.20). */
+/** MCR cancels a waiting or running video; the row and its history stay (P7.20).
+ *  Sent at once, so a running tool stops now; «Αναίρεση» puts it back in the queue. */
 export async function cancelJob(job, after) {
   const name = fileName(job);
-  if (!confirm(
-    `Ακύρωση του ${name};\n\n` +
-    'Δεν θα σταλεί στο Dalet. Μπορείτε να το ξαναβάλετε στην ουρά από την καρτέλα Email («Δοκιμή ξανά»).',
-  )) return;
   try {
     await api(`/api/jobs/${job.id}/cancel`, { method: 'POST' });
-    toast(`Το ${name} ακυρώθηκε.`, 'ok');
+  } catch (e) { toast(e.message, 'bad'); return; }
+  after();
+  undoToast(`Το ${name} ακυρώθηκε· δεν θα σταλεί στο Dalet.`, async () => {
+    try {
+      await api(`/api/jobs/${job.id}/retry`, { method: 'POST' });
+      toast(`Το ${name} μπήκε ξανά στην ουρά.`, 'ok');
+    } catch (e) { toast(e.message, 'bad'); }
     after();
-  } catch (e) { toast(e.message, 'bad'); }
+  });
 }
 
+/** Download a delivered video again: it goes on air again, so it is asked. */
 export async function redownloadJob(job, after) {
   const name = deliveredName(job);
-  if (!confirm(
-    `Νέα λήψη του ${name};\n\n` +
-    'Το βίντεο κατεβαίνει από τον σύνδεσμό του, μετατρέπεται και παραδίδεται ξανά στο watchfolder. ' +
-    'Αν το παλιό αρχείο υπάρχει ακόμη, το νέο αποθηκεύεται δίπλα του με έναν αριθμό στο τέλος (…_2.mxf)· τίποτα δεν αντικαθίσταται.',
-  )) return;
+  if (!(await confirmDialog({
+    title: `Νέα λήψη του ${name};`,
+    body: [
+      'Το βίντεο κατεβαίνει από τον σύνδεσμό του, μετατρέπεται και παραδίδεται ξανά στο watchfolder.',
+      'Αν το παλιό αρχείο υπάρχει ακόμη, το νέο αποθηκεύεται δίπλα του με έναν αριθμό στο τέλος (…_2.mxf)· τίποτα δεν αντικαθίσταται.',
+    ],
+    confirm: 'Νέα λήψη',
+  }))) return;
   try {
     await api(`/api/jobs/${job.id}/redownload`, { method: 'POST' });
     toast(`Το ${name} μπήκε ξανά στην ουρά.`, 'ok');
@@ -264,13 +316,14 @@ export async function redownloadJob(job, after) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
-/** MCR put the video into Dalet by hand: record it as done (P7.16). */
+/** MCR put the video into Dalet by hand: record it as done (P7.16). Closes the job for good. */
 export async function markDoneJob(job, after) {
   const name = fileName(job);
-  if (!confirm(
-    `Σημείωση του ${name} ως παραδομένου χειροκίνητα;\n\n` +
-    'Βεβαιωθείτε ότι το βίντεο είναι ήδη στο Dalet: από εδώ δεν θα σταλεί αρχείο.',
-  )) return;
+  if (!(await confirmDialog({
+    title: `Το ${name} είναι ήδη στο Dalet;`,
+    body: 'Η εργασία κλείνει ως παραδομένη χειροκίνητα. Βεβαιωθείτε ότι το βίντεο είναι ήδη στο Dalet: από εδώ δεν θα σταλεί αρχείο.',
+    confirm: 'Το έβαλα στο Dalet',
+  }))) return;
   try {
     await api(`/api/jobs/${job.id}/mark-done`, { method: 'POST' });
     toast(`Το ${name} σημειώθηκε ως παραδομένο.`, 'ok');
@@ -278,15 +331,25 @@ export async function markDoneJob(job, after) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
+/** «Λάθος βίντεο»: the same dialog wherever it appears (a held video in
+ *  approval.js, an automatic delivery here); `what` says what follows. */
+export function confirmWrongVideo(name, what) {
+  return confirmDialog({
+    title: `Το ${name} είναι λάθος βίντεο;`,
+    body: what,
+    confirm: 'Λάθος βίντεο',
+    danger: true,
+  });
+}
+
 /** MCR says a video that a trusted recipe delivered without approval was the wrong one (P10.16a):
  *  the recipe loses its trust on that site. The file is already in Dalet and is never touched. */
 export async function wrongVideoJob(job, after) {
   const name = deliveredName(job);
-  if (!confirm(
-    `Το ${name} είναι λάθος βίντεο;\n\n` +
-    'Η συνταγή που το βρήκε χάνει την εμπιστοσύνη της σε αυτό το site και τα επόμενα βίντεό της θα περιμένουν έγκριση. ' +
+  if (!(await confirmWrongVideo(name, [
+    'Η συνταγή που το βρήκε χάνει την εμπιστοσύνη της σε αυτό το site και τα επόμενα βίντεό της θα περιμένουν έγκριση.',
     'Το αρχείο είναι ήδη στο Dalet· αφαιρέστε το από εκεί.',
-  )) return;
+  ]))) return;
   try {
     await api(`/api/jobs/${job.id}/wrong-video`, { method: 'POST' });
     toast(`Καταγράφηκε: λάθος βίντεο. Το αρχείο είναι ήδη στο Dalet· αφαιρέστε το από εκεί.`, 'ok');

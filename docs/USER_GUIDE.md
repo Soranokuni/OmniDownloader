@@ -93,7 +93,8 @@ Press **«Αποστολή»** (Send). You will see one of:
 
 **«Οι αποστολές μου»** (My submissions) lists what you sent and its state.
 Press **«Ανανέωση»** to refresh. While a submission is still waiting
-(«Σε αναμονή»), you can withdraw it with **«Ακύρωση»** (Cancel).
+(«Σε αναμονή»), you can withdraw it with **«Ακύρωση»** (Cancel); for 8 seconds
+**«Αναίρεση»** (Undo) keeps it.
 
 «Ειδοποίησέ με όταν ολοκληρωθεί ένα βίντεο μου» (notify me when a video of
 mine is done) saves your preference. Sending the notification email is not
@@ -225,13 +226,20 @@ does.
 |---|---|
 | «Δοκιμή ξανά» | try again: back into the queue |
 | «Νέα λήψη» | download again; if the file is already in Dalet the new one is `…_2.mxf` (nothing is overwritten) |
-| «Μετονομασία…» | change the keyword, and so the file name |
-| «Ακύρωση» | cancel: it will not be sent to Dalet |
-| «Το έβαλα στο Dalet» | you put the video into Dalet yourself; the job is closed as done |
-| «Αφαίρεση» | remove the card from the lists (a delivered file is never touched) |
+| «Μετονομασία…» | opens a field on the card: type the keyword (Greek or Latin) and it shows the file name it will get; Enter saves, Escape closes |
+| «Ακύρωση» | cancel at once: it will not be sent to Dalet. «Αναίρεση» for 8 seconds puts it back in the queue |
+| «Το έβαλα στο Dalet» | you put the video into Dalet yourself; the job is closed as done (asks first) |
+| «Αφαίρεση» | remove the card from the lists (a delivered file is never touched); «Αναίρεση» for 8 seconds brings it back |
 | «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the Email tab) | use a link you pasted instead of the one found |
 | «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the Email tab the history shows under a selected card. |
 | «Τώρα» | in the «Καθυστερούν» strip: try now instead of waiting for the next retry (§4.9) |
+
+What can be taken back happens at once, with **«Αναίρεση»** (Undo) at the
+bottom left for 8 seconds: «Αφαίρεση», «Ακύρωση», «Απόκρυψη παλαιότερων από 3
+ημέρες» and «Αφαίρεση παραδοθέντων από τη λίστα». What sends a video to Dalet
+or closes a job for good asks first, in a window on the page: «Έγκριση → Dalet»,
+«Το έβαλα στο Dalet», «Λάθος βίντεο», «Επόμενη επιλογή» and «Νέα λήψη». The
+window starts on «Άκυρο»; Escape also closes it.
 
 **The «Χρειάζονται έλεγχο» tab is a work list.** It holds only what waits for
 you, grouped by what you have to do, not by date:

@@ -19,13 +19,15 @@ import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
-  canRename, renameJob as deskRename, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=15';
+  canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
+} from '/static/desk.js?v=16';
+import { deferAction, visible } from '/static/undo.js?v=1';
+import { confirmDialog } from '/static/dialog.js?v=1';
 import { STATUS, statusBadge } from '/static/status.js?v=1';
 import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=1';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=22';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=23';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=11';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=10';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=11';
 
 let journalists = [];
 
@@ -440,7 +442,8 @@ async function loadQueue() {
     data = await fetchPage('live');
   } catch (e) { failed(e); return; }
   showCounts(data.counts);
-  const jobs = data.jobs || [];
+  // What waits for its «Αναίρεση» to run out is already gone from the list.
+  const jobs = visible('live', data.jobs || []);
   renderOffers('article-offers', jobs);
   if (jobs.length === 0) {
     liveCards.clear();
@@ -475,7 +478,7 @@ function queueSig(job) {
   if (!isActive(job)) return JSON.stringify(job);
   const t = job.status === 'RUNNING' ? stepTimeNode(job) : null;
   const wait = job.status === 'PENDING' ? waitLine(job) : '';
-  return JSON.stringify([job, wait, t ? t.className : '', t ? t.textContent : '', groupGen]);
+  return JSON.stringify([job, wait, t ? t.className : '', t ? t.textContent : '', groupGen, renameOpen.has(job.id)]);
 }
 
 function activeCard(job) {
@@ -507,6 +510,7 @@ function activeCard(job) {
         }, 'Ακύρωση'),
       ),
     ),
+    canRename(job) ? renameFormFor(job) : null,
     el('div', {},
       el('div', { class: 'job-meta' },
         el('span', {},
@@ -551,19 +555,19 @@ function deliveredCard(job) {
   );
 }
 
-document.getElementById('clear-finished').addEventListener('click', async (event) => {
+// Nothing is deleted: the delivered videos stay in «Ολοκληρωμένα». They leave
+// the list at once and the request goes when the «Αναίρεση» runs out (P12.4).
+const isDelivered = (job) => job.status === 'COMPLETED' || job.status === 'COMPLETED_MANUAL';
+document.getElementById('clear-finished').addEventListener('click', (event) => {
   const n = Number(event.currentTarget.dataset.count || 0);
   if (!n) return;
-  if (!confirm(
-    `Να φύγουν ${n === 1 ? 'το 1 παραδοθέν βίντεο' : `τα ${n} παραδοθέντα βίντεο`} από τη λίστα «Σε εξέλιξη»;\n\n` +
-    'Δεν διαγράφεται τίποτα. Μένουν στα «Ολοκληρωμένα», από όπου μπορείτε να τα κατεβάσετε ξανά.',
-  )) return;
-  try {
-    const r = await api('/api/jobs/clear-finished', { method: 'POST' });
-    toast(`${r.cleared} παραδοθέντα βίντεο έφυγαν από τη λίστα. Βρίσκονται στα «Ολοκληρωμένα».`, 'ok');
-    pages.live.page = 1;
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
+  pages.live.page = 1;
+  deferAction({
+    text: `${n === 1 ? 'Το 1 παραδοθέν βίντεο έφυγε' : `Τα ${n} παραδοθέντα βίντεο έφυγαν`} από τη λίστα· είναι στα «Ολοκληρωμένα».`,
+    hides: (view, job) => view === 'live' && isDelivered(job),
+    run: () => api('/api/jobs/clear-finished', { method: 'POST' }),
+    after: refresh,
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -593,26 +597,25 @@ function showHiddenCount(n) {
 const HIDE_OLD_HOURS = 72;
 document.getElementById('hide-old-review').addEventListener('click', async () => {
   let hidden;
+  const cutoff = Date.now() - HIDE_OLD_HOURS * 3600 * 1000;
+  const isOld = (j) => !j.cleared_at && !!j.updated_at && Date.parse(j.updated_at) < cutoff;
   try {
-    // Count first so the question can say how many.
-    const cutoff = Date.now() - HIDE_OLD_HOURS * 3600 * 1000;
+    // Count first so the message can say how many.
     const data = await api('/api/jobs?view=review&page=1&per_page=100');
     const jobs = data.jobs || [];
-    hidden = jobs.filter((j) => j.updated_at && Date.parse(j.updated_at) < cutoff).length;
+    hidden = jobs.filter(isOld).length;
     if (data.total > jobs.length) hidden = null; // more than one page: the exact number is unknown
   } catch (e) { toast(e.message, 'bad'); return; }
   if (hidden === 0) { toast('Δεν υπάρχει τίποτα παλαιότερο από 3 ημέρες.', 'ok'); return; }
-  const how = hidden === null ? 'Τα παλαιότερα βίντεο' : hidden === 1 ? 'Το 1 βίντεο' : `Τα ${hidden} βίντεο`;
-  if (!confirm(
-    `${how} που περιμένουν πάνω από 3 ημέρες θα κρυφτούν από τη λίστα.\n\n` +
-    'Δεν σβήνεται τίποτα· εμφανίζονται ξανά με «Εμφάνιση κρυμμένων».',
-  )) return;
-  try {
-    const r = await api('/api/jobs/review/hide-old', { method: 'POST', body: { hours: HIDE_OLD_HOURS } });
-    toast(`${r.hidden} βίντεο κρύφτηκαν από τη λίστα.`, 'ok');
-    pages.review.page = 1;
-    refresh();
-  } catch (e) { toast(e.message, 'bad'); }
+  const how = hidden === null ? 'Τα παλαιότερα βίντεο κρύφτηκαν' : hidden === 1 ? 'Το 1 βίντεο κρύφτηκε' : `Τα ${hidden} βίντεο κρύφτηκαν`;
+  pages.review.page = 1;
+  // Nothing is deleted; they show again with «Εμφάνιση κρυμμένων».
+  deferAction({
+    text: `${how} (πάνω από 3 ημέρες)· εμφανίζονται με «Εμφάνιση κρυμμένων».`,
+    hides: (view, job) => view === 'review' && isOld(job),
+    run: () => api('/api/jobs/review/hide-old', { method: 'POST', body: { hours: HIDE_OLD_HOURS } }),
+    after: refresh,
+  });
 });
 
 /* Keyed lists (P12.3). The lists refresh every 5 s; rebuilding every card
@@ -749,6 +752,13 @@ function syncKeyedList(list, host, jobs, { build, sig, heading = null, headingTe
   for (const id of [...list.cards.keys()]) if (!seen.has(id)) list.cards.delete(id);
   reconcileChildren(host, wanted);
   for (const restore of restores) restore();
+  if (focusAfterSync) {
+    const target = document.getElementById(focusAfterSync);
+    if (target && host.contains(target)) {
+      focusAfterSync = null;
+      target.focus();
+    }
+  }
 }
 
 /* The held videos (P10.7): fetched with every review refresh, but their cards
@@ -777,7 +787,7 @@ async function loadReview() {
   showCounts(data.counts);
   // Grouped by what the operator has to do (P12.2); a job that will retry by
   // itself is not in this list.
-  const jobs = inGroupOrder(data.jobs || []);
+  const jobs = inGroupOrder(visible('review', data.jobs || []));
   // Forget the history and the open panels of jobs that left the page; keep the rest.
   const here = new Set([...jobs.map((j) => j.id), ...approvalIds()]);
   for (const id of [...historyState.keys(), ...historyBox.keys(), ...historyOpen, ...historyTech, ...moreOpen, ...techOpen]) {
@@ -794,7 +804,7 @@ async function loadReview() {
   } else {
     syncKeyedList(reviewList, document.getElementById('review-cards'), jobs, {
       build: reviewCard,
-      sig: (job) => JSON.stringify(job),
+      sig: (job) => JSON.stringify([job, renameOpen.has(job.id)]),
       heading: (job) => groupLabel(groupOf(job)) || null,
       headingText: (label, n) => `${label} · ${n}`,
     });
@@ -978,6 +988,7 @@ function reviewCard(job) {
     ),
     el('p', { class: 'wl-why' }, whyText(job)),
     main,
+    canRename(job) ? renameFormFor(job) : null,
     more,
     tech,
   );
@@ -987,7 +998,19 @@ const retryJob = (job) => deskRetry(job, refresh);
 const overrideJob = (job, url) => deskOverride(job, url, refresh);
 const discardJob = (job) => deskDiscard(job, refresh);
 const cancelJob = (job) => deskCancel(job, refresh);
-const renameJob = (job) => deskRename(job, refresh);
+/** «Μετονομασία…»: open (or close) the card's own field (P12.4); the
+ *  refresh redraws the card with it, and the field takes the focus. */
+let focusAfterSync = null;
+const renameJob = (job) => {
+  if (renameOpen.has(job.id)) {
+    renameOpen.delete(job.id);
+  } else {
+    renameOpen.add(job.id);
+    focusAfterSync = `rename-${job.id}`;
+  }
+  refresh();
+};
+const renameFormFor = (job) => (renameOpen.has(job.id) ? renameForm(job, refresh, refresh) : null);
 const markDoneJob = (job) => deskMarkDone(job, refresh);
 
 /* ------------------------------------------------------------------ *
@@ -1051,7 +1074,7 @@ async function loadCompleted() {
     });
   } catch (e) { failed(e); return; }
   showCounts(data.counts);
-  const jobs = data.jobs || [];
+  const jobs = visible('completed', data.jobs || []);
   renderOffers('completed-offers', jobs);
   if (jobs.length === 0) {
     const filtered = searchInput.value.trim() || filterSelect.value || groupSelect.value;
@@ -1156,7 +1179,12 @@ document.getElementById('journalist-form').addEventListener('submit', async (eve
 });
 
 async function deleteJournalist(surname) {
-  if (!confirm(`Διαγραφή του δημοσιογράφου ${surname};\n\nΤα βίντεο που έχουν ήδη παραδοθεί κρατούν τα ονόματά τους.`)) return;
+  if (!(await confirmDialog({
+    title: `Διαγραφή του δημοσιογράφου ${surname};`,
+    body: 'Τα βίντεο που έχουν ήδη παραδοθεί κρατούν τα ονόματά τους.',
+    confirm: 'Διαγραφή',
+    danger: true,
+  }))) return;
   try {
     await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
     toast(`Ο ${surname} διαγράφηκε.`, 'ok');
@@ -1290,7 +1318,7 @@ async function loadLate() {
     try {
       data = await api('/api/jobs?view=late');
     } catch (e) { failed(e); return; }
-    const jobs = data.jobs || [];
+    const jobs = visible('late', data.jobs || []);
     const shown = jobs.slice(0, LATE_ROWS);
     const extra = Math.max(0, (Number(data.total) || jobs.length) - shown.length);
     // A button the operator tabbed to keeps its focus when its row is rebuilt.

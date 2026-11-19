@@ -324,6 +324,18 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
+    // The rename field's live file-name preview (P12.4): read-only, same gate as the rename.
+    (
+        "GET",
+        "/api/keyword-preview",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Denied),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     (
         "POST",
         "/api/jobs/1/override",

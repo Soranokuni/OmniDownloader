@@ -19,9 +19,10 @@
 import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
-  waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename, renameJob,
-  autoDeliveredNode,
-} from '/static/desk.js?v=15';
+  waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
+  renameForm, renameOpen, autoDeliveredNode,
+} from '/static/desk.js?v=16';
+import { visible } from '/static/undo.js?v=1';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
 } from '/static/status.js?v=1';
@@ -530,6 +531,8 @@ const afterAction = () => hooks.refresh();
  * ------------------------------------------------------------------ */
 
 function setDetail(d) {
+  // A video being removed (its «Αναίρεση» still showing) is already gone here.
+  d.jobs = visible('email', d.jobs || []);
   detail = d;
   const push = (m, k, v) => { if (!m.has(k)) m.set(k, []); m.get(k).push(v); };
   const linkById = new Map(d.links.map((l) => [l.id, l]));
@@ -762,7 +765,7 @@ const jobSig = (j) => JSON.stringify([j.status, j.stage, pct(j), j.speed, j.eta,
 
 function paintJob(card, j, force) {
   const sel = !!selected && selected.job === j.id;
-  const sig = `${jobSig(j)}|${sel}|${overrideOpen.has(j.id)}|${sel ? (timelines.get(j.id) || []).length : ''}`;
+  const sig = `${jobSig(j)}|${sel}|${overrideOpen.has(j.id)}|${renameOpen.has(j.id)}|${sel ? (timelines.get(j.id) || []).length : ''}`;
   if (!force && card.dataset.sig === sig) return;
   // Never rebuild a card under a field being typed in.
   if (!force && card.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') return;
@@ -788,7 +791,8 @@ function paintJob(card, j, force) {
   if (limit) parts.push(el('div', { class: 'jc-found' }, limit));
   const auto = autoDeliveredNode(j, afterAction);
   if (auto) parts.push(auto);
-  if (needsAttention(j) || sel) parts.push(moreNode(j, sel));
+  const more = moreNode(j, sel);
+  if (more) parts.push(more);
   card.replaceChildren(...parts);
 }
 
@@ -862,8 +866,7 @@ function moreNode(j, sel) {
       // The same sentence as the review tab's card: by state as well as code (P12.2).
       el('strong', {}, whyText(j)),
       j.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${j.error_code}`) : null));
-    // What fixes it is always there; opening and removing it, once the
-    // card is selected, so a mail with many failures stays readable.
+    // Every action is on the card without selecting it first (P12.4).
     box.append(el('div', { class: 'jc-actions' },
       locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, 'Δοκιμή ξανά'),
       locker ? null : el('button', {
@@ -877,9 +880,10 @@ function moreNode(j, sel) {
         },
       }, 'Άλλος σύνδεσμος…'),
       el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(j, afterAction) }, 'Το έβαλα στο Dalet'),
-      sel || locker ? openLink : null,
-      sel && canRename(j) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(j, afterAction) }, 'Μετονομασία…') : null,
-      sel || locker ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση') : null));
+      openLink,
+      canRename(j) ? renameButton(j) : null,
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));
+    if (renameOpen.has(j.id)) box.append(renameForm(j, afterAction, () => repaintJob(j.id, true)));
     if (overrideOpen.has(j.id)) {
       const input = el('input', { type: 'url', class: 'mono', placeholder: 'https://… ο σύνδεσμος του ίδιου του βίντεο', 'aria-label': 'Άλλος σύνδεσμος για το ίδιο βίντεο' });
       const submit = async () => {
@@ -889,21 +893,37 @@ function moreNode(j, sel) {
       box.append(el('div', { class: 'jc-override' }, el('div', { class: 'grow' }, input),
         el('button', { class: 'btn btn-warn', type: 'button', onClick: submit }, 'Χρήση')));
     }
-  } else if (sel) {
+  } else if (j.status !== 'AWAITING_APPROVAL') {
+    // A held video's actions are on its approval card (the chip above leads there).
     const done = j.status === 'COMPLETED' || j.status === 'COMPLETED_MANUAL';
     const live = j.status === 'PENDING' || j.status === 'RUNNING';
     box.append(el('div', { class: 'jc-actions' },
       openLink,
-      canRename(j) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(j, afterAction) }, 'Μετονομασία…') : null,
+      canRename(j) ? renameButton(j) : null,
       j.status === 'CANCELLED' ? el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, 'Δοκιμή ξανά') : null,
       done
         ? el('button', { class: 'btn', type: 'button', onClick: () => redownloadJob(j, afterAction) }, 'Νέα λήψη')
         : live
           ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => cancelJob(j, afterAction) }, 'Ακύρωση')
           : el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));
+    if (renameOpen.has(j.id)) box.append(renameForm(j, afterAction, () => repaintJob(j.id, true)));
   }
   if (sel) box.append(historyNode(j.id));
-  return box;
+  return box.childNodes.length ? box : null;
+}
+
+/** «Μετονομασία…»: opens the card's own field (P12.4), focused. */
+function renameButton(j) {
+  return el('button', {
+    class: 'btn',
+    type: 'button',
+    'aria-expanded': String(renameOpen.has(j.id)),
+    onClick: () => {
+      if (renameOpen.has(j.id)) renameOpen.delete(j.id); else renameOpen.add(j.id);
+      repaintJob(j.id, true);
+      if (renameOpen.has(j.id)) document.getElementById(`rename-${j.id}`)?.focus();
+    },
+  }, 'Μετονομασία…');
 }
 
 function offerCard(j, o) {

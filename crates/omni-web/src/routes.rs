@@ -940,6 +940,24 @@ fn house_keyword(raw: &str) -> Option<String> {
 }
 
 #[derive(Deserialize)]
+pub struct KeywordPreviewQuery {
+    text: Option<String>,
+}
+
+/// What a typed keyword becomes in the file name, for the desk's inline
+/// rename field (P12.4): the same [`house_keyword`] the rename stores, so the
+/// preview cannot promise a name the rename would not give. Changes nothing;
+/// `keyword` is null under 2 letters or digits.
+pub async fn api_keyword_preview(
+    RequireMcr(_): RequireMcr,
+    Query(query): Query<KeywordPreviewQuery>,
+) -> JsonResult {
+    // The keyword keeps at most 20 characters; a long paste is cut before the work.
+    let text: String = query.text.unwrap_or_default().chars().take(200).collect();
+    Ok(Json(serde_json::json!({ "keyword": house_keyword(&text) })))
+}
+
+#[derive(Deserialize)]
 pub struct QueueOfferPayload {
     url: String,
 }

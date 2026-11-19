@@ -1840,3 +1840,46 @@ async fn the_late_limits_are_the_configured_ones() -> Result<()> {
     assert_eq!(st["queue"]["late"], 1, "{st}");
     Ok(())
 }
+
+/// P12.4: the inline rename field's live preview names the file the rename then gives. Same
+/// keyword (Greek transliterated, upper case, letters and digits), and nothing under two of them.
+#[tokio::test]
+async fn the_keyword_preview_is_the_keyword_the_rename_stores() -> Result<()> {
+    let app = App::new()?;
+    let (status, created) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({ "url": "https://www.youtube.com/watch?v=preview1" })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["job_id"].as_i64().unwrap();
+    // Percent-encode every byte that is not a plain letter or digit.
+    let encode = |s: &str| -> String {
+        s.bytes()
+            .map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") })
+            .collect()
+    };
+
+    for (typed, want) in [("σεισμός σητεία", Some("SEISMOSSITEIA")), ("Fire-Heraklion 2", Some("FIREHERAKLION2")), ("ά!", None)] {
+        let (status, preview) = app
+            .send("GET", &format!("/api/keyword-preview?text={}", encode(typed)), &app.mcr_token, None)
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["keyword"].as_str(), want, "preview of {typed:?}");
+        let (status, renamed) = app
+            .send("POST", &format!("/api/jobs/{id}/rename"), &app.mcr_token, Some(json!({ "keyword": typed })))
+            .await?;
+        match want {
+            Some(k) => {
+                assert_eq!(status, StatusCode::OK, "{renamed}");
+                assert_eq!(renamed["keyword"], k, "the rename stored another keyword than the preview showed");
+                assert!(renamed["slug"].as_str().unwrap().ends_with(&format!("_{k}")), "{renamed}");
+            }
+            None => assert_eq!(status, StatusCode::BAD_REQUEST, "{renamed}"),
+        }
+    }
+    // A long paste is cut, never refused.
+    let long = "a".repeat(5000);
+    let (status, preview) = app.send("GET", &format!("/api/keyword-preview?text={long}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview["keyword"].as_str().map(str::len), Some(20));
+    Ok(())
+}

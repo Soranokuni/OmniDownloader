@@ -378,14 +378,17 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 15),
-        ("inbox.js", 22),
-        ("approval.js", 10),
+        ("desk.js", 16),
+        ("inbox.js", 23),
+        ("approval.js", 11),
         ("notify.js", 11),
-        ("mcr.js", 48),
+        ("mcr.js", 49),
         ("status.js", 1),
-        ("status.css", 2),
+        ("status.css", 3),
         ("worklist.js", 1),
+        ("undo.js", 1),
+        ("dialog.js", 1),
+        ("user.js", 9),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -625,7 +628,7 @@ fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
     assert!(why.contains("αυτόματη επανάληψη") && why.contains("STOPPED_TEXT"), "a stopped job can say it retries by itself");
 
     // mcr.js: the list is grouped, still reconciled in place (P12.3), with the panels kept open.
-    assert!(mcr.contains("const jobs = inGroupOrder(data.jobs || []);"), "the review list is not grouped");
+    assert!(mcr.contains("const jobs = inGroupOrder(visible('review', data.jobs || []));"), "the review list is not grouped");
     assert!(mcr.contains("heading: (job) => groupLabel(groupOf(job)) || null"), "the headings are not the groups");
     assert!(!mcr.contains("dayHeading"), "the review list is still grouped by date");
     let card = mcr.split("function reviewCard(job)").nth(1).and_then(|s| s.split("\n}\n").next()).expect("reviewCard");
@@ -662,12 +665,98 @@ fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
     }
 }
 
+/// The body of `function name(` in `src`, up to the next top-level `}`.
+fn function_body<'a>(src: &'a str, name: &str) -> &'a str {
+    src.split(&format!("function {name}(")).nth(1).and_then(|s| s.split("\n}\n").next()).unwrap_or_else(|| panic!("no function {name}"))
+}
+
+/// P12.4: no native dialogs on the desk and /user. What can be taken back acts at once with
+/// «Αναίρεση» for 8 s; what puts a video on air or closes a job for good asks in the page's own
+/// dialog (focus trap, Escape, focus return); «Λάθος βίντεο» is the same dialog wherever it is;
+/// every action of an Email-tab card shows without selecting the card first.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v8() {
+fn the_desk_uses_no_native_dialogs() {
+    let assets = all_assets();
+    let code = |module: &str| -> String {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    // A call of the browser's own, not `confirmDialog(` or `x.confirm(`-like names of ours.
+    let calls = |src: &str, name: &str| -> bool {
+        let needle = format!("{name}(");
+        src.match_indices(needle.as_str()).any(|(i, _)| {
+            let before = src[..i].chars().next_back();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    };
+    let desk_modules = [
+        "app.js", "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js",
+        "status.js", "worklist.js", "undo.js", "dialog.js",
+    ];
+    for module in desk_modules {
+        let src = code(module);
+        for native in ["confirm", "prompt", "alert"] {
+            assert!(!calls(&src, native), "{module} still calls the browser's {native}()");
+        }
+    }
+
+    // Reversible: at once, with «Αναίρεση» for 8 seconds.
+    let undo = code("undo.js");
+    assert!(undo.contains("export const UNDO_MS = 8000;") && undo.contains("'Αναίρεση'"), "no 8 s «Αναίρεση»");
+    let desk = code("desk.js");
+    assert!(function_body(&desk, "discardJob").contains("deferAction({"), "removing a job is not undoable");
+    assert!(function_body(&desk, "cancelJob").contains("undoToast("), "a desk cancel has no «Αναίρεση»");
+    let mcr = code("mcr.js");
+    for (what, call) in [("clear-finished", "'/api/jobs/clear-finished'"), ("hide-old", "'/api/jobs/review/hide-old'")] {
+        let at = mcr.find(call).unwrap_or_else(|| panic!("mcr.js no longer calls {what}"));
+        let before = &mcr[..at];
+        let defer = before.rfind("deferAction({").unwrap_or(0);
+        assert!(defer > 0 && before[defer..].matches("addEventListener").count() == 0, "{what} is not sent through deferAction");
+    }
+    assert!(function_body(&code("user.js"), "cancelJob").contains("deferAction({"), "a journalist's cancel has no «Αναίρεση»");
+    // What is waiting to be sent is already gone from every list.
+    for needle in ["visible('live',", "visible('review',", "visible('late',", "visible('completed',"] {
+        assert!(mcr.contains(needle), "mcr.js does not hide what waits for its «Αναίρεση»: {needle}");
+    }
+    assert!(code("inbox.js").contains("d.jobs = visible('email',"), "the Email tab shows a job being removed");
+
+    // On air or closed for good: the page's dialog.
+    for name in ["markDoneJob", "redownloadJob"] {
+        assert!(function_body(&desk, name).contains("await confirmDialog({"), "{name} does not ask in the dialog");
+    }
+    assert!(function_body(&desk, "wrongVideoJob").contains("await confirmWrongVideo("), "«Λάθος βίντεο» (delivered) does not ask");
+    let approval = code("approval.js");
+    assert!(approval.contains("await confirmDialog({") && approval.contains("confirm: 'Έγκριση → Dalet'"), "approve does not ask in the dialog");
+    assert_eq!(approval.matches("await confirmWrongVideo(").count(), 2, "«Λάθος βίντεο» and «Επόμενη επιλογή» do not ask like the delivered card");
+    let dialog = code("dialog.js");
+    for (what, needle) in [
+        ("Escape closes", "ev.key === 'Escape'"),
+        ("Tab stays inside", "ev.key === 'Tab'"),
+        ("the page behind is inert", "node.inert = true"),
+        ("focus goes back", "opener.focus()"),
+        ("focus starts on «Άκυρο»", "no.focus();"),
+    ] {
+        assert!(dialog.contains(needle), "the dialog lost: {what}");
+    }
+
+    // Rename is a field on the card with a live preview, from the server's own keyword rule.
+    let rename = function_body(&desk, "renameForm");
+    assert!(rename.contains("/api/keyword-preview?text="), "the rename field has no live preview");
+    assert!(rename.contains("ev.key === 'Escape'") && rename.contains("ev.key === 'Enter'"), "the rename field lacks Enter/Escape");
+
+    // Every action of an Email-tab card shows without selecting it first.
+    let more = function_body(&code("inbox.js"), "moreNode").to_string();
+    for gate in ["sel ||", "sel &&", "else if (sel)"] {
+        assert!(!more.contains(gate), "an Email-tab card still hides actions until selected: {gate}");
+    }
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v9() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=8"), "user.html does not import user.js?v=8");
-    assert!(!page.contains("/static/user.js?v=7"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=9"), "user.html does not import user.js?v=9");
+    assert!(!page.contains("/static/user.js?v=8"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
