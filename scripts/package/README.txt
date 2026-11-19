@@ -23,6 +23,11 @@ INSTALL WITH SETUP (new PC; the usual way)
      Press "Close": the admin page opens in your browser on this computer.
      Sign in as Admin / Admin, the first-run account, which works only from
      this computer; the setup wizard continues there (see step 4 below).
+     If the folder still held the database of an earlier installation (an
+     uninstall that kept the data), there is no first-run account: sign in
+     with that installation's administrator, as the last page says.
+  If Setup says "Setup cannot continue", nothing was changed: the reason and
+  what to do are in docs\ADMIN_GUIDE.md section 2.1c.
   Setup adds "OmniIngest" to Settings > Apps: Modify there changes the account
   the service runs as, Uninstall removes it. Unattended installs (/quiet) and
   the exit codes: OmniIngest-Setup.exe /?  and docs\ADMIN_GUIDE.md section 2.
@@ -78,7 +83,9 @@ UNINSTALL
   Installed with Setup: Settings > Apps > OmniIngest > Uninstall. It removes
   the service, the firewall rule, the Apps entry and the program files; the
   configuration, database and logs stay unless you tick the box that removes
-  them too. The watchfolder is never touched.
+  them too (Setup then shows a second page listing what goes, with Cancel as
+  its default: press Remove there to go ahead). The watchfolder is never
+  touched.
   Uninstall.cmd removes the service and the firewall rule. The folder
   C:\OmniIngest (database, configuration, logs) stays; delete it by hand.
 
@@ -125,6 +132,12 @@ GUIDES
      πρόγραμμα περιήγησης αυτού του υπολογιστή. Συνδεθείτε ως Admin / Admin,
      τον λογαριασμό πρώτης εκκίνησης, που λειτουργεί μόνο από εδώ· ο οδηγός
      ρύθμισης συνεχίζει από εκεί (βλ. βήμα 4 παρακάτω).
+     Αν ο φάκελος είχε ακόμη τη βάση δεδομένων μιας προηγούμενης εγκατάστασης
+     (κατάργηση που κράτησε τα δεδομένα), δεν υπάρχει λογαριασμός πρώτης
+     εκκίνησης: συνδεθείτε με τον διαχειριστή εκείνης της εγκατάστασης, όπως
+     λέει η τελευταία σελίδα.
+  Αν το Setup γράψει «Η εγκατάσταση δεν μπορεί να συνεχιστεί», δεν άλλαξε
+  τίποτα: ο λόγος και τι κάνετε είναι στο docs\ADMIN_GUIDE.el.md, ενότητα 2.1c.
   Το Setup προσθέτει το «OmniIngest» στις Ρυθμίσεις > Εφαρμογές: το
   «Τροποποίηση» αλλάζει τον λογαριασμό της υπηρεσίας, το «Κατάργηση
   εγκατάστασης» την αφαιρεί. Αθόρυβη εγκατάσταση (/quiet) και κωδικοί
@@ -152,4 +165,8 @@ GUIDES
   Τα δεδομένα και ο λογαριασμός της υπηρεσίας μένουν.
   Αν η νέα έκδοση δεν ξεκινήσει, επανέρχεται αυτόματα η προηγούμενη.
   Κατάργηση: Ρυθμίσεις > Εφαρμογές > OmniIngest > Κατάργηση εγκατάστασης
-  (εγκατάσταση με το Setup), ή Uninstall.cmd. Ο φάκελος Dalet δεν αγγίζεται ποτέ.
+  (εγκατάσταση με το Setup), ή Uninstall.cmd. Οι ρυθμίσεις, η βάση δεδομένων
+  και τα αρχεία καταγραφής μένουν, εκτός αν επιλέξετε το πλαίσιο που τα
+  καταργεί κι αυτά (το Setup δείχνει τότε δεύτερη σελίδα με όσα φεύγουν, με
+  προεπιλογή το «Άκυρο»: πατήστε εκεί «Κατάργηση» για να συνεχίσετε). Ο φάκελος
+  Dalet δεν αγγίζεται ποτέ.

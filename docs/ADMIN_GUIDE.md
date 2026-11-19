@@ -417,7 +417,9 @@ remove the data too) and change the account (`/change-account /account
 
 ### 2.5 From the command line (Install.cmd)
 
-The zip installs without Setup, at a console. Unzip it on the server and
+The zip installs without Setup, at a console. Unzip it into a local folder on
+the server (not on a mapped network drive: the copy of `Install.cmd` that runs
+with administrator rights does not see your drive letters) and
 double-click **`Install.cmd`** (it asks for administrator rights), give the
 Dalet watchfolder when asked, and continue in the browser as in §2.1 (*Where
 it ends*). It installs the same way as Setup, except that there is no Apps &
@@ -458,10 +460,21 @@ jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build.
 
-The verified yt-dlp update also runs early when one platform has 3
-extraction failures in 30 minutes, at most once every 6 hours; it waits at
-most a minute and a half for running jobs and tries again later if they are
-still busy.
+The verified yt-dlp update also runs early when one platform (YouTube, X,
+Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) has 3 extraction
+failures in 30 minutes (a rate limit or a login wall does not count), at most
+once every 6 hours and only while the nightly update is on
+(`ytdl_auto_update_nightly`); it waits at most a minute and a half for running
+jobs and tries again later if they are still busy. It is recorded as a run of
+`ytdl_update` noted `early: …` (§7); the 03:00 run still happens. When the new
+build is kept, the jobs waiting in review for it get their second chance
+(§5.3, `retry.second_chance_window_mins`).
+
+yt-dlp is always started with `--ignore-config`, `--no-plugin-dirs` and
+`--ffmpeg-location` pointing at the pinned ffmpeg in `bin\` (downloads, probes,
+the cookie test, the self-check, the canaries, the benchmark and the repair
+route alike). A `yt-dlp.conf` in the service account's profile or a yt-dlp
+plugin folder is therefore ignored, and a merge always uses the pinned ffmpeg.
 
 The service reads the CPU of the machine it runs on. On an ARM64 Windows
 host it installs the native BtbN ARM64 ffmpeg and ffprobe, because the x64
@@ -517,8 +530,11 @@ needed; finished `.mxf` files and any other file are never touched. The job
 records where the file is going just before the final rename, so after a crash
 or restart a video that is already in the watchfolder is never delivered a
 second time: the job is finished as delivered ("Recovered after a restart").
-If the share cannot be read at that moment, the job goes to review instead of
-being requeued: check Dalet before retrying it.
+If the share cannot be read at that moment, the job waits for the watchfolder
+(§11.1) with that record; when the share answers, a file that is there finishes
+the job without a second copy, a file that is not there sends it to review
+(`DELIVERY_UNCONFIRMED`: check Dalet before retrying), and otherwise the job
+runs again from its link.
 
 ---
 
@@ -573,7 +589,7 @@ with a placeholder until you add the person (§6.3).
 | `mail_text_retention_days` | 30 | how long mail text is kept for the desk (in effect at most 90: the handled-mail records themselves are removed after 90 days) |
 | `archive.enabled`, `archive.retention_days` | true, 14 | archive of downloaded sources |
 | `retry.max_age_mins` | 120 | no automatic retry for a job older than this, counted from when it was queued or from MCR's last «Δοκιμή ξανά» (read as 30 to 360); see §10 |
-| `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | when a job not yet delivered counts as late, ordinary and urgent; not used yet |
+| `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | minutes after which a job that is waiting or running (not yet delivered) counts as late, ordinary and urgent, counted like `retry.max_age_mins` (read as 1 to 120). A late job is listed in the desk's «Καθυστερούν» strip with its reason, and the desk sounds once; a live stream waiting for its next check is listed whatever its age. See the User Guide, §4.9 |
 | `retry.second_chance_window_mins` | 120 | a job waiting in review goes back to the queue on its own when what it failed on is fixed: a new yt-dlp or Deno kept after the nightly self-check (jobs that failed to find or read the video), a cookie jar uploaded, signed in or tested good (that site's jobs that needed a login or were rate-limited), a news site that works again (that site's jobs that failed to find the video). Once per cause, at most once for a site and three times in all, never a job a person acted on («Δοκιμή ξανά», cancel, «Το έβαλα στο Dalet», reject, wrong video, an offered video queued…), never a job whose link is already queued or was delivered again meanwhile, and only while the job is younger than this, counted like `retry.max_age_mins` (read as 30 to 360, and never longer than `retry.max_age_mins`). The job's history says «Αυτόματη επανάληψη» and why |
 | `pacing.per_host_concurrency` | 1 | yt-dlp runs starting at one video platform (YouTube, X, Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) at a time, so a mail with many links does not trip the platform's bot check (read as 1 to 4). A download gives its turn back as soon as the video starts transferring, so downloads still overlap; a probe keeps it until it ends. A job waiting for its turn keeps its download slot; a wait over 2 s is written to its history |
 | `pacing.min_gap_secs` | 8 | seconds between two starts on one platform, plus up to 4 s at random (read as 0 to 120; 0 switches the gap off). After a platform refuses a run as a rate limit (`RATE_LIMITED`), nothing new starts there for 2 minutes |
@@ -686,6 +702,7 @@ Prometheus handles as a counter reset.
 
 | Card | Use |
 |---|---|
+| **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b) |
 | **Download engine** | yt-dlp version, update now, roll back |
 | **Toolchain** | install or repair ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno |
 | **Credentials** | set or clear the secrets above |
@@ -785,7 +802,7 @@ before every delete or import.
 
 | Task | When (local time) | What |
 |---|---|---|
-| `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp |
+| `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp; also run early when a platform starts failing, noted `early: …` (§3) |
 | `adblock_update` | daily 03:30 | refresh blocklists |
 | `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text, and the old database records below |
 | `selfcheck` | daily 05:15 | browser check and per-site check links |
@@ -828,6 +845,7 @@ Green = ok, amber = degraded, red = down.
 | `cookies` | a jar failed its test or expires within 7 days |
 | `lockdown` | the `data` and `temp` folders are not restricted to SYSTEM, Administrators and the service account |
 | `archive` | the archive disk is low |
+| `workers` | a job run hit an internal error in the last 24 hours (amber). Before delivery the job goes back to the queue once (after 30 s), then to review; during delivery it is never queued again: it is finished as delivered when its file is in the watchfolder, otherwise it goes to review with `DELIVERY_UNCONFIRMED`. If it repeats, send `logs\` to support |
 
 ---
 
@@ -851,6 +869,7 @@ Run from the install folder (elevated on an installed service).
 | `omni-ingest mail-ingest --eml <file>…` | queue saved `.eml` files as if they had arrived |
 | `omni-ingest mail-history [--last 20]` | handled mail, newest first |
 | `omni-ingest mail-reprocess --message-id <id> \| --subject <part>` | read a mail again on the next poll |
+| `omni-ingest report autonomy [--days 14]` | the Autonomy card's figures as text, for the last N days (1 to 365); reads only, safe while the service runs (§6) |
 | `omni-ingest browser-test <url>` | show what the page reader finds on a URL |
 | `omni-ingest selfcheck` | run the check links now (downloads nothing) |
 | `omni-ingest benchmark run [--mode extract\|full] [--targets 1-65] [--parallel 2]` | the benchmark corpus; `benchmark list`, `benchmark report <id>` |
@@ -886,7 +905,14 @@ or from MCR's last «Δοκιμή ξανά», is not retried. `LOW_DISK` retries
 more room than the temp or watchfolder volume has. While the disk check is
 red, no job is started at all; they wait in the queue. `RATE_LIMITED`
 retries after 2, 5, 10 and 15 minutes (five tries, about half an hour),
-within the same age limit.
+within the same age limit. While a job waits out one of these waits, the desk
+lists it as late once it is past `retry.late_after_mins`, and MCR's «Τώρα» runs
+it at once (that counts as a person acting on the job). A job in review with
+`LOGIN_REQUIRED` or `RATE_LIMITED` (a cookie jar for its site saved or tested
+good), or with `NO_STREAM_FOUND`, `VIDEO_UNRESOLVED`, `HTTP_403` or
+`UNSUPPORTED_URL` (a new yt-dlp or Deno kept, or its news site working again),
+may go back to the queue on its own: the second chance of §5.3
+(`retry.second_chance_window_mins`).
 
 | Code | Auto | Meaning / action |
 |---|---|---|
@@ -933,6 +959,7 @@ within the same age limit.
 | Wrong video from a news site | **Test URL** on the article; report the article link |
 | Files not appearing in Dalet | `watchfolder` health line; for a share, the service must run as an account with write rights on it (§2.2a), or the computer account must be granted on the share |
 | Everything waits | `disk` health line (no new jobs below 5 GB) |
+| The desk lists videos under «Καθυστερούν» | the reason on each row: «Περιμένει τον φάκελο παράδοσης» is a watchfolder outage (§11.1, `watchfolder` health line); «Νέα προσπάθεια στις …» is an automatic retry, with the code's hint (§10); «Ζωντανή μετάδοση· επόμενος έλεγχος …» is a stream still live (`LIVE_STREAM`). Many YouTube rows at once with «Ο ιστότοπος περιορίζει προσωρινά τις λήψεις»: `RATE_LIMITED`, see `pacing` (§5.3) and cookies (§6.1) |
 | Windows says *Windows protected your PC* when Setup starts | the file is not code-signed: check its `.sha256`, then **More info** → **Run anyway** (§2.1) |
 | Setup says **Setup cannot continue** | a refusal; nothing was changed. Find the message in §2.1c |
 | Setup says **The account was not accepted:** | the reason follows (§2.1c); correct the account or password on the same page |
