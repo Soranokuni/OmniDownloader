@@ -76,6 +76,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -Arch x64 -ToolsD
   `--verify`, `/?` του Setup): ένα πακέτο x64 μπορεί να δημιουργηθεί σε
   υπολογιστή ARM64, όπου τα προγράμματα x64 εκτελούνται με εξομοίωση, αλλά ένα
   πακέτο arm64 πρέπει να δημιουργηθεί σε μηχάνημα ARM64.
+- Το `omni-ingest.exe --version` και η πρώτη γραμμή του
+  `OmniIngest-Setup.exe /?` δείχνουν την έκδοση και το commit από το οποίο
+  δημιουργήθηκε το πρόγραμμα, για παράδειγμα `omni-ingest 1.0.0 (abc1234)`·
+  ένα build εκτός αποθετηρίου git γράφει `(unknown)`.
 
 ### 2.1 Εγκατάσταση με το Setup
 

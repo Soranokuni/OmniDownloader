@@ -28,6 +28,9 @@ use crate::ui::Ui;
 use crate::workdir::{create_secure_work_dir, WorkDir};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The short commit id this Setup was built from, "unknown" outside a
+/// checkout (set by build.rs, P14.4).
+pub const BUILD: &str = env!("OMNI_GIT_SHA");
 
 /// How a run ended: the process exit code, and the error to show (always,
 /// `/quiet` included).

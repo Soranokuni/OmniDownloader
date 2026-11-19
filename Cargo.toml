@@ -39,6 +39,19 @@ serde_json = "1.0"
 async-trait = "0.1"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
+# The shipped build (P14.4).
+[profile.release]
+# Thin: measured here, a full release build took 416 s against 676 s for fat
+# LTO, for an omni-ingest.exe only 3 % larger (26.7 MB against 25.8 MB) and
+# the same start-up time.
+lto = "thin"
+codegen-units = 1
+# No symbols in the .exe (the PDB beside it is not shipped); a panic message
+# still names its file and line (those are strings in the program).
+strip = "symbols"
+# A panic in a job is caught and the job released (P11.8): never "abort".
+# src/main.rs refuses to compile with panic = "abort".
+panic = "unwind"
 
 # The recipe interpreter parses whole pages; keep the HTML and regex engines
 # fast in debug test runs so the per-recipe time budget is meaningful.

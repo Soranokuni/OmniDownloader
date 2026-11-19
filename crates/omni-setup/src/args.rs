@@ -58,10 +58,14 @@ impl Command {
     }
 }
 
-/// The first line names the version: `scripts\package.ps1` reads it there.
+/// The first line names the version and the commit ("OmniIngest Setup 1.0.0
+/// (abc1234)"): `scripts\package.ps1` reads the version there.
 pub const USAGE: &str = concat!(
     "OmniIngest Setup ",
     env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("OMNI_GIT_SHA"),
+    ")",
     r#"
 
   OmniIngest-Setup.exe [/dir <folder>] [/account <name>] [/no-firewall] [/answer <file>] [/quiet]
@@ -542,9 +546,18 @@ mod tests {
 
     /// P13.1d: the packaging script reads Setup's version from the first line
     /// of `/?` and refuses a Setup whose version is not the packaged release's.
+    /// P14.4: the commit it was built from follows, in parentheses.
     #[test]
     fn the_usage_text_starts_with_the_setup_version() {
-        assert_eq!(USAGE.lines().next(), Some(format!("OmniIngest Setup {}", crate::run::VERSION).as_str()));
+        let build = crate::run::BUILD;
+        assert!(build == "unknown" || (build.len() == 7 && build.bytes().all(|b| b.is_ascii_hexdigit())), "{build}");
+        // Built inside a checkout, the commit is known: the reader of `.git` works
+        // for a plain checkout and a worktree alike.
+        let in_checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().any(|d| d.join(".git").exists());
+        if in_checkout && std::env::var_os("OMNI_BUILD_SHA").is_none() {
+            assert_ne!(build, "unknown", "built in a git checkout but the commit was not read");
+        }
+        assert_eq!(USAGE.lines().next(), Some(format!("OmniIngest Setup {} ({build})", crate::run::VERSION).as_str()));
         assert!(USAGE.contains("\n  OmniIngest-Setup.exe [/dir <folder>]"), "the rest of the text is unchanged");
     }
 
