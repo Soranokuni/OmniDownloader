@@ -1,12 +1,13 @@
 /* Journalist panel behaviour (plan P2.3, P2.5), in Greek. */
 
 import {
-  api, el, render, live, toast, fmtTime, logout,
+  api, el, render, live, fmtTime, logout,
 } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=1';
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
 import { statusBadge } from '/static/status.js?v=1';
-import { deferAction, hiddenNow } from '/static/undo.js?v=1';
+import { deferAction, hiddenNow } from '/static/undo.js?v=2';
 
 /** Where a working video is, in words a journalist knows. */
 const STAGE_TEXT = {

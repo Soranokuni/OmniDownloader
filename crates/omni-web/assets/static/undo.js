@@ -16,7 +16,8 @@
  * effort. Nothing here builds HTML from a string.
  */
 
-import { el, toast } from '/static/app.js?v=6';
+import { el } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=1';
 
 export const UNDO_MS = 8000;
 

@@ -9,8 +9,9 @@
  * Nothing here builds HTML from a string: see app.js.
  */
 
-import { api, el, fmtDuration, safeHref, toast } from '/static/app.js?v=6';
-import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=17';
+import { api, el, fmtDuration, safeHref } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=1';
+import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=18';
 import { confirmDialog } from '/static/dialog.js?v=1';
 import { statusBadge } from '/static/status.js?v=1';
 

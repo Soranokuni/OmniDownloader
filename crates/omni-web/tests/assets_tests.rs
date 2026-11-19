@@ -378,17 +378,18 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 17),
-        ("inbox.js", 24),
-        ("approval.js", 12),
-        ("notify.js", 12),
-        ("mcr.js", 50),
+        ("desk.js", 18),
+        ("inbox.js", 25),
+        ("approval.js", 13),
+        ("notify.js", 13),
+        ("mcr.js", 51),
         ("status.js", 1),
-        ("status.css", 4),
+        ("status.css", 5),
         ("worklist.js", 1),
-        ("undo.js", 1),
+        ("undo.js", 2),
         ("dialog.js", 1),
-        ("user.js", 10),
+        ("user.js", 11),
+        ("toast.js", 1),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -691,7 +692,7 @@ fn the_desk_uses_no_native_dialogs() {
     };
     let desk_modules = [
         "app.js", "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js",
-        "status.js", "worklist.js", "undo.js", "dialog.js",
+        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js",
     ];
     for module in desk_modules {
         let src = code(module);
@@ -856,7 +857,10 @@ fn the_desk_is_laid_out_for_the_control_room() {
     assert!(mcr.contains("paintHealth(data)") && mcr.contains("'Φάκελος παράδοσης (Dalet)'"), "the panel has no free space");
 
     // No static inline styles: only a progress width, a CSS variable and a computed scroll margin.
-    for module in ["desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js", "dialog.js"] {
+    for module in [
+        "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js", "dialog.js",
+        "toast.js",
+    ] {
         let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
         for (i, _) in src.match_indices("style: ") {
             let value = &src[i + "style: ".len()..];
@@ -876,12 +880,84 @@ fn the_desk_is_laid_out_for_the_control_room() {
     }
 }
 
+/// P12.6: health in plain Greek. Every check the daemon can report (the names in
+/// `omni_core::health::checks`) has three Greek texts on the desk: what happened (by state), what
+/// it means for the videos, what to do and who does it. The banner never shows the tool's English
+/// detail, a site line is a Greek sentence, and an error message stays until closed, is announced
+/// assertively, and stacks at most three.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v10() {
+fn health_is_told_in_plain_greek() {
+    let assets = all_assets();
+    let notify = assets.get("static/notify.js").expect("notify.js shipped");
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
+
+    let health_rs = include_str!("../../omni-core/src/health.rs");
+    let module = health_rs.split("pub mod checks {").nth(1).and_then(|s| s.split("\n}").next()).expect("checks module");
+    let names: Vec<&str> = module
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pub const "))
+        .filter_map(|l| l.split('"').nth(1))
+        .collect();
+    assert!(names.len() >= 15, "found only {names:?} in health.rs");
+    let table = notify.split("export const CHECK_INFO = {").nth(1).and_then(|s| s.split("\n};").next()).expect("CHECK_INFO");
+    let field = |row: &str, key: &str| -> String {
+        let pat = format!("{key}: '");
+        row.split(pat.as_str()).nth(1).and_then(|s| s.split('\'').next()).unwrap_or("").to_string()
+    };
+    for name in names {
+        let head = format!("  {name}: {{");
+        let row = table.lines().find(|l| l.starts_with(&head)).unwrap_or_else(|| panic!("no Greek texts for the `{name}` check"));
+        assert!(!field(row, "name").is_empty(), "`{name}` has no name");
+        for key in ["degraded", "down", "means", "todo"] {
+            let text = field(row, key);
+            assert!(greek(&text), "`{name}` has no Greek `{key}`: {text:?}");
+        }
+        let who = field(row, "who");
+        assert!(who == "mcr" || who == "admin", "`{name}` does not say who acts: {who:?}");
+    }
+
+    // The banner and the panel's lines: the three texts, never the tool's detail.
+    let texts = function_body(mcr, "healthTextNodes");
+    for needle in ["t.happened", "t.means", "t.todo", "WHO[t.who]", "'Για τα βίντεο: '", "'Τι κάνετε: '"] {
+        assert!(texts.contains(needle), "a health line lost {needle}");
+    }
+    assert!(!texts.contains(".detail"), "a health line shows the tool's own detail");
+    let banner = mcr
+        .split("const problems = healthProblems(checks);")
+        .nth(1)
+        .and_then(|s| s.split("render(banner,").nth(1))
+        .and_then(|s| s.split(";\n").next())
+        .expect("the health banner");
+    assert!(banner.contains("healthTextNodes(") && !banner.contains("detail"), "the banner shows the tool's detail:\n{banner}");
+    assert!(mcr.contains("'Τεχνικές λεπτομέρειες'"), "the panel has no place for the tool's detail");
+    // A site is a sentence, from the payload's `sites` rows.
+    assert!(texts.contains("name === 'sites'") && texts.contains("map(siteSentence)"), "the sites line is not told per site");
+    let site = function_body(notify, "siteSentence");
+    for needle in ["Ο ιστότοπος ${site.domain}", "από τις ${at}", "αποτυχίες στη σειρά", "'δεν δίνει βίντεο'"] {
+        assert!(site.contains(needle), "the site sentence lost {needle}");
+    }
+
+    // Messages: an error stays until closed, is announced at once, three at most.
+    let toast = assets.get("static/toast.js").expect("toast.js shipped");
+    assert!(toast.contains("role: 'alert', 'aria-live': 'assertive'"), "errors are not announced assertively");
+    assert!(toast.contains("export const MAX_ERRORS = 3;") && toast.contains("errors.children.length > MAX_ERRORS"), "errors can pile up");
+    let bad = toast.split("if (kind === 'bad') {").nth(1).and_then(|s| s.split("\n  }\n").next()).expect("the error branch");
+    assert!(bad.contains("toast-close") && !bad.contains("setTimeout"), "an error message goes away by itself");
+    for module in ["desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "undo.js"] {
+        let src = assets.get(&format!("static/{module}")).unwrap();
+        assert!(src.contains("import { toast } from '/static/toast.js?v="), "{module} does not use the desk's messages");
+        let app_import = src.split("from '/static/app.js").next().and_then(|s| s.rsplit("import").next()).unwrap_or("");
+        assert!(!app_import.contains("toast"), "{module} still takes toast() from app.js");
+    }
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v11() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=10"), "user.html does not import user.js?v=10");
-    assert!(!page.contains("/static/user.js?v=9"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=11"), "user.html does not import user.js?v=11");
+    assert!(!page.contains("/static/user.js?v=10"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

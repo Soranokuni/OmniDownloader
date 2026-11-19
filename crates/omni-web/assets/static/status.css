@@ -183,8 +183,6 @@ select.auto, input.auto { width: auto; }
 .gap-left { margin-left: 8px; }
 .card.pager { padding: 10px 14px; }
 .pager-page { padding: 0 8px; }
-.banner-line { margin-top: 8px; }
-.banner-line .note { font-size: 13px; }
 .offer-row { border-top: 1px solid var(--line); padding-top: 10px; }
 .row.head-row { gap: 10px; align-items: flex-start; }
 .under-name { margin: 2px 0 0; }
@@ -195,6 +193,32 @@ strong.block { display: block; }
 .fchip .pip.warn { background: var(--warn); }
 .fchip .pip.ok   { background: var(--ok); }
 .fchip .pip.none { background: #3a4762; }
+
+/* Health in plain Greek (plan P12.6): what happened, what it means for the
+ * videos, what to do and who does it; the tool's words folded away. */
+.banner-line { margin-top: 12px; }
+.hl-name { display: block; font-size: 15px; }
+.hl-happened, .hl-means, .hl-todo { margin: 3px 0 0; font-size: 14px; line-height: 1.45; }
+.hl-label { color: var(--text-dim); font-weight: 600; }
+.badge.who { margin-left: 4px; text-transform: none; letter-spacing: 0; }
+.badge.who.mcr   { color: var(--accent); border-color: rgba(34, 211, 238, 0.35); }
+.badge.who.admin { color: var(--busy); border-color: rgba(167, 139, 250, 0.35); }
+.hp-texts { grid-column: 2 / 4; }
+.hp-texts .hl-happened, .hp-texts .hl-means, .hp-texts .hl-todo { font-size: 13px; }
+.hp-tech { grid-column: 2 / 4; margin-top: 2px; }
+
+/* Messages: an error stays, with its «✕», until closed; at most three. */
+.desk-toasts { gap: 8px; }
+.toast-stack { display: flex; flex-direction: column; gap: 8px; }
+.toast.sticky { display: flex; align-items: flex-start; gap: 10px; }
+.toast.sticky .toast-text { flex: 1; }
+.toast-close {
+  appearance: none; flex: 0 0 auto;
+  background: none; border: 1px solid var(--line); border-radius: 6px;
+  color: var(--text-dim); font: inherit; font-size: 13px; line-height: 1;
+  padding: 4px 7px; cursor: pointer;
+}
+.toast-close:hover { color: var(--text); border-color: var(--text-dim); }
 
 /* Nothing under 12 px: app.css's smaller sizes, raised on these pages. */
 thead th { font-size: 12px; }

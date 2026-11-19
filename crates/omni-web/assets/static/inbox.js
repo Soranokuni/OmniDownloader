@@ -16,13 +16,14 @@
  * half-typed link is never lost.
  */
 
-import { api, el, render, toast, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
+import { api, el, render, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=1';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=17';
-import { visible } from '/static/undo.js?v=1';
+} from '/static/desk.js?v=18';
+import { visible } from '/static/undo.js?v=2';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
 } from '/static/status.js?v=1';

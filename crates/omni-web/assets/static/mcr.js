@@ -13,23 +13,25 @@
  */
 
 import {
-  api, el, render, toast, fmtTime, fmtDuration, logout, safeHref, icon,
+  api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=1';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=17';
-import { deferAction, visible } from '/static/undo.js?v=1';
+} from '/static/desk.js?v=18';
+import { deferAction, visible } from '/static/undo.js?v=2';
 import { confirmDialog } from '/static/dialog.js?v=1';
 import { STATUS, statusBadge } from '/static/status.js?v=1';
 import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=1';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=24';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=25';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
-} from '/static/notify.js?v=12';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=12';
+  checkTexts, siteSentence, WHO,
+} from '/static/notify.js?v=13';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=13';
 
 let journalists = [];
 
@@ -202,17 +204,10 @@ async function loadStatusOnce() {
     banner.hidden = true;
   } else {
     banner.hidden = false;
+    // In plain Greek only (P12.6): the tool's own detail is in the header's panel.
     render(banner, el('div', { class: 'card attention' },
       el('strong', {}, problems.some(([name, c]) => name !== 'mail' && c.state === 'down') ? 'Η λήψη βίντεο έχει σταματήσει' : 'Προσοχή'),
-      ...problems.map(([name, c]) => {
-        const info = CHECK_INFO[name];
-        return el('div', { class: 'banner-line' },
-          el('div', {}, info ? info.name : name),
-          info?.action ? el('div', {}, info.action) : null,
-          el('div', { class: 'note mono' }, c.detail || c.state),
-        );
-      }),
-    ));
+      ...problems.map(([name, c]) => el('div', { class: 'banner-line' }, healthTextNodes(name, c, data)))));
   }
   renderSelfheal(data.selfheal);
   watchStatus(data);
@@ -232,6 +227,32 @@ const gb = (v) => (v === undefined || v === null
   ? 'άγνωστο'
   : `${Number(v).toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`);
 
+const panelTechOpen = new Set();
+const SITES_SHOWN = 3;
+
+/**
+ * A check that is not OK, in plain Greek (P12.6): what happened, what it
+ * means for the videos, what to do and who does it. A site line names the
+ * sites from the payload's `sites`, one sentence each. `withName` puts the
+ * check's name first (the banner; the panel has it in its own column).
+ */
+function healthTextNodes(name, check, data, withName = true) {
+  const t = checkTexts(name, check);
+  let happened = [t.happened];
+  if (name === 'sites' && Array.isArray(data.sites) && data.sites.length) {
+    happened = data.sites.slice(0, SITES_SHOWN).map(siteSentence);
+    const more = data.sites.length - SITES_SHOWN;
+    if (more > 0) happened.push(more === 1 ? 'Και 1 ακόμη ιστότοπος.' : `Και ${more} ακόμη ιστότοποι.`);
+  }
+  return [
+    withName ? el('strong', { class: 'hl-name' }, t.name) : null,
+    el('p', { class: 'hl-happened' }, happened.join(' ')),
+    el('p', { class: 'hl-means' }, el('span', { class: 'hl-label' }, 'Για τα βίντεο: '), t.means),
+    el('p', { class: 'hl-todo' }, el('span', { class: 'hl-label' }, 'Τι κάνετε: '), t.todo, ' ',
+      el('span', { class: `badge who ${t.who}` }, WHO[t.who] || WHO.admin)),
+  ];
+}
+
 /** The pill and the panel from a status payload; `null` while the service does not answer. */
 function paintHealth(data) {
   const s = data ? healthSummary(data.checks || {}) : { tone: 'bad', text: 'Η υπηρεσία δεν απαντά' };
@@ -246,14 +267,21 @@ function paintHealth(data) {
   const checks = data.checks || {};
   const q = data.queue;
   const lines = Object.entries(checks).map(([name, c]) => {
-    const info = CHECK_INFO[name];
     const bad = c.state !== 'ok';
+    let tech = null;
+    if (c.detail) {
+      // The check's own words, for support; open stays open across the 5 s refresh.
+      tech = el('details', { class: 'tech hp-tech' }, el('summary', {}, 'Τεχνικές λεπτομέρειες'),
+        el('span', { class: 'hp-detail mono' }, c.detail));
+      if (panelTechOpen.has(name)) tech.open = true;
+      tech.addEventListener('toggle', () => { if (tech.open) panelTechOpen.add(name); else panelTechOpen.delete(name); });
+    }
     return el('li', { class: `hp-check ${bad ? 'bad' : ''}`.trim() },
       el('span', { class: `dot ${DOT[c.state] || ''}`.trim(), 'aria-hidden': 'true' }),
-      el('span', { class: 'hp-name' }, info ? info.name : name),
+      el('span', { class: 'hp-name' }, CHECK_INFO[name] ? CHECK_INFO[name].name : name),
       el('span', { class: 'hp-state' }, STATE_WORD[c.state] || 'άγνωστο'),
-      bad && info?.action ? el('span', { class: 'hp-action' }, info.action) : null,
-      c.detail ? el('span', { class: 'hp-detail mono' }, c.detail) : null);
+      bad ? el('div', { class: 'hp-texts' }, healthTextNodes(name, c, data, false)) : null,
+      tech);
   });
   render(healthPanel,
     el('h2', { class: 'hp-title' }, s.text),

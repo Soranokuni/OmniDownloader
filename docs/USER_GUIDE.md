@@ -302,6 +302,18 @@ opening it, or the browser keeps the sound muted. The desk also warns when the
 ingest service stops answering («Η υπηρεσία λήψης δεν απαντά») and when it is
 back.
 
+A message about something that went wrong (red) stays until you close it with
+«✕»; at most three are shown, the oldest going first. Other messages leave by
+themselves after a few seconds.
+
+A health problem is told in three parts, in the banner above the tabs and in
+the health pill's panel: what happened, what it means for the videos
+(«Για τα βίντεο: …») and what to do («Τι κάνετε: …»), with who does it:
+**MCR** or **Διαχειριστής** (the administrator). A site that stopped giving
+video is named in a sentence, for example «Ο ιστότοπος example.gr δεν δίνει
+βίντεο από τις 14:21 (4 αποτυχίες στη σειρά).» The system's own technical text
+is only in the panel, under «Τεχνικές λεπτομέρειες», for support.
+
 ### 4.8 Keeping the lists tidy
 
 - «Αφαίρεση παραδοθέντων από τη λίστα» (Completed tab) clears delivered jobs

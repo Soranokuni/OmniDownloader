@@ -19,7 +19,8 @@
  * when the desk is opened stays quiet.
  */
 
-import { api, el, toast } from '/static/app.js?v=6';
+import { api, el } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=1';
 
 const POLL_MS = 8000;
 const PREF_KEY = 'omni.mcr.chime';
@@ -92,54 +93,71 @@ function alarm() {
   return true;
 }
 
-/** Check name -> what the desk calls it and what MCR should do. */
+/**
+ * Every health check in plain Greek (P12.6), one row per check name of
+ * `omni_core::health::checks`. Three texts, never the tool's English:
+ *   degraded / down  what happened (by how bad it is)
+ *   means            what it means for the videos
+ *   todo             what to do; `who` does it: 'mcr' or 'admin'
+ * The check's own detail (English, for support) goes under «Τεχνικές
+ * λεπτομέρειες» in the header's panel, never in the banner.
+ */
 export const CHECK_INFO = {
-  mail: {
-    name: 'Email (εισερχόμενα)',
-    action: 'Τα νέα email δεν διαβάζονται· θέματα που στέλνονται τώρα δεν θα εμφανιστούν. Ενημερώστε τον διαχειριστή.',
-  },
-  encoder: {
-    name: 'Κωδικοποιητής',
-    action: 'Τα βίντεο δεν μετατρέπονται σε μορφή εκπομπής. Ενημερώστε τον διαχειριστή· χρειάζεται επανεκκίνηση της υπηρεσίας.',
-  },
-  tools: {
-    name: 'Εργαλεία',
-    action: 'Λείπει ή χάλασε εργαλείο λήψης/μετατροπής. Ενημερώστε τον διαχειριστή.',
-  },
-  watchfolder: {
-    name: 'Watchfolder',
-    action: 'Δεν γράφεται ο φάκελος του Dalet· τα έτοιμα βίντεο δεν παραδίδονται. Ελέγξτε τη σύνδεση με τον server του Dalet και ενημερώστε τον διαχειριστή.',
-  },
-  disk: {
-    name: 'Δίσκος',
-    action: 'Ο δίσκος γεμίζει· κάτω από 5 GB ελεύθερα οι λήψεις σταματούν. Ενημερώστε τον διαχειριστή.',
-  },
-  browser: {
-    name: 'Πρόγραμμα περιήγησης',
-    action: 'Ο ενσωματωμένος browser δεν ξεκινά· βίντεο μέσα σε άρθρα ειδησεογραφικών σελίδων μπορεί να αποτύχουν.',
-  },
-  selfcheck: {
-    name: 'Αυτοέλεγχος',
-    action: 'Κάποιοι δοκιμαστικοί σύνδεσμοι δεν κατεβαίνουν· ίσως ένας ιστότοπος άλλαξε. Ενημερώστε τον διαχειριστή αν επιμένει.',
-  },
-  deno: {
-    name: 'YouTube (Deno)',
-    action: 'Τα βίντεο από YouTube μπορεί να αποτυγχάνουν. Ενημερώστε τον διαχειριστή.',
-  },
-  queue: {
-    name: 'Ουρά',
-    action: 'Βίντεο περιμένουν ή τρέχουν ασυνήθιστα πολύ. Ελέγξτε την καρτέλα «Σε εξέλιξη».',
-  },
-  workers: {
-    name: 'Εκτέλεση εργασιών',
-    action: 'Κάποια εργασία σταμάτησε από εσωτερικό σφάλμα και μπήκε ξανά στην ουρά. Αν επαναληφθεί, ενημερώστε τον διαχειριστή.',
-  },
-  accounts: { name: 'Λογαριασμοί', action: '' },
-  sites: {
-    name: 'Ιστότοποι',
-    action: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο· οι εργασίες από αυτόν ίσως χρειαστούν χειροκίνητη λήψη.',
-  },
+  mail: { name: 'Email (εισερχόμενα)', degraded: 'Η ανάγνωση των email έχει πρόβλημα.', down: 'Τα νέα email δεν διαβάζονται.', means: 'Σύνδεσμοι που στέλνονται τώρα με email δεν εμφανίζονται· όσα βίντεο είναι ήδη στην ουρά συνεχίζουν.', todo: 'Ενημερώστε τον διαχειριστή. Μέχρι τότε προσθέστε τους επείγοντες συνδέσμους με το χέρι.', who: 'admin' },
+  llm: { name: 'Βοηθός ανάγνωσης (LLM)', degraded: 'Ο βοηθός που αναγνωρίζει δημοσιογράφο και θέμα δεν απαντά.', down: 'Ο βοηθός που αναγνωρίζει δημοσιογράφο και θέμα δεν λειτουργεί.', means: 'Τα βίντεο κατεβαίνουν κανονικά· κάποια email ίσως μείνουν χωρίς δημοσιογράφο ή λέξη-κλειδί.', todo: 'Ελέγξτε τα ονόματα των νέων αρχείων· αν επιμένει, ενημερώστε τον διαχειριστή.', who: 'admin' },
+  tools: { name: 'Εργαλεία λήψης και μετατροπής', degraded: 'Ένα εργαλείο λήψης ή μετατροπής έχει πρόβλημα.', down: 'Λείπει ή δεν ξεκινά ένα εργαλείο λήψης ή μετατροπής.', means: 'Βίντεο μπορεί να μην κατεβαίνουν ή να μη μετατρέπονται.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
+  pinned_tools: { name: 'Εκδόσεις εργαλείων', degraded: 'Ένα εργαλείο μετατροπής δεν είναι η έκδοση που έχει ελεγχθεί.', down: 'Ένα εργαλείο μετατροπής δεν είναι η έκδοση που έχει ελεγχθεί.', means: 'Κάθε αρχείο ελέγχεται πριν παραδοθεί· ένα που δεν πληροί τις προδιαγραφές δεν φτάνει στο Dalet.', todo: 'Ενημερώστε τον διαχειριστή να βάλει πάλι τη σωστή έκδοση.', who: 'admin' },
+  encoder: { name: 'Κωδικοποιητής', degraded: 'Ο έλεγχος του κωδικοποιητή στην εκκίνηση βγήκε με πρόβλημα.', down: 'Ο κωδικοποιητής δεν φτιάχνει σωστό αρχείο εκπομπής.', means: 'Τα βίντεο δεν μετατρέπονται σε μορφή εκπομπής και δεν παραδίδονται.', todo: 'Ενημερώστε αμέσως τον διαχειριστή· χρειάζεται επανεκκίνηση της υπηρεσίας.', who: 'admin' },
+  watchfolder: { name: 'Φάκελος παράδοσης (Dalet)', degraded: 'Ο φάκελος του Dalet απαντά με πρόβλημα.', down: 'Ο φάκελος του Dalet δεν δέχεται αρχεία.', means: 'Τα έτοιμα βίντεο δεν παραδίδονται· περιμένουν και φεύγουν μόλις ο φάκελος επανέλθει.', todo: 'Ελέγξτε ότι ο server του Dalet λειτουργεί και ενημερώστε τον διαχειριστή.', who: 'mcr' },
+  disk: { name: 'Χώρος στον δίσκο', degraded: 'Ο ελεύθερος χώρος στον δίσκο λιγοστεύει.', down: 'Ο δίσκος είναι σχεδόν γεμάτος.', means: 'Κάτω από 5 GB ελεύθερα δεν ξεκινά καμία νέα λήψη.', todo: 'Ενημερώστε τον διαχειριστή να ελευθερώσει χώρο.', who: 'admin' },
+  browser: { name: 'Ενσωματωμένος browser', degraded: 'Ο browser που ψάχνει βίντεο μέσα σε άρθρα απέτυχε στη δοκιμή του.', down: 'Ο browser που ψάχνει βίντεο μέσα σε άρθρα δεν ξεκινά.', means: 'Βίντεο από YouTube και άλλες πλατφόρμες κατεβαίνουν· βίντεο μέσα σε άρθρα ειδησεογραφικών σελίδων μπορεί να αποτύχουν.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
+  selfcheck: { name: 'Νυχτερινός αυτοέλεγχος', degraded: 'Κάποιοι δοκιμαστικοί σύνδεσμοι δεν κατέβηκαν στον τελευταίο έλεγχο.', down: 'Οι δοκιμαστικοί σύνδεσμοι δεν κατεβαίνουν.', means: 'Ίσως ένας ιστότοπος άλλαξε· βίντεο από αυτόν μπορεί να χρειαστούν χειροκίνητη λήψη.', todo: 'Αν επιμένει πάνω από μία ημέρα, ενημερώστε τον διαχειριστή.', who: 'admin' },
+  deno: { name: 'YouTube (Deno)', degraded: 'Το Deno, που χρειάζεται για το YouTube, λείπει ή κατεβαίνει ακόμη.', down: 'Το Deno, που χρειάζεται για το YouTube, δεν λειτουργεί.', means: 'Βίντεο από YouTube μπορεί να αποτυγχάνουν.', todo: 'Περιμένετε λίγα λεπτά· αν δεν επανέλθει, ενημερώστε τον διαχειριστή.', who: 'admin' },
+  queue: { name: 'Ουρά', degraded: 'Βίντεο περιμένουν ή επεξεργάζονται ασυνήθιστα πολύ.', down: 'Η ουρά δεν προχωρά.', means: 'Κάποια βίντεο θα αργήσουν να φτάσουν στο Dalet.', todo: 'Δείτε την καρτέλα «Σε εξέλιξη» και τη λωρίδα «Καθυστερούν»· αν τίποτα δεν προχωρά, ενημερώστε τον διαχειριστή.', who: 'mcr' },
+  workers: { name: 'Εκτέλεση εργασιών', degraded: 'Μια εργασία σταμάτησε από εσωτερικό σφάλμα το τελευταίο 24ωρο.', down: 'Οι εργασίες σταματούν από εσωτερικό σφάλμα.', means: 'Η εργασία ξαναμπήκε στην ουρά ή πήγε για έλεγχο· τα υπόλοιπα βίντεο συνεχίζουν.', todo: 'Αν επαναληφθεί, ενημερώστε τον διαχειριστή.', who: 'admin' },
+  accounts: { name: 'Λογαριασμοί', degraded: 'Ο αρχικός λογαριασμός Admin με τον αρχικό κωδικό λειτουργεί ακόμη.', down: 'Ο αρχικός λογαριασμός Admin με τον αρχικό κωδικό λειτουργεί ακόμη.', means: 'Τα βίντεο δεν επηρεάζονται· η σελίδα διαχείρισης όμως δεν είναι ασφαλής.', todo: 'Ο διαχειριστής αλλάζει τον κωδικό του λογαριασμού Admin.', who: 'admin' },
+  sites: { name: 'Ιστότοποι', degraded: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο.', down: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο.', means: 'Βίντεο από αυτόν τον ιστότοπο μπορεί να χρειαστούν χειροκίνητη λήψη.', todo: 'Για κάθε βίντεο που σταματά, ανοίξτε τον σύνδεσμο και κατεβάστε το με το χέρι, ή δώστε άλλον σύνδεσμο.', who: 'mcr' },
+  cookies: { name: 'Cookies σύνδεσης', degraded: 'Τα cookies για κάποιον ιστότοπο λήγουν, απέτυχαν ή δεν έχουν δοκιμαστεί.', down: 'Τα cookies σύνδεσης δεν διαβάζονται.', means: 'Βίντεο από ιστότοπους που ζητούν σύνδεση μπορεί να αποτύχουν.', todo: 'Ο διαχειριστής ανεβάζει νέα cookies (Διαχείριση → Cookies).', who: 'admin' },
+  lockdown: { name: 'Προστασία φακέλων', degraded: 'Οι φάκελοι δεδομένων και προσωρινών αρχείων δεν είναι κλειδωμένοι.', down: 'Οι φάκελοι δεδομένων και προσωρινών αρχείων δεν είναι κλειδωμένοι.', means: 'Τα βίντεο δεν επηρεάζονται.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
+  archive: { name: 'Αρχείο πηγών', degraded: 'Η φύλαξη των αρχικών αρχείων σταμάτησε (λίγος χώρος ή λάθος φάκελος).', down: 'Η φύλαξη των αρχικών αρχείων σταμάτησε.', means: 'Τα βίντεο παραδίδονται κανονικά· τα αρχικά τους δεν κρατιούνται.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
 };
+
+/** Who does what a line asks. */
+export const WHO = { mcr: 'MCR', admin: 'Διαχειριστής' };
+
+/** The three texts of a check that is not OK; a check the desk does not know
+ *  yet still gets Greek, never only its English detail. */
+export function checkTexts(name, check) {
+  const info = CHECK_INFO[name];
+  const state = check && check.state === 'down' ? 'down' : 'degraded';
+  if (!info) {
+    return {
+      name,
+      happened: 'Ένας έλεγχος του συστήματος αναφέρει πρόβλημα.',
+      means: 'Ίσως επηρεάζει κάποια βίντεο.',
+      todo: 'Ενημερώστε τον διαχειριστή.',
+      who: 'admin',
+    };
+  }
+  return { name: info.name, happened: info[state], means: info.means, todo: info.todo, who: info.who };
+}
+
+/** «14:21», or '' for a missing or unreadable time (never "now"). */
+function hhmm(at) {
+  const d = at ? new Date(at) : null;
+  if (!d || Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+/** A site that stopped giving video, as one Greek sentence (P12.6), from the
+ *  status payload's `sites` row: «Ο ιστότοπος x.gr δεν δίνει βίντεο από τις 14:21 (4 αποτυχίες στη σειρά).» */
+export function siteSentence(site) {
+  const what = site.state === 'broken' ? 'δεν δίνει βίντεο' : 'δίνει βίντεο με δυσκολία';
+  const at = hhmm(site.state_since);
+  const n = Number(site.consecutive_fail) || 0;
+  const fails = n === 1 ? ' (1 αποτυχία)' : n > 1 ? ` (${n} αποτυχίες στη σειρά)` : '';
+  return `Ο ιστότοπος ${site.domain} ${what}${at ? ` από τις ${at}` : ''}${fails}.`;
+}
 
 /** The checks that are not OK, as `[name, check]`, for the banner and the
  *  header's pill. The LLM is left out: without it the parser still works,
@@ -239,8 +257,8 @@ export function watchStatus(data) {
   }
   if (diff.wentBad.length) alarm();
   for (const bad of diff.wentBad) {
-    const info = CHECK_INFO[bad.name];
-    const text = `Πρόβλημα: ${info ? info.name : bad.name}${info?.action ? ` — ${info.action}` : ''}`;
+    const t = checkTexts(bad.name, bad);
+    const text = `Πρόβλημα: ${t.name} — ${t.happened} ${t.todo}`;
     toast(text, 'bad');
     plainNotification(text, `omni-health-${bad.name}`);
   }
