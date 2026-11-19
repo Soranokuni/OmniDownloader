@@ -473,8 +473,9 @@ async fn late_after(state: &AppState) -> omni_core::models::LateAfter {
 /// and what to do about it, in the operators' language.
 ///
 /// `late`, `next_try_at` and `wait_reason` (P11.3b) say whether the video is
-/// late and what it is waiting for: `delivery` (the watchfolder), `retry` (a
-/// back-off), `running`, `queue`; `null` for a job that is neither waiting nor running.
+/// late and what it is waiting for: `delivery` (the watchfolder), `live` (the
+/// next check of a stream still live, P11.7), `retry` (a back-off), `running`,
+/// `queue`; `null` for a job that is neither waiting nor running.
 fn job_for_desk(
     repo: &omni_core::repository::Repository,
     job: &omni_core::models::Job,
@@ -487,6 +488,8 @@ fn job_for_desk(
     v["next_try_at"] = next_try.map(omni_core::timestamps::format).into();
     let reason: Option<&str> = match job.status {
         JobStatus::Pending if job.delivery_wait => Some("delivery"),
+        // A stream still live waits for its next check (P11.7).
+        JobStatus::Pending if job.waits_for_live_check(now) => Some("live"),
         JobStatus::Pending if next_try.is_some() => Some("retry"),
         JobStatus::Pending => Some("queue"),
         JobStatus::Running => Some("running"),

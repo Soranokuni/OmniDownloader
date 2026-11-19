@@ -377,7 +377,7 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 #[test]
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
-    for (module, version) in [("desk.js", 13), ("inbox.js", 19), ("approval.js", 8), ("notify.js", 11), ("mcr.js", 45)] {
+    for (module, version) in [("desk.js", 14), ("inbox.js", 20), ("approval.js", 9), ("notify.js", 11), ("mcr.js", 46)] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
         for s in assets.values() {
@@ -436,6 +436,14 @@ fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
     );
     assert!(mcr.contains("syncKeyedList(lateList,"), "the late strip is not reconciled by job id");
     assert!(mcr.contains("/now`, { method: 'POST' }"), "no «Τώρα» action");
+    // P11.7: «Τώρα» for a back-off and for a stream still live waiting for its next check.
+    let row = mcr.split("function lateRow(job)").nth(1).and_then(|s| s.split("\n}").next()).expect("mcr.js has lateRow");
+    let button = row.split("el('button'").next().unwrap();
+    assert!(
+        button.contains("job.wait_reason === 'retry' || job.wait_reason === 'live'"),
+        "the late strip does not offer «Τώρα» for both 'retry' and 'live':\n{row}"
+    );
+    assert!(row.contains("runNow(job, ev.currentTarget)"), "the late row's button does not run the job now");
     assert!(mcr.contains("και άλλα"), "the strip does not cap its rows");
     let page = assets.get("mcr.html").expect("mcr.html shipped");
     let strip = page.find("id=\"late-strip\"").expect("the strip is in mcr.html");
@@ -450,6 +458,13 @@ fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
     let desk = assets.get("static/desk.js").expect("desk.js shipped");
     assert!(desk.contains("Περιμένει τον φάκελο παράδοσης"), "desk.js has no watchfolder wait text");
     assert!(desk.contains("export function lateReason"), "desk.js has no lateReason");
+
+    // P11.7: a stream still live says so, with its next check's time, in the late strip.
+    let late = desk.split("export function lateReason").nth(1).and_then(|s| s.split("\nexport function").next()).unwrap();
+    let live = late.split("case 'live':").nth(1).expect("lateReason has no case for wait_reason 'live'");
+    let live = live.split("case '").next().unwrap();
+    assert!(live.contains("Ζωντανή μετάδοση"), "the live case does not say «Ζωντανή μετάδοση»:\n{live}");
+    assert!(live.contains("επόμενος έλεγχος ${at}") && live.contains("clock(job.next_try_at)"), "the live case does not show the next check's time:\n{live}");
 }
 
 /// P12.3: the desk's lists are updated in place. A full `render(list, every card)` on the 5 s

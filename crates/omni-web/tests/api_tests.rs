@@ -1705,6 +1705,36 @@ async fn the_desk_says_what_a_late_or_waiting_video_waits_for() -> Result<()> {
     Ok(())
 }
 
+/// P11.7: a stream still live that waits for its next check is late from the
+/// first check, says `live` with the check's time, and is in the late list
+/// and its count, though younger than the late limit.
+#[tokio::test]
+async fn a_live_stream_waiting_for_its_next_check_is_late_and_says_live() -> Result<()> {
+    let app = App::new()?;
+    let live = aged_job(&app, 1, 2)?;
+    let young = aged_job(&app, 2, 2)?;
+    let later = omni_core::timestamps::format(chrono::Utc::now() + chrono::Duration::minutes(10));
+    sql(&app, "UPDATE queue SET not_before = ?, error_code = 'LIVE_STREAM' WHERE id = ?", rusqlite::params![later, live]);
+    sql(&app, "UPDATE queue SET not_before = ?, error_code = 'NETWORK' WHERE id = ?", rusqlite::params![later, young]);
+
+    let (status, page) = app.send("GET", "/api/jobs?view=live", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let find = |id: i64| page["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).unwrap().clone();
+    assert_eq!((find(live)["late"].clone(), find(live)["wait_reason"].clone()), (json!(true), json!("live")), "{page}");
+    assert_eq!(find(live)["next_try_at"].as_str(), Some(later.as_str()));
+    assert_eq!((find(young)["late"].clone(), find(young)["wait_reason"].clone()), (json!(false), json!("retry")));
+
+    let (status, page) = app.send("GET", "/api/jobs?view=late", &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let ids: Vec<i64> = page["jobs"].as_array().unwrap().iter().map(|j| j["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![live], "{page}");
+    assert_eq!(page["counts"]["late"], 1);
+    assert_eq!(page["jobs"][0]["wait_reason"], "live");
+    let (_, st) = app.send("GET", "/api/system/status", &app.mcr_token, None).await?;
+    assert_eq!(st["queue"]["late"], 1, "{st}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_late_view_lists_the_late_jobs_oldest_first_and_the_counts_say_how_many() -> Result<()> {
     let app = App::new()?;

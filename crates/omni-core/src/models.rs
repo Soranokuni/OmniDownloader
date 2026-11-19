@@ -310,12 +310,22 @@ impl Default for LateAfter {
     }
 }
 
+/// `omni_broadcast::errors::ErrorCode::LiveStream`'s code (P11.7), which the
+/// late rule names: omni-core cannot depend on omni-broadcast, and a test
+/// there keeps the two equal.
+pub const LIVE_STREAM_CODE: &str = "LIVE_STREAM";
+
 impl Job {
     /// The one rule for "late" (P11.3b): waiting or running, and at least the
     /// limit old, counted from MCR's last restart (`retry_from`) or else from
     /// `created_at`. A job with neither timestamp is never late: no "now" is
-    /// invented for it.
+    /// invented for it. A stream that was still live and waits for its next
+    /// check (P11.7: PENDING, [`LIVE_STREAM_CODE`], `not_before` ahead) is late
+    /// whatever its age. `Repository::late_clause` is the same rule in SQL.
     pub fn is_late(&self, now: DateTime<Utc>, after: LateAfter) -> bool {
+        if self.waits_for_live_check(now) {
+            return true;
+        }
         if !matches!(self.status, JobStatus::Pending | JobStatus::Running) {
             return false;
         }
@@ -323,6 +333,15 @@ impl Job {
             Some(since) => now - since >= chrono::Duration::minutes(after.mins_for(self.priority)),
             None => false,
         }
+    }
+
+    /// A stream that was still live (or a premiere not yet started) waits for
+    /// its next check (P11.7): PENDING, [`LIVE_STREAM_CODE`], and a
+    /// `not_before` after `now`.
+    pub fn waits_for_live_check(&self, now: DateTime<Utc>) -> bool {
+        self.status == JobStatus::Pending
+            && self.error_code.as_deref() == Some(LIVE_STREAM_CODE)
+            && self.not_before.is_some_and(|t| t > now)
     }
 }
 

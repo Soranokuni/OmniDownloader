@@ -145,6 +145,55 @@ fn the_count_and_the_late_list_agree_with_the_rule_and_list_the_oldest_first() {
     assert_eq!((page.total, page.jobs[0].id), (1, running));
 }
 
+/// P11.7: a stream still live that waits for its next check is late whatever
+/// its age, in the rule, the count and the list alike; not once it waits no
+/// more (no back-off left, or MCR's «Τώρα»), nor once it is running or done.
+#[test]
+fn a_live_stream_waiting_for_its_next_check_is_late_at_any_age() {
+    let now = Utc::now();
+    let mut job = a_job(JobStatus::Pending);
+    job.created_at = Some(now - Duration::minutes(1));
+    job.error_code = Some(omni_core::models::LIVE_STREAM_CODE.to_string());
+    job.not_before = Some(now + Duration::minutes(10));
+    assert!(job.is_late(now, LateAfter::default()), "a waiting live stream one minute old");
+    assert!(job.is_late(now, LateAfter::new(120, 120)), "whatever the limit");
+    job.not_before = Some(now - Duration::seconds(1));
+    assert!(!job.is_late(now, LateAfter::default()), "its check is due: the age rule again");
+    job.not_before = None;
+    assert!(!job.is_late(now, LateAfter::default()), "no back-off: the age rule again");
+    job.not_before = Some(now + Duration::minutes(10));
+    job.error_code = Some("NETWORK".into());
+    assert!(!job.is_late(now, LateAfter::default()), "another code's back-off is not");
+    job.error_code = Some(omni_core::models::LIVE_STREAM_CODE.to_string());
+    for status in [JobStatus::Completed, JobStatus::RequiresReview, JobStatus::Cancelled, JobStatus::Running] {
+        job.status = status;
+        assert!(!job.is_late(now, LateAfter::default()), "{status:?}");
+    }
+
+    let (d, repo) = repo();
+    let live = pending(&repo, 1);
+    let other = pending(&repo, 2);
+    let due = pending(&repo, 3);
+    let done = pending(&repo, 4);
+    let future = timestamps::format(Utc::now() + Duration::minutes(10));
+    let past = timestamps::format(Utc::now() - Duration::minutes(1));
+    for (id, code, at) in [(live, "LIVE_STREAM", &future), (other, "NETWORK", &future), (due, "LIVE_STREAM", &past), (done, "LIVE_STREAM", &future)] {
+        sql(&d, "UPDATE queue SET error_code = ?, not_before = ? WHERE id = ?", rusqlite::params![code, at, id]);
+    }
+    sql(&d, "UPDATE queue SET status = 'COMPLETED' WHERE id = ?", rusqlite::params![done]);
+    assert_eq!(late_ids(&repo), vec![live]);
+    assert_eq!(repo.job_counts(LateAfter::default()).unwrap().late, 1);
+    assert_eq!(repo.queue_summary(LateAfter::default()).unwrap().late, 1);
+    for id in [live, other, due, done] {
+        let job = repo.get_job(id).unwrap().unwrap();
+        assert_eq!(job.is_late(Utc::now(), LateAfter::default()), id == live, "job {id}: the rule and the SQL disagree");
+    }
+    // MCR's «Τώρα»: no wait left, so not late until the age rule says so.
+    assert!(repo.run_now(live).unwrap());
+    assert!(late_ids(&repo).is_empty());
+    assert_eq!(repo.job_counts(LateAfter::default()).unwrap().late, 0);
+}
+
 #[test]
 fn a_job_with_no_created_at_is_not_counted_late() {
     let (d, repo) = repo();

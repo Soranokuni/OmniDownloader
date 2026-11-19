@@ -202,6 +202,10 @@ impl ErrorCode {
             // seconds: 2, 5, 10 and 15 minutes, while the pacer holds the
             // platform's other jobs for two minutes after each refusal.
             Self::RateLimited => &RATE_LIMITED_DELAYS,
+            // A stream still live, or a premiere not yet started (P11.7): its
+            // recording usually exists an hour or two later. Checked again 10,
+            // 30, 60 and 120 minutes after the job was queued, then review.
+            Self::LiveStream => &LIVE_STREAM_DELAYS,
             _ => &[],
         }
     }
@@ -217,11 +221,17 @@ impl ErrorCode {
     /// "exhausted" hint instead of its own (P11.3a): only the codes whose own
     /// hint describes a passing condition. DELIVERY_FAILED (check the share),
     /// HTTP_403 (already says the retries failed) and LOW_DISK (tell the
-    /// administrator) keep their own.
+    /// administrator) keep their own. LIVE_STREAM (P11.7) has an exhausted
+    /// text of its own ([`stopped_hint_el`]).
     pub fn uses_exhausted_hint(&self) -> bool {
         matches!(
             self,
-            Self::Network | Self::DownloadTimeout | Self::ExtractTimeout | Self::DeliverTimeout | Self::RateLimited
+            Self::Network
+                | Self::DownloadTimeout
+                | Self::ExtractTimeout
+                | Self::DeliverTimeout
+                | Self::RateLimited
+                | Self::LiveStream
         )
     }
 
@@ -326,6 +336,17 @@ static LOW_DISK_DELAYS: [Duration; 3] = [Duration::minutes(10), Duration::minute
 static RATE_LIMITED_DELAYS: [Duration; 4] =
     [Duration::minutes(2), Duration::minutes(5), Duration::minutes(10), Duration::minutes(15)];
 
+/// 10, 20, 30, 60 min: LIVE_STREAM's waits (P11.7), so the checks fall 10,
+/// 30, 60 and 120 minutes after the first run. The last is scheduled when the
+/// job is about an hour old, inside [`retry_after`]'s age limit; its failure
+/// has no wait left and goes to review.
+static LIVE_STREAM_DELAYS: [Duration; 4] =
+    [Duration::minutes(10), Duration::minutes(20), Duration::minutes(30), Duration::minutes(60)];
+
+/// The review card's text for a stream that was still live after its last
+/// check (P11.7).
+pub const LIVE_STREAM_EXHAUSTED_EL: &str = "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) μετά από 2 ώρες ελέγχων. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο.";
+
 /// How long a job that failed with `code` waits before its automatic retry,
 /// or `None` when it goes to review instead (P11.3a). `attempts` is the
 /// job's count after the failed run (1 for the first; a value below 1 reads
@@ -360,8 +381,13 @@ pub fn exhausted_hint_el(attempts: i32) -> String {
 /// for the desk's card and the job's history alike, so the two cannot drift.
 /// A rate limit that outlasted its retries on a video platform (or on a site
 /// that has a jar) is followed by the same site's login hint a login wall
-/// gets: the station's cookies are what usually gets past it.
+/// gets: the station's cookies are what usually gets past it. A stream still
+/// live after its checks has its own text (P11.7); one that was never checked
+/// again (the job was already past the age limit) the plain one.
 pub fn stopped_hint_el(code: ErrorCode, attempts: i32, url: &str, repo: &omni_core::repository::Repository) -> String {
+    if code == ErrorCode::LiveStream && attempts > 1 {
+        return LIVE_STREAM_EXHAUSTED_EL.to_string();
+    }
     let exhausted = exhausted_hint_el(attempts);
     if code == ErrorCode::RateLimited {
         let login = hint_for_job(ErrorCode::LoginRequired, url, repo);
@@ -833,14 +859,18 @@ mod tests {
             ErrorCode::ExtractTimeout,
             ErrorCode::DeliverTimeout,
             ErrorCode::RateLimited,
+            ErrorCode::LiveStream,
         ] {
             assert!(retryable.is_retryable(), "{retryable} should retry");
         }
-        assert_eq!(ErrorCode::ALL.iter().filter(|c| c.is_retryable()).count(), 8, "the seven codes as before, and RATE_LIMITED");
+        assert_eq!(
+            ErrorCode::ALL.iter().filter(|c| c.is_retryable()).count(),
+            9,
+            "the seven codes as before, RATE_LIMITED, and LIVE_STREAM (P11.7)"
+        );
         for terminal in [
             ErrorCode::PrivateOrRemoved,
             ErrorCode::GeoBlocked,
-            ErrorCode::LiveStream,
             ErrorCode::LoginRequired,
             ErrorCode::ComplianceFailed,
             ErrorCode::NoStreamFound,
@@ -892,9 +922,10 @@ mod tests {
         assert_eq!(ErrorCode::PrivateOrRemoved.retry_max_attempts(), None);
     }
 
-    /// P11.3a: the waits per code, over every code. Seven codes retry; five
-    /// transient ones wait 30 s, 2 min, 5 min, 10 min; HTTP_403 30 s, 2 min;
-    /// LOW_DISK 10 min three times; every other code has none.
+    /// P11.3a: the waits per code, over every code. Five transient codes wait
+    /// 30 s, 2 min, 5 min, 10 min; HTTP_403 30 s, 2 min; LOW_DISK 10 min three
+    /// times; RATE_LIMITED 2, 5, 10, 15 min; LIVE_STREAM (P11.7) 10, 20, 30,
+    /// 60 min; every other code has none.
     #[test]
     fn every_code_has_its_retry_waits() {
         let transient = [
@@ -913,6 +944,7 @@ mod tests {
                 | ErrorCode::DeliveryFailed => &transient,
                 ErrorCode::LowDisk => &[Duration::minutes(10), Duration::minutes(10), Duration::minutes(10)],
                 ErrorCode::RateLimited => &[Duration::minutes(2), Duration::minutes(5), Duration::minutes(10), Duration::minutes(15)],
+                ErrorCode::LiveStream => &[Duration::minutes(10), Duration::minutes(20), Duration::minutes(30), Duration::minutes(60)],
                 _ => &[],
             };
             assert_eq!(c.retry_delays(), want, "{c}");
@@ -920,6 +952,10 @@ mod tests {
             assert_eq!(c.retry_max_attempts(), (!want.is_empty()).then(|| want.len() as i32 + 1), "{c}");
         }
         assert_eq!(ErrorCode::Http403.retry_max_attempts(), Some(3), "HTTP_403 keeps its old budget");
+        // P11.7 changed only LIVE_STREAM: two codes pinned by name.
+        assert_eq!(ErrorCode::Network.retry_delays(), &transient, "NETWORK's waits changed");
+        assert_eq!(ErrorCode::Network.retry_max_attempts(), Some(5));
+        assert_eq!(ErrorCode::Http403.retry_delays(), &[Duration::seconds(30), Duration::minutes(2)], "HTTP_403's waits changed");
         let max = Duration::minutes(120);
         let got: Vec<_> = (1..=3).map(|n| retry_after(ErrorCode::Http403, n, Duration::zero(), max)).collect();
         assert_eq!(got, vec![Some(Duration::seconds(30)), Some(Duration::minutes(2)), None]);
@@ -1003,6 +1039,7 @@ mod tests {
         assert_eq!(
             uses,
             vec![
+                ErrorCode::LiveStream,
                 ErrorCode::Network,
                 ErrorCode::ExtractTimeout,
                 ErrorCode::DownloadTimeout,
@@ -1203,6 +1240,45 @@ mod tests {
         assert_eq!(stopped_hint_el(ErrorCode::RateLimited, 5, article, &repo), exhausted_hint_el(5));
         assert_eq!(stopped_hint_el(ErrorCode::Network, 5, x, &repo), exhausted_hint_el(5));
         assert_eq!(stopped_hint_el(ErrorCode::DownloadTimeout, 1, yt, &repo), exhausted_hint_el(1));
+    }
+
+    /// P11.7: a stream still live is checked again 10, 30, 60 and 120 minutes
+    /// after the job was queued (each run taking no time), and the failure of
+    /// the fourth check goes to review with its own text. The 120-minute check
+    /// is scheduled at the 60-minute mark, inside the 2-hour limit.
+    #[test]
+    fn a_live_stream_is_checked_at_10_30_60_and_120_minutes_then_reviewed() {
+        let c = ErrorCode::LiveStream;
+        let max = Duration::minutes(120);
+        let created = chrono::DateTime::parse_from_rfc3339("2026-11-18T09:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let mut now = created;
+        let mut checks = Vec::new();
+        for attempts in 1..=4 {
+            let wait = retry_after(c, attempts, now - created, max).unwrap_or_else(|| panic!("failure {attempts} not retried"));
+            now += wait;
+            checks.push((now - created).num_minutes());
+        }
+        assert_eq!(checks, vec![10, 30, 60, 120]);
+        assert_eq!(retry_after(c, 5, now - created, max), None, "a fifth check");
+        assert_eq!(c.retry_max_attempts(), Some(5), "the first run and four checks");
+        // The last check runs late (a busy queue): it is still scheduled.
+        assert_eq!(retry_after(c, 4, Duration::minutes(75), max), Some(Duration::minutes(60)));
+        assert_eq!(retry_after(c, 1, Duration::minutes(121), max), None, "the age limit holds for it too");
+        assert!(c.is_retryable() && c.uses_exhausted_hint());
+        assert!(!c.should_sniff("https://www.youtube.com/watch?v=abc") && !c.should_sniff("https://www.news.example/story/1"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let yt = "https://www.youtube.com/watch?v=abcdefghijk";
+        assert_eq!(stopped_hint_el(c, 5, yt, &repo), LIVE_STREAM_EXHAUSTED_EL);
+        assert_eq!(
+            LIVE_STREAM_EXHAUSTED_EL,
+            "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) μετά από 2 ώρες ελέγχων. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο."
+        );
+        // Never checked again (already past the age limit): the plain text says why.
+        assert_eq!(stopped_hint_el(c, 1, yt, &repo), exhausted_hint_el(1));
+        // The code omni-core's late rule names is this one.
+        assert_eq!(c.as_str(), omni_core::models::LIVE_STREAM_CODE);
     }
 
     /// P11.4: what a rate limit looks like, and what still is not one.

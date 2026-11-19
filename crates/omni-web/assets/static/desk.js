@@ -89,6 +89,11 @@ export function lateReason(job, now = Date.now()) {
   switch (job.wait_reason) {
     case 'delivery':
       return 'Περιμένει τον φάκελο παράδοσης';
+    case 'live': {
+      // A stream still live, checked again at its next try (P11.7); no time when none is known.
+      const at = job.next_try_at ? clock(job.next_try_at) : '—';
+      return at === '—' ? 'Ζωντανή μετάδοση' : `Ζωντανή μετάδοση· επόμενος έλεγχος ${at}`;
+    }
     case 'retry': {
       const text = `Νέα προσπάθεια στις ${clock(job.next_try_at)}`;
       return job.hint ? `${text} · ${job.hint}` : text;

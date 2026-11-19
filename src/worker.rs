@@ -1168,9 +1168,7 @@ pub(crate) async fn run_job(
                     }
                     None if all_live => {
                         sniff_end = SniffEnd::AllLive;
-                        repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
-                        process_result = Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
-                            .context(ErrorCode::LiveStream.as_str()));
+                        process_result = Err(every_video_is_live(repo, job_id)?);
                     }
                     None if queued_emptied => {
                         sniff_end = SniffEnd::SiblingsHoldTheRest;
@@ -1766,9 +1764,7 @@ async fn ytdlp_attempt(
         )
         .context(ErrorCode::NoStreamFound.as_str()))
     } else if all_live_scan {
-        repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
-        Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
-            .context(ErrorCode::LiveStream.as_str()))
+        Err(every_video_is_live(repo, job_id)?)
     } else if held_by_siblings {
         repo.record_event(
             job_id,
@@ -2058,6 +2054,16 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
 /// would refuse, but the events and sniffing would not.
 fn lost_lease<T>(result: &anyhow::Result<T>) -> bool {
     matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
+}
+
+/// Every video the page offers is live, or a premiere not yet started (P11.7):
+/// an INFO line in the history and the failure, whose code travels in the
+/// context only, so no text names it twice. The one ERROR line of the failure
+/// is the review hint, when it goes to review; a stream checked again later
+/// gets the requeue's WARN instead.
+fn every_video_is_live(repo: &Repository, job_id: i64) -> Result<anyhow::Error> {
+    repo.record_event(job_id, "INFO", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
+    Ok(anyhow::anyhow!("every video on the page is live").context(ErrorCode::LiveStream.as_str()))
 }
 
 /// The one readable line for a failure's `error_message` (P7.15): the root
@@ -2800,11 +2806,26 @@ mod tests {
     }
 
     /// 2026-10-19: a live download's DEBUG line read "LIVE_STREAM: LIVE_STREAM: …".
+    /// P11.7: the stored message and the diagnostic name the code at most once,
+    /// for the download's failure (a `DownloadError` under the pipeline's code
+    /// layer) and the page's (the code in the context only), and both are
+    /// still classified LIVE_STREAM.
     #[test]
     fn the_diagnostic_chain_names_a_code_once_and_keeps_every_other_layer() {
-        let e = anyhow::anyhow!("LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it").context("LIVE_STREAM");
-        assert_eq!(format!("{e:#}"), "LIVE_STREAM: LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
-        assert_eq!(diagnostic_chain(&e), "LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
+        let download = anyhow::Error::from(omni_broadcast::downloader::DownloadError {
+            code: ErrorCode::LiveStream,
+            message: "the video is live or not yet started; yt-dlp skipped it".into(),
+        })
+        .context(ErrorCode::LiveStream.as_str());
+        let page = anyhow::anyhow!("every video on the page is live").context(ErrorCode::LiveStream.as_str());
+        for e in [&download, &page] {
+            assert_eq!(classify_pipeline_error(e), ErrorCode::LiveStream, "{e:#}");
+            assert!(diagnostic_chain(e).matches("LIVE_STREAM").count() <= 1, "{}", diagnostic_chain(e));
+            assert!(!readable_cause(e).contains("LIVE_STREAM"), "{}", readable_cause(e));
+        }
+        assert_eq!(diagnostic_chain(&download), "LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
+        assert_eq!(format!("{page:#}"), "LIVE_STREAM: every video on the page is live", "the page's text names the code twice");
+        assert_eq!(readable_cause(&page), "every video on the page is live");
         // A code layer over a different message, and plain layers, all stay.
         let e = anyhow::anyhow!("exited with 1. stderr tail: boom").context("transcode failed").context("TRANSCODE_FAILED");
         assert_eq!(diagnostic_chain(&e), format!("{e:#}"));

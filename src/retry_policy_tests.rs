@@ -122,6 +122,148 @@ impl Rig {
     fn decide(&self, id: i64, code: ErrorCode) -> bool {
         retry_by_policy(&self.repo, &self.engine, id, OWNER, code, "test failure").unwrap()
     }
+
+    /// Job `id`, leased, fails with `e` the way `run_job`'s failure site
+    /// handles it (P11.7): the DEBUG chain, the policy, and on review the
+    /// hint and the end. `run_job` cannot reach a live stream without the
+    /// network; `every_failure_site_uses_the_retry_policy` and
+    /// `every_review_site_writes_the_review_hint` keep the sites on these calls.
+    fn fail_like_run_job(&self, id: i64, e: &anyhow::Error) {
+        let code = classify_pipeline_error(e);
+        let message = readable_cause(e);
+        self.repo.record_event(id, "DEBUG", None, &diagnostic_chain(e)).unwrap();
+        if !retry_by_policy(&self.repo, &self.engine, id, OWNER, code, &message).unwrap() {
+            let url = self.row(id).url;
+            self.repo.record_event(id, "ERROR", None, &review_hint(&self.repo, id, code, &url)).unwrap();
+            assert!(self.repo.finish(id, OWNER, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None).unwrap());
+        }
+    }
+
+    /// The job's events at `level`.
+    fn events(&self, id: i64, level: &str) -> Vec<String> {
+        self.repo.get_job_events(id, 500).unwrap().into_iter().filter(|e| e.level == level).map(|e| e.message).collect()
+    }
+}
+
+/// A yt-dlp failure as the pipeline returns it: the classified `DownloadError`
+/// under the pipeline's code layer.
+fn download_failure(stderr_line: &str) -> anyhow::Error {
+    let code = omni_broadcast::errors::classify_download_error(stderr_line);
+    anyhow::Error::from(omni_broadcast::downloader::DownloadError { code, message: stderr_line.to_string() }).context(code.as_str())
+}
+
+/// The waits of a live stream, in seconds: checks 10, 30, 60 and 120 minutes after the first run.
+const LIVE_WAITS: [i64; 4] = [600, 1200, 1800, 3600];
+
+/// P11.7: a stream still live on its first run goes back to the queue for
+/// 10 minutes as LIVE_STREAM, not to review, untouched by anyone; it is late
+/// at once. Still live at every check, it goes to review after the fourth
+/// with the live text. The page's own line is INFO: a checked-again failure
+/// writes no ERROR (its requeue writes one WARN), and the last one writes one
+/// about the failure, the review hint (plus the repository's «Finished as»
+/// status line every reviewed job gets).
+#[test]
+fn a_page_whose_videos_are_all_live_is_checked_four_times_then_reviewed() {
+    let r = rig();
+    let id = r.queue(1);
+    for (n, secs) in LIVE_WAITS.into_iter().enumerate() {
+        r.lease(id);
+        r.queued_ago(id, [0, 10, 30, 60][n]);
+        let e = every_video_is_live(&r.repo, id).unwrap();
+        r.fail_like_run_job(id, &e);
+        let job = r.row(id);
+        assert_eq!(job.status, JobStatus::Pending, "failure {} went to review: {:?}", n + 1, job.error_message);
+        assert_eq!((job.attempts, job.max_attempts), (n as i32 + 1, 5), "failure {}", n + 1);
+        assert_eq!((job.error_code.as_deref(), job.first_error_code.as_deref()), (Some("LIVE_STREAM"), Some("LIVE_STREAM")));
+        assert_eq!(job.error_message.as_deref(), Some("every video on the page is live"));
+        assert!(!job.human_touched && job.touch_reason.is_none(), "failure {}: the requeue counts as a person", n + 1);
+        let left = waits_secs(&job);
+        assert!(left > secs - 10 && left <= secs, "failure {}: {left} s, expected {secs}", n + 1);
+        assert!(job.is_late(chrono::Utc::now(), omni_core::models::LateAfter::default()), "failure {}: not late", n + 1);
+        assert!(r.events(id, "ERROR").is_empty(), "failure {}: {:?}", n + 1, r.events(id, "ERROR"));
+        assert_eq!(r.events(id, "WARN").len(), n + 1, "one requeue line per failure");
+    }
+    r.lease(id);
+    r.queued_ago(id, 120);
+    let e = every_video_is_live(&r.repo, id).unwrap();
+    r.fail_like_run_job(id, &e);
+    let job = r.row(id);
+    assert_eq!((job.status, job.attempts, job.error_code.as_deref()), (JobStatus::RequiresReview, 5, Some("LIVE_STREAM")));
+    assert!(!job.is_late(chrono::Utc::now(), omni_core::models::LateAfter::default()), "a reviewed job is late");
+    assert_eq!(failure_errors(&r, id), vec![omni_broadcast::errors::LIVE_STREAM_EXHAUSTED_EL.to_string()]);
+    assert_eq!(r.events(id, "ERROR").len(), 2, "the hint and the repository's «Finished as» line: {:?}", r.events(id, "ERROR"));
+    assert_eq!(r.events(id, "INFO").iter().filter(|m| m.contains("live stream")).count(), 5, "the page's line, once per run");
+    for ev in r.repo.get_job_events(id, 500).unwrap() {
+        assert!(ev.message.matches("LIVE_STREAM").count() <= 1, "{}: {}", ev.level, ev.message);
+    }
+}
+
+/// P11.7: the recording exists at the second check: the job completes, and
+/// nobody touched it. A premiere ("will begin in 3 hours") takes the same way
+/// as a stream still live, and so does yt-dlp's live filter.
+#[test]
+fn a_live_download_that_has_its_recording_at_the_second_check_completes_untouched() {
+    for line in [
+        "ERROR: [youtube] abcdefghijk: This live event will begin in 3 hours",
+        "the video is live or not yet started; yt-dlp skipped it",
+    ] {
+        let r = rig();
+        let id = r.queue(1);
+        let e = if line.starts_with("ERROR:") {
+            download_failure(line)
+        } else {
+            anyhow::Error::from(omni_broadcast::downloader::DownloadError { code: ErrorCode::LiveStream, message: line.into() })
+                .context(ErrorCode::LiveStream.as_str())
+        };
+        assert_eq!(classify_pipeline_error(&e), ErrorCode::LiveStream, "{line}");
+        for (n, secs) in LIVE_WAITS[..2].iter().enumerate() {
+            r.lease(id);
+            r.fail_like_run_job(id, &e);
+            let job = r.row(id);
+            assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::Pending, Some("LIVE_STREAM")), "{line}: failure {}", n + 1);
+            let left = waits_secs(&job);
+            assert!(left > secs - 10 && left <= *secs, "{line}: failure {}: {left} s", n + 1);
+            assert!(job.error_message.as_deref().is_some_and(|m| !m.contains("LIVE_STREAM")), "{:?}", job.error_message);
+        }
+        // The second check: the recording is there, and the lease holder completes the job.
+        r.lease(id);
+        assert!(r.repo.finish(id, OWNER, JobStatus::Completed, None, None, Some("watch/1_ANNA_TEST.mxf")).unwrap());
+        let job = r.row(id);
+        assert_eq!(job.status, JobStatus::Completed);
+        assert!(!job.human_touched && job.touch_reason.is_none(), "{line}: counted as touched");
+        assert_eq!(job.first_error_code.as_deref(), Some("LIVE_STREAM"));
+        assert!(!job.is_late(chrono::Utc::now(), omni_core::models::LateAfter::default()));
+    }
+}
+
+/// P11.7: a live stream queued more than two hours ago is not checked again:
+/// its first failure goes to review with the plain text (it never waited).
+#[test]
+fn a_live_stream_past_the_age_limit_goes_to_review_at_once() {
+    let r = rig();
+    let id = r.queue(1);
+    r.lease(id);
+    r.queued_ago(id, 121);
+    r.fail_like_run_job(id, &every_video_is_live(&r.repo, id).unwrap());
+    let job = r.row(id);
+    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("LIVE_STREAM")));
+    assert_eq!(failure_errors(&r, id), vec![omni_broadcast::errors::exhausted_hint_el(1)]);
+}
+
+/// The job's ERROR lines about its failure: every one but the repository's
+/// own status line («Finished as …»), which every job sent to review gets.
+fn failure_errors(r: &Rig, id: i64) -> Vec<String> {
+    r.events(id, "ERROR").into_iter().filter(|m| !m.starts_with("Finished as ")).collect()
+}
+
+/// P11.7: the page's live line is written once per failure, as INFO, by both
+/// sites through one helper; neither writes it as ERROR or names the code in its text.
+#[test]
+fn both_live_page_sites_use_the_one_helper() {
+    let src = include_str!("worker.rs");
+    assert_eq!(src.matches("every_video_is_live(repo, job_id)?").count(), 2, "the two page sites");
+    assert!(!src.contains("\"ERROR\", Some(JobStage::Extract), \"Every video found on the page is a live stream\""));
+    assert!(!src.contains("\"{}: every video on the page is live\""), "the page's text names the code again");
 }
 
 /// How long job `id` waits now, in whole seconds (rounded up).

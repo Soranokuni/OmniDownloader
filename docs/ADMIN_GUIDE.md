@@ -891,11 +891,11 @@ within the same age limit.
 | `EXTRACT_TIMEOUT`, `DOWNLOAD_TIMEOUT` | yes | download timed out |
 | `DELIVERY_FAILED`, `DELIVER_TIMEOUT` | yes | could not write to the watchfolder: check the share and the service account's rights |
 | `LOW_DISK` | yes | free disk space |
+| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after it was queued (within the same 2-hour age limit), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
 | `LOGIN_REQUIRED` | no | the site wants a login: add cookies (§6.1) |
 | `GEO_BLOCKED` | no | not available from Greece |
 | `PRIVATE_OR_REMOVED` | no | ask for another link |
 | `PAGE_NOT_FOUND` | no | 404; check the link |
-| `LIVE_STREAM` | no | live; wait for the recording |
 | `UNSUPPORTED_URL` | no | not recognised; try a direct video link |
 | `NO_STREAM_FOUND`, `NO_VIDEO_ON_PAGE` | no | no video found on the page |
 | `VIDEO_UNRESOLVED` | no | a video is there but was not fetched; download by hand |

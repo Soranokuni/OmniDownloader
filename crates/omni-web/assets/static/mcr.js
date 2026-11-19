@@ -20,10 +20,10 @@ import {
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameJob as deskRename, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=13';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=19';
+} from '/static/desk.js?v=14';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=20';
 import { initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO } from '/static/notify.js?v=11';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=8';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=9';
 
 let journalists = [];
 
@@ -1231,7 +1231,8 @@ function lateRow(job) {
     Number(job.priority) >= URGENT_PRIORITY ? el('span', { class: 'badge warn' }, 'Επείγον') : null,
     el('span', { class: 'late-reason' }, lateReason(job)),
     el('span', { class: 'late-age' }, arrivedAgo(job)),
-    job.wait_reason === 'retry'
+    // A back-off, or a stream still live waiting for its next check (P11.7).
+    job.wait_reason === 'retry' || job.wait_reason === 'live'
       ? el('button', {
           class: 'btn btn-warn',
           type: 'button',

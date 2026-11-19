@@ -2906,12 +2906,10 @@ impl Repository {
 
         let mut summary = QueueSummary::default();
         // Late: the same rule as `Job::is_late` and the desk's late view (P11.3b).
-        let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(late);
+        let (late_sql, late_values) = Self::late_clause(late);
         summary.late = conn.query_row(
-            "SELECT COUNT(*) FROM queue
-             WHERE status IN ('PENDING','RUNNING')
-               AND COALESCE(retry_from, created_at) <= CASE WHEN priority >= ? THEN ? ELSE ? END",
-            params![crate::models::URGENT_PRIORITY_BOOST, urgent_cutoff, normal_cutoff],
+            &format!("SELECT COUNT(*) FROM queue WHERE {late_sql}"),
+            rusqlite::params_from_iter(late_values.iter()),
             |r| r.get(0),
         )?;
         let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM queue GROUP BY status")?;
@@ -3006,15 +3004,9 @@ impl Repository {
         let late_scope;
         let (scope, order) = match view {
             JobsView::Late => {
-                let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(filter.late_after);
-                values.push(urgent_cutoff);
-                values.push(normal_cutoff);
-                // The integer is a compile-time constant, not input.
-                late_scope = format!(
-                    "status IN ('PENDING','RUNNING') AND COALESCE(retry_from, created_at) <= \
-                     CASE WHEN priority >= {} THEN ? ELSE ? END",
-                    crate::models::URGENT_PRIORITY_BOOST
-                );
+                let (sql, late_values) = Self::late_clause(filter.late_after);
+                values.extend(late_values);
+                late_scope = sql;
                 (late_scope.as_str(), "COALESCE(retry_from, created_at) ASC, id ASC")
             }
             JobsView::Live => (
@@ -3101,6 +3093,23 @@ impl Repository {
         )
     }
 
+    /// The late rule in SQL (P11.3b, P11.7), the same as `Job::is_late`: the
+    /// clause and its bound values, in order. Waiting or running and at least
+    /// the limit old, or a stream still live that waits for its next check
+    /// (PENDING, LIVE_STREAM, `not_before` ahead) whatever its age.
+    fn late_clause(late: crate::models::LateAfter) -> (String, [String; 4]) {
+        let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(late);
+        // The integer is a compile-time constant, not input; every value is bound.
+        let sql = format!(
+            "((status IN ('PENDING','RUNNING') AND COALESCE(retry_from, created_at) <= \
+             CASE WHEN priority >= {} THEN ? ELSE ? END) \
+             OR (status = 'PENDING' AND error_code = ? AND not_before > ?))",
+            crate::models::URGENT_PRIORITY_BOOST
+        );
+        let values = [urgent_cutoff, normal_cutoff, crate::models::LIVE_STREAM_CODE.to_string(), timestamps::now_string()];
+        (sql, values)
+    }
+
     /// Jobs per status, every status present (0 when none), for `/metrics`.
     /// A stored status this build does not know is not counted.
     pub fn job_counts_by_status(&self) -> Result<Vec<(JobStatus, i64)>> {
@@ -3125,10 +3134,12 @@ impl Repository {
         late: crate::models::LateAfter,
     ) -> Result<crate::models::JobCounts> {
         let today_start = timestamps::format(day_start_utc);
-        let (urgent_cutoff, normal_cutoff) = Self::late_cutoffs(late);
+        let (late_sql, late_values) = Self::late_clause(late);
+        let values: Vec<String> = std::iter::once(today_start).chain(late_values).collect();
         let conn = self.pool.get()?;
         Ok(conn.query_row(
-            r#"
+            &format!(
+                r#"
             SELECT
               COALESCE(SUM(status IN ('PENDING','RUNNING')), 0),
               COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND cleared_at IS NULL), 0),
@@ -3137,11 +3148,11 @@ impl Repository {
               COALESCE(SUM(status IN ('REQUIRES_REVIEW','MANUAL_DOWNLOAD','FAILED') AND cleared_at IS NOT NULL), 0),
               COALESCE(SUM(status IN ('COMPLETED','COMPLETED_MANUAL') AND completed_at >= ?), 0),
               COALESCE(SUM(status = 'AWAITING_APPROVAL'), 0),
-              COALESCE(SUM(status IN ('PENDING','RUNNING')
-                           AND COALESCE(retry_from, created_at) <= CASE WHEN priority >= ? THEN ? ELSE ? END), 0)
+              COALESCE(SUM({late_sql}), 0)
             FROM queue
-            "#,
-            params![today_start, crate::models::URGENT_PRIORITY_BOOST, urgent_cutoff, normal_cutoff],
+            "#
+            ),
+            rusqlite::params_from_iter(values.iter()),
             |r| {
                 Ok(crate::models::JobCounts {
                     active: r.get(0)?,
