@@ -10,10 +10,11 @@
  */
 
 import { api, el, fmtDuration, safeHref } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=1';
-import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=18';
-import { confirmDialog } from '/static/dialog.js?v=1';
-import { statusBadge } from '/static/status.js?v=1';
+import { toast } from '/static/toast.js?v=2';
+import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=19';
+import { confirmDialog } from '/static/dialog.js?v=2';
+import { statusBadge } from '/static/status.js?v=2';
+import { t, tn } from '/static/text.js?v=1';
 
 const cards = new Map(); // job id -> { node, job, expiry }
 let wantedFocus = null;
@@ -46,21 +47,20 @@ function applyFocus() {
 /** How the video was found, for the person deciding whether to trust it. */
 export function foundHow(method) {
   const m = String(method || '');
-  if (m.startsWith('repair:recipe:')) return 'Βρέθηκε με γνωστό τρόπο (συνταγή)';
-  if (m.startsWith('repair:llm:')) return 'Βρέθηκε με τη βοήθεια AI — ελέγξτε προσεκτικά';
-  return 'Αυτόματη επισκευή';
+  if (m.startsWith('repair:recipe:')) return t('approval.found.recipe_method');
+  if (m.startsWith('repair:llm:')) return t('approval.found.llm_method');
+  return t('approval.found.repair');
 }
 
 /** «Λήγει σε 5 ώρες (14:05)», «Λήγει σε 40 λεπτά», or «Έληξε». */
 export function expiryText(iso, now = Date.now()) {
-  const t = iso ? Date.parse(iso) : NaN;
-  if (Number.isNaN(t)) return '';
-  const mins = Math.floor((t - now) / 60000);
-  if (mins < 0) return 'Έληξε';
+  const until = iso ? Date.parse(iso) : NaN;
+  if (Number.isNaN(until)) return '';
+  const mins = Math.floor((until - now) / 60000);
+  if (mins < 0) return t('approval.expired');
   const at = clock(iso);
-  if (mins < 60) return `Λήγει σε ${Math.max(mins, 1)} λεπτά (${at})`;
-  const hours = Math.round(mins / 60);
-  return `Λήγει σε ${hours} ${hours === 1 ? 'ώρα' : 'ώρες'} (${at})`;
+  if (mins < 60) return t('approval.expires_mins', { n: Math.max(mins, 1), at });
+  return tn('approval.expires_hours', Math.round(mins / 60), { at });
 }
 
 /** m:ss for a number of seconds; empty when unknown. */
@@ -75,27 +75,22 @@ export function clockSecs(secs) {
 export function foundText(repair, method) {
   if (!repair) return foundHow(method);
   switch (repair.found) {
-    case 'shipped': return 'Βρέθηκε με: γενική συνταγή';
+    case 'shipped': return t('approval.found.shipped');
     case 'recipe': {
       const n = Number(repair.recipe_approvals) || 0;
-      return n > 0 ? `Βρέθηκε με: γνωστή συνταγή, εγκρίθηκε ${n} ${n === 1 ? 'φορά' : 'φορές'}` : 'Βρέθηκε με: νέα συνταγή';
+      return n > 0 ? tn('approval.found.known', n) : t('approval.found.new');
     }
-    case 'llm': return 'Βρέθηκε με: τη βοήθεια AI — ελέγξτε προσεκτικά';
+    case 'llm': return t('approval.found.llm');
     default: return foundHow(method);
   }
 }
 
-const CHECK_LABELS = {
-  egress: 'Διεύθυνση',
-  ad: 'Διαφήμιση',
-  probe: 'Βίντεο',
-  length: 'Διάρκεια',
-  short: 'Μήκος',
-};
+/** The gate's checks that have a label (`approval.check.<name>`). */
+const CHECK_LABELS = ['egress', 'ad', 'probe', 'length', 'short'];
 
-/** The Greek label of a gate check; an unknown name is shown as it is. */
+/** The label of a gate check; an unknown name is shown as it is. */
 export function checkLabel(name) {
-  return Object.prototype.hasOwnProperty.call(CHECK_LABELS, name) ? CHECK_LABELS[name] : String(name || '');
+  return CHECK_LABELS.includes(name) ? t(`approval.check.${name}`) : String(name || '');
 }
 
 const previewUrl = (job, kind) => `/api/jobs/${job.id}/preview/${kind}`;
@@ -121,8 +116,8 @@ function mediaNode(job, held) {
     const video = el('video', { class: 'ap-video', controls: true, preload: 'metadata', src: previewUrl(job, 'video') });
     const sheet = pv.contact
       ? el('img', {
-        class: 'ap-sheet', src: previewUrl(job, 'contact'), alt: 'Καρέ από όλο το βίντεο',
-        title: 'Πατήστε σε ένα καρέ για να πάτε εκεί',
+        class: 'ap-sheet', src: previewUrl(job, 'contact'), alt: t('approval.sheet.alt'),
+        title: t('approval.sheet.title'),
         onClick: (ev) => seekFromSheet(ev, ev.currentTarget, video, held),
       })
       : null;
@@ -131,7 +126,7 @@ function mediaNode(job, held) {
   if (pv.audio_only) {
     return el('div', { class: 'ap-media' }, el('audio', { class: 'ap-audio', controls: true, preload: 'metadata', src: previewUrl(job, 'video') }));
   }
-  return el('div', { class: 'ap-media' }, el('p', { class: 'note' }, 'Δεν υπάρχει προεπισκόπηση· ανοίξτε τον σύνδεσμο.'));
+  return el('div', { class: 'ap-media' }, el('p', { class: 'note' }, t('approval.no_preview')));
 }
 
 function buildCard(job, ctx) {
@@ -166,22 +161,22 @@ function buildCard(job, ctx) {
       toast(e.message, 'bad');
       ctx.refresh();
     } else if (e.status === 409 || e.code === 'NOT_HELD') {
-      toast('Το βίντεο άλλαξε ή δεν περιμένει πια έγκριση', 'bad');
+      toast(t('approval.changed'), 'bad');
       ctx.refresh();
     } else {
       toast(e.message, 'bad');
     }
   };
 
-  const approve = mk('btn btn-primary', 'Έγκριση → Dalet', guarded(async () => {
+  const approve = mk('btn btn-primary', t('approval.approve'), guarded(async () => {
     if (!(await confirmDialog({
-      title: `Να σταλεί στο Dalet ως ${fileName(job)};`,
-      body: 'Το βίντεο που βλέπετε παραδίδεται στο watchfolder και μπαίνει στο Dalet. Εγκρίνετε μόνο αν είναι το σωστό.',
-      confirm: 'Έγκριση → Dalet',
+      title: t('approval.approve.title', { name: fileName(job) }),
+      body: t('approval.approve.body'),
+      confirm: t('approval.approve'),
     }))) return false;
     try {
       await api(`/api/jobs/${job.id}/approve`, { method: 'POST', body: { sha256: held.sha256 } });
-      return done(`Το ${fileName(job)} εγκρίθηκε και στέλνεται στο Dalet.`, 'Στάλθηκε…');
+      return done(t('approval.approve.done', { name: fileName(job) }), t('approval.approve.sent'));
     } catch (e) { failedAction(e); return false; }
   }));
   const reject = async (reason, note) => {
@@ -189,15 +184,12 @@ function buildCard(job, ctx) {
       const body = { reason };
       if (note) body.note = note;
       await api(`/api/jobs/${job.id}/reject`, { method: 'POST', body });
-      return done(`Το ${fileName(job)} απορρίφθηκε.`, 'Απορρίφθηκε');
+      return done(t('approval.reject.done', { name: fileName(job) }), t('approval.reject.mark'));
     } catch (e) { failedAction(e); return false; }
   };
   // «Λάθος βίντεο» asks in the same dialog as on a delivered card (desk.js).
-  const wrong = mk('btn btn-danger', 'Λάθος βίντεο', guarded(async () => {
-    if (!(await confirmWrongVideo(fileName(job), [
-      'Το βίντεο απορρίπτεται, το αρχείο του σβήνεται και ΔΕΝ στέλνεται στο Dalet.',
-      'Η εργασία πηγαίνει στη λίστα «Χρειάζονται έλεγχο», για χειροκίνητη λήψη ή άλλον σύνδεσμο.',
-    ]))) return false;
+  const wrong = mk('btn btn-danger', t('desk.wrong.button'), guarded(async () => {
+    if (!(await confirmWrongVideo(fileName(job), [t('approval.wrong.body1'), t('approval.wrong.body2')]))) return false;
     return reject('wrong_video');
   }));
   // «Επόμενη επιλογή»: only while the repair verified another video after this
@@ -205,30 +197,28 @@ function buildCard(job, ctx) {
   const repair = job.repair || null;
   const nextLeft = repair && Number(repair.next_left) > 0 ? Number(repair.next_left) : 0;
   const next = nextLeft > 0
-    ? mk('btn', `Επόμενη επιλογή (${nextLeft})`, guarded(async () => {
-      if (!(await confirmWrongVideo(fileName(job), [
-        'Το τρέχον βίντεο απορρίπτεται ως λάθος και κατεβαίνει η επόμενη επιλογή, που θα περιμένει ξανά έγκριση.',
-      ]))) return false;
+    ? mk('btn', t('approval.next', { n: nextLeft }), guarded(async () => {
+      if (!(await confirmWrongVideo(fileName(job), [t('approval.next.body')]))) return false;
       try {
         await api(`/api/jobs/${job.id}/next`, { method: 'POST', body: { sha256: held.sha256 } });
-        return done('Η επόμενη επιλογή κατεβαίνει.', 'Επόμενη επιλογή…');
+        return done(t('approval.next.done'), t('approval.next.mark'));
       } catch (e) { failedAction(e); return false; }
     }))
     : null;
 
   // «Απόρριψη…» opens a small inline form instead of a dialog.
-  const reason = el('select', { 'aria-label': 'Λόγος απόρριψης' },
-    el('option', { value: 'not_usable' }, 'Δεν είναι χρήσιμο'),
-    el('option', { value: 'other' }, 'Άλλο'));
-  const note = el('input', { type: 'text', maxlength: '300', placeholder: 'Σημείωση (προαιρετικά)', 'aria-label': 'Σημείωση απόρριψης' });
-  const confirmReject = mk('btn btn-danger', 'Απόρριψη', guarded(() => reject(reason.value, note.value.trim())));
+  const reason = el('select', { 'aria-label': t('approval.reject.reason') },
+    el('option', { value: 'not_usable' }, t('approval.reject.not_usable')),
+    el('option', { value: 'other' }, t('approval.reject.other')));
+  const note = el('input', { type: 'text', maxlength: '300', placeholder: t('approval.reject.note'), 'aria-label': t('approval.reject.note_label') });
+  const confirmReject = mk('btn btn-danger', t('approval.reject'), guarded(() => reject(reason.value, note.value.trim())));
   const form = el('div', { class: 'row ap-reject' }, reason, note, confirmReject);
   form.hidden = true;
-  const toggle = mk('btn', 'Απόρριψη…', () => { form.hidden = !form.hidden; });
+  const toggle = mk('btn', t('approval.reject.open'), () => { form.hidden = !form.hidden; });
 
   // desk.js's markDoneJob confirms and reports on its own and says nothing
   // about the outcome, so this one is re-enabled afterwards (it refreshes).
-  const markDone = mk('btn', 'Το έβαλα στο Dalet', guarded(async () => { await ctx.markDone(job); return false; }));
+  const markDone = mk('btn', t('desk.markdone.button'), guarded(async () => { await ctx.markDone(job); return false; }));
   const history = ctx.historyPanel(job);
   const media = mediaNode(job, held);
   const expiry = el('span', { class: 'note' }, expiryText(held.expires_at));
@@ -240,7 +230,7 @@ function buildCard(job, ctx) {
         el('div', {},
           el('h3', { class: 'job-name' }, fileName(job)),
           el('p', { class: 'job-meta under-name' },
-            `Δημοσιογράφος: ${job.journalist} · από ${clock(job.updated_at || held.created_at)}`),
+            t('card.journalist_since', { name: job.journalist, at: clock(job.updated_at || held.created_at) })),
           ctx.mailLink(job),
         )),
       statusBadge({ status: 'AWAITING_APPROVAL' })),
@@ -249,7 +239,7 @@ function buildCard(job, ctx) {
     pvChecks(repair),
     el('div', { class: 'ap-facts note' },
       ...pvFacts(job, held, repair),
-      href ? el('a', { href, target: '_blank', rel: 'noopener noreferrer', title: job.url }, 'Άνοιγμα σελίδας') : null,
+      href ? el('a', { href, target: '_blank', rel: 'noopener noreferrer', title: job.url }, t('approval.open_page')) : null,
       expiry),
     el('div', { class: 'row' }, approve, wrong, next, toggle, markDone, history[0], status),
     form,
@@ -262,7 +252,7 @@ function figure(src, alt, caption, onClick) {
   const img = el('img', { src, alt });
   if (onClick) {
     img.classList.add('ap-seek');
-    img.title = 'Πατήστε για να πάτε σε αυτό το σημείο του βίντεο';
+    img.title = t('approval.seek');
     img.addEventListener('click', onClick);
   }
   return el('figure', { class: 'ap-figure' }, img, el('figcaption', { class: 'note' }, caption));
@@ -277,18 +267,18 @@ function pvArticle(job, held, repair, video) {
   const pv = held.preview || {};
   if (!pv.article) return null;
   const image = repair && repair.image;
-  const parts = [figure(previewUrl(job, 'article'), 'Εικόνα άρθρου', 'Εικόνα άρθρου')];
+  const parts = [figure(previewUrl(job, 'article'), t('approval.article_image'), t('approval.article_image'))];
   if (pv.frame) {
-    const t = image && Number.isFinite(Number(image.frame_secs)) ? Number(image.frame_secs) : null;
-    const seek = video && t !== null ? () => { video.currentTime = t; } : null;
-    const label = t !== null ? `Πλησιέστερο καρέ ${clockSecs(t)}` : 'Πλησιέστερο καρέ';
+    const at = image && Number.isFinite(Number(image.frame_secs)) ? Number(image.frame_secs) : null;
+    const seek = video && at !== null ? () => { video.currentTime = at; } : null;
+    const label = at !== null ? t('approval.frame_at', { at: clockSecs(at) }) : t('approval.frame');
     parts.push(figure(previewUrl(job, 'frame'), label, label, seek));
   }
   let verdict = null;
   if (image && image.match) {
-    verdict = el('span', { class: 'ap-same' }, 'ίδια εικόνα ✓');
+    verdict = el('span', { class: 'ap-same' }, t('approval.same_image'));
   } else if (image && image.distance !== null && image.distance !== undefined) {
-    verdict = el('span', { class: 'note' }, 'η εικόνα του άρθρου δεν μοιάζει με κάποιο καρέ (συχνό σε γραφικά)');
+    verdict = el('span', { class: 'note' }, t('approval.no_match'));
   }
   return el('div', { class: 'ap-article' }, el('div', { class: 'row ap-pics' }, ...parts), verdict);
 }
@@ -298,10 +288,10 @@ function pvChecks(repair) {
   const checks = repair && Array.isArray(repair.checks) ? repair.checks : [];
   if (!checks.length) return null;
   return el('div', { class: 'ap-checks' },
-    el('span', { class: 'note' }, 'Έλεγχοι'),
+    el('span', { class: 'note' }, t('approval.checks')),
     el('ul', { class: 'ap-checklist' },
       ...checks.map((c) => el('li', { class: c.ok ? 'ap-ok' : 'ap-bad' },
-        el('span', { class: 'ap-mark', 'aria-label': c.ok ? 'πέρασε' : 'απέτυχε' }, c.ok ? '✓' : '✗'),
+        el('span', { class: 'ap-mark', 'aria-label': t(c.ok ? 'approval.check.passed' : 'approval.check.failed') }, c.ok ? '✓' : '✗'),
         el('b', {}, checkLabel(c.name)),
         c.detail ? el('span', { class: 'note' }, ` ${c.detail}`) : null))));
 }
@@ -310,12 +300,12 @@ function pvChecks(repair) {
 function pvFacts(job, held, repair) {
   const expected = repair && Number(repair.expected_secs) > 0 ? clockSecs(repair.expected_secs) : '';
   const length = expected
-    ? `Διάρκεια: ${clockSecs(held.duration)} (σελίδα: ${expected})`
-    : `Διάρκεια ${fmtDuration(held.duration)}`;
+    ? t('approval.length_vs_page', { length: clockSecs(held.duration), page: expected })
+    : t('approval.length', { length: fmtDuration(held.duration) });
   return [
     el('span', {}, length),
-    repair && repair.source_host ? el('span', {}, `Πηγή: ${repair.source_host}`) : null,
-    repair && repair.short_clip ? el('span', { class: 'ap-warn' }, 'Σύντομο κλιπ — μπορεί να είναι διαφήμιση') : null,
+    repair && repair.source_host ? el('span', {}, t('approval.source', { host: repair.source_host })) : null,
+    repair && repair.short_clip ? el('span', { class: 'ap-warn' }, t('approval.short_clip')) : null,
     el('span', {}, foundText(repair, job.extraction_method)),
   ];
 }
@@ -354,6 +344,6 @@ export function syncApproval(root, jobs, ctx) {
   const n = cards.size;
   root.hidden = n === 0;
   const title = root.querySelector('.ap-title');
-  if (title) title.textContent = `Για έγκριση (${n})`;
+  if (title) title.textContent = t('approval.title', { n });
   applyFocus();
 }

@@ -13,6 +13,7 @@
  */
 
 import { el } from '/static/app.js?v=6';
+import { t } from '/static/text.js?v=1';
 
 let openNow = false;
 let seq = 0;
@@ -23,7 +24,7 @@ const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabi
  * `body` is a string or an array of strings (one paragraph each). `danger`
  * colours the confirm button red. Resolves `true` only for the confirm button.
  */
-export function confirmDialog({ title, body, confirm, cancel = 'Άκυρο', danger = false }) {
+export function confirmDialog({ title, body, confirm, cancel = t('dialog.cancel'), danger = false }) {
   if (openNow) return Promise.resolve(false);
   openNow = true;
   return new Promise((resolve) => {

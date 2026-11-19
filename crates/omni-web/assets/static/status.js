@@ -8,49 +8,61 @@
  * coloured tag carries its mark, for an operator who cannot tell amber from
  * violet on a control-room monitor.
  *
- * The colours themselves are in status.css, one rule per tone.
+ * The colours themselves are in status.css, one rule per tone; the words are
+ * in text.el.js (`status.<STATUS>.label|short|phrase|user`, `tone.<tone>`).
  */
 
 import { el } from '/static/app.js?v=6';
+import { t } from '/static/text.js?v=1';
 
-/**
- * The colour families. `mark` is a text glyph (no sprite needed, so a tag
- * keeps it at any size); `legend` is the word under the Email tab's text.
- * The badge classes are the tone names (`badge run`, `badge off`, …).
- */
+/** The colour families and their marks (a text glyph: no sprite needed, so a
+ *  tag keeps it at any size). The badge classes are the tone names. */
 export const TONES = {
-  ok: { mark: '✓', legend: 'παραδόθηκε' },
-  run: { mark: '↻', legend: 'σε εξέλιξη' },
-  wait: { mark: '◷', legend: 'σε αναμονή' },
-  approval: { mark: '◉', legend: 'για έγκριση' },
-  warn: { mark: '!', legend: 'χρειάζεται έλεγχο' },
-  bad: { mark: '✕', legend: 'απέτυχε' },
-  off: { mark: '⊘', legend: 'ακυρώθηκε' },
+  ok: { mark: '✓' },
+  run: { mark: '↻' },
+  wait: { mark: '◷' },
+  approval: { mark: '◉' },
+  warn: { mark: '!' },
+  bad: { mark: '✕' },
+  off: { mark: '⊘' },
+};
+
+/** The tone of every status the server sends (`JobStatus::as_str`). */
+export const STATUS_TONE = {
+  PENDING: 'wait',
+  RUNNING: 'run',
+  COMPLETED: 'ok',
+  COMPLETED_MANUAL: 'ok',
+  AWAITING_APPROVAL: 'approval',
+  REQUIRES_REVIEW: 'warn',
+  MANUAL_DOWNLOAD: 'warn',
+  FAILED: 'bad',
+  CANCELLED: 'off',
 };
 
 /**
- * One row per status the server sends (`JobStatus::as_str`):
+ * A status's row, read in the current language each time:
  *   label   the badge, on the desk
  *   short   the narrow rail beside a mail's text
  *   phrase  inside a sentence («2 σε αναμονή · 1 για έγκριση»)
  *   user    what the journalist who sent it reads on /user
  *   tone    the colour family above
  */
-export const STATUS = {
-  PENDING: { label: 'Σε αναμονή', short: 'Αναμονή', phrase: 'σε αναμονή', user: 'Σε αναμονή', tone: 'wait' },
-  RUNNING: { label: 'Σε εξέλιξη', short: 'Σε εξέλιξη', phrase: 'σε εξέλιξη', user: 'Σε επεξεργασία', tone: 'run' },
-  COMPLETED: { label: 'Παραδόθηκε', short: 'Παραδόθηκε', phrase: 'παραδόθηκε', user: 'Παραδόθηκε', tone: 'ok' },
-  COMPLETED_MANUAL: { label: 'Παραδόθηκε χειροκίνητα', short: 'Παραδόθηκε', phrase: 'παραδόθηκε χειροκίνητα', user: 'Παραδόθηκε', tone: 'ok' },
-  AWAITING_APPROVAL: { label: 'Για έγκριση', short: 'Για έγκριση', phrase: 'για έγκριση', user: 'Το βλέπει το MCR', tone: 'approval' },
-  REQUIRES_REVIEW: { label: 'Χρειάζεται έλεγχο', short: 'Έλεγχος', phrase: 'χρειάζεται έλεγχο', user: 'Το εξετάζει το MCR', tone: 'warn' },
-  MANUAL_DOWNLOAD: { label: 'Χειροκίνητη λήψη', short: 'Χειροκίνητα', phrase: 'χειροκίνητη λήψη', user: 'Το κατεβάζει το MCR', tone: 'warn' },
-  FAILED: { label: 'Απέτυχε', short: 'Απέτυχε', phrase: 'απέτυχε', user: 'Απέτυχε', tone: 'bad' },
-  CANCELLED: { label: 'Ακυρώθηκε', short: 'Ακυρώθηκε', phrase: 'ακυρώθηκε', user: 'Ακυρώθηκε', tone: 'off' },
-};
+function row(status, tone) {
+  return {
+    get label() { return t(`status.${status}.label`); },
+    get short() { return t(`status.${status}.short`); },
+    get phrase() { return t(`status.${status}.phrase`); },
+    get user() { return t(`status.${status}.user`); },
+    tone,
+  };
+}
+
+export const STATUS = Object.fromEntries(Object.entries(STATUS_TONE).map(([s, tone]) => [s, row(s, tone)]));
 
 /** A status the page does not know yet (a newer server): treat it as
  *  needing a look rather than hide it. */
-const UNKNOWN = { label: 'Χρειάζεται έλεγχο', short: 'Έλεγχος', phrase: 'χρειάζεται έλεγχο', user: 'Το εξετάζει το MCR', tone: 'warn' };
+const UNKNOWN = row('UNKNOWN', 'warn');
 
 /** The row for a status string. */
 export function statusInfo(status) {
@@ -63,8 +75,8 @@ export function tone(job) {
 }
 
 /** The glyph of a tone, aria-hidden: the word beside it is what is read. */
-export function markNode(t) {
-  return el('span', { class: 'mark', 'aria-hidden': 'true' }, (TONES[t] || TONES.warn).mark);
+export function markNode(name) {
+  return el('span', { class: 'mark', 'aria-hidden': 'true' }, (TONES[name] || TONES.warn).mark);
 }
 
 /**
@@ -87,10 +99,10 @@ export function statusTag(job, text, title) {
 /** The key under the Email tab's text: one entry per tone, plus the dashed
  *  «δεν κατέβηκε» of a link that became no file. */
 export function legendNode() {
-  const item = (t, text) => el('span', {}, el('i', { class: t }, t === 'skip' ? '' : TONES[t].mark), text);
+  const item = (name) => el('span', {}, el('i', { class: name }, name === 'skip' ? '' : TONES[name].mark), t(`tone.${name}`));
   return el('span', { class: 'legend', 'aria-hidden': 'true' },
-    ...Object.entries(TONES).map(([t, v]) => item(t, v.legend)),
-    item('skip', 'δεν κατέβηκε'));
+    ...Object.keys(TONES).map(item),
+    item('skip'));
 }
 
 /** Needs a person: review, a file-locker download, a failure. */

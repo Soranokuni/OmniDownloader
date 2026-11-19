@@ -15,23 +15,28 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=1';
+import { toast } from '/static/toast.js?v=2';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=18';
-import { deferAction, visible } from '/static/undo.js?v=2';
-import { confirmDialog } from '/static/dialog.js?v=1';
-import { STATUS, statusBadge } from '/static/status.js?v=1';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=1';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=25';
+} from '/static/desk.js?v=19';
+import { deferAction, visible } from '/static/undo.js?v=3';
+import { confirmDialog } from '/static/dialog.js?v=2';
+import { STATUS, statusBadge } from '/static/status.js?v=2';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=2';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=26';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=13';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=13';
+} from '/static/notify.js?v=14';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=14';
+import { t, tn, applyText } from '/static/text.js?v=1';
+
+// The page's fixed words (header, tabs, the broadcast specification) come
+// from the same dictionary as everything else (P12.7).
+applyText();
 
 let journalists = [];
 
@@ -141,10 +146,9 @@ function showOutage() {
   const banner = document.getElementById('offline-banner');
   banner.hidden = false;
   render(banner, el('div', { class: 'card attention' },
-    el('strong', {}, 'Η υπηρεσία λήψης δεν απαντά'),
-    ` από ${at}`,
-    el('div', { class: 'banner-line' },
-      'Οι λίστες δεν ενημερώνονται και οι λήψεις μπορεί να έχουν σταματήσει. Αν δεν επανέλθει σε λίγα λεπτά, ενημερώστε τον διαχειριστή.'),
+    el('strong', {}, t('service.down')),
+    t('outage.since', { at }),
+    el('div', { class: 'banner-line' }, t('outage.text')),
   ));
 }
 
@@ -165,7 +169,7 @@ function noteStatusSuccess() {
   if (!outageShown) return;
   outageShown = false;
   document.getElementById('offline-banner').hidden = true;
-  toast('Η υπηρεσία λήψης απαντά ξανά.', 'ok');
+  toast(t('outage.back'), 'ok');
   serviceBack();
   refresh();
 }
@@ -177,7 +181,7 @@ const STATUS_DEADLINE_MS = 15000;
 function statusWithDeadline() {
   let timer;
   const late = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(Object.assign(new Error('Η υπηρεσία λήψης δεν απαντά.'), { code: 'NETWORK' })), STATUS_DEADLINE_MS);
+    timer = setTimeout(() => reject(Object.assign(new Error(t('service.down')), { code: 'NETWORK' })), STATUS_DEADLINE_MS);
   });
   return Promise.race([api('/api/system/status'), late]).finally(() => clearTimeout(timer));
 }
@@ -206,7 +210,7 @@ async function loadStatusOnce() {
     banner.hidden = false;
     // In plain Greek only (P12.6): the tool's own detail is in the header's panel.
     render(banner, el('div', { class: 'card attention' },
-      el('strong', {}, problems.some(([name, c]) => name !== 'mail' && c.state === 'down') ? 'Η λήψη βίντεο έχει σταματήσει' : 'Προσοχή'),
+      el('strong', {}, t(problems.some(([name, c]) => name !== 'mail' && c.state === 'down') ? 'health.banner.stopped' : 'health.banner.attention')),
       ...problems.map(([name, c]) => el('div', { class: 'banner-line' }, healthTextNodes(name, c, data)))));
   }
   renderSelfheal(data.selfheal);
@@ -222,10 +226,11 @@ async function loadStatusOnce() {
 const healthPill = document.getElementById('health-pill');
 const healthPanel = document.getElementById('health-panel');
 
-const STATE_WORD = { ok: 'εντάξει', degraded: 'με πρόβλημα', down: 'εκτός λειτουργίας' };
+/** A check's state in a word (`health.state.<state>`). */
+const stateWord = (state) => (['ok', 'degraded', 'down'].includes(state) ? t(`health.state.${state}`) : t('health.state.unknown'));
 const gb = (v) => (v === undefined || v === null
-  ? 'άγνωστο'
-  : `${Number(v).toLocaleString('el-GR', { maximumFractionDigits: 1, minimumFractionDigits: 1 })} GB ελεύθερα`);
+  ? t('health.state.unknown')
+  : t('health.free_gb', { n: Number(v).toLocaleString(t('locale'), { maximumFractionDigits: 1, minimumFractionDigits: 1 }) }));
 
 const panelTechOpen = new Set();
 const SITES_SHOWN = 3;
@@ -237,31 +242,30 @@ const SITES_SHOWN = 3;
  * check's name first (the banner; the panel has it in its own column).
  */
 function healthTextNodes(name, check, data, withName = true) {
-  const t = checkTexts(name, check);
-  let happened = [t.happened];
+  const ct = checkTexts(name, check);
+  let happened = [ct.happened];
   if (name === 'sites' && Array.isArray(data.sites) && data.sites.length) {
     happened = data.sites.slice(0, SITES_SHOWN).map(siteSentence);
     const more = data.sites.length - SITES_SHOWN;
-    if (more > 0) happened.push(more === 1 ? 'Και 1 ακόμη ιστότοπος.' : `Και ${more} ακόμη ιστότοποι.`);
+    if (more > 0) happened.push(tn('site.more', more));
   }
   return [
-    withName ? el('strong', { class: 'hl-name' }, t.name) : null,
+    withName ? el('strong', { class: 'hl-name' }, ct.name) : null,
     el('p', { class: 'hl-happened' }, happened.join(' ')),
-    el('p', { class: 'hl-means' }, el('span', { class: 'hl-label' }, 'Για τα βίντεο: '), t.means),
-    el('p', { class: 'hl-todo' }, el('span', { class: 'hl-label' }, 'Τι κάνετε: '), t.todo, ' ',
-      el('span', { class: `badge who ${t.who}` }, WHO[t.who] || WHO.admin)),
+    el('p', { class: 'hl-means' }, el('span', { class: 'hl-label' }, t('health.label.means')), ct.means),
+    el('p', { class: 'hl-todo' }, el('span', { class: 'hl-label' }, t('health.label.todo')), ct.todo, ' ',
+      el('span', { class: `badge who ${ct.who}` }, WHO[ct.who] || WHO.admin)),
   ];
 }
 
 /** The pill and the panel from a status payload; `null` while the service does not answer. */
 function paintHealth(data) {
-  const s = data ? healthSummary(data.checks || {}) : { tone: 'bad', text: 'Η υπηρεσία δεν απαντά' };
+  const s = data ? healthSummary(data.checks || {}) : { tone: 'bad', text: t('health.pill.down') };
   document.getElementById('health-dot').className = `dot ${s.tone}`;
   document.getElementById('health-text').textContent = s.text;
   healthPill.dataset.tone = s.tone;
   if (!data) {
-    render(healthPanel, el('p', { class: 'hp-line' },
-      'Η υπηρεσία λήψης δεν απαντά: οι λίστες δεν ενημερώνονται. Αν δεν επανέλθει σε λίγα λεπτά, ενημερώστε τον διαχειριστή.'));
+    render(healthPanel, el('p', { class: 'hp-line' }, t('health.panel.down')));
     return;
   }
   const checks = data.checks || {};
@@ -271,7 +275,7 @@ function paintHealth(data) {
     let tech = null;
     if (c.detail) {
       // The check's own words, for support; open stays open across the 5 s refresh.
-      tech = el('details', { class: 'tech hp-tech' }, el('summary', {}, 'Τεχνικές λεπτομέρειες'),
+      tech = el('details', { class: 'tech hp-tech' }, el('summary', {}, t('card.tech')),
         el('span', { class: 'hp-detail mono' }, c.detail));
       if (panelTechOpen.has(name)) tech.open = true;
       tech.addEventListener('toggle', () => { if (tech.open) panelTechOpen.add(name); else panelTechOpen.delete(name); });
@@ -279,7 +283,7 @@ function paintHealth(data) {
     return el('li', { class: `hp-check ${bad ? 'bad' : ''}`.trim() },
       el('span', { class: `dot ${DOT[c.state] || ''}`.trim(), 'aria-hidden': 'true' }),
       el('span', { class: 'hp-name' }, CHECK_INFO[name] ? CHECK_INFO[name].name : name),
-      el('span', { class: 'hp-state' }, STATE_WORD[c.state] || 'άγνωστο'),
+      el('span', { class: 'hp-state' }, stateWord(c.state)),
       bad ? el('div', { class: 'hp-texts' }, healthTextNodes(name, c, data, false)) : null,
       tech);
   });
@@ -287,13 +291,13 @@ function paintHealth(data) {
     el('h2', { class: 'hp-title' }, s.text),
     el('ul', { class: 'hp-checks' }, lines),
     el('dl', { class: 'hp-facts' },
-      el('dt', {}, 'Φάκελος παράδοσης (Dalet)'), el('dd', {}, gb(data.disk?.watchfolder?.free_gb)),
-      el('dt', {}, 'Προσωρινός φάκελος'), el('dd', {}, gb(data.disk?.temp?.free_gb)),
-      el('dt', {}, 'Ουρά'), el('dd', {}, q
+      el('dt', {}, t('health.fact.watchfolder')), el('dd', {}, gb(data.disk?.watchfolder?.free_gb)),
+      el('dt', {}, t('health.fact.temp')), el('dd', {}, gb(data.disk?.temp?.free_gb)),
+      el('dt', {}, t('health.fact.queue')), el('dd', {}, q
         ? `${q.pending} ${STATUS.PENDING.phrase} · ${q.running} ${STATUS.RUNNING.phrase}${q.approval > 0 ? ` · ${q.approval} ${STATUS.AWAITING_APPROVAL.phrase}` : ''}`
         : '—')),
     el('p', { class: 'note hp-note' },
-      s.count ? 'Κάθε γραμμή με πρόβλημα λέει τι σημαίνει και τι να κάνετε.' : 'Δεν χρειάζεται κάτι από εσάς.'));
+      t(s.count ? 'health.panel.note_problems' : 'health.panel.note_ok')));
 }
 
 function setHealthOpen(open) {
@@ -326,7 +330,7 @@ function renderSelfheal(list) {
   }
   box.hidden = false;
   render(box, el('div', { class: 'card' },
-    ...[...found].map((domain) => el('div', {}, `${domain}: η σελίδα άλλαξε· βρέθηκε νέος τρόπος (θα ζητηθεί έγκριση)`)),
+    ...[...found].map((domain) => el('div', {}, t('selfheal.found', { domain }))),
   ));
 }
 
@@ -362,13 +366,13 @@ function showCounts(counts) {
   set('review-count', (counts.review || 0) + (counts.approval || 0));
   // The Completed badge is today's deliveries; the total is in the tooltip.
   set('completed-count', counts.completed_today);
-  document.getElementById('completed-count').title = `Σήμερα · σύνολο ${counts.completed || 0}`;
+  document.getElementById('completed-count').title = t('counts.completed.title', { n: counts.completed || 0 });
   showHiddenCount(counts.review_hidden || 0);
   const clear = document.getElementById('clear-finished');
   clear.disabled = !counts.finished;
   clear.textContent = counts.finished
-    ? `Αφαίρεση παραδοθέντων από τη λίστα (${counts.finished})`
-    : 'Αφαίρεση παραδοθέντων από τη λίστα';
+    ? t('queue.clear.count', { n: counts.finished })
+    : t('queue.clear');
   clear.dataset.count = String(counts.finished || 0);
 }
 
@@ -413,12 +417,12 @@ function mailLink(job) {
   const kind = fromMail ? 'mail' : 'manual';
   const key = fromMail ? job.email_message_id : String(job.parent_job_id || job.id);
   const label = fromMail
-    ? (job.mail_subject ? `Email: «${job.mail_subject}»` : 'Email: (χωρίς θέμα)')
-    : 'Χειροκίνητη προσθήκη';
+    ? t('maillink.mail', { subject: job.mail_subject || t('mail.no_subject') })
+    : t('maillink.manual');
   return el('button', {
     class: 'mail-link',
     type: 'button',
-    title: 'Άνοιγμα στην καρτέλα Email, με το κείμενο και τα άλλα βίντεό του',
+    title: t('maillink.title'),
     onClick: () => {
       switchTab('email');
       openMail(kind, key);
@@ -451,24 +455,23 @@ function renderOffers(targetId, jobs) {
     return;
   }
   render(targetId, el('div', { class: 'card stack' },
-    el('h3', { class: 'job-name' }, 'Βρέθηκαν κι άλλα βίντεο σε αυτά τα άρθρα'),
-    el('p', { class: 'note flat' },
-      'Δεν προστέθηκαν αυτόματα. Ανοίξτε ένα για να το δείτε και προσθέστε το αν ανήκει στο θέμα.'),
+    el('h3', { class: 'job-name' }, t('offers.title')),
+    el('p', { class: 'note flat' }, t('offers.note')),
     ...withOffers.flatMap((job) => offersOf(job).map((offer) => {
       const href = safeHref(offer.url);
       return el('div', { class: 'job-head offer-row' },
         el('div', {},
           el('p', { class: 'job-meta' },
-            `Από την εργασία #${job.id} (${fileName(job)}) — θα γίνει ${offer.index_str}_${job.journalist}_${job.keyword}.mxf`),
+            t('offers.from', { id: job.id, name: fileName(job), becomes: `${offer.index_str}_${job.journalist}_${job.keyword}.mxf` })),
           el('p', { class: 'job-url', title: offer.url }, offer.url),
         ),
         el('div', { class: 'row tight' },
-          href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα') : null,
+          href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, t('mail.open')) : null,
           el('button', {
             class: 'btn btn-warn',
             type: 'button',
             onClick: () => queueOffer(job.id, offer),
-          }, `Προσθήκη ως ${offer.index_str}`),
+          }, t('offers.add', { index: offer.index_str })),
         ),
       );
     })),
@@ -497,8 +500,7 @@ async function loadQueue() {
   if (jobs.length === 0) {
     liveCards.clear();
     queueList.cards.clear();
-    render('queue-cards', el('div', { class: 'card center' },
-      'Δεν περιμένει τίποτα. Οι νέοι σύνδεσμοι από email εμφανίζονται εδώ αυτόματα.'));
+    render('queue-cards', el('div', { class: 'card center' }, t('queue.empty')));
   } else {
     syncKeyedList(queueList, document.getElementById('queue-cards'), jobs, {
       build: (j) => {
@@ -525,9 +527,9 @@ const isActive = (job) => job.status === 'PENDING' || job.status === 'RUNNING';
  *  colour), so a ticking card is redrawn and a still one is left alone. */
 function queueSig(job) {
   if (!isActive(job)) return JSON.stringify(job);
-  const t = job.status === 'RUNNING' ? stepTimeNode(job) : null;
+  const step = job.status === 'RUNNING' ? stepTimeNode(job) : null;
   const wait = job.status === 'PENDING' ? waitLine(job) : '';
-  return JSON.stringify([job, wait, t ? t.className : '', t ? t.textContent : '', groupGen, renameOpen.has(job.id)]);
+  return JSON.stringify([job, wait, step ? step.className : '', step ? step.textContent : '', groupGen, renameOpen.has(job.id)]);
 }
 
 function activeCard(job) {
@@ -548,15 +550,15 @@ function activeCard(job) {
         canRename(job) ? el('button', {
           class: 'btn',
           type: 'button',
-          title: 'Αλλαγή της λέξης-κλειδιού στο όνομα του αρχείου, πριν παραδοθεί',
+          title: t('queue.rename.title'),
           onClick: () => renameJob(job),
-        }, 'Μετονομασία…') : null,
+        }, t('action.rename')) : null,
         el('button', {
           class: 'btn btn-danger',
           type: 'button',
-          title: 'Ακύρωση του βίντεο: δεν θα σταλεί στο Dalet',
+          title: t('queue.cancel.title'),
           onClick: () => cancelJob(job),
-        }, 'Ακύρωση'),
+        }, t('action.cancel')),
       ),
     ),
     canRename(job) ? renameFormFor(job) : null,
@@ -573,10 +575,10 @@ function activeCard(job) {
             el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` }))
         : null,
       el('div', { class: 'job-meta' },
-        el('span', {}, `Δημοσιογράφος: ${job.journalist}`,
+        el('span', {}, t('card.journalist', { name: job.journalist }),
           job.group_code ? el('span', { class: 'badge info gap-left', title: groupName(job.group_code) }, job.group_code) : null,
           limitNote(job)),
-        el('span', {}, running && job.eta && job.eta !== '--:--' ? `Απομένουν περίπου ${job.eta}` : ''),
+        el('span', {}, running && job.eta && job.eta !== '--:--' ? t('queue.eta', { eta: job.eta }) : ''),
       ),
     ),
   );
@@ -590,14 +592,14 @@ function deliveredCard(job) {
         el('div', {},
           el('h3', { class: 'job-name' }, deliveredName(job)),
           el('p', { class: 'job-meta under-name' },
-            `Παραδόθηκε ${fmtTime(job.completed_at || job.updated_at)} · ${fmtDuration(job.duration_secs)} · ${job.journalist}`,
+            t('queue.delivered_line', { at: fmtTime(job.completed_at || job.updated_at), length: fmtDuration(job.duration_secs), name: job.journalist }),
             limitNote(job)),
           mailLink(job),
         ),
       ),
       el('div', { class: 'row tight' },
         statusBadge(job),
-        el('button', { class: 'btn', type: 'button', onClick: () => redownload(job) }, 'Νέα λήψη'),
+        el('button', { class: 'btn', type: 'button', onClick: () => redownload(job) }, t('desk.redownload.button')),
       ),
     ),
     autoDeliveredNode(job, refresh),
@@ -612,7 +614,7 @@ document.getElementById('clear-finished').addEventListener('click', (event) => {
   if (!n) return;
   pages.live.page = 1;
   deferAction({
-    text: `${n === 1 ? 'Το 1 παραδοθέν βίντεο έφυγε' : `Τα ${n} παραδοθέντα βίντεο έφυγαν`} από τη λίστα· είναι στα «Ολοκληρωμένα».`,
+    text: tn('queue.cleared', n),
     hides: (view, job) => view === 'live' && isDelivered(job),
     run: () => api('/api/jobs/clear-finished', { method: 'POST' }),
     after: refresh,
@@ -640,7 +642,7 @@ function showHiddenCount(n) {
   const label = document.getElementById('review-hidden-label');
   // Keep the box visible while it is ticked, so it can be unticked.
   label.hidden = !n && !reviewShowHidden.checked;
-  document.getElementById('review-hidden-text').textContent = `Εμφάνιση κρυμμένων (${n})`;
+  document.getElementById('review-hidden-text').textContent = t('review.show_hidden', { n });
 }
 
 const HIDE_OLD_HOURS = 72;
@@ -655,12 +657,11 @@ document.getElementById('hide-old-review').addEventListener('click', async () =>
     hidden = jobs.filter(isOld).length;
     if (data.total > jobs.length) hidden = null; // more than one page: the exact number is unknown
   } catch (e) { toast(e.message, 'bad'); return; }
-  if (hidden === 0) { toast('Δεν υπάρχει τίποτα παλαιότερο από 3 ημέρες.', 'ok'); return; }
-  const how = hidden === null ? 'Τα παλαιότερα βίντεο κρύφτηκαν' : hidden === 1 ? 'Το 1 βίντεο κρύφτηκε' : `Τα ${hidden} βίντεο κρύφτηκαν`;
+  if (hidden === 0) { toast(t('review.hide_old.none'), 'ok'); return; }
   pages.review.page = 1;
   // Nothing is deleted; they show again with «Εμφάνιση κρυμμένων».
   deferAction({
-    text: `${how} (πάνω από 3 ημέρες)· εμφανίζονται με «Εμφάνιση κρυμμένων».`,
+    text: hidden === null ? t('review.hide_old.some') : tn('review.hide_old.done', hidden),
     hides: (view, job) => view === 'review' && isOld(job),
     run: () => api('/api/jobs/review/hide-old', { method: 'POST', body: { hours: HIDE_OLD_HOURS } }),
     after: refresh,
@@ -849,7 +850,7 @@ async function loadReview() {
     reviewList.cards.clear();
     reviewList.days.clear();
     render('review-cards', el('div', { class: 'card center' },
-      filtered ? 'Κανένα βίντεο δεν ταιριάζει με την αναζήτηση.' : 'Δεν υπάρχει κάτι που να περιμένει εσάς.'));
+      t(filtered ? 'review.no_match' : 'review.empty')));
   } else {
     syncKeyedList(reviewList, document.getElementById('review-cards'), jobs, {
       build: reviewCard,
@@ -900,10 +901,10 @@ function paintHistory(id) {
     box.replaceChildren(st.node);
     restoreHistoryScroll(id);
   } else if (st.failed) {
-    box.replaceChildren(el('p', { class: 'note' }, 'Δεν φορτώθηκε το ιστορικό. ',
-      el('button', { class: 'btn', type: 'button', onClick: () => loadHistory(id, st.at) }, 'Ξανά')));
+    box.replaceChildren(el('p', { class: 'note' }, t('history.failed'),
+      el('button', { class: 'btn', type: 'button', onClick: () => loadHistory(id, st.at) }, t('history.again'))));
   } else {
-    box.replaceChildren(el('p', { class: 'note' }, 'Φόρτωση…'));
+    box.replaceChildren(el('p', { class: 'note' }, t('loading')));
   }
 }
 
@@ -937,7 +938,7 @@ function historyPanel(job) {
       const st = historyState.get(job.id);
       if (open && (!st || (st.at !== job.updated_at && !st.loading))) loadHistory(job.id, job.updated_at);
     },
-  }, 'Ιστορικό');
+  }, t('action.history'));
   if (historyOpen.has(job.id)) {
     const st = historyState.get(job.id);
     if (!st || (st.at !== job.updated_at && !st.loading)) loadHistory(job.id, job.updated_at);
@@ -982,39 +983,39 @@ function reviewCard(job) {
     });
     return el('div', { class: 'wl-override' },
       el('label', { for: `override-${job.id}` },
-        'Επικολλήστε άλλον σύνδεσμο για το ίδιο βίντεο (την ίδια την ανάρτηση, ή απευθείας σύνδεσμο .mp4 / .m3u8):'),
+        t('review.override.label')),
       el('div', { class: 'row' },
         el('div', { class: 'grow' }, input),
         el('button', {
           class: primary === 'override' ? 'btn btn-primary' : 'btn btn-warn',
           type: 'button',
           onClick: () => overrideJob(job, input.value),
-        }, 'Χρήση αυτού του συνδέσμου')));
+        }, t('review.override.use'))));
   };
-  const retry = (cls) => el('button', { class: cls, type: 'button', onClick: () => retryJob(job) }, 'Δοκιμή ξανά');
-  const markDone = (cls) => el('button', { class: cls, type: 'button', onClick: () => markDoneJob(job) }, 'Το έβαλα στο Dalet');
+  const retry = (cls) => el('button', { class: cls, type: 'button', onClick: () => retryJob(job) }, t('action.retry'));
+  const markDone = (cls) => el('button', { class: cls, type: 'button', onClick: () => markDoneJob(job) }, t('desk.markdone.button'));
 
   let main;
   if (primary === 'override' && !locker) main = overrideForm();
   else if (primary === 'markdone' || locker) main = el('div', { class: 'row' }, markDone('btn btn-primary'));
   else main = el('div', { class: 'row' }, retry('btn btn-primary'));
 
-  const more = keptDetails(moreOpen, job.id, 'wl-more', 'Περισσότερα',
+  const more = keptDetails(moreOpen, job.id, 'wl-more', t('review.more'),
     el('div', { class: 'row' },
-      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, 'Άνοιγμα συνδέσμου') : null,
+      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, t('action.open_link')) : null,
       !locker && primary !== 'retry' ? retry('btn') : null,
       primary !== 'markdone' && !locker ? markDone('btn') : null,
-      canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, 'Μετονομασία…') : null,
-      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, 'Αφαίρεση'),
+      canRename(job) ? el('button', { class: 'btn', type: 'button', onClick: () => renameJob(job) }, t('action.rename')) : null,
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(job) }, t('action.remove')),
       history[0]),
     history[1],
     !locker && primary !== 'override' ? overrideForm() : null);
 
   const tech = job.error_code || (job.error_message && job.error_message !== job.error_code)
-    ? keptDetails(techOpen, job.id, 'tech', 'Τεχνικές λεπτομέρειες',
-      job.error_code ? el('p', { class: 'mono' }, `Κωδικός: ${job.error_code}`) : null,
+    ? keptDetails(techOpen, job.id, 'tech', t('card.tech'),
+      job.error_code ? el('p', { class: 'mono' }, t('card.code', { code: job.error_code })) : null,
       job.error_message && job.error_message !== job.error_code
-        ? el('p', { class: 'mono wl-cause' }, `Αιτία: ${job.error_message}`)
+        ? el('p', { class: 'mono wl-cause' }, t('card.cause', { text: job.error_message }))
         : null)
     : null;
 
@@ -1026,12 +1027,12 @@ function reviewCard(job) {
           el('h3', { class: 'job-name' }, fileName(job)),
           el('p', { class: 'job-url', title: job.url }, job.url),
           el('p', { class: 'job-meta under-name' },
-            `Δημοσιογράφος: ${job.journalist} · από ${fmtTime(job.updated_at)}`),
+            t('card.journalist_since', { name: job.journalist, at: fmtTime(job.updated_at) })),
           mailLink(job),
         ),
       ),
       el('div', { class: 'row tight' },
-        job.cleared_at ? el('span', { class: 'badge', title: 'Κρύφτηκε από τη λίστα· δεν σβήστηκε' }, 'κρυμμένο') : null,
+        job.cleared_at ? el('span', { class: 'badge', title: t('card.hidden.title') }, t('card.hidden')) : null,
         statusBadge(job),
       ),
     ),
@@ -1096,16 +1097,16 @@ async function loadFilters() {
   } catch { /* the lists show codes and the filter stays at "all" */ }
   const surnames = journalists.map((x) => x.surname).filter(Boolean).sort();
   render(filterSelect,
-    el('option', { value: '' }, 'Όλοι οι δημοσιογράφοι'),
+    el('option', { value: '' }, t('filter.all_journalists')),
     surnames.map((name) => el('option', { value: name }, name)),
   );
   render(reviewJournalist,
-    el('option', { value: '' }, 'Όλοι οι δημοσιογράφοι'),
+    el('option', { value: '' }, t('filter.all_journalists')),
     surnames.map((name) => el('option', { value: name }, name)),
   );
   render(groupSelect,
-    el('option', { value: '' }, 'Όλες οι ομάδες'),
-    el('option', { value: '-' }, 'Χωρίς ομάδα'),
+    el('option', { value: '' }, t('filter.all_groups')),
+    el('option', { value: '-' }, t('filter.no_group')),
     [...groupNames.keys()].sort().map((code) => el('option', { value: code }, `${code} — ${groupName(code)}`)),
   );
   render('m-journalists', journalists
@@ -1129,7 +1130,7 @@ async function loadCompleted() {
     const filtered = searchInput.value.trim() || filterSelect.value || groupSelect.value;
     completedList.cards.clear();
     render('completed-body', el('tr', {},
-      el('td', { colspan: '6', class: 'empty' }, filtered ? 'Τίποτα δεν ταιριάζει με την αναζήτηση.' : 'Δεν έχει παραδοθεί τίποτα ακόμη.')));
+      el('td', { colspan: '6', class: 'empty' }, t(filtered ? 'completed.no_match' : 'completed.empty'))));
   } else {
     syncKeyedList(completedList, document.getElementById('completed-body'), jobs, {
       build: completedRow,
@@ -1146,7 +1147,7 @@ function completedRow(job) {
       el('div', { class: 'strong' }, deliveredName(job), limitNote(job),
         // No file was made here: the name is the slug, not a file in the watchfolder (P7.16).
         job.status === 'COMPLETED_MANUAL'
-          ? el('span', { class: 'badge gap-left', title: 'Το βίντεο μπήκε στο Dalet από το MCR, όχι από εδώ' }, 'χειροκίνητα')
+          ? el('span', { class: 'badge gap-left', title: t('completed.manual.title') }, t('completed.manual'))
           : null),
       el('div', { class: 'note mono url-cell', title: job.url }, job.url),
       mailLink(job),
@@ -1160,8 +1161,8 @@ function completedRow(job) {
     el('td', {}, fmtDuration(job.duration_secs)),
     el('td', { class: 'right' },
       el('div', { class: 'row tight row-end' },
-        href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: 'Άνοιγμα του αρχικού συνδέσμου' }, 'Άνοιγμα') : null,
-        el('button', { class: 'btn btn-primary', type: 'button', onClick: () => redownload(job) }, 'Νέα λήψη'),
+        href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: t('completed.open.title') }, t('mail.open')) : null,
+        el('button', { class: 'btn btn-primary', type: 'button', onClick: () => redownload(job) }, t('desk.redownload.button')),
       ),
     ),
   );
@@ -1181,7 +1182,7 @@ async function loadJournalists() {
 
   if (journalists.length === 0) {
     render('journalists-body', el('tr', {},
-      el('td', { colspan: '5', class: 'empty' }, 'Δεν υπάρχουν δημοσιογράφοι.')));
+      el('td', { colspan: '5', class: 'empty' }, t('journalists.empty'))));
     return;
   }
 
@@ -1194,11 +1195,11 @@ async function loadJournalists() {
       j.surname === 'MCR'
         // MCR is structural: unresolved jobs are filed under it and the desk
         // addresses are recognised by it. It is never the journalist.
-        ? el('span', { class: 'note', title: 'Οι διευθύνσεις του MCR αναγνωρίζονται, αλλά το MCR δεν θεωρείται ποτέ δημοσιογράφος' }, 'σταθερό')
+        ? el('span', { class: 'note', title: t('journalists.fixed.title') }, t('journalists.fixed'))
         : el('button', {
             class: 'btn btn-icon btn-danger',
             type: 'button',
-            title: `Διαγραφή ${j.surname}`,
+            title: t('journalists.delete.title', { name: j.surname }),
             onClick: () => deleteJournalist(j.surname),
           }, '✕'),
     ),
@@ -1219,7 +1220,7 @@ document.getElementById('journalist-form').addEventListener('submit', async (eve
         priority: Number(document.getElementById('j-priority').value) || 0,
       },
     });
-    toast('Ο δημοσιογράφος αποθηκεύτηκε.', 'ok');
+    toast(t('journalists.saved'), 'ok');
     event.target.reset();
     document.getElementById('j-priority').value = '0';
     loadJournalists();
@@ -1229,14 +1230,14 @@ document.getElementById('journalist-form').addEventListener('submit', async (eve
 
 async function deleteJournalist(surname) {
   if (!(await confirmDialog({
-    title: `Διαγραφή του δημοσιογράφου ${surname};`,
-    body: 'Τα βίντεο που έχουν ήδη παραδοθεί κρατούν τα ονόματά τους.',
-    confirm: 'Διαγραφή',
+    title: t('journalists.delete.ask', { name: surname }),
+    body: t('journalists.delete.body'),
+    confirm: t('journalists.delete'),
     danger: true,
   }))) return;
   try {
     await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
-    toast(`Ο ${surname} διαγράφηκε.`, 'ok');
+    toast(t('journalists.deleted', { name: surname }), 'ok');
     loadJournalists();
     loadFilters();
   } catch (e) { toast(e.message, 'bad'); }
@@ -1256,8 +1257,8 @@ function showManualPreview() {
   document.getElementById('m-preview').textContent = !(index && journalist && keyword)
     ? ''
     : greek
-      ? `Το όνομα του αρχείου θα έχει τη μορφή ΑΡΙΘΜΟΣ_ΔΗΜΟΣΙΟΓΡΑΦΟΣ_ΛΕΞΗ.mxf, με τα ελληνικά σε λατινικούς χαρακτήρες (π.χ. Σεισμός → SEISMOS).`
-      : `Το αρχείο θα ονομαστεί ${index}_${journalist.toUpperCase()}_${keyword.toUpperCase()}.mxf`;
+      ? t('manual.preview.greek')
+      : t('manual.preview', { name: `${index}_${journalist.toUpperCase()}_${keyword.toUpperCase()}.mxf` });
 }
 for (const f of manualFields) f.addEventListener('input', showManualPreview);
 
@@ -1276,7 +1277,7 @@ document.getElementById('manual-form').addEventListener('submit', async (event) 
         max_videos: max,
       },
     });
-    toast(`Προστέθηκε: ${result.slug}.mxf`, 'ok');
+    toast(t('manual.added', { name: `${result.slug}.mxf` }), 'ok');
     event.target.reset();
     document.getElementById('m-index').value = '1';
     showManualPreview();
@@ -1322,7 +1323,7 @@ const lateStrip = document.getElementById('late-strip');
 const lateList = { cards: new Map(), days: new Map() };
 const lateRows = el('div', { class: 'late-rows' });
 const lateMore = el('p', { class: 'late-more', hidden: true });
-if (lateStrip) lateStrip.append(el('p', { class: 'late-title' }, 'Καθυστερούν'), lateRows, lateMore);
+if (lateStrip) lateStrip.append(el('p', { class: 'late-title' }, t('late.title')), lateRows, lateMore);
 
 /** «Τώρα»: the next free worker takes the video at once. The server says no
  *  (409) when it started meanwhile; either way the strip is refreshed. */
@@ -1340,7 +1341,7 @@ async function runNow(job, button) {
 function lateRow(job) {
   return el('div', { class: 'late-row', 'data-id': String(job.id) },
     el('span', { class: 'late-name' }, fileName(job)),
-    Number(job.priority) >= URGENT_PRIORITY ? el('span', { class: 'badge warn' }, 'Επείγον') : null,
+    Number(job.priority) >= URGENT_PRIORITY ? el('span', { class: 'badge warn' }, t('mail.urgent')) : null,
     el('span', { class: 'late-reason' }, lateReason(job)),
     el('span', { class: 'late-age' }, arrivedAgo(job)),
     // A back-off, or a stream still live waiting for its next check (P11.7).
@@ -1348,9 +1349,9 @@ function lateRow(job) {
       ? el('button', {
           class: 'btn btn-warn',
           type: 'button',
-          title: 'Να δοκιμάσει το σύστημα αμέσως, χωρίς να περιμένει την επόμενη προσπάθεια',
+          title: t('late.now.title'),
           onClick: (ev) => runNow(job, ev.currentTarget),
-        }, 'Τώρα')
+        }, t('late.now'))
       : null,
   );
 }
@@ -1377,7 +1378,7 @@ async function loadLate() {
     if (focused && !lateStrip.contains(document.activeElement)) {
       lateRows.querySelector(`.late-row[data-id="${CSS.escape(focused)}"] button`)?.focus({ preventScroll: true });
     }
-    const more = extra > 0 ? `και άλλα ${extra}` : '';
+    const more = extra > 0 ? t('late.more', { n: extra }) : '';
     if (lateMore.textContent !== more) lateMore.textContent = more;
     if (lateMore.hidden !== (extra === 0)) lateMore.hidden = extra === 0;
     if (lateStrip.hidden !== (shown.length === 0)) lateStrip.hidden = shown.length === 0;

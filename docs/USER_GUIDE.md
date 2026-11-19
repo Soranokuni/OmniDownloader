@@ -122,7 +122,7 @@ switched on yet at every station; ask MCR.
 
 | Tab | English | What is in it |
 |---|---|---|
-| **Email** | Email (opens first) | every mail and manually added link, newest first |
+| **«Εισερχόμενα»** | Inbox (opens first) | every mail and manually added link, newest first |
 | **«Σε εξέλιξη»** | In progress | jobs waiting or being processed |
 | **«Χρειάζονται έλεγχο»** | Need checking | jobs that stopped and need a person, plus videos waiting for approval |
 | **«Ολοκληρωμένα»** | Completed | delivered jobs |
@@ -131,7 +131,7 @@ switched on yet at every station; ask MCR.
 
 The number on each tab is how many items are in it.
 
-### 4.3 The Email tab
+### 4.3 The «Εισερχόμενα» tab (the mails)
 
 Filters along the top:
 
@@ -196,7 +196,7 @@ While a video waits you may see:
 
 - «Σε αναμονή · Nο στη σειρά» — Nth in the queue.
 - «Νέα προσπάθεια σε …» — an automatic retry in so many seconds or minutes;
-  on the Email tab followed by «(έγιναν N από M)», tries made so far out of
+  on the «Εισερχόμενα» tab followed by «(έγιναν N από M)», tries made so far out of
   the most it will make (§4.10).
 - «Περιμένει τον φάκελο παράδοσης» — the video is ready and waits for the
   Dalet watchfolder to answer (§4.10).
@@ -235,8 +235,8 @@ does.
 | «Ακύρωση» | cancel at once: it will not be sent to Dalet. «Αναίρεση» for 8 seconds puts it back in the queue |
 | «Το έβαλα στο Dalet» | you put the video into Dalet yourself; the job is closed as done (asks first) |
 | «Αφαίρεση» | remove the card from the lists (a delivered file is never touched); «Αναίρεση» for 8 seconds brings it back |
-| «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the Email tab) | use a link you pasted instead of the one found |
-| «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the Email tab the history shows under a selected card. |
+| «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the «Εισερχόμενα» tab) | use a link you pasted instead of the one found |
+| «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the «Εισερχόμενα» tab the history shows under a selected card. |
 | «Τώρα» | in the «Καθυστερούν» strip: try now instead of waiting for the next retry (§4.9) |
 
 What can be taken back happens at once, with **«Αναίρεση»** (Undo) at the

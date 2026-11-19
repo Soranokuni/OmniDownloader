@@ -1,27 +1,17 @@
-/* Journalist panel behaviour (plan P2.3, P2.5), in Greek. */
+/* Journalist panel behaviour (plan P2.3, P2.5). Every word is in text.el.js (P12.7). */
 
 import {
   api, el, render, live, fmtTime, logout,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=1';
+import { toast } from '/static/toast.js?v=2';
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
-import { statusBadge } from '/static/status.js?v=1';
-import { deferAction, hiddenNow } from '/static/undo.js?v=2';
+import { statusBadge } from '/static/status.js?v=2';
+import { deferAction, hiddenNow } from '/static/undo.js?v=3';
+import { t, tn } from '/static/text.js?v=1';
 
-/** Where a working video is, in words a journalist knows. */
-const STAGE_TEXT = {
-  QUEUED: 'Στην ουρά',
-  EXTRACT: 'Εύρεση βίντεο',
-  DOWNLOAD: 'Κατεβαίνει',
-  PROBE: 'Έλεγχος',
-  TRANSCODE: 'Μετατροπή',
-  REWRAP: 'Συσκευασία',
-  VERIFY: 'Έλεγχος',
-  DELIVER: 'Παράδοση',
-  ARCHIVE: 'Παράδοση',
-  DONE: 'Έτοιμο',
-};
+/** Where a working video is, in words a journalist knows (`user.stage.<STAGE>`). */
+const stageText = (stage) => (stage ? t(`user.stage.${stage}`) : '—');
 
 /* ------------------------------------------------------------------ *
  * Identity
@@ -53,8 +43,7 @@ async function loadMyJobs() {
   }
 
   if (jobs.length === 0) {
-    render('my-jobs', el('div', { class: 'card center' },
-      'Δεν έχετε στείλει κάτι ακόμη. Επικολλήστε έναν σύνδεσμο παραπάνω και πηγαίνει κατευθείαν στο MCR.'));
+    render('my-jobs', el('div', { class: 'card center' }, t('user.empty')));
     return;
   }
 
@@ -80,21 +69,20 @@ function jobCard(job) {
     !finished && el('div', { class: 'progress' },
       el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),
     (job.status === 'REQUIRES_REVIEW' || job.status === 'FAILED')
-      && el('div', { class: 'reason' }, el('strong', { class: 'block' },
-        'Δεν κατέβηκε αυτόματα· το MCR το έχει δει. Αν έχετε άλλον σύνδεσμο για το ίδιο βίντεο, στείλτε τον.')),
+      && el('div', { class: 'reason' }, el('strong', { class: 'block' }, t('user.not_auto'))),
     done && job.delivered_name
-      && el('div', { class: 'job-meta' }, el('span', {}, `Αρχείο: ${job.delivered_name}`)),
+      && el('div', { class: 'job-meta' }, el('span', {}, t('user.file', { name: job.delivered_name }))),
     el('div', { class: 'job-meta' },
-      el('span', {}, `Στάδιο: ${STAGE_TEXT[job.stage] || '—'}`),
-      el('span', {}, `Στάλθηκε: ${fmtTime(job.created_at)}`),
-      el('span', {}, `Τελείωσε: ${fmtTime(job.completed_at)}`),
+      el('span', {}, t('user.stage', { text: stageText(job.stage) })),
+      el('span', {}, t('user.sent', { at: fmtTime(job.created_at) })),
+      el('span', {}, t('user.finished', { at: fmtTime(job.completed_at) })),
     ),
     el('div', { class: 'job-meta' },
-      el('span', {}, job.notes ? `Σημείωση: ${job.notes}` : ''),
+      el('span', {}, job.notes ? t('user.note', { text: job.notes }) : ''),
       job.status === 'PENDING' && hiddenNow(CANCELLING, job)
-        ? el('span', { class: 'note' }, 'Ακυρώνεται…')
+        ? el('span', { class: 'note' }, t('user.cancelling'))
         : job.status === 'PENDING'
-          && el('button', { class: 'btn btn-danger', type: 'button', onclick: () => cancelJob(job) }, 'Ακύρωση'),
+          && el('button', { class: 'btn btn-danger', type: 'button', onclick: () => cancelJob(job) }, t('user.cancel')),
     ),
   );
 }
@@ -104,11 +92,11 @@ function jobCard(job) {
 const CANCELLING = 'user-cancelling';
 function cancelJob(job) {
   deferAction({
-    text: 'Η αποστολή ακυρώνεται.',
+    text: t('user.cancel.pending'),
     hides: (view, j) => view === CANCELLING && j.id === job.id,
     run: () => api(`/api/user/jobs/${job.id}/cancel`, { method: 'POST', body: {} }),
     after: loadMyJobs,
-    done: 'Η αποστολή ακυρώθηκε.',
+    done: t('user.cancel.done'),
   });
 }
 
@@ -133,25 +121,28 @@ async function postSubmit(body) {
       body: JSON.stringify(body),
     });
   } catch {
-    throw new Error('Η υπηρεσία λήψης δεν απαντά. Ελέγξτε ότι τρέχει και ξαναδοκιμάστε.');
+    throw new Error(t('error.network'));
   }
-  if (response.status === 401) { location.href = '/login'; throw new Error('Η σύνδεση έληξε. Συνδεθείτε ξανά.'); }
+  if (response.status === 401) { location.href = '/login'; throw new Error(t('error.session')); }
   let payload = null;
   try { payload = JSON.parse(await response.text()); } catch { payload = null; }
   if (!response.ok && !(payload && Array.isArray(payload.results))) {
-    throw new Error((payload && payload.error && payload.error.message) || 'Το αίτημα απέτυχε.');
+    throw new Error((payload && payload.error && payload.error.message) || t('error.failed'));
   }
   return { ok: response.ok, payload };
 }
 
+/** One submitted link's line: its file name and what became of it. */
+const resultLine = (r, withError) => el('div', { class: 'job-meta' },
+  el('span', {}, r.slug ? `${r.slug}.mxf` : '—'),
+  el('span', {}, withError && r.error ? r.error : t(r.duplicate ? 'user.result.duplicate' : 'user.result.sent')),
+);
+
 /** Show what was queued before the failure, the link that failed, and how many
  *  were not tried. */
 function showPartialFailure(payload) {
-  const rows = payload.results.map((r) => el('div', { class: 'job-meta' },
-    el('span', {}, r.slug ? `${r.slug}.mxf` : '—'),
-    el('span', {}, r.error ? r.error : (r.duplicate ? 'Υπάρχει ήδη στην ουρά' : 'Στάλθηκε στο MCR')),
-  ));
-  rows.push(el('div', { class: 'reason' }, `Δεν δοκιμάστηκαν: ${Number(payload.not_attempted) || 0}`));
+  const rows = payload.results.map((r) => resultLine(r, true));
+  rows.push(el('div', { class: 'reason' }, t('user.not_tried', { n: Number(payload.not_attempted) || 0 })));
   render('submit-result', rows);
   toast(payload.error.message, 'bad');
   loadMyJobs();
@@ -174,11 +165,10 @@ document.getElementById('submit-form').addEventListener('submit', async (event) 
     const { ok, payload } = await postSubmit(body);
     if (!ok) { showPartialFailure(payload); return; }
     const results = payload;
-    render('submit-result', results.map((r) => el('div', { class: 'job-meta' },
-      el('span', {}, r.slug ? `${r.slug}.mxf` : '—'),
-      el('span', {}, r.duplicate ? 'Υπάρχει ήδη στην ουρά' : 'Στάλθηκε στο MCR'),
-    )));
-    toast(results.length > 1 ? `Στάλθηκαν ${results.length} σύνδεσμοι στο MCR.` : (results[0].slug ? `Στάλθηκε στο MCR ως ${results[0].slug}.mxf` : 'Ο σύνδεσμος υπάρχει ήδη στην ουρά.'), 'ok');
+    render('submit-result', results.map((r) => resultLine(r, false)));
+    toast(results.length > 1
+      ? tn('user.sent_many', results.length)
+      : (results[0].slug ? t('user.sent_as', { name: `${results[0].slug}.mxf` }) : t('user.already')), 'ok');
     event.target.reset();
     document.getElementById('single-box').hidden = false;
     document.getElementById('multi-box').hidden = true;
@@ -206,7 +196,7 @@ notify.addEventListener('change', async () => {
   const wanted = notify.checked;
   try {
     await api('/api/user/prefs', { method: 'PUT', body: { notify_on_completion: wanted } });
-    toast('Η προτίμηση αποθηκεύτηκε.', 'ok');
+    toast(t('user.prefs.saved'), 'ok');
   } catch (e) {
     notify.checked = !wanted;
     toast(e.message, 'bad');
@@ -234,7 +224,7 @@ document.getElementById('password-form').addEventListener('submit', async (event
     });
     // The server ended every session, including this one, so there is nothing
     // to stay on this page for.
-    toast('Ο κωδικός άλλαξε. Συνδεθείτε ξανά…', 'ok');
+    toast(t('user.password.done'), 'ok');
     setTimeout(() => { location.href = '/login'; }, 1200);
   } catch (e) { toast(e.message, 'bad'); }
 });

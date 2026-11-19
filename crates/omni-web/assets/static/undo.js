@@ -17,7 +17,8 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=1';
+import { toast } from '/static/toast.js?v=2';
+import { t } from '/static/text.js?v=1';
 
 export const UNDO_MS = 8000;
 
@@ -33,7 +34,7 @@ function strip() {
 /** One line with its «Αναίρεση» button; `onUndo` runs once if pressed in time. */
 function undoLine(text, onUndo, onExpire) {
   let settled = false;
-  const button = el('button', { class: 'btn', type: 'button' }, 'Αναίρεση');
+  const button = el('button', { class: 'btn', type: 'button' }, t('undo.button'));
   const node = el('div', { class: 'toast undo' }, el('span', {}, text), button);
   const finish = () => { node.remove(); };
   const timer = setTimeout(() => {

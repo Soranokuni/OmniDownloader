@@ -17,17 +17,18 @@
  */
 
 import { api, el, render, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=1';
+import { toast } from '/static/toast.js?v=2';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=18';
-import { visible } from '/static/undo.js?v=2';
+} from '/static/desk.js?v=19';
+import { visible } from '/static/undo.js?v=3';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
-} from '/static/status.js?v=1';
-import { whyText } from '/static/worklist.js?v=1';
+} from '/static/status.js?v=2';
+import { whyText } from '/static/worklist.js?v=2';
+import { t, tn } from '/static/text.js?v=1';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -77,19 +78,14 @@ const isActiveTab = () => {
  * Words
  * ------------------------------------------------------------------ */
 
-/** Short stage names, for the one-line summary of a mail. */
-const STAGE_SHORT = {
-  EXTRACT: 'αναζήτηση στη σελίδα',
-  DOWNLOAD: 'λήψη',
-  PROBE: 'έλεγχος αρχείου',
-  TRANSCODE: 'μετατροπή',
-  REWRAP: 'πακετάρισμα MXF',
-  VERIFY: 'έλεγχος προδιαγραφών',
-  DELIVER: 'παράδοση',
-};
+/** Short stage names, for the one-line summary of a mail (`stage_short.<STAGE>`). */
+const SHORT_STAGES = ['EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER'];
 
 function shortStatus(j) {
-  if (j.status === 'RUNNING') return `${STAGE_SHORT[j.stage] || STATUS.RUNNING.phrase} ${pct(j)}%`;
+  if (j.status === 'RUNNING') {
+    const stage = SHORT_STAGES.includes(j.stage) ? t(`stage_short.${j.stage}`) : STATUS.RUNNING.phrase;
+    return `${stage} ${pct(j)}%`;
+  }
   return statusInfo(j.status).phrase;
 }
 
@@ -104,38 +100,38 @@ function railBadge(j) {
 /** "3 βίντεο · 1 απέτυχε · 1B: μετατροπή 63% · 1 παραδόθηκε". Counted by
  *  tone, so a cancelled video is never counted as one still waiting. */
 function summary(e) {
-  if (e.state === 'failed') return [el('b', {}, 'Δεν διαβάστηκε'), ' · ανοίξτε το για να διαβαστεί ξανά'];
+  if (e.state === 'failed') return [el('b', {}, t('mail.unread_failed')), t('mail.unread_failed.hint')];
   const js = e.jobs || [];
   if (!js.length) {
-    return [e.outcome === 'PHOTOS_ONLY' ? 'Μόνο φωτογραφίες· τίποτα για λήψη' : 'Δεν βρέθηκε βίντεο'];
+    return [t(e.outcome === 'PHOTOS_ONLY' ? 'mail.photos_only' : 'mail.no_video')];
   }
   const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0, approval: 0, off: 0 };
   for (const j of js) c[tone(j)] += 1;
-  const head = el('b', {}, js.length === 1 ? '1 βίντεο' : `${js.length} βίντεο`);
-  if (c.ok === js.length) return [head, js.length === 1 ? ' · παραδόθηκε' : ' · όλα παραδόθηκαν'];
+  const head = el('b', {}, tn('mail.videos', js.length));
+  if (c.ok === js.length) return [head, tn('mail.sum.all_done', js.length)];
   const parts = [];
-  if (c.bad) parts.push(c.bad === 1 ? `1 ${STATUS.FAILED.phrase}` : `${c.bad} απέτυχαν`);
+  if (c.bad) parts.push(tn('mail.sum.failed', c.bad));
   if (c.approval) parts.push(`${c.approval} ${STATUS.AWAITING_APPROVAL.phrase}`);
-  if (c.warn) parts.push(c.warn === 1 ? '1 θέλει έλεγχο' : `${c.warn} θέλουν έλεγχο`);
+  if (c.warn) parts.push(tn('mail.sum.check', c.warn));
   if (c.run) {
     const r = js.find((j) => j.status === 'RUNNING');
     parts.push(c.run === 1 ? `${r.index_str}: ${shortStatus(r)}` : `${c.run} ${STATUS.RUNNING.phrase}`);
   }
   if (c.wait) parts.push(`${c.wait} ${STATUS.PENDING.phrase}`);
-  if (c.off) parts.push(c.off === 1 ? `1 ${STATUS.CANCELLED.phrase}` : `${c.off} ακυρώθηκαν`);
-  if (c.ok) parts.push(c.ok === 1 ? `1 ${STATUS.COMPLETED.phrase}` : `${c.ok} παραδόθηκαν`);
+  if (c.off) parts.push(tn('mail.sum.cancelled', c.off));
+  if (c.ok) parts.push(tn('mail.sum.done', c.ok));
   return [head, ' · ', parts.join(' · ')];
 }
 
 function dayLabel(at) {
   const d = at ? new Date(at) : null;
-  if (!d || Number.isNaN(d.getTime())) return 'Χωρίς ημερομηνία';
+  if (!d || Number.isNaN(d.getTime())) return t('day.none');
   const today = new Date();
   const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
   const same = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-  const long = d.toLocaleDateString('el-GR', { weekday: 'long', day: 'numeric', month: 'long' });
-  if (same(d, today)) return 'Σήμερα';
-  if (same(d, yesterday)) return `Χθες · ${long}`;
+  const long = d.toLocaleDateString(t('locale'), { weekday: 'long', day: 'numeric', month: 'long' });
+  if (same(d, today)) return t('day.today');
+  if (same(d, yesterday)) return t('day.yesterday', { date: long });
   return long;
 }
 
@@ -187,7 +183,7 @@ function updateUnreadBadge() {
   const n = entries.filter(isUnread).length;
   badge.hidden = n === 0;
   badge.textContent = String(n);
-  badge.title = 'Νέα που δεν έχετε ανοίξει ακόμη';
+  badge.title = t('mail.unread_count');
 }
 
 /* ------------------------------------------------------------------ *
@@ -273,12 +269,13 @@ async function loadOnce() {
  * ------------------------------------------------------------------ */
 
 // The pip's colour is a class (`pip run` …, status.css), not an inline style (P12.5).
+// Each filter's name is `filter.<key>` in text.el.js.
 const FILTERS = [
-  ['all', 'Όλα', null],
-  ['active', 'Σε εξέλιξη', 'run'],
-  ['attention', 'Θέλουν προσοχή', 'warn'],
-  ['done', 'Ολοκληρώθηκαν', 'ok'],
-  ['empty', 'Χωρίς βίντεο', 'none'],
+  ['all', null],
+  ['active', 'run'],
+  ['attention', 'warn'],
+  ['done', 'ok'],
+  ['empty', 'none'],
 ];
 let filtersSig = '';
 
@@ -286,7 +283,7 @@ function renderFilters(counts) {
   const sig = JSON.stringify([list.filter, counts]);
   if (sig === filtersSig) return;
   filtersSig = sig;
-  render('inbox-filters', FILTERS.map(([key, label, color]) => el('button', {
+  render('inbox-filters', FILTERS.map(([key, color]) => el('button', {
     class: 'fchip',
     type: 'button',
     'aria-pressed': String(list.filter === key),
@@ -296,7 +293,7 @@ function renderFilters(counts) {
       list.page = 1;
       loadInbox();
     },
-  }, color ? el('span', { class: `pip ${color}`, 'aria-hidden': 'true' }) : null, label,
+  }, color ? el('span', { class: `pip ${color}`, 'aria-hidden': 'true' }) : null, t(`filter.${key}`),
   el('span', { class: 'n' }, String(counts[key] ?? 0)))));
 }
 
@@ -309,8 +306,8 @@ function renderList() {
   if (!entries.length && !open) {
     cards.clear();
     render(host, el('div', { class: 'card center' }, list.q || list.filter !== 'all'
-      ? 'Τίποτα δεν ταιριάζει με την αναζήτηση ή το φίλτρο.'
-      : `Δεν έχει έρθει κανένα email τις τελευταίες ${windowDays} ημέρες. Τα νέα εμφανίζονται εδώ αυτόματα.`));
+      ? t('mail.list.no_match')
+      : t('mail.list.empty', { n: windowDays })));
     return;
   }
   const wanted = [];
@@ -318,7 +315,7 @@ function renderList() {
   // The open mail stays where the operator is reading it, even if it no
   // longer matches the filter (it just finished, say).
   if (open && !ids.has(open.id) && cards.has(open.id)) {
-    wanted.push(dayNode('Ανοιχτό'), cards.get(open.id).card);
+    wanted.push(dayNode(t('day.open')), cards.get(open.id).card);
   }
   let day = null;
   for (const e of entries) {
@@ -419,15 +416,15 @@ function paintHead(c) {
   c.sig = sig;
 
   const who = e.kind === 'manual'
-    ? `Χειροκίνητη προσθήκη · ${e.added_by_name || 'MCR'}`
-    : (e.from_name || e.from_address || 'Άγνωστος αποστολέας');
+    ? t('mail.manual_by', { name: e.added_by_name || 'MCR' })
+    : (e.from_name || e.from_address || t('mail.unknown_sender'));
   let journalist = null;
   if (e.kind === 'manual') {
     journalist = e.journalist && e.journalist !== 'MCR' ? el('span', { class: 'badge info' }, e.journalist) : null;
   } else if (e.state !== 'failed') {
     journalist = !e.journalist || e.journalist === 'MCR'
-      ? el('span', { class: 'badge warn', title: 'Δεν βρέθηκε δημοσιογράφος: τα αρχεία παίρνουν το όνομα MCR' }, 'Χωρίς δημοσιογράφο')
-      : el('span', { class: 'badge info', title: `Δημοσιογράφος, ${e.how || ''}` }, e.journalist);
+      ? el('span', { class: 'badge warn', title: t('mail.no_journalist.title') }, t('mail.no_journalist'))
+      : el('span', { class: 'badge info', title: t('mail.journalist.title', { how: e.how || '' }) }, e.journalist);
   }
   c.head.replaceChildren(
     el('span', { class: `avatar ${e.kind === 'manual' ? 'manual' : ''}`.trim(), 'aria-hidden': 'true' }, initials(e)),
@@ -436,11 +433,11 @@ function paintHead(c) {
         el('span', { class: 'who', title: e.from_address || '' }, who),
         journalist,
         e.group_code ? el('span', { class: 'badge', title: hooks.groupName(e.group_code) }, e.group_code) : null,
-        e.urgent ? el('span', { class: 'badge bad' }, 'Επείγον') : null,
-        e.attachments ? el('span', { class: 'clip', title: 'Συνημμένα' }, icon('paperclip'), String(e.attachments)) : null,
-        unread ? el('span', { class: 'new-pill' }, 'Νέο') : null,
+        e.urgent ? el('span', { class: 'badge bad' }, t('mail.urgent')) : null,
+        e.attachments ? el('span', { class: 'clip', title: t('mail.attachments') }, icon('paperclip'), String(e.attachments)) : null,
+        unread ? el('span', { class: 'new-pill' }, t('mail.new')) : null,
       ),
-      el('span', { class: 'mail-subject' }, e.subject || '(χωρίς θέμα)'),
+      el('span', { class: 'mail-subject' }, e.subject || t('mail.no_subject')),
       el('span', { class: 'mail-preview' }, e.preview || ''),
     ),
     el('span', { class: 'mail-status' }, segbar(e), el('span', { class: 'mail-sum' }, summary(e))),
@@ -458,9 +455,9 @@ function segbar(e) {
     return bar;
   }
   for (const j of js) {
-    const t = tone(j);
-    const seg = el('span', { class: `seg ${t}`, title: `${j.index_str}: ${shortStatus(j)}` });
-    if (t === 'run') {
+    const family = tone(j);
+    const seg = el('span', { class: `seg ${family}`, title: `${j.index_str}: ${shortStatus(j)}` });
+    if (family === 'run') {
       seg.style.setProperty('--p', `${pct(j)}%`);
       seg.append(el('i'));
     }
@@ -489,7 +486,7 @@ function toggle(id) {
   c.sig = '';
   paintHead(c);
   updateUnreadBadge();
-  render(c.inner, el('div', { class: 'md-loading' }, 'Φόρτωση…'));
+  render(c.inner, el('div', { class: 'md-loading' }, t('loading')));
   loadDetail(c, open);
 }
 
@@ -567,7 +564,7 @@ function detailNode(d) {
   paintRail(rail);
   root.append(el('div', { class: 'reader' },
     el('div', { class: 'letter-pane' },
-      el('div', { class: 'pane-title' }, el('span', {}, d.kind === 'manual' ? 'Ο σύνδεσμος' : 'Το κείμενο του email'), legend()),
+      el('div', { class: 'pane-title' }, el('span', {}, t(d.kind === 'manual' ? 'mail.pane.link' : 'mail.pane.text')), legend()),
       letterNode(d)),
     el('div', { class: 'rail' }, rail)));
   return root;
@@ -578,19 +575,19 @@ function metaNode(d) {
   const rows = [];
   const add = (label, ...value) => rows.push(el('dt', {}, label), el('dd', {}, ...value));
   if (d.kind === 'manual') {
-    add('Από', el('b', {}, entry?.added_by_name || 'MCR'), ' · μέσα από τη φόρμα «Προσθήκη συνδέσμου»');
-    add('Προστέθηκε', fmtTime(d.received_at));
+    add(t('mail.meta.from'), el('b', {}, entry?.added_by_name || 'MCR'), t('mail.meta.via_form'));
+    add(t('mail.meta.added'), fmtTime(d.received_at));
   } else {
-    add('Από', el('b', {}, d.from_name || d.from_address || '—'), d.from_name && d.from_address ? ` <${d.from_address}>` : '');
-    if (d.to && d.to.length) add('Προς', d.to.join(', '), d.cc && d.cc.length ? `  ·  Κοιν.: ${d.cc.join(', ')}` : '');
-    add('Ελήφθη', fmtTime(d.received_at || d.processed_at));
+    add(t('mail.meta.from'), el('b', {}, d.from_name || d.from_address || '—'), d.from_name && d.from_address ? ` <${d.from_address}>` : '');
+    if (d.to && d.to.length) add(t('mail.meta.to'), d.to.join(', '), d.cc && d.cc.length ? t('mail.meta.cc', { list: d.cc.join(', ') }) : '');
+    add(t('mail.meta.received'), fmtTime(d.received_at || d.processed_at));
   }
   if (d.journalist && d.outcome !== 'FAILED') {
-    add('Δημοσιογράφος', el('b', {}, d.journalist === 'MCR' ? 'MCR (κανένας)' : d.journalist), d.how ? el('span', { class: 'how' }, `  ·  ${d.how}`) : '');
+    add(t('mail.meta.journalist'), el('b', {}, d.journalist === 'MCR' ? t('mail.meta.nobody') : d.journalist), d.how ? el('span', { class: 'how' }, `  ·  ${d.how}`) : '');
   }
-  if (d.group_code) add('Ομάδα', `${d.group_code} — ${hooks.groupName(d.group_code)}`);
+  if (d.group_code) add(t('mail.meta.group'), `${d.group_code} — ${hooks.groupName(d.group_code)}`);
   if (d.attachments && d.attachments.length) {
-    add('Συνημμένα', d.attachments.map((a) => chipNode(a.id, `${a.name} · ${fmtSize(a.size)}`)));
+    add(t('mail.attachments'), d.attachments.map((a) => chipNode(a.id, `${a.name} · ${fmtSize(a.size)}`)));
   }
   return el('dl', { class: 'md-meta' }, rows);
 }
@@ -604,10 +601,10 @@ function fmtSize(bytes) {
 
 function failedNode() {
   return el('div', { class: 'md-failed' },
-    el('p', {}, 'Το σύστημα δεν μπόρεσε να διαβάσει αυτό το email από το γραμματοκιβώτιο, ούτε μετά από επανειλημμένες προσπάθειες, και δεν μπήκε κανένα βίντεο στην ουρά. Συνήθως φταίει μια προσωρινή διακοπή.'),
+    el('p', {}, t('mail.failed.text')),
     el('div', { class: 'row' },
-      el('button', { class: 'btn btn-primary', type: 'button', onClick: (ev) => reprocess(ev.currentTarget) }, icon('refresh'), 'Να διαβαστεί ξανά'),
-      el('span', { class: 'note' }, 'Διαβάζεται στον επόμενο έλεγχο του γραμματοκιβωτίου. Ό,τι έχει ήδη μπει στην ουρά δεν μπαίνει δεύτερη φορά.')));
+      el('button', { class: 'btn btn-primary', type: 'button', onClick: (ev) => reprocess(ev.currentTarget) }, icon('refresh'), t('mail.reprocess')),
+      el('span', { class: 'note' }, t('mail.reprocess.note'))));
 }
 
 async function reprocess(button) {
@@ -615,7 +612,7 @@ async function reprocess(button) {
   button.disabled = true;
   try {
     await api('/api/mails/reprocess', { method: 'POST', body: { key: open.key } });
-    toast('Το email θα διαβαστεί ξανά σε λίγα δευτερόλεπτα.', 'ok');
+    toast(t('mail.reprocess.done'), 'ok');
   } catch (e) {
     toast(e.message, 'bad');
     button.disabled = false;
@@ -632,7 +629,7 @@ function letterNode(d) {
   const box = el('div', { class: 'letter' });
   if (!d.text) {
     box.append(el('p', { class: 'note' },
-      `Το κείμενο αυτού του email δεν κρατήθηκε: το κείμενο κρατιέται ${windowDays} ημέρες, και όσα email ήρθαν πριν από την ενημέρωση του συστήματος δεν το έχουν. Τα βίντεο του είναι δεξιά.`));
+      t('mail.text_gone', { n: windowDays })));
     return box;
   }
   for (const block of d.text) {
@@ -645,10 +642,10 @@ function letterNode(d) {
       box.append(body);
     } else if (block.role === 'forwarded') {
       body.classList.add('fwd');
-      body.title = 'Κεφαλίδες του προωθημένου μηνύματος';
+      body.title = t('mail.forwarded');
       box.append(body);
     } else {
-      box.append(folded(block.role === 'signature' ? 'Υπογραφή' : 'Παλιότερο μήνυμα', body));
+      box.append(folded(t(block.role === 'signature' ? 'mail.signature' : 'mail.older'), body));
     }
   }
   return box;
@@ -656,7 +653,7 @@ function letterNode(d) {
 
 function folded(label, body) {
   body.hidden = true;
-  const text = el('span', {}, `${label} · δεν το διαβάζει το σύστημα · εμφάνιση`);
+  const text = el('span', {}, t('mail.fold.show', { label }));
   const button = el('button', { type: 'button', class: 'fold', 'aria-expanded': 'false' }, icon('eye'), text);
   const wrap = el('div', { class: 'skipped', 'data-label': label }, button, body);
   button.addEventListener('click', () => setFold(wrap, body.hidden));
@@ -668,7 +665,7 @@ function setFold(wrap, show) {
   const body = wrap.querySelector('.blk');
   body.hidden = !show;
   button.setAttribute('aria-expanded', String(show));
-  button.lastChild.textContent = `${wrap.dataset.label} · δεν το διαβάζει το σύστημα · ${show ? 'απόκρυψη' : 'εμφάνιση'}`;
+  button.lastChild.textContent = t(show ? 'mail.fold.hide' : 'mail.fold.show', { label: wrap.dataset.label });
 }
 
 /* A link (or an attachment) in the text, tagged with the files it became. */
@@ -699,7 +696,7 @@ function paintChip(chip) {
   chip.classList.toggle('hl', pinnedChips().includes(id));
   chip.title = jobs.length
     ? jobs.map((j) => `${j.index_str}: ${shortStatus(j)}`).join(' · ')
-    : (link && link.skip ? link.skip.reason : 'Δεν κατέβηκε');
+    : (link && link.skip ? link.skip.reason : t('mail.link.not_downloaded'));
   const tags = jobs.length
     ? jobs.map((j) => statusTag(j, j.index_str))
     : [el('span', { class: 'tag' }, '—')];
@@ -713,8 +710,8 @@ function paintChip(chip) {
 function paintRail(rail) {
   const d = detail;
   const nodes = [el('div', { class: 'pane-title' }, el('span', {},
-    `${d.kind === 'manual' ? 'Βίντεο από αυτόν τον σύνδεσμο' : 'Βίντεο από αυτό το email'} · ${d.jobs.length}`))];
-  if (!d.jobs.length) nodes.push(el('p', { class: 'empty-mail' }, 'Δεν μπήκε κανένα βίντεο στην ουρά.'));
+    t(d.kind === 'manual' ? 'mail.rail.link' : 'mail.rail.mail', { n: d.jobs.length })))];
+  if (!d.jobs.length) nodes.push(el('p', { class: 'empty-mail' }, t('mail.rail.none')));
   for (const j of d.jobs) {
     nodes.push(jobCard(j));
     for (const o of d.offers.filter((x) => x.job_id === j.id)) nodes.push(offerCard(j, o));
@@ -727,7 +724,7 @@ function paintRail(rail) {
     skipped.push(l);
   }
   if (skipped.length) {
-    nodes.push(el('div', { class: 'rail-sep' }, `Σύνδεσμοι που δεν κατέβηκαν · ${skipped.length}`));
+    nodes.push(el('div', { class: 'rail-sep' }, t('mail.rail.skipped', { n: skipped.length })));
     for (const l of skipped) nodes.push(skipCard(l));
   }
   rail.replaceChildren(...nodes);
@@ -804,7 +801,7 @@ function subLine(j) {
   switch (j.status) {
     case 'RUNNING': {
       const step = STAGE_ORDER.indexOf(j.stage);
-      left = [step >= 0 ? `Βήμα ${step + 1} από ${STAGE_ORDER.length} · ` : '', el('span', { class: 'st' }, STAGE_TEXT[j.stage] || STATUS.RUNNING.label)];
+      left = [step >= 0 ? t('mail.job.step', { n: step + 1, of: STAGE_ORDER.length }) : '', el('span', { class: 'st' }, STAGE_TEXT[j.stage] || STATUS.RUNNING.label)];
       if (j.stage === 'DOWNLOAD' && j.speed && !/^0(\.0+)? /.test(j.speed)) left.push(` · ${j.speed}`);
       left.push(stepTimeNode(j));
       right = j.stage === 'DOWNLOAD' && j.eta && j.eta !== '--:--' ? `${pct(j)}% · ${j.eta}` : `${pct(j)}%`;
@@ -812,15 +809,15 @@ function subLine(j) {
     }
     case 'PENDING':
       left = [waitLine(j)];
-      if (j.attempts >= 1 && j.not_before) left.push(` (έγιναν ${j.attempts} από ${j.max_attempts})`);
+      if (j.attempts >= 1 && j.not_before) left.push(t('mail.job.attempts', { n: j.attempts, of: j.max_attempts }));
       break;
     case 'COMPLETED':
     case 'COMPLETED_MANUAL':
-      left = [`Παραδόθηκε ${fmtTime(j.completed_at || j.delivered_at)}`];
+      left = [t('mail.job.delivered', { at: fmtTime(j.completed_at || j.delivered_at) })];
       right = fmtDuration(j.duration_secs);
       break;
     case 'MANUAL_DOWNLOAD':
-      left = [el('span', { class: 'st' }, 'Χρειάζεται χειροκίνητη λήψη')];
+      left = [el('span', { class: 'st' }, t('mail.job.manual'))];
       break;
     case 'CANCELLED':
       left = [STATUS.CANCELLED.label];
@@ -828,7 +825,7 @@ function subLine(j) {
     case 'AWAITING_APPROVAL':
       // To the review tab, with this video's card in view (mcr.js listens).
       left = [el('button', {
-        class: 'badge approval', type: 'button', title: 'Άνοιγμα στην καρτέλα «Χρειάζονται έλεγχο»',
+        class: 'badge approval', type: 'button', title: t('mail.job.to_review'),
         onClick: (ev) => {
           ev.stopPropagation();
           window.dispatchEvent(new CustomEvent('desk:approval', { detail: { id: j.id } }));
@@ -836,7 +833,7 @@ function subLine(j) {
       }, markNode('approval'), STATUS.AWAITING_APPROVAL.label)];
       break;
     default:
-      left = [el('span', { class: 'st' }, 'Δεν κατέβηκε αυτόματα')];
+      left = [el('span', { class: 'st' }, t('mail.job.not_auto'))];
   }
   return el('div', { class: 'jc-sub' }, el('span', {}, left), el('span', {}, right));
 }
@@ -844,16 +841,16 @@ function subLine(j) {
 /** Where the video came from, when that is not just «its link». */
 function originLine(j) {
   if (j.place.parent) {
-    return el('div', { class: 'jc-found', title: j.url }, `↳ βρέθηκε μέσα στο ίδιο άρθρο · ${shortUrl(j.url)}`);
+    return el('div', { class: 'jc-found', title: j.url }, t('mail.origin.in_article', { url: shortUrl(j.url) }));
   }
   if (j.place.shared) {
-    return el('div', { class: 'jc-found' }, `Ο σύνδεσμος ήταν ήδη στην ουρά: είναι η εργασία #${j.id}, από άλλο email ή χειροκίνητα.`);
+    return el('div', { class: 'jc-found' }, t('mail.origin.shared', { id: j.id }));
   }
-  if (String(j.url).startsWith('attachment://')) return el('div', { class: 'jc-found' }, 'Από το συνημμένο του email');
+  if (String(j.url).startsWith('attachment://')) return el('div', { class: 'jc-found' }, t('mail.origin.attachment'));
   const link = j.place.link ? index.linkById.get(j.place.link) : null;
-  if (!j.place.link) return el('div', { class: 'jc-found' }, 'Ο σύνδεσμός του δεν φαίνεται στο κείμενο.');
+  if (!j.place.link) return el('div', { class: 'jc-found' }, t('mail.origin.not_in_text'));
   if (link && link.url !== j.url) {
-    return el('div', { class: 'jc-found', title: j.url }, `Σύνδεσμος που έδωσε το MCR: ${shortUrl(j.url)}`);
+    return el('div', { class: 'jc-found', title: j.url }, t('mail.origin.mcr_link', { url: shortUrl(j.url) }));
   }
   return null;
 }
@@ -861,16 +858,16 @@ function originLine(j) {
 function moreNode(j, sel) {
   const box = el('div', { class: 'jc-more' });
   const href = safeHref(j.url);
-  const openLink = href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: j.url }, icon('external-link'), 'Άνοιγμα') : null;
+  const openLink = href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: j.url }, icon('external-link'), t('mail.open')) : null;
   if (needsAttention(j)) {
     const locker = j.status === 'MANUAL_DOWNLOAD';
     box.append(el('div', { class: `jc-hint ${j.status === 'FAILED' ? 'bad' : ''}`.trim() },
       // The same sentence as the review tab's card: by state as well as code (P12.2).
       el('strong', {}, whyText(j)),
-      j.error_code ? el('span', { class: 'note mono' }, `Κωδικός: ${j.error_code}`) : null));
+      j.error_code ? el('span', { class: 'note mono' }, t('card.code', { code: j.error_code })) : null));
     // Every action is on the card without selecting it first (P12.4).
     box.append(el('div', { class: 'jc-actions' },
-      locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, 'Δοκιμή ξανά'),
+      locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, t('action.retry')),
       locker ? null : el('button', {
         class: 'btn btn-warn',
         type: 'button',
@@ -880,20 +877,20 @@ function moreNode(j, sel) {
           repaintJob(j.id, true);
           if (overrideOpen.has(j.id)) openRoot()?.querySelector(`.jcard[data-job="${j.id}"] input`)?.focus();
         },
-      }, 'Άλλος σύνδεσμος…'),
-      el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(j, afterAction) }, 'Το έβαλα στο Dalet'),
+      }, t('mail.other_link')),
+      el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(j, afterAction) }, t('desk.markdone.button')),
       openLink,
       canRename(j) ? renameButton(j) : null,
-      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, t('action.remove'))));
     if (renameOpen.has(j.id)) box.append(renameForm(j, afterAction, () => repaintJob(j.id, true)));
     if (overrideOpen.has(j.id)) {
-      const input = el('input', { type: 'url', class: 'mono', placeholder: 'https://… ο σύνδεσμος του ίδιου του βίντεο', 'aria-label': 'Άλλος σύνδεσμος για το ίδιο βίντεο' });
+      const input = el('input', { type: 'url', class: 'mono', placeholder: t('mail.other_link.placeholder'), 'aria-label': t('mail.other_link.label') });
       const submit = async () => {
         if (await overrideJob(j, input.value, afterAction)) overrideOpen.delete(j.id);
       };
       input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
       box.append(el('div', { class: 'jc-override' }, el('div', { class: 'grow' }, input),
-        el('button', { class: 'btn btn-warn', type: 'button', onClick: submit }, 'Χρήση')));
+        el('button', { class: 'btn btn-warn', type: 'button', onClick: submit }, t('mail.other_link.use'))));
     }
   } else if (j.status !== 'AWAITING_APPROVAL') {
     // A held video's actions are on its approval card (the chip above leads there).
@@ -902,12 +899,12 @@ function moreNode(j, sel) {
     box.append(el('div', { class: 'jc-actions' },
       openLink,
       canRename(j) ? renameButton(j) : null,
-      j.status === 'CANCELLED' ? el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, 'Δοκιμή ξανά') : null,
+      j.status === 'CANCELLED' ? el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, t('action.retry')) : null,
       done
-        ? el('button', { class: 'btn', type: 'button', onClick: () => redownloadJob(j, afterAction) }, 'Νέα λήψη')
+        ? el('button', { class: 'btn', type: 'button', onClick: () => redownloadJob(j, afterAction) }, t('desk.redownload.button'))
         : live
-          ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => cancelJob(j, afterAction) }, 'Ακύρωση')
-          : el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, 'Αφαίρεση')));
+          ? el('button', { class: 'btn btn-danger', type: 'button', onClick: () => cancelJob(j, afterAction) }, t('action.cancel'))
+          : el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, t('action.remove'))));
     if (renameOpen.has(j.id)) box.append(renameForm(j, afterAction, () => repaintJob(j.id, true)));
   }
   if (sel) box.append(historyNode(j.id));
@@ -925,30 +922,30 @@ function renameButton(j) {
       repaintJob(j.id, true);
       if (renameOpen.has(j.id)) document.getElementById(`rename-${j.id}`)?.focus();
     },
-  }, 'Μετονομασία…');
+  }, t('action.rename'));
 }
 
 function offerCard(j, o) {
   const href = safeHref(o.url);
   return el('div', { class: 'skipcard offer' },
-    el('div', { class: 'why' }, `Προτείνεται: κι άλλο βίντεο στο ίδιο άρθρο · θα γίνει ${o.index_str}`),
+    el('div', { class: 'why' }, t('mail.offer', { index: o.index_str })),
     el('div', { class: 'u', title: o.url }, shortUrl(o.url)),
     el('div', { class: 'row tight' },
-      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, icon('external-link'), 'Άνοιγμα') : null,
-      el('button', { class: 'btn btn-warn', type: 'button', onClick: () => queueOffer(j.id, o, afterAction) }, icon('plus'), `Λήψη ως ${o.index_str}`)));
+      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, icon('external-link'), t('mail.open')) : null,
+      el('button', { class: 'btn btn-warn', type: 'button', onClick: () => queueOffer(j.id, o, afterAction) }, icon('plus'), t('mail.offer.queue', { index: o.index_str }))));
 }
 
 function skipCard(l) {
   const href = safeHref(l.url);
   const canQueue = l.skip.can_queue && detail.kind === 'mail';
   const button = canQueue
-    ? el('button', { class: 'btn', type: 'button', onClick: (ev) => queueLink(l, ev.currentTarget) }, icon('plus'), `Λήψη και αυτού ως ${detail.next_index}`)
+    ? el('button', { class: 'btn', type: 'button', onClick: (ev) => queueLink(l, ev.currentTarget) }, icon('plus'), t('mail.skip.queue', { index: detail.next_index }))
     : null;
   const card = el('div', { class: 'skipcard', 'data-url': l.url },
     el('div', { class: 'u', title: l.url }, shortUrl(l.url)),
     el('div', { class: 'why' }, l.skip.reason),
     (href || button) ? el('div', { class: 'row tight' },
-      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, icon('external-link'), 'Άνοιγμα') : null,
+      href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer' }, icon('external-link'), t('mail.open')) : null,
       button) : null);
   card.addEventListener('mouseenter', () => hover({ url: l.url }, true));
   card.addEventListener('mouseleave', () => hover({ url: l.url }, false));
@@ -961,8 +958,8 @@ async function queueLink(l, button) {
   try {
     const r = await api('/api/mails/queue-link', { method: 'POST', body: { key: open.key, url: l.url } });
     toast(r.duplicate
-      ? `Ο σύνδεσμος ήταν ήδη στην ουρά (εργασία #${r.job_id}).`
-      : `Προστέθηκε ως ${r.slug}.mxf (εργασία #${r.job_id}).`, 'ok');
+      ? t('mail.queue_link.duplicate', { id: r.job_id })
+      : t('mail.queue_link.done', { name: `${r.slug}.mxf`, id: r.job_id }), 'ok');
     selected = { job: r.job_id };
     afterAction();
   } catch (e) {
@@ -982,13 +979,13 @@ const TIMELINE_FAILED = [];
 function historyNode(jobId) {
   const events = timelines.get(jobId);
   if (events === TIMELINE_FAILED) {
-    return el('p', { class: 'note jc-history' }, 'Δεν φορτώθηκε το ιστορικό. ',
+    return el('p', { class: 'note jc-history' }, t('history.failed'),
       el('button', {
         class: 'btn', type: 'button',
         onClick: () => { timelines.delete(jobId); loadTimeline(jobId); repaintJob(jobId, true); },
-      }, 'Ξανά'));
+      }, t('history.again')));
   }
-  if (!events) return el('p', { class: 'note jc-history' }, 'Φόρτωση ιστορικού…');
+  if (!events) return el('p', { class: 'note jc-history' }, t('history.loading'));
   return timelineNode(events, techOpen.has(jobId), (open) => { if (open) techOpen.add(jobId); else techOpen.delete(jobId); });
 }
 
@@ -1153,7 +1150,7 @@ export async function openMail(kind, key) {
   }
   const c = cards.get(id);
   if (!c) {
-    toast(`Το email δεν είναι πια στη λίστα: η λίστα κρατά τις τελευταίες ${windowDays} ημέρες.`, 'bad');
+    toast(t('mail.gone', { n: windowDays }), 'bad');
     return;
   }
   if (!open || open.id !== id) toggle(id);

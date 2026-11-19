@@ -11,6 +11,7 @@
  */
 
 import { el } from '/static/app.js?v=6';
+import { t } from '/static/text.js?v=1';
 
 export const MAX_ERRORS = 3;
 const PASSING_MS = 6000;
@@ -37,7 +38,7 @@ export function toast(message, kind = '') {
   if (kind === 'bad') {
     const same = [...errors.children].find((n) => n.dataset.text === text);
     if (same) same.remove();
-    const close = el('button', { class: 'toast-close', type: 'button', 'aria-label': 'Κλείσιμο του μηνύματος' }, '✕');
+    const close = el('button', { class: 'toast-close', type: 'button', 'aria-label': t('toast.close') }, '✕');
     const node = el('div', { class: 'toast bad sticky', 'data-text': text }, el('span', { class: 'toast-text' }, text), close);
     close.addEventListener('click', () => node.remove());
     errors.append(node);

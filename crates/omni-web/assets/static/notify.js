@@ -17,10 +17,13 @@
  *
  * Only a change seen happening is announced: an email already finished
  * when the desk is opened stays quiet.
+ *
+ * Every word is in text.el.js (P12.7): `notify.*` and `health.*`.
  */
 
 import { api, el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=1';
+import { toast } from '/static/toast.js?v=2';
+import { t, tn, has } from '/static/text.js?v=1';
 
 const POLL_MS = 8000;
 const PREF_KEY = 'omni.mcr.chime';
@@ -74,13 +77,13 @@ function note(freq, at, length, gain) {
 /** `ok`: C5 E5 G5 C6, rising. Otherwise G5 then E5, quieter. */
 function jingle(ok) {
   if (!soundOn() || !ctx || ctx.state !== 'running') return false;
-  const t = ctx.currentTime + 0.03;
+  const start = ctx.currentTime + 0.03;
   if (ok) {
-    [523.25, 659.25, 783.99].forEach((f, i) => note(f, t + i * 0.12, 0.5, 0.22));
-    note(1046.5, t + 0.36, 1.1, 0.25);
+    [523.25, 659.25, 783.99].forEach((f, i) => note(f, start + i * 0.12, 0.5, 0.22));
+    note(1046.5, start + 0.36, 1.1, 0.25);
   } else {
-    note(783.99, t, 0.45, 0.2);
-    note(659.25, t + 0.22, 0.9, 0.2);
+    note(783.99, start, 0.45, 0.2);
+    note(659.25, start + 0.22, 0.9, 0.2);
   }
   return true;
 }
@@ -88,75 +91,91 @@ function jingle(ok) {
 /** Three short low notes, A4 A4 E4: unlike either jingle, and not a celebration. */
 function alarm() {
   if (!soundOn() || !ctx || ctx.state !== 'running') return false;
-  const t = ctx.currentTime + 0.03;
-  [[440, 0], [440, 0.2], [329.63, 0.4]].forEach(([f, d]) => note(f, t + d, 0.3, 0.24));
+  const start = ctx.currentTime + 0.03;
+  [[440, 0], [440, 0.2], [329.63, 0.4]].forEach(([f, d]) => note(f, start + d, 0.3, 0.24));
   return true;
 }
 
 /**
- * Every health check in plain Greek (P12.6), one row per check name of
- * `omni_core::health::checks`. Three texts, never the tool's English:
+ * Every health check in plain words (P12.6, P12.7), one row per check name of
+ * `omni_core::health::checks`: who acts on it, 'mcr' or 'admin'. The texts
+ * are in text.el.js under `health.<name>.`:
+ *   name             what the desk calls it
  *   degraded / down  what happened (by how bad it is)
- *   means            what it means for the videos
- *   todo             what to do; `who` does it: 'mcr' or 'admin'
+ *   means            what it means for the videos   (`means.down` if it differs)
+ *   todo             what to do                     (`todo.down` if it differs)
  * The check's own detail (English, for support) goes under «Τεχνικές
  * λεπτομέρειες» in the header's panel, never in the banner.
  */
-export const CHECK_INFO = {
-  mail: { name: 'Email (εισερχόμενα)', degraded: 'Η ανάγνωση των email έχει πρόβλημα.', down: 'Τα νέα email δεν διαβάζονται.', means: 'Σύνδεσμοι που στέλνονται τώρα με email δεν εμφανίζονται· όσα βίντεο είναι ήδη στην ουρά συνεχίζουν.', todo: 'Ενημερώστε τον διαχειριστή. Μέχρι τότε προσθέστε τους επείγοντες συνδέσμους με το χέρι.', who: 'admin' },
-  llm: { name: 'Βοηθός ανάγνωσης (LLM)', degraded: 'Ο βοηθός που αναγνωρίζει δημοσιογράφο και θέμα δεν απαντά.', down: 'Ο βοηθός που αναγνωρίζει δημοσιογράφο και θέμα δεν λειτουργεί.', means: 'Τα βίντεο κατεβαίνουν κανονικά· κάποια email ίσως μείνουν χωρίς δημοσιογράφο ή λέξη-κλειδί.', todo: 'Ελέγξτε τα ονόματα των νέων αρχείων· αν επιμένει, ενημερώστε τον διαχειριστή.', who: 'admin' },
-  tools: { name: 'Εργαλεία λήψης και μετατροπής', degraded: 'Ένα εργαλείο λήψης ή μετατροπής έχει πρόβλημα.', down: 'Λείπει ή δεν ξεκινά ένα εργαλείο λήψης ή μετατροπής.', means: 'Βίντεο μπορεί να μην κατεβαίνουν ή να μη μετατρέπονται.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
-  pinned_tools: { name: 'Εκδόσεις εργαλείων', degraded: 'Ένα εργαλείο μετατροπής δεν είναι η έκδοση που έχει ελεγχθεί.', down: 'Ένα εργαλείο μετατροπής δεν είναι η έκδοση που έχει ελεγχθεί.', means: 'Κάθε αρχείο ελέγχεται πριν παραδοθεί· ένα που δεν πληροί τις προδιαγραφές δεν φτάνει στο Dalet.', todo: 'Ενημερώστε τον διαχειριστή να βάλει πάλι τη σωστή έκδοση.', who: 'admin' },
-  encoder: { name: 'Κωδικοποιητής', degraded: 'Ο έλεγχος του κωδικοποιητή στην εκκίνηση βγήκε με πρόβλημα.', down: 'Ο κωδικοποιητής δεν φτιάχνει σωστό αρχείο εκπομπής.', means: 'Τα βίντεο δεν μετατρέπονται σε μορφή εκπομπής και δεν παραδίδονται.', todo: 'Ενημερώστε αμέσως τον διαχειριστή· χρειάζεται επανεκκίνηση της υπηρεσίας.', who: 'admin' },
-  watchfolder: { name: 'Φάκελος παράδοσης (Dalet)', degraded: 'Ο φάκελος του Dalet απαντά με πρόβλημα.', down: 'Ο φάκελος του Dalet δεν δέχεται αρχεία.', means: 'Τα έτοιμα βίντεο δεν παραδίδονται· περιμένουν και φεύγουν μόλις ο φάκελος επανέλθει.', todo: 'Ελέγξτε ότι ο server του Dalet λειτουργεί και ενημερώστε τον διαχειριστή.', who: 'mcr' },
-  disk: { name: 'Χώρος στον δίσκο', degraded: 'Ο ελεύθερος χώρος στον δίσκο λιγοστεύει.', down: 'Ο δίσκος είναι σχεδόν γεμάτος.', means: 'Κάτω από 5 GB ελεύθερα δεν ξεκινά καμία νέα λήψη.', todo: 'Ενημερώστε τον διαχειριστή να ελευθερώσει χώρο.', who: 'admin' },
-  browser: { name: 'Ενσωματωμένος browser', degraded: 'Ο browser που ψάχνει βίντεο μέσα σε άρθρα απέτυχε στη δοκιμή του.', down: 'Ο browser που ψάχνει βίντεο μέσα σε άρθρα δεν ξεκινά.', means: 'Βίντεο από YouTube και άλλες πλατφόρμες κατεβαίνουν· βίντεο μέσα σε άρθρα ειδησεογραφικών σελίδων μπορεί να αποτύχουν.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
-  selfcheck: { name: 'Νυχτερινός αυτοέλεγχος', degraded: 'Κάποιοι δοκιμαστικοί σύνδεσμοι δεν κατέβηκαν στον τελευταίο έλεγχο.', down: 'Οι δοκιμαστικοί σύνδεσμοι δεν κατεβαίνουν.', means: 'Ίσως ένας ιστότοπος άλλαξε· βίντεο από αυτόν μπορεί να χρειαστούν χειροκίνητη λήψη.', todo: 'Αν επιμένει πάνω από μία ημέρα, ενημερώστε τον διαχειριστή.', who: 'admin' },
-  deno: { name: 'YouTube (Deno)', degraded: 'Το Deno, που χρειάζεται για το YouTube, λείπει ή κατεβαίνει ακόμη.', down: 'Το Deno, που χρειάζεται για το YouTube, δεν λειτουργεί.', means: 'Βίντεο από YouTube μπορεί να αποτυγχάνουν.', todo: 'Περιμένετε λίγα λεπτά· αν δεν επανέλθει, ενημερώστε τον διαχειριστή.', who: 'admin' },
-  queue: { name: 'Ουρά', degraded: 'Βίντεο περιμένουν ή επεξεργάζονται ασυνήθιστα πολύ.', down: 'Η ουρά δεν προχωρά.', means: 'Κάποια βίντεο θα αργήσουν να φτάσουν στο Dalet.', todo: 'Δείτε την καρτέλα «Σε εξέλιξη» και τη λωρίδα «Καθυστερούν»· αν τίποτα δεν προχωρά, ενημερώστε τον διαχειριστή.', who: 'mcr' },
-  workers: { name: 'Εκτέλεση εργασιών', degraded: 'Μια εργασία σταμάτησε από εσωτερικό σφάλμα το τελευταίο 24ωρο.', down: 'Οι εργασίες σταματούν από εσωτερικό σφάλμα.', means: 'Η εργασία ξαναμπήκε στην ουρά ή πήγε για έλεγχο· τα υπόλοιπα βίντεο συνεχίζουν.', todo: 'Αν επαναληφθεί, ενημερώστε τον διαχειριστή.', who: 'admin' },
-  accounts: { name: 'Λογαριασμοί', degraded: 'Ο αρχικός λογαριασμός Admin με τον αρχικό κωδικό λειτουργεί ακόμη.', down: 'Ο αρχικός λογαριασμός Admin με τον αρχικό κωδικό λειτουργεί ακόμη.', means: 'Τα βίντεο δεν επηρεάζονται· η σελίδα διαχείρισης όμως δεν είναι ασφαλής.', todo: 'Ο διαχειριστής αλλάζει τον κωδικό του λογαριασμού Admin.', who: 'admin' },
-  sites: { name: 'Ιστότοποι', degraded: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο.', down: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο.', means: 'Βίντεο από αυτόν τον ιστότοπο μπορεί να χρειαστούν χειροκίνητη λήψη.', todo: 'Για κάθε βίντεο που σταματά, ανοίξτε τον σύνδεσμο και κατεβάστε το με το χέρι, ή δώστε άλλον σύνδεσμο.', who: 'mcr' },
-  cookies: { name: 'Cookies σύνδεσης', degraded: 'Τα cookies για κάποιον ιστότοπο λήγουν, απέτυχαν ή δεν έχουν δοκιμαστεί.', down: 'Τα cookies σύνδεσης δεν διαβάζονται.', means: 'Βίντεο από ιστότοπους που ζητούν σύνδεση μπορεί να αποτύχουν.', todo: 'Ο διαχειριστής ανεβάζει νέα cookies (Διαχείριση → Cookies).', who: 'admin' },
-  lockdown: { name: 'Προστασία φακέλων', degraded: 'Οι φάκελοι δεδομένων και προσωρινών αρχείων δεν είναι κλειδωμένοι.', down: 'Οι φάκελοι δεδομένων και προσωρινών αρχείων δεν είναι κλειδωμένοι.', means: 'Τα βίντεο δεν επηρεάζονται.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
-  archive: { name: 'Αρχείο πηγών', degraded: 'Η φύλαξη των αρχικών αρχείων σταμάτησε (λίγος χώρος ή λάθος φάκελος).', down: 'Η φύλαξη των αρχικών αρχείων σταμάτησε.', means: 'Τα βίντεο παραδίδονται κανονικά· τα αρχικά τους δεν κρατιούνται.', todo: 'Ενημερώστε τον διαχειριστή.', who: 'admin' },
+export const CHECK_WHO = {
+  mail: 'admin',
+  llm: 'admin',
+  tools: 'admin',
+  pinned_tools: 'admin',
+  encoder: 'admin',
+  watchfolder: 'mcr',
+  disk: 'admin',
+  browser: 'admin',
+  selfcheck: 'admin',
+  deno: 'admin',
+  queue: 'mcr',
+  workers: 'admin',
+  accounts: 'admin',
+  sites: 'mcr',
+  cookies: 'admin',
+  lockdown: 'admin',
+  archive: 'admin',
+  maintenance: 'admin',
+  database: 'admin',
 };
 
-/** Who does what a line asks. */
-export const WHO = { mcr: 'MCR', admin: 'Διαχειριστής' };
+/** `CHECK_INFO[name].name`: what the desk calls a check, in the current language. */
+export const CHECK_INFO = Object.fromEntries(Object.keys(CHECK_WHO).map((name) => [name, {
+  get name() { return t(`health.${name}.name`); },
+  who: CHECK_WHO[name],
+}]));
+
+/** Who does what a line asks, as the badge says it. */
+export const WHO = {
+  get mcr() { return t('who.mcr'); },
+  get admin() { return t('who.admin'); },
+};
 
 /** The three texts of a check that is not OK; a check the desk does not know
- *  yet still gets Greek, never only its English detail. */
+ *  yet still gets words of its own, never only its English detail. */
 export function checkTexts(name, check) {
-  const info = CHECK_INFO[name];
   const state = check && check.state === 'down' ? 'down' : 'degraded';
-  if (!info) {
-    return {
-      name,
-      happened: 'Ένας έλεγχος του συστήματος αναφέρει πρόβλημα.',
-      means: 'Ίσως επηρεάζει κάποια βίντεο.',
-      todo: 'Ενημερώστε τον διαχειριστή.',
-      who: 'admin',
-    };
+  if (!CHECK_WHO[name]) {
+    return { name, happened: t('health.unknown.happened'), means: t('health.unknown.means'), todo: t('health.unknown.todo'), who: 'admin' };
   }
-  return { name: info.name, happened: info[state], means: info.means, todo: info.todo, who: info.who };
+  const key = (part) => (has(`health.${name}.${part}.${state}`) ? `health.${name}.${part}.${state}` : `health.${name}.${part}`);
+  return {
+    name: t(`health.${name}.name`),
+    happened: t(`health.${name}.${state}`),
+    means: t(key('means')),
+    todo: t(key('todo')),
+    who: CHECK_WHO[name],
+  };
 }
 
 /** «14:21», or '' for a missing or unreadable time (never "now"). */
 function hhmm(at) {
   const d = at ? new Date(at) : null;
   if (!d || Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString('el-GR', { hour: '2-digit', minute: '2-digit', hour12: false });
+  return d.toLocaleTimeString(t('locale'), { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
-/** A site that stopped giving video, as one Greek sentence (P12.6), from the
- *  status payload's `sites` row: «Ο ιστότοπος x.gr δεν δίνει βίντεο από τις 14:21 (4 αποτυχίες στη σειρά).» */
+/** A site that stopped giving video, as one sentence (P12.6), from the status
+ *  payload's `sites` row: «Ο ιστότοπος x.gr δεν δίνει βίντεο από τις 14:21 (4 αποτυχίες στη σειρά).» */
 export function siteSentence(site) {
-  const what = site.state === 'broken' ? 'δεν δίνει βίντεο' : 'δίνει βίντεο με δυσκολία';
   const at = hhmm(site.state_since);
   const n = Number(site.consecutive_fail) || 0;
-  const fails = n === 1 ? ' (1 αποτυχία)' : n > 1 ? ` (${n} αποτυχίες στη σειρά)` : '';
-  return `Ο ιστότοπος ${site.domain} ${what}${at ? ` από τις ${at}` : ''}${fails}.`;
+  return t('site.sentence', {
+    domain: site.domain,
+    what: t(site.state === 'broken' ? 'site.broken' : 'site.degraded'),
+    since: at ? t('site.since', { at }) : '',
+    fails: n > 0 ? tn('site.fails', n) : '',
+  });
 }
 
 /** The checks that are not OK, as `[name, check]`, for the banner and the
@@ -171,9 +190,9 @@ export function healthProblems(checks) {
 export function healthSummary(checks) {
   const problems = healthProblems(checks);
   const count = problems.length;
-  if (!count) return { count, tone: 'ok', text: 'Όλα καλά' };
+  if (!count) return { count, tone: 'ok', text: t('health.pill.ok') };
   const tone = problems.some(([, c]) => c.state === 'down') ? 'bad' : 'warn';
-  return { count, tone, text: count === 1 ? '1 πρόβλημα' : `${count} προβλήματα` };
+  return { count, tone, text: tn('health.pill.problems', count) };
 }
 
 const SEVERITY = { ok: 0, degraded: 1, down: 2 };
@@ -242,7 +261,7 @@ export function watchStatus(data) {
   lastStatus = data;
   if (diff.needsPerson > 0) {
     const n = diff.needsPerson;
-    const text = n === 1 ? '1 βίντεο χρειάζεται έλεγχο' : `${n} βίντεο χρειάζονται έλεγχο`;
+    const text = tn('notify.needs', n);
     const covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
     lastBadNews = Date.now();
     if (!covered) jingle(false);
@@ -253,45 +272,45 @@ export function watchStatus(data) {
   if (diff.newlyLate > 0) {
     // The softer of the two jingles, once; no title count and no review alert.
     jingle(false);
-    toast(diff.newlyLate === 1 ? 'Ένα βίντεο καθυστερεί' : `${diff.newlyLate} βίντεο καθυστερούν`, 'warn');
+    toast(tn('notify.late', diff.newlyLate), 'warn');
   }
   if (diff.wentBad.length) alarm();
   for (const bad of diff.wentBad) {
-    const t = checkTexts(bad.name, bad);
-    const text = `Πρόβλημα: ${t.name} — ${t.happened} ${t.todo}`;
+    const ct = checkTexts(bad.name, bad);
+    const text = t('notify.problem', { name: ct.name, happened: ct.happened, todo: ct.todo });
     toast(text, 'bad');
     plainNotification(text, `omni-health-${bad.name}`);
   }
   for (const name of diff.recovered) {
-    toast(`Αποκαταστάθηκε: ${CHECK_INFO[name]?.name || name}`, 'ok');
+    toast(t('notify.recovered', { name: CHECK_INFO[name]?.name || name }), 'ok');
   }
 }
 
 /** The service stopped answering: sound once and say so outside the tab too. */
 export function serviceDown() {
   alarm();
-  plainNotification('Η υπηρεσία λήψης δεν απαντά', 'omni-offline', () => {});
+  plainNotification(t('service.down'), 'omni-offline', () => {});
 }
 
 /** The service answers again (same tag, so it replaces the outage notification). */
 export function serviceBack() {
-  plainNotification('Η υπηρεσία λήψης απαντά ξανά', 'omni-offline', () => {});
+  plainNotification(t('service.back'), 'omni-offline', () => {});
 }
 
 function describe(s) {
-  return s.ok
-    ? `${s.delivered}/${s.total} βίντεο παραδόθηκαν`
-    : `${s.delivered}/${s.total} παραδόθηκαν · τα υπόλοιπα θέλουν έλεγχο`;
+  return t(s.ok ? 'notify.mail.all' : 'notify.mail.some', { delivered: s.delivered, total: s.total });
 }
+
+const subjectOf = (s) => s.subject || t('mail.no_subject');
 
 function systemNotification(done) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   const first = done[0];
   const allOk = done.every((s) => s.ok);
   const title = done.length === 1
-    ? (first.ok ? 'Ολοκληρώθηκε email' : 'Ολοκληρώθηκε email, θέλει έλεγχο')
-    : `Ολοκληρώθηκαν ${done.length} email${allOk ? '' : ' (κάποια θέλουν έλεγχο)'}`;
-  const body = done.slice(0, 3).map((s) => `«${s.subject || '(χωρίς θέμα)'}» — ${describe(s)}`).join('\n');
+    ? t(first.ok ? 'notify.mail.done' : 'notify.mail.done_check')
+    : t(allOk ? 'notify.mails.done' : 'notify.mails.done_check', { n: done.length });
+  const body = done.slice(0, 3).map((s) => t('notify.mail.line', { subject: subjectOf(s), what: describe(s) })).join('\n');
   try {
     const n = new Notification(title, { body, tag: `omni-${first.id}`, silent: true });
     n.onclick = () => {
@@ -324,9 +343,9 @@ function announce(done) {
   }
   if (!covered) jingle(allOk);
   for (const s of done.slice(0, 3)) {
-    toast(`${s.ok ? '✔' : '⚠'} Email «${s.subject || '(χωρίς θέμα)'}»: ${describe(s)}`, s.ok ? 'ok' : 'bad');
+    toast(t('notify.mail.toast', { mark: s.ok ? '✔' : '⚠', subject: subjectOf(s), what: describe(s) }), s.ok ? 'ok' : 'bad');
   }
-  if (done.length > 3) toast(`Και ${done.length - 3} ακόμη email ολοκληρώθηκαν`, 'ok');
+  if (done.length > 3) toast(tn('notify.mails.more', done.length - 3), 'ok');
   systemNotification(done);
   if (!covered) count(done.length, !allOk);
 }
@@ -351,13 +370,9 @@ function paintButton() {
   const on = soundOn();
   const locked = on && (!ctx || ctx.state !== 'running');
   // Short, so the header stays on one line at 1366 px (P12.5); the tooltip says the rest.
-  button.textContent = on ? (locked ? '🔔 Ενεργοποίηση ήχου' : '🔔 Ήχος') : '🔕 Σίγαση';
+  button.textContent = on ? (locked ? t('sound.locked') : t('sound.on')) : t('sound.off');
   button.setAttribute('aria-pressed', String(on));
-  button.title = on
-    ? (locked
-      ? 'Ο browser παίζει ήχο μόνο μετά από ένα πάτημα στη σελίδα. Πατήστε για να ενεργοποιηθεί.'
-      : 'Μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email. Πατήστε για σίγαση.')
-    : 'Σίγαση. Πατήστε για μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email.';
+  button.title = on ? t(locked ? 'sound.locked.title' : 'sound.on.title') : t('sound.off.title');
 }
 
 /**

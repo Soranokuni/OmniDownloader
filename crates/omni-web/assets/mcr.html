@@ -18,16 +18,16 @@
       <div class="brand-mark" aria-hidden="true">O</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p>Λήψη βίντεο για το MCR</p>
+        <p data-t="page.tagline"></p>
       </div>
     </div>
     <div class="topbar-status">
       <button class="health-pill" type="button" id="health-pill" aria-expanded="false" aria-controls="health-panel">
-        <span id="health-dot" class="dot" aria-hidden="true"></span><span id="health-text">Έλεγχος…</span>
+        <span id="health-dot" class="dot" aria-hidden="true"></span><span id="health-text" data-t="health.pill.checking"></span>
       </button>
       <span id="sound-slot" class="sound-slot"></span>
-      <a class="btn" href="/admin">Διαχείριση</a>
-      <button class="btn" type="button" id="logout-btn">Αποσύνδεση</button>
+      <a class="btn" href="/admin" data-t="page.admin"></a>
+      <button class="btn" type="button" id="logout-btn" data-t="page.logout"></button>
     </div>
   </div>
   <!-- Every health line, free space and what to do; filled by mcr.js. -->
@@ -47,21 +47,21 @@
   <div class="tabs">
   <div role="tablist" class="tablist">
     <button class="tab" type="button" role="tab" id="tabbtn-email" data-tab="email" aria-controls="tab-email" aria-selected="true" tabindex="0">
-      Email <span id="email-count" class="badge info" hidden>0</span>
+      <span data-t="tab.email"></span> <span id="email-count" class="badge info" hidden>0</span>
     </button>
     <button class="tab" type="button" role="tab" id="tabbtn-queue" data-tab="queue" aria-controls="tab-queue" aria-selected="false" tabindex="-1">
-      Σε εξέλιξη <span id="queue-count" class="badge info" hidden>0</span>
+      <span data-t="tab.queue"></span> <span id="queue-count" class="badge info" hidden>0</span>
     </button>
     <button class="tab" type="button" role="tab" id="tabbtn-review" data-tab="review" aria-controls="tab-review" aria-selected="false" tabindex="-1">
-      Χρειάζονται έλεγχο <span id="review-count" class="badge warn" hidden>0</span>
+      <span data-t="tab.review"></span> <span id="review-count" class="badge warn" hidden>0</span>
     </button>
     <button class="tab" type="button" role="tab" id="tabbtn-completed" data-tab="completed" aria-controls="tab-completed" aria-selected="false" tabindex="-1">
-      Ολοκληρωμένα <span id="completed-count" class="badge" hidden>0</span>
+      <span data-t="tab.completed"></span> <span id="completed-count" class="badge" hidden>0</span>
     </button>
-    <button class="tab" type="button" role="tab" id="tabbtn-journalists" data-tab="journalists" aria-controls="tab-journalists" aria-selected="false" tabindex="-1">Δημοσιογράφοι</button>
-    <button class="tab" type="button" role="tab" id="tabbtn-manual" data-tab="manual" aria-controls="tab-manual" aria-selected="false" tabindex="-1">Προσθήκη συνδέσμου</button>
+    <button class="tab" type="button" role="tab" id="tabbtn-journalists" data-tab="journalists" aria-controls="tab-journalists" aria-selected="false" tabindex="-1" data-t="tab.journalists"></button>
+    <button class="tab" type="button" role="tab" id="tabbtn-manual" data-tab="manual" aria-controls="tab-manual" aria-selected="false" tabindex="-1" data-t="tab.manual"></button>
   </div>
-    <button class="tab tab-end" type="button" id="specs-btn">Προδιαγραφές εκπομπής</button>
+    <button class="tab tab-end" type="button" id="specs-btn" data-t="tab.specs"></button>
   </div>
 
   <!-- Every mail and every link added by hand, each with its videos (plan P7.10) -->
@@ -259,24 +259,23 @@
 <div class="modal" id="specs-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="specs-title">
     <div class="section-head modal-head">
-      <h2 id="specs-title" class="modal-title">
-        Προδιαγραφές κάθε αρχείου που παραδίδεται
-      </h2>
-      <button class="btn btn-icon" type="button" id="specs-close" aria-label="Κλείσιμο">✕</button>
+      <h2 id="specs-title" class="modal-title" data-t="spec.title"></h2>
+      <button class="btn btn-icon" type="button" id="specs-close" data-t-aria-label="page.close">✕</button>
     </div>
-    <div class="spec-row"><span>Κωδικοποίηση βίντεο</span><span>MPEG-2 (Sony XDCAM HD422)</span></div>
-    <div class="spec-row"><span>Ρυθμός δεδομένων</span><span>50 Mbps CBR</span></div>
-    <div class="spec-row"><span>Ανάλυση</span><span>1920×1080, 16:9</span></div>
-    <div class="spec-row"><span>Καρέ / σάρωση</span><span>25 fps, 1080i50, πρώτο το πάνω πεδίο</span></div>
-    <div class="spec-row"><span>Χρωματική δειγματοληψία</span><span>4:2:2 (yuv422p)</span></div>
-    <div class="spec-row"><span>Διάταξη ήχου</span><span>EBU R48 — 8 ανεξάρτητα μονοφωνικά κανάλια</span></div>
-    <div class="spec-row"><span>Κωδικοποίηση ήχου</span><span>PCM 24-bit @ 48 kHz</span></div>
-    <div class="spec-row"><span>Αντιστοίχιση καναλιών</span><span>1 Αριστερό, 2 Δεξί, 3–8 σιωπή</span></div>
-    <div class="spec-row"><span>Περιτύλιγμα</span><span>SMPTE RDD9 OP1a (bmxtranswrap)</span></div>
-    <button class="btn btn-block spaced-top" type="button" id="specs-close-2">Κλείσιμο</button>
+    <!-- What every delivered file is (the on-air format); words in text.el.js, `spec.*`. -->
+    <div class="spec-row"><span data-t="spec.video"></span><span data-t="spec.video.value"></span></div>
+    <div class="spec-row"><span data-t="spec.bitrate"></span><span data-t="spec.bitrate.value"></span></div>
+    <div class="spec-row"><span data-t="spec.size"></span><span data-t="spec.size.value"></span></div>
+    <div class="spec-row"><span data-t="spec.scan"></span><span data-t="spec.scan.value"></span></div>
+    <div class="spec-row"><span data-t="spec.chroma"></span><span data-t="spec.chroma.value"></span></div>
+    <div class="spec-row"><span data-t="spec.audio_layout"></span><span data-t="spec.audio_layout.value"></span></div>
+    <div class="spec-row"><span data-t="spec.audio"></span><span data-t="spec.audio.value"></span></div>
+    <div class="spec-row"><span data-t="spec.channels"></span><span data-t="spec.channels.value"></span></div>
+    <div class="spec-row"><span data-t="spec.wrap"></span><span data-t="spec.wrap.value"></span></div>
+    <button class="btn btn-block spaced-top" type="button" id="specs-close-2" data-t="page.close"></button>
   </div>
 </div>
 
-<script type="module" src="/static/mcr.js?v=51"></script>
+<script type="module" src="/static/mcr.js?v=52"></script>
 </body>
 </html>

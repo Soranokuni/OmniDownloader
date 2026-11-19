@@ -378,18 +378,20 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 18),
-        ("inbox.js", 25),
-        ("approval.js", 13),
-        ("notify.js", 13),
-        ("mcr.js", 51),
-        ("status.js", 1),
+        ("desk.js", 19),
+        ("inbox.js", 26),
+        ("approval.js", 14),
+        ("notify.js", 14),
+        ("mcr.js", 52),
+        ("status.js", 2),
         ("status.css", 5),
-        ("worklist.js", 1),
-        ("undo.js", 2),
-        ("dialog.js", 1),
-        ("user.js", 11),
-        ("toast.js", 1),
+        ("worklist.js", 2),
+        ("undo.js", 3),
+        ("dialog.js", 2),
+        ("user.js", 12),
+        ("toast.js", 2),
+        ("text.js", 1),
+        ("text.el.js", 1),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -457,27 +459,53 @@ fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
         "the late strip does not offer «Τώρα» for both 'retry' and 'live':\n{row}"
     );
     assert!(row.contains("runNow(job, ev.currentTarget)"), "the late row's button does not run the job now");
-    assert!(mcr.contains("και άλλα"), "the strip does not cap its rows");
+    // P12.7: the words are in the dictionary (text.el.js), the code reads them by key.
+    let words = desk_dictionary(&assets);
+    assert!(mcr.contains("t('late.more'") && words["late.more"].contains("και άλλα"), "the strip does not cap its rows");
     let page = assets.get("mcr.html").expect("mcr.html shipped");
     let strip = page.find("id=\"late-strip\"").expect("the strip is in mcr.html");
     assert!(strip < page.find("class=\"tabs\"").unwrap(), "the strip is not above the tab bar");
 
     let notify = assets.get("static/notify.js").expect("notify.js shipped");
-    assert!(notify.contains("workers: {"), "CHECK_INFO has no entry for the workers check");
+    assert!(notify.contains("  workers: '"), "CHECK_WHO has no entry for the workers check");
     assert!(notify.contains("queue.late"), "notify.js does not read queue.late");
     let need = notify.split("function needCount").nth(1).and_then(|s| s.split('}').next()).unwrap();
     assert!(!need.contains("late"), "late videos must not count as needing a person");
 
     let desk = assets.get("static/desk.js").expect("desk.js shipped");
-    assert!(desk.contains("Περιμένει τον φάκελο παράδοσης"), "desk.js has no watchfolder wait text");
+    assert!(
+        desk.contains("t('desk.wait.delivery')") && words["desk.wait.delivery"] == "Περιμένει τον φάκελο παράδοσης",
+        "desk.js has no watchfolder wait text"
+    );
     assert!(desk.contains("export function lateReason"), "desk.js has no lateReason");
 
     // P11.7: a stream still live says so, with its next check's time, in the late strip.
     let late = desk.split("export function lateReason").nth(1).and_then(|s| s.split("\nexport function").next()).unwrap();
     let live = late.split("case 'live':").nth(1).expect("lateReason has no case for wait_reason 'live'");
     let live = live.split("case '").next().unwrap();
-    assert!(live.contains("Ζωντανή μετάδοση"), "the live case does not say «Ζωντανή μετάδοση»:\n{live}");
-    assert!(live.contains("επόμενος έλεγχος ${at}") && live.contains("clock(job.next_try_at)"), "the live case does not show the next check's time:\n{live}");
+    assert!(
+        live.contains("t('desk.late.live')") && words["desk.late.live"] == "Ζωντανή μετάδοση",
+        "the live case does not say «Ζωντανή μετάδοση»:\n{live}"
+    );
+    assert!(
+        live.contains("t('desk.late.live_at', { at })") && live.contains("clock(job.next_try_at)")
+            && words["desk.late.live_at"].contains("επόμενος έλεγχος {at}"),
+        "the live case does not show the next check's time:\n{live}"
+    );
+}
+
+/// The desk's dictionary (P12.7), `static/text.el.js`, as key -> text. Fails on a key given twice
+/// (a JS object keeps the last one silently).
+fn desk_dictionary(assets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let src = assets.get("static/text.el.js").expect("text.el.js shipped");
+    let body = src.split("export default {").nth(1).and_then(|s| s.split("\n};").next()).expect("text.el.js exports a dictionary");
+    let mut out = BTreeMap::new();
+    for line in body.lines().map(str::trim).filter(|l| l.starts_with('\'')) {
+        let key = line[1..].split('\'').next().expect("a key").to_string();
+        let value = line.split_once("': '").map(|(_, v)| v.trim_end_matches(',').trim_end_matches('\'').to_string()).unwrap_or_else(|| panic!("no text for {key}"));
+        assert!(out.insert(key.clone(), value).is_none(), "text.el.js has `{key}` twice");
+    }
+    out
 }
 
 /// P12.3: the desk's lists are updated in place. A full `render(list, every card)` on the 5 s
@@ -517,44 +545,48 @@ fn every_status_has_one_word_one_colour_and_a_mark_in_status_js() {
         assets.get("static/app.css").expect("app.css shipped"),
         assets.get("static/status.css").expect("status.css shipped")
     );
-    // A one-line table row, `NAME: { key: '…', … }`, and one of its fields.
-    let row = |block: &str, name: &str| -> String {
-        let head = format!("{name}: {{");
-        block
-            .lines()
-            .find(|l| l.trim_start().starts_with(&head))
-            .unwrap_or_else(|| panic!("status.js has no row for {name}"))
-            .to_string()
-    };
-    let field = |row: &str, key: &str| -> String {
-        let pat = format!("{key}: '");
-        row.split(pat.as_str()).nth(1).and_then(|s| s.split('\'').next()).unwrap_or("").to_string()
-    };
+    // P12.7: the tones are in status.js (`NAME: 'tone',`), the words in text.el.js
+    // (`status.NAME.label|short|phrase|user`, `tone.<tone>`).
+    let words = desk_dictionary(&assets);
     let tones = js
         .split("export const TONES = {")
         .nth(1)
         .and_then(|s| s.split("};").next())
         .expect("status.js has a TONES table");
     let statuses = js
-        .split("export const STATUS = {")
+        .split("export const STATUS_TONE = {")
         .nth(1)
         .and_then(|s| s.split("};").next())
-        .expect("status.js has a STATUS table");
+        .expect("status.js has a STATUS_TONE table");
+    let tone_of = |name: &str| -> String {
+        let head = format!("{name}: '");
+        statuses
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix(head.as_str()))
+            .and_then(|s| s.split('\'').next())
+            .unwrap_or_else(|| panic!("status.js has no tone for {name}"))
+            .to_string()
+    };
 
     for status in JobStatus::ALL {
         let name = status.as_str();
-        let r = row(statuses, name);
         for key in ["label", "short", "phrase", "user"] {
-            assert!(!field(&r, key).is_empty(), "{name} has no `{key}` text in status.js");
+            let k = format!("status.{name}.{key}");
+            assert!(words.get(&k).is_some_and(|w| !w.is_empty()), "{name} has no `{key}` text (`{k}`)");
         }
-        let tone = field(&r, "tone");
-        let t = row(tones, &tone);
-        assert!(!field(&t, "mark").is_empty(), "tone {tone} ({name}) has no mark beside its colour");
+        let tone = tone_of(name);
+        let mark = tones
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{tone}: {{")))
+            .and_then(|l| l.split("mark: '").nth(1))
+            .and_then(|s| s.split('\'').next())
+            .unwrap_or("");
+        assert!(!mark.is_empty(), "tone {tone} ({name}) has no mark beside its colour");
+        assert!(words.contains_key(&format!("tone.{tone}")), "tone {tone} has no legend word");
         for selector in [format!(".badge.{tone} "), format!(".tag.{tone} "), format!(".legend i.{tone} ")] {
             assert!(css.contains(&selector), "tone {tone} ({name}) has no `{selector}` colour rule");
         }
     }
-    let tone_of = |name: &str| field(&row(statuses, name), "tone");
     assert_eq!(tone_of("AWAITING_APPROVAL"), "approval", "approval is not its own (violet) colour");
     assert_ne!(tone_of("CANCELLED"), tone_of("PENDING"), "a cancelled job looks like a waiting one");
     assert!(css.contains(".badge.approval") && css.contains("var(--busy)"), "the approval badge is not violet");
@@ -595,10 +627,19 @@ fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
     let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
     let page = assets.get("mcr.html").expect("mcr.html shipped");
 
-    // The groups, in order, after the approval section.
+    // The groups, in order, after the approval section; their names in the dictionary (P12.7).
+    let words = desk_dictionary(&assets);
     let groups = wl.split("export const GROUPS = [").nth(1).and_then(|s| s.split("];").next()).expect("GROUPS");
-    let at = |label: &str| groups.find(label).unwrap_or_else(|| panic!("no group «{label}»"));
-    let order = ["Χρειάζεται σύνδεση (cookies)", "Δεν βρέθηκε βίντεο", "Χειροκίνητη λήψη", "Άλλο"].map(at);
+    let agreed = [
+        ("cookies", "Χρειάζεται σύνδεση (cookies)"),
+        ("novideo", "Δεν βρέθηκε βίντεο"),
+        ("manual", "Χειροκίνητη λήψη"),
+        ("other", "Άλλο"),
+    ];
+    let order = agreed.map(|(key, label)| {
+        assert_eq!(words.get(&format!("work.group.{key}")).map(String::as_str), Some(label), "group {key} is not «{label}»");
+        groups.find(&format!("key: '{key}'")).unwrap_or_else(|| panic!("no group {key}"))
+    });
     assert!(order.windows(2).all(|w| w[0] < w[1]), "the groups are not in the agreed order");
     let review = page.find("id=\"tab-review\"").expect("review tab");
     let approval = page[review..].find("id=\"approval-section\"").expect("approval section in the review tab");
@@ -626,7 +667,10 @@ fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
     assert!(state < group_of.find("includes(code)").unwrap(), "groupOf reads the code before the state");
     // A job in the list never says it is being retried.
     let why = wl.split("export function whyText").nth(1).and_then(|s| s.split("\n}").next()).expect("whyText");
-    assert!(why.contains("αυτόματη επανάληψη") && why.contains("STOPPED_TEXT"), "a stopped job can say it retries by itself");
+    assert!(
+        why.contains("EL['server.retrying']") && why.contains("t('work.why.stopped')") && words["server.retrying"] == "αυτόματη επανάληψη",
+        "a stopped job can say it retries by itself"
+    );
 
     // mcr.js: the list is grouped, still reconciled in place (P12.3), with the panels kept open.
     assert!(mcr.contains("const jobs = inGroupOrder(visible('review', data.jobs || []));"), "the review list is not grouped");
@@ -635,13 +679,17 @@ fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
     let card = mcr.split("function reviewCard(job)").nth(1).and_then(|s| s.split("\n}\n").next()).expect("reviewCard");
     assert!(card.contains("whyText(job)") && !card.contains("job.hint"), "the card does not use the one why-sentence");
     assert!(card.contains("primaryOf(job)"), "the card has no primary action");
-    assert!(card.contains("keptDetails(moreOpen, job.id, 'wl-more', 'Περισσότερα'"), "no «Περισσότερα» that stays open");
+    assert!(
+        card.contains("keptDetails(moreOpen, job.id, 'wl-more', t('review.more')") && words["review.more"] == "Περισσότερα",
+        "no «Περισσότερα» that stays open"
+    );
+    assert_eq!(words["card.tech"], "Τεχνικές λεπτομέρειες");
     let tech = card
-        .split("keptDetails(techOpen, job.id, 'tech', 'Τεχνικές λεπτομέρειες',")
+        .split("keptDetails(techOpen, job.id, 'tech', t('card.tech'),")
         .nth(1)
         .and_then(|s| s.split("    : null;").next())
         .expect("no «Τεχνικές λεπτομέρειες» that stays open on the card");
-    for (shown, field) in [("Κωδικός:", "job.error_code"), ("Αιτία:", "job.error_message")] {
+    for (shown, field) in [("t('card.code'", "job.error_code"), ("t('card.cause'", "job.error_message")] {
         assert!(tech.contains(shown) && tech.contains(field), "«Τεχνικές λεπτομέρειες» no longer shows {shown}");
         assert_eq!(card.matches(shown).count(), 1, "{shown} is shown outside «Τεχνικές λεπτομέρειες»");
     }
@@ -649,19 +697,26 @@ fn the_review_tab_is_a_work_list_grouped_by_what_to_do() {
     // Every button a hint names by «…» is on the card (or its history panel).
     let history = mcr.split("function historyPanel(job)").nth(1).and_then(|s| s.split("\n}\n").next()).expect("historyPanel");
     let panel = format!("{history}\n{card}");
+    // The words the card and its history panel show: the texts of the keys they look up.
+    let shown: Vec<&str> = panel
+        .split("t('")
+        .skip(1)
+        .filter_map(|s| s.split('\'').next())
+        .filter_map(|key| words.get(key).map(String::as_str))
+        .collect();
     let quoted = |text: &str| -> Vec<String> {
         text.split('«').skip(1).filter_map(|s| s.split('»').next()).map(str::to_string).collect()
     };
     let mut hints: Vec<String> = ErrorCode::ALL.iter().map(|c| c.hint_el().to_string()).collect();
     hints.push(omni_broadcast::errors::exhausted_hint_el(3));
     hints.push(omni_broadcast::errors::LIVE_STREAM_EXHAUSTED_EL.to_string());
-    hints.extend(wl.lines().filter(|l| l.starts_with("const LOCKER_TEXT") || l.starts_with("const STOPPED_TEXT")).map(str::to_string));
+    hints.extend(["work.why.locker", "work.why.stopped"].map(|k| words[k].clone()));
     for hint in &hints {
         for name in quoted(hint) {
             if name.starts_with('-') {
                 continue; // an example of a link's tail, not a button
             }
-            assert!(panel.contains(&name), "a hint names «{name}», which the review card does not have:\n{hint}");
+            assert!(shown.iter().any(|w| w.contains(name.as_str())), "a hint names «{name}», which the review card does not have:\n{hint}");
         }
     }
 }
@@ -703,7 +758,11 @@ fn the_desk_uses_no_native_dialogs() {
 
     // Reversible: at once, with «Αναίρεση» for 8 seconds.
     let undo = code("undo.js");
-    assert!(undo.contains("export const UNDO_MS = 8000;") && undo.contains("'Αναίρεση'"), "no 8 s «Αναίρεση»");
+    let words = desk_dictionary(&assets);
+    assert!(
+        undo.contains("export const UNDO_MS = 8000;") && undo.contains("t('undo.button')") && words["undo.button"] == "Αναίρεση",
+        "no 8 s «Αναίρεση»"
+    );
     let desk = code("desk.js");
     assert!(function_body(&desk, "discardJob").contains("deferAction({"), "removing a job is not undoable");
     assert!(function_body(&desk, "cancelJob").contains("undoToast("), "a desk cancel has no «Αναίρεση»");
@@ -727,7 +786,10 @@ fn the_desk_uses_no_native_dialogs() {
     }
     assert!(function_body(&desk, "wrongVideoJob").contains("await confirmWrongVideo("), "«Λάθος βίντεο» (delivered) does not ask");
     let approval = code("approval.js");
-    assert!(approval.contains("await confirmDialog({") && approval.contains("confirm: 'Έγκριση → Dalet'"), "approve does not ask in the dialog");
+    assert!(
+        approval.contains("await confirmDialog({") && approval.contains("confirm: t('approval.approve')") && words["approval.approve"] == "Έγκριση → Dalet",
+        "approve does not ask in the dialog"
+    );
     assert_eq!(approval.matches("await confirmWrongVideo(").count(), 2, "«Λάθος βίντεο» and «Επόμενη επιλογή» do not ask like the delivered card");
     let dialog = code("dialog.js");
     for (what, needle) in [
@@ -853,8 +915,16 @@ fn the_desk_is_laid_out_for_the_control_room() {
     assert!(desk_css.contains(".desk-page .topbar-status { flex-wrap: nowrap;"), "the header can wrap");
     let notify = assets.get("static/notify.js").expect("notify.js shipped");
     let summary = function_body(notify, "healthSummary");
-    assert!(summary.contains("'Όλα καλά'") && summary.contains("προβλήματα"), "the pill does not say «Όλα καλά» / «N προβλήματα»");
-    assert!(mcr.contains("paintHealth(data)") && mcr.contains("'Φάκελος παράδοσης (Dalet)'"), "the panel has no free space");
+    let words = desk_dictionary(&assets);
+    assert!(
+        summary.contains("t('health.pill.ok')") && summary.contains("tn('health.pill.problems', count)")
+            && words["health.pill.ok"] == "Όλα καλά" && words["health.pill.problems.other"] == "{n} προβλήματα",
+        "the pill does not say «Όλα καλά» / «N προβλήματα»"
+    );
+    assert!(
+        mcr.contains("paintHealth(data)") && mcr.contains("t('health.fact.watchfolder')") && words["health.fact.watchfolder"] == "Φάκελος παράδοσης (Dalet)",
+        "the panel has no free space"
+    );
 
     // No static inline styles: only a progress width, a CSS variable and a computed scroll margin.
     for module in [
@@ -900,28 +970,30 @@ fn health_is_told_in_plain_greek() {
         .filter_map(|l| l.split('"').nth(1))
         .collect();
     assert!(names.len() >= 15, "found only {names:?} in health.rs");
-    let table = notify.split("export const CHECK_INFO = {").nth(1).and_then(|s| s.split("\n};").next()).expect("CHECK_INFO");
-    let field = |row: &str, key: &str| -> String {
-        let pat = format!("{key}: '");
-        row.split(pat.as_str()).nth(1).and_then(|s| s.split('\'').next()).unwrap_or("").to_string()
-    };
+    // P12.7: who acts is in notify.js (`  name: 'who',`), the texts in text.el.js (`health.<name>.…`).
+    let words = desk_dictionary(&assets);
+    let table = notify.split("export const CHECK_WHO = {").nth(1).and_then(|s| s.split("\n};").next()).expect("CHECK_WHO");
     for name in names {
-        let head = format!("  {name}: {{");
-        let row = table.lines().find(|l| l.starts_with(&head)).unwrap_or_else(|| panic!("no Greek texts for the `{name}` check"));
-        assert!(!field(row, "name").is_empty(), "`{name}` has no name");
-        for key in ["degraded", "down", "means", "todo"] {
-            let text = field(row, key);
-            assert!(greek(&text), "`{name}` has no Greek `{key}`: {text:?}");
-        }
-        let who = field(row, "who");
+        let head = format!("  {name}: '");
+        let who = table
+            .lines()
+            .find_map(|l| l.strip_prefix(head.as_str()))
+            .and_then(|s| s.split('\'').next())
+            .unwrap_or_else(|| panic!("no row for the `{name}` check in CHECK_WHO"));
         assert!(who == "mcr" || who == "admin", "`{name}` does not say who acts: {who:?}");
+        assert!(words.get(&format!("health.{name}.name")).is_some_and(|w| !w.is_empty()), "`{name}` has no name");
+        for key in ["degraded", "down", "means", "todo"] {
+            let text = words.get(&format!("health.{name}.{key}")).map(String::as_str).unwrap_or("");
+            assert!(greek(text), "`{name}` has no Greek `{key}`: {text:?}");
+        }
     }
 
     // The banner and the panel's lines: the three texts, never the tool's detail.
     let texts = function_body(mcr, "healthTextNodes");
-    for needle in ["t.happened", "t.means", "t.todo", "WHO[t.who]", "'Για τα βίντεο: '", "'Τι κάνετε: '"] {
+    for needle in ["ct.happened", "ct.means", "ct.todo", "WHO[ct.who]", "t('health.label.means')", "t('health.label.todo')"] {
         assert!(texts.contains(needle), "a health line lost {needle}");
     }
+    assert_eq!((words["health.label.means"].as_str(), words["health.label.todo"].as_str()), ("Για τα βίντεο: ", "Τι κάνετε: "));
     assert!(!texts.contains(".detail"), "a health line shows the tool's own detail");
     let banner = mcr
         .split("const problems = healthProblems(checks);")
@@ -930,12 +1002,20 @@ fn health_is_told_in_plain_greek() {
         .and_then(|s| s.split(";\n").next())
         .expect("the health banner");
     assert!(banner.contains("healthTextNodes(") && !banner.contains("detail"), "the banner shows the tool's detail:\n{banner}");
-    assert!(mcr.contains("'Τεχνικές λεπτομέρειες'"), "the panel has no place for the tool's detail");
+    assert!(mcr.contains("el('summary', {}, t('card.tech'))"), "the panel has no place for the tool's detail");
     // A site is a sentence, from the payload's `sites` rows.
     assert!(texts.contains("name === 'sites'") && texts.contains("map(siteSentence)"), "the sites line is not told per site");
     let site = function_body(notify, "siteSentence");
-    for needle in ["Ο ιστότοπος ${site.domain}", "από τις ${at}", "αποτυχίες στη σειρά", "'δεν δίνει βίντεο'"] {
+    for needle in ["t('site.sentence'", "domain: site.domain", "t('site.since', { at })", "tn('site.fails', n)", "'site.broken'"] {
         assert!(site.contains(needle), "the site sentence lost {needle}");
+    }
+    for (key, text) in [
+        ("site.sentence", "Ο ιστότοπος {domain} {what}{since}{fails}."),
+        ("site.since", " από τις {at}"),
+        ("site.fails.other", " ({n} αποτυχίες στη σειρά)"),
+        ("site.broken", "δεν δίνει βίντεο"),
+    ] {
+        assert_eq!(words[key], text, "the site sentence's `{key}` changed");
     }
 
     // Messages: an error stays until closed, is announced at once, three at most.
@@ -952,12 +1032,125 @@ fn health_is_told_in_plain_greek() {
     }
 }
 
+/// P12.7: every word of the desk's modules is in one dictionary, `static/text.el.js`, read through
+/// `text.js` (a lookup with a language switch, Greek by default, that the admin pages can give an
+/// English dictionary). No module keeps Greek text of its own; every key a module or the desk page
+/// asks for exists; the stragglers are translated; lane auto's two new checks have their words.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v11() {
+fn every_word_of_the_desk_is_in_one_dictionary() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
+    let modules = [
+        "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
+        "dialog.js", "toast.js", "text.js",
+    ];
+
+    // The lookup: a language switch, Greek the default and the fallback.
+    let lookup = assets.get("static/text.js").expect("text.js shipped");
+    for export in [
+        "export function t(", "export function tn(", "export function setLanguage(", "export function addLanguage(",
+        "export function language(", "export function applyText(",
+    ] {
+        assert!(lookup.contains(export), "text.js lost {export}");
+    }
+    assert!(lookup.contains("let current = 'el';") && lookup.contains(": EL[key]"), "Greek is not the default and the fallback");
+
+    for module in modules {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        // No Greek of its own (comments aside).
+        for line in src.lines().filter(|l| !is_comment(l)) {
+            assert!(!greek(line), "{module} keeps Greek text of its own: {}", line.trim());
+        }
+        let code = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+        let src = code.as_str();
+        // Every literal key it asks for is in the dictionary (tn: both forms).
+        for (call, plural) in [("t('", false), ("tn('", true)] {
+            // `t('` as a call of its own, not the end of `set('` or `split('`.
+            let keys = src.match_indices(call).filter(|(i, _)| {
+                !src[..*i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            });
+            for key in keys.filter_map(|(i, _)| src[i + call.len()..].split('\'').next()) {
+                let wanted: Vec<String> = if plural { vec![format!("{key}.one"), format!("{key}.other")] } else { vec![key.to_string()] };
+                for k in wanted {
+                    assert!(words.contains_key(&k), "{module} asks for `{k}`, which text.el.js does not have");
+                }
+            }
+        }
+    }
+    // Keys chosen by a condition (`t(ok ? 'a.b' : 'a.c')`): any quoted `prefix.rest` whose prefix is
+    // one of the dictionary's must be in it.
+    let prefixes: std::collections::BTreeSet<&str> = words.keys().filter_map(|k| k.split('.').next()).collect();
+    for module in modules {
+        let src = assets.get(&format!("static/{module}")).unwrap();
+        let code = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+        for quoted in code.split('\'').skip(1).step_by(2) {
+            let looks_like_key = quoted.contains('.')
+                && quoted.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_')
+                && prefixes.contains(quoted.split('.').next().unwrap());
+            if looks_like_key && !quoted.ends_with('.') {
+                assert!(words.contains_key(quoted) || words.contains_key(&format!("{quoted}.one")), "{module} names `{quoted}`, which text.el.js does not have");
+            }
+        }
+    }
+    // The keys built from a name: every stage, every short stage, every filter, every gate check.
+    for stage in ["QUEUED", "EXTRACT", "DOWNLOAD", "PROBE", "TRANSCODE", "REWRAP", "VERIFY", "DELIVER", "ARCHIVE", "DONE"] {
+        assert!(words.contains_key(&format!("stage.{stage}")) && words.contains_key(&format!("user.stage.{stage}")), "no words for {stage}");
+    }
+    for key in ["all", "active", "attention", "done", "empty"] {
+        assert!(words.contains_key(&format!("filter.{key}")), "no words for the filter {key}");
+    }
+    for key in ["egress", "ad", "probe", "length", "short"] {
+        assert!(words.contains_key(&format!("approval.check.{key}")), "no words for the gate check {key}");
+    }
+
+    // The page's fixed words, by key (data-t), all there; the stragglers are gone.
+    let page = assets.get("mcr.html").expect("mcr.html shipped");
+    for attr in ["data-t=\"", "data-t-aria-label=\""] {
+        for key in page.split(attr).skip(1).filter_map(|s| s.split('"').next()) {
+            assert!(words.contains_key(key), "mcr.html asks for `{key}`, which text.el.js does not have");
+        }
+    }
+    assert!(assets.get("static/mcr.js").unwrap().contains("applyText();"), "the page's fixed words are never filled");
+    for straggler in ["Master Control Room", "Watchfolder:", "Temp:", "LLM:", ">Email<", "Email <span"] {
+        assert!(!page.contains(straggler), "mcr.html still says {straggler}");
+        for module in modules {
+            assert!(!assets.get(&format!("static/{module}")).unwrap().contains(straggler), "{module} still says {straggler}");
+        }
+    }
+    assert_eq!(words["tab.email"], "Εισερχόμενα");
+    // The broadcast specification keeps its values word for word (the on-air format does not change).
+    for (key, value) in [
+        ("spec.video.value", "MPEG-2 (Sony XDCAM HD422)"),
+        ("spec.bitrate.value", "50 Mbps CBR"),
+        ("spec.size.value", "1920×1080, 16:9"),
+        ("spec.scan.value", "25 fps, 1080i50, πρώτο το πάνω πεδίο"),
+        ("spec.chroma.value", "4:2:2 (yuv422p)"),
+        ("spec.audio_layout.value", "EBU R48 — 8 ανεξάρτητα μονοφωνικά κανάλια"),
+        ("spec.audio.value", "PCM 24-bit @ 48 kHz"),
+        ("spec.channels.value", "1 Αριστερό, 2 Δεξί, 3–8 σιωπή"),
+        ("spec.wrap.value", "SMPTE RDD9 OP1a (bmxtranswrap)"),
+    ] {
+        assert_eq!(words[key], value, "the broadcast specification's `{key}` changed");
+    }
+
+    // Lane auto's two checks (P12.7 brief): words ready before the check reaches this branch.
+    let notify = assets.get("static/notify.js").unwrap();
+    for name in ["maintenance", "database"] {
+        assert!(notify.contains(&format!("  {name}: 'admin',")), "the `{name}` check is not the administrator's");
+        for key in ["name", "degraded", "down", "means", "todo"] {
+            assert!(words.contains_key(&format!("health.{name}.{key}")), "the `{name}` check has no `{key}`");
+        }
+    }
+    assert!(words["health.database.todo.down"].contains("αντίγραφο ασφαλείας"), "a damaged database does not say to restore the backup");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v12() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=11"), "user.html does not import user.js?v=11");
-    assert!(!page.contains("/static/user.js?v=10"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=12"), "user.html does not import user.js?v=12");
+    assert!(!page.contains("/static/user.js?v=11"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

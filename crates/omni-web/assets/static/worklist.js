@@ -9,13 +9,17 @@
  * Pure: no DOM, no requests. mcr.js builds the cards from what this says.
  */
 
-/** The groups after «Για έγκριση», in the order they are shown. `primary`
- *  is the one action the card shows outside «Περισσότερα». */
+import { t } from '/static/text.js?v=1';
+import EL from '/static/text.el.js?v=1';
+
+/** The groups after «Για έγκριση», in the order they are shown (their names
+ *  are `work.group.<key>` in text.el.js). `primary` is the one action the
+ *  card shows outside «Περισσότερα». */
 export const GROUPS = [
-  { key: 'cookies', label: 'Χρειάζεται σύνδεση (cookies)', primary: 'override' },
-  { key: 'novideo', label: 'Δεν βρέθηκε βίντεο', primary: 'override' },
-  { key: 'manual', label: 'Χειροκίνητη λήψη', primary: 'markdone' },
-  { key: 'other', label: 'Άλλο', primary: 'retry' },
+  { key: 'cookies', primary: 'override' },
+  { key: 'novideo', primary: 'override' },
+  { key: 'manual', primary: 'markdone' },
+  { key: 'other', primary: 'retry' },
 ];
 
 /** A login wall: the site wants a signed-in visitor. */
@@ -47,8 +51,7 @@ export function groupOf(job) {
 }
 
 export function groupLabel(key) {
-  const g = GROUPS.find((x) => x.key === key);
-  return g ? g.label : '';
+  return GROUPS.some((x) => x.key === key) ? t(`work.group.${key}`) : '';
 }
 
 /** The card's one primary action: 'override' (another link), 'markdone'
@@ -71,21 +74,17 @@ export function inGroupOrder(jobs) {
     .map((x) => x.job);
 }
 
-const LOCKER_TEXT = 'Σύνδεσμος μεταφοράς αρχείων: κατεβάστε το αρχείο από τον σύνδεσμο, βάλτε το στο Dalet και πατήστε «Το έβαλα στο Dalet».';
-const STOPPED_TEXT = 'Οι αυτόματες προσπάθειες τελείωσαν. Πατήστε «Δοκιμή ξανά» ή δώστε άλλον σύνδεσμο.';
-
 /**
- * Why the video waits for a person, in one Greek sentence. It depends on the
+ * Why the video waits for a person, in one sentence. It depends on the
  * state as well as the code: a file-locker link says what to do with the
  * file, and a job in this list never says it is being retried (a code's own
- * hint may, for a job that is still retrying; this one has stopped).
+ * hint may, for a job that is still retrying; this one has stopped). The
+ * server's hint is Greek, so it is matched against the Greek words.
  */
 export function whyText(job) {
-  if (job.status === 'MANUAL_DOWNLOAD') return job.hint || LOCKER_TEXT;
+  if (job.status === 'MANUAL_DOWNLOAD') return job.hint || t('work.why.locker');
   const hint = String(job.hint || '').trim();
-  if (hint && /αυτόματη επανάληψη/.test(hint)) return STOPPED_TEXT;
+  if (hint && hint.includes(EL['server.retrying'])) return t('work.why.stopped');
   if (hint) return hint;
-  return job.status === 'FAILED'
-    ? 'Η λήψη σταμάτησε με σφάλμα και δεν θα ξαναδοκιμαστεί αυτόματα.'
-    : 'Το βίντεο δεν παραδόθηκε αυτόματα.';
+  return job.status === 'FAILED' ? t('work.why.failed') : t('work.why.review');
 }
