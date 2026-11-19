@@ -1878,9 +1878,13 @@ pub async fn api_admin_vacuum(
     RequireAdmin(_): RequireAdmin,
     State(state): State<AppState>,
 ) -> JsonResult {
-    state
-        .repo
-        .vacuum_database()
+    // Off the async threads (P11.13): a VACUUM of a large database takes
+    // minutes, and the rest of the panel must keep answering meanwhile.
+    let repo = state.repo.clone();
+    tokio::task::spawn_blocking(move || repo.vacuum_database())
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
         .map_err(internal_error("Could not compact the database."))?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }

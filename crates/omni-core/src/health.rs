@@ -156,6 +156,10 @@ pub mod checks {
     pub const ARCHIVE: &str = "archive";
     /// Job runs that hit an internal error (a panic) in the last 24 h (P11.8).
     pub const WORKERS: &str = "workers";
+    /// A scheduled maintenance task failed on its last run (P11.13).
+    pub const MAINTENANCE: &str = "maintenance";
+    /// The weekly integrity check of `omni.db` and the last backup (P11.13).
+    pub const DATABASE: &str = "database";
 }
 
 impl Default for HealthState {

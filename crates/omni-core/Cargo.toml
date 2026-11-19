@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "backup"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
 serde = { version = "1.0", features = ["derive"] }

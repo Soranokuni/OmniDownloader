@@ -102,6 +102,12 @@ impl AppPaths {
         self.data.join("benchmarks").join(run_id.to_string())
     }
 
+    /// The nightly database backups (P11.13): `data\backups`, inside the
+    /// restricted data folder.
+    pub fn db_backups(&self) -> PathBuf {
+        self.data.join("backups")
+    }
+
     /// Create every directory the daemon writes to.
     ///
     /// Called once at start-up so a missing `logs/` does not surface later as a

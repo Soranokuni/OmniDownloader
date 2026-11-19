@@ -3750,6 +3750,69 @@ impl Repository {
         Ok(())
     }
 
+    /// Copy the live database into `dest` with SQLite's online backup API
+    /// (P11.13): one step, so the copy is one consistent snapshot, taken under
+    /// a read transaction that does not stop the workers writing (WAL). An
+    /// existing `dest` is replaced. Blocking: call it off the async threads.
+    pub fn backup_database(&self, dest: &Path) -> Result<()> {
+        let conn = self.pool.get()?;
+        match std::fs::remove_file(dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("could not replace {dest:?}")),
+        }
+        let mut copy = rusqlite::Connection::open(dest).with_context(|| format!("could not create {dest:?}"))?;
+        {
+            use rusqlite::backup::StepResult;
+            let backup = rusqlite::backup::Backup::new(&conn, &mut copy).context("could not start the backup")?;
+            // -1: every page in one step. Busy or locked: try again for up to a minute.
+            let mut waits = 0;
+            loop {
+                match backup.step(-1).context("the backup did not complete")? {
+                    StepResult::Done => break,
+                    StepResult::More => {}
+                    StepResult::Busy | StepResult::Locked if waits < 240 => {
+                        waits += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    other => anyhow::bail!("the backup could not get the database: {other:?}"),
+                }
+            }
+        }
+        // The copy carries the live file's WAL flag: one self-contained file
+        // instead, so no `-wal`/`-shm` is left beside it (restoring it, the
+        // daemon turns WAL on again).
+        copy.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0))
+            .context("could not finish the backup file")?;
+        copy.close().map_err(|(_, e)| e).context("could not close the backup file")?;
+        Ok(())
+    }
+
+    /// `PRAGMA quick_check` of the live database (P11.13): `["ok"]` when it
+    /// is sound, otherwise up to 20 lines naming the problems. Blocking.
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        Self::quick_check_on(&conn)
+    }
+
+    /// `PRAGMA quick_check` of the database file at `path`, opened read-only
+    /// (a fresh backup is checked before it counts). Blocking.
+    pub fn quick_check_file(path: &Path) -> Result<Vec<String>> {
+        let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("could not open {path:?}"))?;
+        Self::quick_check_on(&conn)
+    }
+
+    fn quick_check_on(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("PRAGMA quick_check(20)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn map_job_row(row: &rusqlite::Row) -> rusqlite::Result<Job> {
         let status_str: String = row.get("status")?;
         let stage_str: String = row.get("stage").unwrap_or_else(|_| "QUEUED".to_string());

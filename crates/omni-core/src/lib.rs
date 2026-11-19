@@ -13,6 +13,7 @@ pub mod held;
 pub mod health;
 pub mod lockdown;
 pub mod logging;
+pub mod maintenance;
 pub mod migrations;
 pub mod paths;
 pub mod process;

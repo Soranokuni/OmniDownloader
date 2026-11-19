@@ -802,12 +802,22 @@ before every delete or import.
 
 | Task | When (local time) | What |
 |---|---|---|
+| `db_backup` | daily 02:30 | back up the database while the service runs into `data\backups\omni-YYYY-MM-DD.db`; the copy is checked before it counts; the 7 newest and one for each of the 4 weeks before them are kept |
+| `db_check` | every 7 days, 02:45 | integrity check of the database (`PRAGMA quick_check`) |
 | `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp; also run early when a platform starts failing, noted `early: …` (§3) |
 | `adblock_update` | daily 03:30 | refresh blocklists |
 | `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text, and the old database records below |
 | `selfcheck` | daily 05:15 | browser check and per-site check links |
 | `cookie_test` | daily 05:30 | test each cookie jar |
 | `vacuum` | every 30 days, 04:30 | compact the database |
+
+A task that fails on its last run turns the **maintenance** health line amber
+and names it; its next good run clears it. The **database** line shows the
+last integrity check and the last backup; it turns red if the check finds the
+database damaged. Then stop the service, move `data\omni.db` together with
+`omni.db-wal` and `omni.db-shm` (if present) to another folder, copy the newest
+file from `data\backups\` to `data\omni.db`, and start the service again. The backups hold the whole database, accounts and sessions included:
+they stay in `data\`, which only the service and administrators can read.
 
 What the `retention` task keeps in the database, and for how long (fixed, not configurable):
 

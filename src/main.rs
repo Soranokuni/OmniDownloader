@@ -1604,6 +1604,8 @@ async fn run_daemon(
         let specs = omni_core::scheduler::default_tasks();
         repo.ensure_scheduled_tasks(&specs)
             .context("Failed registering the maintenance tasks")?;
+        // The `maintenance` and `database` lines from what the tasks did before this start (P11.13).
+        omni_core::maintenance::refresh_health(&repo, &health);
 
         let repo_sched = repo.clone();
         let mut sched_rx = shutdown_tx.subscribe();
@@ -1611,6 +1613,7 @@ async fn run_daemon(
             bin_dir: bin_dir.clone(),
             temp_path: temp_path.clone(),
             paths: paths.clone(),
+            db_path: db_path.clone(),
             ytdl_channel: config.ytdl_channel.clone(),
             ytdl_enabled: config.ytdl_auto_update_nightly,
             adblock_enabled: config.adblock_auto_update_nightly,
@@ -2606,6 +2609,8 @@ struct MaintenanceContext {
     bin_dir: PathBuf,
     temp_path: PathBuf,
     paths: AppPaths,
+    /// `omni.db`, whose size the nightly backup needs room for (P11.13).
+    db_path: PathBuf,
     ytdl_channel: String,
     ytdl_enabled: bool,
     adblock_enabled: bool,
@@ -2696,6 +2701,8 @@ async fn run_due_tasks(
             }
         };
         let _ = repo.record_task_run(&name, outcome, error.as_deref(), elapsed_ms);
+        // A failed task turns the `maintenance` line amber and names it; the next good run clears it (P11.13).
+        omni_core::maintenance::refresh_health(repo, &ctx.health);
     }
 }
 
@@ -2917,9 +2924,39 @@ async fn run_one_task(
         }
 
         "vacuum" => {
-            // Blocking, and it holds a write lock, which is why it is monthly
-            // and at 04:30 rather than opportunistic.
-            repo.vacuum_database().context("VACUUM failed")?;
+            // It holds a write lock, which is why it is monthly and at 04:30
+            // rather than opportunistic; off the async threads (P11.13), so
+            // the web panel and the workers' heartbeats keep running.
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || repo.vacuum_database())
+                .await
+                .context("the VACUUM task did not finish")?
+                .context("VACUUM failed")?;
+            Ok(TaskOutcome::Ok)
+        }
+
+        omni_core::maintenance::BACKUP_TASK => {
+            let (repo, dir) = (repo.clone(), ctx.paths.db_backups());
+            let db_bytes = std::fs::metadata(&ctx.db_path).map(|m| m.len()).unwrap_or(0);
+            let today = chrono::Local::now().date_naive();
+            let report = tokio::task::spawn_blocking(move || omni_core::maintenance::nightly_backup(&repo, db_bytes, &dir, today))
+                .await
+                .context("the backup task did not finish")??;
+            info!(
+                "Database backed up to {:?} ({} MB); {} old backup(s) removed",
+                report.path,
+                report.bytes / (1024 * 1024),
+                report.removed
+            );
+            Ok(TaskOutcome::Ok)
+        }
+
+        omni_core::maintenance::CHECK_TASK => {
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || omni_core::maintenance::integrity_check(&repo))
+                .await
+                .context("the integrity check task did not finish")??;
+            info!("Database integrity check passed");
             Ok(TaskOutcome::Ok)
         }
 
