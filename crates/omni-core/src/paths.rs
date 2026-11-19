@@ -180,6 +180,33 @@ fn is_unc(s: &str) -> bool {
     s.starts_with("\\\\") || s.starts_with("//")
 }
 
+/// A Windows tool by its full path in the system directory
+/// (`GetSystemDirectoryW`, e.g. `C:\Windows\System32\icacls.exe`). A bare name
+/// would be looked up in the running executable's own folder first, where an
+/// elevated installer must never pick up a planted copy. When Windows cannot
+/// say where its system directory is, this is an error, never a bare name.
+/// Off Windows: the name.
+pub fn system_tool(name: &str) -> std::io::Result<PathBuf> {
+    system_directory().map(|dir| dir.join(name))
+}
+
+#[cfg(windows)]
+fn system_directory() -> std::io::Result<PathBuf> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = vec![0u16; 520];
+    // SAFETY: the buffer outlives the call and its length is passed with it.
+    let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+    if n == 0 || n >= buf.len() {
+        return Err(std::io::Error::other("Windows did not say where its system directory is"));
+    }
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..n])))
+}
+
+#[cfg(not(windows))]
+fn system_directory() -> std::io::Result<PathBuf> {
+    Ok(PathBuf::new())
+}
+
 /// What Windows says about a drive letter's root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveKind {
@@ -396,6 +423,15 @@ fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_system_tool_is_an_absolute_path_in_the_system_directory() {
+        let t = system_tool("icacls.exe").unwrap();
+        assert!(t.is_absolute(), "{t:?}");
+        assert_eq!(t.file_name().unwrap(), "icacls.exe");
+        assert!(t.parent().unwrap().join("kernel32.dll").is_file(), "{t:?} is not in the system directory");
+    }
 
     #[test]
     fn relative_paths_resolve_against_root_not_cwd() {

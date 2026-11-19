@@ -77,6 +77,9 @@ pub enum Disposition {
     Held,
     /// A trusted recipe's video was delivered without approval: complete the job.
     Delivered,
+    /// A trusted recipe's video is made and verified but the watchfolder did not
+    /// answer (P11.2a): the job waits for it, with its automatic-delivery marker.
+    Parked,
     /// The job is no longer ours: write nothing more.
     Lost,
     /// End the job (REQUIRES_REVIEW) with this code and message instead of the one it had.
@@ -93,6 +96,7 @@ pub fn disposition(result: &LadderResult, mode: RepairMode, budget: Duration) ->
     match result {
         LadderResult::Held { .. } => Disposition::Held,
         LadderResult::Delivered { .. } => Disposition::Delivered,
+        LadderResult::Parked { .. } => Disposition::Parked,
         LadderResult::Lost => Disposition::Lost,
         LadderResult::Exhausted if mode == RepairMode::Hold => Disposition::Finish {
             code: ErrorCode::RepairExhausted,
@@ -132,6 +136,9 @@ pub enum LadderResult {
     Held { recipe_hash: String },
     /// A recipe MCR trusts on this site found it: the video is in the watchfolder, unapproved (P10.16a).
     Delivered { recipe_hash: String },
+    /// As `Delivered`, but the watchfolder did not answer: the made and verified
+    /// video waits for it (P11.2a), and the attempt stays `auto_delivering`.
+    Parked { recipe_hash: String },
     /// Shadow mode: this is what would have been used. Nothing was downloaded.
     ShadowFound { verified: Vec<Verified> },
     /// No candidate passed the gate, or the downloads of those that did failed.
@@ -277,7 +284,16 @@ pub trait Env: Send + Sync {
         None
     }
     fn fetcher(&self) -> &dyn Fetcher;
+    /// The gate's prober for a ladder that is not a job's (the admin's Test
+    /// URL, the nightly self-heal): a platform cooling down after a rate limit
+    /// is reported at once (P11.4).
     fn prober(&self) -> &dyn Prober;
+    /// The gate's prober for a ladder that runs inside a job: it waits out a
+    /// cool-down like the job's own runs, within the gate's deadline. The
+    /// default is [`Self::prober`].
+    fn job_prober(&self) -> &dyn Prober {
+        self.prober()
+    }
     fn resolver(&self) -> &dyn Resolver;
     fn is_ad(&self, url: &str) -> bool;
     /// Test only: accept a loopback answer from the resolver.
@@ -359,7 +375,10 @@ pub struct RealEnv {
     images: HttpImages,
     ffmpeg: std::path::PathBuf,
     ytdl: std::path::PathBuf,
+    /// Not a job's: the Test URL and the nightly self-heal (P11.4).
     prober: ToolProber,
+    /// A job's ladder: waits out a platform's cool-down.
+    job_prober: ToolProber,
     resolver: repair_gate::SystemResolver,
     model: Option<LlmModel>,
 }
@@ -381,13 +400,16 @@ impl RealEnv {
         ytdl: std::path::PathBuf,
         ffmpeg: std::path::PathBuf,
     ) -> Self {
+        // Every yt-dlp run of the ladder waits for its turn in the engine's pacer (P11.4).
+        let pacer = engine.pacer();
         Self {
             engine,
             fetcher: HttpFetcher::new(),
             images: HttpImages(HttpFetcher::new()),
-            ffmpeg,
             ytdl: ytdl.clone(),
-            prober: ToolProber::new(ffprobe, Some(ytdl)),
+            prober: ToolProber::new(ffprobe.clone(), Some(ytdl.clone()), Some(&ffmpeg), &pacer),
+            job_prober: ToolProber::new(ffprobe, Some(ytdl), Some(&ffmpeg), &pacer).for_a_job(),
+            ffmpeg,
             resolver: repair_gate::SystemResolver,
             model: None,
         }
@@ -421,6 +443,9 @@ impl Env for RealEnv {
     fn prober(&self) -> &dyn Prober {
         &self.prober
     }
+    fn job_prober(&self) -> &dyn Prober {
+        &self.job_prober
+    }
     fn resolver(&self) -> &dyn Resolver {
         &self.resolver
     }
@@ -441,10 +466,10 @@ impl Env for RealEnv {
         }
     }
     async fn ytdl_probe(&self, url: &str, timeout: Duration) -> std::result::Result<LinkInfo, String> {
-        Downloader::new(&self.ytdl).probe_info(url, timeout).await
+        Downloader::new(&self.ytdl, Some(&self.ffmpeg), &self.engine.pacer()).probe_info(url, timeout).await
     }
     async fn page_scan(&self, url: &str, timeout: Duration) -> omni_broadcast::downloader::PageScan {
-        Downloader::new(&self.ytdl).page_videos(url, timeout).await
+        Downloader::new(&self.ytdl, Some(&self.ffmpeg), &self.engine.pacer()).page_videos(url, timeout).await
     }
     async fn final_url(&self, url: &str) -> Option<String> {
         final_page_url(url).await
@@ -618,7 +643,7 @@ pub async fn after_failure_with(
     let already_rejected_same = false;
     if !omni_broadcast::repair::eligible(ctx.cfg.mode, code, job_kind(job, orig_url), site_breaker_open, already_rejected_same)
         || cancel.is_cancelled()
-        || !crate::still_ours(&ctx.repo, job.id, owner)
+        || !crate::worker::still_ours(&ctx.repo, job.id, owner)
     {
         return None;
     }
@@ -645,7 +670,7 @@ fn skips_of_site(repo: &Repository, job: &Job, orig_url: &str) -> Option<Vec<Str
 const NO_JOB: i64 = 0;
 
 fn lost(ctx: &RepairCtx, job_id: i64, owner: &str, cancel: &CancellationToken) -> bool {
-    cancel.is_cancelled() || (job_id != NO_JOB && !crate::still_ours(&ctx.repo, job_id, owner))
+    cancel.is_cancelled() || (job_id != NO_JOB && !crate::worker::still_ours(&ctx.repo, job_id, owner))
 }
 
 fn note(ctx: &RepairCtx, job_id: i64, level: &str, text: &str) {
@@ -985,11 +1010,13 @@ async fn find_and_verify(
         facts.ad_media.extend(lf.ad_media);
     }
     let is_ad = |u: &str| env.is_ad(u);
+    // A job's ladder waits out a platform's cool-down within the deadline (P11.4).
+    let prober = if job.id != NO_JOB { env.job_prober() } else { env.prober() };
     let gate = async {
         if env.allow_loopback() {
-            repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, env.prober(), env.resolver(), deadline).await
+            repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, prober, env.resolver(), deadline).await
         } else {
-            repair_gate::verify(cands, &facts, &is_ad, env.prober(), env.resolver(), deadline).await
+            repair_gate::verify(cands, &facts, &is_ad, prober, env.resolver(), deadline).await
         }
     };
     let (verified, rejected) = tokio::select! {
@@ -1042,6 +1069,8 @@ pub async fn run(
     let outcome = match &result {
         LadderResult::Held { .. } => "held".to_string(),
         LadderResult::Delivered { .. } => "auto_delivered".to_string(),
+        // Not delivered yet: the marker the delivery after the wait completes (P11.2a).
+        LadderResult::Parked { .. } => "auto_delivering".to_string(),
         LadderResult::ShadowFound { .. } => "shadow_found".to_string(),
         LadderResult::NothingVerified => end.outcome.take().unwrap_or_else(|| "nothing_verified".to_string()),
         LadderResult::Exhausted => "exhausted".to_string(),
@@ -1058,7 +1087,10 @@ pub async fn run(
     }
     // A model rung that found nothing is a miss; three on one site within 24 h
     // close the rung for it for 24 h (a canary pass or a new yt-dlp build reopens it).
-    let found = matches!(result, LadderResult::Held { .. } | LadderResult::Delivered { .. } | LadderResult::ShadowFound { .. } | LadderResult::Lost);
+    let found = matches!(
+        result,
+        LadderResult::Held { .. } | LadderResult::Delivered { .. } | LadderResult::Parked { .. } | LadderResult::ShadowFound { .. } | LadderResult::Lost
+    );
     if end.llm_calls > 0 && !found {
         if let Some(domain) = end.domain.as_deref() {
             let now = Utc::now();
@@ -1457,11 +1489,13 @@ async fn llm_rung(
             }
             tried.extend(cands.iter().map(|c| c.url.clone()));
             let is_ad = |u: &str| ctx.env.is_ad(u);
+            // A job's ladder waits out a platform's cool-down within the deadline (P11.4).
+            let prober = if job_id != NO_JOB { ctx.env.job_prober() } else { ctx.env.prober() };
             let gate = async {
                 if ctx.env.allow_loopback() {
-                    repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, ctx.env.prober(), ctx.env.resolver(), deadline).await
+                    repair_gate::verify_allowing_loopback_for_tests(cands, &facts, &is_ad, prober, ctx.env.resolver(), deadline).await
                 } else {
-                    repair_gate::verify(cands, &facts, &is_ad, ctx.env.prober(), ctx.env.resolver(), deadline).await
+                    repair_gate::verify(cands, &facts, &is_ad, prober, ctx.env.resolver(), deadline).await
                 }
             };
             let (verified, rejected) = tokio::select! {
@@ -1698,6 +1732,17 @@ async fn ladder(
                 end.next_index = index as i64;
                 return LadderResult::Delivered { recipe_hash };
             }
+            HoldStep::Parked { url } => {
+                // Made and verified, waiting for the watchfolder (P11.2a): no next
+                // candidate (it would be made into the same workspace), and the
+                // marker stays, so the delivery after the wait is an automatic one.
+                note(ctx, job_id, "WARN", "Η αυτόματη επισκευή: ο φάκελος του Dalet δεν απαντά· το βίντεο περιμένει και παραδίδεται μόλις απαντήσει");
+                end.recipe_id = Some(recipe_id);
+                end.recipe_hash = Some(recipe_hash.clone());
+                end.held_url = Some(url);
+                end.next_index = index as i64;
+                return LadderResult::Parked { recipe_hash };
+            }
             HoldStep::Skipped | HoldStep::Failed => {
                 // This candidate never reached the watchfolder: its marker must not outlive it.
                 if let (DeliveryMode::Deliver, Some(attempt_id)) = (mode, attempt) {
@@ -1866,8 +1911,8 @@ async fn next_step(
     let mode = DeliveryMode::Hold { hold_hours: ctx.cfg.hold_hours, held_max_bytes: ctx.cfg.held_max_bytes };
     let held_url = match hold_one(ctx, job, owner, url, referer, &method, mode, cancel).await {
         HoldStep::Held { url } => url,
-        // Hold never delivers: `hold_one` reports that as a stop.
-        HoldStep::Delivered { .. } => return NextResult::Failed,
+        // Hold never delivers (`hold_one` reports that as a stop), so it never waits for the watchfolder.
+        HoldStep::Delivered { .. } | HoldStep::Parked { .. } => return NextResult::Failed,
         HoldStep::Lost => return NextResult::Lost,
         HoldStep::Skipped | HoldStep::Failed => {
             restore();
@@ -1933,12 +1978,49 @@ fn auto_delivered(ctx: &RepairCtx, job_id: i64, recipe_id: i64, domain: &str, ap
     info!("Job #{job_id}: delivered without approval, recipe #{recipe_id} is trusted on {domain} ({n} approvals)");
 }
 
+/// A video that waited for the watchfolder has been delivered and its job
+/// completed (P11.2a). When a trusted recipe's automatic delivery is what
+/// waited (the job's latest attempt is still `auto_delivering`), it is now
+/// what [`auto_delivered`] makes of a delivery that did not wait: the use is
+/// scored, MCR's note and the audit row are written, and the attempt becomes
+/// `auto_delivered`. The outcome changes first and only once, so a second
+/// call counts nothing.
+pub fn after_waiting_delivery(ctx: &RepairCtx, job_id: i64) {
+    let attempt = match ctx.repo.latest_attempt(job_id) {
+        Ok(Some(a)) if a.outcome.as_deref() == Some("auto_delivering") => a,
+        Ok(_) => return,
+        Err(e) => {
+            warn!("Job #{job_id}: the repair attempt could not be read after the delivery: {e:#}");
+            return;
+        }
+    };
+    match ctx.repo.promote_attempt_auto_delivered(attempt.id) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn!("Job #{job_id}: the automatic delivery could not be recorded: {e:#}");
+            return;
+        }
+    }
+    let (Some(recipe_id), Some(domain)) = (attempt.recipe_id, attempt.domain.clone()) else {
+        warn!("Job #{job_id}: the automatic delivery names no recipe or site; not scored");
+        return;
+    };
+    let approvals = ctx.repo.recipe_site_approvals(recipe_id, &domain).ok();
+    let host = attempt.held_url.as_deref().map(host_of).unwrap_or_default();
+    let duration = ctx.repo.get_job(job_id).ok().flatten().map(|j| j.duration_secs).unwrap_or(0.0);
+    auto_delivered(ctx, job_id, recipe_id, &domain, approvals, &host, duration);
+}
+
 /// What one held download of a verified address came to.
 enum HoldStep {
     /// Held, from this address; the caller records it.
     Held { url: String },
     /// Delivered to the watchfolder without approval (only in `DeliveryMode::Deliver`).
     Delivered { url: String },
+    /// Made and verified for `DeliveryMode::Deliver`, but the watchfolder did not
+    /// answer: the video waits for it (P11.2a).
+    Parked { url: String },
     /// Not tried: the address or its host is no longer one to use.
     Skipped,
     /// The download failed (noted on the job).
@@ -2012,7 +2094,13 @@ async fn hold_one(
             if e.downcast_ref::<LeaseLost>().is_some() || lost(ctx, job_id, owner, cancel) {
                 return HoldStep::Lost;
             }
-            let code: ErrorCode = crate::classify_pipeline_error(&e);
+            let code: ErrorCode = crate::worker::classify_pipeline_error(&e);
+            let waits = code == ErrorCode::DeliveryFailed
+                && ctx.repo.get_job(job_id).ok().flatten().is_some_and(|j| j.delivery_wait && j.lease_owner.as_deref() == Some(owner));
+            if waits {
+                info!("Job #{job_id}: the repaired video from {host} waits for the watchfolder");
+                return HoldStep::Parked { url: url.to_string() };
+            }
             info!("Job #{job_id}: repair download from {host} failed: {code}");
             note(ctx, job_id, "WARN", &format!("Η αυτόματη επισκευή: η λήψη από {host} απέτυχε ({})", code.as_str()));
             HoldStep::Failed

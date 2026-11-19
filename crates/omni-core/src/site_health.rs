@@ -85,13 +85,14 @@ impl SiteRow {
 }
 
 /// Error codes that say something about the site rather than the one page or
-/// the machine. Everything else (no video on the page, 404, DRM, login,
-/// transcode, disk, ...) never counts.
+/// the machine. (A second chance has its own list,
+/// `second_chance::SECOND_CHANCE_SITE_CODES`, on purpose.)
+pub const SITE_CODES: &[&str] = &["NO_STREAM_FOUND", "VIDEO_UNRESOLVED", "HTTP_403", "UNSUPPORTED_URL"];
+
+/// Whether `code` is one of [`SITE_CODES`]. Everything else (no video on the
+/// page, 404, DRM, login, transcode, disk, ...) never counts.
 pub fn counts_against_site(code: &str) -> bool {
-    matches!(
-        code,
-        "NO_STREAM_FOUND" | "VIDEO_UNRESOLVED" | "HTTP_403" | "UNSUPPORTED_URL"
-    )
+    SITE_CODES.contains(&code)
 }
 
 /// Apply one outcome. `Broken` is only ever set from outside (`set_site_state`).
@@ -288,6 +289,8 @@ mod tests {
             "DISK_FULL",
             "TIMEOUT",
             "NETWORK_ERROR",
+            // A platform refusing us for now says nothing about a news site (P11.4).
+            "RATE_LIMITED",
             "",
         ] {
             assert!(!counts_against_site(c), "{c}");

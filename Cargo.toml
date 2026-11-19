@@ -7,6 +7,7 @@ members = [
     "crates/omni-web",
     "crates/omni-service",
     "crates/omni-cli",
+    "crates/omni-setup",
 ]
 resolver = "2"
 
@@ -61,3 +62,5 @@ opt-level = 3
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
+# Paused time in tests: the pacer's waits and cool-downs without real sleeps (P11.4).
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -237,6 +237,36 @@ pub struct Job {
     /// review tab). `None`: shown.
     #[serde(default)]
     pub cleared_at: Option<DateTime<Utc>>,
+    /// The finished, verified video waits for an unreachable watchfolder
+    /// (P11.2a): the next lease delivers `ready_path` and nothing else.
+    #[serde(default)]
+    pub delivery_wait: bool,
+    /// The file that waits, its size and its SHA-256 (checked before it is delivered).
+    #[serde(default)]
+    pub ready_path: Option<String>,
+    #[serde(default)]
+    pub ready_bytes: Option<i64>,
+    #[serde(default)]
+    pub ready_sha256: Option<String>,
+    /// When the video first parked (P11.2b): the limit on waiting for a file
+    /// that cannot be read counts from it. `None` for a row recovered at
+    /// start-up without a trusted file, or parked before the column existed.
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
+    /// When MCR last started the job afresh (P11.3a): the 2-hour limit on
+    /// automatic retries counts from it, or from `created_at` when `None`.
+    #[serde(default)]
+    pub retry_from: Option<DateTime<Utc>>,
+    /// A person acted on the job (P11.0): «Δοκιμή ξανά», a rename, an
+    /// approval, a cancel… Set by the repository's operator methods only.
+    #[serde(default)]
+    pub human_touched: bool,
+    /// The first thing a person did (`retry`, `override`, `rename`, …); `None` while untouched.
+    #[serde(default)]
+    pub touch_reason: Option<String>,
+    /// The first `error_code` the job ever had; kept when a retry clears `error_code`.
+    #[serde(default)]
+    pub first_error_code: Option<String>,
 
     /// Stored timestamp, `None` when the row predates real timestamps or the
     /// value is unreadable. Never substituted with "now" (defect D-11): the MCR
@@ -244,6 +274,162 @@ pub struct Job {
     /// value is worse than an honest blank.
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Priority added to jobs from a mail whose subject is urgent (plan P4.5).
+/// `omni_email::watcher` re-exports it.
+pub const URGENT_PRIORITY_BOOST: i32 = 10;
+
+/// After how many minutes a job not yet delivered counts as late on the MCR
+/// desk (P11.3b): one limit for a normal job, a shorter one for an urgent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateAfter {
+    normal_mins: i64,
+    urgent_mins: i64,
+}
+
+impl LateAfter {
+    /// Both limits are read as 1..=120 minutes, so a config typo cannot make every job late or none.
+    pub fn new(normal_mins: i64, urgent_mins: i64) -> Self {
+        Self { normal_mins: normal_mins.clamp(1, 120), urgent_mins: urgent_mins.clamp(1, 120) }
+    }
+
+    /// The limit for a job of this priority.
+    pub fn mins_for(&self, priority: i32) -> i64 {
+        if priority >= URGENT_PRIORITY_BOOST {
+            self.urgent_mins
+        } else {
+            self.normal_mins
+        }
+    }
+}
+
+impl Default for LateAfter {
+    fn default() -> Self {
+        Self::new(10, 5)
+    }
+}
+
+/// `omni_broadcast::errors::ErrorCode::LiveStream`'s code (P11.7), which the
+/// late rule names: omni-core cannot depend on omni-broadcast, and a test
+/// there keeps the two equal.
+pub const LIVE_STREAM_CODE: &str = "LIVE_STREAM";
+
+impl Job {
+    /// The one rule for "late" (P11.3b): waiting or running, and at least the
+    /// limit old, counted from MCR's last restart (`retry_from`) or else from
+    /// `created_at`. A job with neither timestamp is never late: no "now" is
+    /// invented for it. A stream that was still live and waits for its next
+    /// check (P11.7: PENDING, [`LIVE_STREAM_CODE`], `not_before` ahead) is late
+    /// whatever its age. `Repository::late_clause` is the same rule in SQL.
+    pub fn is_late(&self, now: DateTime<Utc>, after: LateAfter) -> bool {
+        if self.waits_for_live_check(now) {
+            return true;
+        }
+        if !matches!(self.status, JobStatus::Pending | JobStatus::Running) {
+            return false;
+        }
+        match self.retry_from.or(self.created_at) {
+            Some(since) => now - since >= chrono::Duration::minutes(after.mins_for(self.priority)),
+            None => false,
+        }
+    }
+
+    /// A stream that was still live (or a premiere not yet started) waits for
+    /// its next check (P11.7): PENDING, [`LIVE_STREAM_CODE`], and a
+    /// `not_before` after `now`.
+    pub fn waits_for_live_check(&self, now: DateTime<Utc>) -> bool {
+        self.status == JobStatus::Pending
+            && self.error_code.as_deref() == Some(LIVE_STREAM_CODE)
+            && self.not_before.is_some_and(|t| t > now)
+    }
+}
+
+/// How the jobs that ended in a period ended (P11.0), from their outcome rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OutcomeTotals {
+    /// Every ending in the period.
+    pub ended: i64,
+    /// Reached the watchfolder (COMPLETED)...
+    pub delivered: i64,
+    /// ...of which with nobody acting on the job.
+    pub delivered_untouched: i64,
+    /// MCR put it into Dalet by hand («Το έβαλα στο Dalet»).
+    pub delivered_manual: i64,
+    pub cancelled: i64,
+    pub discarded: i64,
+}
+
+impl OutcomeTotals {
+    pub(crate) fn add(&mut self, outcome: &str, touched: bool) {
+        self.ended += 1;
+        match outcome {
+            "delivered" => {
+                self.delivered += 1;
+                if !touched {
+                    self.delivered_untouched += 1;
+                }
+            }
+            "delivered_manual" => self.delivered_manual += 1,
+            "cancelled" => self.cancelled += 1,
+            "discarded" => self.discarded += 1,
+            _ => {}
+        }
+    }
+
+    /// Delivered untouched out of every video that reached air (delivered
+    /// and delivered by hand): the soak test's gate figure. `None` when no
+    /// video reached air, never a made-up 0 %.
+    pub fn untouched_rate(&self) -> Option<f64> {
+        let aired = self.delivered + self.delivered_manual;
+        (aired > 0).then(|| self.delivered_untouched as f64 / aired as f64)
+    }
+
+    /// Delivered untouched out of every ending (cancelled and discarded too).
+    pub fn strict_rate(&self) -> Option<f64> {
+        (self.ended > 0).then(|| self.delivered_untouched as f64 / self.ended as f64)
+    }
+}
+
+/// One `key → count` line of the autonomy report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutonomyCount {
+    pub key: String,
+    pub count: i64,
+}
+
+/// One site of the autonomy report: its registrable domain only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutonomySite {
+    pub site: String,
+    /// Endings that needed a person (touched, or not delivered).
+    pub needed_person: i64,
+    pub delivered_untouched: i64,
+    pub total: i64,
+}
+
+/// The autonomy report (P11.0): how often a video reached air with nobody
+/// touching it, and why somebody had to. Holds no address, slug, journalist
+/// or file name: only outcome counts, error codes, actions and sites.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AutonomyReport {
+    pub totals: OutcomeTotals,
+    /// The same counts for the jobs that came by mail, and for the rest.
+    pub from_mail: OutcomeTotals,
+    pub manual: OutcomeTotals,
+    /// [`OutcomeTotals::untouched_rate`] of `totals`, 0.0..=1.0.
+    pub untouched_rate: Option<f64>,
+    /// [`OutcomeTotals::strict_rate`] of `totals`, 0.0..=1.0.
+    pub strict_rate: Option<f64>,
+    /// First error code of the endings that needed a person, most first;
+    /// `(none)` when the job never had one.
+    pub by_first_error: Vec<AutonomyCount>,
+    /// The first thing a person did, most first.
+    pub by_touch_reason: Vec<AutonomyCount>,
+    /// At most 15 sites, the most endings needing a person first.
+    pub by_site: Vec<AutonomySite>,
+    /// Jobs waiting for a person right now (review, manual download, approval).
+    pub waiting_now: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +503,8 @@ pub enum JobsView {
     Approval,
     /// Every delivered job, cleared or not, newest first.
     Completed,
+    /// Waiting or working for longer than the late limit, oldest first (P11.3b).
+    Late,
 }
 
 /// Filters for a page of jobs; empty strings mean "any".
@@ -329,6 +517,8 @@ pub struct JobsFilter {
     pub group: String,
     /// Review view only: also list the jobs the desk tidied away (P7.21).
     pub include_hidden: bool,
+    /// Late view only: the limits (default: 10 and 5 minutes).
+    pub late_after: LateAfter,
 }
 
 /// One page of a job list.
@@ -357,6 +547,9 @@ pub struct JobCounts {
     pub completed_today: i64,
     /// Videos waiting for MCR approval (P10.7).
     pub approval: i64,
+    /// Waiting or working for longer than the late limit right now (P11.3b).
+    #[serde(default)]
+    pub late: i64,
 }
 
 /// What the `queue` health check looks at (plan P7.19).
@@ -391,6 +584,9 @@ pub struct QueueSummary {
     /// stalled": twenty pending jobs are normal right after a rundown arrives
     /// and alarming an hour later.
     pub oldest_pending_age_secs: Option<i64>,
+    /// Waiting or working for longer than the late limit (P11.3b); the desk chimes when it rises.
+    #[serde(default)]
+    pub late: i64,
 }
 
 /// One row of `login_attempts` (plan P2.2).
@@ -675,6 +871,11 @@ pub struct NewJob {
     pub max_videos: Option<i64>,
     /// The job whose article this video was found in (plan P7.6).
     pub parent_job_id: Option<i64>,
+    /// MCR queued it by hand from an offered video or a skipped mail link
+    /// (P11.0): the job starts touched, reason `queued`. Not for the desk's
+    /// add form or the journalist panel, where a person submitting a link is
+    /// the normal start of a job.
+    pub queued_by_operator: bool,
 }
 
 impl NewJob {
@@ -696,6 +897,7 @@ impl NewJob {
             group_code: None,
             max_videos: None,
             parent_job_id: None,
+            queued_by_operator: false,
         }
     }
 }

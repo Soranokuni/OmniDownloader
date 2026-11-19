@@ -648,7 +648,7 @@ async fn a_model_recipe_merged_into_a_player_recipe_is_judged_as_the_player_reci
 
     // Park it and let MCR call it the wrong video.
     assert!(r.repo.hold_output(r.job.id, OWNER, "temp/held/x/clip.mxf", 3, &"ab".repeat(32), Some(9.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
-    assert!(crate::finish_held(&r.repo, r.job.id, OWNER).unwrap());
+    assert!(crate::worker::finish_held(&r.repo, r.job.id, OWNER).unwrap());
     assert!(r.repo.reject_held(r.job.id, "wrong_video", "no", "desk").unwrap());
     assert!(r.repo.recipe_steps_barred(&steps, DOMAIN).unwrap(), "the steps are barred on the domain");
     let offered = r.repo.recipes_for_site(DOMAIN, Some("hlsjs"), Utc::now()).unwrap();

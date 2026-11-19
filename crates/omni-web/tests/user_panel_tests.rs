@@ -119,6 +119,8 @@ async fn many_links_get_index_suffixes_and_one_bad_link_queues_nothing() -> Resu
     let slugs: Vec<&str> = json.as_array().unwrap().iter().map(|r| r["slug"].as_str().unwrap()).collect();
     assert_eq!(slugs, ["1A_ANNOU_FOTIA", "1B_ANNOU_FOTIA", "1C_ANNOU_FOTIA"]);
     assert_eq!(p.job_count(), 3);
+    // A journalist submitting links is the normal start of a job, not a touch (P11.0).
+    assert!(p.repo.get_all_jobs()?.iter().all(|j| !j.human_touched && j.touch_reason.is_none()));
 
     let (status, _) = p
         .send(

@@ -3,6 +3,7 @@ use std::time::Duration as StdDuration;
 
 use omni_core::process::RunOpts;
 
+use crate::errors::{disk_full_text, ErrorCode};
 use crate::probe::SourceProbe;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -696,9 +697,8 @@ impl Transcoder {
         // probed duration is an honest percentage, unlike scraping "time=" out
         // of the human-readable stderr.
         let total_us = (duration * 1_000_000.0).max(1.0);
-        let opts = self.cancellable(RunOpts::new(StdDuration::from_secs_f64(
-            (duration * 6.0).clamp(600.0, 10_800.0),
-        )))
+        let timeout = StdDuration::from_secs_f64((duration * 6.0).clamp(600.0, 10_800.0));
+        let opts = self.cancellable(RunOpts::new(timeout))
         .on_stdout_line(move |line| {
             if let Some(v) = line.strip_prefix("out_time_us=") {
                 if let Ok(us) = v.trim().parse::<f64>() {
@@ -714,12 +714,27 @@ impl Transcoder {
         let outcome = omni_core::process::run(&self.ffmpeg_path, &plan.args, opts)
             .await
             .with_context(|| format!("Failed running ffmpeg at {:?}", self.ffmpeg_path))?;
-        outcome.ok_or_err("ffmpeg")?;
+        let (timed_out, cancelled) = (outcome.timed_out, outcome.cancelled);
+        if let Err(e) = outcome.ok_or_err("ffmpeg") {
+            // A cancelled run is the pipeline's to report (a lost lease), not a failure.
+            if cancelled {
+                return Err(e);
+            }
+            return Err(match transcode_failure_code(timed_out, &format!("{e:#}")) {
+                ErrorCode::TranscodeTimeout => e.context(format!(
+                    "{}: ffmpeg exceeded {} s for job #{job_id}",
+                    ErrorCode::TranscodeTimeout.as_str(),
+                    timeout.as_secs()
+                )),
+                code => e.context(code.as_str()),
+            });
+        }
 
         if !intermediate_mxf.exists() {
             return Err(anyhow!(
                 "ffmpeg reported success but produced no output at {intermediate_mxf:?}"
-            ));
+            )
+            .context(ErrorCode::TranscodeFailed.as_str()));
         }
 
         // ffmpeg exits 0 for a cut-short programme (loudnorm going dynamic
@@ -734,5 +749,36 @@ impl Transcoder {
         }
 
         Ok((intermediate_mxf, duration))
+    }
+}
+
+/// The code for an ffmpeg run that did not succeed (P11.1): out of time, out
+/// of disk (retried later, like a refused hold), or a failed encode. Before,
+/// none of these carried a code and the card said "unexpected error".
+fn transcode_failure_code(timed_out: bool, text: &str) -> ErrorCode {
+    if timed_out {
+        ErrorCode::TranscodeTimeout
+    } else if disk_full_text(text) {
+        ErrorCode::LowDisk
+    } else {
+        ErrorCode::TranscodeFailed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_encode_names_why_it_failed() {
+        let full = "ffmpeg exited with code Some(1). stderr tail: [out#0/mxf @ 000001] av_interleaved_write_frame(): No space left on device\nConversion failed!";
+        assert_eq!(transcode_failure_code(false, full), ErrorCode::LowDisk);
+        assert_eq!(
+            transcode_failure_code(false, "ffmpeg exited with code Some(1). stderr tail: VBV buffer too small for bitrate"),
+            ErrorCode::TranscodeFailed
+        );
+        // A run killed at its timeout is a timeout, whatever its tail said last.
+        assert_eq!(transcode_failure_code(true, full), ErrorCode::TranscodeTimeout);
+        assert_eq!(transcode_failure_code(true, "ffmpeg timed out after 600s; process tree killed. stderr tail: frame=10"), ErrorCode::TranscodeTimeout);
     }
 }

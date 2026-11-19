@@ -617,6 +617,7 @@ impl EmailWatcher {
                 group_code: parsed.group.as_ref().map(|g| g.code.clone()),
                 max_videos: job.max_videos.map(i64::from),
                 parent_job_id: None,
+                queued_by_operator: false,
             };
             let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
             match &result {
@@ -642,7 +643,8 @@ impl EmailWatcher {
 }
 
 /// Priority added to jobs from a mail whose subject is urgent (plan P4.5).
-pub const URGENT_PRIORITY_BOOST: i32 = 10;
+/// Defined in omni-core, where the desk's "late" rule needs it too (P11.3b).
+pub use omni_core::models::URGENT_PRIORITY_BOOST;
 
 enum Handled {
     Done,

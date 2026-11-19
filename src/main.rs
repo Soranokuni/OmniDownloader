@@ -4,22 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Semaphore};
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
-use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
-use omni_browser::evidence::{Evidence, EvidenceClass};
 use omni_browser::sniffer::StreamSniffer;
-use omni_core::config::{AppConfig, RepairMode};
+use omni_core::config::AppConfig;
 use omni_core::paths::AppPaths;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStage, JobStatus};
 use omni_core::repository::Repository;
 use omni_core::secrets::SecretStore;
 use omni_core::health::HealthState;
-use omni_core::site_health::{SiteOutcome, SiteState};
 use omni_core::logging::{LogGuard, Redactions};
 use omni_core::update_gate::UpdateGate;
 use omni_email::watcher::EmailWatcher;
@@ -29,10 +24,18 @@ use omni_web::state::AppState;
 mod benchmark;
 mod canary;
 mod cookies_cli;
+mod early_update;
 mod egress;
 mod repair;
+mod report_cli;
 mod selfcheck;
 mod site_memory;
+mod worker;
+
+use selfcheck::UpdateVerdict;
+#[cfg(debug_assertions)]
+use worker::finish_held;
+use worker::{run_job, wait_for_deliveries, LEASE_REAP_INTERVAL, LEASE_SECS, SHUTDOWN_DELIVERY_BUDGET};
 
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
@@ -148,6 +151,11 @@ enum Commands {
         /// The .eml files
         #[arg(long, required = true)]
         eml: Vec<std::path::PathBuf>,
+    },
+    /// Reports from the database the daemon writes (read only; safe while it runs)
+    Report {
+        #[command(subcommand)]
+        what: report_cli::ReportKind,
     },
     /// The mail the daemon has handled, newest first
     MailHistory {
@@ -773,6 +781,9 @@ async fn main() -> Result<()> {
                 yes: *yes,
                 no_firewall: *no_firewall,
                 import: import.clone(),
+                base_config: None,
+                // `--account` names an account knowingly: as before (P13.1c).
+                confirm_share_for_passwordless: false,
             })
             .await;
         }
@@ -853,6 +864,7 @@ async fn main() -> Result<()> {
             let repo = Repository::new(paths.resolve(&config.database_path))?;
             let health = HealthState::new();
             let ytdl = DependencyManager::new(&paths.bin).ytdl_live();
+            let ffmpeg = resolve_ffmpeg(&config, &DependencyManager::new(paths.resolve(&config.bin_dir)));
             let deps = DependencyManager::new(&paths.bin);
             if !ensure_deno(&deps, &health, config.ytdl_auto_update_nightly).await {
                 println!("  ✗ Deno: {}", health.get(omni_core::health::checks::DENO).and_then(|c| c.detail).unwrap_or_default());
@@ -866,14 +878,15 @@ async fn main() -> Result<()> {
             }
             let links = repo.list_selfcheck_links()?;
             println!("Checking {} link(s); each takes a few seconds…", links.len());
-            let mut failing = 0;
-            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, &links).await {
-                if !outcome.ok {
-                    failing += 1;
-                }
-                println!("  {} {:<32} {}", if outcome.ok { "✓" } else { "✗" }, link.label, outcome.detail);
+            let (mut working, mut unchecked) = (0, 0);
+            for (link, outcome) in selfcheck::check_and_record(&repo, &ytdl, Some(&ffmpeg), &omni_broadcast::pacing::HostPacer::default(), &links).await {
+                working += usize::from(outcome.ok);
+                unchecked += usize::from(outcome.inconclusive);
+                // Inconclusive: the site was limiting requests (P11.4); not counted either way.
+                let mark = if outcome.ok { "✓" } else if outcome.inconclusive { "–" } else { "✗" };
+                println!("  {mark} {:<32} {}", link.label, outcome.detail);
             }
-            println!("{} of {} links work.", links.len() - failing, links.len());
+            println!("{working} of {} links work; {unchecked} not checked this time.", links.len());
         }
         Some(Commands::Cookies { action }) => cookies_cli::run(&paths, action).await?,
         Some(Commands::Benchmark { action }) => {
@@ -947,6 +960,7 @@ async fn main() -> Result<()> {
             dev_seed_repair(&Repository::new(&db_path)?)?;
             println!("Seeded invented sites, recipes and repair attempts.");
         }
+        Some(Commands::Report { what }) => report_cli::run(&paths, what)?,
         Some(Commands::MailHistory { last }) => {
             let config = AppConfig::load_from_file(&paths.config)
                 .with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
@@ -1106,7 +1120,9 @@ async fn run_daemon(
     info!("Initializing SQLite database at: {:?}", db_path);
     // One live-update bus: the repository announces job changes on it, the web server streams it (P1.10).
     let events = omni_core::events::EventBus::new();
-    let mut repo = Repository::new(&db_path)?.with_events(events.clone());
+    let mut repo = Repository::new(&db_path)?
+        .with_events(events.clone())
+        .with_second_chance_window(&config.retry);
     // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them,
     // and every later read of a jar registers its values again (a jar the sign-in command stored).
     if let Some(r) = &log_redactions {
@@ -1219,12 +1235,7 @@ async fn run_daemon(
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
-    let ffmpeg_path = config
-        .ffmpeg_path
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| dep_mgr.find_binary("ffmpeg"))
-        .unwrap_or_else(|| dep_mgr.unresolved_path("ffmpeg"));
+    let ffmpeg_path = resolve_ffmpeg(&config, &dep_mgr);
     let ffprobe_path = config
         .ffprobe_path
         .as_ref()
@@ -1307,7 +1318,12 @@ async fn run_daemon(
     let archive_shares_temp = omni_core::archive::same_volume(&archive_settings.root, &temp_path);
     let repair_ffprobe = ffprobe_path.clone();
     let repair_ffmpeg = ffmpeg_path.clone();
+    // Handed to the yt-dlp runs outside the engine: canaries, self-check, cookie tests (P11.4e).
+    let ytdl_ffmpeg = ffmpeg_path.clone();
     let (st_ffmpeg, st_ffprobe, st_bmx) = (ffmpeg_path.clone(), ffprobe_path.clone(), bmxtranswrap_path.clone());
+    // Whether the watchfolder answers (P11.2a): the start-up probe sets it, the
+    // share watch and every delivery keep it current, the worker loop reads it.
+    let watchfolder_state = omni_core::selftest::WatchfolderState::default();
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdl_path.clone(),
@@ -1318,7 +1334,12 @@ async fn run_daemon(
         watchfolder_path.clone(),
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
-    .with_archive(Some(archive_settings.clone())));
+    .with_archive(Some(archive_settings.clone()))
+    .with_watchfolder_state(watchfolder_state.clone())
+    .with_retry_max_age(config.retry.max_age_mins)
+    // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,
+    // the canaries, the self-check and the benchmark take turns at a platform.
+    .with_pacing(config.pacing.per_host_concurrency, config.pacing.min_gap_secs));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -1331,6 +1352,11 @@ async fn run_daemon(
     // URL, once per job. It never blocks start-up: refusing to come up is the
     // one outcome an operator cannot diagnose from the MCR desk.
     omni_core::selftest::run(&health, &bin_dir, &watchfolder_path, &temp_path).await;
+    watchfolder_state.set(
+        health
+            .get(omni_core::health::checks::WATCHFOLDER)
+            .is_some_and(|c| c.state == omni_core::health::Health::Ok),
+    );
     omni_core::selftest::check_default_admin(&repo, &health);
     omni_core::selftest::check_archive(
         &health,
@@ -1382,7 +1408,7 @@ async fn run_daemon(
 
     // The self-check's last results, and a browser launch in the background:
     // a broken browser is reported now, not when the first article fails.
-    selfcheck::refresh_health(&repo, &health);
+    selfcheck::refresh_health(&repo, &health, &bin_dir);
     omni_core::site_health::refresh_health(&repo, &health);
     {
         let health = health.clone();
@@ -1420,8 +1446,13 @@ async fn run_daemon(
     // daytime trigger and the admin's «Run now», so only one runs at a time.
     let canary_env = Arc::new(
         canary::CanaryEnv::new(repo.clone(), health.clone(), bin_dir.clone(), config.ytdl_channel.clone())
-            .with_scratch(temp_path.clone()),
+            .with_scratch(temp_path.clone())
+            .with_pacer(broadcast_engine.pacer())
+            .with_ffmpeg(ytdl_ffmpeg.clone()),
     );
+    // The workers ask the scheduler for an early yt-dlp update when a platform starts failing (P11.4d).
+    let (early_ytdl, early_ytdl_rx) = early_update::EarlyYtdlUpdate::new(config.ytdl_auto_update_nightly);
+    canary_env.set_early_ytdl(early_ytdl.clone());
     // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
     let url_tester = Arc::new(repair::AdminTester::new());
     omni_core::cookies::refresh_health(&repo, &health);
@@ -1457,12 +1488,14 @@ async fn run_daemon(
             repo: repo.clone(),
             bin_dir: bin_dir.clone(),
             temp_path: temp_path.clone(),
+            pacer: broadcast_engine.pacer(),
+            ffmpeg: Some(ytdl_ffmpeg),
         }))
         .with_site_runner(Arc::new(canary::AdminRunner::new(canary_env.clone())))
         .with_benchmark_starter(Arc::new(benchmark::Starter::new(Arc::new(benchmark::Benchmark::new(
             repo.clone(),
             paths.clone(),
-            Arc::new(benchmark::RealStages::new(repo.clone(), bench_tools, paths.benchmark_temp())),
+            Arc::new(benchmark::RealStages::new(repo.clone(), bench_tools, paths.benchmark_temp()).with_pacer(broadcast_engine.pacer())),
             "daemon",
         ).with_gate(update_gate.clone())))))
         .with_secret_store(secret_store.clone())
@@ -1587,7 +1620,9 @@ async fn run_daemon(
             canary: canary_env.clone(),
             evidence_days: config.repair.evidence_days.max(1),
             evidence_max_bytes: config.repair.evidence_max_mb.saturating_mul(1024 * 1024),
+            early_ytdl: early_ytdl.clone(),
         };
+        let mut early_ytdl_rx = early_ytdl_rx;
 
         tokio::spawn(async move {
             // A minute is fine: these tasks are nightly, and the cost of a tick
@@ -1600,6 +1635,13 @@ async fn run_daemon(
                     _ = tick.tick() => {
                         omni_core::cookies::refresh_health_if_changed(&repo_sched, &ctx.health, &mut jars_seen);
                         run_due_tasks(&repo_sched, &specs, &ctx).await;
+                    }
+                    // In this loop, so never beside a nightly task; a request that waited
+                    // for one is dropped by the 6-hour rule (P11.4d).
+                    Some(platform) = early_ytdl_rx.recv() => {
+                        ctx.early_ytdl
+                            .run_requested(&repo_sched, platform, chrono::Utc::now(), |drain| early_ytdl_update(&repo_sched, &ctx, drain))
+                            .await;
                     }
                 }
             }
@@ -1626,17 +1668,10 @@ async fn run_daemon(
 
     // 5. Sweep scratch directories left behind by jobs that are no longer
     // running. On a newsroom machine these are gigabytes of source media.
-    match repo.running_job_ids() {
-        Ok(running) => {
-            let removed = omni_broadcast::delivery::WatchfolderDelivery::sweep_orphan_job_dirs(
-                &temp_path.join("jobs"),
-                &running,
-            )
-            .await;
-            if removed > 0 {
-                info!("Swept {removed} orphaned job workspace(s) from temp/jobs.");
-            }
-        }
+    // A finished video that waits for the watchfolder (P11.2a) is kept.
+    match startup_sweep(&repo, &temp_path.join("jobs")).await {
+        Ok(0) => {}
+        Ok(removed) => info!("Swept {removed} orphaned job workspace(s) from temp/jobs."),
         Err(e) => warn!("Could not list running jobs for the temp sweep: {e:?}"),
     }
 
@@ -1703,6 +1738,57 @@ async fn run_daemon(
         });
     }
 
+    // 6b. Share watch (P11.2a): the watchfolder is looked at every 30 s, so a
+    // video that waits for it is delivered soon after it answers again, and the
+    // `watchfolder` line says while it does not. While it answers the look is
+    // read-only (nothing is written into the watchfolder); once it does not (a
+    // failed look, a failed start-up probe, a delivery that found it
+    // unreachable) the write probe runs, and only a passing one reopens it. A
+    // look that does not answer in 15 s counts as not reachable; one still
+    // hanging is not started twice.
+    {
+        let (state, wf_health, wf) = (watchfolder_state.clone(), health.clone(), watchfolder_path.clone());
+        let mut watch_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            use omni_core::selftest::ShareCheck;
+            let mut tick = tokio::time::interval(omni_core::selftest::WATCHFOLDER_PROBE_EVERY);
+            tick.tick().await; // the start-up self-test has just probed
+            let mut probe: Option<(ShareCheck, tokio::task::JoinHandle<Result<(), String>>)> = None;
+            loop {
+                tokio::select! {
+                    _ = watch_rx.recv() => break,
+                    _ = tick.tick() => {
+                        let (check, mut running) = match probe.take() {
+                            Some((check, p)) if !p.is_finished() => (check, p),
+                            _ => {
+                                let (path, check) = (wf.clone(), ShareCheck::for_state(state.reachable()));
+                                (check, tokio::task::spawn_blocking(move || check.run(&path)))
+                            }
+                        };
+                        let answered = tokio::time::timeout(omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT, &mut running).await;
+                        let result = match answered {
+                            Ok(Ok(r)) => Some(r),
+                            Ok(Err(e)) => Some(Err(format!("the check did not finish: {e}"))),
+                            Err(_) => {
+                                probe = Some((check, running));
+                                None
+                            }
+                        };
+                        let was = state.reachable();
+                        let now = omni_core::selftest::record_watchfolder(&wf_health, &state, &wf, check, result.as_ref());
+                        if was != now {
+                            if now {
+                                info!("The watchfolder answers again; videos waiting for it are delivered");
+                            } else {
+                                warn!("The watchfolder does not answer; finished videos wait for it");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // 7. Worker pool.
     //
     // Capacity is acquired *before* leasing (plan P1.1, defect D-01). The old
@@ -1729,6 +1815,7 @@ async fn run_daemon(
     let worker_encoder_ok = encoder_ok.clone();
     let worker_health = health.clone();
     let worker_watchfolder = watchfolder_path.clone();
+    let worker_watchfolder_state = watchfolder_state.clone();
     let worker_temp = temp_path.clone();
     let worker_archive = archive_settings.clone();
     // The LLM rung of the repair ladder (P10.12): both the switch and a model name,
@@ -1767,6 +1854,10 @@ async fn run_daemon(
     canary_env.set_heal(worker_repair.clone());
     url_tester.set_ctx(worker_repair.clone());
     let worker_canary = canary_env.clone();
+    // The job runs (P11.8): lease heartbeat, release on every exit, and the
+    // `workers` line for runs that hit an internal error.
+    let worker_ctx = worker::JobRunCtx::new(repo_worker.clone(), engine_worker.clone(), worker_health.clone());
+    worker_health.set(omni_core::health::checks::WORKERS, omni_core::health::Check::ok("running"));
 
     tokio::spawn(async move {
         info!("Queue worker pool active ({max_concurrency} downloads, {max_encoders} encoders)");
@@ -1833,13 +1924,9 @@ async fn run_daemon(
                 archive_separate,
                 omni_core::selftest::disk_space(&worker_archive.root).map(|(free, _)| free),
             );
-            if !omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp) {
-                drop(permit);
-                tokio::select! {
-                    _ = worker_rx.recv() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
-                }
-            }
+            // A video that waits for the watchfolder (P11.2a) still goes then: it
+            // needs no temp space, and delivering it is what frees some.
+            let disk_ok = omni_core::selftest::check_disks(&worker_health, &worker_watchfolder, &worker_temp);
 
             // A tool swap is pending: hold off rather than lease a job whose
             // downloader is about to be replaced underneath it. The pass is
@@ -1854,33 +1941,43 @@ async fn run_daemon(
             };
 
             let owner = format!("{worker_hostname}:{}:{worker_seq}", std::process::id());
+            // A video that waits for the watchfolder is leased only while it answers (P11.2a).
+            let deliver_ok = worker_watchfolder_state.reachable();
 
-            let leased = if permit.1.is_some() {
-                repo_worker.lease_job(&owner, LEASE_SECS)
-            } else {
-                // Every download slot is busy: an approved held video can
-                // still start; anything else waits briefly for a slot.
-                match repo_worker.lease_approved_held_job(&owner, LEASE_SECS) {
-                    Ok(None) => match tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned()).await {
+            let leased = match lease_now(&repo_worker, &owner, disk_ok, permit.1.is_some(), deliver_ok) {
+                // Every download slot is busy and nothing deliver-only is ready:
+                // anything else waits briefly for a slot.
+                Ok(None) if disk_ok && permit.1.is_none() => {
+                    match tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned()).await {
                         Ok(Ok(slot)) => {
                             permit.1 = Some(slot);
-                            repo_worker.lease_job(&owner, LEASE_SECS)
+                            repo_worker.lease_job_when(&owner, LEASE_SECS, worker_watchfolder_state.reachable())
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
                             drop(permit);
                             continue;
                         }
-                    },
-                    other => other,
+                    }
                 }
+                other => other,
             };
             let job = match leased {
                 Ok(Some(job)) => job,
+                Ok(None) if !disk_ok => {
+                    // Under STOP_DISK_GB and no waiting delivery: wait for room, as before.
+                    drop(permit);
+                    tokio::select! {
+                        _ = worker_rx.recv() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                    }
+                }
                 Ok(None) => {
                     // Nothing ready. Release the permit and idle with jitter so
                     // several workers do not wake in lockstep and hammer SQLite.
                     drop(permit);
+                    // An internal error ages out of the `workers` line on a quiet day too.
+                    worker_ctx.refresh_health();
                     let jitter = Duration::from_millis(1000 + (worker_seq % 5) * 100);
                     tokio::select! {
                         _ = worker_rx.recv() => break,
@@ -1895,82 +1992,29 @@ async fn run_daemon(
                 }
             };
 
+            worker_ctx.refresh_health();
+            let ctx = worker_ctx.clone();
             let eng = engine_worker.clone();
             let rep = repo_worker.clone();
-            let busy_guard = busy_worker.guard(job.id, &owner);
             let evidence_dir = worker_temp.join("evidence");
             let job_health = worker_health.clone();
             let job_canary = worker_canary.clone();
             let job_repair = worker_repair.clone();
+            let (job_slot, download_slot) = permit;
+            let leased = worker::LeasedJob {
+                job_id: job.id,
+                owner: owner.clone(),
+                busy: busy_worker.guard(job.id, &owner),
+                gate_pass,
+                job_slot,
+                download_slot,
+            };
 
             tokio::spawn(async move {
-                // Held for the whole job, including every error path: dropping
-                // it is what tells a waiting updater the downloader is idle.
-                let _gate_pass = gate_pass;
-                // Until this task is done with the job, MCR cannot queue it
-                // again (a cancelled job stops only at its next stage).
-                // Its token is the job run's: MCR's cancel and a lost lease
-                // both fire it, and it kills the running tool (plan P1.15).
-                let cancel = busy_guard.token();
-                let _busy = busy_guard;
-                let job_id = job.id;
-                let (job_slot, download_slot) = permit;
-                // Handed back on every exit, a panic in run_job included.
-                let _slot_guard = download_slot.map(|slot| {
-                    eng.hold_download_slot(job_id, &owner, slot);
-                    eng.download_slot_guard(job_id, &owner)
-                });
-
-                // Keep the lease alive while we work. If it stops succeeding we
-                // have lost the job -- the reaper requeued it, or an operator
-                // cancelled it -- and must stop rather than deliver a file for a
-                // job somebody else now owns.
-                let heartbeat = {
-                    let rep = rep.clone();
-                    let owner = owner.clone();
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-                        tick.tick().await; // fires immediately; skip it
-                        loop {
-                            tokio::select! {
-                                _ = cancel.cancelled() => break,
-                                _ = tick.tick() => {
-                                    match rep.heartbeat(job_id, &owner, LEASE_SECS) {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            warn!("Job #{job_id}: lease lost, abandoning work");
-                                            cancel.cancel();
-                                            break;
-                                        }
-                                        Err(e) => warn!("Job #{job_id}: heartbeat failed: {e:?}"),
-                                    }
-                                }
-                            }
-                        }
-                    })
-                };
-
-                let outcome = run_job(&rep, &eng, &owner, job, cancel.clone(), &evidence_dir, &job_repair, &job_health, &job_canary).await;
-                cancel.cancel();
-                heartbeat.abort();
-
-                if let Err(e) = outcome {
-                    // run_job handles its own failures; reaching here means the
-                    // bookkeeping itself failed, so release the lease rather
-                    // than leaving the job RUNNING until the reaper notices.
-                    error!("Job #{job_id}: worker bookkeeping failed: {e:?}");
-                    let _ = rep.finish(
-                        job_id,
-                        &owner,
-                        JobStatus::RequiresReview,
-                        Some(ErrorCode::PipelineFailed.as_str()),
-                        Some(&e.to_string()),
-                        None,
-                    );
-                }
-
-                drop(job_slot);
+                worker::run_leased_job(&ctx, leased, move |cancel| async move {
+                    run_job(&rep, &eng, &owner, job, cancel, &evidence_dir, &job_repair, &job_health, &job_canary).await
+                })
+                .await;
             });
         }
     });
@@ -2017,52 +2061,6 @@ async fn run_daemon(
 
     Ok(())
 }
-
-/// How long a stop waits for jobs that have reached the watchfolder step.
-/// With the runtime's 20 s shutdown it stays inside the service's stop wait
-/// hint (`omni_service` STOP_WAIT_HINT, 60 s).
-const SHUTDOWN_DELIVERY_BUDGET: Duration = Duration::from_secs(25);
-
-/// A running job at DELIVER or later: stopping it now costs a stale staging
-/// file or a second delivery, so a stop waits for it.
-fn is_delivering(status: JobStatus, stage: JobStage) -> bool {
-    status == JobStatus::Running && matches!(stage, JobStage::Deliver | JobStage::Archive | JobStage::Done)
-}
-
-/// Wait until no busy job is delivering, up to `budget`; how many still are.
-/// Re-checked every poll, so a job that reaches DELIVER meanwhile is waited for too.
-async fn wait_for_deliveries(
-    busy: &omni_core::busy::BusyJobs,
-    status_of: impl Fn(i64) -> Option<(JobStatus, JobStage)>,
-    budget: Duration,
-) -> usize {
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut announced = false;
-    loop {
-        let delivering = busy
-            .ids()
-            .into_iter()
-            .filter(|id| status_of(*id).is_some_and(|(status, stage)| is_delivering(status, stage)))
-            .count();
-        if delivering == 0 || tokio::time::Instant::now() >= deadline {
-            return delivering;
-        }
-        if !announced {
-            info!("Waiting up to {} s for {delivering} job(s) delivering to the watchfolder", budget.as_secs());
-            announced = true;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-/// Lease renewal interval and lease length.
-///
-/// The lease outlives several missed heartbeats so a momentarily busy machine
-/// does not lose a job mid-transcode, but is short enough that a crashed worker
-/// is noticed within a couple of minutes rather than at the next restart.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const LEASE_SECS: i64 = 180;
-const LEASE_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A ready video waiting, or one step running, longer than this is a warning.
 const QUEUE_SLOW_SECS: i64 = 30 * 60;
@@ -2126,1628 +2124,15 @@ fn hostname_for_lease() -> String {
         .unwrap_or_else(|_| "unknown-host".to_string())
 }
 
-/// Whether this worker still holds the job. A failed check counts as lost:
-/// better to stop than to queue or deliver for a job MCR may have cancelled.
-fn still_ours(repo: &Repository, job_id: i64, owner: &str) -> bool {
-    repo.owns_lease(job_id, owner).unwrap_or(false)
-}
-
-/// A repaired video a trusted recipe delivered without approval (P10.16a): the
-/// pipeline has put it in the watchfolder; the worker holding the lease completes
-/// the job with that file, as it does for any delivery.
-fn finish_delivered(repo: &Repository, job_id: i64, owner: &str) -> Result<bool> {
-    let delivered = repo.get_job(job_id)?.and_then(|j| j.file_path).filter(|p| !p.is_empty());
-    repo.finish(job_id, owner, JobStatus::Completed, None, None, delivered.as_deref())
-}
-
-/// The run holding the lease parks the job for MCR's approval (P10.5): not
-/// terminal, no lease, never leased again until approved. `false` when the
-/// job is no longer this worker's.
-fn finish_held(repo: &Repository, job_id: i64, owner: &str) -> Result<bool> {
-    repo.finish(job_id, owner, JobStatus::AwaitingApproval, None, None, None)
-}
-
-/// An approved held video: deliver exactly that file (P10.5). No download,
-/// no encode, no site-health or evidence bookkeeping. The terminal status is
-/// set here, by the worker holding the lease, as for every other job.
-async fn run_approved_delivery(
-    repo: &Repository,
-    engine: &Arc<BroadcastEngine>,
-    owner: &str,
-    job: &omni_core::models::Job,
-    held: &omni_core::repository::HeldOutput,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    let job_id = job.id;
-    let result = engine.deliver_held(job, owner, held, Some(cancel.clone())).await;
-    if lost_lease(&result) {
-        warn!("Job #{job_id}: no longer ours; nothing more to do");
-        return Ok(());
-    }
-    match result {
-        Ok(()) => {
-            // The job and the held row finish together; a lost lease marks
-            // nothing and keeps the held file.
-            if repo.finish_held_delivery(job_id, owner)? {
-                engine.discard_held_dir(job_id);
-            } else {
-                warn!("Job #{job_id}: no longer ours after delivering the approved video; the held file is kept");
-            }
-        }
-        Err(e) => {
-            let code = classify_pipeline_error(&e);
-            let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
-            let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
-            let message = readable_cause(&e);
-            let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
-            let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
-            if code.is_retryable() && attempts < max_attempts {
-                // The approval stands: the next lease delivers the same file.
-                let backoff = code.backoff(attempts);
-                info!("Job #{job_id}: {code} delivering the approved video, retrying in {} s", backoff.num_seconds());
-                repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
-            } else {
-                if still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, &job.url, repo))?;
-                }
-                repo.finish(job_id, owner, JobStatus::RequiresReview, Some(code.as_str()), Some(&message), None)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Run one leased job through the pipeline.
-///
-/// Extracted from the worker loop so the lease, the heartbeat and the permit are
-/// all managed in one place and cannot be forgotten on an early return.
-async fn run_job(
-    repo: &Repository,
-    engine: &Arc<BroadcastEngine>,
-    owner: &str,
-    job: omni_core::models::Job,
-    cancel: CancellationToken,
-    evidence_dir: &std::path::Path,
-    repair: &repair::RepairCtx,
-    health: &HealthState,
-    canary: &Arc<canary::CanaryEnv>,
-) -> Result<()> {
-    let repair_mode = repair.cfg.mode;
-    let job_id = job.id;
-    let orig_url = job.url.clone();
-
-    // File lockers (WeTransfer and friends) are never handed to yt-dlp: the
-    // link is a landing page, not a media URL. Plan P8 may resolve them
-    // automatically; until then an operator fetches the file.
-    let locker_resolver = ComputerUseAgentPlaceholder::new(None, None);
-    if locker_resolver.can_handle(&orig_url) {
-        warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
-        repo.record_event(
-            job_id,
-            "WARN",
-            Some(JobStage::Extract),
-            "File-locker link (WeTransfer/AirBridge/…); needs a manual download",
-        )?;
-        repo.finish(
-            job_id,
-            owner,
-            JobStatus::ManualDownload,
-            Some(ErrorCode::ManualDownload.as_str()),
-            Some("File-locker link: download the file and use 'Upload file' on this job."),
-            None,
-        )?;
-        return Ok(());
-    }
-
-    // MCR approved the video this job held back: deliver that file, and do
-    // nothing of what follows (no download, no page scan, no sniffing).
-    if let Some(held) = repo.approved_held(job_id)? {
-        return run_approved_delivery(repo, engine, owner, &job, &held, &cancel).await;
-    }
-
-    // MCR asked for the next verified candidate of this job (P10.13): hold that
-    // one, from the list the earlier run already verified. No download of the
-    // link, no page scan, no sniffing, no recipes, no model.
-    if let Some(attempt) = repair::open_next(repo, job_id)? {
-        if !repo.set_stage(job_id, owner, JobStage::Download)? {
-            warn!("Job #{job_id}: no longer ours; stopping without the next choice");
-            return Ok(());
-        }
-        // Only `hold` lets MCR walk the verified list; with repair off or in shadow
-        // nothing is downloaded and the job goes to review.
-        if repair_mode != omni_core::config::RepairMode::Hold {
-            let end = omni_core::repository::AttemptEnd {
-                rung: Some("next".into()),
-                outcome: Some("repair_off".into()),
-                domain: attempt.domain.clone(),
-                candidates_json: attempt.candidates_json.clone(),
-                next_index: attempt.next_index,
-                ..Default::default()
-            };
-            if let Err(e) = repo.finish_attempt(attempt.id, &end, chrono::Utc::now()) {
-                warn!("Job #{job_id}: the next-choice attempt could not be closed: {e:#}");
-            }
-            repo.finish(
-                job_id,
-                owner,
-                JobStatus::RequiresReview,
-                Some(ErrorCode::VideoUnresolved.as_str()),
-                Some(repair::REPAIR_OFF_EL),
-                None,
-            )?;
-            return Ok(());
-        }
-        match repair::run_next(repair, &job, owner, evidence_dir, &attempt, &cancel).await {
-            repair::NextResult::Held => {
-                info!("Job #{job_id}: MCR's next choice is held for approval");
-                finish_held(repo, job_id, owner)?;
-            }
-            repair::NextResult::Lost => warn!("Job #{job_id}: no longer ours; nothing more to do"),
-            repair::NextResult::Failed => {
-                if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, ErrorCode::VideoUnresolved.hint_el())?;
-                }
-                repo.finish(
-                    job_id,
-                    owner,
-                    JobStatus::RequiresReview,
-                    Some(ErrorCode::VideoUnresolved.as_str()),
-                    Some(repair::NEXT_FAILED_EL),
-                    None,
-                )?;
-            }
-        }
-        return Ok(());
-    }
-
-    if !repo.set_stage(job_id, owner, JobStage::Download)? {
-        warn!("Job #{job_id}: no longer ours; stopping without delivering");
-        return Ok(());
-    }
-
-    // A word typed onto the end of the link that the parser did not know
-    // ("…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", plan P3.10): used only when the site says
-    // the address as given does not exist and confirms the one without it.
-    //
-    // First the words the parser knows (P3.12): a job queued before P3.9
-    // still carries "…-ΒΙΝΤΕΟ", and some sites (amna.gr) answer 200 for the
-    // decorated address, so a 404 never says so. The same rule as the
-    // parser: no guess, no request.
-    let mut job = job;
-    // The first request of the job path is the first thing checked (P2.12): a link to a
-    // loopback, private, link-local or reserved address ends the job here, before any
-    // request of any kind (the dead-link check, the site API, yt-dlp, the browser).
-    let egress_allow = &repair.cfg.egress_allow;
-    // Every URL but an attachment's is judged by its PARSED form: `HTTP://10.0.0.5/` and
-    // `ftp://...` are not skipped for the way they are written. What passes is used from here
-    // on as written, trimmed and with the scheme lowercased (not stored: a retry vets it again).
-    let orig_url = if orig_url.starts_with("attachment://") {
-        orig_url
-    } else {
-        match egress::vet_url(&orig_url, egress_allow).await {
-            Ok(normal) => {
-                job.url = normal.clone();
-                normal
-            }
-            Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
-        }
-    };
-    let orig_url = if orig_url.starts_with("http://") || orig_url.starts_with("https://") {
-        let known = omni_email::parser::without_annotation(&orig_url);
-        let (fixed, why) = if known != orig_url {
-            (Some(known.to_string()), "the word the sender glued to it removed")
-        } else {
-            (omni_browser::pages::repair_dead_link(&orig_url).await, "it does not exist as sent (404); the site has it without the ending the sender added")
-        };
-        match fixed {
-            Some(fixed) => {
-                // A replacement address is judged by the same rule before it is used.
-                let fixed = match egress::vet_url(&fixed, egress_allow).await {
-                    Ok(normal) => normal,
-                    Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
-                };
-                info!("Job #{job_id}: {} -> {}", omni_core::cookies::host_and_path(&orig_url), omni_core::cookies::host_and_path(&fixed));
-                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed}"))?;
-                if let Err(e) = repo.set_leased_job_url(job_id, owner, &fixed) {
-                    warn!("Job #{job_id}: could not store the corrected link: {e:#}");
-                }
-                job.url = fixed.clone();
-                fixed
-            }
-            None => orig_url,
-        }
-    } else {
-        orig_url
-    };
-
-    // A news page yt-dlp reads as several videos (an article with four
-    // Streamable embeds): this job takes the first, the others become
-    // sibling jobs or offers, as when the sniffer finds them. Before, all
-    // were downloaded into this job and one was delivered.
-    let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
-    let mut page_referer: Option<String> = None;
-    // How many videos yt-dlp's page scan named (P10.2).
-    let mut scanned_videos = 0usize;
-    // The ones queued as this job's siblings, which a later sniff must not take as its own.
-    // A retry starts from what an earlier attempt queued: those videos are neither taken nor
-    // queued again, whichever of yt-dlp or the browser ranks one first now.
-    let mut scan_siblings: Vec<String> = match repo.jobs_with_children(job_id) {
-        Ok(jobs) => omni_broadcast::article::queued_children(&jobs, job_id),
-        Err(e) => {
-            warn!("Job #{job_id}: could not read the siblings already queued: {e:#}");
-            Vec::new()
-        }
-    };
-    // Every video the page offers is already queued as this job's sibling.
-    let mut siblings_hold_the_rest = false;
-    // What the page showed was only the site's furniture (P3.16): the pick yt-dlp made first was refused,
-    // the one it made after the browser was refused (`Some`), and the addresses taken out, for the repair ladder.
-    let mut pick_refused = false;
-    let mut fallback_refused: Option<bool> = None;
-    let mut furniture_urls: Vec<String> = Vec::new();
-    // Held videos left out when furniture took the article's own: yt-dlp's pick after the browser may not take them.
-    let mut refused_held: Vec<String> = Vec::new();
-    // An embedded video on another site, whose cookie jar this job also carries (P3.5).
-    let mut login_site: Option<String> = None;
-    let mut _login_guard: Option<omni_broadcast::pipeline::LoginSiteGuard> = None;
-
-    // A portal whose video one API request names (plan P3.8): no yt-dlp
-    // page scan, no browser. A failed request just takes the usual way.
-    if is_web {
-        match omni_browser::pages::resolve(&orig_url).await {
-            Ok(Some(video)) => {
-                // The API's answer can name any address: it is judged like the job's own.
-                let video = match egress::vet_url(&video, egress_allow).await {
-                    Ok(normal) => normal,
-                    Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
-                };
-                info!("Job #{job_id}: the page's own API names {}", omni_core::cookies::host_and_path(&video));
-                repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Video named by the site's API: {video}"))?;
-                job.url = video;
-                page_referer = Some(orig_url.clone());
-            }
-            Ok(None) => {}
-            Err(e) => warn!("Job #{job_id}: site API lookup failed, trying the usual way: {e:#}"),
-        }
-    }
-
-    if cancel.is_cancelled() {
-        warn!("Job #{job_id}: cancelled; not scanning the page");
-        return Ok(());
-    }
-    // The page scan, for a page neither the site's API nor a video platform named.
-    let is_platform = omni_broadcast::downloader::is_video_platform(&orig_url);
-    let mut scan = omni_broadcast::downloader::PageScan::default();
-    if is_web && page_referer.is_none() && !is_platform {
-        scan = engine.page_videos(&orig_url).await;
-        scanned_videos = scan.videos.len();
-    }
-    // yt-dlp reads this page only through its generic scan, which does not know
-    // where on the page each video sits: the browser chooses (P3.15), and yt-dlp's
-    // own pick waits as the fallback.
-    // Where the page lands is judged by the egress rule too; an internal landing ends the job.
-    let landed_refusal = std::sync::Mutex::new(None);
-    let route = omni_broadcast::downloader::first_attempt_resolved(
-        page_referer.is_some(),
-        is_platform,
-        job.parent_job_id.is_some(),
-        &scan,
-        &orig_url,
-        |u| {
-            let slot = &landed_refusal;
-            async move {
-                match egress::vet_landing_with(repair::final_page_landing(&u).await, egress_allow, omni_core::net::system_lookup).await {
-                    Ok(landed) => landed,
-                    Err(why) => {
-                        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
-                        None
-                    }
-                }
-            }
-        },
-    )
-    .await;
-    if let Some(why) = landed_refusal.into_inner().unwrap_or_else(|p| p.into_inner()) {
-        return egress::end_job_internal_address(repo, job_id, owner, &why);
-    }
-    let sniff_first = route == omni_broadcast::downloader::FirstAttempt::SnifferFirst;
-    let mut deferred_scan: Option<omni_broadcast::downloader::PageScan> = None;
-    let mut process_result = if sniff_first {
-        repo.record_event(
-            job_id,
-            "INFO",
-            Some(JobStage::Extract),
-            "yt-dlp reaches this page only through its generic scan; the browser chooses the video",
-        )?;
-        // The page's one video on another site: its cookie jar joins the job's for the
-        // sniffed download too, as in `ytdlp_attempt` (P3.5).
-        if let [only] = scan.videos.as_slice() {
-            if other_site(&orig_url, only) {
-                login_site = Some(only.clone());
-                _login_guard = login_site.as_deref().map(|v| engine.set_login_site(job_id, v));
-            }
-        }
-        deferred_scan = Some(scan);
-        Err(anyhow::anyhow!("{}: yt-dlp reads the page only generically", ErrorCode::UnsupportedUrl.as_str())
-            .context(ErrorCode::UnsupportedUrl.as_str()))
-    } else {
-        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), None, &[], egress_allow).await? {
-            None => return Ok(()),
-            Some(a) => {
-                page_referer = a.page_referer;
-                scan_siblings.extend(a.scan_siblings);
-                siblings_hold_the_rest = a.siblings_hold_the_rest;
-                pick_refused = a.only_furniture;
-                furniture_urls.extend(a.furniture_urls);
-                login_site = a.login_site;
-                _login_guard = a.login_guard;
-                a.result
-            }
-        }
-    };
-
-    if lost_lease(&process_result) {
-        warn!("Job #{job_id}: no longer ours; nothing more to do");
-        return Ok(());
-    }
-
-    // yt-dlp could not resolve the page. For a news portal that is expected:
-    // the video is behind an embedded player, so sniff the actual stream and
-    // retry with the session context (referer/UA/cookies) it needs to avoid 403.
-    // A platform post is sniffed only where that can help (`should_sniff`):
-    // its page also plays other posts' videos.
-    // What the browser saw, kept for a job that ends without a video (P10.1).
-    let mut snapshot: Option<omni_browser::PageSnapshot> = None;
-    let mut sniffed_streams: Vec<String> = Vec::new();
-    // Every video the sniffer found is already queued as this job's sibling: the
-    // job ends as NO_STREAM_FOUND for that reason, without the page assessment or
-    // the repair ladder (they would look for, and could repair into, a second copy).
-    // The referer the sniffed stream was tried with (the repair ladder does not retry it).
-    let mut sniff_referer: Option<String> = None;
-    let sniff = sniff_first
-        || match &process_result {
-            Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
-            Ok(_) => false,
-        };
-    // The sniffer, taken first, found no usable video: yt-dlp's own pick is tried (P3.15).
-    let mut sniff_end = SniffEnd::NotRun;
-    if sniff && (orig_url.starts_with("http://") || orig_url.starts_with("https://")) {
-        if sniff_first {
-            info!("Job #{job_id}: yt-dlp reads the page only generically; the stream sniffer chooses.");
-        } else {
-            info!("Job #{job_id}: direct download failed; trying the stream sniffer.");
-        }
-        if !repo.set_stage(job_id, owner, JobStage::Extract)? {
-            warn!("Job #{job_id}: no longer ours; not sniffing");
-            return Ok(());
-        }
-        repo.record_event(
-            job_id,
-            "INFO",
-            Some(JobStage::Extract),
-            if sniff_first { "Sniffing the page for its video" } else { "Direct download failed; sniffing the page for a stream" },
-        )?;
-
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        let sniffed = StreamSniffer::extract_with_evidence(&orig_url, 25).await;
-        snapshot = Some(sniffed.snapshot);
-        let early_end = sniff_result_end(
-            sniff_first,
-            sniffed.media.is_ok(),
-            snapshot.as_ref().and_then(|s| s.final_url.as_deref()),
-        );
-        match sniffed.media {
-            Ok(_) if early_end == Some(SniffEnd::LandedOnPlatform) => {
-                sniff_end = SniffEnd::LandedOnPlatform;
-                repo.record_event(
-                    job_id,
-                    "INFO",
-                    Some(JobStage::Extract),
-                    "The browser ended on a video platform's page; leaving the choice to yt-dlp",
-                )?;
-            }
-            Ok(bundle) => {
-                // An article's embedded posts are not all videos: the first
-                // X post in a news247 article was a photo, became the job's
-                // video, and sent the job to review while its two real
-                // videos were delivered as siblings (P3.13). Ask yt-dlp
-                // about each post first; keep the ones it cannot rule out.
-                // Every video the browser saw is remembered for this article of the site,
-                // then the ones the site shows on its other articles too (a promo, a show, a
-                // recommendation) leave the candidates: never the job's video, never queued,
-                // only offered (P3.16). An article's sibling job holds a stream or post, not
-                // a page of the site.
-                let site_memory::SniffScreen { pool, furniture, removed_own } = site_memory::screen_sniff(
-                    repo,
-                    &orig_url,
-                    snapshot.as_ref(),
-                    &bundle.all_streams,
-                    job.parent_job_id.is_some(),
-                    |u| omni_browser::sniffer::is_demoted(&bundle.meta, u),
-                );
-                furniture_urls.extend(furniture.iter().map(|f| f.url.clone()));
-                // No stream on a loopback, private or reserved address is probed, chosen or
-                // downloaded (P2.12). Screened before the first probe of any of them.
-                // Nothing public left after dropping internal ones: the job ends here, and yt-dlp is
-                // not sent to fetch the same address as its fallback.
-                let pool = match egress::screen_candidates(pool, egress_allow).await {
-                    egress::Screened::Kept { urls, dropped, unreadable } => {
-                        egress::record_dropped_hosts(repo, job_id, &dropped, unreadable)?;
-                        urls
-                    }
-                    egress::Screened::AllInternal { dropped } => return egress::end_job_internal_hosts(repo, job_id, owner, &dropped),
-                };
-                let mut streams = without_videoless_posts(repo, engine, job_id, &pool, &cancel).await;
-                if cancel.is_cancelled() {
-                    return Ok(());
-                }
-                // Not one already queued as this job's sibling: it would air twice.
-                let (left, queued_emptied) = omni_broadcast::article::remaining_after_queued(&streams, &scan_siblings);
-                streams = left;
-                // Furniture took the article's own video and no own one is left: a rail or header video is not
-                // the article's either (P3.16).
-                let (left, dropped_held) =
-                    site_memory::leave_nothing_held(removed_own, streams, |u| omni_browser::sniffer::is_demoted(&bundle.meta, u));
-                streams = left;
-                furniture_urls.extend(dropped_held.iter().cloned());
-                refused_held.extend(dropped_held);
-                // Only what is left after the photo-only posts are dropped
-                // says the page has a video.
-                sniffed_streams = streams.clone();
-                let primary = if streams.contains(&bundle.primary_stream) {
-                    Some(bundle.primary_stream.clone())
-                } else {
-                    streams.first().cloned()
-                };
-                // The job's video among the candidates, in the sniffer's rank
-                // order: the page's own first, a held one (outside the article,
-                // a link outside its body, a contextual list) only when no
-                // other exists, and a live platform video never (P1.18). With
-                // nothing live this is the first candidate, as the ranking
-                // already made it.
-                let mut all_live = false;
-                let mut all_dead: Option<ErrorCode> = None;
-                let mut primary = primary;
-                if primary.is_some() {
-                    // Every kind of candidate is asked before the primary is decided (P3.15):
-                    // a player page or stream that is gone is skipped for the next one, and
-                    // no sibling or offer is planned until the primary is confirmed. With the
-                    // sniffer's own session, as the download would have it.
-                    let cands = omni_broadcast::downloader::sniffed_cands(&streams, |u| omni_browser::sniffer::is_demoted(&bundle.meta, u));
-                    // The candidates were asked with the sniffer's referer: the repair ladder
-                    // does not retry them with it again.
-                    sniff_referer = Some(bundle.referer.clone());
-                    let session = &bundle;
-                    let choice = omni_broadcast::downloader::choose_primary(&cands, omni_broadcast::downloader::MAX_LIVE_PROBES, |u| {
-                        let cancel = &cancel;
-                        async move {
-                            tokio::select! {
-                                p = engine.probe_candidate(&u, Some(&session.referer), Some(&session.user_agent), session.cookies.as_deref()) => p,
-                                _ = cancel.cancelled() => omni_broadcast::downloader::Probe::Unknown,
-                            }
-                        }
-                    })
-                    .await;
-                    use omni_broadcast::downloader::Choice;
-                    let (live, dead) = match choice {
-                        Choice::Primary { url, live, dead } => {
-                            primary = Some(url);
-                            (live, dead)
-                        }
-                        Choice::AllLive { live } => {
-                            all_live = true;
-                            primary = None;
-                            (live, Vec::new())
-                        }
-                        Choice::AllDead { code, live } => {
-                            all_dead = Some(code);
-                            primary = None;
-                            (live, Vec::new())
-                        }
-                        Choice::Nothing => (Vec::new(), Vec::new()),
-                    };
-                    for l in &live {
-                        info!("Job #{job_id}: {} is live; not taken", omni_core::cookies::host_and_path(l));
-                        repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Live stream skipped: {l}"))?;
-                    }
-                    for d in &dead {
-                        info!("Job #{job_id}: {} is gone; not taken", omni_core::cookies::host_and_path(d));
-                        // A warning on the desk, so a video wrongly read as gone is seen.
-                        repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Video that is gone skipped: {d}"))?;
-                    }
-                    streams.retain(|u| !live.contains(u) && !dead.contains(u));
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                }
-                // The site's furniture is offered to MCR whatever the job takes; when the job
-                // queues the article's siblings they write the offered list first, so then
-                // it is done after them.
-                if primary.is_none() {
-                    omni_broadcast::article::offer_site_wide(repo, &job, &furniture);
-                }
-                match primary {
-                    Some(primary) => {
-                        // Found: no fallback even when this download fails. yt-dlp's own pick is
-                        // the promo clip the browser was asked to avoid; a retry or review beats it.
-                        sniff_end = SniffEnd::Found;
-                        // The yt-dlp attempt may have found every scanned video already
-                        // queued; the browser found one more, so a failure from here is
-                        // that video's own and gets the assessment and the ladder.
-                        siblings_hold_the_rest = false;
-                        info!("Job #{job_id}: sniffer found {}", omni_core::cookies::host_and_path(&primary));
-                        repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Sniffed stream: {primary}"))?;
-                        let mut retry_job = job.clone();
-                        if !still_ours(repo, job_id, owner) {
-                            warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
-                            return Ok(());
-                        }
-                        let facts = article_facts(engine, &retry_job, &primary, &streams, &bundle.meta, &cancel).await;
-                        if !still_ours(repo, job_id, owner) {
-                            warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
-                            return Ok(());
-                        }
-                        omni_broadcast::article::queue_article_siblings(repo, owner, &mut retry_job, &primary, &streams, &facts);
-                        omni_broadcast::article::offer_site_wide(repo, &retry_job, &furniture);
-                        retry_job.url = primary;
-                        sniff_referer = Some(bundle.referer.clone());
-                        if !repo.set_stage(job_id, owner, JobStage::Download)? {
-                            warn!("Job #{job_id}: no longer ours; not downloading the sniffed stream");
-                            return Ok(());
-                        }
-                        process_result = engine
-                            .process_job_mode(
-                                retry_job,
-                                owner,
-                                Some(&bundle.referer),
-                                Some(&bundle.user_agent),
-                                bundle.cookies.as_deref(),
-                                Some(cancel.clone()),
-                                omni_broadcast::pipeline::DeliveryMode::Deliver,
-                            )
-                            .await;
-                    }
-                    None if all_dead.is_some() => {
-                        // Every video the browser found is gone: the job ends as a failed
-                        // download with that code would, so the page assessment and the repair
-                        // ladder see it as before. yt-dlp's own pick is not tried.
-                        let code = all_dead.unwrap_or(ErrorCode::NoStreamFound);
-                        sniff_end = SniffEnd::AllDead;
-                        repo.record_event(
-                            job_id,
-                            "ERROR",
-                            Some(JobStage::Extract),
-                            &format!("Every video the browser found is gone ({})", code.as_str()),
-                        )?;
-                        process_result = Err(anyhow::anyhow!("{}: every video the browser found is gone", code.as_str())
-                            .context(code.as_str()));
-                    }
-                    None if all_live => {
-                        sniff_end = SniffEnd::AllLive;
-                        repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
-                        process_result = Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
-                            .context(ErrorCode::LiveStream.as_str()));
-                    }
-                    None if queued_emptied => {
-                        sniff_end = SniffEnd::SiblingsHoldTheRest;
-                        siblings_hold_the_rest = true;
-                        repo.record_event(
-                            job_id,
-                            "ERROR",
-                            Some(JobStage::Extract),
-                            "The page's remaining videos are already queued as this job's siblings",
-                        )?;
-                        process_result = Err(anyhow::anyhow!(
-                            "{}: the page's remaining videos are already queued as siblings",
-                            ErrorCode::NoStreamFound.as_str()
-                        )
-                        .context(ErrorCode::NoStreamFound.as_str()));
-                    }
-                    None if site_memory::ends_on_furniture(&furniture, &streams) => {
-                        // What the page showed is the site's own furniture (P3.16): no video for
-                        // this job. yt-dlp's own pick is asked next (it is refused if it is the same
-                        // promo), and a failure after that is assessed and repaired as any other.
-                        sniff_end = SniffEnd::SiteWide;
-                        repo.record_event(
-                            job_id,
-                            "ERROR",
-                            Some(JobStage::Extract),
-                            "The only videos on this page are ones the site shows on its other articles",
-                        )?;
-                        process_result = Err(anyhow::anyhow!(
-                            "{}: the only videos on the page are ones the site shows on its other articles",
-                            ErrorCode::NoStreamFound.as_str()
-                        )
-                        .context(ErrorCode::NoStreamFound.as_str()));
-                    }
-                    None => {
-                        sniff_end = SniffEnd::PostsHaveNoVideo;
-                        repo.record_event(
-                            job_id,
-                            "ERROR",
-                            Some(JobStage::Extract),
-                            "The page's embedded posts have no video (photos or text only)",
-                        )?;
-                        process_result = Err(anyhow::anyhow!(
-                            "{}: the page's embedded posts have no video",
-                            ErrorCode::NoStreamFound.as_str()
-                        )
-                        .context(ErrorCode::NoStreamFound.as_str()));
-                    }
-                }
-            }
-            Err(sniff_err) => {
-                warn!("Job #{job_id}: sniffer found nothing: {sniff_err}");
-                sniff_end = SniffEnd::Error;
-                repo.record_event(
-                    job_id,
-                    "ERROR",
-                    Some(JobStage::Extract),
-                    &format!("Sniffer found no stream: {sniff_err}"),
-                )?;
-                if let Err(previous) = std::mem::replace(&mut process_result, Ok(omni_broadcast::pipeline::RunOutcome::Delivered)) {
-                    process_result = Err(after_failed_sniff(previous, sniff_err));
-                }
-            }
-        }
-    }
-
-    // The browser, asked first, found no video: yt-dlp's own pick, as it would have
-    // been taken before. Its result takes the error handling below; the sniff's
-    // snapshot stays as evidence. Not after a live stream, siblings that hold the
-    // rest, a cancel or a lost lease.
-    let end = if lost_lease(&process_result) {
-        SniffEnd::LeaseLost
-    } else if cancel.is_cancelled() {
-        SniffEnd::Cancelled
-    } else {
-        sniff_end
-    };
-    if falls_back_to_ytdlp(sniff_first, end) {
-        repo.record_event(job_id, "INFO", Some(JobStage::Extract), "The browser found no video; trying yt-dlp's own pick")?;
-        if !repo.set_stage(job_id, owner, JobStage::Download)? {
-            warn!("Job #{job_id}: no longer ours; not trying yt-dlp's own pick");
-            return Ok(());
-        }
-        // The login guard is the attempt's to make again; two for one job would drop the new one.
-        _login_guard = None;
-        let scan = deferred_scan.take().unwrap_or_default();
-        match ytdlp_attempt(repo, engine, owner, &mut job, &cancel, &orig_url, &scan_siblings, scan, page_referer.clone(), snapshot.as_ref().and_then(|s| s.final_url.as_deref()), &refused_held, egress_allow).await? {
-            None => return Ok(()),
-            Some(a) => {
-                page_referer = a.page_referer;
-                siblings_hold_the_rest = a.siblings_hold_the_rest;
-                fallback_refused = Some(a.only_furniture);
-                furniture_urls.extend(a.furniture_urls);
-                login_site = a.login_site;
-                _login_guard = a.login_guard;
-                process_result = a.result;
-            }
-        }
-    }
-
-    if lost_lease(&process_result) {
-        warn!("Job #{job_id}: no longer ours; nothing more to do");
-        return Ok(());
-    }
-
-    match process_result {
-        Ok(omni_broadcast::pipeline::RunOutcome::Held) => {
-            // Made and checked, but held for MCR (P10.5): nothing was delivered.
-            finish_held(repo, job_id, owner)?;
-            Ok(())
-        }
-        Ok(omni_broadcast::pipeline::RunOutcome::Delivered) => {
-            let delivered = repo
-                .get_job(job_id)?
-                .and_then(|j| j.file_path)
-                .filter(|p| !p.is_empty());
-            let done = repo.finish(
-                job_id,
-                owner,
-                JobStatus::Completed,
-                None,
-                None,
-                delivered.as_deref(),
-            )?;
-            if done && !cancel.is_cancelled() {
-                // An article's sibling job holds a sniffed stream or post,
-                // not a page of the site: it says nothing about the site.
-                if job.parent_job_id.is_none() {
-                    note_site_outcome(repo, health, job_id, &orig_url, SiteOutcome::Success);
-                }
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // The classified code decides whether waiting could possibly help
-            // (plan P1.9). Retrying a deleted video burns worker slots and
-            // delays telling the journalist their link is dead; retrying a
-            // dropped connection usually just works.
-            let mut code = classify_pipeline_error(&e);
-            let attempts = repo.get_job(job_id)?.map(|j| j.attempts).unwrap_or(1);
-            let max_attempts = repo.get_job(job_id)?.map(|j| j.max_attempts).unwrap_or(3);
-            let mut message = readable_cause(&e);
-
-            // The full context chain, which carries each stage's stderr tail,
-            // into the job's own timeline (plan P6.1). `error_message` is the
-            // one line the MCR card shows; this is what an engineer needs an
-            // hour later, and putting it on the job means it survives log
-            // rotation and does not require finding the right file.
-            let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
-            let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
-
-            if code.is_retryable() && attempts < max_attempts {
-                let backoff = code.backoff(attempts);
-                info!(
-                    "Job #{job_id}: {code}, retrying in {} s (attempt {attempts}/{max_attempts})",
-                    backoff.num_seconds()
-                );
-                repo.requeue_after(job_id, owner, backoff, code.as_str(), &message)?;
-            } else {
-                // MANUAL_DOWNLOAD is not a failure, it is a different workflow.
-                let status = match code {
-                    ErrorCode::ManualDownload => JobStatus::ManualDownload,
-                    _ => JobStatus::RequiresReview,
-                };
-                // A page that gave no video: what did it show (P10.2)? May
-                // name a more exact code, and may look at the page again.
-                let original = code;
-                if is_web
-                    && matches!(code, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
-                    && !omni_broadcast::downloader::is_video_platform(&orig_url)
-                    && !siblings_hold_the_rest
-                {
-                    let page = FailedPage {
-                        url: &orig_url,
-                        mode: repair_mode,
-                        snapshot: snapshot.take(),
-                        sniffed_streams: &sniffed_streams,
-                        original: code,
-                        named_by_site: site_named_video(page_referer.is_some(), scanned_videos),
-                    };
-                    let (exact, line, seen) = assess_failed_page(repo, owner, job_id, &cancel, page).await;
-                    code = exact;
-                    if let Some(line) = line {
-                        message = line;
-                    }
-                    snapshot = seen;
-                }
-                let wants_evidence = |code: ErrorCode| {
-                    matches!(original, ErrorCode::NoStreamFound | ErrorCode::UnsupportedUrl | ErrorCode::Http403)
-                        || matches!(
-                            code,
-                            ErrorCode::DrmProtected
-                                | ErrorCode::NoVideoOnPage
-                                | ErrorCode::VideoUnresolved
-                                | ErrorCode::RepairExhausted
-                        )
-                };
-
-                // The page showed a video the normal path could not resolve:
-                // the repair ladder (P10.11a). Only here, only for a web page,
-                // only with repair on; a held video waits for MCR.
-                let tried = repair::Tried::of(&job, &orig_url, page_referer.as_deref(), &sniffed_streams, sniff_referer.as_deref());
-                let ladder = if siblings_hold_the_rest {
-                    None
-                } else {
-                    repair::after_failure_with(repair, &job, owner, &orig_url, code, &snapshot, tried, furniture_urls.clone(), &cancel).await
-                };
-                if let Some(ladder) = ladder {
-                    match &ladder {
-                        repair::LadderResult::ShadowFound { verified } => {
-                            info!("Job #{job_id}: repair (shadow) verified {} video(s); the job ends as before", verified.len())
-                        }
-                        repair::LadderResult::Held { recipe_hash } => {
-                            info!("Job #{job_id}: a repaired video is held for MCR (recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
-                        }
-                        repair::LadderResult::Delivered { recipe_hash } => {
-                            info!("Job #{job_id}: a repaired video was delivered without approval (trusted recipe {})", &recipe_hash[..recipe_hash.len().min(8)])
-                        }
-                        _ => {}
-                    }
-                    match repair::disposition(&ladder, repair_mode, repair.cfg.budget) {
-                        repair::Disposition::Held => {
-                            if let Some(snap) = &snapshot {
-                                if wants_evidence(code) && still_ours(repo, job_id, owner) {
-                                    save_page_evidence(repo, evidence_dir, job_id, snap).await;
-                                }
-                            }
-                            // Waiting, not failed: no site-health record.
-                            finish_held(repo, job_id, owner)?;
-                            return Ok(());
-                        }
-                        repair::Disposition::Delivered => {
-                            // Delivered by the pipeline; the worker completes the job. No failure is recorded.
-                            finish_delivered(repo, job_id, owner)?;
-                            return Ok(());
-                        }
-                        repair::Disposition::Lost => {
-                            warn!("Job #{job_id}: no longer ours; nothing more to do");
-                            return Ok(());
-                        }
-                        repair::Disposition::Finish { code: c, message: m } => {
-                            code = c;
-                            message = m;
-                        }
-                        // The model said why nothing can be resolved: MCR reads it on the card.
-                        repair::Disposition::Annotate(reason) => message = repair::annotate(&message, &reason),
-                        repair::Disposition::Unchanged => {}
-                    }
-                }
-
-                // Nothing more is written for a job that is no longer ours.
-                if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &omni_broadcast::errors::hint_for_job(code, login_site.as_deref().unwrap_or(&job.url), repo))?;
-                }
-                // Only the job's owner writes evidence: a job MCR cancelled
-                // or the reaper gave away has no business leaving a file.
-                if let Some(snap) = &snapshot {
-                    if wants_evidence(code) && !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                        save_page_evidence(repo, evidence_dir, job_id, snap).await;
-                    }
-                }
-                let done = repo.finish(
-                    job_id,
-                    owner,
-                    status,
-                    Some(code.as_str()),
-                    Some(&message),
-                    None,
-                )?;
-                // Site health (P10.3): only a finished job, and only the
-                // codes that say something about the site, not this page.
-                // A repair that ran out of time counts as the unresolved video it was.
-                let site_code = repair::site_code(code);
-                if site_failure_counts(done, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
-                {
-                    let noted = note_site_outcome(
-                        repo,
-                        health,
-                        job_id,
-                        &orig_url,
-                        SiteOutcome::SiteFailure(site_code.as_str().to_string()),
-                    );
-                    // A site that just started failing: look at its recent
-                    // articles in the background (P10.4). Never awaited here.
-                    if let Some((domain, before, after)) = noted {
-                        if canary::should_trigger(repair_mode, before, after) {
-                            canary.trigger(&domain);
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Fold a finished job into its site's health (plan P10.3). Bookkeeping only:
-/// a database error is a warning and never changes the job's outcome.
-fn note_site_outcome(
-    repo: &Repository,
-    health: &HealthState,
-    job_id: i64,
-    url: &str,
-    outcome: SiteOutcome,
-) -> Option<(String, SiteState, SiteState)> {
-    let is_platform = omni_broadcast::downloader::is_video_platform(url);
-    let domain = omni_core::site_health::site_for_job(url, is_platform)?;
-    match repo.record_site_outcome(&domain, outcome) {
-        Ok((before, after)) => {
-            if before != after {
-                let line = match (after, repo.get_site(&domain)) {
-                    (SiteState::Healthy, _) => format!("Site {domain} is healthy again"),
-                    (state, Ok(Some(row))) => format!(
-                        "Site {domain} is now {} ({} failures in a row)",
-                        state.as_str(),
-                        row.consecutive_fail
-                    ),
-                    (state, _) => format!("Site {domain} is now {}", state.as_str()),
-                };
-                info!("Job #{job_id}: {line}");
-                let _ = repo.record_event(job_id, "INFO", None, &line);
-            }
-            omni_core::site_health::refresh_health(repo, health);
-            Some((domain, before, after))
-        }
-        Err(e) => {
-            warn!("Job #{job_id}: site health for {domain} not recorded: {e:#}");
-            None
-        }
-    }
-}
-
-/// Whether to open the page again with the diagnostic recorders: only when
-/// repair is on, for a page (not a platform post), and when the passive look
-/// proved nothing (no snapshot at all, weak or none).
-fn should_diagnose(mode: RepairMode, passive: Option<EvidenceClass>, is_platform: bool) -> bool {
-    mode != RepairMode::Off
-        && !is_platform
-        && passive.map_or(true, |c| matches!(c, EvidenceClass::Weak | EvidenceClass::None))
-}
-
-/// The code and the one-line reason (Greek, for the MCR card) a page's
-/// evidence gives a job that failed with `original`. `None` for the line
-/// keeps the existing cause text. A "no video" verdict needs the diagnostic
-/// run; without it the original code stands, as it does for a weak page.
-fn evidence_code(original: ErrorCode, ev: &Evidence) -> (ErrorCode, Option<String>) {
-    match ev.class {
-        EvidenceClass::Protected => {
-            let system = ev.signals.iter().find_map(|s| s.strip_prefix("eme:")).unwrap_or("DRM");
-            (ErrorCode::DrmProtected, Some(format!("Το βίντεο έχει DRM ({system})")))
-        }
-        EvidenceClass::LoginWall => (ErrorCode::LoginRequired, None),
-        EvidenceClass::GeoBlocked => (ErrorCode::GeoBlocked, None),
-        EvidenceClass::Strong => (
-            ErrorCode::VideoUnresolved,
-            Some(format!("Βρέθηκε βίντεο στη σελίδα ({}) αλλά δεν κατέβηκε", ev.signals.join(", "))),
-        ),
-        EvidenceClass::None if ev.diagnosed => {
-            (ErrorCode::NoVideoOnPage, Some("Δεν βρέθηκε βίντεο ούτε στον δεύτερο έλεγχο".to_string()))
-        }
-        EvidenceClass::None | EvidenceClass::Weak => (original, None),
-    }
-}
-
-/// What a failed web job's page left behind, for [`assess_failed_page`].
-struct FailedPage<'a> {
-    url: &'a str,
-    mode: RepairMode,
-    snapshot: Option<omni_browser::PageSnapshot>,
-    sniffed_streams: &'a [String],
-    original: ErrorCode,
-    /// The site's API or yt-dlp's page scan named a video for this job.
-    named_by_site: bool,
-}
-
-/// How the sniffer's run ended for a job whose page it was asked about first (P3.15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SniffEnd {
-    /// The sniffer did not run.
-    NotRun,
-    /// It chose a video; whatever the download does, yt-dlp is not asked.
-    Found,
-    /// It failed or found no stream.
-    Error,
-    /// Its streams were embedded posts with no video in them.
-    PostsHaveNoVideo,
-    /// Every video it found is live.
-    AllLive,
-    /// Every video it found is gone (probed): the job ends with that code, yt-dlp's pick is not tried.
-    AllDead,
-    /// What it found is already queued as this job's siblings.
-    SiblingsHoldTheRest,
-    /// Every video it found is one the site shows on its other articles (P3.16), or only held ones
-    /// were left once those were out: none is the job's. yt-dlp's own pick is asked next, and refused
-    /// if it is one of them (`guard_scan`).
-    SiteWide,
-    Cancelled,
-    LeaseLost,
-    /// The browser ended on a video platform's page (a meta refresh or script redirect): yt-dlp
-    /// follows it and takes the post itself, as before.
-    LandedOnPlatform,
-}
-
-/// How a sniff ends before its streams are looked at: it failed, or (for a page the browser was
-/// asked about first) it ended on a video platform's page, which yt-dlp follows instead.
-/// `None`: the streams it found are looked at.
-fn sniff_result_end(sniff_first: bool, media_ok: bool, final_url: Option<&str>) -> Option<SniffEnd> {
-    if !media_ok {
-        return Some(SniffEnd::Error);
-    }
-    (sniff_first && omni_broadcast::downloader::landed_on_platform(final_url)).then_some(SniffEnd::LandedOnPlatform)
-}
-
-/// Whether yt-dlp's own pick is tried after the sniffer, asked first, ended as `end`: only when
-/// it found no usable video (its only videos were the site's furniture: yt-dlp's pick is asked, and
-/// refused if it is one of them). Never after a live stream, siblings that hold the rest, a video
-/// it did choose, a cancel or a lost lease.
-fn falls_back_to_ytdlp(sniff_first: bool, end: SniffEnd) -> bool {
-    sniff_first && matches!(end, SniffEnd::Error | SniffEnd::PostsHaveNoVideo | SniffEnd::LandedOnPlatform | SniffEnd::SiteWide)
-}
-
-/// What yt-dlp's attempt at a web page left: its result, and what the page scan
-/// set up for it (the first video's referer, the siblings queued, the other site's login).
-struct YtdlpAttempt {
-    result: Result<omni_broadcast::pipeline::RunOutcome>,
-    page_referer: Option<String>,
-    scan_siblings: Vec<String>,
-    /// Every video of the page's scan is already queued as a sibling: nothing was downloaded.
-    siblings_hold_the_rest: bool,
-    /// The page's only videos are the site's furniture (P3.16): not a failure of the site.
-    only_furniture: bool,
-    /// What was taken out of the scan as the site's furniture.
-    furniture_urls: Vec<String>,
-    login_site: Option<String>,
-    login_guard: Option<omni_broadcast::pipeline::LoginSiteGuard>,
-}
-
-/// yt-dlp's own attempt at a job's link: the page scan's pick among several videos
-/// (the rest become siblings), or the download of the link itself. Taken first
-/// for most links, and after a sniff that found nothing for a page yt-dlp reads
-/// only generically (P3.15). `Ok(None)`: the job is no longer ours or was
-/// cancelled; nothing more to do.
-async fn ytdlp_attempt(
-    repo: &Repository,
-    engine: &Arc<BroadcastEngine>,
-    owner: &str,
-    job: &mut omni_core::models::Job,
-    cancel: &CancellationToken,
-    orig_url: &str,
-    queued: &[String],
-    mut scan: omni_broadcast::downloader::PageScan,
-    page_referer: Option<String>,
-    // Where the browser ended, when it looked at the page first (its site is looked up too).
-    browser_final: Option<&str>,
-    // Held videos the browser's look took out (furniture removed the article's own): not yt-dlp's pick either.
-    refused: &[String],
-    egress_allow: &omni_core::net::CidrSet,
-) -> Result<Option<YtdlpAttempt>> {
-    let job_id = job.id;
-    // yt-dlp's page scan names videos by any http(s) address: none on an internal address is probed,
-    // queued or downloaded (P2.12). Nothing public left and something refused: the job ends here.
-    // yt-dlp's own pick on a single-video page is among `fetch_urls` (every address its result names,
-    // uncapped): screened with the videos, and an internal or refused one ends the job before yt-dlp
-    // reads the page. Nothing kept and something refused ends it as well: yt-dlp is not sent to pick
-    // the same address. No guard around it: with nothing to screen it is `Continue` at once.
-    let scan_dropped = match egress::screen_page_scan(std::mem::take(&mut scan.videos), &scan.fetch_urls, egress_allow).await {
-        egress::PageScanVerdict::Continue { videos, dropped, unreadable } => {
-            egress::record_dropped_hosts(repo, job_id, &dropped, unreadable)?;
-            scan.videos = videos;
-            !dropped.is_empty() || unreadable > 0
-        }
-        egress::PageScanVerdict::EndInternal { hosts } => {
-            egress::end_job_internal_hosts(repo, job_id, owner, &hosts)?;
-            return Ok(None);
-        }
-        egress::PageScanVerdict::EndUnreadable => {
-            egress::end_job_unreadable(repo, job_id, owner)?;
-            return Ok(None);
-        }
-    };
-    let mut page_referer = page_referer;
-    let mut scan_siblings: Vec<String> = Vec::new();
-    // An embedded video on another site, whose cookie jar this job also carries (P3.5).
-    let mut login_site: Option<String> = None;
-    // Every video of the page's scan was live (P1.18).
-    let mut all_live_scan = false;
-    let known_unsupported = scan.unsupported;
-    let scan_count = scan.videos.len();
-    // Videos an earlier attempt queued as siblings are neither taken nor queued again.
-    let (mut videos, held_by_siblings) = omni_broadcast::article::remaining_after_queued(&scan.videos, queued);
-    // A video the site shows on its other articles too is never yt-dlp's pick (P3.16): out of the
-    // multi-video choice, and a single result whose media is one is not downloaded. Read only: the
-    // browser's sightings are what is remembered.
-    let mut furniture: Vec<omni_core::site_videos::Furniture> = Vec::new();
-    let mut only_furniture = false;
-    if job.parent_job_id.is_none() && page_referer.is_none() {
-        let guard = site_memory::guard_scan(repo, orig_url, scan.webpage_url.as_deref(), browser_final, std::mem::take(&mut videos), &scan.media_urls, refused);
-        (videos, furniture, only_furniture) = (guard.videos, guard.furniture, guard.only_furniture);
-    }
-    // One left after the screen took the others out is still a choice among the page's videos: yt-dlp
-    // is not sent to read the page itself, where it could pick the refused one.
-    if (scan_count > 1 || scan_dropped) && !videos.is_empty() {
-        // yt-dlp's page scan says nothing about where on the page a video
-        // sat, so the placement rule (R2) is the sniffer's alone; here only
-        // a glomex contextual list is known (held), and live videos are
-        // skipped: one chosen or queued as a sibling would air twice once
-        // the sniffer ran for the failed job (P1.18).
-        let (cands, scan_meta) = page_scan_cands(&videos);
-        let choice = omni_broadcast::downloader::choose_primary(&cands, omni_broadcast::downloader::MAX_LIVE_PROBES, |u| {
-            let cancel = &cancel;
-            async move {
-                tokio::select! {
-                    i = engine.video_length(&u) => omni_broadcast::downloader::Probe::from_length(i),
-                    _ = cancel.cancelled() => omni_broadcast::downloader::Probe::Unknown,
-                }
-            }
-        })
-        .await;
-        if cancel.is_cancelled() {
-            return Ok(None);
-        }
-        use omni_broadcast::downloader::Choice;
-        let (first, live) = match choice {
-            Choice::Primary { url, live, .. } => (Some(url), live),
-            Choice::AllLive { live } => (None, live),
-            // A length probe never says a video is gone, so this cannot happen here.
-            Choice::AllDead { live, .. } => (None, live),
-            Choice::Nothing => (None, Vec::new()),
-        };
-        for l in &live {
-            info!("Job #{job_id}: {} is live; not taken", omni_core::cookies::host_and_path(l));
-            repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Live stream skipped: {l}"))?;
-        }
-        videos.retain(|u| !live.contains(u));
-        match first {
-            None => {
-                all_live_scan = true;
-                videos.clear();
-            }
-            Some(first) => {
-                info!("Job #{job_id}: the page holds {} videos; this job takes the first", videos.len());
-                repo.record_event(
-                    job_id,
-                    "INFO",
-                    Some(JobStage::Extract),
-                    &format!("The page holds {} videos; this job downloads the first: {}", videos.len(), first),
-                )?;
-                if !still_ours(repo, job_id, owner) {
-                    warn!("Job #{job_id}: no longer ours; not queuing the article's other videos");
-                    return Ok(None);
-                }
-                let facts = article_facts(engine, &job, &first, &videos, &scan_meta, &cancel).await;
-                let count = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
-                scan_siblings =
-                    omni_broadcast::article::plan_article_videos_facts(&job.url, &first, &videos, &job.index_str, count, &facts)
-                        .siblings
-                        .into_iter()
-                        .map(|(u, _)| u)
-                        .collect();
-                omni_broadcast::article::queue_article_siblings(repo, owner, job, &first, &videos, &facts);
-                job.url = first;
-                page_referer = Some(orig_url.to_string());
-            }
-        }
-    } else if scan_count == 1 && videos.len() == 1 && other_site(&orig_url, &videos[0]) {
-        // The article's one video is another site's (an X post, say): that site's
-        // cookie jar joins the job's, and its name is in the login hint. The
-        // download itself is unchanged.
-        login_site = Some(videos[0].clone());
-    }
-    if !still_ours(repo, job_id, owner) {
-        warn!("Job #{job_id}: no longer ours; not downloading");
-        return Ok(None);
-    }
-    // After the article's siblings were queued, which write the offered list first.
-    omni_broadcast::article::offer_site_wide(repo, job, &furniture);
-    let login_guard = login_site.as_deref().map(|v| engine.set_login_site(job_id, v));
-    let result = if only_furniture && !all_live_scan && !held_by_siblings {
-        repo.record_event(
-            job_id,
-            "ERROR",
-            Some(JobStage::Extract),
-            "The only videos on this page are ones the site shows on its other articles",
-        )?;
-        Err(anyhow::anyhow!(
-            "{}: the only videos on the page are ones the site shows on its other articles",
-            ErrorCode::NoStreamFound.as_str()
-        )
-        .context(ErrorCode::NoStreamFound.as_str()))
-    } else if all_live_scan {
-        repo.record_event(job_id, "ERROR", Some(JobStage::Extract), "Every video found on the page is a live stream")?;
-        Err(anyhow::anyhow!("{}: every video on the page is live", ErrorCode::LiveStream.as_str())
-            .context(ErrorCode::LiveStream.as_str()))
-    } else if held_by_siblings {
-        repo.record_event(
-            job_id,
-            "ERROR",
-            Some(JobStage::Extract),
-            "The page's remaining videos are already queued as this job's siblings",
-        )?;
-        Err(anyhow::anyhow!("{}: the page's remaining videos are already queued as siblings", ErrorCode::NoStreamFound.as_str())
-            .context(ErrorCode::NoStreamFound.as_str()))
-    } else if known_unsupported {
-        repo.record_event(
-            job_id,
-            "INFO",
-            Some(JobStage::Extract),
-            "yt-dlp has no extractor for this page; going straight to the browser",
-        )?;
-        Err(anyhow::anyhow!("{}: yt-dlp has no extractor for the page", ErrorCode::UnsupportedUrl.as_str())
-            .context(ErrorCode::UnsupportedUrl.as_str()))
-    } else {
-        engine
-            .process_job_mode(
-                job.clone(),
-                owner,
-                page_referer.as_deref(),
-                None,
-                None,
-                Some(cancel.clone()),
-                omni_broadcast::pipeline::DeliveryMode::Deliver,
-            )
-            .await
-    };
-    Ok(Some(YtdlpAttempt {
-        result,
-        page_referer,
-        scan_siblings,
-        // Nothing is left to assess or repair into: the page's videos are queued, or are the site's furniture.
-        siblings_hold_the_rest: held_by_siblings,
-        only_furniture,
-        furniture_urls: furniture.iter().map(|f| f.url.clone()).collect(),
-        login_site,
-        login_guard,
-    }))
-}
-
-/// The site or yt-dlp's page scan named a video for this job: the API
-/// resolved it (a referer is kept), or the scan found at least one.
-/// Whether `video` is on another registrable domain than `article`.
-fn other_site(article: &str, video: &str) -> bool {
-    match (omni_core::urlnorm::registrable_domain(article), omni_core::urlnorm::registrable_domain(video)) {
-        (Some(a), Some(v)) => a != v,
-        _ => false,
-    }
-}
-
-fn site_named_video(api_or_sibling: bool, scanned_videos: usize) -> bool {
-    api_or_sibling || scanned_videos >= 1
-}
-
-/// The passive verdict with "the site itself named a video" added as a strong
-/// signal: such a job is never reported as a page without video.
-fn with_site_hint(passive: Option<Evidence>, named_by_site: bool) -> Option<Evidence> {
-    if !named_by_site {
-        return passive;
-    }
-    let hint = Evidence { class: EvidenceClass::Strong, signals: vec!["named-by-site".into()], diagnosed: false };
-    Some(match passive {
-        Some(p) => omni_browser::evidence::combine(&hint, &p),
-        None => hint,
-    })
-}
-
-/// Judge a web page that ended without a video from what the browser saw, run
-/// the diagnostic second look when that is allowed and needed, and note the
-/// verdict on the job. Returns the code to finish with, a replacement cause
-/// line, and the snapshot to keep as evidence (the diagnostic one when there
-/// is one). Never fails: whatever goes wrong leaves today's outcome.
-async fn assess_failed_page(
-    repo: &Repository,
-    owner: &str,
-    job_id: i64,
-    cancel: &CancellationToken,
-    page: FailedPage<'_>,
-) -> (ErrorCode, Option<String>, Option<omni_browser::PageSnapshot>) {
-    let FailedPage { url, mode, snapshot, sniffed_streams, original, named_by_site } = page;
-    let is_ad = |u: &str| StreamSniffer::is_ad_or_tracking(u);
-    let mut snapshot = snapshot;
-    let passive = with_site_hint(
-        snapshot.as_ref().map(|snap| omni_browser::evidence::classify(snap, sniffed_streams, None, is_ad)),
-        named_by_site,
-    );
-    let mut verdict = passive.clone();
-
-    if should_diagnose(mode, passive.as_ref().map(|e| e.class), false)
-        && !cancel.is_cancelled()
-        && still_ours(repo, job_id, owner)
-    {
-        info!("Job #{job_id}: the page showed no video; looking at it once more with the diagnostic run");
-        // Dropping the run closes its browser.
-        let ran = tokio::select! {
-            r = StreamSniffer::diagnose(url, 30) => Some(r),
-            _ = cancel.cancelled() => None,
-        };
-        let Some((diag_snap, diag)) = ran else {
-            return (original, None, snapshot);
-        };
-        if cancel.is_cancelled() || !still_ours(repo, job_id, owner) {
-            return (original, None, snapshot);
-        }
-        let looked = omni_browser::evidence::classify(&diag_snap, sniffed_streams, Some(&diag), is_ad);
-        verdict = Some(match &passive {
-            Some(p) => omni_browser::evidence::combine(p, &looked),
-            None => looked,
-        });
-        // A run that was blocked or cut short leaves the first look as the evidence.
-        if diag.complete || snapshot.is_none() {
-            snapshot = Some(diag_snap);
-        }
-    }
-
-    let Some(ev) = verdict else {
-        return (original, None, snapshot);
-    };
-    if cancel.is_cancelled() || !still_ours(repo, job_id, owner) {
-        return (original, None, snapshot);
-    }
-    let line = format!("Evidence: {} — {}", ev.class.as_str(), ev.signals.join(", "));
-    if let Err(e) = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &line) {
-        warn!("Job #{job_id}: could not note the page evidence verdict: {e:#}");
-    }
-    let (code, message) = evidence_code(original, &ev);
-    (code, message, snapshot)
-}
-
-/// Largest evidence file written for one job.
-const EVIDENCE_MAX_BYTES: usize = 512 * 1024;
-
-/// Write the page evidence of a failed job to `{dir}/{job_id}.json` and note
-/// it in the database. A failure here is a warning only: it never changes the
-/// job's outcome.
-async fn save_page_evidence(
-    repo: &Repository,
-    dir: &std::path::Path,
-    job_id: i64,
-    snapshot: &omni_browser::PageSnapshot,
-) {
-    let path = dir.join(format!("{job_id}.json"));
-    let json = snapshot.to_capped_json(EVIDENCE_MAX_BYTES);
-    let bytes = json.len() as i64;
-    let (dir, file) = (dir.to_path_buf(), path.clone());
-    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&file, json)
-    })
-    .await;
-    match written {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return warn!("Job #{job_id}: page evidence not written: {e}"),
-        Err(e) => return warn!("Job #{job_id}: page evidence not written: {e}"),
-    }
-    if let Err(e) = repo.record_evidence(job_id, &path.to_string_lossy(), bytes) {
-        warn!("Job #{job_id}: page evidence not recorded: {e:#}");
-    }
-}
-
-/// What is known about the article's other videos before they are queued
-/// (P3.14): where on the page each sat and whether it was a contextual
-/// playlist (from the sniffer; nothing for yt-dlp's own page scan), and the
-/// length of each one that would be queued, asked of yt-dlp without
-/// downloading. At most `MAX_AUTO_SIBLINGS` probes plus one for each sibling
-/// held back (its replacement is asked too), 15 s each, one after another. A length that cannot be had stays unknown and plans as before
-/// (queued). Nothing is probed when the journalist asked for a count: they
-/// chose those videos.
-async fn article_facts(
-    engine: &BroadcastEngine,
-    job: &omni_core::models::Job,
-    primary: &str,
-    streams: &[String],
-    meta: &std::collections::HashMap<String, omni_browser::sniffer::StreamMeta>,
-    cancel: &CancellationToken,
-) -> omni_broadcast::article::Facts {
-    use omni_broadcast::article::{facts_from_placement, probe_siblings, Probed};
-    let mut facts = facts_from_placement(
-        streams.iter().filter_map(|u| meta.get(u).map(|m| (u.as_str(), m.in_article, m.contextual))),
-    );
-    for u in streams {
-        if meta.get(u).is_some_and(|m| m.link) {
-            if let Some(f) = facts.get_mut(&omni_broadcast::article::facts_key(u)) {
-                f.link = true;
-            }
-        }
-    }
-    let count = job.max_videos.filter(|n| *n > 0).map(|n| n as usize);
-    probe_siblings(&job.url, primary, streams, &job.index_str, count, &mut facts, |url| async move {
-        let info = tokio::select! {
-            i = engine.video_length(&url) => i,
-            _ = cancel.cancelled() => None,
-        };
-        info.map(|i| Probed { duration_secs: i.duration_secs, live: i.live })
-    })
-    .await;
-    facts
-}
-
-/// The candidates of yt-dlp's page scan for [`omni_broadcast::downloader::choose_primary`],
-/// in page order, and the meta that marks the glomex contextual lists (`cl-…`)
-/// among them. A contextual list is held: never the job's video while another
-/// is on the page. Nothing else is known to be held here (P3.14).
-fn page_scan_cands(
-    videos: &[String],
-) -> (Vec<omni_broadcast::downloader::Cand>, std::collections::HashMap<String, omni_browser::sniffer::StreamMeta>) {
-    let contextual = |u: &str| omni_browser::glomex::parse_embed(u).is_some_and(|e| e.is_contextual_list());
-    let cands = videos
-        .iter()
-        .map(|u| omni_broadcast::downloader::Cand {
-            url: u.clone(),
-            held: contextual(u),
-            probe_able: omni_broadcast::downloader::is_video_platform(u),
-        })
-        .collect();
-    let meta = videos
-        .iter()
-        .filter(|u| contextual(u))
-        .map(|u| (u.clone(), omni_browser::sniffer::StreamMeta { in_article: None, contextual: true, link: false }))
-        .collect();
-    (cands, meta)
-}
-
-/// `streams` without the social posts yt-dlp says have no video, in page
-/// order (P3.13). YouTube is not asked (it has no photo posts) and raw
-/// streams cannot be; a post that cannot be checked (network, login) stays.
-/// About a second per post with the folder build of yt-dlp.
-async fn without_videoless_posts(
-    repo: &Repository,
-    engine: &BroadcastEngine,
-    job_id: i64,
-    streams: &[String],
-    cancel: &CancellationToken,
-) -> Vec<String> {
-    use omni_broadcast::downloader::{is_video_platform, is_youtube};
-    let mut kept = Vec::with_capacity(streams.len());
-    let mut seen = std::collections::HashSet::new();
-    for (i, url) in streams.iter().enumerate() {
-        // One post under two addresses (".../visegrad24/status/N" and
-        // ".../i/status/N") is asked about, and kept, once.
-        if !seen.insert(omni_core::urlnorm::normalize(url)) {
-            continue;
-        }
-        let ask = i < 12 && is_video_platform(url) && !is_youtube(url);
-        let has_video = if ask {
-            // Dropping the future kills yt-dlp (run_capture sets kill_on_drop).
-            tokio::select! {
-                r = engine.post_has_video(url) => r,
-                _ = cancel.cancelled() => break,
-            }
-        } else {
-            None
-        };
-        if ask && has_video == Some(false) {
-            info!("Job #{job_id}: {url} has no video; not a candidate");
-            let _ = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Embedded post without a video, skipped: {url}"));
-            continue;
-        }
-        kept.push(url.clone());
-    }
-    kept
-}
-
-/// The job's failure once the sniffer has also come back empty-handed.
-///
-/// A page the browser opened and found no video on is reported as that
-/// (NO_STREAM_FOUND): yt-dlp's "Unsupported URL" for a news article only
-/// means it has no extractor for the portal, which is why the sniffer ran,
-/// and told MCR to "try a direct video link" for an article that has none.
-/// A browser that never got that far leaves yt-dlp's failure standing.
-fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyhow::Error {
-    match sniff_err.downcast_ref::<omni_browser::BrowserError>() {
-        Some(omni_browser::BrowserError::NoStreamFound(_)) => {
-            anyhow::anyhow!("{}: no video found in the page", ErrorCode::NoStreamFound.as_str())
-                .context(ErrorCode::NoStreamFound.as_str())
-        }
-        _ => previous,
-    }
-}
-
-/// Whether the engine stopped because this worker no longer holds the job
-/// (P1.14). Nothing more may be written for it: `finish` and `requeue_after`
-/// would refuse, but the events and sniffing would not.
-fn lost_lease<T>(result: &anyhow::Result<T>) -> bool {
-    matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
-}
-
-/// The one readable line for a failure's `error_message` (P7.15): the root
-/// cause, without the code strings the pipeline wraps around it.
-/// The error chain for the job's DEBUG diagnostic, as `{e:#}` would print it,
-/// minus a bare code layer whose next layer already starts with that code: the
-/// pipeline adds `.context(code)` to a download error that names its code itself,
-/// which printed "LIVE_STREAM: LIVE_STREAM: …" (2026-10-19).
-fn diagnostic_chain(e: &anyhow::Error) -> String {
-    let parts: Vec<String> = e.chain().map(|c| c.to_string()).collect();
-    let mut kept: Vec<&str> = Vec::new();
-    for (i, part) in parts.iter().enumerate() {
-        let repeated = ErrorCode::from_code(part).is_some()
-            && parts.get(i + 1).is_some_and(|next| next.starts_with(part.as_str()));
-        if !repeated {
-            kept.push(part);
-        }
-    }
-    kept.join(": ")
-}
-
-fn readable_cause(e: &anyhow::Error) -> String {
-    const CAP: usize = 300;
-    const TAIL: &str = ". stderr tail: ";
-    let outer = format!("{e}");
-    let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
-    let Some(ri) = chain.iter().rposition(|s| ErrorCode::from_code(s).is_none()) else { return outer };
-    let root = &chain[ri];
-
-    let strip = |mut text: &str| -> String {
-        loop {
-            let before = text;
-            if let Some(rest) = text.strip_prefix("ERROR:") {
-                text = rest.trim_start();
-            }
-            for code in ErrorCode::ALL {
-                if let Some(rest) = text.strip_prefix(code.as_str()).and_then(|r| r.strip_prefix(':')) {
-                    text = rest.trim_start();
-                }
-            }
-            if text == before {
-                return text.trim().to_string();
-            }
-        }
-    };
-
-    let text = if let Some((header, tail)) = root.split_once(TAIL) {
-        // A tool that failed (omni_core::process): keep "exited / timed out",
-        // add the tail's FIRST line that names an error. FFmpeg 7+ follows
-        // the cause ("Error while opening encoder - maybe incorrect
-        // parameters…") with generic thread-teardown lines that also say
-        // "error"; those name nothing (seen with the installed FFmpeg 9).
-        const GENERIC: [&str; 5] = [
-            "Conversion failed!",
-            "Task finished with error code",
-            "Terminating thread with return code",
-            "Error sending frames to consumers",
-            "Nothing was written into output file",
-        ];
-        let header = strip(header);
-        let hit = tail
-            .lines()
-            .map(|l| without_log_prefixes(l.trim()))
-            .find(|l| l.to_ascii_lowercase().contains("error") && !GENERIC.iter().any(|g| l.contains(g)));
-        match hit {
-            Some(l) => format!("{header}: {}", strip(l)),
-            None => header,
-        }
-    } else {
-        // A stderr tail: the ERROR line if there is one, else the last line with text.
-        let lines: Vec<&str> = root.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        let line = lines.iter().rev().find(|l| l.contains("ERROR")).or(lines.last()).copied().unwrap_or("");
-        let line = strip(line);
-        // A bare OS or serde error says little alone; keep what was being done.
-        // The OS error goes first: a parent quoting two long paths
-        // ("Failed copying … to …") would otherwise push it past the cap.
-        let parent = ri.checked_sub(1).map(|i| chain[i].as_str());
-        match parent {
-            Some(p) if lines.len() <= 1 && ErrorCode::from_code(p).is_none() && !p.trim().is_empty() && !line.is_empty() => {
-                format!("{line} ({})", p.trim())
-            }
-            _ => line,
-        }
-    };
-    if text.is_empty() {
-        return outer;
-    }
-    if text.chars().count() > CAP {
-        let cut: String = text.chars().take(CAP).collect();
-        return format!("{}…", cut.trim_end());
-    }
-    text
-}
-
-/// "[vost#0:0/mpeg2video @ 000001] [enc:mpeg2video @ 000002] Error …" ->
-/// "Error …": FFmpeg's per-component prefixes carry only addresses.
-fn without_log_prefixes(mut line: &str) -> &str {
-    while line.starts_with('[') {
-        match line.find("] ") {
-            Some(end) => line = line[end + 2..].trim_start(),
-            None => break,
-        }
-    }
-    line
-}
-
-/// Recover the error code the pipeline attached to a failure.
-///
-/// The pipeline wraps failures with `.context(code.as_str())`, so the code is in
-/// the anyhow chain rather than parsed back out of a message. Anything
-/// unrecognised goes to a human rather than being retried on a guess.
-fn classify_pipeline_error(e: &anyhow::Error) -> ErrorCode {
-    let text = format!("{e:#}");
-    for code in [
-        ErrorCode::ManualDownload,
-        ErrorCode::HeldFileChanged,
-        ErrorCode::ComplianceFailed,
-        ErrorCode::ProbeFailed,
-        ErrorCode::LoginRequired,
-        ErrorCode::GeoBlocked,
-        ErrorCode::PrivateOrRemoved,
-        ErrorCode::PageNotFound,
-        ErrorCode::LiveStream,
-        ErrorCode::Http403,
-        ErrorCode::UnsupportedUrl,
-        ErrorCode::NoStreamFound,
-        ErrorCode::DownloadTimeout,
-        ErrorCode::TranscodeTimeout,
-        ErrorCode::RewrapTimeout,
-        ErrorCode::DeliveryFailed,
-        ErrorCode::LowDisk,
-        ErrorCode::Network,
-    ] {
-        if text.contains(code.as_str()) {
-            return code;
-        }
-    }
-    ErrorCode::PipelineFailed
+/// The ffmpeg the daemon runs: `config.json`'s path, else `bin/`'s. Every
+/// yt-dlp run is handed the same one for its merge (P11.4e).
+pub(crate) fn resolve_ffmpeg(config: &AppConfig, dep_mgr: &DependencyManager) -> PathBuf {
+    config
+        .ffmpeg_path
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(|| dep_mgr.find_binary("ffmpeg"))
+        .unwrap_or_else(|| dep_mgr.unresolved_path("ffmpeg"))
 }
 
 /// One nightly yt-dlp update: verify, wait for the pool, swap (plan P2.9).
@@ -3761,7 +2146,11 @@ async fn nightly_ytdl_update(
     channel: &str,
     gate: &UpdateGate,
     repo: &Repository,
-) -> omni_core::scheduler::TaskOutcome {
+    pacer: &omni_broadcast::pacing::HostPacer,
+    ffmpeg: Option<&std::path::Path>,
+    drain: Duration,
+) -> early_update::UpdateRun {
+    use early_update::UpdateRun;
     use omni_core::scheduler::TaskOutcome;
 
     info!("Running scheduled nightly yt-dlp update check...");
@@ -3776,7 +2165,7 @@ async fn nightly_ytdl_update(
             // would have installed silently.
             warn!("Nightly yt-dlp update not installed: {e:#}");
             let _ = repo.log_audit("WARN", "SYSTEM", &format!("yt-dlp update skipped: {e}"));
-            return TaskOutcome::Failed;
+            return UpdateRun::new(TaskOutcome::Failed, "not downloaded or not verified");
         }
     };
 
@@ -3787,28 +2176,32 @@ async fn nightly_ytdl_update(
     if rejected.trim() == staged.sha256 {
         dep_mgr.discard_staged_ytdl();
         info!("yt-dlp update skipped: this build was rolled back before");
-        return TaskOutcome::Skipped;
+        return UpdateRun::new(TaskOutcome::Skipped, "rolled back before");
     }
     // Live and also the release: nothing to do. (The download is still made,
     // to know; it is a few seconds at 03:00.)
     if dep_mgr.ytdl_live_sha256().as_deref() == Some(staged.sha256.as_str()) {
         dep_mgr.discard_staged_ytdl();
         info!("yt-dlp is already the latest release");
-        return TaskOutcome::Ok;
+        // No update is waiting any more (P11.4).
+        selfcheck::note_postponed(&dep_mgr.get_bin_dir(), false);
+        return UpdateRun::new(TaskOutcome::Ok, "already the latest");
     }
 
-    // Up to ten minutes for in-flight downloads. Longer than any sane clip and
-    // shorter than the gap to the next bulletin.
-    if !swap.drain(Duration::from_secs(600)).await {
+    // At night up to ten minutes for in-flight downloads: longer than any sane
+    // clip and shorter than the gap to the next bulletin. An early (daytime)
+    // run waits far less, since intake is paused meanwhile (P11.4d).
+    if !swap.drain(drain).await {
         warn!(
-            "yt-dlp update postponed: {} download(s) still running after 10 minutes. The \
+            "yt-dlp update postponed: {} download(s) still running after {} s. The \
              verified build stays staged and will be applied on the next attempt.",
-            swap.active()
+            swap.active(),
+            drain.as_secs()
         );
         // Skipped, not failed: nothing is wrong, the pipeline was simply busy,
         // and an operator reading the maintenance panel should not be sent
         // looking for a fault that does not exist.
-        return TaskOutcome::Skipped;
+        return UpdateRun::drain_postponed();
     }
 
     let outcome = dep_mgr.apply_staged_ytdl();
@@ -3817,7 +2210,7 @@ async fn nightly_ytdl_update(
         Err(e) => {
             warn!("Nightly yt-dlp update failed to install: {e:#}");
             let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
-            return TaskOutcome::Failed;
+            return UpdateRun::new(TaskOutcome::Failed, "install failed");
         }
     };
 
@@ -3826,39 +2219,117 @@ async fn nightly_ytdl_update(
     // still paused. A link the new build fails and the old one passes means
     // the release broke it: the old build goes back and this one is marked
     // rejected. A link both fail is the site, not the update.
-    let verdict = verify_ytdl_update(dep_mgr, &installed, repo).await;
+    let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer, ffmpeg).await;
     drop(swap);
+    let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
+    if act.reject {
+        let _ = std::fs::write(&rejected_marker, &staged.sha256);
+    }
+    if act.level == "INFO" {
+        info!("Nightly yt-dlp update: {}", act.audit);
+    } else {
+        warn!("Nightly yt-dlp update: {}", act.audit);
+    }
+    let _ = repo.log_audit(act.level, "SYSTEM", &act.audit);
+    if act.close_breakers {
+        // A new downloader may resolve what the model once could not be asked about.
+        if let Err(e) = repo.close_all_llm_breakers() {
+            warn!("The repair model breakers could not be closed after the update: {e:#}");
+        }
+    }
+    if let Some(postponed) = act.postponed_night {
+        selfcheck::note_postponed(&dep_mgr.get_bin_dir(), postponed);
+    }
+    ytdl_second_chance(repo, &act);
+    UpdateRun::new(act.outcome, verdict_reason(&verdict))
+}
+
+/// The few words the maintenance panel shows for an early run's `verdict` (P11.4d).
+fn verdict_reason(verdict: &UpdateVerdict) -> &'static str {
     match verdict {
-        UpdateVerdict::Kept { checked } => {
-            info!("Nightly yt-dlp updated to {:?} ({checked} self-check link(s) still work)", installed);
-            let _ = repo.log_audit(
-                "INFO",
-                "SYSTEM",
-                &format!(
-                    "yt-dlp updated ({} channel, sha256 {}); {checked} self-check link(s) still work; previous build kept for rollback",
-                    channel,
-                    &staged.sha256[..16]
-                ),
-            );
-            // A new downloader may resolve what the model once could not be asked about.
-            if let Err(e) = repo.close_all_llm_breakers() {
-                warn!("The repair model breakers could not be closed after the update: {e:#}");
-            }
-            TaskOutcome::Ok
-        }
-        UpdateVerdict::RolledBack { broken } => {
-            let _ = std::fs::write(&rejected_marker, &staged.sha256);
-            warn!("yt-dlp update rolled back: it broke {}", broken.join(", "));
-            let _ = repo.log_audit(
-                "ERROR",
-                "SYSTEM",
-                &format!(
-                    "yt-dlp update rolled back automatically: the new build could not get {} while the previous one could. The previous build is in use; the next release will be tried.",
-                    broken.join(", ")
-                ),
-            );
-            TaskOutcome::Failed
-        }
+        UpdateVerdict::Kept { .. } => "kept",
+        UpdateVerdict::RolledBack { .. } => "rolled back",
+        UpdateVerdict::Postponed { .. } => "postponed by the self-check",
+        UpdateVerdict::Unverified { .. } => "unverified",
+    }
+}
+
+/// The second chance a kept yt-dlp build gives (P11.5): the jobs in review for
+/// an extraction failure go back to the queue, once per build. Never fails the
+/// task. Returns how many moved.
+fn ytdl_second_chance(repo: &Repository, act: &VerdictAction) -> usize {
+    act.second_chance.as_deref().map_or(0, |build| omni_core::second_chance::after_ytdlp_update(repo, build))
+}
+
+/// What the nightly yt-dlp task does with a verdict (P11.4).
+#[derive(Debug, PartialEq)]
+struct VerdictAction {
+    /// Write `yt-dlp.exe.rejected`: this build is never tried again.
+    reject: bool,
+    /// The audit row's level and text.
+    level: &'static str,
+    audit: String,
+    outcome: omni_core::scheduler::TaskOutcome,
+    /// A new downloader is live: the repair model's breakers close.
+    close_breakers: bool,
+    /// One more postponed night (`Some(true)`), the run of them ends
+    /// (`Some(false)`), or unchanged (`None`).
+    postponed_night: Option<bool>,
+    /// A kept build: the jobs in review for an extraction failure get a second
+    /// chance with this build's id (P11.5, `ytdlp:<id>`).
+    second_chance: Option<String>,
+}
+
+/// [`VerdictAction`] for `verdict` on a build of `channel` whose hash begins `sha16`.
+fn ytdl_verdict_action(verdict: &UpdateVerdict, channel: &str, sha16: &str) -> VerdictAction {
+    use omni_core::scheduler::TaskOutcome;
+    match verdict {
+        UpdateVerdict::Kept { checked } => VerdictAction {
+            reject: false,
+            level: "INFO",
+            audit: format!(
+                "yt-dlp updated ({channel} channel, sha256 {sha16}); {checked} self-check link(s) still work; previous build kept for rollback"
+            ),
+            outcome: TaskOutcome::Ok,
+            close_breakers: true,
+            postponed_night: Some(false),
+            second_chance: Some(sha16.to_string()),
+        },
+        UpdateVerdict::RolledBack { broken } => VerdictAction {
+            reject: true,
+            level: "ERROR",
+            audit: format!(
+                "yt-dlp update rolled back automatically: the new build could not get {} while the previous one could. The previous build is in use; the next release will be tried.",
+                broken.join(", ")
+            ),
+            outcome: TaskOutcome::Failed,
+            close_breakers: false,
+            postponed_night: Some(false),
+            second_chance: None,
+        },
+        // Not judged: the previous build is live, this one is not marked
+        // rejected and is tried again the next night.
+        UpdateVerdict::Postponed { why } => VerdictAction {
+            reject: false,
+            level: "WARN",
+            audit: format!("yt-dlp update ({channel} channel, sha256 {sha16}) postponed to the next night: {why}. The previous build is in use."),
+            outcome: TaskOutcome::Skipped,
+            close_breakers: false,
+            postponed_night: Some(true),
+            second_chance: None,
+        },
+        // The new build is live but nobody could tell whether it works.
+        UpdateVerdict::Unverified { why } => VerdictAction {
+            reject: false,
+            level: "WARN",
+            audit: format!(
+                "yt-dlp ({channel} channel, sha256 {sha16}) is live but could not be verified: {why}. Check Administration → Download engine and roll back if downloads fail."
+            ),
+            outcome: TaskOutcome::Failed,
+            close_breakers: false,
+            postponed_night: None,
+            second_chance: None,
+        },
     }
 }
 
@@ -3914,6 +2385,8 @@ async fn nightly_deno_update(
     gate: &UpdateGate,
     repo: &Repository,
     health: &HealthState,
+    pacer: &omni_broadcast::pacing::HostPacer,
+    ffmpeg: Option<&std::path::Path>,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
     let Some(installed) = dep_mgr.deno_version() else {
@@ -3960,23 +2433,43 @@ async fn nightly_deno_update(
                 .filter(|l| l.last_ok == Some(true))
                 .collect();
             let ytdl = dep_mgr.ytdl_live();
-            let broken: Vec<String> = selfcheck::check_and_record(repo, &ytdl, &worked)
-                .await
-                .into_iter()
-                .filter(|(_, o)| !o.ok)
-                .map(|(l, _)| l.label)
-                .collect();
-            if broken.is_empty() {
-                let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
-                TaskOutcome::Ok
-            } else {
-                let _ = dep_mgr.rollback_deno();
-                let _ = repo.log_audit(
-                    "ERROR",
-                    "SYSTEM",
-                    &format!("Deno {new_version} rolled back to {installed}: {} stopped working with it", broken.join(", ")),
-                );
-                TaskOutcome::Failed
+            let results = selfcheck::check_and_record(repo, &ytdl, ffmpeg, pacer, &worked).await;
+            // A rollback that fails leaves the new Deno live and unverified (P11.4).
+            let verdict = match selfcheck::judge_deno(&results) {
+                UpdateVerdict::RolledBack { broken } if dep_mgr.rollback_deno().is_err() => UpdateVerdict::Unverified {
+                    why: format!("{} stopped working with it, and Deno {installed} could not be put back", broken.join(", ")),
+                },
+                UpdateVerdict::Postponed { why } if dep_mgr.rollback_deno().is_err() => {
+                    UpdateVerdict::Unverified { why: format!("{why}, and Deno {installed} could not be put back") }
+                }
+                v => v,
+            };
+            match verdict {
+                UpdateVerdict::Kept { .. } => {
+                    let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                    // yt-dlp reads YouTube through Deno: a second chance for extraction failures (P11.5).
+                    omni_core::second_chance::after_deno_update(repo, &new_version);
+                    TaskOutcome::Ok
+                }
+                UpdateVerdict::RolledBack { broken } => {
+                    let _ = repo.log_audit(
+                        "ERROR",
+                        "SYSTEM",
+                        &format!("Deno {new_version} rolled back to {installed}: {} stopped working with it", broken.join(", ")),
+                    );
+                    TaskOutcome::Failed
+                }
+                UpdateVerdict::Postponed { why } => {
+                    // Not judged (P11.4): the previous Deno is back, and the new one is tried again the next night.
+                    warn!("Deno update postponed: {why}");
+                    let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno {new_version} postponed to the next night: {why}. Deno {installed} is in use."));
+                    TaskOutcome::Skipped
+                }
+                UpdateVerdict::Unverified { why } => {
+                    warn!("Deno {new_version} is live but could not be verified: {why}");
+                    let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno {new_version} is live but could not be verified: {why}"));
+                    TaskOutcome::Failed
+                }
             }
         }
     };
@@ -3987,42 +2480,35 @@ async fn nightly_deno_update(
     outcome
 }
 
-enum UpdateVerdict {
-    Kept { checked: usize },
-    RolledBack { broken: Vec<String> },
-}
-
-async fn verify_ytdl_update(dep_mgr: &DependencyManager, live: &std::path::Path, repo: &Repository) -> UpdateVerdict {
+/// The new yt-dlp against the links that worked before it ([`selfcheck::verify_update`]):
+/// each round is a self-check of those links, and the swap is `rollback_ytdl`
+/// (it puts whichever build is not live back).
+async fn verify_ytdl_update(
+    dep_mgr: &DependencyManager,
+    live: &std::path::Path,
+    repo: &Repository,
+    pacer: &omni_broadcast::pacing::HostPacer,
+    ffmpeg: Option<&std::path::Path>,
+) -> UpdateVerdict {
     let worked: Vec<omni_core::models::SelfcheckLink> = repo
         .list_selfcheck_links()
         .unwrap_or_default()
         .into_iter()
         .filter(|l| l.last_ok == Some(true))
         .collect();
-    let results = selfcheck::check_and_record(repo, live, &worked).await;
-    let failed: Vec<omni_core::models::SelfcheckLink> =
-        results.into_iter().filter(|(_, o)| !o.ok).map(|(l, _)| l).collect();
-    if failed.is_empty() {
-        return UpdateVerdict::Kept { checked: worked.len() };
-    }
-
-    if let Err(e) = dep_mgr.rollback_ytdl() {
-        warn!("yt-dlp verification: could not put the previous build back to compare: {e:#}");
-        return UpdateVerdict::Kept { checked: worked.len() };
-    }
-    let with_old = selfcheck::check_and_record(repo, live, &failed).await;
-    let broken: Vec<String> = with_old.iter().filter(|(_, o)| o.ok).map(|(l, _)| l.label.clone()).collect();
-    if broken.is_empty() {
-        // Both builds fail those links: the sites changed or the network is
-        // down. The newer build is the better bet for a fix; put it back.
-        if let Err(e) = dep_mgr.rollback_ytdl() {
-            warn!("yt-dlp verification: could not reinstate the new build: {e:#}");
-        }
-        // Record what the build that stays in place sees.
-        selfcheck::check_and_record(repo, live, &failed).await;
-        return UpdateVerdict::Kept { checked: worked.len() };
-    }
-    UpdateVerdict::RolledBack { broken }
+    selfcheck::verify_update(
+        &worked,
+        |links| async move { selfcheck::check_and_record(repo, live, ffmpeg, pacer, &links).await },
+        || match dep_mgr.rollback_ytdl() {
+            Ok(_) => true,
+            Err(e) => {
+                warn!("yt-dlp verification: could not swap the builds: {e:#}");
+                false
+            }
+        },
+        |links, why| selfcheck::withdraw_results(repo, links, why),
+    )
+    .await
 }
 
 /// Replace a one-file yt-dlp with the folder build of the *same release*
@@ -4091,13 +2577,21 @@ struct CookieJarTester {
     repo: Repository,
     bin_dir: PathBuf,
     temp_path: PathBuf,
+    /// The daemon's pacer (P11.4): the test takes its turn at the platform like everything else.
+    pacer: omni_broadcast::pacing::HostPacer,
+    /// The daemon's ffmpeg, handed to yt-dlp (P11.4e).
+    ffmpeg: Option<PathBuf>,
 }
 
 impl omni_web::state::CookieTester for CookieJarTester {
     fn test<'a>(&'a self, domain: &'a str, url: &'a str) -> omni_web::state::CookieTestFuture<'a> {
         Box::pin(async move {
             let ytdl = DependencyManager::new(&self.bin_dir).ytdl_live();
-            let t = omni_broadcast::cookie_file::test_jar(&ytdl, &self.temp_path, &self.repo, domain, url).await?;
+            let t = omni_broadcast::cookie_file::test_jar(&ytdl, self.ffmpeg.as_deref(), &self.temp_path, &self.repo, domain, url, &self.pacer).await?;
+            // The site was limiting requests: nothing was learnt or stored; the admin is told to try later.
+            if t.inconclusive {
+                return Err(t.detail);
+            }
             Ok((t.ok, t.detail))
         })
     }
@@ -4118,6 +2612,21 @@ struct MaintenanceContext {
     evidence_max_bytes: u64,
     health: HealthState,
     canary: Arc<canary::CanaryEnv>,
+    /// The early yt-dlp update (P11.4d); the nightly run holds its running lock.
+    early_ytdl: Arc<early_update::EarlyYtdlUpdate>,
+}
+
+/// The early yt-dlp update (P11.4d): the nightly task's own update, under the
+/// same canary lock and gate, without the Deno update that follows it at night.
+async fn early_ytdl_update(repo: &Repository, ctx: &MaintenanceContext, drain: Duration) -> early_update::UpdateRun {
+    let dep_mgr = DependencyManager::new(&ctx.bin_dir);
+    let run = canary::with_canary_lock(&ctx.canary, async {
+        let ffmpeg = ctx.canary.ffmpeg();
+        nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref(), drain).await
+    })
+    .await;
+    selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
+    run
 }
 
 /// Run whatever is due, recording the outcome of each (plan P6.6).
@@ -4198,14 +2707,19 @@ async fn run_one_task(
                 return Ok(TaskOutcome::Skipped);
             }
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
+            // An early run (P11.4d) finding this held is dropped.
+            let _running = ctx.early_ytdl.lock_running().await;
             // No canary run (its yt-dlp starts without a gate pass) overlaps the swap.
             let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
-                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo).await;
-                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health).await;
+                let ffmpeg = ctx.canary.ffmpeg();
+                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref(), early_update::NIGHTLY_DRAIN)
+                    .await
+                    .outcome;
+                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
                 (ytdl, deno)
             })
             .await;
-            selfcheck::refresh_health(repo, &ctx.health);
+            selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
             // The worse of the two is what the maintenance panel shows.
             Ok(match (ytdl, deno) {
                 (TaskOutcome::Failed, _) | (_, TaskOutcome::Failed) => TaskOutcome::Failed,
@@ -4216,7 +2730,7 @@ async fn run_one_task(
 
         "selfcheck" => {
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
-            let failing = selfcheck::run(repo, &ytdl, &ctx.health).await?;
+            let failing = selfcheck::run(repo, &ytdl, ctx.canary.ffmpeg().as_deref(), &ctx.canary.pacer(), &ctx.health, &ctx.bin_dir).await?;
             // Then the recent articles of each frequent site (P10.4). Always
             // on; a site's verdict never changes this task's outcome.
             canary::nightly(&ctx.canary).await;
@@ -4234,12 +2748,18 @@ async fn run_one_task(
             // expired login is seen overnight and not by a journalist.
             let jars = repo.list_cookie_jars()?;
             let ytdl = DependencyManager::new(&ctx.bin_dir).ytdl_live();
+            let ffmpeg = ctx.canary.ffmpeg();
             let (mut tested, mut failing) = (0usize, Vec::<String>::new());
             for jar in &jars {
                 let Some(url) = omni_core::cookies::sample_url_for(&jar.domain, jar.last_sample_url.as_deref()) else { continue };
                 tested += 1;
-                match omni_broadcast::cookie_file::test_jar(&ytdl, &ctx.temp_path, repo, &jar.domain, &url).await {
-                    Ok(t) if t.ok => {}
+                match omni_broadcast::cookie_file::test_jar(&ytdl, ffmpeg.as_deref(), &ctx.temp_path, repo, &jar.domain, &url, &ctx.canary.pacer()).await {
+                    // The jar logs in: a second chance for the site's login jobs (P11.5).
+                    Ok(t) if t.ok => {
+                        omni_core::second_chance::after_cookies(repo, &jar.domain);
+                    }
+                    // The site was limiting requests: not a failed jar, and nothing was stored.
+                    Ok(t) if t.inconclusive => info!("Cookie test for {}: not judged tonight, {}", jar.domain, t.detail),
                     Ok(_) => failing.push(jar.domain.clone()),
                     Err(why) => {
                         warn!("Cookie test for {} could not run: {why}", jar.domain);
@@ -4341,8 +2861,8 @@ async fn run_one_task(
                 Ok(c) => {
                     if c.total() > 0 {
                         info!(
-                            "Retention: removed {} job(s), {} timeline row(s), {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s)",
-                            c.jobs, c.job_events, c.evidence, c.audit, c.mail, c.sessions
+                            "Retention: removed {} job(s), {} timeline row(s), {} evidence record(s), {} audit entr(ies), {} mail record(s), {} expired session(s), {} outcome row(s)",
+                            c.jobs, c.job_events, c.evidence, c.audit, c.mail, c.sessions, c.outcomes
                         );
                     }
                     for e in &c.errors {
@@ -4403,6 +2923,38 @@ async fn run_one_task(
             Ok(TaskOutcome::Skipped)
         }
     }
+}
+
+/// What the worker loop leases now. With the `disk` check red (`disk_ok`
+/// false) only a video that waits for the watchfolder (P11.2a): it needs no
+/// temp space and delivering it frees some; ordinary jobs and approved held
+/// videos wait for room as before. Otherwise any job with a download slot,
+/// and without one only a deliver-only job (approved held, or waiting). A
+/// waiting video only while the watchfolder answers (`deliver_ok`).
+fn lease_now(
+    repo: &Repository,
+    owner: &str,
+    disk_ok: bool,
+    has_download_slot: bool,
+    deliver_ok: bool,
+) -> anyhow::Result<Option<omni_core::models::Job>> {
+    if !disk_ok {
+        repo.lease_waiting_delivery_when(owner, LEASE_SECS, deliver_ok)
+    } else if has_download_slot {
+        repo.lease_job_when(owner, LEASE_SECS, deliver_ok)
+    } else {
+        repo.lease_approved_held_job_when(owner, LEASE_SECS, deliver_ok)
+    }
+}
+
+/// The start-up sweep of `temp/jobs`: every job's workspace goes but those of
+/// RUNNING jobs and of jobs whose finished video waits for the watchfolder
+/// (P11.2a). Runs after start-up recovery, which turns a waiting job that was
+/// RUNNING when the daemon stopped back into a waiting one.
+async fn startup_sweep(repo: &Repository, jobs_root: &std::path::Path) -> anyhow::Result<usize> {
+    let mut keep = repo.running_job_ids()?;
+    keep.extend(repo.parked_job_ids()?);
+    Ok(omni_broadcast::delivery::WatchfolderDelivery::sweep_orphan_job_dirs(jobs_root, &keep).await)
 }
 
 /// Remove `{dir}/{id}` directories (`temp/jobs`, `temp/attachments`) whose
@@ -4593,49 +3145,6 @@ fn sweep_evidence_with(
 
 #[cfg(test)]
 mod tests {
-    /// P2.15: a stop lets a job that reached the watchfolder step finish, so it
-    /// leaves neither a stale `.tmp` holding its slug nor a requeue that
-    /// delivers it twice; earlier stages are left to recovery at once.
-    #[tokio::test]
-    async fn a_stop_waits_for_a_delivering_job_and_for_nothing_else() {
-        use omni_core::models::{JobStage, JobStatus};
-        use std::time::Duration;
-        let busy = omni_core::busy::BusyJobs::new();
-        let budget = Duration::from_secs(5);
-
-        // Nothing busy, and a job still transcoding: no wait.
-        let t = std::time::Instant::now();
-        assert_eq!(super::wait_for_deliveries(&busy, |_| None, budget).await, 0);
-        let transcoding = busy.guard(1, "w1");
-        assert_eq!(super::wait_for_deliveries(&busy, |_| Some((JobStatus::Running, JobStage::Transcode)), budget).await, 0);
-        assert!(t.elapsed() < Duration::from_secs(1));
-
-        // A delivering job is waited for until its worker is done with it.
-        let delivering = busy.guard(2, "w2");
-        let stage = |id: i64| Some((JobStatus::Running, if id == 2 { JobStage::Deliver } else { JobStage::Transcode }));
-        let t = std::time::Instant::now();
-        let done = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            drop(delivering);
-        });
-        assert_eq!(super::wait_for_deliveries(&busy, stage, budget).await, 0);
-        assert!(t.elapsed() >= Duration::from_millis(500), "returned before the delivery ended");
-        done.await.unwrap();
-
-        // One that never ends is given up on at the budget, and counted.
-        let _stuck = busy.guard(3, "w3");
-        let t = std::time::Instant::now();
-        let left = super::wait_for_deliveries(&busy, |id| Some((JobStatus::Running, if id == 3 { JobStage::Archive } else { JobStage::Transcode })), Duration::from_millis(400)).await;
-        assert_eq!(left, 1);
-        assert!(t.elapsed() < Duration::from_secs(2));
-        drop(transcoding);
-
-        // A job already finished in the database is not waited for.
-        assert!(!super::is_delivering(JobStatus::Completed, JobStage::Done));
-        assert!(super::is_delivering(JobStatus::Running, JobStage::Deliver));
-        assert!(!super::is_delivering(JobStatus::Running, JobStage::Verify));
-    }
-
     #[test]
     fn the_banner_names_deno_even_when_it_is_missing() {
         // An empty bin dir that need not exist: nothing is written.
@@ -4643,59 +3152,6 @@ mod tests {
         let (found, line) = super::deno_banner_line(&omni_core::dependencies::DependencyManager::new(&dir));
         assert!(!found);
         assert!(line.contains("deno:") && line.contains("missing"), "{line}");
-    }
-
-    #[tokio::test]
-    async fn the_page_scan_never_picks_a_contextual_list_or_a_live_video() {
-        use omni_broadcast::downloader::{choose_primary, Choice, Probe};
-        let cl = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=cl-abc".to_string();
-        let live = "https://www.youtube.com/watch?v=liveliveli1".to_string();
-        let x = "https://x.com/i/status/2".to_string();
-        let run = |videos: Vec<String>, live: String| async move {
-            let (cands, meta) = page_scan_cands(&videos);
-            let l = live.clone();
-            (choose_primary(&cands, 3, move |u| {
-                let is = u == l;
-                async move { if is { Probe::Live } else { Probe::Ok } }
-            })
-            .await, meta)
-        };
-        // [cl-, LIVE youtube, x post] -> the x post.
-        let (c, meta) = run(vec![cl.clone(), live.clone(), x.clone()], live.clone()).await;
-        assert!(matches!(c, Choice::Primary { ref url, .. } if *url == x), "{c:?}");
-        assert!(meta[&cl].contextual && meta.len() == 1);
-        // [LIVE youtube, cl-] -> all live, not the cl- list.
-        let (c, _) = run(vec![live.clone(), cl.clone()], live.clone()).await;
-        assert!(matches!(c, Choice::AllLive { .. }), "{c:?}");
-        // Nothing live: the first non-contextual, as before; a concrete clip keeps its place.
-        let clip = "https://player.glomex.com/integration/1/iframe-player.html?integrationId=i1&playlistId=v-abc".to_string();
-        let (c, meta) = run(vec![clip.clone(), x.clone()], String::new()).await;
-        assert!(matches!(c, Choice::Primary { ref url, .. } if *url == clip), "{c:?}");
-        assert!(meta.is_empty());
-        let (c, _) = run(vec![cl.clone(), x.clone()], String::new()).await;
-        assert!(matches!(c, Choice::Primary { ref url, .. } if *url == x), "{c:?}");
-    }
-
-    #[test]
-    fn a_single_video_on_another_site_names_that_site_and_leaves_the_job_alone() {
-        assert!(other_site("https://www.news.example/story/1", "https://x.com/a/status/1"));
-        assert!(!other_site("https://www.news.example/story/1", "https://cdn.news.example/v/1"));
-        // The hint is keyed on the embed's site while the job's own address stays the article.
-        let dir = std::env::temp_dir().join(format!("omni-f6-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let repo = Repository::new(dir.join("omni.db")).unwrap();
-        let article = "https://www.news.example/story/1";
-        let embed = Some("https://x.com/a/status/1".to_string());
-        assert_eq!(
-            omni_broadcast::errors::hint_for_job(ErrorCode::LoginRequired, embed.as_deref().unwrap_or(article), &repo),
-            omni_broadcast::errors::login_hint_el("x.com", false)
-        );
-        assert_eq!(
-            omni_broadcast::errors::hint_for_job(ErrorCode::LoginRequired, None::<String>.as_deref().unwrap_or(article), &repo),
-            ErrorCode::LoginRequired.hint_el()
-        );
-        drop(repo);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -4711,23 +3167,6 @@ mod tests {
     use omni_core::health::Health;
     use omni_core::models::QueueWatch;
 
-    /// A scratch database that removes itself.
-    struct ScratchDb(std::path::PathBuf);
-    impl ScratchDb {
-        fn new() -> (Self, Repository) {
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let dir = std::env::temp_dir().join(format!("omni-main-test-{}-{nanos}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let repo = Repository::new(dir.join("omni.db")).unwrap();
-            (Self(dir), repo)
-        }
-    }
-    impl Drop for ScratchDb {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// P10.5: the worker holding the lease parks a held job; only it can.
     #[cfg(debug_assertions)]
     #[test]
@@ -4740,39 +3179,6 @@ mod tests {
         let dev = AppPaths::with_root("C:/omni-install", "dev/config.json");
         assert!(dev_hold_guard(&dev, true, &dev.root.join("dev").join("omni.db")).is_ok());
         assert!(dev_hold_guard(&dev, true, std::path::Path::new("C:/OMNI-INSTALL/Data/omni.db")).is_err(), "case-insensitive on Windows paths");
-    }
-
-    #[test]
-    fn finish_held_parks_the_job_for_its_owner_and_nobody_else() {
-        let (_db, repo) = ScratchDb::new();
-        let id = repo
-            .enqueue(
-                &omni_core::models::NewJob::new("https://example.gr/h", "1_ANNA_HELD", "ANNA"),
-                omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS,
-            )
-            .unwrap()
-            .job_id();
-        repo.lease_job("w1", 180).unwrap().expect("leased");
-
-        assert!(!finish_held(&repo, id, "w2").unwrap(), "another worker must not park the job");
-        assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Running);
-
-        assert!(finish_held(&repo, id, "w1").unwrap());
-        let job = repo.get_job(id).unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::AwaitingApproval);
-        assert_eq!(job.lease_owner, None);
-        assert!(!finish_held(&repo, id, "w1").unwrap(), "the lease is gone once parked");
-        assert!(repo.lease_job("w3", 180).unwrap().is_none(), "a parked job is not leased");
-    }
-
-    /// P10.5: a changed held file is a terminal, named failure, never "unexpected".
-    #[test]
-    fn a_changed_held_file_classifies_as_its_own_terminal_code() {
-        let e = anyhow::anyhow!("{}: the video changed", ErrorCode::HeldFileChanged.as_str())
-            .context(ErrorCode::HeldFileChanged.as_str());
-        let code = classify_pipeline_error(&e);
-        assert_eq!(code, ErrorCode::HeldFileChanged);
-        assert!(!code.is_retryable(), "a file that is not the approved one is never retried into delivery");
     }
 
     fn ev_row(job_id: i64, mb: i64, age_days: i64, now: chrono::DateTime<chrono::Utc>) -> omni_core::repository::EvidenceRow {
@@ -4926,161 +3332,11 @@ mod tests {
         assert_eq!(near(24, true).state, Health::Ok);
     }
 
-    /// 2026-10-19: a live download's DEBUG line read "LIVE_STREAM: LIVE_STREAM: …".
-    #[test]
-    fn the_diagnostic_chain_names_a_code_once_and_keeps_every_other_layer() {
-        let e = anyhow::anyhow!("LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it").context("LIVE_STREAM");
-        assert_eq!(format!("{e:#}"), "LIVE_STREAM: LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
-        assert_eq!(diagnostic_chain(&e), "LIVE_STREAM: the video is live or not yet started; yt-dlp skipped it");
-        // A code layer over a different message, and plain layers, all stay.
-        let e = anyhow::anyhow!("exited with 1. stderr tail: boom").context("transcode failed").context("TRANSCODE_FAILED");
-        assert_eq!(diagnostic_chain(&e), format!("{e:#}"));
-    }
-
-    /// Job #20 (2026-10-08): the card said PIPELINE_FAILED; the reason was only
-    /// in the timeline.
-    #[test]
-    fn readable_cause_is_the_root_of_the_chain() {
-        let e = anyhow::anyhow!("ERROR: [twitter] 2106778297484939750: No video could be found in this tweet")
-            .context("PIPELINE_FAILED");
-        assert_eq!(readable_cause(&e), "[twitter] 2106778297484939750: No video could be found in this tweet");
-    }
-
-    #[test]
-    fn readable_cause_prefers_the_error_line_of_a_stderr_tail() {
-        let e = anyhow::anyhow!("WARNING: something minor\nERROR: [generic] Unable to download webpage: HTTP Error 404\n\n")
-            .context("PAGE_NOT_FOUND");
-        assert_eq!(readable_cause(&e), "[generic] Unable to download webpage: HTTP Error 404");
-        let plain = anyhow::anyhow!("first\nlast line\n\n").context("NETWORK");
-        assert_eq!(readable_cause(&plain), "last line");
-    }
-
-    #[test]
-    fn readable_cause_of_a_bare_code_is_the_code() {
-        let e = anyhow::anyhow!("PIPELINE_FAILED");
-        assert_eq!(readable_cause(&e), "PIPELINE_FAILED");
-        let repeated = anyhow::anyhow!("PIPELINE_FAILED: PIPELINE_FAILED: boom").context("PIPELINE_FAILED");
-        assert_eq!(readable_cause(&repeated), "boom");
-    }
-
-    #[test]
-    fn readable_cause_keeps_the_header_of_a_tool_failure() {
-        let ff = anyhow::anyhow!(
-            "ffmpeg exited with code Some(1). stderr tail: frame=0 fps=0.0\n[mpeg2video @ 000001] Error initializing output stream\nError while opening encoder for output stream #0:0 - maybe incorrect parameters\nConversion failed!\n"
-        )
-        .context("PIPELINE_FAILED");
-        let s = readable_cause(&ff);
-        assert!(s.starts_with("ffmpeg exited with code Some(1)"), "{s}");
-        assert!(s.ends_with(": Error initializing output stream"), "the first error line, without its [… @ addr] prefix: {s}");
-        assert!(!s.contains("Conversion failed"), "{s}");
-
-        // The tail the installed FFmpeg 9 writes for an encoder that will not
-        // open (VBV buffer too small): the cause comes first, then lines
-        // that also say "error" but name nothing.
-        let ff9 = anyhow::anyhow!(concat!(
-            "ffmpeg exited with code Some(1). stderr tail: ",
-            "[mpeg2video @ 0000029b555468c0] VBV buffer too small for bitrate\n",
-            "[vost#0:0/mpeg2video @ 0000029b55546680] [enc:mpeg2video @ 0000029b4afd5540] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n",
-            "[vf#0:0 @ 0000029b55549840] Error sending frames to consumers: Invalid argument\n",
-            "[vf#0:0 @ 0000029b55549840] Task finished with error code: -22 (Invalid argument)\n",
-            "[vost#0:0/mpeg2video @ 0000029b55546680] [enc:mpeg2video @ 0000029b4afd5540] Could not open encoder before EOF\n",
-            "[vf#0:0 @ 0000029b55549840] Terminating thread with return code -22 (Invalid argument)\n",
-            "[vost#0:0/mpeg2video @ 0000029b55546680] Task finished with error code: -22 (Invalid argument)\n",
-            "[vost#0:0/mpeg2video @ 0000029b55546680] Terminating thread with return code -22 (Invalid argument)\n",
-            "[out#0/null @ 0000029b55544780] Nothing was written into output file, because at least one of its streams received no packets.\n",
-            "frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:00.02\n",
-            "Conversion failed!\n",
-        ))
-        .context("TRANSCODE_FAILED");
-        assert_eq!(
-            readable_cause(&ff9),
-            "ffmpeg exited with code Some(1): Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height."
-        );
-
-        let timeout = anyhow::anyhow!("ffmpeg timed out after 3600s; process tree killed. stderr tail: frame=10\nspeed=0.1x\n")
-            .context("TRANSCODE_TIMEOUT");
-        assert_eq!(readable_cause(&timeout), "ffmpeg timed out after 3600s; process tree killed");
-
-        let ytdlp = anyhow::anyhow!("yt-dlp exited with code Some(1). stderr tail: WARNING: x\nERROR: [twitter] 1: No video could be found\n")
-            .context("PIPELINE_FAILED");
-        let s = readable_cause(&ytdlp);
-        assert!(s.starts_with("yt-dlp exited with code Some(1)"), "{s}");
-        assert!(s.ends_with("[twitter] 1: No video could be found"), "{s}");
-    }
-
-    #[test]
-    fn readable_cause_keeps_the_parent_of_a_bare_os_error() {
-        let e = anyhow::anyhow!("The network path was not found. (os error 53)")
-            .context("Failed creating the watchfolder")
-            .context("DELIVERY_FAILED");
-        let s = readable_cause(&e);
-        assert!(s.contains("Failed creating the watchfolder") && s.contains("os error 53"), "{s}");
-        // Two long quoted paths in the parent must not push the OS error
-        // itself past the cap.
-        let long = format!("Failed copying \"{}\" to \"{}\"", "C:\\OmniIngest\\temp\\jobs\\42\\x".repeat(6), "\\\\dalet\\watch\\y".repeat(8));
-        let e = anyhow::anyhow!("Access is denied. (os error 5)").context(long).context("DELIVERY_FAILED");
-        assert!(readable_cause(&e).starts_with("Access is denied. (os error 5)"));
-        // A code above the root is not a parent worth quoting.
-        let coded = anyhow::anyhow!("boom").context("PIPELINE_FAILED");
-        assert_eq!(readable_cause(&coded), "boom");
-    }
-
-    #[test]
-    fn readable_cause_is_capped_on_a_char_boundary() {
-        let e = anyhow::anyhow!("Σφάλμα λήψης βίντεο ".repeat(50)).context("PIPELINE_FAILED");
-        let s = readable_cause(&e);
-        assert!(s.chars().count() <= 301, "{}", s.chars().count());
-        assert!(s.ends_with('…'));
-    }
-
-    /// The engine's lost-lease error is recognised by type; a failure that
-    /// merely quotes the code in its text (a URL ending in it) is not.
-    #[test]
-    fn a_lost_lease_is_recognised_by_type_not_by_text() {
-        let lost: anyhow::Result<()> = Err(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 7, stage: JobStage::Rewrap })
-            .context(ErrorCode::LeaseExpired.as_str()));
-        assert!(lost_lease(&lost));
-
-        let quoting: anyhow::Result<()> = Err(anyhow::anyhow!("ERROR: unable to download https://example.gr/LEASE_EXPIRED")
-            .context("LEASE_EXPIRED"));
-        assert!(!lost_lease(&quoting));
-        assert!(!lost_lease(&Ok(())));
-    }
-
-    /// neakriti.gr article without a video (2026-10-05): the card said
-    /// UNSUPPORTED_URL, "try a direct video link".
-    #[test]
-    fn a_page_without_a_video_is_reported_as_no_stream_not_unsupported() {
-        let yt_dlp = || anyhow::anyhow!("ERROR: Unsupported URL: https://www.neakriti.gr/x").context(ErrorCode::UnsupportedUrl.as_str());
-
-        let empty = anyhow::Error::from(omni_browser::BrowserError::NoStreamFound("https://www.neakriti.gr/x".into()));
-        assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), empty)), ErrorCode::NoStreamFound);
-
-        let no_browser = anyhow::Error::from(omni_browser::BrowserError::LaunchFailed("no Chrome".into()));
-        assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), no_browser)), ErrorCode::UnsupportedUrl);
-    }
-
-    /// A mistyped YouTube id (2026-10-07): the card said «Απρόβλεπτο
-    /// σφάλμα». The downloader's code must come back out of the chain the
-    /// pipeline wraps around it.
-    #[test]
-    fn an_unavailable_video_keeps_its_code_through_the_pipeline() {
-        let line = "ERROR: [youtube] zzzzzzzzzz0: This video is unavailable";
-        let code = omni_broadcast::errors::classify_download_error(line);
-        let e = anyhow::Error::from(omni_broadcast::downloader::DownloadError { code, message: line.into() })
-            .context(code.as_str());
-        assert_eq!(classify_pipeline_error(&e), ErrorCode::PrivateOrRemoved);
-    }
-
-    fn verdict(class: EvidenceClass, signals: &[&str], diagnosed: bool) -> Evidence {
-        Evidence { class, signals: signals.iter().map(|s| s.to_string()).collect(), diagnosed }
-    }
-
     /// The code a page's evidence gives a failed job (P10.2): a "no video"
     /// verdict needs the second look; a weak page keeps what it had.
     #[test]
     fn only_four_codes_count_against_a_site() {
-        let counting: Vec<&str> = ErrorCode::ALL
+        let counting: Vec<&str> = omni_broadcast::errors::ErrorCode::ALL
             .iter()
             .map(|c| c.as_str())
             .filter(|c| omni_core::site_health::counts_against_site(c))
@@ -5092,243 +3348,79 @@ mod tests {
         );
     }
 
+    /// P11.4 review round 2: what the nightly yt-dlp task does with each verdict.
+    /// Only a rollback marks the build rejected; a postponed update writes no
+    /// marker, is Skipped and counts a postponed night; an unverified build is a
+    /// warning and a failed task, never the INFO "updated" row.
     #[test]
-    fn evidence_names_the_exact_failure() {
-        let orig = ErrorCode::NoStreamFound;
-        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::None, &[], false));
-        assert_eq!((c, m), (orig, None), "not diagnosed: no claim that the page has no video");
-        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::None, &[], true));
-        assert_eq!(c, ErrorCode::NoVideoOnPage);
-        assert_eq!(m.as_deref(), Some("Δεν βρέθηκε βίντεο ούτε στον δεύτερο έλεγχο"));
-        assert_eq!(evidence_code(ErrorCode::Http403, &verdict(EvidenceClass::Weak, &["player-container"], true)), (ErrorCode::Http403, None));
-        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::Strong, &["og:video", "embed:jwplayer"], false));
-        assert_eq!(c, ErrorCode::VideoUnresolved);
-        assert_eq!(m.as_deref(), Some("Βρέθηκε βίντεο στη σελίδα (og:video, embed:jwplayer) αλλά δεν κατέβηκε"));
-        let (c, m) = evidence_code(orig, &verdict(EvidenceClass::Protected, &["eme:com.widevine.alpha", "mse:video/mp4"], true));
-        assert_eq!(c, ErrorCode::DrmProtected);
-        assert_eq!(m.as_deref(), Some("Το βίντεο έχει DRM (com.widevine.alpha)"));
-        assert_eq!(evidence_code(orig, &verdict(EvidenceClass::LoginWall, &["http-401 cdn.example"], true)), (ErrorCode::LoginRequired, None));
-        assert_eq!(evidence_code(orig, &verdict(EvidenceClass::GeoBlocked, &["http-451 cdn.example"], false)), (ErrorCode::GeoBlocked, None));
-        // every result is a final code: nothing here sends a job round again
-        for class in [EvidenceClass::Protected, EvidenceClass::LoginWall, EvidenceClass::GeoBlocked, EvidenceClass::Strong] {
-            let (c, _) = evidence_code(ErrorCode::UnsupportedUrl, &verdict(class, &[], true));
-            assert!(!c.is_retryable(), "{c}");
-        }
+    fn the_nightly_update_maps_each_verdict_honestly() {
+        use omni_core::scheduler::TaskOutcome;
+        let kept = ytdl_verdict_action(&UpdateVerdict::Kept { checked: 4 }, "stable", "0123456789abcdef");
+        assert_eq!((kept.reject, kept.level, kept.outcome, kept.close_breakers, kept.postponed_night), (false, "INFO", TaskOutcome::Ok, true, Some(false)));
+        assert!(kept.audit.starts_with("yt-dlp updated (stable channel, sha256 0123456789abcdef); 4 self-check link(s) still work"));
+
+        let back = ytdl_verdict_action(&UpdateVerdict::RolledBack { broken: vec!["X video".into()] }, "stable", "0123456789abcdef");
+        assert_eq!((back.reject, back.level, back.outcome, back.postponed_night), (true, "ERROR", TaskOutcome::Failed, Some(false)));
+        assert!(back.audit.contains("could not get X video"));
+
+        let later = ytdl_verdict_action(&UpdateVerdict::Postponed { why: "no youtube link could be compared".into() }, "stable", "0123456789abcdef");
+        assert_eq!((later.reject, later.level, later.outcome, later.close_breakers, later.postponed_night), (false, "WARN", TaskOutcome::Skipped, false, Some(true)));
+        assert!(later.audit.contains("postponed to the next night: no youtube link could be compared"));
+
+        let unknown = ytdl_verdict_action(&UpdateVerdict::Unverified { why: "the swap failed".into() }, "stable", "0123456789abcdef");
+        assert_eq!((unknown.reject, unknown.level, unknown.outcome, unknown.close_breakers, unknown.postponed_night), (false, "WARN", TaskOutcome::Failed, false, None));
+        assert!(unknown.audit.contains("is live but could not be verified: the swap failed") && !unknown.audit.contains("updated"));
     }
 
+    /// P11.5: only a kept build gives the jobs in review for an extraction
+    /// failure a second chance, once per build.
     #[test]
-    fn the_second_look_needs_repair_on_a_page_and_nothing_proven() {
-        use EvidenceClass as C;
-        for passive in [None, Some(C::Weak), Some(C::None)] {
-            assert!(!should_diagnose(RepairMode::Off, passive, false), "off never diagnoses");
-            assert!(should_diagnose(RepairMode::Shadow, passive, false));
-            assert!(should_diagnose(RepairMode::Hold, passive, false));
-            assert!(!should_diagnose(RepairMode::Hold, passive, true), "a platform post is never re-sniffed");
-        }
-        for passive in [C::Protected, C::LoginWall, C::GeoBlocked, C::Strong] {
-            assert!(!should_diagnose(RepairMode::Hold, Some(passive), false), "{passive:?} is already decided");
-        }
-    }
-
-    /// A job the site itself named a video for can never be "no video on the
-    /// page", and needs no second look.
-    #[test]
-    fn one_scanned_video_counts_as_named_by_the_site() {
-        assert!(!site_named_video(false, 0));
-        assert!(site_named_video(false, 1), "a single video is enough, not only several");
-        assert!(site_named_video(false, 3));
-        assert!(site_named_video(true, 0));
-    }
-
-    #[test]
-    fn a_video_the_site_named_is_never_reported_missing() {
-        assert!(with_site_hint(None, false).is_none());
-        let named = with_site_hint(None, true).unwrap();
-        assert_eq!(named.class, EvidenceClass::Strong);
-        assert_eq!(named.signals, vec!["named-by-site"]);
-        assert_eq!(evidence_code(ErrorCode::NoStreamFound, &named).0, ErrorCode::VideoUnresolved);
-        assert!(!should_diagnose(RepairMode::Hold, Some(named.class), false));
-        // over a weak or empty look it wins; over a refusal it does not
-        let weak = verdict(EvidenceClass::Weak, &["player-container"], false);
-        let both = with_site_hint(Some(weak), true).unwrap();
-        assert_eq!(both.class, EvidenceClass::Strong);
-        assert!(both.signals.contains(&"player-container".to_string()));
-        let drm = with_site_hint(Some(verdict(EvidenceClass::Protected, &["drm:setkeys"], false)), true).unwrap();
-        assert_eq!(drm.class, EvidenceClass::Protected);
-    }
-
-    /// A job MCR cancelled while the page was judged gets no verdict event and
-    /// keeps today's code; the same page for a job still ours gets both.
-    #[tokio::test]
-    async fn a_cancelled_job_gets_no_evidence_verdict() {
-        let db = std::env::temp_dir().join(format!("omni_p102_cancel_{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&db);
-        let repo = Repository::new(&db).unwrap();
+    fn a_kept_ytdlp_build_gives_extraction_failures_a_second_chance() {
+        use omni_core::models::{JobStatus, NewJob};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
         let id = repo
-            .enqueue(&omni_core::models::NewJob::new("https://news.example/a", "slug-a", "Test Person"), 24)
+            .enqueue(&NewJob::new("https://news.example/a", "1_ANNA_TEST", "ANNA"), 24)
             .unwrap()
             .job_id();
-        let job = repo.lease_job("w1", 60).unwrap().expect("leased");
-        assert_eq!(job.id, id);
-        let page = || {
-            let mut snap = omni_browser::PageSnapshot::new("https://news.example/a");
-            snap.meta = vec![("og:video".into(), "https://cdn.example/v.mp4".into())];
-            FailedPage {
-                url: "https://news.example/a",
-                mode: RepairMode::Off,
-                snapshot: Some(snap),
-                sniffed_streams: &[],
-                original: ErrorCode::NoStreamFound,
-                named_by_site: false,
-            }
-        };
-        let notes = |repo: &Repository| {
-            repo.get_job_events(id, 50).unwrap().iter().filter(|e| e.message.starts_with("Evidence:")).count()
-        };
+        assert!(repo.lease_job_by_id(id, "host:1:0", 180).unwrap());
+        assert!(repo.finish(id, "host:1:0", JobStatus::RequiresReview, Some("NO_STREAM_FOUND"), Some("x"), None).unwrap());
 
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let (code, line, _) = assess_failed_page(&repo, "w1", id, &cancel, page()).await;
-        assert_eq!((code, line), (ErrorCode::NoStreamFound, None));
-        assert_eq!(notes(&repo), 0, "no verdict for a cancelled job");
-
-        let live = CancellationToken::new();
-        let (code, line, _) = assess_failed_page(&repo, "w1", id, &live, page()).await;
-        assert_eq!(code, ErrorCode::VideoUnresolved);
-        assert!(line.is_some());
-        assert_eq!(notes(&repo), 1);
-
-        let (code, _, _) = assess_failed_page(&repo, "someone-else", id, &live, page()).await;
-        assert_eq!(code, ErrorCode::NoStreamFound, "a lost lease gets no verdict either");
-        assert_eq!(notes(&repo), 1);
-        drop(repo);
-        let _ = std::fs::remove_file(&db);
-    }
-}
-
-#[cfg(test)]
-mod sniff_fallback_tests {
-    use super::{falls_back_to_ytdlp, sniff_result_end, SniffEnd};
-
-
-    #[test]
-    fn a_sniff_that_ended_on_a_platform_page_is_not_taken_but_only_when_the_browser_was_first() {
-        let post = Some("https://www.youtube.com/watch?v=abcdefghijk");
-        let page = Some("https://www.example-news.gr/article");
-        assert_eq!(sniff_result_end(true, true, post), Some(SniffEnd::LandedOnPlatform));
-        assert_eq!(sniff_result_end(true, true, page), None);
-        assert_eq!(sniff_result_end(true, true, None), None);
-        assert_eq!(sniff_result_end(false, true, post), None, "yt-dlp went first for this page");
-        assert_eq!(sniff_result_end(true, false, page), Some(SniffEnd::Error));
-        assert!(falls_back_to_ytdlp(true, sniff_result_end(true, true, post).unwrap()));
-    }
-
-    #[test]
-    fn yt_dlp_is_tried_after_the_browser_only_when_it_found_no_usable_video() {
-        assert!(falls_back_to_ytdlp(true, SniffEnd::Error));
-        assert!(falls_back_to_ytdlp(true, SniffEnd::PostsHaveNoVideo));
-        assert!(falls_back_to_ytdlp(true, SniffEnd::LandedOnPlatform));
-        assert!(falls_back_to_ytdlp(true, SniffEnd::SiteWide), "yt-dlp's pick may be another video; guard_scan blocks a furniture one");
-        for end in [
-            SniffEnd::Found,
-            SniffEnd::AllLive,
-            SniffEnd::AllDead,
-            SniffEnd::SiblingsHoldTheRest,
-            SniffEnd::Cancelled,
-            SniffEnd::LeaseLost,
-            SniffEnd::NotRun,
+        for verdict in [
+            UpdateVerdict::RolledBack { broken: vec!["X video".into()] },
+            UpdateVerdict::Postponed { why: "busy".into() },
+            UpdateVerdict::Unverified { why: "the swap failed".into() },
         ] {
-            assert!(!falls_back_to_ytdlp(true, end), "{end:?}");
+            let act = ytdl_verdict_action(&verdict, "stable", "0123456789abcdef");
+            assert_eq!(act.second_chance, None);
+            assert_eq!(ytdl_second_chance(&repo, &act), 0, "{verdict:?}");
         }
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::RequiresReview);
+
+        let kept = ytdl_verdict_action(&UpdateVerdict::Kept { checked: 4 }, "stable", "0123456789abcdef");
+        assert_eq!(ytdl_second_chance(&repo, &kept), 1);
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Pending);
+        assert_eq!(repo.second_chances(id).unwrap(), vec!["ytdlp:0123456789abcdef".to_string()]);
     }
 
-    #[test]
-    fn a_page_the_browser_was_not_asked_first_never_falls_back() {
-        assert!(!falls_back_to_ytdlp(false, SniffEnd::Error));
-        assert!(!falls_back_to_ytdlp(false, SniffEnd::PostsHaveNoVideo));
-    }
-}
-
-/// Whether a failed job's end is written to its site's health (P10.3): only a finished,
-/// uncancelled job of its own page, with a code that says something about the site. A page whose
-/// only videos are the site's furniture (P3.16) fails the job but says nothing about the site.
-fn site_failure_counts(done: bool, cancelled: bool, is_child: bool, furniture_only: bool, code: &str) -> bool {
-    done && !cancelled && !is_child && !furniture_only && omni_core::site_health::counts_against_site(code)
-}
-
-#[cfg(test)]
-mod site_failure_tests {
-    use super::*;
-
-    #[test]
-    fn a_furniture_only_ending_is_not_a_site_failure_but_a_real_no_stream_found_is() {
-        assert!(site_failure_counts(true, false, false, false, "NO_STREAM_FOUND"), "control: counts as before");
-        assert!(!site_failure_counts(true, false, false, true, "NO_STREAM_FOUND"));
-    }
-
-    #[test]
-    fn the_furniture_ending_leaves_the_stored_site_health_unchanged() {
-        let (_d, repo) = crate::site_memory::tests::repo();
-        let health = HealthState::new();
-        let url = "https://www.news.example/a/story-1";
-        // As the end of run_job does it: only what site_failure_counts allows is recorded.
-        for furniture_only in [true, false] {
-            if site_failure_counts(true, false, false, furniture_only, "NO_STREAM_FOUND") {
-                note_site_outcome(&repo, &health, 1, url, SiteOutcome::SiteFailure("NO_STREAM_FOUND".into()));
-            }
-            let row = repo.get_site("news.example").unwrap();
-            if furniture_only {
-                assert!(row.is_none(), "nothing recorded for the site");
-            } else {
-                assert_eq!(row.unwrap().consecutive_fail, 1, "a real NO_STREAM_FOUND still counts");
-            }
-        }
-    }
-}
-
-/// Whether a failed job ended for lack of a video only because the page's videos are the site's
-/// furniture (P3.16), which says nothing about the site: `pick_refused` is yt-dlp's first pick refused
-/// as furniture (the route where yt-dlp goes first), `sniff` how the browser's look ended, and
-/// `fallback_refused` whether yt-dlp's pick after the browser was refused (`None`: not made).
-fn furniture_only_end(pick_refused: bool, sniff: SniffEnd, fallback_refused: Option<bool>) -> bool {
-    match sniff {
-        SniffEnd::SiteWide => fallback_refused.unwrap_or(true),
-        SniffEnd::Error | SniffEnd::PostsHaveNoVideo | SniffEnd::LandedOnPlatform => fallback_refused.unwrap_or(pick_refused),
-        SniffEnd::NotRun => pick_refused,
-        SniffEnd::Found
-        | SniffEnd::AllLive
-        | SniffEnd::AllDead
-        | SniffEnd::SiblingsHoldTheRest
-        | SniffEnd::Cancelled
-        | SniffEnd::LeaseLost => false,
-    }
-}
-
-#[cfg(test)]
-mod furniture_end_tests {
-    use super::*;
-
-    #[test]
-    fn the_browser_first_route_ends_on_furniture_unless_yt_dlps_own_pick_is_another_video() {
-        assert!(furniture_only_end(false, SniffEnd::SiteWide, None), "no pick was made after the browser");
-        assert!(furniture_only_end(false, SniffEnd::SiteWide, Some(true)), "the pick was the same promo");
-        assert!(!furniture_only_end(false, SniffEnd::SiteWide, Some(false)), "another video that then failed is a real failure");
-        assert!(furniture_only_end(false, SniffEnd::Error, Some(true)), "browser found nothing, pick refused");
-        assert!(!furniture_only_end(false, SniffEnd::Error, Some(false)));
-    }
-
-    #[test]
-    fn the_yt_dlp_first_route_keeps_a_refused_pick_through_a_sniff_that_finds_nothing() {
-        for end in [SniffEnd::Error, SniffEnd::PostsHaveNoVideo, SniffEnd::SiteWide, SniffEnd::NotRun] {
-            assert!(furniture_only_end(true, end, None), "{end:?}");
-            assert!(!furniture_only_end(false, end, None) || end == SniffEnd::SiteWide, "{end:?}: no refused pick, a real failure");
-        }
-    }
-
-    #[test]
-    fn a_sniff_that_chose_a_video_or_ended_for_another_reason_is_a_real_ending() {
-        for end in [SniffEnd::Found, SniffEnd::AllLive, SniffEnd::AllDead, SniffEnd::SiblingsHoldTheRest, SniffEnd::Cancelled, SniffEnd::LeaseLost] {
-            assert!(!furniture_only_end(true, end, Some(true)), "{end:?}");
-        }
+    /// P11.4 review round 1: the admin's cookie «Test» while the platform cools
+    /// down after a rate limit says to try again in a few minutes (an error the
+    /// card shows), at once, and stores nothing about the jar.
+    #[tokio::test(start_paused = true)]
+    async fn the_admin_jar_test_during_a_cool_down_says_try_later_and_stores_nothing() {
+        use omni_web::state::CookieTester;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let jar = omni_core::cookies::parse_netscape("x.com", ".x.com\tTRUE\t/\tTRUE\t0\tn\tvalue-123456\n").unwrap();
+        repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
+        let pacer = omni_broadcast::pacing::HostPacer::default();
+        pacer.penalize("x", omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN);
+        std::fs::create_dir_all(dir.path().join("temp")).unwrap();
+        let tester = CookieJarTester { repo: repo.clone(), bin_dir: dir.path().join("bin"), temp_path: dir.path().join("temp"), pacer, ffmpeg: None };
+        let t0 = tokio::time::Instant::now();
+        let got = tester.test("x.com", "https://x.com/someone/status/1").await;
+        assert_eq!(tokio::time::Instant::now(), t0);
+        assert_eq!(got, Err(omni_broadcast::cookie_file::JAR_TEST_LIMITED.to_string()));
+        assert_eq!(repo.list_cookie_jars().unwrap()[0].last_test_ok, None, "a result was stored");
     }
 }

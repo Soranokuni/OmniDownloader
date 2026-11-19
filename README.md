@@ -21,10 +21,17 @@ Pure Rust, one `omni-ingest.exe`, runs as a Windows service.
   [ADMIN_GUIDE.el.md](docs/ADMIN_GUIDE.el.md). The English text wins where
   they differ.
 
-Quick start for a station: build or download a release, run `Install.cmd`,
-open `http://127.0.0.1:8080/admin` on the server itself, sign in as
-`Admin` / `Admin` (refused from any other PC) and change that password before
-anything else. The Administrator Guide covers the rest.
+Quick start for a station: take `OmniIngest-Setup-<version>-<date>-<arch>.exe`
+from a release (`x64` for a 64-bit Intel or AMD server) with its `.sha256`,
+check the hash, and run it on the server. Setup installs the Windows service,
+then opens `http://127.0.0.1:8080/admin` on the server itself: sign in as
+`Admin` / `Admin` (refused from any other PC) and the setup wizard replaces
+that account with your own administrator and walks you through the
+watchfolder and the mailbox. Setup also upgrades, changes the service account
+(Settings → Apps → OmniIngest → Modify) and uninstalls. The command-line
+alternative is `Install.cmd` in the release zip. Step by step, with every
+page, the unattended `/quiet` install and its exit codes:
+[Administrator Guide, section 2](docs/ADMIN_GUIDE.md#2-installing).
 
 ---
 
@@ -210,7 +217,8 @@ can route to everything and a misconfiguration is one keystroke away. So:
 
 ## Architecture
 
-Seven-crate Cargo workspace, one binary:
+Eight-crate Cargo workspace, two binaries (`omni-ingest.exe`, the daemon and
+its command line; `OmniIngest-Setup.exe`, the installer):
 
 | Crate | Responsibility |
 |---|---|
@@ -220,7 +228,8 @@ Seven-crate Cargo workspace, one binary:
 | `omni-email` | mail source, MIME decoding, deterministic parser, LLM assist |
 | `omni-web` | Axum server, session auth, MCR / admin / user panels, SSE |
 | `omni-service` | Windows Service Control Manager integration |
-| `omni-cli` | setup wizard, service and secret commands |
+| `omni-cli` | setup wizard, installer, service and secret commands |
+| `omni-setup` | `OmniIngest-Setup.exe`: installs, upgrades (with the way back), changes the service account and uninstalls, with pages or `/quiet` |
 
 Conventions the codebase holds to:
 
@@ -256,10 +265,13 @@ running daemon installs or repairs them from **Admin → Toolchain**, and
 The encoder and wrapper are pinned on purpose: the broadcast output was
 validated with those exact builds, and they are never upgraded on their own.
 
-To build a release folder and zip under `dist\`:
+To build a release under `dist\` (the folder, its zip, and
+`OmniIngest-Setup-<version>-<date>-<arch>.exe` with its `.sha256`; `-Arch x64`
+is the default, `-ToolsDir` and `-RuntimeDir` say where the tools and the C++
+runtime DLLs of that architecture are; see the Administrator Guide, section 2):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -Arch x64
 ```
 
 ## Running
@@ -271,8 +283,8 @@ copy config.example.json config.json
 # console mode
 .\target\release\omni-ingest.exe run
 
-# first run: open http://127.0.0.1:8080/setup from this machine,
-# or use the wizard
+# first run: open http://127.0.0.1:8080/admin from this machine and sign in
+# as Admin / Admin (the setup wizard opens), or use the console wizard
 .\target\release\omni-ingest.exe setup
 
 # what the daemon made of each mail; read one again on its next poll

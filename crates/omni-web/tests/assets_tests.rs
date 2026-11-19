@@ -377,7 +377,7 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 #[test]
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
-    for (module, version) in [("desk.js", 12), ("inbox.js", 18), ("approval.js", 7), ("mcr.js", 43)] {
+    for (module, version) in [("desk.js", 14), ("inbox.js", 20), ("approval.js", 9), ("notify.js", 11), ("mcr.js", 46)] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
         for s in assets.values() {
@@ -407,6 +407,89 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     );
 }
 
+/// One app.css URL across every page, so a bump cannot miss one.
+#[test]
+fn every_page_links_the_same_app_css_version() {
+    let versions: std::collections::BTreeSet<String> = all_assets()
+        .values()
+        .flat_map(|s| {
+            s.match_indices("/static/app.css?v=").map(move |(i, m)| {
+                let rest = &s[i + m.len()..];
+                rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()
+            })
+        })
+        .collect();
+    assert_eq!(versions.len(), 1, "pages link different app.css versions: {versions:?}");
+}
+
+/// P11.3b: the late strip is loaded on every refresh and reconciled by job id, the chime reads
+/// `queue.late` (and is not part of the needs-a-person count), and a video that waits for the
+/// watchfolder says so.
+#[test]
+fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
+    let assets = all_assets();
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    assert!(mcr.contains("'/api/jobs?view=late'"), "mcr.js does not load the late list");
+    assert!(
+        mcr.contains("const reloadAll = () => { refresh(); loadStatus(); loadLate(); };"),
+        "the late strip is not part of the 5 s cycle on every tab"
+    );
+    assert!(mcr.contains("syncKeyedList(lateList,"), "the late strip is not reconciled by job id");
+    assert!(mcr.contains("/now`, { method: 'POST' }"), "no «Τώρα» action");
+    // P11.7: «Τώρα» for a back-off and for a stream still live waiting for its next check.
+    let row = mcr.split("function lateRow(job)").nth(1).and_then(|s| s.split("\n}").next()).expect("mcr.js has lateRow");
+    let button = row.split("el('button'").next().unwrap();
+    assert!(
+        button.contains("job.wait_reason === 'retry' || job.wait_reason === 'live'"),
+        "the late strip does not offer «Τώρα» for both 'retry' and 'live':\n{row}"
+    );
+    assert!(row.contains("runNow(job, ev.currentTarget)"), "the late row's button does not run the job now");
+    assert!(mcr.contains("και άλλα"), "the strip does not cap its rows");
+    let page = assets.get("mcr.html").expect("mcr.html shipped");
+    let strip = page.find("id=\"late-strip\"").expect("the strip is in mcr.html");
+    assert!(strip < page.find("class=\"tabs\"").unwrap(), "the strip is not above the tab bar");
+
+    let notify = assets.get("static/notify.js").expect("notify.js shipped");
+    assert!(notify.contains("workers: {"), "CHECK_INFO has no entry for the workers check");
+    assert!(notify.contains("queue.late"), "notify.js does not read queue.late");
+    let need = notify.split("function needCount").nth(1).and_then(|s| s.split('}').next()).unwrap();
+    assert!(!need.contains("late"), "late videos must not count as needing a person");
+
+    let desk = assets.get("static/desk.js").expect("desk.js shipped");
+    assert!(desk.contains("Περιμένει τον φάκελο παράδοσης"), "desk.js has no watchfolder wait text");
+    assert!(desk.contains("export function lateReason"), "desk.js has no lateReason");
+
+    // P11.7: a stream still live says so, with its next check's time, in the late strip.
+    let late = desk.split("export function lateReason").nth(1).and_then(|s| s.split("\nexport function").next()).unwrap();
+    let live = late.split("case 'live':").nth(1).expect("lateReason has no case for wait_reason 'live'");
+    let live = live.split("case '").next().unwrap();
+    assert!(live.contains("Ζωντανή μετάδοση"), "the live case does not say «Ζωντανή μετάδοση»:\n{live}");
+    assert!(live.contains("επόμενος έλεγχος ${at}") && live.contains("clock(job.next_try_at)"), "the live case does not show the next check's time:\n{live}");
+}
+
+/// P12.3: the desk's lists are updated in place. A full `render(list, every card)` on the 5 s
+/// refresh throws away an operator's typed address, the focus and the open panels.
+#[test]
+fn mcr_lists_are_reconciled_not_rebuilt_every_refresh() {
+    let assets = all_assets();
+    let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
+    for old in [
+        "render('review-cards', withDayHeadings",
+        "render('queue-cards', cards)",
+        "render('completed-body', jobs.map(completedRow))",
+    ] {
+        assert!(!mcr.contains(old), "mcr.js rebuilds a whole list again: {old}");
+    }
+    for new in [
+        "syncKeyedList(reviewList,",
+        "syncKeyedList(queueList,",
+        "syncKeyedList(completedList,",
+        "carryControls(",
+    ] {
+        assert!(mcr.contains(new), "mcr.js no longer reconciles its lists: {new}");
+    }
+}
+
 #[test]
 fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
     let assets = all_assets();
@@ -425,11 +508,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v28_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v30_and_login_v6() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=28"), "admin.html does not import admin.js?v=28");
-    assert!(!admin.contains("/static/admin.js?v=27"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=30"), "admin.html does not import admin.js?v=30");
+    assert!(!admin.contains("/static/admin.js?v=29"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
     assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
@@ -440,6 +523,29 @@ fn the_first_run_password_card_ships_with_admin_v28_and_login_v6() {
     assert!(login_js.contains("password_change_required"), "login.js ignores the first-run flag");
 }
 
+/// The Autonomy card (P11.0) opens the right-hand column and its loader asks
+/// the admin endpoint, building nodes rather than writing HTML.
+#[test]
+fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
+    let assets = all_assets();
+    let admin = assets.get("admin.html").expect("admin.html shipped");
+    let right = admin.find(r#"<div class="stack" style="grid-column:span 2">"#).expect("the right-hand column");
+    let first = admin[right..].find("<section").map(|i| right + i).expect("a card in it");
+    assert!(admin[first..].starts_with(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not first");
+    assert!(admin.contains("A video later marked as wrong counts as touched."));
+    for id in ["autonomy-days", "autonomy-refresh", "autonomy-figures", "autonomy-tables"] {
+        assert!(admin.contains(&format!(r#"id="{id}""#)), "{id} missing");
+    }
+    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
+    let code = code.join("\n");
+    assert!(code.contains("/api/admin/autonomy-report?days="), "admin.js does not load the autonomy report");
+    assert!(code.contains("Delivered untouched"));
+    assert!(code.contains("No finished jobs in this period yet."));
+    assert!(code.contains("Queued by MCR from an offer or a skipped link"));
+    assert!(!code.contains("innerHTML"));
+}
+
 /// P7.12: the wizard is one module under one URL, built with el() only, and the
 /// admin page still hands the first-run session to it.
 #[test]
@@ -447,9 +553,11 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
     let assets = all_assets();
     let wizard = assets.get("static/wizard.js").expect("wizard.js shipped");
     let code: String = wizard.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
-    for banned in ["innerHTML", "outerHTML", "document.write", "insertAdjacentHTML", "http://", "https://"] {
+    for banned in ["innerHTML", "outerHTML", "document.write", "insertAdjacentHTML", "http://", "https://", "service install --account"] {
         assert!(!code.contains(banned), "wizard.js contains {banned}");
     }
+    // P13.1f: the account is changed in place by Setup, not by re-registering the service.
+    assert!(code.contains("/change-account"), "the service-account hints do not point to Setup");
     assert!(code.contains("/api/setup/wizard/account"), "the account step is not wired");
     assert!(code.contains("/api/admin/settings/watchfolder/test"), "the watchfolder test is not wired");
     assert!(code.contains("/api/admin/settings/complete"), "Finish does not complete setup");
@@ -462,7 +570,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["3".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["4".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");

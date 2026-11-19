@@ -49,7 +49,7 @@ pub async fn run(paths: &AppPaths, action: CookiesAction) -> Result<()> {
 
 async fn run_inner(paths: &AppPaths, action: CookiesAction) -> Result<()> {
     let config = AppConfig::load_from_file(&paths.config).with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
-    let repo = Repository::new(paths.resolve(&config.database_path))?;
+    let repo = Repository::new(paths.resolve(&config.database_path))?.with_second_chance_window(&config.retry);
     match action {
         CookiesAction::List => list(&repo),
         CookiesAction::SignIn { domain, browser } => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
@@ -114,14 +114,22 @@ async fn sign_in(paths: &AppPaths, config: &AppConfig, repo: &Repository, raw_do
         Err(e) => return Err(e),
     };
     println!("{}", signin::summary(&domain, &jar, &all));
+    // A second chance for the site's jobs waiting in review for a login (P11.5).
+    let requeued = omni_core::second_chance::after_cookies(repo, &domain);
+    if requeued > 0 {
+        println!("{requeued} job(s) waiting in review for {domain} were queued again.");
+    }
 
     let ytdl = DependencyManager::new(&paths.bin).ytdl_live();
     let stored = repo.list_cookie_jars()?.into_iter().find(|j| j.domain == domain).and_then(|j| j.last_sample_url);
     match (ytdl.exists(), cookies::sample_url_for(&domain, stored.as_deref())) {
         (true, Some(url)) => {
             println!("Testing the login with yt-dlp on {}…", cookies::host_and_path(&url));
-            match omni_broadcast::cookie_file::test_jar(&ytdl, &paths.resolve(&config.temp_path), repo, &domain, &url).await {
+            let pacer = omni_broadcast::pacing::HostPacer::default();
+            let ffmpeg = crate::resolve_ffmpeg(config, &DependencyManager::new(paths.resolve(&config.bin_dir)));
+            match omni_broadcast::cookie_file::test_jar(&ytdl, Some(&ffmpeg), &paths.resolve(&config.temp_path), repo, &domain, &url, &pacer).await {
                 Ok(t) if t.ok => println!("Test ok: yt-dlp reads a video with this login."),
+                Ok(t) if t.inconclusive => println!("Not tested: {}.", t.detail),
                 Ok(t) => println!("Test FAILED: {}", t.detail),
                 Err(why) => println!("The test could not run: {why}"),
             }

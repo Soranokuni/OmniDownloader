@@ -41,6 +41,8 @@ const SHORT_SECS: f64 = 20.0;
 const NOT_CHECKED: &str = "Δεν ελέγχθηκε: υπάρχει ήδη αποδεκτό βίντεο";
 const PROBE_TIMEOUT_DETAIL: &str = "Έληξε ο χρόνος ελέγχου";
 const RESOLVE_TIMEOUT_DETAIL: &str = "Λήξη χρόνου στην ανάλυση";
+/// The platform is limiting requests, or cooling down after it did (P11.4).
+const PROBE_RATE_LIMITED_DETAIL: &str = "Δεν κρίθηκε: η πλατφόρμα περιορίζει προσωρινά τους ελέγχους";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -108,6 +110,7 @@ impl Rejected {
                 c.detail != NOT_CHECKED
                     && !c.detail.starts_with(PROBE_TIMEOUT_DETAIL)
                     && !c.detail.starts_with(RESOLVE_TIMEOUT_DETAIL)
+                    && !c.detail.starts_with(PROBE_RATE_LIMITED_DETAIL)
             }
             _ => false,
         }
@@ -224,8 +227,18 @@ pub struct ToolProber {
 }
 
 impl ToolProber {
-    pub fn new(ffprobe: PathBuf, ytdl: Option<PathBuf>) -> Self {
-        Self { ffprobe, downloader: ytdl.map(Downloader::new) }
+    /// yt-dlp's probes of a platform link wait for their turn in `pacer` (P11.4);
+    /// `ffmpeg` is the daemon's, handed to yt-dlp (P11.4e).
+    pub fn new(ffprobe: PathBuf, ytdl: Option<PathBuf>, ffmpeg: Option<&std::path::Path>, pacer: &crate::pacing::HostPacer) -> Self {
+        Self { ffprobe, downloader: ytdl.map(|y| Downloader::new(y, ffmpeg, pacer)) }
+    }
+
+    /// For a ladder that runs inside a job: its yt-dlp probes wait out a
+    /// platform's cool-down like the job's own runs, bounded by the gate's
+    /// deadline, instead of reporting it at once.
+    pub fn for_a_job(mut self) -> Self {
+        self.downloader = self.downloader.map(Downloader::for_a_job);
+        self
     }
 
     async fn ffprobe(&self, cand: &Candidate, url: &url::Url) -> Result<ProbeInfo, String> {
@@ -356,6 +369,14 @@ async fn check_one(
     let info = match tokio::time::timeout_at(deadline, prober.probe(cand)).await {
         Err(_) => {
             checks.push(check("probe", false, format!("{PROBE_TIMEOUT_DETAIL} ({host})")));
+            return Err(checks);
+        }
+        // The platform is refusing us for now, or cooling down after it did
+        // (P11.4): the candidate was not judged, and the recipe that found it
+        // is not held to account for it.
+        Ok(Err(why)) if crate::errors::classify_download_error(&why) == crate::errors::ErrorCode::RateLimited => {
+            debug!("repair gate: probe of {host} not judged: the platform is limiting requests");
+            checks.push(check("probe", false, format!("{PROBE_RATE_LIMITED_DETAIL} ({host})")));
             return Err(checks);
         }
         Ok(Err(why)) => {
@@ -554,6 +575,38 @@ mod tests {
         assert!(!rejected(vec![check("egress", false, format!("{RESOLVE_TIMEOUT_DETAIL} του a.example"))]).is_conclusive(), "resolve timed out");
         assert!(!rejected(vec![]).is_conclusive());
         assert!(!rejected(vec![check("probe", true, "ok")]).is_conclusive());
+        assert!(!rejected(vec![check("probe", false, format!("{PROBE_RATE_LIMITED_DETAIL} (a.example)"))]).is_conclusive(), "rate limited");
+    }
+
+    /// P11.4 review round 1: a probe refused as a rate limit, or not started
+    /// because the platform cools down, leaves the candidate not judged: never
+    /// a conclusive rejection that would count against its recipe.
+    #[tokio::test]
+    async fn a_rate_limited_probe_leaves_the_candidate_not_judged() {
+        struct Limited;
+        #[async_trait]
+        impl Prober for Limited {
+            async fn probe(&self, cand: &Candidate) -> Result<ProbeInfo, String> {
+                Err(if cand.url.contains("cool") {
+                    crate::pacing::cooling_down_line("youtube", Duration::from_secs(90))
+                } else if cand.url.contains("bot") {
+                    "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies".to_string()
+                } else {
+                    "ERROR: [generic] Unable to download webpage: HTTP Error 404: Not Found".to_string()
+                })
+            }
+        }
+        let cands = vec![cand("https://cdn.example.org/cool.mp4"), cand("https://cdn.example.org/bot.mp4"), cand("https://cdn.example.org/gone.mp4")];
+        // Not media addresses for ffprobe: the Prober is asked about each.
+        let (verified, rejected) = verify(cands, &facts(), &|_| false, &Limited, &public_resolver(), soon()).await;
+        assert!(verified.is_empty());
+        let by = |part: &str| rejected.iter().find(|r| r.candidate.url.contains(part)).unwrap();
+        for part in ["cool", "bot"] {
+            let r = by(part);
+            assert!(!r.is_conclusive(), "{part}: {:?}", r.checks);
+            assert!(r.checks.last().unwrap().detail.starts_with(PROBE_RATE_LIMITED_DETAIL), "{part}");
+        }
+        assert!(by("gone").is_conclusive(), "an ordinary failed probe is still a verdict");
     }
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};

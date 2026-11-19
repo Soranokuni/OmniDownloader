@@ -353,6 +353,61 @@ async fn the_report_takes_one_to_ninety_days_and_counts_what_the_period_holds() 
     Ok(())
 }
 
+#[tokio::test]
+async fn the_autonomy_report_has_its_shape_clamps_the_days_and_names_no_address() -> Result<()> {
+    let app = App::new(None)?;
+    let (status, empty) = app.send("GET", "/api/admin/autonomy-report", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["days"], 14, "14 days by default");
+    assert_eq!((empty["untouched_rate"].clone(), empty["strict_rate"].clone()), (Value::Null, Value::Null), "no video, no rate");
+    assert_eq!(empty["totals"]["ended"], 0);
+    assert_eq!(empty["waiting_now"], 0);
+    for (ask, got) in [("0", 1), ("-5", 1), ("7", 7), ("365", 365), ("9999", 365)] {
+        let (status, json) = app.send("GET", &format!("/api/admin/autonomy-report?days={ask}"), None).await?;
+        assert_eq!(status, StatusCode::OK, "days={ask}");
+        assert_eq!(json["days"], got, "days={ask} is clamped");
+    }
+
+    // One delivered untouched, one sent to review and delivered by hand.
+    let owner = "web:1:0";
+    let mut ids = vec![];
+    for (n, url) in ["https://www.portal.example/a/secret-story-one", "https://www.portal.example/b/secret-story-two"].iter().enumerate() {
+        let id = app
+            .repo
+            .enqueue(&omni_core::models::NewJob::new(*url, &format!("{n}_TESTOPOULOS_SECRETKEY"), "Testopoulos"), DEFAULT_DEDUP_WINDOW_HOURS)?
+            .job_id();
+        assert!(app.repo.lease_job_by_id(id, owner, 180)?);
+        ids.push(id);
+    }
+    assert!(app.repo.finish(ids[0], owner, omni_core::models::JobStatus::Completed, None, None, None)?);
+    assert!(app.repo.finish(ids[1], owner, omni_core::models::JobStatus::RequiresReview, Some("NETWORK"), Some("timed out"), None)?);
+    let (_, one) = app.send("GET", "/api/admin/autonomy-report", None).await?;
+    assert_eq!(one["waiting_now"], 1);
+    assert!(app.repo.mark_completed_manually(ids[1])?);
+
+    let (_, json) = app.send("GET", "/api/admin/autonomy-report?days=30", None).await?;
+    for key in ["totals", "from_mail", "manual", "untouched_rate", "strict_rate", "by_first_error", "by_touch_reason", "by_site", "waiting_now", "days"] {
+        assert!(json.get(key).is_some(), "{key} missing: {json}");
+    }
+    for key in ["ended", "delivered", "delivered_untouched", "delivered_manual", "cancelled", "discarded"] {
+        assert!(json["totals"].get(key).is_some(), "totals.{key} missing: {json}");
+    }
+    assert_eq!(json["totals"]["ended"], 2);
+    assert_eq!(json["untouched_rate"], 0.5);
+    assert_eq!(json["by_first_error"], json!([{ "key": "NETWORK", "count": 1 }]));
+    assert_eq!(json["by_touch_reason"], json!([{ "key": "manual_done", "count": 1 }]));
+    assert_eq!(
+        json["by_site"],
+        json!([{ "site": "portal.example", "needed_person": 1, "delivered_untouched": 1, "total": 2 }])
+    );
+    assert_eq!(json["waiting_now"], 0);
+    let text = json.to_string();
+    for secret in ["secret-story", "SECRETKEY", "TESTOPOULOS", "Testopoulos", "www.portal"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    Ok(())
+}
+
 fn variant(n: usize) -> String {
     format!(r#"{{"dsl_version":1,"steps":[{{"op":"attr","css":"div.p{n}","attr":"data-video"}},{{"op":"abs","from":0}},{{"op":"media","from":1,"referer":"page"}}]}}"#)
 }

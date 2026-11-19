@@ -58,9 +58,13 @@ fn yt_dlp() -> PathBuf {
 /// yt-dlp's metadata for `url` without downloading: `(video id, duration)`,
 /// or its error line.
 async fn resolve(url: &str) -> Result<(String, f64), String> {
+    // Started the way the daemon starts it (P11.4e).
+    let ffmpeg = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin").join("ffmpeg.exe");
+    let mut args = omni_broadcast::downloader::hardening_args(Some(&ffmpeg));
+    args.extend(["--no-warnings", "--simulate", "--no-playlist", "--print", "%(id)s %(duration)s", url].map(String::from));
     let out = run(
         &yt_dlp(),
-        ["--no-warnings", "--simulate", "--no-playlist", "--print", "%(id)s %(duration)s", url],
+        args,
         RunOpts::new(Duration::from_secs(90)).capture_stdout(),
     )
     .await

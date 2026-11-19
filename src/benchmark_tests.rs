@@ -642,11 +642,13 @@ struct Steps {
     /// Addresses the site shows on several of its articles (P3.16).
     furniture: Vec<&'static str>,
     asked: Mutex<Vec<&'static str>>,
+    /// What yt-dlp says instead, when set (it fails with this line).
+    ytdlp_error: Option<String>,
 }
 
 impl Steps {
     fn new(scan: PageScan, sniff_finds: bool, ytdlp_reads: bool) -> Self {
-        Self { scan, sniff_finds, ytdlp_reads, landed: None, sniff_ends_on: None, sniff_streams: vec![(SECRET_STREAM, false)], probes: Vec::new(), furniture: Vec::new(), asked: Mutex::new(Vec::new()) }
+        Self { scan, sniff_finds, ytdlp_reads, landed: None, sniff_ends_on: None, sniff_streams: vec![(SECRET_STREAM, false)], probes: Vec::new(), furniture: Vec::new(), asked: Mutex::new(Vec::new()), ytdlp_error: None }
     }
 
     fn asked(&self) -> Vec<&'static str> {
@@ -670,6 +672,9 @@ impl ExtractSteps for Steps {
     }
     async fn ytdlp(&self, _url: &str) -> std::result::Result<Option<f64>, String> {
         self.asked.lock().unwrap().push("yt-dlp");
+        if let Some(e) = &self.ytdlp_error {
+            return Err(e.clone());
+        }
         if self.ytdlp_reads { Ok(Some(42.0)) } else { Err("ERROR: Unsupported URL".into()) }
     }
     async fn sniff(&self, _url: &str) -> Option<Sniff> {
@@ -889,4 +894,30 @@ async fn a_held_video_left_out_is_not_yt_dlps_pick_after_the_browser() {
     steps.furniture = vec![PROMO];
     assert_eq!(extract_with(&steps, ARTICLE).await.err().as_deref(), Some(ErrorCode::NoStreamFound.as_str()));
     assert!(!steps.asked().contains(&"yt-dlp"), "{:?}", steps.asked());
+}
+
+/// P11.4 review round 1: a platform cooling down after a rate limit is
+/// recorded as RATE_LIMITED, not EXTRACT_TIMEOUT: the real stages' yt-dlp is
+/// not a job's, so it answers at once, and the extraction maps that answer.
+#[tokio::test(start_paused = true)]
+async fn a_cool_down_is_recorded_as_rate_limited_not_as_a_timeout() {
+    let root = Root::new();
+    let paths = root.paths();
+    std::fs::create_dir_all(&paths.data).unwrap();
+    let repo = Repository::new(paths.data.join("omni.db")).unwrap();
+    let pacer = HostPacer::with_jitter(1, Duration::from_secs(8), || Duration::ZERO);
+    pacer.penalize("youtube", omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN);
+    let none = root.0.join("no-tool.exe");
+    let tools = Tools { ytdl: none.clone(), ffmpeg: none.clone(), ffprobe: none.clone(), bmxtranswrap: none };
+    let stages = RealStages::new(repo, tools, paths.benchmark_temp()).with_pacer(pacer);
+    let t0 = tokio::time::Instant::now();
+    let e = ExtractSteps::ytdlp(&stages, "https://youtu.be/abcdefghijk").await.unwrap_err();
+    assert_eq!(tokio::time::Instant::now(), t0, "the benchmark waited for the cool-down");
+    assert_eq!(classify_download_error(&e), ErrorCode::RateLimited, "{e}");
+
+    // The extraction turns that answer into RATE_LIMITED, and does not open the browser on it.
+    let mut steps = Steps::new(PageScan::default(), true, true);
+    steps.ytdlp_error = Some(e);
+    assert_eq!(extract_with(&steps, "https://youtu.be/abcdefghijk").await.err().as_deref(), Some(ErrorCode::RateLimited.as_str()));
+    assert_eq!(steps.asked(), ["site-api", "yt-dlp"]);
 }

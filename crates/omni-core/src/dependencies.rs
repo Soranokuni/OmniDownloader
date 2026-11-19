@@ -390,16 +390,7 @@ impl DependencyManager {
         let live = self.ytdl_dir();
         let staged = self.ytdl_dir_staged();
         if prev.join("yt-dlp.exe").is_file() {
-            // The build being rolled back becomes the new `.prev`, so a
-            // rollback can be undone.
-            if live.exists() {
-                let _ = std::fs::remove_dir_all(&staged);
-                rename_patiently(&live, &staged)?;
-            }
-            rename_patiently(&prev, &live)?;
-            if staged.exists() {
-                let _ = rename_patiently(&staged, &prev);
-            }
+            swap_previous_in(&live, &prev, &staged, rename_patiently)?;
         } else if live.exists() && self.ytdl_legacy().is_file() {
             // Back to the one-file exe: the folder build steps aside as
             // `.prev`, and stepping forward again is another rollback.
@@ -571,12 +562,28 @@ impl DependencyManager {
             anyhow::bail!("No previous Deno to roll back to");
         }
         let live = self.deno_live();
-        let _ = std::fs::remove_file(&live);
-        std::fs::rename(&prev, &live)?;
+        // One rename that replaces the live file: a failure leaves the Deno
+        // that was live in place (P11.4), never no Deno at all.
+        std::fs::rename(&prev, &live)
+            .with_context(|| format!("Could not put the previous Deno in place; the Deno that was live is still at {live:?}"))?;
         info!("Rolled Deno back to the previous build");
         Ok(())
     }
+
+    /// The admin installed a yt-dlp by hand: no update waits any more, so the
+    /// count of nights the nightly one was postponed (P11.4) ends.
+    pub fn forget_ytdl_postponed(&self) {
+        let marker = self.bin_dir.join(YTDL_POSTPONED_MARKER);
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("Could not remove {marker:?}: {e}"),
+            _ => {}
+        }
+    }
 }
+
+/// In `bin/`, next to `yt-dlp.exe.rejected`: the nights in a row the nightly
+/// yt-dlp update was postponed, and the local date of the last one (P11.4).
+pub const YTDL_POSTPONED_MARKER: &str = "yt-dlp.exe.postponed";
 
 /// "deno 2.9.7 (stable, release, x86_64-pc-windows-msvc)" → "2.9.7".
 pub fn parse_deno_version(output: &str) -> Option<String> {
@@ -660,6 +667,36 @@ fn dir_size(dir: &Path) -> u64 {
 /// `rename`, retried briefly: right after a folder is unpacked, or right
 /// after its exe exits, an antivirus scan can hold a handle for a moment
 /// and Windows refuses to move the folder.
+/// Put the folder build at `prev` live (`live`), the one that was live becoming
+/// the new `prev` through `staged`, so a rollback can be undone. `rename` moves
+/// one folder.
+///
+/// A swap that fails leaves the build that was live in place (P11.4): when the
+/// previous build cannot be moved in after the live one stepped aside, the live
+/// one is moved back before the error is returned; the error says when even
+/// that failed and no yt-dlp is in place.
+fn swap_previous_in(live: &Path, prev: &Path, staged: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> Result<()> {
+    let stepped_aside = live.exists();
+    if stepped_aside {
+        let _ = std::fs::remove_dir_all(staged);
+        rename(live, staged).with_context(|| format!("Could not move {live:?} aside; it is still live"))?;
+    }
+    if let Err(e) = rename(prev, live) {
+        if stepped_aside {
+            if let Err(back) = rename(staged, live) {
+                anyhow::bail!(
+                    "Could not put the previous yt-dlp in place ({e}), nor move the one that was live back ({back}): no yt-dlp is in place at {live:?}"
+                );
+            }
+        }
+        return Err(e).with_context(|| format!("Could not put the previous yt-dlp in place; the build that was live is still at {live:?}"));
+    }
+    if staged.exists() {
+        let _ = rename(staged, prev);
+    }
+    Ok(())
+}
+
 fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut last = None;
     for attempt in 0..5 {
@@ -1853,6 +1890,74 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  yt-dlp_macos
         std::fs::write(mgr.ytdl_legacy(), b"one-file").unwrap();
         assert!(mgr.rollback_ytdl().is_err());
         assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"one-file");
+    }
+
+    /// P11.4 review round 3: a swap whose second move fails (the previous
+    /// build cannot be moved in after the live one stepped aside) leaves the
+    /// build that was live at the live path; when even moving it back fails,
+    /// the error says no yt-dlp is in place.
+    #[test]
+    fn a_swap_that_fails_halfway_leaves_the_build_that_was_live_in_place() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.apply_staged_ytdl().unwrap();
+        let (live, prev, staged) = (mgr.ytdl_dir(), mgr.ytdl_dir_previous(), mgr.ytdl_dir_staged());
+        let prev_in_fails = |from: &Path, to: &Path| {
+            if from == prev.as_path() {
+                Err(std::io::Error::other("the previous build is locked"))
+            } else {
+                std::fs::rename(from, to)
+            }
+        };
+        let e = swap_previous_in(&live, &prev, &staged, prev_in_fails).unwrap_err();
+        assert!(format!("{e:#}").contains("still at"), "{e:#}");
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"new build", "the build that was live is not live");
+        assert_eq!(std::fs::read(prev.join("yt-dlp.exe")).unwrap(), b"old build");
+        // The real swap still works afterwards.
+        mgr.rollback_ytdl().unwrap();
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"old build");
+
+        // Nothing can be moved back either: said, not hidden.
+        let only_aside = |from: &Path, to: &Path| if from == live.as_path() { std::fs::rename(from, to) } else { Err(std::io::Error::other("locked")) };
+        let e = swap_previous_in(&live, &prev, &staged, only_aside).unwrap_err();
+        assert!(format!("{e:#}").contains("no yt-dlp is in place"), "{e:#}");
+    }
+
+    /// P11.4 review round 3: a Deno rollback that cannot move the previous one
+    /// in leaves the Deno that was live in place (it used to delete it first).
+    /// Windows: the previous deno.exe held open without sharing (an antivirus
+    /// scan, say) cannot be moved; the live one, which nothing holds, must
+    /// still be there afterwards.
+    #[cfg(windows)]
+    #[test]
+    fn a_deno_rollback_that_fails_leaves_the_live_deno_in_place() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        std::fs::write(mgr.deno_live(), b"new deno").unwrap();
+        std::fs::write(mgr.deno_previous(), b"old deno").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(mgr.deno_previous()).unwrap();
+        assert!(mgr.rollback_deno().is_err());
+        drop(held);
+        assert_eq!(std::fs::read(mgr.deno_live()).unwrap(), b"new deno", "the live Deno was removed");
+        assert_eq!(std::fs::read(mgr.deno_previous()).unwrap(), b"old deno");
+        // Once it is free, the previous Deno replaces it.
+        mgr.rollback_deno().unwrap();
+        assert_eq!(std::fs::read(mgr.deno_live()).unwrap(), b"old deno");
+        assert!(!mgr.deno_previous().exists());
+    }
+
+    #[test]
+    fn a_hand_install_forgets_the_postponed_nights() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        std::fs::write(dir.path().join(YTDL_POSTPONED_MARKER), "3 2026-11-17").unwrap();
+        mgr.forget_ytdl_postponed();
+        assert!(!dir.path().join(YTDL_POSTPONED_MARKER).exists());
+        mgr.forget_ytdl_postponed();
     }
 
     #[test]

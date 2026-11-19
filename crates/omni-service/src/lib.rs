@@ -4,7 +4,9 @@ use std::path::Path;
 use tracing::{error, info};
 
 
+pub mod account;
 pub mod eventlog;
+pub use account::{check_service_logon, grant_service_logon_right, logon_check_from_error, split_account, LogonCheck};
 pub const SERVICE_NAME: &str = "OmniIngestService";
 pub const SERVICE_DISPLAY_NAME: &str = "OmniDownloader Broadcast Ingest Engine";
 pub const SERVICE_DESCRIPTION: &str = "Automated mailbox monitoring, newsroom rundown parsing, browser video extraction, and Sony XDCAM HD422 PAL 1080i50 delivery to the broadcast ingest watchfolder.";
@@ -166,24 +168,10 @@ mod windows_impl {
         Ok(())
     }
 
-    pub fn install(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .context("Failed opening Service Manager with CREATE_SERVICE access")?;
-
-        // `None` means LocalSystem, which is fine for a single machine writing
-        // to a local watchfolder — and wrong the moment the watchfolder is a
-        // UNC share, because LocalSystem authenticates to SMB as the *computer
-        // account*, which a file server will usually refuse (defect W-13). The
-        // caller warns about that; here we just honour what it decided.
-        let (account_name, account_password) = match account {
-            Some(a) => (
-                Some(OsString::from(&a.name)),
-                a.password.as_ref().map(OsString::from),
-            ),
-            None => (None, None),
-        };
-
-        let service_info = ServiceInfo {
+    /// What `install` and `reconfigure` both send: the name, display name,
+    /// type, start type, error control and command line of the service.
+    fn service_info(exe_path: &Path, account_name: Option<OsString>, account_password: Option<OsString>) -> ServiceInfo {
+        ServiceInfo {
             name: OsString::from(SERVICE_NAME),
             display_name: OsString::from(SERVICE_DISPLAY_NAME),
             service_type: ServiceType::OWN_PROCESS,
@@ -194,12 +182,19 @@ mod windows_impl {
             dependencies: vec![],
             account_name,
             account_password,
-        };
+        }
+    }
 
-        let service = manager
-            .create_service(&service_info, INSTALL_ACCESS)
-            .context("Failed creating Windows Service")?;
+    /// The `ServiceInfo` of a change: the account and the password always
+    /// explicit, never windows-service's "no change" (`None`).
+    pub(crate) fn change_info(exe_path: &Path, account: Option<&ServiceAccount>) -> ServiceInfo {
+        let c = super::account_change(account);
+        service_info(exe_path, Some(OsString::from(&c.account_name)), Some(OsString::from(c.password())))
+    }
 
+    /// What a registration gets after the service exists, by `install` and
+    /// `reconfigure` alike, so the two cannot drift.
+    fn configure_registered(service: &windows_service::service::Service) {
         let _ = service.set_description(SERVICE_DESCRIPTION);
 
         // Start after the boot rush (network shares and DNS up), and come
@@ -223,6 +218,32 @@ mod windows_impl {
         if let Err(e) = service.set_failure_actions_on_non_crash_failures(true) {
             info!("Restart after a non-crash failure not set ({})", winapi_detail(&e));
         }
+    }
+
+    pub fn install(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
+            .context("Failed opening Service Manager with CREATE_SERVICE access")?;
+
+        // `None` means LocalSystem, which is fine for a single machine writing
+        // to a local watchfolder — and wrong the moment the watchfolder is a
+        // UNC share, because LocalSystem authenticates to SMB as the *computer
+        // account*, which a file server will usually refuse (defect W-13). The
+        // caller warns about that; here we just honour what it decided.
+        let (account_name, account_password) = match account {
+            Some(a) => (
+                Some(OsString::from(&a.name)),
+                a.password.as_ref().map(OsString::from),
+            ),
+            None => (None, None),
+        };
+
+        let service_info = service_info(exe_path, account_name, account_password);
+
+        let service = manager
+            .create_service(&service_info, INSTALL_ACCESS)
+            .context("Failed creating Windows Service")?;
+
+        configure_registered(&service);
 
         // Register the Event Log source while we still have the administrator
         // rights that creating a service required. A failure here is not fatal
@@ -242,6 +263,24 @@ mod windows_impl {
                 SERVICE_NAME
             ),
         }
+        Ok(())
+    }
+
+    /// Change the existing registration in place: the same command line and
+    /// settings as `install`, the account given (`None` = LocalSystem), then
+    /// what `install` applies after creation. The service is never removed, so
+    /// a refused change leaves the registration as it was.
+    pub fn reconfigure(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .context("Failed opening Service Manager")?;
+        let service = manager
+            .open_service(SERVICE_NAME, INSTALL_ACCESS)
+            .context("Failed opening the service to change its configuration")?;
+        service
+            .change_config(&change_info(exe_path, account))
+            .map_err(|e| anyhow::anyhow!("Failed changing the service configuration ({})", winapi_detail(&e)))?;
+        configure_registered(&service);
+        info!("Windows Service {} now runs as {}", SERVICE_NAME, super::account_change(account).account_name);
         Ok(())
     }
 
@@ -311,11 +350,12 @@ mod windows_impl {
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE).is_ok()
     }
 
-    /// The executable the installed service runs, if it is installed.
+    /// The executable the installed service runs, if it is installed. The SCM
+    /// gives the whole command line (`… omni-ingest.exe run-service`); only the path is returned.
     pub fn installed_exe() -> Option<std::path::PathBuf> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
         let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG).ok()?;
-        Some(service.query_config().ok()?.executable_path)
+        Some(super::exe_of_service_config(&service.query_config().ok()?.executable_path))
     }
 
     pub fn installed_account() -> Option<String> {
@@ -385,6 +425,9 @@ mod non_windows_impl {
     pub fn uninstall() -> Result<()> {
         anyhow::bail!("Windows Service uninstallation is only supported on Windows OS.");
     }
+    pub fn reconfigure() -> Result<()> {
+        anyhow::bail!("Windows Service configuration is only supported on Windows OS.");
+    }
     pub fn start() -> Result<()> {
         anyhow::bail!("Windows Service start is only supported on Windows OS.");
     }
@@ -410,11 +453,57 @@ where
 ///
 /// `password: None` covers the accounts Windows does not take a password for:
 /// the virtual service account `NT SERVICE\OmniIngestService`, and the built-in
-/// `NT AUTHORITY\NetworkService` / `LocalService`.
-#[derive(Debug, Clone)]
+/// `NT AUTHORITY\NetworkService` / `LocalService`. `Debug` hides the password.
+#[derive(Clone)]
 pub struct ServiceAccount {
     pub name: String,
     pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ServiceAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccount")
+            .field("name", &self.name)
+            .field("password", &self.password.as_ref().map(|_| "<hidden>"))
+            .finish()
+    }
+}
+
+/// The account part of an in-place change of the registration
+/// ([`reconfigure_service`]). Both values are always sent: windows-service
+/// reads a missing account as "do not change" (not LocalSystem) and a missing
+/// password the same way, which would keep an old password with a new account.
+/// `Debug` hides the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountChange {
+    /// `LocalSystem` for none, the account's name otherwise.
+    pub account_name: String,
+    password: String,
+}
+
+impl AccountChange {
+    /// The account's password, or the empty string Windows takes for an
+    /// account that has none (the virtual account, the built-ins, LocalSystem).
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+}
+
+impl std::fmt::Debug for AccountChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountChange")
+            .field("account_name", &self.account_name)
+            .field("password", &if self.password.is_empty() { "<empty>" } else { "<hidden>" })
+            .finish()
+    }
+}
+
+/// What [`reconfigure_service`] sends for `account` (`None` = LocalSystem). Pure.
+pub fn account_change(account: Option<&ServiceAccount>) -> AccountChange {
+    match account {
+        None => AccountChange { account_name: "LocalSystem".into(), password: String::new() },
+        Some(a) => AccountChange { account_name: a.name.clone(), password: a.password.clone().unwrap_or_default() },
+    }
 }
 
 impl ServiceAccount {
@@ -487,6 +576,19 @@ pub fn install_service(exe_path: &Path, account: Option<&ServiceAccount>) -> Res
     }
 }
 
+/// Change the installed service in place: its command line (`exe_path
+/// run-service`), the settings `install_service` gives it, and the account
+/// (`None` = LocalSystem). The registration is never removed.
+pub fn reconfigure_service(exe_path: &Path, account: Option<&ServiceAccount>) -> Result<()> {
+    #[cfg(windows)]
+    return windows_impl::reconfigure(exe_path, account);
+    #[cfg(not(windows))]
+    {
+        let _ = (exe_path, account);
+        return non_windows_impl::reconfigure();
+    }
+}
+
 pub fn uninstall_service() -> Result<()> {
     #[cfg(windows)]
     return windows_impl::uninstall();
@@ -523,8 +625,36 @@ pub fn can_install_services() -> bool {
     return false;
 }
 
-/// The executable the installed service points at; `None` when the
-/// service is not installed.
+/// The executable of a service's registered command line, which the SCM
+/// stores whole: `"C:\Program Files\X\a.exe" run-service` → the quoted part;
+/// unquoted → the longest prefix ending in `.exe` (any case) before whitespace
+/// or the end, which also reads a path with spaces someone set by hand with
+/// `sc`; no `.exe` at all → the whole string; empty → empty.
+pub fn exe_of_service_command(command: &str) -> std::path::PathBuf {
+    let s = command.trim();
+    if let Some(rest) = s.strip_prefix('"') {
+        return std::path::PathBuf::from(rest.split('"').next().unwrap_or(rest));
+    }
+    let lower = s.to_ascii_lowercase();
+    let longest = lower
+        .match_indices(".exe")
+        .map(|(i, _)| i + 4)
+        .filter(|&end| s[end..].chars().next().map_or(true, char::is_whitespace))
+        .last();
+    std::path::PathBuf::from(match longest {
+        Some(end) => &s[..end],
+        None => s,
+    })
+}
+
+/// The executable in what `query_config` reports as `executable_path`, which
+/// windows-service fills with the SCM's whole command line.
+pub fn exe_of_service_config(executable_path: &Path) -> std::path::PathBuf {
+    exe_of_service_command(&executable_path.to_string_lossy())
+}
+
+/// The executable the installed service points at (its path, without the
+/// command line's arguments); `None` when the service is not installed.
 pub fn installed_service_exe() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     return windows_impl::installed_exe();
@@ -556,6 +686,48 @@ pub fn stop_service_and_wait(timeout: std::time::Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SCM returns the whole command line; comparing that with the install
+    /// folder's exe never matched, so every upgrade re-registered the service.
+    #[test]
+    fn the_installed_executable_is_the_path_not_the_command_line() {
+        let exe = |s: &str| exe_of_service_command(s);
+        assert_eq!(exe(r"C:\OmniIngest\omni-ingest.exe run-service"), Path::new(r"C:\OmniIngest\omni-ingest.exe"));
+        assert_eq!(
+            exe(r#""C:\Program Files\Omni Ingest\omni-ingest.exe" run-service"#),
+            Path::new(r"C:\Program Files\Omni Ingest\omni-ingest.exe")
+        );
+        assert_eq!(exe(r"C:\OmniIngest\omni-ingest.exe"), Path::new(r"C:\OmniIngest\omni-ingest.exe"));
+        assert_eq!(exe(r#""C:\OmniIngest\omni-ingest.exe""#), Path::new(r"C:\OmniIngest\omni-ingest.exe"));
+        assert_eq!(exe(""), Path::new(""));
+        assert_eq!(exe("   "), Path::new(""));
+    }
+
+    /// What `installed_exe` hands on is the path, for every form the SCM stores.
+    #[test]
+    fn the_service_config_s_executable_path_is_read_as_the_executable() {
+        for (raw, exe) in [
+            (r"C:\OmniIngest\omni-ingest.exe run-service", r"C:\OmniIngest\omni-ingest.exe"),
+            (r#""C:\Program Files\Omni Ingest\omni-ingest.exe" run-service"#, r"C:\Program Files\Omni Ingest\omni-ingest.exe"),
+            (r"C:\OmniIngest\omni-ingest.exe", r"C:\OmniIngest\omni-ingest.exe"),
+        ] {
+            assert_eq!(exe_of_service_config(Path::new(raw)), Path::new(exe), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_hand_edited_unquoted_path_with_spaces_is_read_to_its_last_exe() {
+        let exe = |s: &str| exe_of_service_command(s);
+        assert_eq!(
+            exe(r"C:\Program Files\Omni Ingest\omni-ingest.EXE run-service"),
+            Path::new(r"C:\Program Files\Omni Ingest\omni-ingest.EXE")
+        );
+        assert_eq!(exe(r"C:\tools.exe dir\omni-ingest.exe run-service"), Path::new(r"C:\tools.exe dir\omni-ingest.exe"));
+        // ".exe" inside a folder name is not the end of the path.
+        assert_eq!(exe(r"C:\a.exed\omni-ingest.exe run-service"), Path::new(r"C:\a.exed\omni-ingest.exe"));
+        // No .exe at all: the whole string.
+        assert_eq!(exe(r"C:\Omni Ingest\omni-ingest run-service"), Path::new(r"C:\Omni Ingest\omni-ingest run-service"));
+    }
 
     #[test]
     fn builtin_accounts_that_take_no_password_are_recognised() {
@@ -615,6 +787,52 @@ mod tests {
         assert!(windows_impl::INSTALL_ACCESS.contains(ServiceAccess::CHANGE_CONFIG));
         assert!(windows_impl::INSTALL_ACCESS.contains(ServiceAccess::START));
         assert!(windows_impl::STOP_WAIT_HINT.as_secs() >= 50, "covers the 25 s delivery wait plus the 20 s runtime shutdown");
+    }
+
+    /// P13.1b2 B1: a change always names the account and a password, never
+    /// windows-service's "no change", which would keep the old account (for
+    /// LocalSystem) or the old password (for a new account).
+    #[test]
+    fn an_account_change_always_names_the_account_and_a_password() {
+        let system = account_change(None);
+        assert_eq!((system.account_name.as_str(), system.password()), ("LocalSystem", ""));
+        let virt = ServiceAccount { name: DEFAULT_SERVICE_ACCOUNT.into(), password: None };
+        let c = account_change(Some(&virt));
+        assert_eq!((c.account_name.as_str(), c.password()), (DEFAULT_SERVICE_ACCOUNT, ""));
+        let named = ServiceAccount::with_password(r"NEWSROOM\svc_test", "Tr0ub4dor-test-only");
+        let c = account_change(Some(&named));
+        assert_eq!((c.account_name.as_str(), c.password()), (r"NEWSROOM\svc_test", "Tr0ub4dor-test-only"));
+        for shown in [format!("{c:?}"), format!("{named:?}")] {
+            assert!(!shown.contains("Tr0ub4dor-test-only"), "{shown}");
+            assert!(shown.contains("<hidden>") && shown.contains(r"NEWSROOM\\svc_test"), "{shown}");
+        }
+    }
+
+    /// What reaches `ChangeServiceConfigW`: the install's command line and
+    /// settings, and both account values present.
+    #[cfg(windows)]
+    #[test]
+    fn the_change_sends_the_install_s_settings_and_never_none_for_the_account() {
+        use windows_service::service::{ServiceErrorControl, ServiceStartType, ServiceType};
+        let exe = Path::new(r"C:\OmniTest\omni-ingest.exe");
+        let named = ServiceAccount::with_password(r"NEWSROOM\svc_test", "Tr0ub4dor-test-only");
+        let virt = ServiceAccount { name: DEFAULT_SERVICE_ACCOUNT.into(), password: None };
+        for (account, name, password) in [
+            (None, "LocalSystem", ""),
+            (Some(&virt), DEFAULT_SERVICE_ACCOUNT, ""),
+            (Some(&named), r"NEWSROOM\svc_test", "Tr0ub4dor-test-only"),
+        ] {
+            let info = windows_impl::change_info(exe, account);
+            assert_eq!(info.account_name.as_deref(), Some(std::ffi::OsStr::new(name)));
+            assert_eq!(info.account_password.as_deref(), Some(std::ffi::OsStr::new(password)));
+            assert_eq!(info.name, SERVICE_NAME);
+            assert_eq!(info.display_name, SERVICE_DISPLAY_NAME);
+            assert_eq!(info.service_type, ServiceType::OWN_PROCESS);
+            assert_eq!(info.start_type, ServiceStartType::AutoStart);
+            assert_eq!(info.error_control, ServiceErrorControl::Normal);
+            assert_eq!(info.executable_path, exe);
+            assert_eq!(info.launch_arguments, ["run-service"]);
+        }
     }
 
     #[test]

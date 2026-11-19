@@ -67,6 +67,39 @@ impl std::fmt::Display for LeaseLostBeforeRename {
 
 impl std::error::Error for LeaseLostBeforeRename {}
 
+/// Why [`WatchfolderDelivery::deliver_with`] delivered nothing (P11.2a), so
+/// the caller can tell a share that does not answer from a delivery that will
+/// never work. Each carries the message the failure always had.
+#[derive(Debug)]
+pub enum DeliveryError {
+    /// The watchfolder could not be written: creating it, the copy, the flush,
+    /// the size check, or a rename that did not land. Worth waiting for.
+    Unreachable(String),
+    /// Refused by the delivery itself, whatever the share does: the source is
+    /// not readable or has no bytes, or 999 files already carry the slug.
+    Refused(String),
+}
+
+impl DeliveryError {
+    fn unreachable(e: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self::Unreachable(format!("{e:#}")))
+    }
+
+    fn refused(e: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self::Refused(format!("{e:#}")))
+    }
+}
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(m) | Self::Refused(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
 /// Exactly `.<name>.mxf.tmp`: the staging name this module writes.
 fn is_staging_name(name: &str) -> bool {
     name.len() > ".mxf.tmp".len() + 1 && name.starts_with('.') && name.ends_with(".mxf.tmp")
@@ -77,6 +110,49 @@ fn is_probe_name(name: &str) -> bool {
     name.strip_prefix(".omni-probe-")
         .and_then(|rest| rest.strip_suffix(".tmp"))
         .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The staging file a delivery of a video that waited for the watchfolder
+/// left when the share dropped (P11.2a): `.{filename}.tmp` in `dir`, removed
+/// however young, but only when it was last touched before this delivery run
+/// began (`run_started`, P11.2b: a newer one is another copy's, not a cut
+/// one), this process is not writing it (in-flight registry) and nothing
+/// anywhere holds it open (exclusive open). Without it the delivery after the
+/// wait, which comes inside [`STALE_STAGING_AGE`], would skip its own name and
+/// land as `_2`. Only for that delivery's own names; every other staging
+/// file, and one newer than the run's start, keeps the age rule. Blocking
+/// file I/O.
+pub fn reclaim_own_staging(dir: &Path, filename: &str, run_started: SystemTime) -> bool {
+    let Some(claim) = StagingClaim::try_new(dir.join(format!(".{filename}.tmp"))) else {
+        return false;
+    };
+    let path = claim.path();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    // The newer of last-write and creation, as for the age rule.
+    let last_touched = [meta.modified().ok(), meta.created().ok()].into_iter().flatten().max();
+    let before_run = last_touched.is_some_and(|t| t < run_started);
+    if !meta.is_file() || !before_run || !unheld(path) {
+        return false;
+    }
+    let removed = std::fs::remove_file(path).is_ok();
+    if removed {
+        info!("Removed the staging file {filename} left by the interrupted delivery");
+    }
+    removed
+}
+
+/// Nothing anywhere has `path` open: an exclusive open succeeds (closed again at once).
+fn unheld(path: &Path) -> bool {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    opts.open(path).is_ok()
 }
 
 /// Remove `path` if it is a leftover: old enough and not open anywhere. The
@@ -224,6 +300,9 @@ impl WatchfolderDelivery {
     /// error. Either way the staging file is removed and nothing is renamed.
     /// The hook runs again if the name has to change because something took it
     /// during the copy, so it always describes the path about to be renamed to.
+    ///
+    /// Every other failure is a [`DeliveryError`] (P11.2a): `Unreachable` for
+    /// the watchfolder's own I/O, `Refused` for what no wait can fix.
     pub async fn deliver_with<F>(
         source_file: &Path,
         watchfolder_dir: &Path,
@@ -235,19 +314,22 @@ impl WatchfolderDelivery {
     {
         tokio::fs::create_dir_all(watchfolder_dir)
             .await
-            .with_context(|| format!("Failed creating watchfolder {watchfolder_dir:?}"))?;
+            .with_context(|| format!("Failed creating watchfolder {watchfolder_dir:?}"))
+            .map_err(DeliveryError::unreachable)?;
 
         let source_bytes = tokio::fs::metadata(source_file)
             .await
-            .with_context(|| format!("Delivery source {source_file:?} is not readable"))?
+            .with_context(|| format!("Delivery source {source_file:?} is not readable"))
+            .map_err(DeliveryError::refused)?
             .len();
         if source_bytes == 0 {
-            return Err(anyhow!(
+            return Err(DeliveryError::refused(anyhow!(
                 "Refusing to deliver a zero-byte file for slug {slug}"
-            ));
+            )));
         }
 
-        let (mut final_dest, mut filename, mut n, staged) = Self::pick_free_name(watchfolder_dir, slug).await?;
+        let (mut final_dest, mut filename, mut n, staged) =
+            Self::pick_free_name(watchfolder_dir, slug).await.map_err(DeliveryError::refused)?;
 
         // Always stage through a hidden temporary file in the *destination*
         // directory. The same-volume rename shortcut is deliberately not used:
@@ -264,14 +346,14 @@ impl WatchfolderDelivery {
             Ok(n) => n,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&temp_dest).await;
-                return Err(e);
+                return Err(DeliveryError::unreachable(e));
             }
         };
         if written != source_bytes {
             let _ = tokio::fs::remove_file(&temp_dest).await;
-            return Err(anyhow!(
+            return Err(DeliveryError::unreachable(anyhow!(
                 "Short write delivering {slug}: {written} bytes written, {source_bytes} expected"
-            ));
+            )));
         }
 
         // The last moment before the file can be seen under its final name: the
@@ -296,7 +378,8 @@ impl WatchfolderDelivery {
             let (from, to) = (temp_dest.clone(), final_dest.clone());
             let renamed = tokio::task::spawn_blocking(move || omni_core::fsutil::rename_no_replace(&from, &to))
                 .await
-                .context("delivery rename task")?;
+                .context("delivery rename task")
+                .map_err(DeliveryError::unreachable)?;
             match renamed {
                 Ok(()) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -305,9 +388,9 @@ impl WatchfolderDelivery {
                     let next = Self::next_free_after(watchfolder_dir, slug, n);
                     let Some((next_n, next_name)) = next else {
                         let _ = tokio::fs::remove_file(&temp_dest).await;
-                        return Err(anyhow!(
+                        return Err(DeliveryError::refused(anyhow!(
                             "Refusing to deliver {slug}: 999 files with that slug already exist in the watchfolder"
-                        ));
+                        )));
                     };
                     warn!("{taken} appeared in the watchfolder during the copy; delivering as {next_name}");
                     (n, filename) = (next_n, next_name);
@@ -322,7 +405,9 @@ impl WatchfolderDelivery {
                         warn!("The rename to {filename} reported an error ({e}) but the file arrived complete; treating it as delivered");
                         break;
                     }
-                    return Err(anyhow::Error::new(e).context(format!("Failed atomic rename to {final_dest:?}")));
+                    return Err(DeliveryError::unreachable(
+                        anyhow::Error::new(e).context(format!("Failed atomic rename to {final_dest:?}")),
+                    ));
                 }
             }
         }
@@ -865,6 +950,139 @@ mod tests {
         assert_eq!(names(&watchfolder), vec!["13_ANNA_CLIP.mxf".to_string(), "13_ANNA_CLIP_2.mxf".to_string()]);
         // The hook was told about the name that was really used.
         assert_eq!(seen, vec![watchfolder.join("13_ANNA_CLIP.mxf"), watchfolder.join("13_ANNA_CLIP_2.mxf")]);
+    }
+
+    /// P11.2a review: the waiting delivery's own leftover staging file goes
+    /// whatever its age, but never one this process is writing or anything
+    /// holds open, and never another name's.
+    #[tokio::test]
+    async fn a_waiting_deliverys_own_fresh_staging_file_is_reclaimed_but_never_one_in_use() {
+        let (_d, watchfolder, _work) = scratch().await;
+        let own = watchfolder.join(".20_ANNA_CLIP.mxf.tmp");
+        let other = watchfolder.join(".21_ANNA_CLIP.mxf.tmp");
+        std::fs::write(&own, b"half a copy, a minute old").unwrap();
+        std::fs::write(&other, b"someone else's fresh copy").unwrap();
+        // This delivery run began after the cut copy was written.
+        let parked = SystemTime::now() + Duration::from_secs(1);
+
+        // In this process's in-flight registry: kept.
+        let claim = StagingClaim::try_new(own.clone()).expect("claimed");
+        assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked));
+        assert!(own.exists());
+        drop(claim);
+
+        // Held open by another handle (another machine's copy): kept.
+        #[cfg(windows)]
+        {
+            let handle = std::fs::File::open(&own).unwrap();
+            assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked));
+            assert!(own.exists());
+            drop(handle);
+        }
+
+        assert!(reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked), "a fresh leftover of our own name");
+        assert!(!own.exists());
+        assert!(other.exists(), "another name's fresh staging file keeps the age rule");
+        assert_eq!(sweep_stale_staging(&watchfolder), 0);
+        assert!(!reclaim_own_staging(&watchfolder, "20_ANNA_CLIP.mxf", parked), "nothing left to reclaim");
+    }
+
+    /// P11.2b review finding 2: a staging file of the video's own name that
+    /// was already there when this delivery run began is a cut copy, whatever
+    /// its age; one created after the run began (another instance's fresh
+    /// copy) keeps the age rule.
+    #[tokio::test]
+    async fn only_a_staging_file_older_than_the_run_start_is_reclaimed() {
+        let (_d, watchfolder, _work) = scratch().await;
+        let own = watchfolder.join(".22_ANNA_CLIP.mxf.tmp");
+        let run_started = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&own, b"a copy started after this run began").unwrap();
+
+        assert!(!reclaim_own_staging(&watchfolder, "22_ANNA_CLIP.mxf", run_started));
+        assert!(own.exists(), "a staging file newer than the run's start was reclaimed");
+        assert!(!remove_if_stale(&own), "and the age rule keeps it too");
+
+        // The next run starts after it was written: it is a cut copy, reclaimed.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(reclaim_own_staging(&watchfolder, "22_ANNA_CLIP.mxf", SystemTime::now()));
+        assert!(!own.exists());
+    }
+
+    fn kind(err: &anyhow::Error) -> &'static str {
+        match err.downcast_ref::<DeliveryError>() {
+            Some(DeliveryError::Unreachable(_)) => "unreachable",
+            Some(DeliveryError::Refused(_)) => "refused",
+            None => "other",
+        }
+    }
+
+    /// P11.2a: the caller parks the video for a share that does not answer, and
+    /// only for that; a delivery that can never work is not waited for.
+    #[tokio::test]
+    async fn each_failure_says_whether_waiting_for_the_watchfolder_can_help() {
+        let (d, watchfolder, work) = scratch().await;
+        let src = source(&work, "out.mxf", b"A_FINISHED_MXF").await;
+
+        // The watchfolder cannot be created (its parent is a file): unreachable.
+        let blocker = d.path().join("blocker");
+        std::fs::write(&blocker, b"a file where the share should be").unwrap();
+        let err = WatchfolderDelivery::deliver(&src, &blocker.join("watch"), "1_ANNA_CLIP").await.unwrap_err();
+        assert_eq!(kind(&err), "unreachable", "{err:#}");
+        assert!(err.to_string().contains("Failed creating watchfolder"), "the message is kept: {err}");
+
+        // The source is gone, or empty: refused.
+        let err = WatchfolderDelivery::deliver(&work.join("missing.mxf"), &watchfolder, "2_ANNA_CLIP").await.unwrap_err();
+        assert_eq!(kind(&err), "refused", "{err:#}");
+        assert!(err.to_string().contains("is not readable"), "{err}");
+        let empty = source(&work, "empty.mxf", b"").await;
+        let err = WatchfolderDelivery::deliver(&empty, &watchfolder, "3_ANNA_CLIP").await.unwrap_err();
+        assert_eq!(kind(&err), "refused", "{err:#}");
+        assert!(err.to_string().contains("zero-byte"), "{err}");
+
+        // 999 files with the slug, found at the pick: refused.
+        for n in 1..=999u32 {
+            let name = if n == 1 { "4_ANNA_CLIP.mxf".to_string() } else { format!("4_ANNA_CLIP_{n}.mxf") };
+            std::fs::write(watchfolder.join(name), b"x").unwrap();
+        }
+        let err = WatchfolderDelivery::deliver(&src, &watchfolder, "4_ANNA_CLIP").await.unwrap_err();
+        assert_eq!(kind(&err), "refused", "{err:#}");
+        assert!(err.to_string().contains("999 files"), "{err}");
+
+        // ... and taken during the copy, at the rename: refused too.
+        let wf = watchfolder.clone();
+        let err = WatchfolderDelivery::deliver_with(&src, &watchfolder, "5_ANNA_CLIP", |_, _| {
+            for n in 1..=999u32 {
+                let name = if n == 1 { "5_ANNA_CLIP.mxf".to_string() } else { format!("5_ANNA_CLIP_{n}.mxf") };
+                let _ = std::fs::write(wf.join(name), b"x");
+            }
+            Ok(true)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(kind(&err), "refused", "{err:#}");
+
+        // The hook's own answers keep their own types.
+        let err = WatchfolderDelivery::deliver_with(&src, &watchfolder, "6_ANNA_CLIP", |_, _| Ok(false)).await.unwrap_err();
+        assert!(err.downcast_ref::<LeaseLostBeforeRename>().is_some(), "{err:#}");
+        assert_eq!(kind(&err), "other");
+        let err = WatchfolderDelivery::deliver_with(&src, &watchfolder, "6_ANNA_CLIP", |_, _| Err(anyhow!("db down"))).await.unwrap_err();
+        assert_eq!(kind(&err), "other", "{err:#}");
+    }
+
+    /// The copy itself failing (the source held open with no sharing, as a
+    /// share that dropped mid-copy fails it): unreachable, nothing left behind.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_copy_that_fails_is_unreachable_and_leaves_no_staging_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_d, watchfolder, work) = scratch().await;
+        let src = source(&work, "out.mxf", b"A_FINISHED_MXF").await;
+        let _exclusive = std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&src).unwrap();
+        let err = WatchfolderDelivery::deliver(&src, &watchfolder, "7_ANNA_CLIP").await.unwrap_err();
+        assert_eq!(kind(&err), "unreachable", "{err:#}");
+        assert!(err.to_string().contains("Failed copying"), "{err}");
+        assert!(names(&watchfolder).is_empty(), "{:?}", names(&watchfolder));
     }
 
     #[test]

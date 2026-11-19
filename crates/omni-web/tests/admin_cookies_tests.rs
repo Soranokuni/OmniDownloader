@@ -285,3 +285,62 @@ async fn the_twenty_first_site_is_refused() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     Ok(())
 }
+
+/// A job on `url` waiting in review with `code`, as its worker leaves it.
+fn job_in_review(repo: &Repository, url: &str, slug: &str, code: &str) -> Result<i64> {
+    use omni_core::models::{JobStatus, NewJob};
+    let id = repo.enqueue(&NewJob::new(url.to_string(), slug.to_string(), "ANNA"), 24)?.job_id();
+    assert!(repo.lease_job_by_id(id, "host:1:0", 180)?);
+    assert!(repo.finish(id, "host:1:0", JobStatus::RequiresReview, Some(code), Some("login"), None)?);
+    Ok(id)
+}
+
+fn status_of(repo: &Repository, id: i64) -> omni_core::models::JobStatus {
+    repo.get_job(id).unwrap().unwrap().status
+}
+
+/// P11.5: a saved jar gives the site's login jobs in review a second chance;
+/// another site's job and a job a person acted on stay.
+#[tokio::test]
+async fn an_upload_gives_the_sites_login_jobs_a_second_chance() -> Result<()> {
+    use omni_core::models::JobStatus;
+    let app = App::new(None)?;
+    let login = job_in_review(&app.repo, "https://twitter.com/someone/status/1", "1_ANNA_TEST", "LOGIN_REQUIRED")?;
+    let other = job_in_review(&app.repo, "https://www.instagram.com/p/abc", "2_ANNA_TEST", "LOGIN_REQUIRED")?;
+    let touched = job_in_review(&app.repo, "https://x.com/someone/status/3", "3_ANNA_TEST", "LOGIN_REQUIRED")?;
+    assert!(app.repo.retry_job(touched, None)?);
+    assert!(app.repo.lease_job_by_id(touched, "host:1:0", 180)?);
+    assert!(app.repo.finish(touched, "host:1:0", JobStatus::RequiresReview, Some("LOGIN_REQUIRED"), Some("login"), None)?);
+
+    let (status, body) = app.upload("x.com", &jar_text(VALUE, 4_102_444_800)).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status_of(&app.repo, login), JobStatus::Pending);
+    let causes = app.repo.second_chances(login)?;
+    assert!(causes.len() == 1 && causes[0].starts_with("cookies:x.com:"), "{causes:?}");
+    assert_eq!(status_of(&app.repo, other), JobStatus::RequiresReview, "another site's job moved");
+    assert_eq!(status_of(&app.repo, touched), JobStatus::RequiresReview, "a job a person acted on moved");
+    let audit = app.audit().await?;
+    assert!(!audit.contains(VALUE), "{audit}");
+    Ok(())
+}
+
+/// P11.5: a test that logs in gives a second chance; a failed one does not.
+#[tokio::test]
+async fn a_passing_test_gives_a_second_chance_and_a_failing_one_does_not() -> Result<()> {
+    use omni_core::models::JobStatus;
+    let failing = tester(Ok((false, "ERROR: login required".into())));
+    let app = App::new(Some(failing.clone()))?;
+    app.upload("x.com", &jar_text(VALUE, 4_102_444_800)).await?;
+    // A job that went to review after the upload.
+    let id = job_in_review(&app.repo, "https://x.com/someone/status/1", "1_ANNA_TEST", "LOGIN_REQUIRED")?;
+    let test = || app.send("POST", "/api/admin/cookies/x.com/test", Some(json!({ "url": "https://x.com/a/status/1" })), true);
+    let (status, _) = test().await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_of(&app.repo, id), JobStatus::RequiresReview, "a failing test moved a job");
+
+    *failing.answer.lock().unwrap() = Ok((true, "ok".into()));
+    let (status, _) = test().await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_of(&app.repo, id), JobStatus::Pending, "a passing test did not move the login job");
+    Ok(())
+}

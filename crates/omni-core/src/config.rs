@@ -579,6 +579,85 @@ impl Default for RepairConfig {
     }
 }
 
+/// Automatic retries of a failed job (`retry` in config.json, P11.3a). Old
+/// files without the section load with these defaults. Values are read
+/// where they are used, not checked at load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// No automatic retry for a job older than this, counted from when it was
+    /// queued or from MCR's last «Δοκιμή ξανά» (read as 30..=360).
+    #[serde(default = "default_retry_max_age_mins")]
+    pub max_age_mins: i64,
+    /// Minutes after which a job not yet delivered counts as late on the
+    /// desk's late strip (P11.3b; read as 1..=120).
+    #[serde(default = "default_late_after_mins")]
+    pub late_after_mins: i64,
+    /// The same for an urgent job (read as 1..=120).
+    #[serde(default = "default_late_after_urgent_mins")]
+    pub late_after_urgent_mins: i64,
+    /// How old (counted like `max_age_mins`) a job waiting in review may be and
+    /// still be re-queued once per fixed cause: a kept yt-dlp, a cookie jar, a
+    /// site that works again (P11.5, `omni_core::second_chance`; read as 30..=360).
+    #[serde(default = "default_second_chance_window_mins")]
+    pub second_chance_window_mins: i64,
+}
+
+fn default_retry_max_age_mins() -> i64 {
+    120
+}
+
+fn default_late_after_mins() -> i64 {
+    10
+}
+
+fn default_late_after_urgent_mins() -> i64 {
+    5
+}
+
+fn default_second_chance_window_mins() -> i64 {
+    120
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_age_mins: default_retry_max_age_mins(),
+            late_after_mins: default_late_after_mins(),
+            late_after_urgent_mins: default_late_after_urgent_mins(),
+            second_chance_window_mins: default_second_chance_window_mins(),
+        }
+    }
+}
+
+/// Pacing of yt-dlp per video platform (`pacing` in config.json, P11.4). Old
+/// files without the section load with these defaults. Values are read where
+/// they are used, not checked at load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacingConfig {
+    /// yt-dlp runs starting at one platform (YouTube, X, …) at a time (read
+    /// as 1..=4); a download gives its turn back once its transfer begins.
+    #[serde(default = "default_pacing_per_host_concurrency")]
+    pub per_host_concurrency: i64,
+    /// Seconds between two starts on one platform, plus up to 4 s of jitter
+    /// (read as 0..=120; 0 switches the gap off).
+    #[serde(default = "default_pacing_min_gap_secs")]
+    pub min_gap_secs: i64,
+}
+
+fn default_pacing_per_host_concurrency() -> i64 {
+    1
+}
+
+fn default_pacing_min_gap_secs() -> i64 {
+    8
+}
+
+impl Default for PacingConfig {
+    fn default() -> Self {
+        Self { per_host_concurrency: default_pacing_per_host_concurrency(), min_gap_secs: default_pacing_min_gap_secs() }
+    }
+}
+
 /// The delivered source archive (plan P1.7): after a video is in the
 /// watchfolder its downloaded source is kept under
 /// `{path}/YYYY/MM/DD/` for `retention_days`, with a JSON sidecar, instead
@@ -801,6 +880,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub repair: RepairConfig,
 
+    /// Automatic retries of a failed job (P11.3a).
+    #[serde(default)]
+    pub retry: RetryConfig,
+
+    /// yt-dlp paced per video platform (P11.4).
+    #[serde(default)]
+    pub pacing: PacingConfig,
+
     /// Delivered sources kept for a while after air (plan P1.7).
     #[serde(default)]
     pub archive: ArchiveConfig,
@@ -917,6 +1004,8 @@ impl Default for AppConfig {
             ollama_model: default_ollama_model(),
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
+            retry: RetryConfig::default(),
+            pacing: PacingConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
             setup_completed: false,
@@ -1153,6 +1242,52 @@ mod tests {
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);
         assert_eq!(set.repair.evidence_max_mb, 200);
+    }
+
+    #[test]
+    fn retry_section_defaults_and_parses() {
+        let check = |r: &RetryConfig, want: (i64, i64, i64, i64)| {
+            assert_eq!((r.max_age_mins, r.late_after_mins, r.late_after_urgent_mins, r.second_chance_window_mins), want);
+        };
+        // A config without the section loads with the owner's numbers.
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        check(&old.retry, (120, 10, 5, 120));
+        check(&AppConfig::default().retry, (120, 10, 5, 120));
+        check(&RetryConfig::default(), (120, 10, 5, 120));
+        // A key that is set is taken; the others keep their defaults.
+        let set: AppConfig = serde_json::from_str(r#"{"retry":{"max_age_mins":60,"late_after_urgent_mins":3}}"#).unwrap();
+        check(&set.retry, (60, 10, 3, 120));
+        let all: AppConfig = serde_json::from_str(
+            r#"{"retry":{"max_age_mins":200,"late_after_mins":15,"late_after_urgent_mins":7,"second_chance_window_mins":90}}"#,
+        )
+        .unwrap();
+        check(&all.retry, (200, 15, 7, 90));
+        // Saved and read back unchanged.
+        let back: AppConfig = serde_json::from_str(&serde_json::to_string(&all).unwrap()).unwrap();
+        check(&back.retry, (200, 15, 7, 90));
+    }
+
+    /// P11.4: one run per platform, 8 s apart, unless set; a config without
+    /// the section loads; a key that is set is taken as written (clamped where used).
+    #[test]
+    fn pacing_section_defaults_and_parses() {
+        let check = |p: &PacingConfig, want: (i64, i64)| assert_eq!((p.per_host_concurrency, p.min_gap_secs), want);
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        check(&old.pacing, (1, 8));
+        check(&AppConfig::default().pacing, (1, 8));
+        check(&PacingConfig::default(), (1, 8));
+        let set: AppConfig = serde_json::from_str(r#"{"pacing":{"min_gap_secs":0}}"#).unwrap();
+        check(&set.pacing, (1, 0));
+        let all: AppConfig =
+            serde_json::from_str(r#"{"pacing":{"_comment":"x","per_host_concurrency":2,"min_gap_secs":20}}"#).unwrap();
+        check(&all.pacing, (2, 20));
+        let back: AppConfig = serde_json::from_str(&serde_json::to_string(&all).unwrap()).unwrap();
+        check(&back.pacing, (2, 20));
+        // The shipped example names the section with the defaults.
+        let example: serde_json::Value =
+            serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        assert_eq!(example["pacing"]["per_host_concurrency"], 1);
+        assert_eq!(example["pacing"]["min_gap_secs"], 8);
     }
 
     #[test]

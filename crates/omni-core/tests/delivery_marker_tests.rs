@@ -181,22 +181,37 @@ fn a_file_of_the_wrong_size_is_not_claimed_and_the_job_is_requeued_with_a_warnin
     assert_eq!(std::fs::metadata(&other).unwrap().len(), 100, "the other file was touched");
 }
 
+/// P11.2b: the share cannot say whether the rename landed. The job neither goes
+/// to review nor runs again from its link: it waits for the watchfolder with its
+/// marker, and the delivery after the wait asks the marker first.
 #[test]
-fn an_unreachable_watchfolder_sends_the_job_to_review_instead_of_requeuing() {
+fn an_unreachable_watchfolder_at_start_up_makes_the_job_wait_for_it_with_its_marker() {
     let fx = Fixture::new();
     let id = fx.at_deliver(5);
     // The folder itself cannot be read (an unplugged share): "not found" proves nothing.
     let gone = fx.dir.path().join("share-that-is-down").join("5_ANNA_TEST.mxf");
     assert!(fx.repo.mark_delivering(id, OWNER, &path_str(&gone), 4096).unwrap());
+    let attempts = fx.repo.get_job(id).unwrap().unwrap().attempts;
 
-    assert_eq!(fx.repo.recover_on_startup(HOST).unwrap(), 0, "counted as requeued");
+    assert_eq!(fx.repo.recover_on_startup(HOST).unwrap(), 1, "back in the queue, waiting");
 
     let job = fx.repo.get_job(id).unwrap().unwrap();
-    assert_eq!(job.status, JobStatus::RequiresReview);
+    assert_ne!(job.status, JobStatus::RequiresReview);
+    assert_eq!((job.status, job.stage), (JobStatus::Pending, JobStage::Queued));
+    assert!(job.delivery_wait, "requeued to run from its link: a second copy could go on air");
     assert_eq!(job.lease_owner, None);
+    assert_eq!(job.attempts, attempts, "the wait spent or gave back an attempt");
+    assert_eq!((job.ready_path.as_deref(), job.ready_at), (None, None), "the crashed run's workspace was trusted");
+    assert!(job.not_before.is_some_and(|nb| nb > Utc::now() + Duration::seconds(20)));
     assert_eq!(job.error_code.as_deref(), Some("DELIVERY_FAILED"));
-    assert!(job.error_message.unwrap_or_default().contains("5_ANNA_TEST.mxf"));
-    assert!(fx.repo.lease_job("newsroom1:100:1", 60).unwrap().is_none(), "a review job was leased");
+    let line = "The daemon restarted while delivering 5_ANNA_TEST.mxf; waiting for the watchfolder to answer";
+    assert_eq!(job.error_message.as_deref(), Some(line));
+    assert_eq!(fx.marker(id), (Some(path_str(&gone)), Some(4096)), "the marker the wait asks first was cleared");
+    let events = fx.events(id);
+    assert_eq!(events.iter().filter(|(l, m)| l == "WARN" && m == line).count(), 1, "{events:?}");
+    assert_eq!(fx.audit_count("Job % restarted while delivering 5_ANNA_TEST.mxf; waiting for the watchfolder%"), 1);
+    // Waiting, not leasable before its delay, and never by the scope that takes new work only.
+    assert!(fx.repo.lease_job("newsroom1:100:1", 60).unwrap().is_none(), "leased before its 30 s");
 }
 
 #[test]

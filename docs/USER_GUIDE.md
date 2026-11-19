@@ -109,6 +109,8 @@ switched on yet at every station; ask MCR.
 - **«Προδιαγραφές εκπομπής»** — the broadcast specification every delivered
   file meets.
 - **«Διαχείριση»** — the admin page (administrators only).
+- **«Καθυστερούν»** — a strip above the tabs, only while some video is late
+  (§4.9).
 
 ### 4.2 The tabs
 
@@ -160,16 +162,33 @@ Labels you may see on a mail:
 
 Each video has a card with its file name, its state and the step it is on:
 
-> «Βήμα 5 από 10 · Μετατροπή στη μορφή εκπομπής»
-> (step 5 of 10 · converting to the broadcast format)
+> «Βήμα 4 από 7 · Μετατροπή στη μορφή εκπομπής»
+> (step 4 of 7 · converting to the broadcast format)
 
-The ten steps: waiting → finding the video on the page → downloading →
-checking the download → converting → wrapping in MXF → checking the broadcast
-specification → delivering to the Dalet watchfolder → archiving → done.
+The seven steps: finding the video on the page → downloading → checking the
+download → converting → wrapping in MXF → checking the broadcast
+specification → delivering to the Dalet watchfolder. Before them the video
+waits in the queue («Σε αναμονή»); after them it is archived
+(«Αρχειοθέτηση») and done.
 
-You may also see «Νέα προσπάθεια σε …» (retrying in …), «Nο στη σειρά» (Nth in
-the queue) and «Ασυνήθιστα πολλή ώρα στο ίδιο βήμα» (unusually long on this
-step).
+While a video waits you may see:
+
+- «Σε αναμονή · Nο στη σειρά» — Nth in the queue.
+- «Νέα προσπάθεια σε …» — an automatic retry in so many seconds or minutes;
+  on the Email tab followed by «(έγιναν N από M)», tries made so far out of
+  the most it will make (§4.10).
+- «Περιμένει τον φάκελο παράδοσης» — the video is ready and waits for the
+  Dalet watchfolder to answer (§4.10).
+
+While it is processed, «· σε αυτό το βήμα N′» says how many minutes it has
+been on this step; after 20 minutes that turns amber, with the tooltip
+«Ασυνήθιστα πολλή ώρα στο ίδιο βήμα» (unusually long on this step).
+
+The desk refreshes by itself every few seconds. In «Σε εξέλιξη»,
+«Χρειάζονται έλεγχο» and «Ολοκληρωμένα» a card is redrawn only when what it
+shows has changed, so a link you are typing into a card's field is kept, with
+the cursor where it was. Enter in that field does what the button beside it
+does.
 
 **States**
 
@@ -195,7 +214,9 @@ step).
 | «Ακύρωση» | cancel: it will not be sent to Dalet |
 | «Το έβαλα στο Dalet» | you put the video into Dalet yourself; the job is closed as done |
 | «Αφαίρεση» | remove the card from the lists (a delivered file is never touched) |
-| «Χρήση» | use a link you pasted instead of the one found |
+| «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the Email tab) | use a link you pasted instead of the one found |
+| «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the Email tab the history shows under a selected card. |
+| «Τώρα» | in the «Καθυστερούν» strip: try now instead of waiting for the next retry (§4.9) |
 
 ### 4.5 Approvals
 
@@ -240,6 +261,100 @@ back.
 - In «Χρειάζονται έλεγχο», filter by journalist, or
   «Απόκρυψη παλαιότερων από 3 ημέρες» (hide older than 3 days).
 
+### 4.9 Late videos («Καθυστερούν»)
+
+Above the tabs, on every tab, the strip **«Καθυστερούν»** (late) lists the
+videos that are still waiting or being processed 10 minutes after they
+arrived (5 minutes for an urgent one), counted from your last «Δοκιμή ξανά» if
+you pressed it. The administrator can change those minutes. It shows the five
+oldest, then «και άλλα N» (and N more), and it disappears when nothing is
+late.
+
+Each row has the file name, «Επείγον» for an urgent video, the reason, and
+«πριν από N′» (how many minutes ago it arrived). The reasons:
+
+| Reason | Meaning |
+|---|---|
+| «Περιμένει τον φάκελο παράδοσης» | the video is ready, but the Dalet watchfolder does not answer; it is delivered by itself when it does (§4.10) |
+| «Νέα προσπάθεια στις HH:MM · …» | an automatic retry at that time, followed by the reason in Greek |
+| «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» | the link is still a live broadcast; it is checked again at that time. Listed whatever its age. |
+| «Σε επεξεργασία · στο τρέχον βήμα εδώ και N′» | being processed, N minutes on its current step |
+| «Σε αναμονή στη σειρά» | waiting for its turn in the queue |
+
+**«Τώρα»** (now), on a retry or live-broadcast row, makes the system try at
+once instead of waiting for the time shown: use it when you know the cause is
+gone. It is not offered for a video waiting for the watchfolder. It counts as
+your action on the job (§4.10, second chance) and does not restart the 2-hour
+limit.
+
+When a video becomes late, the desk plays the short falling chime once and
+shows «Ένα βίντεο καθυστερεί» or «N βίντεο καθυστερούν». A late video does not
+need you yet: the system is still trying, and it is not counted among the
+videos that need checking.
+
+### 4.10 What the system does by itself
+
+**Retries.** When a video fails for a reason that usually passes, the job
+tries again by itself. How often depends on the reason:
+
+| Reason | Tries again after |
+|---|---|
+| a network problem or a time-out | 30 s, 2, 5 and 10 minutes |
+| the source refused (HTTP 403) | 30 s and 2 minutes |
+| the platform limits downloads for now (YouTube's "confirm you're not a bot", "try again later") | 2, 5, 10 and 15 minutes |
+| still a live broadcast, or a premiere not started yet | checked 10, 30, 60 and 120 minutes after it arrived |
+| the disk is full | 10 minutes, three times |
+
+Nothing older than 2 hours, counted from when it arrived or from your last
+«Δοκιμή ξανά», is retried automatically. When the retries end, the job moves
+to «Χρειάζονται έλεγχο» and its card says so, for example «Δεν τα κατάφερε
+μετά από 5 προσπάθειες. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον
+σύνδεσμο.», or, for a broadcast that stayed live, «Η μετάδοση ήταν ακόμη
+ζωντανή (ή δεν είχε ξεκινήσει) μετά από 2 ώρες ελέγχων. …».
+
+**One platform at a time.** Links on the same video platform (YouTube, X,
+Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) start one after
+the other, a few seconds apart, so that a mail with many YouTube links does not
+set off the platform's bot check. Such a video may take a little longer to
+start: that is normal. If the platform refuses anyway, nothing new starts there
+for 2 minutes and the card says «Ο ιστότοπος περιορίζει προσωρινά τις λήψεις.
+Γίνεται αυτόματη επανάληψη.» If the retries run out, the card adds advice
+about the site's cookies: tell the administrator.
+
+**The watchfolder is down.** A finished video that cannot be written into the
+Dalet watchfolder waits on the ingest server, with «Περιμένει τον φάκελο
+παράδοσης» on its card. It is delivered by itself, once, when the watchfolder
+answers again, however long that takes: there is nothing to do. It cannot be
+renamed while it waits. The desk also warns «Πρόβλημα: Watchfolder — …».
+
+**"Check Dalet first".** If a delivery was interrupted (a restart, or an
+error during the copy) and the system cannot confirm that the file arrived,
+the job goes to «Χρειάζονται έλεγχο» with the code `DELIVERY_UNCONFIRMED` and
+the text «Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε. …».
+Look in Dalet first: if the video is there, press «Το έβαλα στο Dalet»; if it
+is not, press «Δοκιμή ξανά». A retry without looking could put a second copy
+(`…_2.mxf`) on air.
+
+**Second chance.** A job waiting in «Χρειάζονται έλεγχο» goes back to the
+queue by itself, once for each cause, when what it failed on has been fixed:
+
+- the administrator added or tested cookies for its site (a job that needed a
+  login, or that the platform kept limiting);
+- a new yt-dlp (or Deno) was installed and passed its check (a job where the
+  video was not found or could not be fetched);
+- a news site that had stopped giving video works again (that site's jobs
+  where the video was not found).
+
+Its history then says «Αυτόματη επανάληψη: …» and why, for example
+«Αυτόματη επανάληψη: νέα cookies για x.com». This happens only within 2 hours
+of its arrival (or of your last «Δοκιμή ξανά»), at most three times for one
+job, and never to a job a person has acted on: once anyone presses «Δοκιμή
+ξανά», «Τώρα», «Μετονομασία…», «Ακύρωση», «Νέα λήψη», «Το έβαλα στο Dalet»,
+rejects it, marks «Λάθος βίντεο» or queues one of its offered videos, the job
+waits for a person. It is also left alone when the same link is already in
+the queue or was delivered meanwhile, and when its video may already be in
+Dalet.
+
 ---
 
 ## 5. Common reasons a job stops, and what to do
@@ -248,11 +363,14 @@ The card always says why in Greek. The usual ones:
 
 | Reason | What to do |
 |---|---|
-| Login required (e.g. YouTube "confirm you're not a bot", X, Instagram) | the site needs the station's cookies: tell the administrator (Admin → Cookies). Then «Δοκιμή ξανά». |
-| No video found on the page | open the link yourself; if there is a video, paste its direct link with «Χρήση» or download it by hand and mark «Το έβαλα στο Dalet». |
-| Live stream | live broadcasts are not downloaded; ask the journalist for the clip. |
+| Login required (e.g. X, Instagram, Facebook) | the site needs the station's cookies: tell the administrator (Admin → Cookies). Once they are added, a job younger than 2 hours that nobody has touched goes back to the queue by itself (§4.10); otherwise «Δοκιμή ξανά». |
+| No video found on the page | open the link yourself; if there is a video, paste its direct link with «Χρήση αυτού του συνδέσμου» or download it by hand and mark «Το έβαλα στο Dalet». |
+| Live stream | checked again by itself for 2 hours (§4.10). If it stays live, ask the journalist for the clip, or «Δοκιμή ξανά» once the recording is up. |
 | Video removed / private | ask the journalist for another source. |
-| Network or "try again later" | usually retries by itself; otherwise «Δοκιμή ξανά» in a few minutes. |
+| Network or a time-out | retries by itself (§4.10). When the card says it stopped trying, «Δοκιμή ξανά» or paste another link. |
+| «Ο ιστότοπος περιορίζει προσωρινά τις λήψεις» (YouTube "confirm you're not a bot", "try again later") | retries by itself for about half an hour. If it stops, «Δοκιμή ξανά» later; if it keeps happening, tell the administrator (cookies for that site). |
+| «Περιμένει τον φάκελο παράδοσης» | nothing to do: it is delivered when the watchfolder answers (§4.10). If it lasts, tell the administrator. |
+| «Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε…» | check Dalet first: there, «Το έβαλα στο Dalet»; not there, «Δοκιμή ξανά» (§4.10). |
 | Failed the broadcast check | the file was *not* delivered. Retry once; if it fails again, report it with the «Τεχνικές λεπτομέρειες». |
 | File locker (WeTransfer, Drive, Dropbox…) | not downloaded automatically yet: download by hand, then «Το έβαλα στο Dalet». |
 

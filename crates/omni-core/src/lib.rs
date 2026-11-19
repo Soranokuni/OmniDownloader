@@ -1,8 +1,10 @@
+pub mod answer_file;
 pub mod benchmark;
 pub mod archive;
 pub mod busy;
 pub mod config;
 pub mod events;
+pub mod extraction_trouble;
 pub mod fsutil;
 pub mod cookies;
 pub mod models;
@@ -17,6 +19,7 @@ pub mod process;
 pub mod recipe_score;
 pub mod repository;
 pub mod scheduler;
+pub mod second_chance;
 pub mod secrets;
 pub mod site_health;
 pub mod site_videos;

@@ -452,8 +452,8 @@ pub use omni_core::auth::validate_password;
 pub struct JobsQuery {
     my: Option<bool>,
     journalist: Option<String>,
-    /// `live`, `review` or `completed`: one page of an MCR desk list
-    /// (plan P7.1). Without it, the old unpaged list.
+    /// `live`, `review`, `approval`, `completed` or `late`: one page of an MCR
+    /// desk list (plan P7.1). Without it, the old unpaged list.
     view: Option<omni_core::models::JobsView>,
     page: Option<i64>,
     per_page: Option<i64>,
@@ -463,13 +463,51 @@ pub struct JobsQuery {
     hidden: Option<u8>,
 }
 
+/// The late limits from the live config, read once per request (P11.3b).
+async fn late_after(state: &AppState) -> omni_core::models::LateAfter {
+    let cfg = state.config.read().await;
+    omni_core::models::LateAfter::new(cfg.retry.late_after_mins, cfg.retry.late_after_urgent_mins)
+}
+
 /// A job as the MCR desk shows it: the row, plus what its error code means
 /// and what to do about it, in the operators' language.
-fn job_for_desk(repo: &omni_core::repository::Repository, job: &omni_core::models::Job) -> serde_json::Value {
+///
+/// `late`, `next_try_at` and `wait_reason` (P11.3b) say whether the video is
+/// late and what it is waiting for: `delivery` (the watchfolder), `live` (the
+/// next check of a stream still live, P11.7), `retry` (a back-off), `running`,
+/// `queue`; `null` for a job that is neither waiting nor running.
+fn job_for_desk(
+    repo: &omni_core::repository::Repository,
+    job: &omni_core::models::Job,
+    late: omni_core::models::LateAfter,
+) -> serde_json::Value {
     let mut v = serde_json::to_value(job).unwrap_or_default();
+    let now = chrono::Utc::now();
+    let next_try = job.not_before.filter(|t| *t > now);
+    v["late"] = serde_json::Value::Bool(job.is_late(now, late));
+    v["next_try_at"] = next_try.map(omni_core::timestamps::format).into();
+    let reason: Option<&str> = match job.status {
+        JobStatus::Pending if job.delivery_wait => Some("delivery"),
+        // A stream still live waits for its next check (P11.7).
+        JobStatus::Pending if job.waits_for_live_check(now) => Some("live"),
+        JobStatus::Pending if next_try.is_some() => Some("retry"),
+        JobStatus::Pending => Some("queue"),
+        JobStatus::Running => Some("running"),
+        _ => None,
+    };
+    v["wait_reason"] = reason.into();
     if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
-        // A login wall names the site and says whether its cookies are there (P3.5).
-        v["hint"] = serde_json::Value::String(omni_broadcast::errors::hint_for_job(code, &job.url, repo));
+        // A job that stopped retrying must not say a retry is under way (P11.3a); a queued
+        // or running one, or a video waiting for the watchfolder, still is. Only the codes
+        // whose own hint says so swap it (`uses_exhausted_hint`).
+        let stopped = !matches!(job.status, JobStatus::Pending | JobStatus::Running) && !job.delivery_wait;
+        let hint = if code.uses_exhausted_hint() && stopped {
+            omni_broadcast::errors::stopped_hint_el(code, job.attempts, &job.url, repo)
+        } else {
+            // A login wall names the site and says whether its cookies are there (P3.5).
+            omni_broadcast::errors::hint_for_job(code, &job.url, repo)
+        };
+        v["hint"] = serde_json::Value::String(hint);
     }
     v
 }
@@ -620,17 +658,25 @@ pub async fn api_get_jobs(
     State(state): State<AppState>,
 ) -> JsonResult {
     if let Some(view) = query.view {
+        let late = late_after(&state).await;
         let filter = omni_core::models::JobsFilter {
             search: query.q.clone().unwrap_or_default(),
             journalist: query.journalist.clone().unwrap_or_default(),
             group: query.group.clone().unwrap_or_default(),
             include_hidden: query.hidden == Some(1),
+            late_after: late,
+        };
+        // The late strip is one short list: the first 50, no pager (P11.3b).
+        let (page_no, per_page) = if view == omni_core::models::JobsView::Late {
+            (1, 50)
+        } else {
+            (query.page.unwrap_or(1), query.per_page.unwrap_or(20))
         };
         let page = state
             .repo
-            .list_jobs_page(view, &filter, query.page.unwrap_or(1), query.per_page.unwrap_or(20))
+            .list_jobs_page(view, &filter, page_no, per_page)
             .map_err(internal_error("Could not read the job queue."))?;
-        let counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+        let counts = state.repo.job_counts(late).map_err(internal_error("Could not count the jobs."))?;
         // Which mail each came from, so the desk can open it (plan P7.11).
         let keys: Vec<String> = page.jobs.iter().filter_map(|j| j.email_message_id.clone()).collect();
         let subjects = state.repo.mail_subjects(&keys).unwrap_or_default();
@@ -645,7 +691,7 @@ pub async fn api_get_jobs(
             .jobs
             .iter()
             .map(|j| {
-                let mut v = job_for_desk(&state.repo, j);
+                let mut v = job_for_desk(&state.repo, j, late);
                 v["held"] = held_for_desk(&state, j);
                 v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
@@ -695,7 +741,7 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
-    let mut desk_job = job_for_desk(&state.repo, &job);
+    let mut desk_job = job_for_desk(&state.repo, &job, late_after(&state).await);
     desk_job["held"] = held_for_desk(&state, &job);
     desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
@@ -944,6 +990,13 @@ pub async fn api_queue_offer(
     new.group_code = job.group_code.clone();
     new.parent_job_id = Some(job_id);
     new.notes = Some(format!("Offered from the article of job #{job_id}: {}", job.url));
+    new.queued_by_operator = true;
+    // MCR settles the parent's article: no second chance may re-run it (P11.5).
+    // Marked before the offer is queued, so no trigger can move the parent in
+    // between; a queuing that then fails leaves it marked (the safe side).
+    if let Err(e) = state.repo.mark_acted_on(job_id, "offer") {
+        tracing::warn!("Job #{job_id}: not marked as acted on before its offer was queued: {e:#}");
+    }
     let result = state
         .repo
         .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
@@ -991,6 +1044,40 @@ pub async fn api_retry_job(
     }
 
     audit_action(&state, &principal, &format!("Job #{job_id}: retried"));
+    state.broadcast_job_event("job_updated", job_id);
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// «Τώρα» was pressed for a video that is not waiting out a retry's back-off (P11.3b).
+fn not_waiting_to_retry() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "NOT_WAITING_TO_RETRY",
+        "Αυτό το βίντεο δεν περιμένει νέα προσπάθεια: ξεκίνησε ήδη, παραδόθηκε, ή περιμένει τον φάκελο παράδοσης. Ανανεώστε τη λίστα.",
+    )
+}
+
+/// MCR's «Τώρα»: the next free worker takes a job that waits for its next
+/// automatic try, instead of waiting out the back-off (P11.3b).
+pub async fn api_run_now_job(
+    RequireMcr(principal): RequireMcr,
+    AxumPath(job_id): AxumPath<i64>,
+    State(state): State<AppState>,
+) -> JsonResult {
+    let started = state
+        .repo
+        .run_now(job_id)
+        .map_err(internal_error("Could not start the job now."))?;
+    if !started {
+        return Err(not_waiting_to_retry());
+    }
+    let _ = state.repo.record_event(
+        job_id,
+        "INFO",
+        None,
+        &format!("Run now requested by {}", principal.audit_label()),
+    );
+    audit_action(&state, &principal, &format!("Job #{job_id}: run now"));
     state.broadcast_job_event("job_updated", job_id);
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -1844,6 +1931,7 @@ pub async fn api_admin_update_ytdl(
         tracing::error!(error = ?e, "yt-dlp update failed");
         ApiError::internal("yt-dlp update failed; see the log for detail.")
     })?;
+    dep_mgr.forget_ytdl_postponed();
     drop(locks);
     let _ = state.repo.log_audit(
         "INFO",
@@ -2164,7 +2252,7 @@ pub async fn api_system_status(
     // `null` when the count failed, never zeros: the desk alerts on a rise in
     // the review count, and zeros followed by the real count would announce
     // the whole backlog as new (P7.14).
-    let queue = state.repo.queue_summary().ok();
+    let queue = state.repo.queue_summary(late_after(&state).await).ok();
 
     let checks = state.health.all();
 
@@ -2361,7 +2449,7 @@ pub async fn api_get_mails(
             v
         })
         .collect();
-    let job_counts = state.repo.job_counts().map_err(internal_error("Could not count the jobs."))?;
+    let job_counts = state.repo.job_counts(late_after(&state).await).map_err(internal_error("Could not count the jobs."))?;
     Ok(Json(serde_json::json!({
         "entries": entries,
         "total": page.total,
@@ -2463,12 +2551,13 @@ pub async fn api_get_mail_view(
     // The Email tab's cards say the place in the queue too (plan P7.19).
     let positions = state.repo.pending_positions().unwrap_or_default();
     let next_ok = next_choice_allowed(&state).await;
+    let late = late_after(&state).await;
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
-                let mut v = job_for_desk(&state.repo, j);
+                let mut v = job_for_desk(&state.repo, j, late);
                 v["held"] = held_for_desk(&state, j);
                 v["repair"] = repair_for_desk(&state, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
@@ -2580,6 +2669,7 @@ pub async fn api_mail_queue_link(
     };
     new.submitted_by_user_id = principal.user().map(|u| u.id);
     new.notes = Some(format!("Queued by MCR from the email: {subject}"));
+    new.queued_by_operator = true;
     let result = state
         .repo
         .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
@@ -3139,6 +3229,67 @@ mod tests {
         assert!(!is_submittable_url(""));
         assert!(!is_submittable_url(&format!("https://x/{}", "a".repeat(3000))));
         assert!(!is_submittable_url("https://x/\u{0}evil"));
+    }
+
+    /// P11.3a: a NETWORK job that went to review says how many tries it had
+    /// and what to do, not that a retry is under way; one still queued keeps
+    /// the code's own hint; a login wall keeps its site hint; DELIVERY_FAILED,
+    /// HTTP_403 and LOW_DISK keep their own advice in review.
+    #[test]
+    fn the_desk_hint_says_when_automatic_retries_have_stopped() {
+        use omni_broadcast::errors::{exhausted_hint_el, ErrorCode};
+        use omni_core::models::NewJob;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let queued = |n: u32, url: &str| {
+            repo.enqueue(&NewJob::new(url, format!("{n}_ANNA_TEST"), "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)
+                .unwrap()
+                .job_id()
+        };
+        let hint = |id: i64| {
+            let job = repo.get_job(id).unwrap().unwrap();
+            job_for_desk(&repo, &job, omni_core::models::LateAfter::default())["hint"].as_str().map(str::to_string)
+        };
+
+        // Five runs, the last one sent to review.
+        let failed = queued(1, "https://news.example/story/1");
+        for _ in 0..4 {
+            assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, failed);
+            assert!(repo.requeue_after(failed, "w", chrono::Duration::seconds(-1), "NETWORK", "reset").unwrap());
+        }
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, failed);
+        assert!(repo.finish(failed, "w", JobStatus::RequiresReview, Some("NETWORK"), Some("reset"), None).unwrap());
+        assert_eq!(repo.get_job(failed).unwrap().unwrap().attempts, 5);
+        assert_eq!(hint(failed), Some(exhausted_hint_el(5)));
+        assert!(hint(failed).unwrap().contains("μετά από 5 προσπάθειες"));
+
+        // Queued for its next try: the code's own hint.
+        let waiting = queued(2, "https://news.example/story/2");
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, waiting);
+        assert!(repo.requeue_after(waiting, "w", chrono::Duration::minutes(5), "NETWORK", "reset").unwrap());
+        assert_eq!(hint(waiting).as_deref(), Some(ErrorCode::Network.hint_el()));
+
+        // Not a retried code: unchanged, the login wall naming its site.
+        let login = queued(3, "https://twitter.com/someone/status/1");
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, login);
+        assert!(repo.finish(login, "w", JobStatus::RequiresReview, Some("LOGIN_REQUIRED"), Some("login"), None).unwrap());
+        assert_eq!(hint(login), Some(omni_broadcast::errors::login_hint_el("x.com", false)));
+
+        // Retried codes whose own hint is the advice MCR needs keep it in review:
+        // the share and its rights, a 403's own words, a full disk for the administrator.
+        for (n, code) in [(4, ErrorCode::DeliveryFailed), (5, ErrorCode::Http403), (6, ErrorCode::LowDisk)] {
+            let id = queued(n, &format!("https://news.example/story/{n}"));
+            assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, id);
+            assert!(repo.finish(id, "w", JobStatus::RequiresReview, Some(code.as_str()), Some("x"), None).unwrap());
+            assert_eq!(hint(id).as_deref(), Some(code.hint_el()), "{code}");
+        }
+
+        // One run and no retry (the age limit): never «1 προσπάθειες».
+        let old = queued(7, "https://news.example/story/7");
+        assert_eq!(repo.lease_job("w", 600).unwrap().unwrap().id, old);
+        assert!(repo.finish(old, "w", JobStatus::RequiresReview, Some("DOWNLOAD_TIMEOUT"), Some("x"), None).unwrap());
+        assert_eq!(hint(old), Some(exhausted_hint_el(1)));
+        assert!(hint(old).unwrap().contains("δεν ξαναδοκιμάστηκε αυτόματα"));
     }
 
     #[test]

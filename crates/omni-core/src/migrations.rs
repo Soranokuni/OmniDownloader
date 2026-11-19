@@ -845,6 +845,70 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN delivering_recorded INTEGER;
         "#,
     ),
+    (
+        34,
+        // A finished, verified video whose watchfolder could not be written waits for it
+        // (P11.2a): `delivery_wait` = 1 while it waits, and the file that will be delivered,
+        // its size and its SHA-256, so the wait never re-downloads, re-encodes or delivers
+        // a file that changed meanwhile.
+        r#"
+        ALTER TABLE queue ADD COLUMN delivery_wait INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queue ADD COLUMN ready_path TEXT;
+        ALTER TABLE queue ADD COLUMN ready_bytes INTEGER;
+        ALTER TABLE queue ADD COLUMN ready_sha256 TEXT;
+        "#,
+    ),
+    (
+        35,
+        // When a finished video first parked for the watchfolder (P11.2b): a waiting video
+        // whose file cannot be read goes to review after a limit counted from it.
+        r#"
+        ALTER TABLE queue ADD COLUMN ready_at TEXT;
+        "#,
+    ),
+    (
+        36,
+        // When MCR last started the job afresh (P11.3a): «Δοκιμή ξανά», «Νέα λήψη», an
+        // approval or the next candidate. Automatic retries stop once the job is older than
+        // `retry.max_age_mins`, counted from this, or from `created_at` while it is NULL.
+        r#"
+        ALTER TABLE queue ADD COLUMN retry_from TEXT;
+        "#,
+    ),
+    (
+        37,
+        // The autonomy report (P11.0): whether a person acted on the job and the first thing
+        // they did, the first error code it ever had, and one row per ending of a job. The
+        // outcome rows have no foreign key: a discarded job's row must outlive the job. `site`
+        // is the registrable domain only, never an address; `day` is the server's local day.
+        r#"
+        ALTER TABLE queue ADD COLUMN human_touched INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queue ADD COLUMN touch_reason TEXT;
+        ALTER TABLE queue ADD COLUMN first_error_code TEXT;
+        CREATE TABLE IF NOT EXISTS job_outcomes (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id           INTEGER NOT NULL,
+            ended_at         TEXT NOT NULL,
+            day              TEXT NOT NULL,
+            site             TEXT,
+            outcome          TEXT NOT NULL,
+            touched          INTEGER NOT NULL,
+            touch_reason     TEXT,
+            first_error_code TEXT,
+            from_mail        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_outcomes_day ON job_outcomes(day);
+        CREATE INDEX IF NOT EXISTS idx_job_outcomes_ended_at ON job_outcomes(ended_at);
+        "#,
+    ),
+    (
+        38,
+        // The second chances a job waiting in review was already given (P11.5): one cause per
+        // line (`ytdlp:…`, `cookies:<domain>:<day>`, `site:<domain>:<minute>`). NULL: none yet.
+        r#"
+        ALTER TABLE queue ADD COLUMN second_chances TEXT;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1538,6 +1602,154 @@ mod tests {
             .query_row("SELECT delivering_to, delivering_bytes FROM queue", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((to, bytes), (None, None), "an existing job must start with no marker");
+    }
+
+    #[test]
+    fn migration_34_adds_the_delivery_wait_and_existing_rows_do_not_wait() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 33) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status) VALUES ('https://example.invalid/v', 'S', 'PENDING')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 33);
+        assert!(!columns_of(&conn, "queue").contains(&"delivery_wait".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        let cols = columns_of(&conn, "queue");
+        for c in ["delivery_wait", "ready_path", "ready_bytes", "ready_sha256"] {
+            assert!(cols.contains(&c.to_string()), "{c} is missing");
+        }
+        let row: (i64, Option<String>, Option<i64>, Option<String>) = conn
+            .query_row("SELECT delivery_wait, ready_path, ready_bytes, ready_sha256 FROM queue", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(row, (0, None, None, None), "an existing job must not wait for the watchfolder");
+    }
+
+    #[test]
+    fn migration_35_adds_the_park_time_and_existing_rows_have_none() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 34) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, delivery_wait, ready_path) VALUES ('https://example.invalid/v', 'S', 'PENDING', 1, 'x.mxf')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 34);
+        assert!(!columns_of(&conn, "queue").contains(&"ready_at".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(columns_of(&conn, "queue").contains(&"ready_at".to_string()));
+        let at: Option<String> = conn.query_row("SELECT ready_at FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(at, None, "a row parked before the migration has no known park time");
+    }
+
+    #[test]
+    fn migration_36_adds_the_retry_start_and_existing_rows_have_none() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 35) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, attempts) VALUES ('https://example.invalid/v', 'S', 'REQUIRES_REVIEW', 3)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 35);
+        assert!(!columns_of(&conn, "queue").contains(&"retry_from".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(columns_of(&conn, "queue").contains(&"retry_from".to_string()));
+        let from: Option<String> = conn.query_row("SELECT retry_from FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(from, None, "an existing job counts its age from created_at");
+    }
+
+    #[test]
+    fn migration_37_adds_the_touch_columns_and_outcomes_and_existing_rows_are_untouched() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 36) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, error_code) VALUES ('https://example.invalid/v', 'S', 'REQUIRES_REVIEW', 'NETWORK')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 36);
+        assert!(!columns_of(&conn, "queue").contains(&"human_touched".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        let row: (i64, Option<String>, Option<String>) = conn
+            .query_row("SELECT human_touched, touch_reason, first_error_code FROM queue", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, (0, None, None), "an existing job is untouched and has no first error yet");
+        let cols = columns_of(&conn, "job_outcomes");
+        for c in ["job_id", "ended_at", "day", "site", "outcome", "touched", "touch_reason", "first_error_code", "from_mail"] {
+            assert!(cols.contains(&c.to_string()), "job_outcomes.{c} missing: {cols:?}");
+        }
+        let fks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('job_outcomes')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fks, 0, "an outcome row must outlive a discarded job");
+    }
+
+    #[test]
+    fn migration_38_adds_the_second_chances_and_existing_rows_have_none() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 37) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, error_code) VALUES ('https://example.invalid/v', 'S', 'REQUIRES_REVIEW', 'LOGIN_REQUIRED')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 37);
+        assert!(!columns_of(&conn, "queue").contains(&"second_chances".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(columns_of(&conn, "queue").contains(&"second_chances".to_string()));
+        let used: Option<String> = conn.query_row("SELECT second_chances FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(used, None, "an existing job has had no second chance");
     }
 
     #[test]

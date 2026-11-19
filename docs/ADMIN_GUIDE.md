@@ -23,66 +23,151 @@ runtime they need.
 
 ## 2. Installing
 
-### 2.1 From a release package
+A release is built for one architecture, `<arch>` = `x64` or `arm64`, and has
+two parts:
 
-A release is a folder `OmniIngest-<version>-<date>\` (or its zip). Build one
-from a checkout with:
+- **`OmniIngest-Setup-<version>-<date>-<arch>.exe`**, one file that installs,
+  upgrades, changes the service account and uninstalls, with
+  `OmniIngest-Setup-<version>-<date>-<arch>.exe.sha256` beside it. This is the
+  usual way (§2.1).
+- **`OmniIngest-<version>-<date>-<arch>.zip`** (and the same folder unpacked):
+  `omni-ingest.exe`, `bin\` (ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno, the
+  C++ runtime DLLs), `Install.cmd`, `Uninstall.cmd`, `README.txt`, `docs\`
+  (these guides) and `SHA256SUMS.txt`, for the command-line route (§2.5).
+
+A 64-bit Intel or AMD server needs the **x64** files; `arm64` is for Windows
+on ARM. The Setup file carries the release folder inside it.
+
+**Building the release package.** From a checkout, into `dist\`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -Arch x64 -ToolsDir D:\Tools\x64\bin -RuntimeDir D:\Tools\x64\vcrt
 ```
 
-The package contains `omni-ingest.exe`, `bin\` (ffmpeg, ffprobe, bmxtranswrap,
-yt-dlp, Deno, the C++ runtime DLLs), `Install.cmd`, `Uninstall.cmd`,
-`README.txt` and `SHA256SUMS.txt`.
+- `-Arch x64` (the default) or `-Arch arm64` chooses the Rust target of
+  `omni-ingest.exe` and the Setup program and is part of every output name.
+- `-ToolsDir` (default `bin`) is where `ffmpeg.exe`, `ffprobe.exe`,
+  `bmxtranswrap.exe`, their DLLs, yt-dlp and `deno.exe` are taken from;
+  `-RuntimeDir` (default `%SystemRoot%\System32`) is where the C++ runtime
+  DLLs `msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` come from.
+- Every `.exe` and `.dll` in the package is checked by its PE header before
+  anything is zipped or packed: an x64 package must hold x64 programs only;
+  an arm64 package may also hold x64 ones (they run under emulation there, and
+  bmxtranswrap exists only as x64). A wrong file stops the script and is named.
+  An x64 package therefore needs the x64 tools and the x64 runtime DLLs; on an
+  ARM64 PC neither the service's own `bin\` (native ARM64 ffmpeg) nor
+  System32's runtime DLLs are x64. No `omni-ingest` command downloads the
+  pinned tool set into a folder; take them from an x64 installation's `bin\`.
+- The script starts the built programs (`--version`, Setup's `--pack`,
+  `--verify`, `/?`): an x64 package can be built on an ARM64 PC, where x64
+  programs run under emulation, but an arm64 package has to be built on an
+  ARM64 machine.
 
-**New installation**
+### 2.1 Installing with Setup
 
-1. Copy the folder to the PC and double-click **`Install.cmd`** (allow
-   administrator rights).
-2. Give the Dalet watchfolder when asked: a local folder or `\\server\share`.
-3. When it says *OmniDownloader is running*, open
-   `http://127.0.0.1:8080/admin` **on the server itself** and sign in as
-   **`Admin` / `Admin`**. This account is created once, on a brand-new
-   installation only. From any other PC the default password is refused (it
-   looks like a wrong password, and the attempt is audited). The page asks for
-   a new password first, and nothing else is available until you set one.
-   This needs the panel to listen on all addresses (`web_host` `0.0.0.0`, the
-   default) or on `127.0.0.1`. If `web_host` names one LAN address, set the
-   password from an elevated prompt instead:
-   `omni-ingest admin reset-password admin`.
-4. **User accounts → Create user**: create your own administrator, sign in as
-   it, and deactivate `Admin`.
-5. Configure the mailbox (§5.2), the network for MCR desks (§5.1), and
-   optionally the LLM (§5.4).
+**1. Check the file.** Copy the Setup file and its `.sha256` to the server:
+the one ending in `-x64` for a 64-bit Intel or AMD server, `-arm64` only for
+Windows on ARM. In PowerShell, in their folder:
 
-It installs to `C:\OmniIngest` as the Windows service **OmniIngestService**:
-starts with Windows, restarts itself after a failure, panel on port 8080,
-firewall opened for domain and private networks.
+```powershell
+$f = 'OmniIngest-Setup-1.0.0-20261118-x64.exe'
+(Get-FileHash $f -Algorithm SHA256).Hash -eq (Get-Content "$f.sha256").Split(' ')[0]
+```
 
-`Install.cmd` options:
+`True` means the file is the one that was built. On `False`, do not run it:
+copy it again.
 
-| Option | Meaning |
+**2. Start it.** Double-click the file. It is not code-signed, so Windows
+warns twice:
+
+- On the first run of a downloaded copy, SmartScreen may show **Windows
+  protected your PC**. Click **More info**, check that the file name is the
+  one you checked, then **Run anyway**.
+- Windows then asks for administrator rights and names an unknown publisher.
+  Answer **Yes**. If you answer No, Setup says it needs administrator rights
+  and changes nothing.
+
+The pages are in Greek when the Windows display language is Greek and in
+English otherwise (`/lang el` or `/lang en` chooses). This guide quotes the
+English pages.
+
+**3. The pages, in order.**
+
+| Page | What it shows | What to choose |
+|---|---|---|
+| **Install OmniIngest \<version\>** | the folder, `C:\OmniIngest` unless `/dir` gave another | **Install**. To install elsewhere, press **Change folder…** first (a drive root such as `D:\` becomes `D:\OmniIngest`). A folder directly on a drive, or under Program Files, passes the checks in §2.1c. |
+| **Which account should the OmniIngest service run as?** | **The built-in service account (recommended)** and **A Windows account…** | see *The account* below, then **Next >** |
+| the Windows credential prompt **OmniIngest service account** | only after **A Windows account…** | the account as `DOMAIN\user` (or `.\user` for an account of this computer) and its password |
+| **Ready to install OmniIngest \<version\>** | the folder, the account, the service, the firewall rule, and under **Please note:** any warning (§2.1c) | **Install**. **< Back** returns to the account; **Cancel** changes nothing. |
+| **Installing OmniIngest \<version\>…** | the step it is on; **Show details** shows the installer's own lines | wait: the first start of the service can take a few minutes |
+| **OmniIngest is installed.** | the admin page's address | **Close** |
+
+**Cancel** on any page before **Install** on the summary changes nothing.
+
+**The account.** The service needs an account that can write to the
+watchfolder. There are three real situations:
+
+| The watchfolder is | Choose |
 |---|---|
-| `--watchfolder "\\dalet\ingest"` | the Dalet watchfolder |
-| `--account "DOMAIN\svc_omni"` | run the service as this account. The default for a new installation is the virtual account `NT SERVICE\OmniIngestService` (no password); `--account LocalSystem` opts out. **A network watchfolder needs a domain account** (password prompted), or the computer account granted Modify on the share: the default account and LocalSystem both reach a share as the computer account. |
-| `--dir D:\OmniIngest` | install somewhere else |
-| `--port 8081` | another web port |
-| `--yes` | accept the defaults, no questions |
-| `--no-firewall` | do not add the firewall rule |
-| `--import D:\OmniDownloader` | move an existing setup on this PC (config, database, keys, seeds) |
+| a folder on this computer | **The built-in service account (recommended)**: the virtual account `NT SERVICE\OmniIngestService`, no password. |
+| a share on a Windows file server in the same domain that admits this computer's account (`DOMAIN\THIS-PC$` has Modify on the share and on the folder) | **The built-in service account**: it reaches a share as this computer's account. |
+| a NAS, or a share that asks for a user name | **A Windows account…**: a user that has Modify on the share. Setup gives it the right to log on as a service and checks its password with Windows before it touches the service; if Windows refuses, the account page comes back with the reason. |
 
-The installer restricts the install folder: Users can read it, and only the service writes its own folders, so no local user can replace the program. The service account gets Modify only on `data\`, `temp\`, `logs\`, `archive\`,
-`bin\`, the file `config.json` and a local watchfolder (a watchfolder inside the
-install folder keeps write access for local users, which Dalet's ingest account
-relies on; the owner can tighten it); the install folder
-itself and the executable are not granted. An upgrade keeps the account the
-service already runs as; if that is LocalSystem the installer says so, and
-`Install.cmd --account "NT SERVICE\OmniIngestService"` switches it.
+On a new installation Setup does not ask for the watchfolder: it is the
+folder `watchfolder` inside the installation folder until you set the real one
+in the setup wizard (§2.1b). If you already know it is on a NAS, choose the
+Windows account now; otherwise change the account later (§2.2a).
 
-After installation `data\` and `temp\` are readable only by SYSTEM,
-Administrators and the service account, so CLI commands against the
-installed root need an elevated prompt.
+When the configuration already names a network share as the watchfolder (a
+folder that kept its data from an earlier installation, or an answer file)
+and the built-in account is chosen, the summary starts with **The watchfolder
+is on a network share**, and its default button is **< Back**, which leads to
+the account page with **A Windows account…** selected. **Install** on that
+summary means: run as the built-in account anyway.
+
+**What Setup does to the computer.**
+
+- Creates the installation folder and copies the program and its tools into
+  it (`omni-ingest.exe`, `bin\`), and a copy of Setup itself,
+  `OmniIngest-Setup.exe`, which Apps & Features runs later. The guides stay in
+  the zip.
+- Restricts the folder: inheritance is cut, SYSTEM and Administrators have
+  full control, Users can read. The service account gets Modify only on
+  `data\`, `temp\`, `logs\`, `archive\`, `bin\`, the file `config.json` and a
+  local watchfolder. A watchfolder inside the installation folder also keeps
+  Modify for Authenticated Users, which Dalet's ingest account relies on (the
+  owner can tighten it). The folder itself and the executable get no write
+  right, so no local user can replace the program. Afterwards `data\` and
+  `temp\` are readable only by SYSTEM, Administrators and the service account,
+  so CLI commands against the installation need an elevated prompt.
+- Registers and starts the Windows service **OmniIngestService** (starts with
+  Windows, restarts itself after a failure) and waits up to 4 minutes for it to
+  answer.
+- Adds the Windows Firewall rule **OmniIngest web panel**, which opens the
+  panel's port (8080) on domain and private networks. Not with `/no-firewall`,
+  and not when the panel listens only on `127.0.0.1`.
+- Adds **OmniIngest** to Apps & Features (Settings → Apps), with Modify and
+  Uninstall.
+- Writes what it did to `setup.log` in the installation folder (§4).
+
+**Where it ends.** **Close** on the last page opens
+`http://127.0.0.1:8080/admin` in the browser of this computer. Sign in as
+**`Admin` / `Admin`**, the first-run account. It is created once, on a
+brand-new installation only, and works only from this computer: from any other
+PC the password is refused (it looks like a wrong password, and the attempt is
+audited). The setup wizard (§2.1b) then replaces that account with your own
+administrator and walks you through the watchfolder and the mailbox. Then
+configure the network for MCR desks (§5.1) and optionally the LLM (§5.4).
+
+- If the folder already held a database (an uninstall that kept the data),
+  there is no first-run account: the last page says so; sign in with that
+  installation's administrator.
+- Setup started from an already elevated prompt does not open the browser;
+  open the address the last page shows.
+- Signing in from this computer needs the panel to listen on all addresses
+  (`web_host` `0.0.0.0`, the default) or on `127.0.0.1`. If `web_host` names
+  one LAN address, set the password from an elevated prompt instead:
+  `omni-ingest admin reset-password admin`.
 
 ### 2.1a The watchfolder and its share
 
@@ -91,7 +176,7 @@ Use the share's `\\server\share` path, never a mapped drive letter: a mapping be
 Share permissions:
 
 - The account the service runs as needs **Modify** on the share. By default that is the server's computer account `DOMAIN\SERVER$`, and that only works on a domain-joined server.
-- For a NAS or a share addressed by IP, install with `--account` and a user the share accepts.
+- For a NAS or a share addressed by IP, run the service as a Windows account the share accepts: **A Windows account…** in Setup (§2.1), or change it later (§2.2a).
 - MCR and Dalet need **Modify** to move files out.
 - Nobody else needs access.
 
@@ -111,9 +196,9 @@ Back and Next move between screens; Next stays disabled until the screen is vali
 
 1. **Welcome.** Pick the mode.
 2. **Administrator account** (only while the first-run account still works). Enter a full name, a login (at least 3 characters, no spaces, not `admin`) and a password (at least 12 characters, typed twice; the ticks turn green as the rules are met). On Next the new administrator is created, the first-run `admin` account is switched off and its sessions end, and this browser is signed in as the new administrator. If anything fails, the first-run account stays as it was and you can try again. A link on this screen offers the older route: keep `admin` and only change its password.
-3. **Watchfolder.** Enter the share's `\\server\share` path (placeholder `\\192.168.4.42\FileIngest`), never a mapped drive letter. **Test** runs in the daemon itself, as the account the service runs as: it creates the folder if it is missing, writes a probe file, renames it and deletes it, within 15 seconds. On "access denied" it names the account to grant **Modify** on the share and the folder. Next saves the path and is enabled only after a passing test; it starts filled with where the current setting resolves. When the test says access denied, the screen explains the cause (the service is not running as an account the share accepts) and the `--account` reinstall. **Skip for now** changes nothing: files keep going to the current watchfolder (the local default folder next to the program on a new installation) until you set the share, and the warning says so. See 2.1a.
+3. **Watchfolder.** Enter the share's `\\server\share` path (placeholder `\\192.168.4.42\FileIngest`), never a mapped drive letter. **Test** runs in the daemon itself, as the account the service runs as: it creates the folder if it is missing, writes a probe file, renames it and deletes it, within 15 seconds. On "access denied" it names the account to grant **Modify** on the share and the folder. Next saves the path and is enabled only after a passing test; it starts filled with where the current setting resolves. When the test says access denied, the screen explains the cause (the service is not running as an account the share accepts) and how to run the service as a named account; on an installation made with Setup, do that with Apps & Features → OmniIngest → Modify (§2.2a). **Skip for now** changes nothing: files keep going to the current watchfolder (the local default folder next to the program on a new installation) until you set the share, and the warning says so. See 2.1a.
 4. **Mail (Microsoft 365).** Tenant ID, client ID, mailbox and client secret of the app registration (see 5.2). **Test connection** reads the mailbox. The secret goes to the encrypted store and is never shown again; leave it blank later to keep the stored one. **Skip for now** warns that no email is ingested until a mailbox is set.
-5. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the LLM card (5.4); a button leaves the wizard and opens it. A short note explains that a NAS or IP share needs the service reinstalled with `--account`.
+5. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the LLM card (5.4); a button leaves the wizard and opens it. A short note explains that a NAS or IP share needs the service to run as a named account (§2.2a).
 6. **TLS, reverse proxy and metrics** (IT only). The `.pfx` certificate path and passphrase, whether to trust the proxy header and from which networks, extra allowed host names, `/metrics` on/off and its networks, and **Download answer file**. A trusted-proxy range wider than /24 (IPv4) or /64 (IPv6) is flagged: every machine in it could speak for any client address. The certificate is opened with its passphrase before it is saved; a file that is not a PKCS#12 bundle, or a wrong passphrase, is refused, because it would stop the web listener at the next start.
 7. **Check and finish.** The daemon's current health lines, green, amber or red, each with its hint, and a notice if a restart is needed. **Finish** records `setup_completed` and the mode, and opens the normal panel.
 
@@ -129,24 +214,232 @@ The wizard tells you after each save, and again on the last screen, when a resta
 
 **Running it again.** The Admin page has a **Setup** card with **Run setup wizard again**. The account step is skipped when the first-run account no longer exists. The settings the wizard writes are also available on their own, to an administrator, at `GET /api/admin/settings` and the `POST /api/admin/settings/...` routes the screens use.
 
-**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation for an unattended install later; nothing reads it back yet.
+**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation, and Setup reads it back for a new installation with `/answer` (§2.4).
+
+### 2.1c What Setup refuses
+
+Setup checks the folder, the configuration and the account before it changes
+anything. A refusal ends on the page **Setup cannot continue** with the reason
+and **Nothing was changed.** (exit code 5; with `/quiet`, the reason is
+printed). On the pages, a refusal about the account (the last five rows)
+brings the account page back instead, with **The account was not accepted:**
+and the reason; a named account keeps the right to log on as a service that
+Setup gave it, nothing else is changed. The messages below are shortened; `<…>` stands for the folder or
+account Setup names.
+
+| Setup says | What it means | What to do |
+|---|---|---|
+| `<folder> exists and belongs to <owner>, not to Administrators.` | The folder was made by another account, which can change its permissions at any time. | Choose another folder, or remove this one. If it is yours, run the `icacls "<folder>" /setowner Administrators /T` line the message gives, then Setup again. |
+| `<folder> already exists and <who> can write to it, so files could be planted in it before Setup secures it.` | An existing folder without an installation in it that other users can write to. | Remove the folder and let Setup create it, or choose another one. |
+| `<folder>\omni-ingest.exe belongs to <owner>, not to Administrators, so Setup cannot tell whether this installation is the one you made.` | A program in the folder that no administrator put there. | If it is yours, run the `icacls … /setowner Administrators /T` line the message gives, then Setup again. |
+| `<folder> is reached through a link (<link>). Give the real folder with /dir.` | The folder, or one above it, is a junction or a symbolic link. | Choose the real folder (**Change folder…** or `/dir`). |
+| `<parent> can be renamed or re-permissioned by <who>, so the service's folder could be swapped.` | Someone else may rename a folder above the installation (a folder in a user profile, for example) and swap the whole installation. | Install directly on a drive (`D:\OmniIngest`) or under Program Files, or remove that permission. An existing installation there is upgraded and only warned. |
+| `<path> is a link inside the installation.` | A junction or link inside the folder (for example `data` pointing elsewhere). | Remove it, or give the real folder in `config.json`, and run Setup again. |
+| `Cannot install: Z: is a mapped network drive (\\nas01\ingest). The service cannot see drive mappings; use \\nas01\ingest\… instead.` | The configuration's watchfolder is a drive letter. A mapping belongs to one user's session (§2.1a). | Put the `\\server\share` path into `config.json` or the answer file. |
+| `A network watchfolder needs --account (a domain account), or the computer account granted on the share.` | `/quiet` with a share watchfolder and no `/account`. | Give `/account` (§2.4), or grant this computer's account on the share and give `/account default`. |
+| `<account> needs a password, which an unattended install is never given.` | `/quiet` with an account that has a password. | Run Setup with its pages, or use `/account default`. |
+| `Windows does not know the account <account>; check the spelling (DOMAIN\user or .\user).` | A misspelt account, or one of a domain this computer does not know. | Correct it on the account page. |
+| `Windows did not accept the password given for <account>; …` | A wrong password. | Type it again. |
+| `<account> may not log on as a service on this computer (a Group Policy denies it); …` | A domain policy denies the account "Log on as a service". | Ask the domain administrator to allow it for that account. |
+| `Windows could not reach a domain controller to check <account>. …` | The computer cannot reach a domain controller now. | Check the network and try again. |
+| `The password of <account> has expired…` / `The account <account> is disabled…` / `… is locked out…` | The account cannot log on. | Fix the account in Active Directory (or Computer Management), then try again. |
+
+**Folders reached through a mounted volume or a link.** A path outside the
+installation folder that Setup would give the service account rights on (a
+local watchfolder, an archive elsewhere) and that is reached through a link or
+a mounted volume is not refused: Setup does not change its permissions and
+says so under **Please note:** on the summary (with `/quiet`, in `setup.log`),
+with the line to run if that is intended:
+
+```text
+! E:\Media\ingest is reached through a link or a mounted volume (E:\Media): Setup did not change its permissions. If that is intended, grant them yourself: icacls "E:\Media\ingest" /grant "NT SERVICE\OmniIngestService:(OI)(CI)M"
+```
 
 ### 2.2 Upgrading
 
-Run the new release's `Install.cmd`. The service stops, the program and tools
-are replaced, the service starts again. Data, configuration, passwords and
-keys are kept. Database migrations run on the first start, after a backup is
-written to `data\backups\`. If the new version does not answer on
-`/api/health` within 4 minutes, the previous release is put back
-automatically.
+Run the new Setup file on the server (check its `.sha256` first, §2.1). Its
+first page is **OmniIngest is installed on this computer**, with the folder,
+the version and the account the service runs as.
+
+1. **Upgrade to \<version\>** (*The settings, the database and the service
+   account are kept.*).
+2. **Ready to upgrade OmniIngest to \<version\>** lists what is kept and ends
+   with *If the new version does not start, the previous one is put back.*
+   Press **Upgrade**.
+
+Setup stops the service, replaces the program and the broadcast tools (yt-dlp
+and Deno only when they are missing: they update themselves), starts the
+service again and waits up to 4 minutes for it to answer on `/api/health`.
+Kept: `config.json`, the database, the saved passwords and keys, the account
+the service runs as, and the previous program as `omni-ingest.exe.prev`.
+Database migrations run on the first start, after a backup is written to
+`data\backups\`.
+
+How to read the result:
+
+| Last page | Exit code | Meaning |
+|---|---|---|
+| **OmniIngest was upgraded to \<version\>.** | 0 | Done. |
+| **Setup put the previous state back** | 7 | The new version did not come up; the previous one is back and running, for example *The upgrade failed (The service did not answer on 127.0.0.1:8080 within 240 s) and the previous version was put back; it is running.* Send `setup.log` and `logs\` to support. |
+| **Setup could not put everything back** | 1 | The message lists what was put back, what was not, and whether the service runs. Act on it; `setup.log` has every step. |
+| **Setup could not finish** | 1 (4: a damaged Setup file) | The message, and *The details are in C:\OmniIngest\setup.log.* |
 
 After upgrading to this version everyone signs in once again; session tokens
 are now stored hashed.
 
+### 2.2a Changing the service account
+
+Apps & Features → **OmniIngest** → **Modify** opens Setup on the account page
+(it runs `C:\OmniIngest\OmniIngest-Setup.exe /change-account`). A Setup file
+started by hand offers the same as **Change the account the service runs as**
+on its first page.
+
+1. The account page says *The service runs as \<account\> now.* Choose as in
+   §2.1, then **Next >**.
+2. **Ready to change the service account**: *The service is restarted under
+   the new account; if it does not start, Setup puts the previous state
+   back.* Press **Change**.
+3. **The service now runs as \<account\>.** Files and settings are kept, and the
+   new account gets the folder rights of §2.1.
+
+If the service does not start under the new account, the last page is **Setup
+put the previous state back** (*The account change failed (…) and was undone;
+it is running.*, exit code 7).
+
+Unattended, for an account without a password:
+`OmniIngest-Setup.exe /change-account /account default /quiet`.
+
 ### 2.3 Uninstalling
 
-`Uninstall.cmd` removes the service and the firewall rule. The install folder
-(database, configuration, logs) stays; delete it by hand if you want.
+Apps & Features → **OmniIngest** → **Uninstall**, or run
+`OmniIngest-Setup.exe /uninstall` from the installation folder. The page
+**Remove OmniIngest from this computer?** says what happens:
+
+- *Removes:* the Windows service, its firewall rule, the Apps & Features entry
+  and the program files (`omni-ingest.exe` and its `.prev`, the tools and DLLs
+  in `bin\`, `OmniIngest-Setup.exe`).
+- *Keeps:* `config.json`, the database, the secrets, logs, temp and archive.
+- *Never removes:* the watchfolder or any video in it.
+
+Press **Remove**. The last page is **Removal finished** (*OmniIngest was
+removed.*). When Setup runs from the installation folder (as Apps & Features
+starts it), its own file there is removed at the next restart of Windows,
+because it is the one running.
+
+**Removing the data too.** Tick *Also remove the database, the saved passwords
+and keys, the settings, the logs, the temporary files and the archive of
+delivered videos in the installation folder* and press **Remove**. The page
+comes back, now listing what goes with the data, and its default button is
+**Cancel**: press **Remove** there to go ahead. This also removes, inside the
+installation folder only: `config.json` and `config.json.prev`, `setup.log`,
+`data\` (the database and its backups, the secret store, the roster seeds,
+the adblock lists, the sign-in browser profile), `logs\`, `temp\` (including
+videos waiting for MCR approval) and `archive\`. A database, temp or archive
+folder configured outside the installation folder is kept, and the page says
+so. The installation folder itself goes once it is empty.
+
+The watchfolder is never touched: a folder that is the watchfolder or holds it
+is kept wherever it is, and a watchfolder inside the installation folder keeps
+that folder too.
+
+If something could not be removed, the last page says how many items and the
+Apps & Features entry stays, so the removal can be run again from there.
+`Uninstall.cmd` (§2.5) removes only the service and the firewall rule.
+
+### 2.4 Unattended install
+
+For deployment tools that run as administrator: no page, no question.
+
+```text
+OmniIngest-Setup-1.0.0-20261118-x64.exe /quiet [/dir <folder>] [/account <name>] [/no-firewall] [/answer <file>]
+```
+
+- `/quiet` needs an elevated process (otherwise exit code 3) and never asks
+  for elevation. It prints only an error; every line of a run that changed
+  something goes to `setup.log`; a refusal, a cancel or a usage error writes
+  none.
+- `/dir`: the installation folder, an absolute path (default
+  `C:\OmniIngest`). For an upgrade, give the folder of the installation.
+- `/account`: only an account without a password: `default` (the virtual
+  account `NT SERVICE\OmniIngestService`), another `NT SERVICE\…` account,
+  `NT AUTHORITY\NetworkService`, `NT AUTHORITY\LocalService` or `LocalSystem`.
+  A user account needs its password, and a password is never given on a
+  command line: install with the pages, or with the default account and change
+  it later with the pages (§2.2a). Without `/account` a new installation runs
+  as the virtual account and an upgrade keeps its account.
+- `/no-firewall`: no firewall rule.
+- `/answer <file>`: the answer file the setup wizard's IT mode exports
+  (**Download answer file**, `omni-answers.json`, §2.1b). It is used only for
+  a new installation: when the folder already has a `config.json`, Setup keeps
+  that and says so. Taken from it: the watchfolder, the web port, the MCR open
+  networks, the proxy and allowed-host settings, the archive, the metrics, the
+  mailbox's tenant, client and address, the LLM mode (`off`, `assist` or
+  `primary`), provider, endpoint and model, and the wizard mode. Never taken: a secret (a key that looks like one refuses
+  the whole file), TLS (the certificate path is checked and noted, not applied:
+  the certificate and its passphrase are not on the new machine), and "setup
+  completed" (a new installation always starts with the wizard). An unknown
+  key or a value of the wrong type refuses the whole file before anything is
+  installed (exit code 5). With `/quiet`, an answer file whose watchfolder is
+  a share needs `/account` too (§2.1c).
+
+Setup is a windowed program: a script must wait for it explicitly.
+
+```bat
+start "" /wait OmniIngest-Setup-1.0.0-20261118-x64.exe /quiet /dir D:\OmniIngest /answer C:\Deploy\omni-answers.json
+echo %ERRORLEVEL%
+```
+
+```powershell
+$p = Start-Process .\OmniIngest-Setup-1.0.0-20261118-x64.exe -ArgumentList '/quiet', '/dir', 'D:\OmniIngest' -Wait -PassThru
+$p.ExitCode
+```
+
+In Windows PowerShell 5.1, put a value with a space in double quotes inside
+the single ones (`'"D:\Omni Ingest"'`). `& .\OmniIngest-Setup….exe` does not
+reliably wait, and `cmd /c "… > file"` captures nothing; to keep the error
+text, add `-NoNewWindow -RedirectStandardError setup-error.txt` to
+`Start-Process`.
+
+The same switches remove it (`/uninstall /quiet`, with `/remove-data` to
+remove the data too) and change the account (`/change-account /account
+<name> /quiet`).
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Done. |
+| 1 | Failed; for an upgrade or an account change, the way back did not restore everything (the message says what). See `setup.log`. |
+| 2 | Wrong command line. |
+| 3 | Needs administrator rights. |
+| 4 | The Setup file is damaged or incomplete: copy it again and check its `.sha256`. |
+| 5 | Refused before anything was changed (§2.1c). |
+| 6 | Cancelled, or the administrator prompt was declined. |
+| 7 | The upgrade or account change failed and the previous state is back and running. |
+
+### 2.5 From the command line (Install.cmd)
+
+The zip installs without Setup, at a console. Unzip it into a local folder on
+the server (not on a mapped network drive: the copy of `Install.cmd` that runs
+with administrator rights does not see your drive letters) and
+double-click **`Install.cmd`** (it asks for administrator rights), give the
+Dalet watchfolder when asked, and continue in the browser as in §2.1 (*Where
+it ends*). It installs the same way as Setup, except that there is no Apps &
+Features entry; Setup can upgrade, change the account of and remove such an
+installation later.
+
+| Option | Meaning |
+|---|---|
+| `--watchfolder "\\nas01\ingest"` | the Dalet watchfolder |
+| `--account "NEWSROOM\svc_omni"` | run the service as this account (its password is asked at the console). Default for a new installation: the virtual account `NT SERVICE\OmniIngestService`; `--account LocalSystem` opts out. A network watchfolder needs an account the share accepts (§2.1, *The account*). An upgrade keeps the account; `--account "NT SERVICE\OmniIngestService"` switches an old LocalSystem installation. |
+| `--dir D:\OmniIngest` | install somewhere else |
+| `--port 8081` | another web port |
+| `--yes` | accept the defaults, no questions |
+| `--no-firewall` | do not add the firewall rule |
+| `--import D:\OmniDownloader` | move an existing setup on this PC (config, database, keys, seeds) |
+
+To upgrade, run the new release's `Install.cmd`: it upgrades as in §2.2. To
+uninstall, `Uninstall.cmd` removes the service and the firewall rule; the
+installation folder (database, configuration, logs) stays; delete it by hand
+if you want.
 
 ---
 
@@ -166,6 +459,22 @@ button. Install downloads the exact pinned build and checks its checksum;
 jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build.
+
+The verified yt-dlp update also runs early when one platform (YouTube, X,
+Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) has 3 extraction
+failures in 30 minutes (a rate limit or a login wall does not count), at most
+once every 6 hours and only while the nightly update is on
+(`ytdl_auto_update_nightly`); it waits at most a minute and a half for running
+jobs and tries again later if they are still busy. It is recorded as a run of
+`ytdl_update` noted `early: …` (§7); the 03:00 run still happens. When the new
+build is kept, the jobs waiting in review for it get their second chance
+(§5.3, `retry.second_chance_window_mins`).
+
+yt-dlp is always started with `--ignore-config`, `--no-plugin-dirs` and
+`--ffmpeg-location` pointing at the pinned ffmpeg in `bin\` (downloads, probes,
+the cookie test, the self-check, the canaries, the benchmark and the repair
+route alike). A `yt-dlp.conf` in the service account's profile or a yt-dlp
+plugin folder is therefore ignored, and a merge always uses the pinned ffmpeg.
 
 The service reads the CPU of the machine it runs on. On an ARM64 Windows
 host it installs the native BtbN ARM64 ffmpeg and ffprobe, because the x64
@@ -195,6 +504,10 @@ directory.
 | Path | What |
 |---|---|
 | `config.json` | configuration (no secrets) |
+| `config.json.prev` | `config.json` as it was before the installer last rewrote it |
+| `omni-ingest.exe.prev` | the previous program, kept by an upgrade |
+| `OmniIngest-Setup.exe` | the copy of Setup that Apps & Features runs for Modify and Uninstall |
+| `setup.log` | what Setup did: each run that changed something, appended under a line with its date (UTC) |
 | `data\omni.db` | the database: queue, mail, users, audit |
 | `data\secrets.bin` | encrypted secret store (Windows DPAPI, tied to this PC) |
 | `data\backups\` | database backups taken before migrations |
@@ -217,8 +530,11 @@ needed; finished `.mxf` files and any other file are never touched. The job
 records where the file is going just before the final rename, so after a crash
 or restart a video that is already in the watchfolder is never delivered a
 second time: the job is finished as delivered ("Recovered after a restart").
-If the share cannot be read at that moment, the job goes to review instead of
-being requeued: check Dalet before retrying it.
+If the share cannot be read at that moment, the job waits for the watchfolder
+(§11.1) with that record; when the share answers, a file that is there finishes
+the job without a second copy, a file that is not there sends it to review
+(`DELIVERY_UNCONFIRMED`: check Dalet before retrying), and otherwise the job
+runs again from its link.
 
 ---
 
@@ -272,6 +588,11 @@ with a placeholder until you add the person (§6.3).
 | `retention_days` | 7 | how long working files of finished jobs are kept |
 | `mail_text_retention_days` | 30 | how long mail text is kept for the desk (in effect at most 90: the handled-mail records themselves are removed after 90 days) |
 | `archive.enabled`, `archive.retention_days` | true, 14 | archive of downloaded sources |
+| `retry.max_age_mins` | 120 | no automatic retry for a job older than this, counted from when it was queued or from MCR's last «Δοκιμή ξανά» (read as 30 to 360); see §10 |
+| `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | minutes after which a job that is waiting or running (not yet delivered) counts as late, ordinary and urgent, counted like `retry.max_age_mins` (read as 1 to 120). A late job is listed in the desk's «Καθυστερούν» strip with its reason, and the desk sounds once; a live stream waiting for its next check is listed whatever its age. See the User Guide, §4.9 |
+| `retry.second_chance_window_mins` | 120 | a job waiting in review goes back to the queue on its own when what it failed on is fixed: a new yt-dlp or Deno kept after the nightly self-check (jobs that failed to find or read the video), a cookie jar uploaded, signed in or tested good (that site's jobs that needed a login or were rate-limited), a news site that works again (that site's jobs that failed to find the video). Once per cause, at most once for a site and three times in all, never a job a person acted on («Δοκιμή ξανά», cancel, «Το έβαλα στο Dalet», reject, wrong video, an offered video queued…), never a job whose link is already queued or was delivered again meanwhile, and only while the job is younger than this, counted like `retry.max_age_mins` (read as 30 to 360, and never longer than `retry.max_age_mins`). The job's history says «Αυτόματη επανάληψη» and why |
+| `pacing.per_host_concurrency` | 1 | yt-dlp runs starting at one video platform (YouTube, X, Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) at a time, so a mail with many links does not trip the platform's bot check (read as 1 to 4). A download gives its turn back as soon as the video starts transferring, so downloads still overlap; a probe keeps it until it ends. A job waiting for its turn keeps its download slot; a wait over 2 s is written to its history |
+| `pacing.min_gap_secs` | 8 | seconds between two starts on one platform, plus up to 4 s at random (read as 0 to 120; 0 switches the gap off). After a platform refuses a run as a rate limit (`RATE_LIMITED`), nothing new starts there for 2 minutes |
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
 | `adblock_*` | on | blocklists for the page reader, updated nightly |
@@ -381,10 +702,12 @@ Prometheus handles as a counter reset.
 
 | Card | Use |
 |---|---|
+| **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b) |
 | **Download engine** | yt-dlp version, update now, roll back |
 | **Toolchain** | install or repair ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno |
 | **Credentials** | set or clear the secrets above |
 | **Database maintenance** | purge completed jobs older than 7–90 days; vacuum |
+| **Autonomy** | how often a video reached air with nobody touching it, and why a person was needed (below) |
 | **Self-heal** | the last 30 days of overnight retries on news sites that stopped giving video (nothing is downloaded) |
 | **Self-check** | the daily check links ("a link that has a video" per site); add, remove, run now |
 | **Sites** | per-site health: recent success, last error, canary checks, **Run now** |
@@ -400,6 +723,29 @@ Prometheus handles as a counter reset.
 | **Audit log** | who did what |
 | **Scheduled maintenance** | the nightly tasks (§7), run one now |
 | **Mailbox test** | check Graph access with given or stored credentials |
+
+**Autonomy report.** The first card on the right. *Delivered untouched* is the
+share of the videos that reached air (delivered to the watchfolder, or put into
+Dalet by hand) that nobody touched: no retry, rename, approval or rejection,
+next choice, cancel, re-download, "wrong video", "run now", discard or manual
+completion. A video MCR queued by hand from an offered video or a skipped mail
+link starts touched (*Queued by MCR from an offer or a skipped link*); a link
+added on the desk or the journalist panel does not. Automatic retries and
+waiting for the watchfolder do not count as a touch. A video later marked as
+wrong counts as touched. This is the figure the 14-day soak test is judged on
+(95 % or more). The smaller *Strict* figure divides by every finished job, cancelled and discarded
+ones included. The tables show the first error code of the jobs that needed a
+person (*Why a person was needed*), the first thing the operator did (*What the
+operator did*) and the sites; *Waiting for a person now* counts the jobs in
+review, manual download or waiting for approval. Choose 7, 14 or 30 days. The
+same figures on the server, safe while the service runs:
+
+```powershell
+.\omni-ingest.exe report autonomy --days 14
+```
+
+The report keeps one small row per finished job for 400 days, with the site's
+domain only: never a link, file name or journalist.
 
 ### 6.1 Cookies for sites that need a login
 
@@ -456,7 +802,7 @@ before every delete or import.
 
 | Task | When (local time) | What |
 |---|---|---|
-| `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp |
+| `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp; also run early when a platform starts failing, noted `early: …` (§3) |
 | `adblock_update` | daily 03:30 | refresh blocklists |
 | `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text, and the old database records below |
 | `selfcheck` | daily 05:15 | browser check and per-site check links |
@@ -499,6 +845,7 @@ Green = ok, amber = degraded, red = down.
 | `cookies` | a jar failed its test or expires within 7 days |
 | `lockdown` | the `data` and `temp` folders are not restricted to SYSTEM, Administrators and the service account |
 | `archive` | the archive disk is low |
+| `workers` | a job run hit an internal error in the last 24 hours (amber). Before delivery the job goes back to the queue once (after 30 s), then to review; during delivery it is never queued again: it is finished as delivered when its file is in the watchfolder, otherwise it goes to review with `DELIVERY_UNCONFIRMED`. If it repeats, send `logs\` to support |
 
 ---
 
@@ -509,7 +856,7 @@ Run from the install folder (elevated on an installed service).
 | Command | What |
 |---|---|
 | `omni-ingest run [--config <file>]` | run in a console window instead of as a service |
-| `omni-ingest install …` / `uninstall` | what `Install.cmd` / `Uninstall.cmd` call (§2) |
+| `omni-ingest install …` / `uninstall` | what `Install.cmd` / `Uninstall.cmd` call (§2.5) |
 | `omni-ingest service install\|start\|stop\|status\|uninstall` | the Windows service |
 | `omni-ingest setup` | interactive setup wizard |
 | `omni-ingest admin list-users` | list accounts |
@@ -522,31 +869,64 @@ Run from the install folder (elevated on an installed service).
 | `omni-ingest mail-ingest --eml <file>…` | queue saved `.eml` files as if they had arrived |
 | `omni-ingest mail-history [--last 20]` | handled mail, newest first |
 | `omni-ingest mail-reprocess --message-id <id> \| --subject <part>` | read a mail again on the next poll |
+| `omni-ingest report autonomy [--days 14]` | the Autonomy card's figures as text, for the last N days (1 to 365); reads only, safe while the service runs (§6) |
 | `omni-ingest browser-test <url>` | show what the page reader finds on a URL |
 | `omni-ingest selfcheck` | run the check links now (downloads nothing) |
 | `omni-ingest benchmark run [--mode extract\|full] [--targets 1-65] [--parallel 2]` | the benchmark corpus; `benchmark list`, `benchmark report <id>` |
 | `omni-ingest adblock status\|update` | blocklists |
+
+**Setup** (`OmniIngest-Setup.exe`, §2). Switches may be written `/x`, `-x` or
+`--x`, in any case. Without `/quiet` Setup shows its pages and asks for
+administrator rights itself; `OmniIngest-Setup.exe /?` prints this list.
+
+| Command | What |
+|---|---|
+| `OmniIngest-Setup.exe [/dir <folder>] [/account <name>] [/no-firewall] [/answer <file>] [/quiet]` | install, or upgrade the installation that is there (§2.1, §2.2, §2.4) |
+| `OmniIngest-Setup.exe /change-account [/account <name>] [/quiet]` | run the service under another account (`default` = the virtual account); with `/quiet`, `/account` is required (§2.2a) |
+| `OmniIngest-Setup.exe /uninstall [/remove-data] [/dir <folder>] [/quiet]` | remove the service and the program files; `/remove-data` also the configuration and data inside the installation folder; never the watchfolder (§2.3) |
+| `OmniIngest-Setup.exe --pack <release folder> --out <file>` | build a Setup that carries a release folder (`scripts\package.ps1` does this); refuses an existing `--out` |
+| `/lang el\|en` | the language of the pages (default: the Windows display language) |
+
+There is no password switch: a password is only ever typed in the Windows
+credential prompt. Exit codes: §2.4.
 
 ---
 
 ## 10. Error codes
 
 A stopped job carries one of these codes; the desk shows a Greek hint.
-"Auto" means the job retries by itself (after 30 s, 2 min, then 5 min;
-10 min for low disk).
+"Auto" means the job retries by itself: after 30 s, 2 min, 5 min and
+10 min, then it goes to review (five tries in all, about 17 minutes);
+`HTTP_403` only after 30 s and 2 min (three tries), then the page's own
+checks and the repair route (§5.5) or review take over. A job
+older than `retry.max_age_mins` (2 hours), counted from when it was queued
+or from MCR's last «Δοκιμή ξανά», is not retried. `LOW_DISK` retries after
+10 minutes three times (four tries), then goes to review: the clip may need
+more room than the temp or watchfolder volume has. While the disk check is
+red, no job is started at all; they wait in the queue. `RATE_LIMITED`
+retries after 2, 5, 10 and 15 minutes (five tries, about half an hour),
+within the same age limit. While a job waits out one of these waits, the desk
+lists it as late once it is past `retry.late_after_mins`, and MCR's «Τώρα» runs
+it at once (that counts as a person acting on the job). A job in review with
+`LOGIN_REQUIRED` or `RATE_LIMITED` (a cookie jar for its site saved or tested
+good), or with `NO_STREAM_FOUND`, `VIDEO_UNRESOLVED`, `HTTP_403` or
+`UNSUPPORTED_URL` (a new yt-dlp or Deno kept, or its news site working again),
+may go back to the queue on its own: the second chance of §5.3
+(`retry.second_chance_window_mins`).
 
 | Code | Auto | Meaning / action |
 |---|---|---|
 | `NETWORK` | yes | network problem |
+| `RATE_LIMITED` | yes | the platform is refusing downloads for now (YouTube's bot check, HTTP 429, "try again later"); nothing new starts there for 2 minutes (§5.3 `pacing`). When the retries run out, the card adds the site's cookie advice (§6.1). The same bot check on X, Facebook or Instagram is `LOGIN_REQUIRED` |
 | `HTTP_403` | yes | the source refused; try later or another link |
 | `EXTRACT_TIMEOUT`, `DOWNLOAD_TIMEOUT` | yes | download timed out |
 | `DELIVERY_FAILED`, `DELIVER_TIMEOUT` | yes | could not write to the watchfolder: check the share and the service account's rights |
 | `LOW_DISK` | yes | free disk space |
+| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after it was queued (within the same 2-hour age limit), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
 | `LOGIN_REQUIRED` | no | the site wants a login: add cookies (§6.1) |
 | `GEO_BLOCKED` | no | not available from Greece |
 | `PRIVATE_OR_REMOVED` | no | ask for another link |
 | `PAGE_NOT_FOUND` | no | 404; check the link |
-| `LIVE_STREAM` | no | live; wait for the recording |
 | `UNSUPPORTED_URL` | no | not recognised; try a direct video link |
 | `NO_STREAM_FOUND`, `NO_VIDEO_ON_PAGE` | no | no video found on the page |
 | `VIDEO_UNRESOLVED` | no | a video is there but was not fetched; download by hand |
@@ -563,6 +943,7 @@ A stopped job carries one of these codes; the desk shows a Greek hint.
 | `HELD_FILE_CHANGED` | no | the held file changed: not delivered |
 | `REPAIR_EXHAUSTED` | no | repair ran out of time or attempts |
 | `NON_PUBLIC_ADDRESS` | no | the link, or a stream behind it, is an internal address: not downloaded (see `egress_allow_networks`) |
+| `DELIVERY_UNCONFIRMED` | no | a delivery was interrupted; check Dalet for the file before retrying |
 | `PIPELINE_FAILED` | no | unexpected error; see the job's history |
 
 ---
@@ -576,12 +957,40 @@ A stopped job carries one of these codes; the desk shows a Greek hint.
 | YouTube LOGIN_REQUIRED | update yt-dlp (**Download engine**); if it persists, add `youtube.com` cookies |
 | X / Instagram posts fail | upload that site's cookies and **Test** |
 | Wrong video from a news site | **Test URL** on the article; report the article link |
-| Files not appearing in Dalet | `watchfolder` health line; for a share, the service must run as a domain account with write rights (`--account`), or the computer account must be granted on the share |
+| Files not appearing in Dalet | `watchfolder` health line; for a share, the service must run as an account with write rights on it (§2.2a), or the computer account must be granted on the share |
 | Everything waits | `disk` health line (no new jobs below 5 GB) |
+| The desk lists videos under «Καθυστερούν» | the reason on each row: «Περιμένει τον φάκελο παράδοσης» is a watchfolder outage (§11.1, `watchfolder` health line); «Νέα προσπάθεια στις …» is an automatic retry, with the code's hint (§10); «Ζωντανή μετάδοση· επόμενος έλεγχος …» is a stream still live (`LIVE_STREAM`). Many YouTube rows at once with «Ο ιστότοπος περιορίζει προσωρινά τις λήψεις»: `RATE_LIMITED`, see `pacing` (§5.3) and cookies (§6.1) |
+| Windows says *Windows protected your PC* when Setup starts | the file is not code-signed: check its `.sha256`, then **More info** → **Run anyway** (§2.1) |
+| Setup says **Setup cannot continue** | a refusal; nothing was changed. Find the message in §2.1c |
+| Setup says **The account was not accepted:** | the reason follows (§2.1c); correct the account or password on the same page |
+| Setup says **Setup could not finish** | the page names `setup.log` in the installation folder; the service's own log is in `logs\` |
+| Setup says **Setup put the previous state back** | the new version or account did not come up; the previous state runs (exit code 7). `setup.log` and `logs\` say why |
+| Setup says **Setup could not put everything back** | the message lists what is in place now; act on it, then run Setup again |
+| Setup says the file is damaged (exit code 4) | copy it again and check its `.sha256` |
+| Setup ends with *Could not remove Setup's work folder … delete it by hand.* | delete the folder it names under `C:\ProgramData` |
 
-**Logs:** `logs\omni-ingest.YYYY-MM-DD.log`. Each job's step-by-step history
+**Logs:** `logs\omni-ingest.YYYY-MM-DD.log`. Setup writes to `setup.log` in the
+installation folder (a refusal or a cancel, which change nothing, write
+nothing; after an uninstall with the data, there is none). Each job's step-by-step history
 is also on its card under «Τεχνικές λεπτομέρειες».
 
 **Rollback:** the installer keeps the previous release, and the
 pre-migration database backup is in `data\backups\`. A restored backup needs
 the matching older program (the database schema only moves forward).
+
+### 11.1 When the watchfolder share is down
+
+- A finished video that cannot be written to the watchfolder waits on this
+  computer and is delivered when the share answers again, however long that
+  takes. It is not downloaded or encoded again, with two exceptions: a
+  waiting video whose saved file changed or disappeared, and a job recovered
+  after a restart that still has to deliver, are downloaded and encoded again
+  from their link.
+- A waiting video whose saved file cannot be read for 2 hours goes to review
+  with `PIPELINE_FAILED`.
+- The `watchfolder` health line turns red while the share does not answer.
+- A video whose delivery was interrupted (a restart or an error during the
+  copy) and whose arrival cannot be confirmed goes to review with
+  `DELIVERY_UNCONFIRMED`. Check in Dalet whether it is already there: if it
+  is, press «Το έβαλα στο Dalet»; if not, press «Δοκιμή ξανά».
+- A waiting video cannot be renamed.

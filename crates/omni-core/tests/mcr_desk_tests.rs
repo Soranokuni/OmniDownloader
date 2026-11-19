@@ -1,7 +1,7 @@
 //! The MCR desk lists (plan P7.1): paging, clearing finished jobs from the
 //! live queue without losing them, and downloading a delivered job again.
 
-use omni_core::models::{JobStatus, JobsFilter, JobsView, NewJob};
+use omni_core::models::{JobStatus, JobsFilter, JobsView, LateAfter, NewJob};
 use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
 fn repo() -> (tempfile::TempDir, Repository) {
@@ -51,7 +51,7 @@ fn each_tab_holds_its_jobs_in_pages() {
     assert_eq!(ids(&repo, JobsView::Review, 1, 20), (vec![review], 1));
     assert_eq!(ids(&repo, JobsView::Completed, 1, 20).1, 12);
 
-    let c = repo.job_counts().unwrap();
+    let c = repo.job_counts(LateAfter::default()).unwrap();
     assert_eq!((c.active, c.finished, c.review, c.completed), (1, 12, 1, 12));
 }
 
@@ -229,7 +229,7 @@ fn old_review_jobs_can_be_hidden_and_shown_again_and_nothing_is_deleted() {
     assert!(repo.get_job(old).unwrap().unwrap().cleared_at.is_some());
     assert!(repo.get_job(done).unwrap().unwrap().cleared_at.is_none(), "delivered jobs are not touched");
 
-    let c = repo.job_counts().unwrap();
+    let c = repo.job_counts(LateAfter::default()).unwrap();
     assert_eq!((c.review, c.review_hidden), (1, 1));
     assert_eq!(repo.hide_old_review(72).unwrap(), 0, "twice");
 }
@@ -249,7 +249,7 @@ fn a_hidden_job_that_is_retried_or_marked_done_is_no_longer_hidden() {
     assert!(repo.get_job(b).unwrap().unwrap().cleared_at.is_none());
     // The marked job shows on the live queue like any other delivery.
     assert!(ids(&repo, JobsView::Live, 1, 20).0.contains(&b));
-    assert_eq!(repo.job_counts().unwrap().review_hidden, 0);
+    assert_eq!(repo.job_counts(LateAfter::default()).unwrap().review_hidden, 0);
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn the_completed_badge_counts_only_todays_deliveries() {
     age(&d, yesterday, "completed_at", 36);
     let _ = today;
 
-    let c = repo.job_counts().unwrap();
+    let c = repo.job_counts(LateAfter::default()).unwrap();
     assert_eq!((c.completed, c.completed_today), (2, 1));
 }
 
@@ -274,7 +274,7 @@ fn the_queue_summary_does_not_count_a_cancelled_video_as_running() {
     // The oldest ready job is leased: now running.
     assert_eq!(repo.lease_job("host:1:0", 120).unwrap().unwrap().id, to_run);
 
-    let s = repo.queue_summary().unwrap();
+    let s = repo.queue_summary(LateAfter::default()).unwrap();
     assert_eq!((s.pending, s.running, s.cancelled, s.total), (1, 1, 1, 3));
 }
 
@@ -303,7 +303,7 @@ fn today_starts_at_the_boundary_given_not_at_utc_midnight() {
     };
     set(before, boundary - chrono::Duration::minutes(1));
     set(after, boundary + chrono::Duration::minutes(1));
-    assert_eq!(repo.job_counts_since(boundary).unwrap().completed_today, 1);
-    assert_eq!(repo.job_counts_since(boundary - chrono::Duration::minutes(2)).unwrap().completed_today, 2);
-    assert_eq!(repo.job_counts_since(boundary + chrono::Duration::minutes(2)).unwrap().completed_today, 0);
+    assert_eq!(repo.job_counts_since(boundary, LateAfter::default()).unwrap().completed_today, 1);
+    assert_eq!(repo.job_counts_since(boundary - chrono::Duration::minutes(2), LateAfter::default()).unwrap().completed_today, 2);
+    assert_eq!(repo.job_counts_since(boundary + chrono::Duration::minutes(2), LateAfter::default()).unwrap().completed_today, 0);
 }

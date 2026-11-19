@@ -339,6 +339,12 @@ const MATRIX: &[Row] = &[
         "POST",
         "/api/jobs/1/retry",
         &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
+    ),
+    // The late strip's «Τώρα» (P11.3b).
+    (
+        "POST",
+        "/api/jobs/1/now",
+        &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Reached)],
     ),    // MCR desk (plan P7.1): download a delivered job again; clear the live list.
     // A video held for approval (P10.5): MCR decides, nobody else.
     (
@@ -843,6 +849,14 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ]),
     ("GET", "/api/admin/repair-report", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    // The autonomy report (P11.0): admin only.
+    ("GET", "/api/admin/autonomy-report", &[
             (Anonymous, Denied),
             (AllowlistedIp, Denied),
             (Caller::User, Denied),

@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use tempfile::TempDir;
 
-use omni_core::models::{JobStatus, JobsFilter, JobsView, NewJob};
+use omni_core::models::{JobStatus, JobsFilter, JobsView, LateAfter, NewJob};
 use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
 const SHA: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -60,17 +60,17 @@ fn a_held_job_is_parked_not_terminal_and_never_leased() -> Result<()> {
 fn the_queue_summary_counts_held_jobs_and_the_review_view_leaves_them_out() -> Result<()> {
     let dir = TempDir::new()?;
     let repo = repo(&dir);
-    assert_eq!(repo.queue_summary()?.approval, 0);
+    assert_eq!(repo.queue_summary(LateAfter::default())?.approval, 0);
     held(&repo, 1);
     let waiting = queue(&repo, 2);
-    let s = repo.queue_summary()?;
+    let s = repo.queue_summary(LateAfter::default())?;
     assert_eq!((s.approval, s.pending, s.total), (1, 1, 2));
     let _ = waiting;
 
     let filter = JobsFilter::default();
     let review = repo.list_jobs_page(JobsView::Review, &filter, 1, 20)?;
     assert_eq!(review.total, 0, "a held job is not in the review list");
-    assert_eq!(repo.job_counts()?.review, 0);
+    assert_eq!(repo.job_counts(LateAfter::default())?.review, 0);
     Ok(())
 }
 

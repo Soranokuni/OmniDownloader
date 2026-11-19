@@ -859,7 +859,7 @@ async fn rerun(r: &Rig, snap: PageSnapshot) -> Option<LadderResult> {
 /// repository functions: the file is held, the job parked, then MCR decides.
 fn park(r: &Rig) {
     assert!(r.repo.hold_output(r.job.id, OWNER, "temp/held/x/clip.mxf", 10, &"ab".repeat(32), Some(9.0), Utc::now() + chrono::Duration::hours(24)).unwrap());
-    assert!(crate::finish_held(&r.repo, r.job.id, OWNER).unwrap());
+    assert!(crate::worker::finish_held(&r.repo, r.job.id, OWNER).unwrap());
 }
 
 fn held_urls(r: &Rig) -> Vec<String> {
@@ -1329,15 +1329,16 @@ async fn a_repaired_video_goes_through_the_real_pipeline_and_waits_for_mcr() {
     let engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdlp.clone(),
-        ffmpeg,
+        ffmpeg.clone(),
         ffprobe.clone(),
         bmx,
         root.join("temp"),
         root.join("watchfolder"),
     ));
+    let pacer = engine.pacer();
     let env = Local {
         engine,
-        prober: Rewriting { inner: ToolProber::new(ffprobe, Some(ytdlp)), addr },
+        prober: Rewriting { inner: ToolProber::new(ffprobe, Some(ytdlp), Some(&ffmpeg), &pacer), addr },
         addr,
         fetch: NoFetch,
     };
@@ -1364,7 +1365,7 @@ async fn a_repaired_video_goes_through_the_real_pipeline_and_waits_for_mcr() {
     assert_eq!(recipe_hash, shipped_hash("next_data_media"));
     // The worker, not the ladder, parks the job.
     assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Running);
-    assert!(crate::finish_held(&repo, id, OWNER).unwrap());
+    assert!(crate::worker::finish_held(&repo, id, OWNER).unwrap());
 
     let job = repo.get_job(id).unwrap().unwrap();
     assert_eq!(job.status, JobStatus::AwaitingApproval);
@@ -1403,7 +1404,7 @@ async fn work(repo: &Repository, engine: &Arc<BroadcastEngine>, root: &Path, job
     let ctx = RepairCtx { repo: repo.clone(), cfg: cfg(mode, Duration::from_secs(5)), env: Arc::new(PanicEnv) };
     let health = omni_core::health::HealthState::new();
     let canary = Arc::new(crate::canary::CanaryEnv::new(repo.clone(), health.clone(), root.join("bin"), "stable".into()));
-    crate::run_job(repo, engine, OWNER, job, CancellationToken::new(), &root.join("evidence"), &ctx, &health, &canary)
+    crate::worker::run_job(repo, engine, OWNER, job, CancellationToken::new(), &root.join("evidence"), &ctx, &health, &canary)
         .await
         .unwrap();
 }
@@ -1945,7 +1946,7 @@ impl NextRig {
         let ctx = RepairCtx { repo: self.repo.clone(), cfg: c, env };
         let health = omni_core::health::HealthState::new();
         let canary = Arc::new(crate::canary::CanaryEnv::new(self.repo.clone(), health.clone(), self.root.join("bin"), "stable".into()));
-        crate::run_job(&self.repo, &self.engine, OWNER, job, CancellationToken::new(), &self.root.join("evidence"), &ctx, &health, &canary)
+        crate::worker::run_job(&self.repo, &self.engine, OWNER, job, CancellationToken::new(), &self.root.join("evidence"), &ctx, &health, &canary)
             .await
             .unwrap();
     }
@@ -2055,7 +2056,7 @@ async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
         let ctx = RepairCtx { repo: n.repo.clone(), cfg: cfg(mode, Duration::from_secs(5)), env: env.clone() };
         let health = omni_core::health::HealthState::new();
         let canary = Arc::new(crate::canary::CanaryEnv::new(n.repo.clone(), health.clone(), n.root.join("bin"), "stable".into()));
-        crate::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
+        crate::worker::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
             .await
             .unwrap();
         assert!(env.downloads.lock().unwrap().is_empty(), "{mode:?}: nothing is downloaded");
@@ -2324,6 +2325,501 @@ async fn a_failed_trusted_delivery_does_not_leave_the_marker() {
     assert_ne!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivering"), "the real outcome replaced it");
 }
 
+/// P11.2a, risk (c): the trusted recipe's video was made and verified but the
+/// watchfolder did not answer, so the pipeline parked it. The ladder stops
+/// there (nothing else is made into the workspace that holds it), the attempt
+/// keeps `auto_delivering` with the recipe, so the job's card reads «delivered
+/// without approval» once the wait ends in a delivery, and the worker requeues
+/// the job to wait.
+#[tokio::test]
+async fn a_trusted_delivery_that_found_the_share_down_waits_with_its_marker() {
+    let (r, id) = trusted_rig(5, 5);
+    let (repo, job_id) = (r.repo.clone(), r.job.id);
+    *r.fake.at_download.lock().unwrap() = Some(Box::new(move || {
+        assert!(repo.park_for_delivery(job_id, OWNER, "temp/jobs/1/1_output.mxf", 10, "00", 2.0).unwrap());
+    }));
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::DeliveryFailed));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    let LadderResult::Parked { recipe_hash } = res else { panic!("expected Parked, got {res:?}") };
+    assert_eq!(recipe_hash, shipped_hash("next_data_media"));
+    assert_eq!(disposition(&LadderResult::Parked { recipe_hash }, RepairMode::Hold, Duration::from_secs(60)), Disposition::Parked);
+    assert_eq!(r.fake.downloads().len(), 1);
+    let at = r.repo.latest_attempt(r.job.id).unwrap().unwrap();
+    assert_eq!((at.outcome.as_deref(), at.recipe_id, at.held_url.as_deref()), (Some("auto_delivering"), Some(id), Some(A)));
+    assert_eq!(site_counts(&r, id), (5, 0, 5), "no use is scored before anything is delivered");
+    assert_eq!(r.repo.get_job(r.job.id).unwrap().unwrap().status, JobStatus::Running, "the worker requeues it, not the ladder");
+
+    // Control: the same failure without a parked video is an ordinary failed download.
+    // (The delivery after the wait is `a_trusted_delivery_that_waited_is_counted_once_when_it_lands`.)
+    let (r, _) = trusted_rig(5, 5);
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::DeliveryFailed));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(!matches!(res, LadderResult::Parked { .. } | LadderResult::Delivered { .. }), "{res:?}");
+    assert_ne!(attempt_outcome(&r._dir.0.join("omni.db"), r.job.id).as_deref(), Some("auto_delivering"));
+}
+
+/// P11.2a review, finding 3: the trusted recipe's video that waited for the
+/// watchfolder and is then delivered is counted and told exactly as one that
+/// did not wait: one AutoDelivered use, the «Παραδόθηκε χωρίς έγκριση» note,
+/// the REPAIR audit row, outcome `auto_delivered`; a second pass adds nothing.
+#[tokio::test]
+async fn a_trusted_delivery_that_waited_is_counted_once_when_it_lands() {
+    let (r, id) = trusted_rig(5, 5);
+    let root = r._dir.0.clone();
+    let job_id = r.job.id;
+    let ws = root.join("temp").join("jobs").join(job_id.to_string());
+    std::fs::create_dir_all(&ws).unwrap();
+    let ready = ws.join(format!("{job_id}_output.mxf"));
+    std::fs::write(&ready, b"the verified video").unwrap();
+    let sha = omni_core::held::sha256_file(&ready).unwrap();
+    let (repo, ready_s, sha2) = (r.repo.clone(), ready.to_string_lossy().into_owned(), sha.clone());
+    *r.fake.at_download.lock().unwrap() = Some(Box::new(move || {
+        assert!(repo.park_for_delivery(job_id, OWNER, &ready_s, 18, &sha2, 2.0).unwrap());
+    }));
+    r.fake.script.lock().unwrap().push_back(Err(ErrorCode::DeliveryFailed));
+    assert!(matches!(go(&r, Some(page(&next_data(A))), &Prior::default()).await, LadderResult::Parked { .. }));
+
+    let watch = root.join("watch");
+    std::fs::create_dir_all(&watch).unwrap();
+    let engine = Arc::new(BroadcastEngine::new(
+        r.repo.clone(),
+        root.join("y.exe"),
+        root.join("f.exe"),
+        root.join("p.exe"),
+        root.join("b.exe"),
+        root.join("temp"),
+        watch.clone(),
+    ));
+    assert!(crate::worker::wait_for_watchfolder(&r.repo, &engine, job_id, OWNER, ErrorCode::DeliveryFailed).unwrap());
+    rusqlite::Connection::open(root.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![job_id])
+        .unwrap();
+    let job = r.repo.lease_job_when(OWNER, 600, true).unwrap().expect("the waiting job");
+    crate::worker::run_waiting_delivery(&r.repo, &engine, OWNER, &job, &CancellationToken::new(), &r.ctx).await.unwrap();
+
+    assert_eq!(r.repo.get_job(job_id).unwrap().unwrap().status, JobStatus::Completed);
+    assert_eq!(std::fs::read_dir(&watch).unwrap().count(), 1, "delivered once");
+    assert_eq!(site_counts(&r, id), (5, 0, 6), "one use, no approval");
+    let at = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!(at.outcome.as_deref(), Some("auto_delivered"));
+    let told = |r: &Rig| events(r).iter().filter(|m| m.starts_with("Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή (5 εγκρίσεις στο site)")).count();
+    let audited = |r: &Rig| r.repo.get_recent_audit_logs(500).unwrap().iter().filter(|a| a.category == "REPAIR" && a.message.contains("delivered without approval")).count();
+    assert_eq!((told(&r), audited(&r)), (1, 1));
+
+    // A second pass (a repeated call, a later run) counts nothing more.
+    crate::repair::after_waiting_delivery(&r.ctx, job_id);
+    assert_eq!(site_counts(&r, id), (5, 0, 6));
+    assert_eq!((told(&r), audited(&r)), (1, 1));
+}
+
+/// P11.2b review, finding 1: a trusted recipe's unapproved delivery was being
+/// renamed (marker written, no park) when the daemon died, and at start-up the
+/// share does not answer. The job waits with its `auto_delivering` marker
+/// intact and no "check Dalet" warning; when the share answers with the file
+/// in place it is COMPLETED and counted, told and offered «Λάθος βίντεο»
+/// exactly as a delivery that was proven at start-up.
+#[tokio::test]
+async fn a_trusted_delivery_cut_by_a_restart_and_proven_later_is_an_automatic_delivery() {
+    use omni_core::models::JobStage;
+    const HOST_OWNER: &str = "host:1:1";
+    let (r, id) = trusted_rig(5, 5);
+    let root = r._dir.0.clone();
+    let watch = root.join("watch");
+    let new = NewJob::new("https://news.example.gr/story/2", "2_ANNA_TEST", "ANNA");
+    let job_id = r.repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    assert_eq!(r.repo.lease_job(HOST_OWNER, 600).unwrap().unwrap().id, job_id);
+    let at = r.repo.start_attempt(job_id, "hold", Utc::now()).unwrap();
+    r.repo.mark_attempt_auto_delivering(at, id, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+    assert!(r.repo.set_stage(job_id, HOST_OWNER, JobStage::Deliver).unwrap());
+    let target = watch.join("2_ANNA_TEST.mxf");
+    let video: &[u8] = b"the trusted recipe's video";
+    assert!(r.repo.mark_delivering(job_id, HOST_OWNER, &target.to_string_lossy(), video.len() as u64).unwrap());
+
+    // Start-up with the share down (the watchfolder is not there).
+    assert_eq!(r.repo.recover_on_startup("host").unwrap(), 1);
+    let row = r.repo.get_job(job_id).unwrap().unwrap();
+    assert!(row.delivery_wait, "{:?} {:?}", row.status, row.error_message);
+    assert_eq!(attempt_outcome(&root.join("omni.db"), job_id).as_deref(), Some("auto_delivering"), "the marker was ended before the wait");
+    let job_events = |r: &Rig| -> Vec<String> { r.repo.get_job_events(job_id, 500).unwrap().into_iter().map(|e| e.message).collect() };
+    assert!(!job_events(&r).iter().any(|m| m.contains("ελέγξτε αν το βίντεο είναι ήδη στο Dalet")), "judged before the wait");
+
+    // The share answers: the rename had landed.
+    std::fs::create_dir_all(&watch).unwrap();
+    std::fs::write(&target, video).unwrap();
+    rusqlite::Connection::open(root.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![job_id])
+        .unwrap();
+    let engine = Arc::new(BroadcastEngine::new(
+        r.repo.clone(),
+        root.join("y.exe"),
+        root.join("f.exe"),
+        root.join("p.exe"),
+        root.join("b.exe"),
+        root.join("temp"),
+        watch.clone(),
+    ));
+    let job = r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("the recovered waiting job");
+    assert_eq!(job.id, job_id);
+    crate::worker::run_waiting_delivery(&r.repo, &engine, HOST_OWNER, &job, &CancellationToken::new(), &r.ctx).await.unwrap();
+
+    assert_eq!(r.repo.get_job(job_id).unwrap().unwrap().status, JobStatus::Completed);
+    assert_eq!(std::fs::read_dir(&watch).unwrap().count(), 1, "copied again");
+    assert_eq!(site_counts(&r, id), (5, 0, 6), "one use, counted once");
+    let told = job_events(&r).iter().filter(|m| m.starts_with("Παραδόθηκε χωρίς έγκριση: έμπιστη συνταγή (5 εγκρίσεις στο site)")).count();
+    let audited = r
+        .repo
+        .get_recent_audit_logs(500)
+        .unwrap()
+        .iter()
+        .filter(|a| a.category == "REPAIR" && a.message.contains("delivered without approval"))
+        .count();
+    assert_eq!((told, audited), (1, 1));
+    // What the desk's Completed card reads (routes.rs `auto_delivered_for_desk`): the latest attempt.
+    let latest = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!((latest.outcome.as_deref(), latest.recipe_id, latest.mcr_decision.as_deref()), (Some("auto_delivered"), Some(id), None));
+    assert_eq!(
+        r.repo.wrong_video_after_auto_delivery(job_id, "desk", Utc::now()).unwrap(),
+        omni_core::repository::WrongVideoOutcome::Recorded,
+        "«Λάθος βίντεο» refused"
+    );
+}
+
+/// P11.2b review, deviation 1: a recovered waiting row whose rename was
+/// attempted and whose file is gone when the share answers goes to review as
+/// DELIVERY_UNCONFIRMED. When it was a trusted recipe's delivery nobody
+/// approved, MCR is told so (the P10.16b note and REPAIR audit row, once) and
+/// the attempt ends `interrupted`; a job without such an attempt gets neither.
+#[tokio::test]
+async fn an_unconfirmed_trusted_delivery_in_review_says_nobody_approved_it() {
+    use omni_core::models::JobStage;
+    const HOST_OWNER: &str = "host:1:1";
+    const NOTE: &str = "Διακοπή κατά την αυτόματη παράδοση χωρίς έγκριση: ελέγξτε αν το βίντεο είναι ήδη στο Dalet";
+    let (r, id) = trusted_rig(5, 5);
+    let root = r._dir.0.clone();
+    let watch = root.join("watch");
+    // Job 2: the trusted recipe's delivery. Job 3: an ordinary one. Both cut at the rename.
+    let mut jobs = Vec::new();
+    for n in [2, 3] {
+        let new = NewJob::new(&format!("https://news.example.gr/story/{n}"), &format!("{n}_ANNA_TEST"), "ANNA");
+        let job_id = r.repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+        assert_eq!(r.repo.lease_job(HOST_OWNER, 600).unwrap().unwrap().id, job_id);
+        if n == 2 {
+            let at = r.repo.start_attempt(job_id, "hold", Utc::now()).unwrap();
+            r.repo.mark_attempt_auto_delivering(at, id, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+        }
+        assert!(r.repo.set_stage(job_id, HOST_OWNER, JobStage::Deliver).unwrap());
+        let target = watch.join(format!("{n}_ANNA_TEST.mxf"));
+        assert!(r.repo.mark_delivering(job_id, HOST_OWNER, &target.to_string_lossy(), 26).unwrap());
+        jobs.push(job_id);
+    }
+    // Start-up with the share down; then it answers, and neither file is there.
+    assert_eq!(r.repo.recover_on_startup("host").unwrap(), 2);
+    std::fs::create_dir_all(&watch).unwrap();
+    rusqlite::Connection::open(root.join("omni.db")).unwrap().execute("UPDATE queue SET not_before = NULL", []).unwrap();
+    let engine = Arc::new(BroadcastEngine::new(
+        r.repo.clone(),
+        root.join("y.exe"),
+        root.join("f.exe"),
+        root.join("p.exe"),
+        root.join("b.exe"),
+        root.join("temp"),
+        watch.clone(),
+    ));
+    for _ in 0..2 {
+        let job = r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("a recovered waiting job");
+        crate::worker::run_waiting_delivery(&r.repo, &engine, HOST_OWNER, &job, &CancellationToken::new(), &r.ctx).await.unwrap();
+    }
+    assert_eq!(std::fs::read_dir(&watch).unwrap().count(), 0, "copied on its own");
+
+    let audits = r.repo.get_recent_audit_logs(500).unwrap();
+    for (n, job_id) in [2, 3].into_iter().zip(jobs) {
+        let row = r.repo.get_job(job_id).unwrap().unwrap();
+        let msg = format!("The delivery of {n}_ANNA_TEST.mxf was interrupted and the file is not in the watchfolder now. Check Dalet for {n}_ANNA_TEST.mxf before retrying");
+        assert_eq!(
+            (row.status, row.error_code.as_deref(), row.error_message.as_deref()),
+            (JobStatus::RequiresReview, Some("DELIVERY_UNCONFIRMED"), Some(msg.as_str()))
+        );
+        let notes = r.repo.get_job_events(job_id, 500).unwrap().into_iter().filter(|e| e.message == NOTE).count();
+        let repair_audits = audits
+            .iter()
+            .filter(|a| a.category == "REPAIR" && a.message.starts_with(&format!("Job {job_id}: interrupted at DELIVER during a trusted recipe's delivery")))
+            .count();
+        if n == 2 {
+            assert_eq!((notes, repair_audits), (1, 1), "MCR was not told the delivery was never approved");
+            assert_eq!(attempt_outcome(&root.join("omni.db"), job_id).as_deref(), Some("interrupted"));
+        } else {
+            assert_eq!((notes, repair_audits), (0, 0), "an ordinary job was called an automatic delivery");
+            assert_eq!(r.repo.latest_attempt(job_id).unwrap().map(|a| a.id), None);
+        }
+    }
+    assert_eq!(site_counts(&r, id), (5, 0, 5), "an unconfirmed delivery was counted as a use");
+}
+
+// ------------------------------- P11.2b review round 2: every exit from the wait
+
+const HOST_OWNER: &str = "host:1:1";
+const NOTE: &str = "Διακοπή κατά την αυτόματη παράδοση χωρίς έγκριση: ελέγξτε αν το βίντεο είναι ήδη στο Dalet";
+
+/// Job `n` of host `host`, cut mid-rename and recovered at start-up with the
+/// share down: PENDING and waiting, its marker kept. With `trusted`, its latest
+/// repair attempt is the trusted recipe's `auto_delivering`.
+fn recovered_waiting_job(r: &Rig, recipe: i64, n: u32, trusted: bool, submitted_by: Option<i64>) -> i64 {
+    use omni_core::models::JobStage;
+    let mut new = NewJob::new(format!("https://news.example.gr/story/{n}"), format!("{n}_ANNA_TEST"), "ANNA");
+    new.submitted_by_user_id = submitted_by;
+    let job_id = r.repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    assert_eq!(r.repo.lease_job(HOST_OWNER, 600).unwrap().unwrap().id, job_id);
+    if trusted {
+        let at = r.repo.start_attempt(job_id, "hold", Utc::now()).unwrap();
+        r.repo.mark_attempt_auto_delivering(at, recipe, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+    }
+    assert!(r.repo.set_stage(job_id, HOST_OWNER, JobStage::Deliver).unwrap());
+    let target = r._dir.0.join("share-that-is-down").join(format!("{n}_ANNA_TEST.mxf"));
+    assert!(r.repo.mark_delivering(job_id, HOST_OWNER, &target.to_string_lossy(), 26).unwrap());
+    r.repo.recover_on_startup("host").unwrap();
+    let row = r.repo.get_job(job_id).unwrap().unwrap();
+    assert!(row.status == JobStatus::Pending && row.delivery_wait, "{:?} {:?}", row.status, row.error_message);
+    if trusted {
+        assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), job_id).as_deref(), Some("auto_delivering"));
+    }
+    job_id
+}
+
+/// (P10.16b notes on the job, REPAIR audit rows naming it.)
+fn notes(r: &Rig, job_id: i64) -> (usize, usize) {
+    let events = r.repo.get_job_events(job_id, 500).unwrap().into_iter().filter(|e| e.message == NOTE).count();
+    let audits = r
+        .repo
+        .get_recent_audit_logs(1000)
+        .unwrap()
+        .iter()
+        .filter(|a| a.category == "REPAIR" && a.message.starts_with(&format!("Job {job_id}: interrupted at DELIVER during a trusted recipe's delivery")))
+        .count();
+    (events, audits)
+}
+
+/// (a) and (d): MCR's «Ακύρωση» on a waiting trusted-recipe delivery tells MCR
+/// it was never approved and ends the attempt; on a waiting job without such
+/// an attempt it writes no note.
+#[test]
+fn cancelling_a_waiting_trusted_delivery_says_nobody_approved_it() {
+    let (r, id) = trusted_rig(5, 5);
+    let trusted = recovered_waiting_job(&r, id, 2, true, None);
+    let plain = recovered_waiting_job(&r, id, 3, false, None);
+
+    assert_eq!(r.repo.cancel_job(trusted).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    assert_eq!(r.repo.get_job(trusted).unwrap().unwrap().status, JobStatus::Cancelled);
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), trusted).as_deref(), Some("interrupted"));
+    assert_eq!(notes(&r, trusted), (1, 1), "a cancelled unapproved delivery was not reported");
+
+    assert_eq!(r.repo.cancel_job(plain).unwrap(), omni_core::repository::CancelOutcome::Cancelled);
+    assert_eq!(notes(&r, plain), (0, 0));
+    assert_eq!(site_counts(&r, id), (5, 0, 5));
+}
+
+/// (b): the journalist's own cancel does the same.
+#[test]
+fn a_journalists_cancel_of_a_waiting_trusted_delivery_says_nobody_approved_it() {
+    let (r, id) = trusted_rig(5, 5);
+    let user = r.repo.create_user("anna.test@example.test", "a-long-test-password-1", omni_core::models::UserRole::User, "Anna Test", Some("TEST")).unwrap();
+    let trusted = recovered_waiting_job(&r, id, 2, true, Some(user));
+    let plain = recovered_waiting_job(&r, id, 3, false, Some(user));
+
+    assert_eq!(r.repo.cancel_own_pending(trusted, user).unwrap(), omni_core::repository::OwnCancelOutcome::Cancelled);
+    assert_eq!(r.repo.get_job(trusted).unwrap().unwrap().status, JobStatus::Cancelled);
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), trusted).as_deref(), Some("interrupted"));
+    assert_eq!(notes(&r, trusted), (1, 1));
+
+    assert_eq!(r.repo.cancel_own_pending(plain, user).unwrap(), omni_core::repository::OwnCancelOutcome::Cancelled);
+    assert_eq!(notes(&r, plain), (0, 0));
+}
+
+/// (c) and (d): «Δοκιμή ξανά» on a waiting trusted-recipe delivery reports it,
+/// ends the attempt, and holds the new run for approval as «Νέα λήψη» does:
+/// the trusted recipe's next result is held, never delivered a second time.
+/// A waiting job without such an attempt retries as before.
+#[tokio::test]
+async fn retrying_a_waiting_trusted_delivery_reports_it_and_holds_the_next_run() {
+    use omni_core::models::JobStage;
+    let (r, id) = trusted_rig(5, 5);
+    // The trusted recipe's delivery found the share down at the rename and parked.
+    let job_id = r.job.id;
+    let at = r.repo.start_attempt(job_id, "hold", Utc::now()).unwrap();
+    r.repo.mark_attempt_auto_delivering(at, id, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+    assert!(r.repo.set_stage(job_id, OWNER, JobStage::Deliver).unwrap());
+    let target = r._dir.0.join("watch").join("1_ANNA_TEST.mxf");
+    assert!(r.repo.mark_delivering(job_id, OWNER, &target.to_string_lossy(), 26).unwrap());
+    assert!(r.repo.park_for_delivery(job_id, OWNER, "temp/jobs/1/1_output.mxf", 26, "00", 2.0).unwrap());
+    assert!(r.repo.requeue_waiting_delivery(job_id, OWNER, chrono::Duration::zero(), "waits").unwrap());
+    assert!(!r.repo.job_auto_delivery_superseded(job_id).unwrap());
+
+    assert!(r.repo.retry_job(job_id, None).unwrap());
+
+    let row = r.repo.get_job(job_id).unwrap().unwrap();
+    assert_eq!((row.status, row.delivery_wait), (JobStatus::Pending, false), "not a full run");
+    let attempt = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!((attempt.id, attempt.outcome.as_deref(), attempt.mcr_decision.as_deref()), (at, Some("interrupted"), Some("superseded")));
+    assert_eq!(notes(&r, job_id), (1, 1));
+    assert!(r.repo.job_auto_delivery_superseded(job_id).unwrap(), "the next run may deliver without approval again");
+
+    // The full run: the trusted recipe finds the same video, and it is held for MCR.
+    assert_eq!(r.repo.lease_job(OWNER, 600).unwrap().unwrap().id, job_id);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.downloads()[0].2, hold_mode(), "the same video went to air unapproved a second time");
+    assert_eq!(site_counts(&r, id), (5, 0, 5));
+    assert_eq!(notes(&r, job_id), (1, 1), "the note was written twice");
+    // The guard outlives attempt retention while the job exists, as «Νέα λήψη»'s does.
+    r.repo.purge_repair_attempts(0).unwrap();
+    assert!(r.repo.job_auto_delivery_superseded(job_id).unwrap(), "retention removed the hold guard");
+
+    // (d) A waiting job without an automatic delivery: no note, no hold rule.
+    let plain = recovered_waiting_job(&r, id, 3, false, None);
+    assert!(r.repo.retry_job(plain, None).unwrap());
+    assert_eq!(notes(&r, plain), (0, 0));
+    assert!(!r.repo.job_auto_delivery_superseded(plain).unwrap());
+}
+
+/// Job `job_id`'s back-off is over.
+fn ready_now(r: &Rig, job_id: i64) {
+    rusqlite::Connection::open(r._dir.0.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![job_id])
+        .unwrap();
+}
+
+/// P11.3a (8a): «Δοκιμή ξανά» pressed after a DELIVERY_UNCONFIRMED review of a
+/// waiting trusted-recipe delivery. The review already ended the attempt
+/// `interrupted` and told MCR; the retry still marks it `superseded`, so the
+/// trusted recipe's next result is held, never delivered a second time
+/// unapproved, and the note is not written again. A waiting row without such
+/// an attempt gets nothing.
+#[tokio::test]
+async fn retrying_after_an_unconfirmed_review_of_a_trusted_waiting_delivery_holds_the_next_run() {
+    use omni_core::models::JobStage;
+    let (r, id) = trusted_rig(5, 5);
+    let job_id = r.job.id;
+    let at = r.repo.start_attempt(job_id, "hold", Utc::now()).unwrap();
+    r.repo.mark_attempt_auto_delivering(at, id, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+    assert!(r.repo.set_stage(job_id, OWNER, JobStage::Deliver).unwrap());
+    let target = r._dir.0.join("watch").join("1_ANNA_TEST.mxf");
+    assert!(r.repo.mark_delivering(job_id, OWNER, &target.to_string_lossy(), 26).unwrap());
+    assert!(r.repo.park_for_delivery(job_id, OWNER, "temp/jobs/1/1_output.mxf", 26, "00", 2.0).unwrap());
+    assert!(r.repo.requeue_waiting_delivery(job_id, OWNER, chrono::Duration::zero(), "waits").unwrap());
+    // The share answers and the file is not at the marker: review, the wait kept.
+    let waiting = r.repo.lease_job_when(OWNER, 600, true).unwrap().expect("the waiting job");
+    assert_eq!((waiting.id, waiting.stage), (job_id, JobStage::Deliver));
+    assert!(r.repo.review_waiting_delivery(job_id, OWNER, "DELIVERY_UNCONFIRMED", "Check Dalet for 1_ANNA_TEST.mxf before retrying").unwrap());
+    let row = r.repo.get_job(job_id).unwrap().unwrap();
+    assert_eq!((row.status, row.delivery_wait), (JobStatus::RequiresReview, true));
+    let attempt = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!((attempt.outcome.as_deref(), attempt.mcr_decision.as_deref()), (Some("interrupted"), None));
+    assert_eq!(notes(&r, job_id), (1, 1));
+    assert!(!r.repo.job_auto_delivery_superseded(job_id).unwrap());
+
+    assert!(r.repo.retry_job(job_id, None).unwrap());
+
+    let attempt = r.repo.latest_attempt(job_id).unwrap().unwrap();
+    assert_eq!((attempt.id, attempt.outcome.as_deref(), attempt.mcr_decision.as_deref()), (at, Some("interrupted"), Some("superseded")));
+    assert!(r.repo.job_auto_delivery_superseded(job_id).unwrap(), "the retry after the review may deliver without approval again");
+    assert_eq!(notes(&r, job_id), (1, 1), "the note was written twice");
+
+    // The full run: the trusted recipe finds the same video, and it is held for MCR.
+    assert_eq!(r.repo.lease_job(OWNER, 600).unwrap().unwrap().id, job_id);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = go(&r, Some(page(&next_data(A))), &Prior::default()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.fake.downloads()[0].2, hold_mode(), "the same video went to air unapproved a second time");
+    assert_eq!(site_counts(&r, id), (5, 0, 5));
+
+    // A waiting row without an automatic delivery, after the same review: nothing.
+    let plain = recovered_waiting_job(&r, id, 3, false, None);
+    ready_now(&r, plain);
+    assert_eq!(r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("the plain waiting job").id, plain);
+    assert!(r.repo.review_waiting_delivery(plain, HOST_OWNER, "DELIVERY_UNCONFIRMED", "check Dalet").unwrap());
+    assert!(r.repo.retry_job(plain, None).unwrap());
+    assert_eq!(notes(&r, plain), (0, 0));
+    assert_eq!(r.repo.latest_attempt(plain).unwrap().map(|a| a.id), None);
+    assert!(!r.repo.job_auto_delivery_superseded(plain).unwrap());
+}
+
+/// P11.3a (8b): «Το έβαλα στο Dalet» on a waiting trusted-recipe delivery in
+/// the 2-hour PIPELINE_FAILED review: done by hand, the attempt ends
+/// `interrupted` (never `auto_delivering` for ever) and MCR's note is written
+/// once. A waiting row without such an attempt gets no note.
+#[test]
+fn marking_a_waiting_trusted_delivery_done_by_hand_ends_its_attempt() {
+    let (r, id) = trusted_rig(5, 5);
+    let trusted = recovered_waiting_job(&r, id, 2, true, None);
+    let plain = recovered_waiting_job(&r, id, 3, false, None);
+    for job_id in [trusted, plain] {
+        ready_now(&r, job_id);
+        assert_eq!(r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("a waiting job").id, job_id);
+        let msg = "The finished video in the workspace could not be read for 2 hours: access denied";
+        assert!(r.repo.review_waiting_delivery(job_id, HOST_OWNER, "PIPELINE_FAILED", msg).unwrap());
+        assert!(r.repo.get_job(job_id).unwrap().unwrap().delivery_wait);
+    }
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), trusted).as_deref(), Some("auto_delivering"));
+    assert_eq!(notes(&r, trusted), (0, 0));
+
+    assert!(r.repo.mark_completed_manually(trusted).unwrap());
+    let row = r.repo.get_job(trusted).unwrap().unwrap();
+    assert_eq!((row.status, row.delivery_wait), (JobStatus::CompletedManual, false));
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), trusted).as_deref(), Some("interrupted"));
+    assert_eq!(notes(&r, trusted), (1, 1));
+    assert!(!r.repo.mark_completed_manually(trusted).unwrap(), "a done job was marked again");
+    assert_eq!(notes(&r, trusted), (1, 1), "the note was written twice");
+
+    assert!(r.repo.mark_completed_manually(plain).unwrap());
+    assert_eq!(notes(&r, plain), (0, 0));
+    assert_eq!(site_counts(&r, id), (5, 0, 5));
+}
+
+/// Finding 2: a waiting trusted-recipe delivery whose run panics at DELIVER
+/// with no file at the marker goes to review with MCR's note and its attempt
+/// ended; a non-waiting one keeps today's behaviour, with the note once.
+#[test]
+fn a_panic_while_delivering_a_waiting_trusted_video_says_nobody_approved_it() {
+    use omni_core::models::JobStage;
+    use omni_core::repository::DeliverySettled;
+    let (r, id) = trusted_rig(5, 5);
+    let waiting = recovered_waiting_job(&r, id, 2, true, None);
+    // The share answers again, but the file is not at the marker.
+    std::fs::create_dir_all(r._dir.0.join("share-that-is-down")).unwrap();
+    rusqlite::Connection::open(r._dir.0.join("omni.db"))
+        .unwrap()
+        .execute("UPDATE queue SET not_before = NULL WHERE id = ?1", rusqlite::params![waiting])
+        .unwrap();
+    let job = r.repo.lease_job_when(HOST_OWNER, 600, true).unwrap().expect("the waiting job");
+    assert_eq!((job.id, job.stage), (waiting, JobStage::Deliver));
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), waiting).as_deref(), Some("auto_delivering"));
+
+    assert_eq!(r.repo.settle_after_delivery_panic(waiting, HOST_OWNER).unwrap(), DeliverySettled::Review);
+
+    let row = r.repo.get_job(waiting).unwrap().unwrap();
+    assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::RequiresReview, Some("DELIVERY_UNCONFIRMED")));
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), waiting).as_deref(), Some("interrupted"));
+    assert_eq!(notes(&r, waiting), (1, 1), "a waiting unapproved delivery went to review silently");
+
+    // Pinned: a trusted delivery that did not wait, panicking at DELIVER with no file.
+    let new = NewJob::new("https://news.example.gr/story/4", "4_ANNA_TEST", "ANNA");
+    let plain = r.repo.enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    assert_eq!(r.repo.lease_job(HOST_OWNER, 600).unwrap().unwrap().id, plain);
+    let at = r.repo.start_attempt(plain, "hold", Utc::now()).unwrap();
+    r.repo.mark_attempt_auto_delivering(at, id, &shipped_hash("next_data_media"), DOMAIN, A).unwrap();
+    assert!(r.repo.set_stage(plain, HOST_OWNER, JobStage::Deliver).unwrap());
+    let target = r._dir.0.join("share-that-is-down").join("4_ANNA_TEST.mxf");
+    assert!(r.repo.mark_delivering(plain, HOST_OWNER, &target.to_string_lossy(), 26).unwrap());
+    assert_eq!(r.repo.settle_after_delivery_panic(plain, HOST_OWNER).unwrap(), DeliverySettled::Review);
+    let row = r.repo.get_job(plain).unwrap().unwrap();
+    assert_eq!((row.status, row.error_code.as_deref(), row.delivery_wait), (JobStatus::RequiresReview, Some("DELIVERY_UNCONFIRMED"), false));
+    assert_eq!(attempt_outcome(&r._dir.0.join("omni.db"), plain).as_deref(), Some("interrupted"));
+    assert_eq!(notes(&r, plain), (1, 1), "the note was written twice, or not at all");
+}
+
 // ------------------------------------------- the egress rule through run_job (P2.12)
 
 /// `work` with a network allowlist.
@@ -2333,7 +2829,7 @@ async fn work_allowing(repo: &Repository, engine: &Arc<BroadcastEngine>, root: &
     let ctx = RepairCtx { repo: repo.clone(), cfg: c, env: Arc::new(PanicEnv) };
     let health = omni_core::health::HealthState::new();
     let canary = Arc::new(crate::canary::CanaryEnv::new(repo.clone(), health.clone(), root.join("bin"), "stable".into()));
-    crate::run_job(repo, engine, OWNER, job, cancel, &root.join("evidence"), &ctx, &health, &canary).await.unwrap();
+    crate::worker::run_job(repo, engine, OWNER, job, cancel, &root.join("evidence"), &ctx, &health, &canary).await.unwrap();
 }
 
 fn leased_url(repo: &Repository, url: &str) -> Job {
@@ -2427,4 +2923,34 @@ async fn a_link_that_is_not_a_plain_web_address_ends_in_review_with_its_own_text
         let events: String = repo.get_job_events(id, 100).unwrap().iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(" ");
         assert!(!events.contains("hunter2") && !events.contains("admin"), "{events}");
     }
+}
+
+/// P11.4 review round 1: the ladder's world is not a job's. While a platform
+/// cools down after a rate limit, its yt-dlp probe (the admin's Test URL, the
+/// ladder) and its gate prober answer at once with the cool-down, never wait
+/// it out against their own time limits.
+#[tokio::test(start_paused = true)]
+async fn the_ladders_probes_report_a_cool_down_at_once_and_a_jobs_ladder_waits_it_out() {
+    let dir = Scratch::new();
+    let repo = Repository::new(dir.0.join("omni.db")).unwrap();
+    let p = |n: &str| dir.0.join(n);
+    let engine = Arc::new(BroadcastEngine::new(repo, p("no-yt-dlp.exe"), p("f.exe"), p("p.exe"), p("b.exe"), p("temp"), p("watch")));
+    let env = RealEnv::new(engine.clone(), p("no-ffprobe.exe"), p("no-yt-dlp.exe"), p("no-ffmpeg.exe"));
+    engine.pacer().penalize("youtube", omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN);
+    let yt = "https://www.youtube.com/watch?v=abcdefghijk";
+    let t0 = tokio::time::Instant::now();
+    let e = env.ytdl_probe(yt, Duration::from_secs(30)).await.unwrap_err();
+    assert!(e.contains("youtube is cooling down for 120 s"), "the Test URL shows: {e}");
+    assert_eq!(omni_broadcast::errors::classify_download_error(&e), ErrorCode::RateLimited);
+    let scan = env.page_scan(yt, Duration::from_secs(30)).await;
+    assert_eq!(scan, omni_broadcast::downloader::PageScan::default());
+    let cand = omni_broadcast::repair_gate::Candidate { url: yt.into(), referer: None, origin: "recipe:abcd1234".into(), position: None, in_article: None };
+    let e = env.prober().probe(&cand).await.unwrap_err();
+    assert_eq!(omni_broadcast::errors::classify_download_error(&e), ErrorCode::RateLimited, "{e}");
+    assert_eq!(tokio::time::Instant::now(), t0, "a probe waited for the cool-down");
+    // Review round 2: a job's ladder waits the cool-down out (the gate's
+    // deadline bounds it), then probes (no yt-dlp here: it cannot start).
+    let e = env.job_prober().probe(&cand).await.unwrap_err();
+    assert_eq!(tokio::time::Instant::now() - t0, omni_broadcast::pacing::RATE_LIMIT_COOL_DOWN, "a job's probe did not wait");
+    assert!(e.contains("could not run yt-dlp"), "{e}");
 }
