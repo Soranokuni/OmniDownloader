@@ -901,6 +901,14 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_job_outcomes_ended_at ON job_outcomes(ended_at);
         "#,
     ),
+    (
+        38,
+        // The second chances a job waiting in review was already given (P11.5): one cause per
+        // line (`ytdlp:…`, `cookies:<domain>:<day>`, `site:<domain>:<minute>`). NULL: none yet.
+        r#"
+        ALTER TABLE queue ADD COLUMN second_chances TEXT;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from
@@ -1716,6 +1724,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('job_outcomes')", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fks, 0, "an outcome row must outlive a discarded job");
+    }
+
+    #[test]
+    fn migration_38_adds_the_second_chances_and_existing_rows_have_none() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 37) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO queue (url, slug, status, error_code) VALUES ('https://example.invalid/v', 'S', 'REQUIRES_REVIEW', 'LOGIN_REQUIRED')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 37);
+        assert!(!columns_of(&conn, "queue").contains(&"second_chances".to_string()));
+
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        assert!(columns_of(&conn, "queue").contains(&"second_chances".to_string()));
+        let used: Option<String> = conn.query_row("SELECT second_chances FROM queue", [], |r| r.get(0)).unwrap();
+        assert_eq!(used, None, "an existing job has had no second chance");
     }
 
     #[test]

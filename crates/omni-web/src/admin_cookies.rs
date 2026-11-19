@@ -116,6 +116,8 @@ pub async fn api_admin_cookies_put(
         &format!("{} uploaded {} cookie(s) for {domain}", admin.email, parsed.count),
     );
     refresh_health(&state);
+    // A second chance for the site's jobs waiting in review for a login (P11.5).
+    omni_core::second_chance::after_cookies(&state.repo, &domain);
     Ok(Json(json!({
         "domain": domain,
         "cookie_count": parsed.count,
@@ -169,6 +171,10 @@ pub async fn api_admin_cookies_test(
     );
     let result = tester.test(&domain, &url).await;
     refresh_health(&state);
+    if matches!(result, Ok((true, _))) {
+        // The jar logs in: a second chance for the site's login jobs (P11.5).
+        omni_core::second_chance::after_cookies(&state.repo, &domain);
+    }
     match result {
         Ok((ok, detail)) => Ok(Json(json!({ "ok": ok, "detail": detail }))),
         Err(why) => Err(ApiError::bad_request(why)),

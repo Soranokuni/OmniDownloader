@@ -742,6 +742,12 @@ pub enum OwnCancelOutcome {
     NotCancellable,
 }
 
+/// Which of `enqueue`'s duplicate rules another job matched, with its id.
+enum Duplicate {
+    Active(i64),
+    Recent(i64),
+}
+
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
@@ -752,6 +758,9 @@ pub struct Repository {
     /// The log redactor: every cookie jar read joins it, so a jar written by
     /// another process (the sign-in command) is redacted from its first use.
     redactions: Option<crate::logging::Redactions>,
+    /// How old (from `retry_from`, else `created_at`) a job in review may be and still get
+    /// a second chance (P11.5, `retry.second_chance_window_mins`, clamped).
+    second_chance_window: Duration,
 }
 
 impl Repository {
@@ -774,6 +783,7 @@ impl Repository {
             db_path: Some(Arc::from(path.to_path_buf())),
             events: None,
             redactions: None,
+            second_chance_window: crate::second_chance::window(crate::second_chance::DEFAULT_WINDOW_MINS),
         };
         repo.run_migrations()?;
         Ok(repo)
@@ -789,6 +799,19 @@ impl Repository {
     pub fn with_cookie_redactions(mut self, r: crate::logging::Redactions) -> Self {
         self.redactions = Some(r);
         self
+    }
+
+    /// The second-chance window (P11.5) from the `retry` config, read through
+    /// [`crate::second_chance::window_for`]: 30..=360 minutes, and never longer
+    /// than `retry.max_age_mins`.
+    pub fn with_second_chance_window(mut self, retry: &crate::config::RetryConfig) -> Self {
+        self.second_chance_window = crate::second_chance::window_for(retry);
+        self
+    }
+
+    /// The window the second-chance triggers use (P11.5).
+    pub fn second_chance_window(&self) -> Duration {
+        self.second_chance_window
     }
 
     fn run_migrations(&self) -> Result<()> {
@@ -952,6 +975,65 @@ impl Repository {
         Ok(self.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id())
     }
 
+    /// The duplicate rules of [`Self::enqueue`] (plan P1.1), shared with
+    /// [`Self::second_chance`] (P11.5) so the two cannot drift: another job with
+    /// the link `normalized` that is queued or running, or waits for MCR's
+    /// approval for this same journalist (`Active`); or one delivered for this
+    /// journalist inside `dedup_window_hours` (`Recent`; a zero window has none).
+    /// `except` is left out of both (the job being re-queued). With
+    /// `any_journalist_for_completed`, a delivery for any journalist counts as
+    /// `Recent` (a second chance must not deliver a video MCR already delivered
+    /// under another name); `enqueue` passes `false`.
+    fn duplicate_of(
+        conn: &rusqlite::Connection,
+        normalized: &str,
+        journalist: &str,
+        dedup_window_hours: i64,
+        except: Option<i64>,
+        any_journalist_for_completed: bool,
+    ) -> Result<Option<Duplicate>> {
+        let journalist = journalist.to_uppercase();
+        let except = except.unwrap_or(-1);
+        // Already queued or running, or finished and waiting for MCR's approval
+        // for this same journalist (a re-sent link must not deliver the story
+        // twice; another journalist needs their own slug, as with the
+        // completed-job rule below)?
+        let active: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM queue
+                 WHERE url_normalized = ? AND id <> ?
+                   AND (status IN ('PENDING','RUNNING')
+                        OR (status = 'AWAITING_APPROVAL' AND journalist = ?))
+                 ORDER BY id ASC LIMIT 1",
+                params![normalized, except, journalist],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = active {
+            return Ok(Some(Duplicate::Active(id)));
+        }
+        // Recently delivered for this same journalist? A zero window means
+        // nothing counts as recent: without this, a job completed in the same
+        // millisecond as the cutoff still matched `>=` (P1.19 exposed it).
+        if dedup_window_hours <= 0 {
+            return Ok(None);
+        }
+        let cutoff = timestamps::format(Utc::now() - Duration::hours(dedup_window_hours));
+        let recent: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM queue
+                 WHERE url_normalized = ?1 AND id <> ?2
+                   AND (?5 OR journalist = ?3)
+                   AND status IN ('COMPLETED','COMPLETED_MANUAL')
+                   AND COALESCE(completed_at, updated_at) >= ?4
+                 ORDER BY id DESC LIMIT 1",
+                params![normalized, except, journalist, cutoff, any_journalist_for_completed],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(recent.map(Duplicate::Recent))
+    }
+
 
     /// Queue a job, deduplicating by normalized URL (plan P1.1, defect D-10).
     ///
@@ -976,55 +1058,26 @@ impl Repository {
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        // Already queued or running, or finished and waiting for MCR's approval
-        // for this same journalist (a re-sent link must not deliver the story
-        // twice; another journalist needs their own slug, as with the
-        // completed-job rule below)?
-        let active: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM queue
-                 WHERE url_normalized = ?
-                   AND (status IN ('PENDING','RUNNING')
-                        OR (status = 'AWAITING_APPROVAL' AND journalist = ?))
-                 ORDER BY id ASC LIMIT 1",
-                params![normalized, job.journalist.to_uppercase()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(existing_id) = active {
-            tx.commit()?;
-            self.log_audit(
-                "INFO",
-                "QUEUE",
-                &format!("Duplicate of active job #{existing_id} ignored: {}", job.url),
-            )?;
-            return Ok(Enqueued::DuplicateActive { existing_id });
-        }
-
-        // Recently delivered for this same journalist? A zero window means
-        // nothing counts as recent: without this, a job completed in the same
-        // millisecond as the cutoff still matched `>=` (P1.19 exposed it).
-        let cutoff = timestamps::format(Utc::now() - Duration::hours(dedup_window_hours));
-        let recent: Option<i64> = if dedup_window_hours <= 0 { None } else { tx
-            .query_row(
-                "SELECT id FROM queue
-                 WHERE url_normalized = ?
-                   AND journalist = ?
-                   AND status IN ('COMPLETED','COMPLETED_MANUAL')
-                   AND COALESCE(completed_at, updated_at) >= ?
-                 ORDER BY id DESC LIMIT 1",
-                params![normalized, job.journalist.to_uppercase(), cutoff],
-                |r| r.get(0),
-            )
-            .optional()? };
-        if let Some(existing_id) = recent {
-            tx.commit()?;
-            self.log_audit(
-                "INFO",
-                "QUEUE",
-                &format!("Duplicate of recently completed job #{existing_id}: {}", job.url),
-            )?;
-            return Ok(Enqueued::DuplicateRecent { existing_id });
+        match Self::duplicate_of(&tx, &normalized, &job.journalist, dedup_window_hours, None, false)? {
+            Some(Duplicate::Active(existing_id)) => {
+                tx.commit()?;
+                self.log_audit(
+                    "INFO",
+                    "QUEUE",
+                    &format!("Duplicate of active job #{existing_id} ignored: {}", job.url),
+                )?;
+                return Ok(Enqueued::DuplicateActive { existing_id });
+            }
+            Some(Duplicate::Recent(existing_id)) => {
+                tx.commit()?;
+                self.log_audit(
+                    "INFO",
+                    "QUEUE",
+                    &format!("Duplicate of recently completed job #{existing_id}: {}", job.url),
+                )?;
+                return Ok(Enqueued::DuplicateRecent { existing_id });
+            }
+            None => {}
         }
 
         let journalist = job.journalist.to_uppercase();
@@ -3312,6 +3365,146 @@ impl Repository {
         Ok(n > 0)
     }
 
+    /// A second chance (P11.5): jobs waiting in review with one of `codes`, whose
+    /// cause has just gone away (a new yt-dlp, a cookie jar, a site that works
+    /// again), go back to the queue on their own, once per `cause`.
+    ///
+    /// A job qualifies while it is REQUIRES_REVIEW, no person has acted on it
+    /// (`human_touched = 0`), it is younger than `window` (from `retry_from`, else
+    /// `created_at`; a job whose age cannot be read is left), its `second_chances`
+    /// allow `cause` ([`crate::second_chance::allows`]: once per cause, one `site:`
+    /// cause, three in all), and, with `site`, its link is on that site (the jar
+    /// domain of the link, [`crate::second_chance::url_is_on`]). A job whose video
+    /// waits for or may already be in the watchfolder (a delivered file or time
+    /// recorded), one with a held output not yet decided or approved, one tidied off
+    /// the review tab, and one with a twin under `enqueue`'s duplicate rules (one
+    /// batch moves at most one job per link) are left for a person.
+    ///
+    /// Each job moved becomes PENDING with `attempts = 0`, no back-off and no lease;
+    /// `error_code`, `first_error_code`, `retry_from` and `human_touched` stay as
+    /// they were, `cause` joins `second_chances`, and the job's history gets one INFO
+    /// line «Αυτόματη επανάληψη: {note_el}». One immediate transaction; the update is
+    /// guarded on the status and `human_touched`, so an operator's action wins.
+    /// Returns the ids moved.
+    pub fn second_chance(
+        &self,
+        codes: &[&str],
+        site: Option<&str>,
+        window: Duration,
+        cause: &str,
+        note_el: &str,
+    ) -> Result<Vec<i64>> {
+        use crate::second_chance::{self as sc, SEPARATOR};
+        anyhow::ensure!(
+            !cause.trim().is_empty() && !cause.contains(SEPARATOR),
+            "a second-chance cause must be one non-empty line"
+        );
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now();
+        let stamp = timestamps::format(now);
+        let site = site.map(crate::cookies::canonical_jar_domain);
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Placeholders only: the codes themselves are bound.
+        let marks = vec!["?"; codes.len()].join(",");
+        // A delivered file or a delivery time recorded: the video may be on air already.
+        let select = format!(
+            "SELECT id, url, journalist, created_at, retry_from, second_chances FROM queue
+             WHERE status = 'REQUIRES_REVIEW' AND error_code IN ({marks})
+               AND delivery_wait = 0 AND delivering_to IS NULL AND cleared_at IS NULL
+               AND file_path IS NULL AND delivered_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM held_outputs h
+                               WHERE h.job_id = queue.id AND (h.decision IS NULL OR h.decision = 'approved'))
+             ORDER BY id ASC"
+        );
+        type Candidate = (i64, String, String, Option<String>, Option<String>, Option<String>);
+        let candidates: Vec<Candidate> = {
+            let mut stmt = tx.prepare(&select)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(codes.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut moved = Vec::new();
+        for (id, url, journalist, created_at, retry_from, used) in candidates {
+            // No "now" is invented for a job whose age cannot be read: it is left.
+            let Some(since) = timestamps::parse_opt(retry_from).or_else(|| timestamps::parse_opt(created_at)) else {
+                continue;
+            };
+            if now - since >= window {
+                continue;
+            }
+            if !sc::allows(used.as_deref(), cause) {
+                continue;
+            }
+            if let Some(site) = site.as_deref() {
+                if !sc::url_is_on(&url, site) {
+                    continue;
+                }
+            }
+            // `enqueue`'s duplicate rules, checked against the rows as this batch left
+            // them: a twin that is queued, running, waiting for approval or just
+            // delivered keeps this job in review, and one batch moves one job per link.
+            // Stricter than `enqueue` on deliveries: one for any journalist blocks
+            // (MCR may have settled the job with «Νέα λήψη» under its own name).
+            let normalized = crate::urlnorm::normalize(&url);
+            if Self::duplicate_of(&tx, &normalized, &journalist, DEFAULT_DEDUP_WINDOW_HOURS, Some(id), true)?.is_some() {
+                continue;
+            }
+            let n = tx.execute(
+                "UPDATE queue
+                 SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                     attempts = 0, not_before = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                     stage_started_at = NULL, completed_at = NULL,
+                     second_chances = CASE WHEN second_chances IS NULL OR second_chances = '' THEN ?1
+                                           ELSE second_chances || char(10) || ?1 END,
+                     updated_at = ?2
+                 WHERE id = ?3 AND status = 'REQUIRES_REVIEW' AND human_touched = 0",
+                params![cause, stamp, id],
+            )?;
+            if n == 1 {
+                tx.execute(
+                    "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'QUEUED', 'INFO', ?)",
+                    params![id, stamp, format!("Αυτόματη επανάληψη: {note_el}")],
+                )?;
+                moved.push(id);
+            }
+        }
+        tx.commit()?;
+        if let Some(bus) = &self.events {
+            for id in &moved {
+                bus.job(*id, JobStatus::Pending.as_str(), Some(JobStage::Queued.as_str()), Some(0.0));
+            }
+        }
+        Ok(moved)
+    }
+
+    /// MCR queued something on behalf of job `id` (an offered video from its
+    /// article, P11.5 review): the job counts as acted on (`human_touched`, first
+    /// reason kept, else `reason`), so no second chance moves it and the autonomy
+    /// report counts it as touched. `false` for no such job.
+    pub fn mark_acted_on(&self, id: i64, reason: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE queue SET human_touched = 1, touch_reason = COALESCE(touch_reason, ?) WHERE id = ?",
+            params![reason, id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The second-chance causes job `id` was already given (P11.5), oldest
+    /// first; empty for none or no such job.
+    pub fn second_chances(&self, id: i64) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        let used: Option<String> = conn
+            .query_row("SELECT second_chances FROM queue WHERE id = ?", params![id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(crate::second_chance::causes(used.as_deref()).map(str::to_string).collect())
+    }
+
     /// MCR's «Τώρα» (P11.3b): a job waiting out an automatic retry's back-off is
     /// taken by the next free worker at once. Only a PENDING job that has a
     /// `not_before` and is not waiting for the watchfolder
@@ -4153,6 +4346,9 @@ impl Repository {
             ],
         )?;
         tx.commit()?;
+        if before != SiteState::Healthy && after == SiteState::Healthy {
+            crate::second_chance::after_site_healthy(self, &domain, now);
+        }
         Ok((before, after))
     }
 
@@ -4176,16 +4372,28 @@ impl Repository {
     }
 
     /// Set a site's state from outside the outcome stream (canaries).
-    /// Returns false when the site has no row.
+    /// Returns false when the site has no row. A degraded or broken site set
+    /// healthy gives its jobs in review a second chance (P11.5).
     pub fn set_site_state(&self, domain: &str, state: SiteState) -> Result<bool> {
-        let conn = self.pool.get()?;
-        let now = timestamps::now_string();
-        let n = conn.execute(
+        let domain = domain.trim().to_lowercase();
+        let mut conn = self.pool.get()?;
+        let at = Utc::now();
+        let now = timestamps::format(at);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let before: Option<String> = tx
+            .query_row("SELECT state FROM site_stats WHERE domain = ?", params![domain], |r| r.get(0))
+            .optional()?;
+        let n = tx.execute(
             "UPDATE site_stats
              SET state = ?, state_since = CASE WHEN state <> ? THEN ? ELSE state_since END, updated_at = ?
              WHERE domain = ?",
-            params![state.as_str(), state.as_str(), now, now, domain.trim().to_lowercase()],
+            params![state.as_str(), state.as_str(), now, now, domain],
         )?;
+        tx.commit()?;
+        let before = before.map(|s| SiteState::parse(&s));
+        if n == 1 && state == SiteState::Healthy && before.is_some_and(|b| b != SiteState::Healthy) {
+            crate::second_chance::after_site_healthy(self, &domain, at);
+        }
         Ok(n == 1)
     }
 

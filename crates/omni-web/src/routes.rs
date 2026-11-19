@@ -991,6 +991,12 @@ pub async fn api_queue_offer(
     new.parent_job_id = Some(job_id);
     new.notes = Some(format!("Offered from the article of job #{job_id}: {}", job.url));
     new.queued_by_operator = true;
+    // MCR settles the parent's article: no second chance may re-run it (P11.5).
+    // Marked before the offer is queued, so no trigger can move the parent in
+    // between; a queuing that then fails leaves it marked (the safe side).
+    if let Err(e) = state.repo.mark_acted_on(job_id, "offer") {
+        tracing::warn!("Job #{job_id}: not marked as acted on before its offer was queued: {e:#}");
+    }
     let result = state
         .repo
         .enqueue(&new, omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS)

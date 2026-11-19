@@ -453,9 +453,11 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     assert_eq!((queued.url.as_str(), queued.slug.as_str()), (raw, "1D_MCR_SEISMOS"));
     assert_eq!(queued.status, JobStatus::Pending);
     assert_eq!(queued.parent_job_id, Some(id), "the mail view files it under its article (plan P7.6)");
-    // MCR had to queue it by hand (P11.0); the article's own job is untouched.
+    // MCR had to queue it by hand (P11.0), and so acted on the article's own job too
+    // (P11.5 review): no second chance may re-run it.
     assert_eq!((queued.human_touched, queued.touch_reason.as_deref()), (true, Some("queued")));
-    assert!(!app.repo.get_job(id)?.unwrap().human_touched);
+    let parent = app.repo.get_job(id)?.unwrap();
+    assert_eq!((parent.human_touched, parent.touch_reason.as_deref()), (true, Some("offer")));
 
     // Twice: refused, and the offer remembers the job it became.
     let (status, body) = app.send("POST", &uri, &app.mcr_token, Some(json!({ "url": raw }))).await?;
@@ -466,6 +468,31 @@ async fn an_offered_article_video_can_be_queued_once_and_nothing_else() -> Resul
     // A reporter cannot use it.
     let (status, _) = app.send("POST", &uri, &app.user_token, Some(json!({ "url": raw }))).await?;
     assert!(status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED, "{status}");
+    Ok(())
+}
+
+/// P11.5 review (F2): MCR queued an offered video from a job waiting in
+/// review; a later yt-dlp update must not re-run that job, and the autonomy
+/// report counts it as one a person acted on.
+#[tokio::test]
+async fn a_job_whose_offer_mcr_queued_gets_no_second_chance() -> Result<()> {
+    let app = App::new()?;
+    let since = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let id = app.repo.enqueue(&omni_core::models::NewJob::new("https://www.portal.example/story/2", "1A_MCR_SEISMOS", "MCR"), 24)?.job_id();
+    assert!(app.repo.lease_job_by_id(id, "host:1:0", 180)?);
+    assert!(app.repo.finish(id, "host:1:0", JobStatus::RequiresReview, Some("NO_STREAM_FOUND"), Some("x"), None)?);
+    let raw = "https://cdn.portal.example/video/other.m3u8";
+    app.repo.set_candidates(id, Some(&json!([{ "url": raw, "index_str": "1B", "queued_job_id": null }]).to_string()))?;
+
+    let (status, body) = app.send("POST", &format!("/api/jobs/{id}/offers/queue"), &app.mcr_token, Some(json!({ "url": raw }))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(omni_core::second_chance::after_ytdlp_update(&app.repo, "0123456789abcdef"), 0);
+    assert_eq!(app.repo.get_job(id)?.unwrap().status, JobStatus::RequiresReview, "a job MCR settled was re-queued");
+
+    assert!(app.repo.mark_completed_manually(id)?);
+    let report = app.repo.autonomy_report(since)?;
+    assert_eq!((report.totals.delivered_manual, report.totals.delivered_untouched), (1, 0));
+    assert!(report.by_touch_reason.iter().any(|c| c.key == "offer"), "{:?}", report.by_touch_reason);
     Ok(())
 }
 // ==========================================

@@ -595,8 +595,9 @@ pub struct RetryConfig {
     /// The same for an urgent job (read as 1..=120).
     #[serde(default = "default_late_after_urgent_mins")]
     pub late_after_urgent_mins: i64,
-    /// How long after it failed a job may still get one more automatic try
-    /// (for example after a yt-dlp update or a new cookie jar). Not read yet.
+    /// How old (counted like `max_age_mins`) a job waiting in review may be and
+    /// still be re-queued once per fixed cause: a kept yt-dlp, a cookie jar, a
+    /// site that works again (P11.5, `omni_core::second_chance`; read as 30..=360).
     #[serde(default = "default_second_chance_window_mins")]
     pub second_chance_window_mins: i64,
 }

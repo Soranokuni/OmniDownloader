@@ -1119,7 +1119,9 @@ async fn run_daemon(
     info!("Initializing SQLite database at: {:?}", db_path);
     // One live-update bus: the repository announces job changes on it, the web server streams it (P1.10).
     let events = omni_core::events::EventBus::new();
-    let mut repo = Repository::new(&db_path)?.with_events(events.clone());
+    let mut repo = Repository::new(&db_path)?
+        .with_events(events.clone())
+        .with_second_chance_window(&config.retry);
     // Cookie jars are logins (P3.5): their values join the log redactor before anything uses them,
     // and every later read of a jar registers its values again (a jar the sign-in command stored).
     if let Some(r) = &log_redactions {
@@ -2221,7 +2223,15 @@ async fn nightly_ytdl_update(
     if let Some(postponed) = act.postponed_night {
         selfcheck::note_postponed(&dep_mgr.get_bin_dir(), postponed);
     }
+    ytdl_second_chance(repo, &act);
     act.outcome
+}
+
+/// The second chance a kept yt-dlp build gives (P11.5): the jobs in review for
+/// an extraction failure go back to the queue, once per build. Never fails the
+/// task. Returns how many moved.
+fn ytdl_second_chance(repo: &Repository, act: &VerdictAction) -> usize {
+    act.second_chance.as_deref().map_or(0, |build| omni_core::second_chance::after_ytdlp_update(repo, build))
 }
 
 /// What the nightly yt-dlp task does with a verdict (P11.4).
@@ -2238,6 +2248,9 @@ struct VerdictAction {
     /// One more postponed night (`Some(true)`), the run of them ends
     /// (`Some(false)`), or unchanged (`None`).
     postponed_night: Option<bool>,
+    /// A kept build: the jobs in review for an extraction failure get a second
+    /// chance with this build's id (P11.5, `ytdlp:<id>`).
+    second_chance: Option<String>,
 }
 
 /// [`VerdictAction`] for `verdict` on a build of `channel` whose hash begins `sha16`.
@@ -2253,6 +2266,7 @@ fn ytdl_verdict_action(verdict: &UpdateVerdict, channel: &str, sha16: &str) -> V
             outcome: TaskOutcome::Ok,
             close_breakers: true,
             postponed_night: Some(false),
+            second_chance: Some(sha16.to_string()),
         },
         UpdateVerdict::RolledBack { broken } => VerdictAction {
             reject: true,
@@ -2264,6 +2278,7 @@ fn ytdl_verdict_action(verdict: &UpdateVerdict, channel: &str, sha16: &str) -> V
             outcome: TaskOutcome::Failed,
             close_breakers: false,
             postponed_night: Some(false),
+            second_chance: None,
         },
         // Not judged: the previous build is live, this one is not marked
         // rejected and is tried again the next night.
@@ -2274,6 +2289,7 @@ fn ytdl_verdict_action(verdict: &UpdateVerdict, channel: &str, sha16: &str) -> V
             outcome: TaskOutcome::Skipped,
             close_breakers: false,
             postponed_night: Some(true),
+            second_chance: None,
         },
         // The new build is live but nobody could tell whether it works.
         UpdateVerdict::Unverified { why } => VerdictAction {
@@ -2285,6 +2301,7 @@ fn ytdl_verdict_action(verdict: &UpdateVerdict, channel: &str, sha16: &str) -> V
             outcome: TaskOutcome::Failed,
             close_breakers: false,
             postponed_night: None,
+            second_chance: None,
         },
     }
 }
@@ -2403,6 +2420,8 @@ async fn nightly_deno_update(
             match verdict {
                 UpdateVerdict::Kept { .. } => {
                     let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                    // yt-dlp reads YouTube through Deno: a second chance for extraction failures (P11.5).
+                    omni_core::second_chance::after_deno_update(repo, &new_version);
                     TaskOutcome::Ok
                 }
                 UpdateVerdict::RolledBack { broken } => {
@@ -2689,7 +2708,10 @@ async fn run_one_task(
                 let Some(url) = omni_core::cookies::sample_url_for(&jar.domain, jar.last_sample_url.as_deref()) else { continue };
                 tested += 1;
                 match omni_broadcast::cookie_file::test_jar(&ytdl, ffmpeg.as_deref(), &ctx.temp_path, repo, &jar.domain, &url, &ctx.canary.pacer()).await {
-                    Ok(t) if t.ok => {}
+                    // The jar logs in: a second chance for the site's login jobs (P11.5).
+                    Ok(t) if t.ok => {
+                        omni_core::second_chance::after_cookies(repo, &jar.domain);
+                    }
                     // The site was limiting requests: not a failed jar, and nothing was stored.
                     Ok(t) if t.inconclusive => info!("Cookie test for {}: not judged tonight, {}", jar.domain, t.detail),
                     Ok(_) => failing.push(jar.domain.clone()),
@@ -3302,6 +3324,37 @@ mod tests {
         let unknown = ytdl_verdict_action(&UpdateVerdict::Unverified { why: "the swap failed".into() }, "stable", "0123456789abcdef");
         assert_eq!((unknown.reject, unknown.level, unknown.outcome, unknown.close_breakers, unknown.postponed_night), (false, "WARN", TaskOutcome::Failed, false, None));
         assert!(unknown.audit.contains("is live but could not be verified: the swap failed") && !unknown.audit.contains("updated"));
+    }
+
+    /// P11.5: only a kept build gives the jobs in review for an extraction
+    /// failure a second chance, once per build.
+    #[test]
+    fn a_kept_ytdlp_build_gives_extraction_failures_a_second_chance() {
+        use omni_core::models::{JobStatus, NewJob};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let id = repo
+            .enqueue(&NewJob::new("https://news.example/a", "1_ANNA_TEST", "ANNA"), 24)
+            .unwrap()
+            .job_id();
+        assert!(repo.lease_job_by_id(id, "host:1:0", 180).unwrap());
+        assert!(repo.finish(id, "host:1:0", JobStatus::RequiresReview, Some("NO_STREAM_FOUND"), Some("x"), None).unwrap());
+
+        for verdict in [
+            UpdateVerdict::RolledBack { broken: vec!["X video".into()] },
+            UpdateVerdict::Postponed { why: "busy".into() },
+            UpdateVerdict::Unverified { why: "the swap failed".into() },
+        ] {
+            let act = ytdl_verdict_action(&verdict, "stable", "0123456789abcdef");
+            assert_eq!(act.second_chance, None);
+            assert_eq!(ytdl_second_chance(&repo, &act), 0, "{verdict:?}");
+        }
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::RequiresReview);
+
+        let kept = ytdl_verdict_action(&UpdateVerdict::Kept { checked: 4 }, "stable", "0123456789abcdef");
+        assert_eq!(ytdl_second_chance(&repo, &kept), 1);
+        assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Pending);
+        assert_eq!(repo.second_chances(id).unwrap(), vec!["ytdlp:0123456789abcdef".to_string()]);
     }
 
     /// P11.4 review round 1: the admin's cookie «Test» while the platform cools

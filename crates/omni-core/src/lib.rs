@@ -18,6 +18,7 @@ pub mod process;
 pub mod recipe_score;
 pub mod repository;
 pub mod scheduler;
+pub mod second_chance;
 pub mod secrets;
 pub mod site_health;
 pub mod site_videos;
