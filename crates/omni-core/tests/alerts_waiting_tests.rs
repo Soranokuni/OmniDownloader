@@ -22,6 +22,30 @@ fn ended_as(repo: &Repository, n: u32, status: JobStatus) -> i64 {
     id
 }
 
+/// A long review list hides nobody: the newest of 520 waiting jobs, the one
+/// about to cross the alert's limit, is in the list.
+#[test]
+fn every_waiting_job_is_listed_however_many_there_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("omni.db");
+    let repo = Repository::new(&db).unwrap();
+    let mut newest = 0;
+    for n in 0..520 {
+        newest = queued(&repo, n);
+    }
+    // All in review at once, the oldest first (seconds apart).
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE queue SET status = 'REQUIRES_REVIEW',
+                completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || (1000 - id) || ' seconds')",
+        [],
+    )
+    .unwrap();
+    let waiting = repo.jobs_waiting_for_person().unwrap();
+    assert_eq!(waiting.len(), 520);
+    assert_eq!(waiting.last().map(|w| w.id), Some(newest), "the newest is last, and present");
+}
+
 #[test]
 fn review_manual_and_held_jobs_wait_for_a_person_and_nothing_else_does() {
     let dir = tempfile::tempdir().unwrap();

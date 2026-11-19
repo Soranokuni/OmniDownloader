@@ -1661,7 +1661,7 @@ async fn run_daemon(
         let (repo_alerts, health_alerts) = (repo.clone(), health.clone());
         let mut alerts_rx = shutdown_tx.subscribe();
         let event_log = service_shutdown_rx.is_some();
-        let mut alerter = alerts::Alerter::new(config.alerts.waiting_for_person_mins);
+        let mut alerter = alerts::Alerter::new(config.alerts.waiting_for_person_mins).with_redactions(log_redactions.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {

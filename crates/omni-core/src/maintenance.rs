@@ -91,6 +91,27 @@ fn room_needed(db_bytes: u64) -> u64 {
 /// renamed into place, so a cut or damaged copy never counts as a backup.
 /// Blocking: run it off the async threads.
 pub fn nightly_backup(repo: &Repository, db_bytes: u64, dir: &Path, today: NaiveDate) -> Result<BackupReport> {
+    nightly_backup_with(repo, db_bytes, dir, today, &|tmp| check_copy(tmp), &mut || {})
+}
+
+/// The check a fresh copy must pass before it counts: `quick_check` says "ok".
+pub fn check_copy(tmp: &Path) -> Result<()> {
+    let found = Repository::quick_check_file(tmp)?;
+    anyhow::ensure!(found == ["ok"], "the backup copy failed its check: {}", found.join("; "));
+    Ok(())
+}
+
+/// [`nightly_backup`] with the copy's check given (`check`, run on the `.tmp`
+/// before it is renamed) and `during_copy` run while the backup holds its
+/// snapshot of the live database (tests prove writers commit meanwhile).
+pub fn nightly_backup_with(
+    repo: &Repository,
+    db_bytes: u64,
+    dir: &Path,
+    today: NaiveDate,
+    check: &dyn Fn(&Path) -> Result<()>,
+    during_copy: &mut dyn FnMut(),
+) -> Result<BackupReport> {
     std::fs::create_dir_all(dir).with_context(|| format!("could not create the backups folder {dir:?}"))?;
     if let Some((free, _)) = crate::selftest::disk_space(dir) {
         let need = room_needed(db_bytes);
@@ -112,11 +133,7 @@ pub fn nightly_backup(repo: &Repository, db_bytes: u64, dir: &Path, today: Naive
     let name = backup_name(today);
     let path = dir.join(&name);
     let tmp = dir.join(format!("{name}.tmp"));
-    let made = repo.backup_database(&tmp).and_then(|()| {
-        let found = Repository::quick_check_file(&tmp)?;
-        anyhow::ensure!(found == ["ok"], "the backup copy failed its check: {}", found.join("; "));
-        Ok(())
-    });
+    let made = repo.backup_database_with(&tmp, during_copy).and_then(|()| check(&tmp));
     if let Err(e) = made {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.context("the database backup failed"));
@@ -126,7 +143,9 @@ pub fn nightly_backup(repo: &Repository, db_bytes: u64, dir: &Path, today: Naive
 
     let days: Vec<NaiveDate> = entries(dir).iter().filter_map(|(n, _)| backup_day(n)).collect();
     let mut removed = 0;
-    for day in to_delete(&days) {
+    // Never the copy just made: after a clock that ran ahead was put right,
+    // later-dated files would otherwise push today's out of the seven.
+    for day in to_delete(&days).into_iter().filter(|d| *d != today) {
         if std::fs::remove_file(dir.join(backup_name(day))).is_ok() {
             removed += 1;
         }
@@ -148,11 +167,29 @@ fn entries(dir: &Path) -> Vec<(String, PathBuf)> {
 /// The weekly integrity check (P11.13): `Ok` when `quick_check` says "ok",
 /// else an error starting with [`INTEGRITY_PROBLEM`]. Blocking.
 pub fn integrity_check(repo: &Repository) -> Result<()> {
-    let found = repo.quick_check().context("the database integrity check could not run")?;
+    integrity_verdict(repo.quick_check())
+}
+
+/// What `quick_check`'s result means: its rows, or SQLite's refusal to run it.
+fn integrity_verdict(checked: Result<Vec<String>>) -> Result<()> {
+    let found = match checked {
+        Ok(found) => found,
+        // SQLite refusing to read its own file is damage too, not a check that could not run.
+        Err(e) if is_damage(&e) => anyhow::bail!("{INTEGRITY_PROBLEM}: {e:#}"),
+        Err(e) => return Err(e.context("the database integrity check could not run")),
+    };
     if found == ["ok"] {
         return Ok(());
     }
     anyhow::bail!("{INTEGRITY_PROBLEM}: {}", found.join("; "))
+}
+
+/// Whether `e` is SQLite saying the file is damaged (`SQLITE_CORRUPT`) or not
+/// a database at all (`SQLITE_NOTADB`).
+pub fn is_damage(e: &anyhow::Error) -> bool {
+    e.chain().filter_map(|c| c.downcast_ref::<rusqlite::Error>()).any(|r| {
+        matches!(r.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
+    })
 }
 
 fn local_time(at: chrono::DateTime<chrono::Utc>) -> String {
@@ -288,6 +325,29 @@ mod tests {
         let mut off = task("adblock_update", Some("failed"), None);
         off.enabled = false;
         assert_eq!(maintenance_check(&[off]).state, Health::Ok);
+    }
+
+    /// SQLite refusing its own file is damage; any other failure is not.
+    #[test]
+    fn corrupt_and_not_a_database_are_damage_and_busy_is_not() {
+        let sqlite = |code: std::os::raw::c_int| {
+            anyhow::Error::new(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)).context("prepare")
+        };
+        assert!(is_damage(&sqlite(rusqlite::ffi::SQLITE_CORRUPT)));
+        assert!(is_damage(&sqlite(rusqlite::ffi::SQLITE_NOTADB)));
+        assert!(!is_damage(&sqlite(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(!is_damage(&anyhow::anyhow!("pool timed out")));
+
+        // Through the verdict: damage is red's prefix, a busy database is "could not run".
+        let red = integrity_verdict(Err(sqlite(rusqlite::ffi::SQLITE_CORRUPT))).unwrap_err();
+        assert!(format!("{red:#}").starts_with(INTEGRITY_PROBLEM), "{red:#}");
+        let red = integrity_verdict(Err(sqlite(rusqlite::ffi::SQLITE_NOTADB))).unwrap_err();
+        assert!(format!("{red:#}").starts_with(INTEGRITY_PROBLEM), "{red:#}");
+        let amber = integrity_verdict(Err(sqlite(rusqlite::ffi::SQLITE_BUSY))).unwrap_err();
+        assert!(format!("{amber:#}").starts_with("the database integrity check could not run"), "{amber:#}");
+        assert!(integrity_verdict(Ok(vec!["ok".into()])).is_ok());
+        let rows = integrity_verdict(Ok(vec!["row 3 missing from index".into()])).unwrap_err();
+        assert!(format!("{rows:#}").starts_with(INTEGRITY_PROBLEM));
     }
 
     #[test]

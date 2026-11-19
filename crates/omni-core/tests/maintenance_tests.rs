@@ -7,7 +7,7 @@ use std::path::Path;
 use chrono::NaiveDate;
 use rusqlite::Connection;
 
-use omni_core::maintenance::{backup_name, integrity_check, nightly_backup, INTEGRITY_PROBLEM};
+use omni_core::maintenance::{backup_name, integrity_check, nightly_backup, nightly_backup_with, INTEGRITY_PROBLEM};
 use omni_core::models::NewJob;
 use omni_core::repository::{Repository, DEFAULT_DEDUP_WINDOW_HOURS};
 
@@ -48,23 +48,32 @@ fn the_nightly_backup_is_a_checked_copy_and_keeps_seven_daily_and_four_weekly() 
         std::fs::write(backups.join(backup_name(today - chrono::Duration::days(n))), b"old").unwrap();
     }
 
-    // Workers keep writing while the copy is made.
-    let writer = {
-        let repo = repo.clone();
-        std::thread::spawn(move || {
-            for n in 100..300 {
-                queue(&repo, n);
-            }
-        })
-    };
-    let report = nightly_backup(&repo, std::fs::metadata(&db).unwrap().len(), &backups, today).unwrap();
-    writer.join().unwrap();
+    // A worker commits a job while the backup holds its snapshot: it is not held
+    // up (it commits within two seconds), and the copy is the snapshot without it.
+    let mut written_during = None;
+    let report = nightly_backup_with(
+        &repo,
+        std::fs::metadata(&db).unwrap().len(),
+        &backups,
+        today,
+        &|tmp| omni_core::maintenance::check_copy(tmp),
+        &mut || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let repo = repo.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(queue(&repo, 777));
+            });
+            written_during = Some(rx.recv_timeout(std::time::Duration::from_secs(2)).expect("a worker's write waited for the backup"));
+        },
+    )
+    .unwrap();
+    assert!(written_during.is_some());
 
     assert_eq!(report.path, backups.join("omni-2026-11-19.db"));
     assert!(report.bytes > 0);
     assert_eq!(Repository::quick_check_file(&report.path).unwrap(), vec!["ok".to_string()]);
-    let copied = rows_in(&report.path);
-    assert!((50..=250).contains(&copied), "a consistent snapshot of the live queue: {copied}");
+    assert_eq!(rows_in(&report.path), 50, "the snapshot, without the job written during the copy");
+    assert_eq!(rows_in(&db), 51, "which the live database has");
 
     let mut ours: Vec<String> = std::fs::read_dir(&backups)
         .unwrap()
@@ -87,6 +96,69 @@ fn the_nightly_backup_is_a_checked_copy_and_keeps_seven_daily_and_four_weekly() 
     assert_eq!(again.path, report.path);
     assert_eq!(rows_in(&again.path), rows_in(&db));
     assert_eq!(again.removed, 0);
+}
+
+/// The names of the files in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut n: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    n.sort();
+    n
+}
+
+/// Eight earlier nights' backups in a fresh `backups` folder.
+fn with_old_backups(today: NaiveDate) -> (tempfile::TempDir, Repository, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+    queue(&repo, 1);
+    let backups = dir.path().join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    for n in 1..=8 {
+        std::fs::write(backups.join(backup_name(today - chrono::Duration::days(n))), b"old").unwrap();
+    }
+    (dir, repo, backups)
+}
+
+/// A backup refused for lack of room touches nothing: the old backups stay and no `.tmp` is left.
+#[test]
+fn a_refused_backup_keeps_every_old_backup_and_leaves_no_tmp() {
+    let today = d("2026-11-19");
+    let (_dir, repo, backups) = with_old_backups(today);
+    let before = names(&backups);
+    let err = nightly_backup(&repo, u64::MAX, &backups, today).expect_err("no volume has room for that");
+    assert!(format!("{err:#}").contains("not enough space"), "{err:#}");
+    assert_eq!(names(&backups), before);
+}
+
+/// A copy that fails its check never counts: the old backups stay, the `.tmp`
+/// goes, and no file for today is written.
+#[test]
+fn a_damaged_copy_keeps_the_old_backups_and_writes_no_day_file() {
+    let today = d("2026-11-19");
+    let (_dir, repo, backups) = with_old_backups(today);
+    let before = names(&backups);
+    let mut checked = false;
+    let check = |tmp: &Path| -> anyhow::Result<()> {
+        assert!(tmp.exists(), "the check sees the copy");
+        anyhow::bail!("the backup copy failed its check: *** in database main *** Page 3 is never used")
+    };
+    let err = nightly_backup_with(&repo, 0, &backups, today, &check, &mut || checked = true).expect_err("refused");
+    assert!(checked);
+    assert!(format!("{err:#}").contains("failed its check"), "{err:#}");
+    assert_eq!(names(&backups), before, "no .tmp, no {}, nothing removed", backup_name(today));
+}
+
+/// Today's copy is never rotated away, even when later-dated backups exist
+/// (a clock that ran ahead and was put right).
+#[test]
+fn todays_copy_survives_later_dated_backups() {
+    let today = d("2026-11-19");
+    let (_dir, repo, backups) = with_old_backups(today);
+    for n in 1..=9 {
+        std::fs::write(backups.join(backup_name(today + chrono::Duration::days(n))), b"ahead").unwrap();
+    }
+    let report = nightly_backup(&repo, 0, &backups, today).unwrap();
+    assert!(report.path.exists(), "the copy just made stays");
+    assert!(names(&backups).contains(&backup_name(today)));
 }
 
 /// The health lines come from the stored task rows, so they survive a restart:

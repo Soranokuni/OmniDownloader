@@ -604,8 +604,10 @@ ends, never repeatedly: a health line turning red (Error, event id 3000; back
 to normal: Information, 1000), videos waiting for a person past
 `alerts.waiting_for_person_mins` (Warning, 2000; one entry naming them), and
 the mailbox not answering for 10 minutes (Error, 3000; answering again:
-Information, 1000). After a restart a condition that still holds is written
-once more. A console run (`omni-ingest.exe run`) writes these lines to its log
+Information, 1000). A health line's change is written once it has held for 3
+minutes, so a line flapping at a threshold writes nothing. E-mail addresses and
+known secrets are masked in these entries. After a restart a condition that
+still holds is written once more. A console run (`omni-ingest.exe run`) writes these lines to its log
 file only.
 
 ### 5.4 LLM assist (optional)
@@ -827,7 +829,9 @@ and names it; its next good run clears it. The **database** line shows the
 last integrity check and the last backup; it turns red if the check finds the
 database damaged. Then stop the service, move `data\omni.db` together with
 `omni.db-wal` and `omni.db-shm` (if present) to another folder, copy the newest
-file from `data\backups\` to `data\omni.db`, and start the service again. The backups hold the whole database, accounts and sessions included:
+`omni-YYYY-MM-DD.db` from `data\backups\` (never a `.tmp`: that is a copy that
+was not finished or failed its check) to `data\omni.db`, and start the service
+again. The backups hold the whole database, accounts and sessions included:
 they stay in `data\`, which only the service and administrators can read.
 
 What the `retention` task keeps in the database, and for how long (fixed, not configurable):

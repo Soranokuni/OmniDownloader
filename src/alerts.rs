@@ -3,7 +3,9 @@
 //!
 //! Three conditions, each written once when it starts and once when it ends,
 //! never on every tick:
-//! - a health line turning red (Error; back to normal: Information);
+//! - a health line turning red (Error; back to normal: Information), each
+//!   once it has held for three ticks, so a line flapping at a threshold
+//!   writes nothing;
 //! - jobs waiting for a person (review, manual download, approval) longer than
 //!   `alerts.waiting_for_person_mins` (Warning, one entry for the jobs that
 //!   crossed the limit since the last tick);
@@ -45,12 +47,57 @@ pub(crate) struct Snapshot<'a> {
     pub waiting: Option<&'a [WaitingForPerson]>,
 }
 
+/// Ticks in a row a health line must hold red, or back from red, before it is written.
+pub(crate) const SETTLE_TICKS: u32 = 3;
+
 /// What has been written, so each condition is written once per transition.
 pub(crate) struct Alerter {
     waiting_limit: Duration,
+    /// Lines written as red.
     red: BTreeSet<String>,
+    /// Lines whose state differs from what was written, and for how many ticks.
+    settling: BTreeMap<String, u32>,
     mail_silent: bool,
     overdue: BTreeSet<i64>,
+    /// The log's secret set: a detail never carries a known secret.
+    redactions: Option<omni_core::logging::Redactions>,
+}
+
+/// `text` with every e-mail-address-shaped run (`name@host.tld`) replaced by
+/// `[address]`: a mailbox error often names the account.
+pub(crate) fn mask_addresses(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let local = |c: char| c.is_alphanumeric() || "._%+-".contains(c);
+    let domain = |c: char| c.is_alphanumeric() || ".-".contains(c);
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' {
+            let mut start = i;
+            while start > 0 && local(chars[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i + 1;
+            while end < chars.len() && domain(chars[end]) {
+                end += 1;
+            }
+            let host: String = chars[i + 1..end].iter().collect();
+            let host = host.trim_end_matches('.');
+            if start < i && host.contains('.') {
+                // Drop what was already copied of the local part.
+                for _ in start..i {
+                    out.pop();
+                }
+                out.push_str("[address]");
+                // A trailing dot is sentence punctuation, kept.
+                i = i + 1 + host.chars().count();
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 fn status_words(status: &str) -> &'static str {
@@ -68,9 +115,17 @@ impl Alerter {
         Self {
             waiting_limit: Duration::minutes(waiting_mins.clamp(1, 1440)),
             red: BTreeSet::new(),
+            settling: BTreeMap::new(),
             mail_silent: false,
             overdue: BTreeSet::new(),
+            redactions: None,
         }
+    }
+
+    /// Details pass through the log's secret set before they are written.
+    pub(crate) fn with_redactions(mut self, redactions: Option<omni_core::logging::Redactions>) -> Self {
+        self.redactions = redactions;
+        self
     }
 
     /// The entries to write for `now`.
@@ -82,20 +137,46 @@ impl Alerter {
         out
     }
 
+    /// A line's change is written once it has held for [`SETTLE_TICKS`] ticks
+    /// in a row: a line flapping at a threshold writes nothing.
     fn health_lines(&mut self, s: &Snapshot, out: &mut Vec<Alert>) {
         let red_now: BTreeSet<String> =
             s.checks.iter().filter(|(name, c)| name.as_str() != checks::MAIL && c.state == Health::Down).map(|(n, _)| n.clone()).collect();
-        for name in red_now.difference(&self.red) {
-            let detail = s.checks.get(name).and_then(|c| c.detail.clone()).unwrap_or_default();
-            out.push(Alert {
-                level: EventLevel::Error,
-                message: format!("Health line «{name}» is red: {detail}. See the admin panel, Overview."),
-            });
+        // The settling ones too: a line back where it was written stops settling.
+        let names: BTreeSet<String> = red_now.iter().chain(&self.red).chain(self.settling.keys()).cloned().collect();
+        for name in names {
+            let is_red = red_now.contains(&name);
+            if is_red == self.red.contains(&name) {
+                self.settling.remove(&name);
+                continue;
+            }
+            let held = self.settling.entry(name.clone()).or_insert(0);
+            *held += 1;
+            if *held < SETTLE_TICKS {
+                continue;
+            }
+            self.settling.remove(&name);
+            if is_red {
+                let detail = self.clean(&s.checks.get(&name).and_then(|c| c.detail.clone()).unwrap_or_default());
+                out.push(Alert {
+                    level: EventLevel::Error,
+                    message: format!("Health line «{name}» is red: {detail}. See the admin panel, Overview."),
+                });
+                self.red.insert(name);
+            } else {
+                out.push(Alert { level: EventLevel::Info, message: format!("Health line «{name}» is no longer red.") });
+                self.red.remove(&name);
+            }
         }
-        for name in self.red.difference(&red_now) {
-            out.push(Alert { level: EventLevel::Info, message: format!("Health line «{name}» is no longer red.") });
-        }
-        self.red = red_now;
+    }
+
+    /// `text` without any known secret and without anything shaped like an e-mail address.
+    fn clean(&self, text: &str) -> String {
+        let text = match &self.redactions {
+            Some(r) => r.apply(text),
+            None => text.to_string(),
+        };
+        mask_addresses(&text)
     }
 
     fn mailbox(&mut self, s: &Snapshot, out: &mut Vec<Alert>) {
@@ -105,7 +186,7 @@ impl Alerter {
         let silent = failing && s.now - answered >= MAIL_SILENT;
         if silent && !self.mail_silent {
             let minutes = (s.now - answered).num_minutes();
-            let detail = mail.and_then(|c| c.detail.clone()).unwrap_or_default();
+            let detail = self.clean(&mail.and_then(|c| c.detail.clone()).unwrap_or_default());
             out.push(Alert {
                 level: EventLevel::Error,
                 message: format!("The mailbox has not answered for {minutes} minutes; new mail is not being ingested: {detail}"),
@@ -198,20 +279,77 @@ mod tests {
         w.checks.insert(checks::DISK.into(), Check::degraded("8 GB free"));
         assert!(w.tick(&mut a, 0).is_empty(), "amber is not an alert");
         w.checks.insert(checks::DISK.into(), Check::down("1 GB free on temp"));
-        let first = w.tick(&mut a, 1);
+        assert!(w.tick(&mut a, 1).is_empty() && w.tick(&mut a, 2).is_empty(), "red for two ticks is not yet settled");
+        let first = w.tick(&mut a, 3);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].level, EventLevel::Error);
         assert!(first[0].message.contains("«disk» is red: 1 GB free on temp"), "{first:?}");
-        for m in 2..30 {
-            assert!(w.tick(&mut a, m).is_empty(), "every tick after the first is quiet");
+        for m in 4..30 {
+            assert!(w.tick(&mut a, m).is_empty(), "every tick after it is quiet");
         }
         w.checks.insert(checks::DISK.into(), Check::ok("40 GB free"));
-        let back = w.tick(&mut a, 31);
+        assert!(w.tick(&mut a, 31).is_empty() && w.tick(&mut a, 32).is_empty());
+        let back = w.tick(&mut a, 33);
         assert_eq!(back, vec![Alert { level: EventLevel::Info, message: "Health line «disk» is no longer red.".into() }]);
-        assert!(w.tick(&mut a, 32).is_empty());
-        // Red again: a new transition, written again.
+        assert!(w.tick(&mut a, 34).is_empty());
+        // Red again: a new transition, written again once it holds.
         w.checks.insert(checks::DISK.into(), Check::down("1 GB free on temp"));
-        assert_eq!(w.tick(&mut a, 33).len(), 1);
+        let again: usize = (35..=37).map(|m| w.tick(&mut a, m).len()).sum();
+        assert_eq!(again, 1);
+    }
+
+    /// A line flapping at a threshold (red one tick, amber the next, for a day)
+    /// writes nothing; flapping after it settled red writes no recovery either.
+    #[test]
+    fn a_line_flapping_at_a_threshold_writes_nothing() {
+        let mut a = Alerter::new(15);
+        let mut w = World::new();
+        let mut written = 0;
+        for m in 0..1440 {
+            let state = if m % 2 == 0 { Check::down("4.9 GB free") } else { Check::degraded("5.1 GB free") };
+            w.checks.insert(checks::DISK.into(), state);
+            written += w.tick(&mut a, m).len();
+        }
+        assert_eq!(written, 0, "a day of flapping");
+        // Two ticks red, one amber, repeated: never three in a row.
+        for m in 0..300 {
+            let state = if m % 3 == 2 { Check::degraded("5.1 GB free") } else { Check::down("4.9 GB free") };
+            w.checks.insert(checks::DISK.into(), state);
+            written += w.tick(&mut a, 2000 + m).len();
+        }
+        assert_eq!(written, 0);
+        // Settled red, then flapping: no recovery entry.
+        w.checks.insert(checks::DISK.into(), Check::down("4.9 GB free"));
+        let red: usize = (3000..3003).map(|m| w.tick(&mut a, m).len()).sum();
+        assert_eq!(red, 1);
+        for m in 0..300 {
+            let state = if m % 3 == 2 { Check::down("4.9 GB free") } else { Check::degraded("5.1 GB free") };
+            w.checks.insert(checks::DISK.into(), state);
+            assert!(w.tick(&mut a, 4000 + m).is_empty(), "tick {m}");
+        }
+    }
+
+    #[test]
+    fn addresses_and_known_secrets_never_reach_the_event_log() {
+        assert_eq!(
+            mask_addresses("IMAP authentication failed for ingest.desk@station-news.example. Retry"),
+            "IMAP authentication failed for [address]. Retry"
+        );
+        assert_eq!(mask_addresses("a@b, no@host, x @y.z, user@mail.example"), "a@b, no@host, x @y.z, [address]");
+        assert_eq!(mask_addresses("Γραμματοκιβώτιο δεν απαντά"), "Γραμματοκιβώτιο δεν απαντά");
+
+        let secrets = omni_core::logging::Redactions::new(vec!["s3cret-client-value".into()]);
+        let mut a = Alerter::new(15).with_redactions(Some(secrets));
+        let mut w = World::new();
+        w.checks.insert(checks::MAIL.into(), Check::down("token s3cret-client-value refused for ingest@station-news.example"));
+        let alert = w.tick(&mut a, 10);
+        assert_eq!(alert.len(), 1);
+        let m = &alert[0].message;
+        assert!(!m.contains("s3cret-client-value") && !m.contains("ingest@") && m.contains("[address]") && m.contains("***"), "{m}");
+        // A red line's detail too.
+        w.checks.insert(checks::WATCHFOLDER.into(), Check::down("cannot write as svc-ingest@station-news.example"));
+        let red: Vec<Alert> = (11..14).flat_map(|t| w.tick(&mut a, t)).collect();
+        assert!(red.len() == 1 && red[0].message.contains("[address]") && !red[0].message.contains("svc-ingest@"), "{red:?}");
     }
 
     #[test]

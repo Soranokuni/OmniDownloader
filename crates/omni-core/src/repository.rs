@@ -3765,6 +3765,13 @@ impl Repository {
     /// a read transaction that does not stop the workers writing (WAL). An
     /// existing `dest` is replaced. Blocking: call it off the async threads.
     pub fn backup_database(&self, dest: &Path) -> Result<()> {
+        self.backup_database_with(dest, &mut || {})
+    }
+
+    /// [`Self::backup_database`], running `during_copy` once the backup holds
+    /// its snapshot (a read transaction on the source) and before it copies:
+    /// whatever commits meanwhile is not in the copy, and is not held up.
+    pub fn backup_database_with(&self, dest: &Path, during_copy: &mut dyn FnMut()) -> Result<()> {
         let conn = self.pool.get()?;
         match std::fs::remove_file(dest) {
             Ok(()) => {}
@@ -3772,9 +3779,33 @@ impl Repository {
             Err(e) => return Err(e).with_context(|| format!("could not replace {dest:?}")),
         }
         let mut copy = rusqlite::Connection::open(dest).with_context(|| format!("could not create {dest:?}"))?;
+        // The snapshot: a read transaction the backup step then uses as its own.
+        conn.execute_batch("BEGIN DEFERRED").context("could not start the backup's read")?;
+        let snapshot = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+            .context("could not start the backup's read");
+        if let Err(e) = snapshot {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        during_copy();
+        let copied = Self::copy_pages(&conn, &mut copy);
+        let _ = conn.execute_batch("ROLLBACK");
+        copied?;
+        // The copy carries the live file's WAL flag: one self-contained file
+        // instead, so no `-wal`/`-shm` is left beside it (restoring it, the
+        // daemon turns WAL on again).
+        copy.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0))
+            .context("could not finish the backup file")?;
+        copy.close().map_err(|(_, e)| e).context("could not close the backup file")?;
+        Ok(())
+    }
+
+    /// Every page of `conn`'s database into `copy`, in one backup step.
+    fn copy_pages(conn: &rusqlite::Connection, copy: &mut rusqlite::Connection) -> Result<()> {
         {
             use rusqlite::backup::StepResult;
-            let backup = rusqlite::backup::Backup::new(&conn, &mut copy).context("could not start the backup")?;
+            let backup = rusqlite::backup::Backup::new(conn, copy).context("could not start the backup")?;
             // -1: every page in one step. Busy or locked: try again for up to a minute.
             let mut waits = 0;
             loop {
@@ -3789,20 +3820,15 @@ impl Repository {
                 }
             }
         }
-        // The copy carries the live file's WAL flag: one self-contained file
-        // instead, so no `-wal`/`-shm` is left beside it (restoring it, the
-        // daemon turns WAL on again).
-        copy.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0))
-            .context("could not finish the backup file")?;
-        copy.close().map_err(|(_, e)| e).context("could not close the backup file")?;
         Ok(())
     }
 
     /// Jobs waiting for a person (P11.14): in review, for a manual download, or
     /// held for approval, not cleared from the desk, with when they started
     /// waiting (held: when the video was held; otherwise when the job ended
-    /// there). A row whose time cannot be read is left out. At most 500, the
-    /// longest waiting first.
+    /// there). A row whose time cannot be read is left out. All of them, the
+    /// longest waiting first: a cap would hide the newest, which are the ones
+    /// about to cross the alert's limit.
     pub fn jobs_waiting_for_person(&self) -> Result<Vec<WaitingForPerson>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
@@ -3813,8 +3839,7 @@ impl Repository {
                LEFT JOIN held_outputs h ON h.job_id = q.id
               WHERE q.status IN ('REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'AWAITING_APPROVAL')
                 AND q.cleared_at IS NULL
-              ORDER BY since ASC
-              LIMIT 500",
+              ORDER BY since ASC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
