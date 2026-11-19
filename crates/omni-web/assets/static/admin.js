@@ -6,7 +6,7 @@
  */
 
 import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=5';
+import { runWizard } from '/static/wizard.js?v=6';
 
 /* ------------------------------------------------------------------ *
  * First-run account (P2.14) and the setup wizard (P7.12)
@@ -80,6 +80,58 @@ if (setupState && setupState.setup_completed === false && !leftWizard) {
     ? `Setup was completed in ${setupState.setup_mode} mode.`
     : 'Setup not finished: the wizard was left before its last screen.';
   document.getElementById('setup-rerun').addEventListener('click', () => runWizard({ defaultAdmin: false }));
+
+  // A new watchfolder that waits for the videos being made now (P13.2).
+  const pending = setupState && setupState.watchfolder_pending;
+  const pendingLine = document.getElementById('watchfolder-pending');
+  if (pending) {
+    pendingLine.hidden = false;
+    pendingLine.textContent = `New watchfolder pending: ${pending.path}. It is used as soon as the videos being made now have finished; until then files go to ${setupState.watchfolder_in_use || 'the current one'}.`;
+  }
+
+  // «Επανεκκίνηση υπηρεσίας» (P13.2): asked in the page, then the panel waits
+  // for the service to answer again and reloads.
+  if (setupState && setupState.restart_available) {
+    document.getElementById('restart-box').hidden = false;
+    const btn = document.getElementById('restart-btn');
+    const warn = document.getElementById('restart-warn');
+    const result = document.getElementById('restart-result');
+    btn.addEventListener('click', async () => {
+      if (warn.hidden) {
+        warn.hidden = false;
+        btn.textContent = 'Επανεκκίνηση τώρα';
+        btn.classList.add('btn-danger');
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api('/api/admin/restart-service', { method: 'POST', body: {} });
+      } catch (e) {
+        result.className = 'note bad';
+        result.textContent = e.message;
+        btn.disabled = false;
+        return;
+      }
+      result.className = 'note';
+      result.textContent = 'Restarting… the page reloads when the service answers again.';
+      const started = Date.now();
+      // Down first, then up again; give up after three minutes.
+      let wentDown = false;
+      const poll = async () => {
+        // Any answer, even a red health, means the service is back; only no answer is "down".
+        const up = await api('/api/health').then(() => true, (e) => e.code !== 'NETWORK');
+        if (!up) wentDown = true;
+        if (up && wentDown) { location.reload(); return; }
+        if (Date.now() - started > 180000) {
+          result.className = 'note bad';
+          result.textContent = 'The service has not answered for three minutes. Check it in Services, and the Event Log.';
+          return;
+        }
+        setTimeout(poll, 2000);
+      };
+      setTimeout(poll, 2000);
+    });
+  }
 }
 
 /* ------------------------------------------------------------------ *

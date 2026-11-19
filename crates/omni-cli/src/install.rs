@@ -1147,6 +1147,9 @@ pub(crate) trait Machine {
     fn install_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()>;
     /// Change the existing registration in place (`None` = LocalSystem).
     fn reconfigure_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()>;
+    /// Let the kept service account start and stop its own service (P13.2), on
+    /// an upgrade that does not register again (registering grants it itself).
+    fn grant_restart(&mut self, account: Option<&str>);
     /// The ACL work for `account`: strip the explicit grants of `strip` and of
     /// `account`, lock the root, apply `grants`.
     async fn apply_acls(
@@ -1237,6 +1240,11 @@ impl Machine for SystemMachine {
     }
     fn reconfigure_service(&mut self, exe: &Path, account: Option<&ServiceAccount>) -> Result<()> {
         reconfigure_service(exe, account)
+    }
+    fn grant_restart(&mut self, account: Option<&str>) {
+        if let Err(e) = omni_service::self_control::grant_self_control(omni_service::SERVICE_NAME, account) {
+            tracing::info!("The service account was not allowed to restart the service ({e:#}); the admin panel's restart will not work");
+        }
     }
     async fn apply_acls(
         &mut self,
@@ -1463,6 +1471,12 @@ async fn forward_steps<M: Machine>(
             );
         }
         m.apply_acls(plan, account, plan.previous_account.as_deref(), &plan.grants, progress).await;
+    } else if let AccountDecision::Keep { current } = &plan.account {
+        // An installation from before P13.2 gets the panel's restart too
+        // (LocalSystem already may).
+        if omni_service::self_control::needs_self_control(current.as_deref()) {
+            m.grant_restart(current.as_deref());
+        }
     }
     if let Some(port) = plan.firewall {
         // As before: a rule that could not be added is said and the run goes on.
@@ -4357,6 +4371,9 @@ mod tests {
             self.log.push(format!("#reconfigure_service {} as {} password={}", exe.display(), account_label(account), pw(account)));
             self.step("reconfigure_service")
         }
+        fn grant_restart(&mut self, account: Option<&str>) {
+            self.log.push(format!("#grant_restart {}", account.unwrap_or("LocalSystem")));
+        }
         async fn apply_acls(
             &mut self,
             _plan: &InstallPlan,
@@ -4480,6 +4497,24 @@ mod tests {
             log.lines().last().unwrap(),
             r"  Previous version kept as C:\OmniTest\omni-ingest.exe.prev."
         );
+    }
+
+    /// P13.2: an upgrade that keeps the service's account still lets that account
+    /// restart its own service (registering again grants it in `omni-service`);
+    /// LocalSystem needs nothing (the test above).
+    #[test]
+    fn an_upgrade_keeping_the_virtual_account_grants_it_the_restart() {
+        let plan = plan_install(&opts(), &installed(omni_service::DEFAULT_SERVICE_ACCOUNT)).unwrap();
+        assert!(!plan.account.registers(), "kept, not registered again");
+        let log = Log::default();
+        let mut machine = FakeMachine::new(&log);
+        machine.had_previous = true;
+        run(&plan, &Answers::default(), &log, machine).unwrap();
+        let lines = log.lines();
+        let at = |s: &str| lines.iter().position(|l| l.starts_with(s)).unwrap_or_else(|| panic!("{s} missing: {lines:?}"));
+        assert_eq!(lines[at("#grant_restart")], format!("#grant_restart {}", omni_service::DEFAULT_SERVICE_ACCOUNT));
+        assert!(at("#create_watchfolder") < at("#grant_restart") && at("#grant_restart") < at("#start_service"));
+        assert_eq!(lines.iter().filter(|l| l.starts_with("#grant_restart")).count(), 1);
     }
 
     #[test]

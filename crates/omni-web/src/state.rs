@@ -132,6 +132,12 @@ pub struct AppState {
     /// given up on to be read again (P11.11b). `None` in tests that have none;
     /// a save then says a restart is needed.
     pub mail: Option<omni_email::watcher::LiveMail>,
+    /// The watchfolder and archive the daemon delivers with (P13.2): a save
+    /// swaps them between jobs. `None` in tests that have none; a save then
+    /// says a restart is needed.
+    pub delivery: Option<crate::admin_delivery::LiveDelivery>,
+    /// Carries out «Επανεκκίνηση υπηρεσίας» (P13.2); `None` outside the Windows service.
+    pub restarter: Option<Arc<dyn crate::admin_delivery::ServiceRestarter>>,
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
@@ -220,6 +226,8 @@ impl AppState {
             tls_enabled,
             llm,
             mail: None,
+            delivery: None,
+            restarter: None,
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
             site_runner: None,
@@ -447,6 +455,18 @@ impl AppState {
     /// Share the daemon's live LLM assist with the admin panel.
     pub fn with_llm(mut self, llm: omni_email::assist::LiveAssist) -> Self {
         self.llm = llm;
+        self
+    }
+
+    /// Share the daemon's delivery paths with the admin panel (P13.2).
+    pub fn with_delivery(mut self, delivery: crate::admin_delivery::LiveDelivery) -> Self {
+        self.delivery = Some(delivery);
+        self
+    }
+
+    /// The service restart behind «Επανεκκίνηση υπηρεσίας» (P13.2).
+    pub fn with_restarter(mut self, restarter: Arc<dyn crate::admin_delivery::ServiceRestarter>) -> Self {
+        self.restarter = Some(restarter);
         self
     }
 

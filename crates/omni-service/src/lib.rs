@@ -6,6 +6,7 @@ use tracing::{error, info};
 
 pub mod account;
 pub mod eventlog;
+pub mod self_control;
 pub use account::{check_service_logon, grant_service_logon_right, logon_check_from_error, split_account, LogonCheck};
 pub const SERVICE_NAME: &str = "OmniIngestService";
 pub const SERVICE_DISPLAY_NAME: &str = "OmniDownloader Broadcast Ingest Engine";
@@ -244,6 +245,7 @@ mod windows_impl {
             .context("Failed creating Windows Service")?;
 
         configure_registered(&service);
+        grant_restart(account);
 
         // Register the Event Log source while we still have the administrator
         // rights that creating a service required. A failure here is not fatal
@@ -280,7 +282,37 @@ mod windows_impl {
             .change_config(&change_info(exe_path, account))
             .map_err(|e| anyhow::anyhow!("Failed changing the service configuration ({})", winapi_detail(&e)))?;
         configure_registered(&service);
+        grant_restart(account);
         info!("Windows Service {} now runs as {}", SERVICE_NAME, super::account_change(account).account_name);
+        Ok(())
+    }
+
+    /// The service's account may stop and start the service (P13.2: the panel's
+    /// restart). A refusal does not fail the install; the panel then says so.
+    fn grant_restart(account: Option<&ServiceAccount>) {
+        if let Err(e) = crate::self_control::grant_self_control(SERVICE_NAME, account.map(|a| a.name.as_str())) {
+            info!("The service account was not allowed to restart the service ({e:#}); the admin panel's restart will not work");
+        }
+    }
+
+    /// Wait until the service has stopped (up to `timeout`), then start it (P13.2).
+    pub fn start_after_stop(timeout: Duration) -> Result<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .context("Failed opening Service Manager")?;
+        let service = manager
+            .open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
+            .context("Failed opening the service to start it again")?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("{SERVICE_NAME} did not stop within {} s; it was not started again", timeout.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        service.start(&[] as &[OsString]).context("Failed starting the service again")?;
         Ok(())
     }
 
@@ -608,6 +640,18 @@ pub fn stop_service() -> Result<()> {
     return windows_impl::stop();
     #[cfg(not(windows))]
     return non_windows_impl::stop();
+}
+
+/// `omni-ingest service restart-self` (P13.2): wait until the service has
+/// stopped, up to `timeout`, and start it again.
+pub fn start_service_after_stop(timeout: std::time::Duration) -> Result<()> {
+    #[cfg(windows)]
+    return windows_impl::start_after_stop(timeout);
+    #[cfg(not(windows))]
+    {
+        let _ = timeout;
+        anyhow::bail!("Windows services are only available on Windows")
+    }
 }
 
 pub fn query_service_status() -> Result<String> {

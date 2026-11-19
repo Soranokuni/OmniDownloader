@@ -13,9 +13,10 @@
 //! setting once at start-up and will use the saved value only after a restart.
 //! Live: `setup_*`, `security.mcr_open_networks`, `security.trust_proxy_header`,
 //! `security.trusted_proxies`, `metrics.allow_networks` (read per request), mail
-//! settings (the watcher's source is rebuilt, P11.11c).
-//! Restart: watchfolder (the worker pool, recovery and the disk checks captured
-//! the path), web port, TLS, `security.allowed_hosts`, `metrics.enabled`, archive.
+//! settings (the watcher's source is rebuilt, P11.11c), the watchfolder (between
+//! jobs, P13.2, `admin_delivery`) and the archive.
+//! Restart («Επανεκκίνηση υπηρεσίας»): web port, TLS, `security.allowed_hosts`,
+//! `metrics.enabled`: the listener reads them when it starts.
 
 use std::path::Path;
 use std::time::Duration;
@@ -292,7 +293,33 @@ fn settings_json(cfg: &AppConfig) -> serde_json::Value {
 }
 
 pub async fn api_admin_get_settings(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
-    Ok(Json(settings_json(&*state.config.read().await)))
+    let mut doc = settings_json(&*state.config.read().await);
+    // What the running daemon uses (P13.2): not part of the answer file.
+    if let Some(live) = &state.delivery {
+        doc["watchfolder_in_use"] = serde_json::json!(live.paths.watchfolder().to_string_lossy());
+        doc["watchfolder_pending"] = serde_json::json!(live.pending());
+    }
+    doc["restart_available"] = serde_json::json!(state.restarter.is_some());
+    Ok(Json(doc))
+}
+
+/// Whether the configured archive and the watchfolder `resolved` contain one
+/// another: refused at save (P13.2), since the archive must never reach a file
+/// Dalet owns.
+fn archive_overlaps(state: &AppState, cfg: &AppConfig, resolved: &Path) -> bool {
+    match &state.delivery {
+        Some(live) => live.archive_for(&cfg.archive, resolved).conflict,
+        None => omni_core::archive::overlaps(&cfg.resolve_path(&cfg.archive.path), resolved),
+    }
+}
+
+/// The refusal for an archive that would overlap the watchfolder.
+fn archive_overlap_refusal(cfg: &AppConfig, resolved: &Path) -> ApiError {
+    ApiError::bad_request(format!(
+        "archive.path ({}) and the watchfolder ({}) would contain one another: the archive must never reach a file Dalet owns. Choose a watchfolder outside the archive, or move the archive (archive.path) first.",
+        cfg.resolve_path(&cfg.archive.path).display(),
+        resolved.display()
+    ))
 }
 
 /// The chosen settings as a file for an unattended install. No secret is in it:
@@ -430,29 +457,55 @@ pub async fn api_admin_test_watchfolder(
     }))
 }
 
-/// Save only a path that passes the test just run again. Restart needed: the
-/// delivery path, crash recovery and disk checks hold the path they started with.
+/// Save only a path that passes the test just run again, and that no archive
+/// overlaps. In the daemon it is put into use between jobs (P13.2): at once
+/// when no job runs, else when they have finished (`pending`); finished videos
+/// waiting for the old folder go to review. Without a daemon to tell (tests),
+/// a restart is needed.
 pub async fn api_admin_save_watchfolder(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
     Json(payload): Json<WatchfolderPayload>,
 ) -> JsonResult {
     let watch = test_watchfolder(&state, &payload.path).await.map_err(ApiError::bad_request)?;
-    let restart = {
+    let (changed, resolved) = {
         let mut cfg = state.config.write().await;
+        let resolved = match &state.delivery {
+            Some(live) => live.install.resolve(&watch),
+            None => cfg.resolve_path(&watch),
+        };
+        if archive_overlaps(&state, &cfg, &resolved) {
+            return Err(archive_overlap_refusal(&cfg, &resolved));
+        }
         let changed = cfg.watchfolder_path != watch;
         let mut next = cfg.clone();
         next.watchfolder_path = watch.clone();
         next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
         *cfg = next;
-        changed
+        (changed, resolved)
     };
     let _ = state.repo.log_audit(
         "WARN",
         "ADMIN",
         &format!("Watchfolder set to {watch} by {} (settings)", admin.email),
     );
-    Ok(Json(serde_json::json!({ "status": "ok", "restart_required": restart })))
+    let applied = match (&state.delivery, changed) {
+        (_, false) => None,
+        (None, true) => return Ok(Json(serde_json::json!({ "status": "ok", "restart_required": true }))),
+        (Some(live), true) => Some(
+            crate::admin_delivery::apply_watchfolder(&state, live, resolved, watch.clone(), admin.email.clone()).await,
+        ),
+    };
+    Ok(Json(match applied {
+        Some(crate::admin_delivery::Applied::Pending) => serde_json::json!({
+            "status": "ok", "restart_required": false, "pending": true,
+            "message": "Saved. Videos are being made right now: the new watchfolder is used as soon as they have finished. Until then files go to the current one.",
+        }),
+        Some(crate::admin_delivery::Applied::Now { reviewed }) => serde_json::json!({
+            "status": "ok", "restart_required": false, "pending": false, "reviewed": reviewed,
+        }),
+        None => serde_json::json!({ "status": "ok", "restart_required": false, "pending": false }),
+    }))
 }
 
 // ==========================================
@@ -682,16 +735,26 @@ pub async fn api_admin_save_advanced(
     if let Some(list) = &p.mcr_open_networks {
         next.security.mcr_open_networks = clean_cidrs("MCR open networks", list)?;
     }
+    // The archive applies at once in the daemon (P13.2); without one, at the next start.
+    let live_archive = state.delivery.is_some();
     if let Some(on) = p.archive_enabled {
         next.archive.enabled = on;
-        restart |= on != cfg.archive.enabled;
+        restart |= on != cfg.archive.enabled && !live_archive;
     }
     if let Some(days) = p.archive_retention_days {
         if !(1..=3650).contains(&days) {
             return Err(ApiError::bad_request("Archive retention must be between 1 and 3650 days."));
         }
         next.archive.retention_days = days;
-        restart |= days != cfg.archive.retention_days;
+        restart |= days != cfg.archive.retention_days && !live_archive;
+    }
+    // An archive that would contain the watchfolder (or sit inside it) is refused.
+    let watchfolder_now = match &state.delivery {
+        Some(live) => live.paths.watchfolder(),
+        None => next.resolve_path(&next.watchfolder_path),
+    };
+    if next.archive.enabled && (p.archive_enabled.is_some() || p.archive_retention_days.is_some()) && archive_overlaps(&state, &next, &watchfolder_now) {
+        return Err(archive_overlap_refusal(&next, &watchfolder_now));
     }
     if let Some(cert) = &p.tls_cert_path {
         let cert = cert.trim();
@@ -738,6 +801,9 @@ pub async fn api_admin_save_advanced(
         restart = true;
     }
     next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
+    if let (Some(live), true) = (&state.delivery, p.archive_enabled.is_some() || p.archive_retention_days.is_some()) {
+        live.paths.set_archive(Some(live.archive_for(&next.archive, &watchfolder_now)));
+    }
     let saved_proxies = next.security.trusted_proxies.clone();
     *cfg = next;
     drop(cfg);

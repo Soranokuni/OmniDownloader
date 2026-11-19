@@ -337,6 +337,80 @@ fn creation_flags(below_normal: bool) -> u32 {
     }
 }
 
+/// The creation flags of [`spawn_detached`]: no window, no console, and out of
+/// our job object.
+pub const DETACHED_FLAGS: u32 = 0x0800_0000 /* CREATE_NO_WINDOW */
+    | 0x0000_0008 /* DETACHED_PROCESS */
+    | 0x0100_0000 /* CREATE_BREAKAWAY_FROM_JOB */;
+
+/// The command line [`spawn_detached`] passes: each part in double quotes.
+/// A part holding a quote or a control character is refused, so nothing can
+/// be smuggled into the line.
+pub fn detached_command_line(program: &Path, args: &[&str]) -> Result<String> {
+    let mut parts = vec![program.to_string_lossy().into_owned()];
+    parts.extend(args.iter().map(|a| a.to_string()));
+    if let Some(bad) = parts.iter().find(|p| p.is_empty() || p.contains('"') || p.chars().any(char::is_control)) {
+        anyhow::bail!("refusing to start a detached process with the argument {bad:?}");
+    }
+    Ok(parts.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(" "))
+}
+
+/// Start `program` with `args` and do not wait for it: the **one exception** to
+/// [`run`] (P13.2). Only for our own executable's `service restart-self` helper,
+/// which must outlive this process: [`run`] puts every child in a job object
+/// whose close kills it, and the helper's whole job is to start the service
+/// again after this process has stopped.
+///
+/// `program` must be a full path (no search, no shell). The child gets no
+/// window and no console, breaks away from our job object, and inherits no
+/// handle. Returns its process id.
+pub fn spawn_detached(program: &Path, args: &[&str]) -> Result<u32> {
+    if !program.is_absolute() {
+        anyhow::bail!("spawn_detached needs a full path, not {program:?}");
+    }
+    let line = detached_command_line(program, args)?;
+    spawn_detached_os(program, &line)
+}
+
+#[cfg(windows)]
+fn spawn_detached_os(program: &Path, line: &str) -> Result<u32> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let app = wide(&program.to_string_lossy());
+    let mut cmd = wide(line);
+    let startup = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: every pointer is to a live, NUL-terminated buffer or struct of this frame;
+    // `cmd` is mutable as CreateProcessW requires. No handle is inherited.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(app.as_ptr()),
+            PWSTR(cmd.as_mut_ptr()),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(DETACHED_FLAGS),
+            None,
+            PCWSTR::null(),
+            &startup,
+            &mut info,
+        )
+        .context("CreateProcessW failed for the detached helper")?;
+        let _ = CloseHandle(info.hThread);
+        let _ = CloseHandle(info.hProcess);
+    }
+    Ok(info.dwProcessId)
+}
+
+#[cfg(not(windows))]
+fn spawn_detached_os(_program: &Path, _line: &str) -> Result<u32> {
+    anyhow::bail!("a detached helper is started only on Windows")
+}
+
 /// Await a pipe-drain task, abandoning it if an orphan is holding the pipe open.
 async fn join_bounded(
     task: tokio::task::JoinHandle<String>,
@@ -423,6 +497,25 @@ mod win_job {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P13.2: the detached helper's line is the program and its arguments, each
+    /// quoted; a quote, a control character or an empty part is refused, and so
+    /// is a program given without a full path. Nothing is started here.
+    #[test]
+    fn the_detached_helper_gets_a_quoted_line_and_nothing_can_be_smuggled_in() {
+        let exe = Path::new(r"C:\Program Files\OmniIngest\omni-ingest.exe");
+        assert_eq!(
+            detached_command_line(exe, &["service", "restart-self"]).unwrap(),
+            r#""C:\Program Files\OmniIngest\omni-ingest.exe" "service" "restart-self""#
+        );
+        for bad in ["a\" & calc", "line\nbreak", ""] {
+            assert!(detached_command_line(exe, &["service", bad]).is_err(), "{bad:?}");
+        }
+        assert!(spawn_detached(Path::new("omni-ingest.exe"), &["service", "restart-self"]).is_err(), "no search of PATH");
+        assert_eq!(DETACHED_FLAGS & 0x0800_0000, 0x0800_0000, "no window");
+        assert_eq!(DETACHED_FLAGS & 0x0000_0008, 0x0000_0008, "no console");
+        assert_eq!(DETACHED_FLAGS & 0x0100_0000, 0x0100_0000, "out of our job object");
+    }
 
     fn shell() -> &'static Path {
         // `cmd` on Windows, `sh` elsewhere; the tests below only use constructs

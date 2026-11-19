@@ -198,6 +198,8 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
         next: async () => {
           const r = await api('/api/admin/settings/watchfolder', { method: 'POST', body: { path: path.value } });
           if (r.restart_required) S.restart = true;
+          // Jobs were running: the new folder is used once they finish (P13.2).
+          S.watchPending = r.pending ? r.message : '';
           S.cfg.watchfolder_path = path.value.trim();
         },
       };
@@ -400,7 +402,10 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
       })();
       if (S.restart) {
         note.append(el('p', { class: 'note warn' },
-          'Restart required: some settings you changed are read once at start-up. Restart the OmniIngest service (services.msc, or: omni-ingest.exe service stop, then start) for them to take effect.'));
+          'Restart required: the web port, TLS, allowed host names and metrics on/off are read once at start-up. After Finish, use «Επανεκκίνηση υπηρεσίας» on the Setup card (or restart the OmniIngest service in Services).'));
+      }
+      if (S.watchPending) {
+        note.append(el('p', { class: 'note warn' }, S.watchPending));
       }
       return {
         title: 'Check and finish',

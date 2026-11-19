@@ -508,11 +508,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v31_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v32_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=31"), "admin.html does not import admin.js?v=31");
-    assert!(!admin.contains("/static/admin.js?v=30"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=32"), "admin.html does not import admin.js?v=32");
+    assert!(!admin.contains("/static/admin.js?v=31"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -544,6 +544,28 @@ fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
     assert!(code.contains("No finished jobs in this period yet."));
     assert!(code.contains("Queued by MCR from an offer or a skipped link"));
     assert!(!code.contains("innerHTML"));
+}
+
+/// P13.2: the restart button asks in the page (no browser dialog), calls the
+/// restart route through `api()`, and shows the pending watchfolder.
+#[test]
+fn the_restart_button_asks_in_the_page_and_the_pending_watchfolder_is_shown() {
+    let assets = all_assets();
+    let html = assets.get("admin.html").expect("admin.html shipped");
+    for id in ["restart-box", "restart-warn", "restart-btn", "restart-result", "watchfolder-pending"] {
+        assert!(html.contains(&format!(r#"id="{id}""#)), "{id} missing");
+    }
+    assert!(html.contains("Επανεκκίνηση υπηρεσίας"));
+    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    let code: String = js.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    // The restart block runs up to the next section heading of the raw file.
+    let raw = &js[js.find("restart_available").expect("the restart block")..];
+    let raw = &raw[..raw.find("/* ----").expect("the next section")];
+    let block: String = raw.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    assert!(block.contains("api('/api/admin/restart-service'"), "the button calls the route");
+    assert!(block.contains("warn.hidden"), "the first click only asks");
+    assert!(!block.contains("confirm(") && !block.contains("innerHTML"));
+    assert!(code.contains("watchfolder_pending"));
 }
 
 /// P13.3: the wizard is the one setup path. No first-run page ships, and nothing
@@ -603,7 +625,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["5".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["6".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");

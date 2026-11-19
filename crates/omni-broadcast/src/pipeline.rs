@@ -450,6 +450,100 @@ impl Drop for DownloadSlotGuard {
     }
 }
 
+/// Where finished videos go and delivered sources are kept (P13.2): shared by
+/// the engine, the worker loop and the admin panel, and swapped by
+/// [`switch_watchfolder`] (between jobs, never under one) or
+/// [`DeliveryPaths::set_archive`]. Cheap to clone.
+#[derive(Clone)]
+pub struct DeliveryPaths(Arc<std::sync::RwLock<DeliveryTargets>>);
+
+#[derive(Clone, Debug)]
+pub struct DeliveryTargets {
+    pub watchfolder: PathBuf,
+    /// As configured, conflict and all; [`DeliveryPaths::archive_writing`] is
+    /// what the engine keeps sources in.
+    pub archive: Option<omni_core::archive::ArchiveSettings>,
+}
+
+impl DeliveryPaths {
+    pub fn new(watchfolder: PathBuf, archive: Option<omni_core::archive::ArchiveSettings>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(DeliveryTargets { watchfolder, archive })))
+    }
+
+    pub fn current(&self) -> DeliveryTargets {
+        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn watchfolder(&self) -> PathBuf {
+        self.current().watchfolder
+    }
+
+    /// The archive new sources go into: `None` when it is off or overlaps the watchfolder.
+    pub fn archive_writing(&self) -> Option<omni_core::archive::ArchiveSettings> {
+        self.current().archive.filter(|s| s.writes())
+    }
+
+    /// Archive settings take effect at once (P13.2): the next delivered job
+    /// uses them. No video is in the archive's way.
+    pub fn set_archive(&self, archive: Option<omni_core::archive::ArchiveSettings>) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).archive = archive;
+    }
+
+    /// Only through [`switch_watchfolder`], which holds the drained gate.
+    fn set_watchfolder(&self, watchfolder: PathBuf) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).watchfolder = watchfolder;
+    }
+}
+
+/// What [`switch_watchfolder`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchfolderSwitch {
+    /// The new folder is in use; these finished videos that waited for the old
+    /// one went to review as DELIVERY_UNCONFIRMED.
+    Switched { reviewed: Vec<i64> },
+    /// Jobs were still running after the drain: nothing changed.
+    Busy,
+}
+
+/// The message on a video that waited for the old watchfolder (P13.2).
+pub fn waiting_video_review_message(old: &Path, new: &Path) -> String {
+    format!(
+        "The watchfolder was changed from {} to {} while this finished video waited for it; it is not delivered to the new one by itself. Check {} and Dalet, then deliver it with «Δοκιμή ξανά» if it is not there",
+        old.display(),
+        new.display(),
+        old.display()
+    )
+}
+
+/// Point delivery at `new` (P13.2), between jobs: the update gate stops new
+/// leases and waits up to `drain` for every running job to end (as a yt-dlp
+/// swap does). Then, with nothing running, the folder is swapped and every
+/// finished video still waiting for the old folder goes to review as
+/// DELIVERY_UNCONFIRMED: its rename may have landed there. If the drain times
+/// out nothing changes and [`WatchfolderSwitch::Busy`] is returned; the gate
+/// opens again either way.
+pub async fn switch_watchfolder(
+    gate: &omni_core::update_gate::UpdateGate,
+    paths: &DeliveryPaths,
+    repo: &Repository,
+    new: PathBuf,
+    drain: std::time::Duration,
+) -> Result<WatchfolderSwitch> {
+    let old = paths.watchfolder();
+    if same_folder(&old, &new) {
+        return Ok(WatchfolderSwitch::Switched { reviewed: Vec::new() });
+    }
+    let Some(_swap) = gate.begin_swap(drain).await else {
+        return Ok(WatchfolderSwitch::Busy);
+    };
+    let reviewed = repo
+        .review_parked_deliveries(&waiting_video_review_message(&old, &new))
+        .context(ErrorCode::DeliveryFailed.as_str())?;
+    paths.set_watchfolder(new.clone());
+    info!("Watchfolder switched from {old:?} to {new:?}; {} waiting video(s) sent to review", reviewed.len());
+    Ok(WatchfolderSwitch::Switched { reviewed })
+}
+
 #[derive(Clone)]
 pub struct BroadcastEngine {
     repo: Repository,
@@ -458,7 +552,8 @@ pub struct BroadcastEngine {
     ffprobe_path: PathBuf,
     bmxtranswrap_path: PathBuf,
     temp_dir: PathBuf,
-    watchfolder_dir: PathBuf,
+    /// The watchfolder and the archive, swappable between jobs (P13.2).
+    delivery: DeliveryPaths,
     /// Encodes in progress (plan P1.13). Downloading is network-bound and
     /// encoding CPU-bound, so they are counted apart: a job finished
     /// downloading hands back its download slot and waits here, and the
@@ -474,9 +569,6 @@ pub struct BroadcastEngine {
     login_sites: Arc<Mutex<HashMap<i64, String>>>,
     /// The H.264 encoder previews use, found on first use (P10.6).
     preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
-    /// Where a delivered job's source goes instead of the bin (P1.7); `None`
-    /// when the archive is switched off.
-    archive: Option<omni_core::archive::ArchiveSettings>,
     /// Set once the daemon is stopping (P2.15): no job enters DELIVER after
     /// it, so none starts a watchfolder copy the stop would cut.
     stopping: Arc<std::sync::atomic::AtomicBool>,
@@ -575,11 +667,27 @@ impl BroadcastEngine {
         self.watchfolder_state.clone()
     }
 
-    /// Keep delivered sources as `settings` says (plan P1.7).
-    pub fn with_archive(mut self, settings: Option<omni_core::archive::ArchiveSettings>) -> Self {
-        // Only a usable archive is kept: off or overlapping the watchfolder means none.
-        self.archive = settings.filter(|s| s.writes());
+    /// Keep delivered sources as `settings` says (plan P1.7). Only a usable
+    /// archive is written: off or overlapping the watchfolder means none.
+    pub fn with_archive(self, settings: Option<omni_core::archive::ArchiveSettings>) -> Self {
+        self.delivery.set_archive(settings);
         self
+    }
+
+    /// The daemon's shared delivery paths (P13.2), which the admin panel swaps.
+    pub fn with_delivery_paths(mut self, paths: DeliveryPaths) -> Self {
+        self.delivery = paths;
+        self
+    }
+
+    /// The delivery paths this engine reads.
+    pub fn delivery_paths(&self) -> DeliveryPaths {
+        self.delivery.clone()
+    }
+
+    /// The watchfolder now. Read per use: it changes only while no job runs.
+    fn watchfolder_dir(&self) -> PathBuf {
+        self.delivery.watchfolder()
     }
 
     /// At most `n` encodes at once (at least one).
@@ -642,12 +750,11 @@ impl BroadcastEngine {
             ffprobe_path,
             bmxtranswrap_path,
             temp_dir,
-            watchfolder_dir,
+            delivery: DeliveryPaths::new(watchfolder_dir, None),
             encoder_slots: Arc::new(Semaphore::new(DEFAULT_ENCODER_SLOTS)),
             download_slots: Arc::new(Mutex::new(HashMap::new())),
             login_sites: Arc::new(Mutex::new(HashMap::new())),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
-            archive: None,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             watchfolder_state: WatchfolderState::default(),
             waits: Arc::new(Mutex::new(HashMap::new())),
@@ -770,7 +877,7 @@ impl BroadcastEngine {
         slug: &str,
         job_temp: &Path,
     ) -> Result<crate::delivery::Delivered> {
-        match WatchfolderDelivery::deliver_with(source, &self.watchfolder_dir, slug, |to, bytes| {
+        match WatchfolderDelivery::deliver_with(source, &self.watchfolder_dir(), slug, |to, bytes| {
             self.record_delivering(job_id, owner, to, bytes)
         })
         .await
@@ -1022,7 +1129,7 @@ impl BroadcastEngine {
         // the queue for 10 min, three times, and then to review (a clip that
         // needs more room than the volume has fails the same way every run).
         if let Ok(probe) = transcoder.probe_source(&downloaded_file).await {
-            if let Err(why) = room_for(probe.duration_secs, &job_temp, &self.watchfolder_dir) {
+            if let Err(why) = room_for(probe.duration_secs, &job_temp, &self.watchfolder_dir()) {
                 warn!("Job #{job_id}: {why}");
                 let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Transcode), &why);
                 drop(encoder);
@@ -1297,7 +1404,7 @@ impl BroadcastEngine {
     /// plus 64 MiB. Asked off the async threads, for at most 15 s; a volume
     /// that does not answer is not held against the delivery.
     async fn room_in_watchfolder(&self, job_id: i64, slug: &str, bytes: u64) -> Result<()> {
-        let wf = self.watchfolder_dir.clone();
+        let wf = self.watchfolder_dir();
         let asked = tokio::time::timeout(
             omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
             tokio::task::spawn_blocking(move || omni_core::selftest::disk_space(&wf).map(|(free, _)| free)),
@@ -1369,7 +1476,7 @@ impl BroadcastEngine {
         };
         let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
         let folder = Path::new(&path).parent().map(Path::to_path_buf).unwrap_or_default();
-        if !recorded && !same_folder(&folder, &self.watchfolder_dir) {
+        if !recorded && !same_folder(&folder, &self.watchfolder_dir()) {
             // An old folder may be a share that is gone for good: not asked, not waited for.
             return Err(self.needs_check(
                 job_id,
@@ -1400,7 +1507,7 @@ impl BroadcastEngine {
     /// began (`run_started`) and is not in use
     /// ([`crate::delivery::reclaim_own_staging`]). Off the async threads.
     async fn reclaim_own_staging(&self, job_id: i64, slug: &str, run_started: std::time::SystemTime) {
-        let (dir, name) = (self.watchfolder_dir.clone(), format!("{slug}.mxf"));
+        let (dir, name) = (self.watchfolder_dir(), format!("{slug}.mxf"));
         let ran = tokio::time::timeout(
             omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
             tokio::task::spawn_blocking(move || crate::delivery::reclaim_own_staging(&dir, &name, run_started)),
@@ -1929,7 +2036,7 @@ impl BroadcastEngine {
     /// delivery: a failed archive is a warning and an `ARCHIVE_FAILED` event,
     /// and the cleanup runs regardless. On a lost lease nothing is written.
     pub async fn archive_then_clean(&self, job_id: i64, owner: &str, source: Option<&Path>, job_temp: &Path, delivered_filename: &str) {
-        if let (Some(settings), Some(source)) = (self.archive.clone(), source) {
+        if let (Some(settings), Some(source)) = (self.delivery.archive_writing(), source) {
             match self.repo.set_stage(job_id, owner, JobStage::Archive) {
                 Ok(true) => {
                     let outcome = match self.repo.get_job(job_id) {

@@ -206,9 +206,11 @@ Which settings apply at once and which wait for a restart of the service:
 
 | Applies at once | Needs a restart |
 |---|---|
-| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks, mailbox settings (used from the next mail check) | watchfolder, web port, TLS, allowed hosts, metrics on/off, archive |
+| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks, mailbox settings (used from the next mail check), archive on/off and days, watchfolder (between videos, below) | web port, TLS, allowed hosts, metrics on/off |
 
-The wizard tells you after each save, and again on the last screen, when a restart is needed.
+The wizard tells you after each save, and again on the last screen, when a restart is needed. The **Setup** card then has **Επανεκκίνηση υπηρεσίας**: the first click says what happens, the second restarts the service (the graceful stop: videos being copied into the watchfolder finish first), and the page reloads when the service answers again, usually within a minute. The button is there only when the program runs as the Windows service. Setup allows the service's own account to stop and start its service, and nothing else; a service registered by an older version gets this right at the next upgrade.
+
+**A new watchfolder** is never switched under a video. On save the queue stops taking new videos and waits for the running ones to finish (at most 10 minutes); then the new folder is used. If videos are still running after that, the save answers that the change is pending, the Setup card shows "New watchfolder pending", files keep going to the current folder, and the change is tried again every 5 minutes until it applies. Finished videos that were waiting for the old folder (because it did not answer) go to review as `DELIVERY_UNCONFIRMED`: they are never delivered to the new folder on their own, because an earlier copy may have reached the old one; check it and Dalet, then «Δοκιμή ξανά». From then on only the new folder is watched and written. A watchfolder inside the archive folder (or containing it) is refused.
 
 **Leaving early.** On every screen after the account step, **Open the admin panel** leaves the wizard for this browser session without completing setup; the Setup card then says "Setup not finished", and the wizard returns at the next sign-in.
 
@@ -718,7 +720,7 @@ Prometheus handles as a counter reset.
 
 | Card | Use |
 |---|---|
-| **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b) |
+| **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b); a pending watchfolder; **Επανεκκίνηση υπηρεσίας** |
 | **Download engine** | yt-dlp version, update now, roll back |
 | **Toolchain** | install or repair ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno |
 | **Credentials** | set or clear the secrets above |

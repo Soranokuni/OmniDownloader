@@ -111,6 +111,7 @@ impl WebServer {
             .route("/api/admin/settings/advanced", post(admin_settings::api_admin_save_advanced))
             .route("/api/admin/settings/complete", post(admin_settings::api_admin_complete_setup))
             .route("/api/admin/settings/answer-file", get(admin_settings::api_admin_answer_file))
+            .route("/api/admin/restart-service", post(crate::admin_delivery::api_admin_restart_service))
             .route("/api/admin/tools", get(admin_tools::api_admin_tools))
             .route("/api/admin/tools/:name/install", post(admin_tools::api_admin_tool_install))
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))

@@ -34,6 +34,13 @@
       <p class="note" id="setup-state" style="margin-bottom:10px">Checking…</p>
       <button class="btn btn-block" type="button" id="setup-rerun">Run setup wizard again</button>
       <p class="note" style="margin-top:8px">Walks through the administrator account (only while the first-run account exists), watchfolder, mail and, in the other modes, network, TLS and metrics.</p>
+      <p class="note warn" id="watchfolder-pending" hidden></p>
+      <div id="restart-box" hidden style="margin-top:12px">
+        <p class="note">The watchfolder, the mailbox and the archive take effect without a restart. The web port, TLS, allowed host names and metrics on/off need one.</p>
+        <p class="note warn" id="restart-warn" hidden>While the service restarts (about a minute) nothing is downloaded and the panels do not answer. Videos being copied into the watchfolder finish first.</p>
+        <button class="btn btn-block" type="button" id="restart-btn">Επανεκκίνηση υπηρεσίας</button>
+        <p class="note" id="restart-result" role="status"></p>
+      </div>
     </section>
     <section class="card">
       <h2 class="card-title">Download engine</h2>
@@ -681,6 +688,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=31"></script>
+<script type="module" src="/static/admin.js?v=32"></script>
 </body>
 </html>

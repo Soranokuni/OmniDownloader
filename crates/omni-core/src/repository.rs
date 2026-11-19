@@ -1506,6 +1506,54 @@ impl Repository {
         Ok(true)
     }
 
+    /// The watchfolder is being changed (P13.2) with no job running: every
+    /// finished video still queued to wait for the old folder goes to review as
+    /// DELIVERY_UNCONFIRMED with `message`, as [`Self::review_waiting_delivery`]
+    /// does for one (event, audit row, the P10.16b note); its file, marker and
+    /// wait are kept, and nothing is delivered to the new folder on its own.
+    /// Returns the jobs moved.
+    pub fn review_parked_deliveries(&self, message: &str) -> Result<Vec<i64>> {
+        let mut conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM queue WHERE delivery_wait = 1 AND status = 'PENDING' ORDER BY id")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut moved = Vec::new();
+        for id in ids {
+            let n = tx.execute(
+                "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+                 error_code='DELIVERY_UNCONFIRMED', first_error_code = COALESCE(first_error_code, 'DELIVERY_UNCONFIRMED'),
+                 error_message=?, completed_at=?, updated_at=?
+                 WHERE id=? AND status='PENDING' AND delivery_wait = 1",
+                params![message, now, now, id],
+            )?;
+            if n != 1 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
+                params![id, now, message],
+            )?;
+            tx.execute(
+                "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+                params![format!("Job {id}: {message}"), now],
+            )?;
+            Self::close_waiting_auto_delivery(&tx, id, &now)?;
+            moved.push(id);
+        }
+        tx.commit()?;
+        for id in &moved {
+            count_finished(JobStatus::RequiresReview);
+            if let Some(bus) = &self.events {
+                bus.job(*id, JobStatus::RequiresReview.as_str(), None, None);
+            }
+        }
+        Ok(moved)
+    }
+
     /// A waiting job leaves the wait without a proven delivery (P11.2b): to
     /// review as DELIVERY_UNCONFIRMED, cancelled, retried, or after an internal
     /// error. When its latest repair attempt is still `auto_delivering` (a

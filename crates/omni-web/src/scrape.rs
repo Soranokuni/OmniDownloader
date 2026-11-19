@@ -57,7 +57,14 @@ pub async fn api_metrics(State(state): State<AppState>, req: Request) -> Respons
         Ok(j) => j,
         Err(e) => return internal_error("metrics")(e).into_response(),
     };
-    let sources = state.metrics_sources.clone();
+    // The watchfolder in use now (P13.2: the panel can change it without a restart).
+    let sources = state.metrics_sources.as_deref().map(|s| {
+        let mut s = s.clone();
+        if let Some(live) = &state.delivery {
+            s.watchfolder = live.paths.watchfolder();
+        }
+        std::sync::Arc::new(s)
+    });
     // Disk space asks the volume (a share can be slow), so not on the async threads.
     let disks = tokio::task::spawn_blocking(move || disk_free(sources.as_deref()))
         .await

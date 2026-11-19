@@ -290,6 +290,51 @@ enum ServiceAction {
     Start,
     Stop,
     Status,
+    /// Started by the service itself for the admin panel's restart (P13.2): wait
+    /// until the service has stopped, then start it again.
+    #[command(hide = true)]
+    RestartSelf,
+}
+
+/// The admin panel's service restart (P13.2): a detached `service restart-self`
+/// helper (the one process not started through `process::run`, see
+/// `omni_core::process::spawn_detached`), then a stop through the SCM, which
+/// runs the graceful stop of P2.15.
+struct ServiceRestart {
+    exe: PathBuf,
+}
+
+impl omni_web::admin_delivery::ServiceRestarter for ServiceRestart {
+    fn begin(&self) -> std::result::Result<(), String> {
+        omni_core::process::spawn_detached(&self.exe, &RESTART_SELF_ARGS).map(|_| ()).map_err(|e| format!("{e:#}"))
+    }
+    fn stop(&self) -> std::result::Result<(), String> {
+        omni_service::stop_service().map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// The helper's command line after the executable.
+const RESTART_SELF_ARGS: [&str; 2] = ["service", "restart-self"];
+
+/// How long `service restart-self` waits for the service to stop (P13.2). The
+/// stop waits for deliveries already copying (P2.15), which are short.
+const RESTART_SELF_WAIT: Duration = Duration::from_secs(180);
+
+/// `omni-ingest service restart-self` (P13.2): start the service again once it
+/// has stopped. A failure goes to the Event Log and the audit log, where an
+/// administrator looks when the panel does not come back.
+fn restart_self(paths: &AppPaths) -> Result<()> {
+    let Err(e) = omni_service::start_service_after_stop(RESTART_SELF_WAIT) else {
+        return Ok(());
+    };
+    let line = format!("The restart asked for in the admin panel did not start the service again: {e:#}. Start it with `omni-ingest service start` or in Services.");
+    omni_service::eventlog::report(omni_service::eventlog::EventLevel::Error, &line);
+    if let Ok(config) = AppConfig::load_from_file(&paths.config) {
+        if let Ok(repo) = Repository::new(paths.resolve(&config.database_path)) {
+            let _ = repo.log_audit("ERROR", "SYSTEM", &line);
+        }
+    }
+    Err(e)
 }
 
 /// Set up logging for whichever subcommand is running.
@@ -854,8 +899,10 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Install { .. } | Commands::Uninstall { .. }) => unreachable!("handled before paths"),
+        Some(Commands::Service { action: ServiceAction::RestartSelf }) => restart_self(&paths)?,
         Some(Commands::Service { action }) => {
             let sub = match action {
+                ServiceAction::RestartSelf => unreachable!("handled above"),
                 ServiceAction::Install { account } => {
                     // The config gives the watchfolder (can the account reach
                     // it?) and the folders that need rights.
@@ -1341,6 +1388,8 @@ async fn run_daemon(
     // Whether the watchfolder answers (P11.2a): the start-up probe sets it, the
     // share watch and every delivery keep it current, the worker loop reads it.
     let watchfolder_state = omni_core::selftest::WatchfolderState::default();
+    // The watchfolder and the archive, which the admin panel swaps between jobs (P13.2).
+    let delivery_paths = omni_broadcast::pipeline::DeliveryPaths::new(watchfolder_path.clone(), Some(archive_settings.clone()));
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdl_path.clone(),
@@ -1351,7 +1400,7 @@ async fn run_daemon(
         watchfolder_path.clone(),
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
-    .with_archive(Some(archive_settings.clone()))
+    .with_delivery_paths(delivery_paths.clone())
     .with_watchfolder_state(watchfolder_state.clone())
     .with_retry_max_age(config.retry.max_age_mins)
     // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,
@@ -1522,6 +1571,7 @@ async fn run_daemon(
         .with_health(health.clone())
         .with_llm(live_llm.clone())
         .with_mail(live_mail.clone())
+        .with_delivery(omni_web::admin_delivery::LiveDelivery::new(delivery_paths.clone(), paths.clone()))
         .with_busy_jobs(busy_jobs.clone())
         .with_update_gate(update_gate.clone())
         .with_tool_dirs(bin_dir.clone(), tools_missing_at_start)
@@ -1532,6 +1582,13 @@ async fn run_daemon(
         .with_events(events.clone());
     if let Some(r) = &log_redactions {
         web_state = web_state.with_redactions(r.clone());
+    }
+    // «Επανεκκίνηση υπηρεσίας» (P13.2) only when this is the Windows service.
+    if service_shutdown_rx.is_some() {
+        match std::env::current_exe() {
+            Ok(exe) => web_state = web_state.with_restarter(Arc::new(ServiceRestart { exe })),
+            Err(e) => warn!("The admin panel's restart is off: this program's path is unknown ({e})"),
+        }
     }
     if let Some(handle) = metrics_handle {
         web_state = web_state.with_metrics(
@@ -1639,7 +1696,7 @@ async fn run_daemon(
             adblock_enabled: config.adblock_auto_update_nightly,
             gate: update_gate.clone(),
             retention_days: config.retention_days.max(1),
-            archive: Some(archive_settings.clone()),
+            archive: delivery_paths.clone(),
             mail_text_retention_days: config.mail_text_retention_days.max(1),
             health: health.clone(),
             canary: canary_env.clone(),
@@ -1773,7 +1830,9 @@ async fn run_daemon(
     // look that does not answer in 15 s counts as not reachable; one still
     // hanging is not started twice.
     {
-        let (state, wf_health, wf) = (watchfolder_state.clone(), health.clone(), watchfolder_path.clone());
+        // The folder in use at each look: a watchfolder changed from the panel (P13.2) is
+        // the one watched from the next tick, and the old one is never looked at again.
+        let (state, wf_health, wf_paths) = (watchfolder_state.clone(), health.clone(), delivery_paths.clone());
         let mut watch_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use omni_core::selftest::ShareCheck;
@@ -1784,6 +1843,7 @@ async fn run_daemon(
                 tokio::select! {
                     _ = watch_rx.recv() => break,
                     _ = tick.tick() => {
+                        let wf = wf_paths.watchfolder();
                         let (check, mut running) = match probe.take() {
                             Some((check, p)) if !p.is_finished() => (check, p),
                             _ => {
@@ -1840,10 +1900,11 @@ async fn run_daemon(
     let worker_gate = update_gate.clone();
     let worker_encoder_ok = encoder_ok.clone();
     let worker_health = health.clone();
-    let worker_watchfolder = watchfolder_path.clone();
+    // Read again for every lease: the panel may have changed them (P13.2).
+    let worker_delivery = delivery_paths.clone();
     let worker_watchfolder_state = watchfolder_state.clone();
     let worker_temp = temp_path.clone();
-    let worker_archive = archive_settings.clone();
+    let worker_archive_at_start = archive_settings.clone();
     // The LLM rung of the repair ladder (P10.12): both the switch and a model name,
     // never the mail model. Endpoint, key and auth are the `llm` section's.
     let repair_llm_cfg = repair::LlmCfg {
@@ -1929,6 +1990,9 @@ async fn run_daemon(
             // are the same, the oldest archived days go first (P1.7): a kept
             // source must never be the reason a newsroom job waits. Runs with
             // the archive switched off too, so old archives still give way.
+            let delivery_now = worker_delivery.current();
+            let worker_watchfolder = delivery_now.watchfolder;
+            let worker_archive = delivery_now.archive.unwrap_or_else(|| worker_archive_at_start.clone());
             if worker_archive.purges() {
                 let (a, temp) = (worker_archive.clone(), worker_temp.clone());
                 let low = (omni_core::selftest::LOW_DISK_GB * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -2634,7 +2698,8 @@ struct MaintenanceContext {
     adblock_enabled: bool,
     gate: UpdateGate,
     retention_days: i64,
-    archive: Option<omni_core::archive::ArchiveSettings>,
+    /// The archive's settings now (P13.2: the panel changes them without a restart).
+    archive: omni_broadcast::pipeline::DeliveryPaths,
     mail_text_retention_days: i64,
     evidence_days: i64,
     evidence_max_bytes: u64,
@@ -2937,7 +3002,7 @@ async fn run_one_task(
             }
             // Delivered sources past their days (P1.7), by the date in the
             // directory name.
-            if let Some(a) = ctx.archive.clone().filter(|a| a.purges()) {
+            if let Some(a) = ctx.archive.current().archive.filter(|a| a.purges()) {
                 let today = chrono::Local::now().date_naive();
                 match tokio::task::spawn_blocking(move || omni_core::archive::purge_expired(&a.root, today, a.retention_days)).await {
                     Ok(n) if n > 0 => info!("Retention: removed {n} expired archive day(s)"),

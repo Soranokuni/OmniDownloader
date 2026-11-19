@@ -645,6 +645,9 @@ const MATRIX: &[Row] = &[
     ("POST", "/api/admin/settings/mail", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("POST", "/api/admin/settings/advanced", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("POST", "/api/admin/settings/complete", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // «Επανεκκίνηση υπηρεσίας» (P13.2): admin only. The harness has no service, so the
+    // admin gets 409 NOT_A_SERVICE, which is reaching it.
+    ("POST", "/api/admin/restart-service", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     // ---- Admin ----
     (
         "GET",

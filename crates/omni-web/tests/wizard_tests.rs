@@ -349,6 +349,148 @@ async fn a_secret_set_on_the_credentials_card_reaches_the_running_watcher() -> R
     Ok(())
 }
 
+// ---- P13.2: everyday settings without a restart ----
+
+/// The wizard harness with the daemon's live delivery paths: the watchfolder starts
+/// at `<dir>/old-watch`, the archive at `<dir>/arch`.
+fn live_app(timing: (u64, u64, u64)) -> Result<(App, omni_web::admin_delivery::LiveDelivery)> {
+    let base = app(false)?;
+    let install = omni_core::paths::AppPaths::with_root(base.dir.path(), "config.json");
+    let mut archive_cfg = AppConfig::default().archive;
+    archive_cfg.path = base.dir.path().join("arch").to_string_lossy().into_owned();
+    let old = base.dir.path().join("old-watch");
+    let archive = omni_core::archive::ArchiveSettings::from_config(&archive_cfg, &install, &old);
+    let ms = std::time::Duration::from_millis;
+    let live = omni_web::admin_delivery::LiveDelivery::new(omni_broadcast::pipeline::DeliveryPaths::new(old, Some(archive)), install)
+        .with_timing(ms(timing.0), ms(timing.1), ms(timing.2));
+    let state = base.state.clone().with_delivery(live.clone());
+    {
+        let mut cfg = state.config.try_write().unwrap();
+        cfg.archive = archive_cfg;
+    }
+    Ok((App { router: WebServer::build_router(state.clone()), repo: base.repo.clone(), state, dir: base.dir }, live))
+}
+
+#[tokio::test]
+async fn a_new_watchfolder_is_used_at_once_when_no_job_runs() -> Result<()> {
+    let (app, live) = live_app((5_000, 100, 5_000))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let new = app.dir.path().join("new-watch");
+    let r = send(&app, "POST", "/api/admin/settings/watchfolder", Some(&tok), Some(json!({"path": new.to_string_lossy()}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!((r.json()["restart_required"].as_bool(), r.json()["pending"].as_bool()), (Some(false), Some(false)), "{}", r.body);
+    assert_eq!(live.paths.watchfolder(), new);
+    let g = send(&app, "GET", "/api/admin/settings", Some(&tok), None).await;
+    assert_eq!(g.json()["watchfolder_in_use"], new.to_string_lossy().as_ref());
+    assert!(g.json()["watchfolder_pending"].is_null(), "{}", g.body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn while_a_job_runs_the_new_watchfolder_waits_and_applies_when_it_ends() -> Result<()> {
+    let (app, live) = live_app((100, 100, 400))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let old = live.paths.watchfolder();
+    let new = app.dir.path().join("new-watch");
+    let running = app.state.update_gate.try_enter().expect("a job holds a pass");
+
+    let r = send(&app, "POST", "/api/admin/settings/watchfolder", Some(&tok), Some(json!({"path": new.to_string_lossy()}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!((r.json()["restart_required"].as_bool(), r.json()["pending"].as_bool()), (Some(false), Some(true)), "{}", r.body);
+    assert_eq!(live.paths.watchfolder(), old, "not under a running job");
+    let g = send(&app, "GET", "/api/admin/settings", Some(&tok), None).await;
+    assert_eq!(g.json()["watchfolder_pending"]["path"], new.to_string_lossy().as_ref(), "{}", g.body);
+    assert_eq!(g.json()["watchfolder_path"], new.to_string_lossy().as_ref(), "saved for the next start too");
+
+    drop(running);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while live.paths.watchfolder() != new && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(live.paths.watchfolder(), new, "applied once the job ended");
+    assert!(live.pending().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_watchfolder_inside_the_archive_is_refused() -> Result<()> {
+    let (app, live) = live_app((5_000, 100, 5_000))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let before = app.state.config.read().await.watchfolder_path.clone();
+    let inside = app.dir.path().join("arch").join("wf");
+    let r = send(&app, "POST", "/api/admin/settings/watchfolder", Some(&tok), Some(json!({"path": inside.to_string_lossy()}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("archive.path"), "{}", r.body);
+    assert_eq!(app.state.config.read().await.watchfolder_path, before, "nothing saved");
+    assert_eq!(live.paths.watchfolder(), app.dir.path().join("old-watch"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn archive_settings_apply_at_once() -> Result<()> {
+    let (app, live) = live_app((5_000, 100, 5_000))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    assert!(live.paths.archive_writing().is_some());
+    let r = send(&app, "POST", "/api/admin/settings/advanced", Some(&tok), Some(json!({"archive_enabled": false, "archive_retention_days": 30}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["restart_required"], false);
+    assert!(live.paths.archive_writing().is_none(), "the next delivered job keeps no source");
+    assert_eq!(live.paths.current().archive.unwrap().retention_days, 30);
+    // A start-up setting still needs the restart.
+    let r = send(&app, "POST", "/api/admin/settings/advanced", Some(&tok), Some(json!({"web_port": 8444}))).await;
+    assert_eq!(r.json()["restart_required"], true);
+    Ok(())
+}
+
+/// Counts the restart's two steps; `begin` fails when asked to.
+struct FakeRestart {
+    begun: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_begin: bool,
+}
+
+impl omni_web::admin_delivery::ServiceRestarter for FakeRestart {
+    fn begin(&self) -> Result<(), String> {
+        self.begun.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_begin { Err("helper refused (test)".into()) } else { Ok(()) }
+    }
+    fn stop(&self) -> Result<(), String> {
+        self.stopped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_restart_button_starts_the_helper_first_then_stops_and_is_audited() -> Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let base = app(false)?;
+    let tok = session_for(&base, "it@newsroom.local");
+    // A console run has no service to restart.
+    let r = send(&base, "POST", "/api/admin/restart-service", Some(&tok), Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+
+    for fail_begin in [true, false] {
+        let (begun, stopped): (std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicUsize>) =
+            (Default::default(), Default::default());
+        let fake = FakeRestart { begun: begun.clone(), stopped: stopped.clone(), fail_begin };
+        let state = base.state.clone().with_restarter(std::sync::Arc::new(fake));
+        let app = App { router: WebServer::build_router(state.clone()), repo: base.repo.clone(), state, dir: TempDir::new()? };
+        let r = send(&app, "POST", "/api/admin/restart-service", Some(&tok), Some(json!({}))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(begun.load(SeqCst), 1);
+        if fail_begin {
+            assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", r.body);
+            assert_eq!(stopped.load(SeqCst), 0, "no helper, no stop: the service is never left stopped");
+        } else {
+            assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+            assert_eq!(stopped.load(SeqCst), 1);
+            let audit: Vec<String> = base.repo.get_recent_audit_logs(50)?.into_iter().map(|a| a.message).collect();
+            assert!(audit.iter().any(|m| m == "Service restart requested by it@newsroom.local"), "{audit:?}");
+        }
+    }
+    Ok(())
+}
+
 // ---- advanced, complete, answer file ----
 
 #[tokio::test]
