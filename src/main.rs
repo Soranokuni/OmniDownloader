@@ -1339,7 +1339,9 @@ async fn run_daemon(
     .with_retry_max_age(config.retry.max_age_mins)
     // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,
     // the canaries, the self-check and the benchmark take turns at a platform.
-    .with_pacing(config.pacing.per_host_concurrency, config.pacing.min_gap_secs));
+    .with_pacing(config.pacing.per_host_concurrency, config.pacing.min_gap_secs)
+    // A source that failed probe, encode, wrap or the gate gets one more way in (P11.6).
+    .with_second_route(true));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -1829,7 +1831,10 @@ async fn run_daemon(
     if config.repair.llm_enabled && repair_llm_cfg.model.is_none() {
         warn!("repair.llm_enabled is on but repair.llm_model is not set: the repair model rung stays off");
     }
-    let mut repair_env = repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
+    // The ladder's candidates do not take the second route (P11.6): the ladder has its own
+    // budget and its own next candidate. A clone shares every slot, the pacer and the stop flag.
+    let ladder_engine = Arc::new((*broadcast_engine).clone().with_second_route(false));
+    let mut repair_env = repair::RealEnv::new(ladder_engine, repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
     if let (true, Some(model)) = (repair_llm_cfg.active(), repair_llm_cfg.model.as_deref()) {
         let client_cfg = omni_core::config::LlmConfig { timeout_secs: repair_llm_cfg.timeout.as_secs(), ..config.llm.clone() };
         let client = omni_email::llm::LlmClient::from_settings(&config.ollama_endpoint, model, &client_cfg)

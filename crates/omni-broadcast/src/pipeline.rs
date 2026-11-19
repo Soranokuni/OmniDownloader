@@ -13,7 +13,7 @@ use omni_core::repository::{HeldOutput, Repository};
 use crate::delivery::{DeliveryError, LeaseLostBeforeRename, WatchfolderDelivery};
 use omni_core::repository::MarkerCheck;
 use omni_core::selftest::WatchfolderState;
-use crate::downloader::{DownloadError, DownloadOpts, Downloader};
+use crate::downloader::{DownloadError, DownloadOpts, Downloader, FormatRoute};
 use crate::errors::ErrorCode;
 use crate::preview::{self, PreviewEncoder};
 use crate::rewrapper::Rewrapper;
@@ -165,6 +165,15 @@ fn unreachable_cause(e: &anyhow::Error) -> Option<String> {
         Some(DeliveryError::Unreachable(cause)) => Some(cause.clone()),
         _ => None,
     }
+}
+
+/// What a job's download is sent with besides its link: the sniffed page's
+/// referer, user agent and cookie header, when there are any.
+#[derive(Clone, Copy, Default)]
+struct SourceContext<'a> {
+    referer: Option<&'a str>,
+    user_agent: Option<&'a str>,
+    cookies: Option<&'a str>,
 }
 
 fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
@@ -492,6 +501,10 @@ pub struct BroadcastEngine {
     /// Every yt-dlp run on a video platform waits here for its turn (P11.4);
     /// shared by clones, the repair ladder, the canaries and the self-check.
     pacer: crate::pacing::HostPacer,
+    /// Whether a source that failed probe, encode, wrap or the gate takes the
+    /// second route before review (P11.6, [`crate::second_route`]). Off unless
+    /// the daemon turns it on for its workers.
+    second_route: bool,
 }
 
 /// `retry.max_age_mins` when the daemon sets none: the owner's two hours.
@@ -653,7 +666,15 @@ impl BroadcastEngine {
             waits: Arc::new(Mutex::new(HashMap::new())),
             retry_max_age: chrono::Duration::minutes(DEFAULT_RETRY_MAX_AGE_MINS),
             pacer: crate::pacing::HostPacer::default(),
+            second_route: false,
         }
+    }
+
+    /// Give a source that failed probe, encode, wrap or the gate its second
+    /// route before review (P11.6), once per job.
+    pub fn with_second_route(mut self, on: bool) -> Self {
+        self.second_route = on;
+        self
     }
 
     /// The daemon is stopping: a job reaching DELIVER from now on waits just before it
@@ -901,38 +922,14 @@ impl BroadcastEngine {
                 Some(JobStage::Download),
                 "Source is the file attached to the email; nothing to download",
             );
-            return self.finish_from_source(job, owner, source, job_temp, cancel, delivery).await;
+            let first = self.finish_from_source(job.clone(), owner, source, job_temp.clone(), cancel.clone(), delivery).await;
+            let context = SourceContext { referer, user_agent, cookies };
+            return self.or_second_route(first, job, owner, context, cancel, delivery, job_temp).await;
         }
 
         // 1. Download stage
-        let downloader = self.downloader_for(job_id, JobStage::Download);
-        let repo_clone = self.repo.clone();
-        // The site's cookie jar (P3.5), a file in this job's workspace for the
-        // length of the download only: the guard removes it on every way out.
-        let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
-        let jar_urls: Vec<&str> = std::iter::once(url.as_str()).chain(login_site.as_deref()).collect();
-        let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, &job_temp, false);
-        let raw_download_res = downloader
-            .download(
-                job_id,
-                &url,
-                &job_temp,
-                DownloadOpts {
-                    referer,
-                    user_agent,
-                    cookie_header: cookies,
-                    cookie_jar: cookie_file.as_ref().map(|f| f.path()),
-                    cookie_values: cookie_file.as_ref().map(|f| f.values()).unwrap_or(&[]),
-                    cancel: cancel.clone(),
-                    ..Default::default()
-                },
-                {
-                    let mut write = progress_writer(repo_clone, job_id);
-                    move |prog| write(prog.percent, &prog.speed, &prog.eta)
-                },
-            )
-            .await;
-        drop(cookie_file);
+        let raw_download_res =
+            self.download_source(job_id, &url, &job_temp, SourceContext { referer, user_agent, cookies }, &cancel, FormatRoute::Usual).await;
 
         let downloaded_file = match raw_download_res {
             Ok(path) => path,
@@ -956,7 +953,177 @@ impl BroadcastEngine {
             }
         };
 
-        self.finish_from_source(job, owner, downloaded_file, job_temp, cancel, delivery).await
+        let first = self.finish_from_source(job.clone(), owner, downloaded_file, job_temp.clone(), cancel.clone(), delivery).await;
+        self.or_second_route(first, job, owner, SourceContext { referer, user_agent, cookies }, cancel, delivery, job_temp).await
+    }
+
+    /// Download job `job_id`'s link `url` into its workspace with `formats`.
+    /// The site's cookie jar (P3.5) is a file in the workspace for the length
+    /// of the download only: the guard removes it on every way out.
+    async fn download_source(
+        &self,
+        job_id: i64,
+        url: &str,
+        job_temp: &Path,
+        context: SourceContext<'_>,
+        cancel: &Option<CancellationToken>,
+        formats: FormatRoute,
+    ) -> Result<PathBuf> {
+        let downloader = self.downloader_for(job_id, JobStage::Download);
+        let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
+        let jar_urls: Vec<&str> = std::iter::once(url).chain(login_site.as_deref()).collect();
+        let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, job_temp, false);
+        let downloaded = downloader
+            .download(
+                job_id,
+                url,
+                job_temp,
+                DownloadOpts {
+                    referer: context.referer,
+                    user_agent: context.user_agent,
+                    cookie_header: context.cookies,
+                    cookie_jar: cookie_file.as_ref().map(|f| f.path()),
+                    cookie_values: cookie_file.as_ref().map(|f| f.values()).unwrap_or(&[]),
+                    cancel: cancel.clone(),
+                    formats,
+                    ..Default::default()
+                },
+                {
+                    let mut write = progress_writer(self.repo.clone(), job_id);
+                    move |prog| write(prog.percent, &prog.speed, &prog.eta)
+                },
+            )
+            .await;
+        drop(cookie_file);
+        downloaded
+    }
+
+    /// The first route's result, or, for a source that could not be made into
+    /// a compliant file (PROBE_FAILED, TRANSCODE_FAILED, REWRAP_FAILED,
+    /// COMPLIANCE_FAILED), the second route's (P11.6, [`crate::second_route`]):
+    /// the link downloaded again with other formats (an attachment: its file
+    /// as it is), copied into a clean container, then the usual encode, wrap,
+    /// gate and delivery. Once per job, recorded on the row before anything
+    /// runs, so a restart or a retry does not take it again; with the engine's
+    /// second route off, or the job's taken, the first failure stands.
+    ///
+    /// When the second route fails at the download, the remux, or the same
+    /// kind of stage (its own source failure), the job ends with its first
+    /// failure; any other ending of the second run (delivered, held, waiting
+    /// for the watchfolder, a full disk, a lost lease) is the job's ending.
+    async fn or_second_route(
+        &self,
+        first: Result<RunOutcome>,
+        job: Job,
+        owner: &str,
+        context: SourceContext<'_>,
+        cancel: Option<CancellationToken>,
+        delivery: DeliveryMode,
+        job_temp: PathBuf,
+    ) -> Result<RunOutcome> {
+        let first_err = match first {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => e,
+        };
+        // A stopping daemon starts no new download or remux and does not use up the job's one
+        // second route; the first failure stands, as before the second route existed.
+        if !self.second_route || first_err.downcast_ref::<LeaseLost>().is_some() || is_cancelled(&cancel) || self.is_stopping() {
+            return Err(first_err);
+        }
+        let Some(code) = crate::second_route::applies(&first_err) else {
+            return Err(first_err);
+        };
+        let job_id = job.id;
+        match self.repo.claim_second_route(job_id, owner) {
+            Ok(true) => {}
+            Ok(false) if !self.repo.owns_lease(job_id, owner).unwrap_or(true) => {
+                return Err(self.lost(job_id, JobStage::Download, &job_temp).await);
+            }
+            // Taken already, by an earlier run of this job.
+            Ok(false) => return Err(first_err),
+            Err(e) => {
+                warn!("Job #{job_id}: could not record the second route, so it is not taken: {e:#}");
+                return Err(first_err);
+            }
+        }
+
+        let attachment = job.url.starts_with("attachment://");
+        let line = if attachment {
+            format!("{code}: second route: the attached file is copied into a clean container and made again")
+        } else {
+            format!("{code}: second route: downloading again with other formats, copied into a clean container and made again")
+        };
+        info!("Job #{job_id}: {line}");
+        let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Download), &line);
+
+        let source = match self.second_source(&job, owner, context, &cancel, &job_temp, attachment).await {
+            Ok(source) => source,
+            Err(e) if e.downcast_ref::<LeaseLost>().is_some() => return Err(e),
+            Err(_) if is_cancelled(&cancel) => return Err(self.lost(job_id, JobStage::Download, &job_temp).await),
+            Err(e) => {
+                let why = format!("The second route did not help: {e:#}");
+                warn!("Job #{job_id}: {why}");
+                let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Download), &why);
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+                return Err(first_err);
+            }
+        };
+
+        match self.finish_from_source(job, owner, source, job_temp, cancel, delivery).await {
+            Ok(outcome) => {
+                let _ = self.repo.record_event(job_id, "INFO", None, "The second route made a compliant file");
+                Ok(outcome)
+            }
+            Err(e) if e.downcast_ref::<LeaseLost>().is_none() && crate::second_route::applies(&e).is_some() => {
+                let why = format!("The second route did not help either ({}); the first failure stands", crate::second_route::applies(&e).map_or("", |c| c.as_str()));
+                warn!("Job #{job_id}: {why}");
+                let _ = self.repo.record_event(job_id, "WARN", None, &why);
+                Err(first_err)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The second route's source in `job_temp` (P11.6): the link downloaded
+    /// again with the second route's formats (an attachment's file as it is),
+    /// copied into a clean container. A downloaded file is removed once
+    /// copied; an attachment is never touched.
+    async fn second_source(
+        &self,
+        job: &Job,
+        owner: &str,
+        context: SourceContext<'_>,
+        cancel: &Option<CancellationToken>,
+        job_temp: &Path,
+        attachment: bool,
+    ) -> Result<PathBuf> {
+        let job_id = job.id;
+        tokio::fs::create_dir_all(job_temp)
+            .await
+            .with_context(|| format!("Failed creating the workspace for job #{job_id} at {job_temp:?}"))
+            .context(ErrorCode::PipelineFailed.as_str())?;
+        let (source, downloaded) = if attachment {
+            let source = job.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file());
+            let source = source.context("the attached file is not on disk any more").context(ErrorCode::ManualDownload.as_str())?;
+            (source, false)
+        } else {
+            self.enter_stage(job_id, owner, JobStage::Download, job_temp).await?;
+            let path = self.download_source(job_id, &job.url, job_temp, context, cancel, FormatRoute::Second).await?;
+            (path, true)
+        };
+        let _ = self.repo.update_job_progress(job_id, 0.0, "Remuxing", "--:--");
+        let remuxed = crate::second_route::remux(&self.ffmpeg_path, &self.ffprobe_path, &source, job_temp, cancel.clone()).await?;
+        if downloaded {
+            let _ = tokio::fs::remove_file(&source).await;
+        }
+        let v = &remuxed.source.video;
+        let _ = self.repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Download),
+            &format!("Second route source: {}x{} {}, {:.1} s, in a clean container", v.width, v.height, v.codec, remuxed.source.duration_secs),
+        );
+        Ok(remuxed.path)
     }
 
     /// Stages 2–6, from a source file on disk to the watchfolder.

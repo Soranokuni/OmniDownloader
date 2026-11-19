@@ -914,6 +914,19 @@ good), or with `NO_STREAM_FOUND`, `VIDEO_UNRESOLVED`, `HTTP_403` or
 may go back to the queue on its own: the second chance of §5.3
 (`retry.second_chance_window_mins`).
 
+A job that fails with `PROBE_FAILED`, `TRANSCODE_FAILED`, `REWRAP_FAILED` or
+`COMPLIANCE_FAILED` first takes a second route, once per job and without anyone
+acting: a link is downloaded again with other formats (another video codec, or
+a file the site serves already merged as MP4, either at least 720 lines high),
+an attached file is taken as it is, and the file is copied into a clean
+container (fresh timestamps) before the usual encode, wrap and compliance
+check. The job's history says «second route», the new source's size, and how
+it ended. If it does not help, the job goes to review with its first code. A
+file is never shortened to fit: one whose own index lists more frames than it
+holds (a download cut part way), or whose copy is shorter than the file says
+(a clock that jumps), goes to review. A daemon that is stopping does not take
+the second route.
+
 | Code | Auto | Meaning / action |
 |---|---|---|
 | `NETWORK` | yes | network problem |

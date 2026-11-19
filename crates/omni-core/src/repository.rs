@@ -1804,6 +1804,30 @@ impl Repository {
         Ok(held.is_some())
     }
 
+    /// Take job `job_id`'s one second route through the pipeline (P11.6) for
+    /// the worker holding its lease. `false` when the job already took it or is
+    /// not `owner`'s running job: then nothing is written.
+    pub fn claim_second_route(&self, job_id: i64, owner: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            "UPDATE queue SET second_route_at = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING' AND second_route_at IS NULL",
+            params![now, now, job_id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// When job `job_id` took its second route (P11.6); `None` if it has not,
+    /// or the row is gone.
+    pub fn second_route_at(&self, job_id: i64) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.pool.get()?;
+        let at: Option<Option<String>> = conn
+            .query_row("SELECT second_route_at FROM queue WHERE id = ?", params![job_id], |r| r.get(0))
+            .optional()?;
+        Ok(at.flatten().as_deref().and_then(timestamps::parse))
+    }
+
     /// Move a leased job to the next stage and reset the stage clock.
     pub fn set_stage(&self, job_id: i64, owner: &str, stage: JobStage) -> Result<bool> {
         self.set_stage_at(job_id, owner, stage, Utc::now())

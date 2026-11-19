@@ -909,6 +909,14 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN second_chances TEXT;
         "#,
     ),
+    (
+        39,
+        // When the job took its second route through the pipeline (P11.6): downloaded again with
+        // other formats and remuxed before the encode, once per job. NULL: not taken.
+        r#"
+        ALTER TABLE queue ADD COLUMN second_route_at TEXT;
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from

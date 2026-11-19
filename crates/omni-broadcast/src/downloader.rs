@@ -64,6 +64,41 @@ pub struct DownloadOpts<'a> {
     /// The pinned ffmpeg for the merge (P11.4e). `download` fills it from
     /// the downloader when the caller leaves it empty.
     pub ffmpeg: Option<&'a Path>,
+    /// Which formats to ask for: the usual ones, or the second route's (P11.6).
+    pub formats: FormatRoute,
+}
+
+/// The format selection of a download (P11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FormatRoute {
+    /// H.264/AAC merged into MP4 where offered, else the best up to the cap.
+    #[default]
+    Usual,
+    /// The second route after a source that failed probe, encode, wrap or the
+    /// gate: another video codec at the same cap, else a file the site serves
+    /// already merged as MP4 (no merge step of ours), both at least 720 lines
+    /// high so the second try is no big drop in picture; else as usual.
+    Second,
+}
+
+/// The lowest height the second route's own alternatives take (P11.6).
+pub const SECOND_ROUTE_MIN_HEIGHT: u32 = 720;
+
+/// The `-f` selector for `route`, every alternative capped at `h` but the last.
+pub fn format_selector(route: FormatRoute, h: u32) -> String {
+    match route {
+        FormatRoute::Usual => format!(
+            "bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
+             bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+        ),
+        FormatRoute::Second => {
+            let floor = SECOND_ROUTE_MIN_HEIGHT;
+            format!(
+                "bestvideo[height<={h}][height>={floor}][vcodec!^=avc1]+bestaudio/\
+                 best[height<={h}][height>={floor}][ext=mp4]/best[height<={h}]/best"
+            )
+        }
+    }
 }
 
 impl Default for DownloadOpts<'_> {
@@ -81,6 +116,7 @@ impl Default for DownloadOpts<'_> {
             cancel: None,
             js_runtime: None,
             ffmpeg: None,
+            formats: FormatRoute::Usual,
         }
     }
 }
@@ -589,10 +625,7 @@ impl Downloader {
             // since the output is 1080i50 either way. Prefer H.264/AAC so the
             // merge is a remux rather than a re-encode.
             "-f".into(),
-            format!(
-                "bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
-                 bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-            ),
+            format_selector(opts.formats, h),
             "--merge-output-format".into(),
             "mp4".into(),
             // A journalist's link often carries a playlist id; ingesting the
@@ -1774,6 +1807,33 @@ mod tests {
                 "fallback {alt:?} is not height-capped"
             );
         }
+    }
+
+    /// P11.6: the second route asks for something else first (another codec,
+    /// then a file the site merged), capped like the usual one; every other
+    /// argument of the download is the same.
+    #[test]
+    fn the_second_route_asks_for_other_formats_and_changes_nothing_else() {
+        let usual = args_for(&DownloadOpts::default());
+        let second = args_for(&DownloadOpts { formats: FormatRoute::Second, ..Default::default() });
+        let f = |args: &[String]| args[args.iter().position(|a| a == "-f").unwrap() + 1].clone();
+        let selector = f(&second);
+        assert_ne!(selector, f(&usual));
+        let alts: Vec<&str> = selector.split('/').collect();
+        assert_eq!(
+            selector,
+            "bestvideo[height<=1080][height>=720][vcodec!^=avc1]+bestaudio/best[height<=1080][height>=720][ext=mp4]/best[height<=1080]/best"
+        );
+        assert_eq!(alts[0], "bestvideo[height<=1080][height>=720][vcodec!^=avc1]+bestaudio", "another codec first, 720 to 1080: {selector}");
+        assert_eq!(alts[1], "best[height<=1080][height>=720][ext=mp4]", "then a pre-merged MP4, 720 to 1080: {selector}");
+        for alt in &alts {
+            assert!(alt.contains("height<=1080") || *alt == "best", "fallback {alt:?} is not height-capped");
+        }
+        let without_f = |args: &[String]| {
+            let i = args.iter().position(|a| a == "-f").unwrap();
+            args.iter().enumerate().filter(|(n, _)| *n != i + 1).map(|(_, a)| a.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(without_f(&second), without_f(&usual));
     }
 
     #[test]
