@@ -397,6 +397,8 @@ pub struct CanaryEnv {
     /// The daemon's ffmpeg, handed to every yt-dlp run of a check, the nightly
     /// self-check and the tool updates (P11.4e).
     ffmpeg: Option<PathBuf>,
+    /// The early yt-dlp update the workers ask for (P11.4d), set once at start-up.
+    early_ytdl: OnceLock<Arc<crate::early_update::EarlyYtdlUpdate>>,
 }
 
 impl CanaryEnv {
@@ -416,7 +418,18 @@ impl CanaryEnv {
             day_llm: Mutex::new((String::new(), 0)),
             pacer: omni_broadcast::pacing::HostPacer::default(),
             ffmpeg: None,
+            early_ytdl: OnceLock::new(),
         }
+    }
+
+    /// Give the workers the early yt-dlp update (P11.4d). Once; later calls change nothing.
+    pub(crate) fn set_early_ytdl(&self, early: Arc<crate::early_update::EarlyYtdlUpdate>) {
+        let _ = self.early_ytdl.set(early);
+    }
+
+    /// The early yt-dlp update, when the daemon set one (tests mostly do not).
+    pub(crate) fn early_ytdl(&self) -> Option<&Arc<crate::early_update::EarlyYtdlUpdate>> {
+        self.early_ytdl.get()
     }
 
     /// Hand `ffmpeg` (the daemon's) to every yt-dlp run made with this value (P11.4e).

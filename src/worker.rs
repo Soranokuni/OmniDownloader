@@ -1447,6 +1447,8 @@ pub(crate) async fn run_job(
                 // codes that say something about the site, not this page.
                 // A repair that ran out of time counts as the unresolved video it was.
                 let site_code = repair::site_code(code);
+                // A platform's extractor may have broken: an early yt-dlp update (P11.4d).
+                note_extraction_trouble(repo, canary, done, cancel.is_cancelled(), &orig_url, site_code.as_str());
                 if site_failure_counts(done, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
                 {
                     let noted = note_site_outcome(
@@ -1468,6 +1470,23 @@ pub(crate) async fn run_job(
             Ok(())
         }
     }
+}
+
+/// A job that ended for good on a platform with an extraction code counts
+/// towards an early yt-dlp update (P11.4d). Only a job this worker finished
+/// and nobody cancelled; never waits, never changes the job's outcome.
+pub(crate) fn note_extraction_trouble(
+    repo: &Repository,
+    canary: &canary::CanaryEnv,
+    done: bool,
+    cancelled: bool,
+    url: &str,
+    code: &str,
+) -> bool {
+    if !done || cancelled {
+        return false;
+    }
+    canary.early_ytdl().is_some_and(|early| early.note_job_failure(repo, url, code, chrono::Utc::now()))
 }
 
 /// Fold a finished job into its site's health (plan P10.3). Bookkeeping only:

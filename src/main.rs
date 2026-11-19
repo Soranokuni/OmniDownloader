@@ -24,6 +24,7 @@ use omni_web::state::AppState;
 mod benchmark;
 mod canary;
 mod cookies_cli;
+mod early_update;
 mod egress;
 mod repair;
 mod report_cli;
@@ -1449,6 +1450,9 @@ async fn run_daemon(
             .with_pacer(broadcast_engine.pacer())
             .with_ffmpeg(ytdl_ffmpeg.clone()),
     );
+    // The workers ask the scheduler for an early yt-dlp update when a platform starts failing (P11.4d).
+    let (early_ytdl, early_ytdl_rx) = early_update::EarlyYtdlUpdate::new(config.ytdl_auto_update_nightly);
+    canary_env.set_early_ytdl(early_ytdl.clone());
     // The admin's Test URL: a dry run of the ladder; its world is set once the workers' exists.
     let url_tester = Arc::new(repair::AdminTester::new());
     omni_core::cookies::refresh_health(&repo, &health);
@@ -1616,7 +1620,9 @@ async fn run_daemon(
             canary: canary_env.clone(),
             evidence_days: config.repair.evidence_days.max(1),
             evidence_max_bytes: config.repair.evidence_max_mb.saturating_mul(1024 * 1024),
+            early_ytdl: early_ytdl.clone(),
         };
+        let mut early_ytdl_rx = early_ytdl_rx;
 
         tokio::spawn(async move {
             // A minute is fine: these tasks are nightly, and the cost of a tick
@@ -1629,6 +1635,13 @@ async fn run_daemon(
                     _ = tick.tick() => {
                         omni_core::cookies::refresh_health_if_changed(&repo_sched, &ctx.health, &mut jars_seen);
                         run_due_tasks(&repo_sched, &specs, &ctx).await;
+                    }
+                    // In this loop, so never beside a nightly task; a request that waited
+                    // for one is dropped by the 6-hour rule (P11.4d).
+                    Some(platform) = early_ytdl_rx.recv() => {
+                        ctx.early_ytdl
+                            .run_requested(&repo_sched, platform, chrono::Utc::now(), |drain| early_ytdl_update(&repo_sched, &ctx, drain))
+                            .await;
                     }
                 }
             }
@@ -2135,7 +2148,9 @@ async fn nightly_ytdl_update(
     repo: &Repository,
     pacer: &omni_broadcast::pacing::HostPacer,
     ffmpeg: Option<&std::path::Path>,
-) -> omni_core::scheduler::TaskOutcome {
+    drain: Duration,
+) -> early_update::UpdateRun {
+    use early_update::UpdateRun;
     use omni_core::scheduler::TaskOutcome;
 
     info!("Running scheduled nightly yt-dlp update check...");
@@ -2150,7 +2165,7 @@ async fn nightly_ytdl_update(
             // would have installed silently.
             warn!("Nightly yt-dlp update not installed: {e:#}");
             let _ = repo.log_audit("WARN", "SYSTEM", &format!("yt-dlp update skipped: {e}"));
-            return TaskOutcome::Failed;
+            return UpdateRun::new(TaskOutcome::Failed, "not downloaded or not verified");
         }
     };
 
@@ -2161,7 +2176,7 @@ async fn nightly_ytdl_update(
     if rejected.trim() == staged.sha256 {
         dep_mgr.discard_staged_ytdl();
         info!("yt-dlp update skipped: this build was rolled back before");
-        return TaskOutcome::Skipped;
+        return UpdateRun::new(TaskOutcome::Skipped, "rolled back before");
     }
     // Live and also the release: nothing to do. (The download is still made,
     // to know; it is a few seconds at 03:00.)
@@ -2170,21 +2185,23 @@ async fn nightly_ytdl_update(
         info!("yt-dlp is already the latest release");
         // No update is waiting any more (P11.4).
         selfcheck::note_postponed(&dep_mgr.get_bin_dir(), false);
-        return TaskOutcome::Ok;
+        return UpdateRun::new(TaskOutcome::Ok, "already the latest");
     }
 
-    // Up to ten minutes for in-flight downloads. Longer than any sane clip and
-    // shorter than the gap to the next bulletin.
-    if !swap.drain(Duration::from_secs(600)).await {
+    // At night up to ten minutes for in-flight downloads: longer than any sane
+    // clip and shorter than the gap to the next bulletin. An early (daytime)
+    // run waits far less, since intake is paused meanwhile (P11.4d).
+    if !swap.drain(drain).await {
         warn!(
-            "yt-dlp update postponed: {} download(s) still running after 10 minutes. The \
+            "yt-dlp update postponed: {} download(s) still running after {} s. The \
              verified build stays staged and will be applied on the next attempt.",
-            swap.active()
+            swap.active(),
+            drain.as_secs()
         );
         // Skipped, not failed: nothing is wrong, the pipeline was simply busy,
         // and an operator reading the maintenance panel should not be sent
         // looking for a fault that does not exist.
-        return TaskOutcome::Skipped;
+        return UpdateRun::drain_postponed();
     }
 
     let outcome = dep_mgr.apply_staged_ytdl();
@@ -2193,7 +2210,7 @@ async fn nightly_ytdl_update(
         Err(e) => {
             warn!("Nightly yt-dlp update failed to install: {e:#}");
             let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
-            return TaskOutcome::Failed;
+            return UpdateRun::new(TaskOutcome::Failed, "install failed");
         }
     };
 
@@ -2224,7 +2241,17 @@ async fn nightly_ytdl_update(
         selfcheck::note_postponed(&dep_mgr.get_bin_dir(), postponed);
     }
     ytdl_second_chance(repo, &act);
-    act.outcome
+    UpdateRun::new(act.outcome, verdict_reason(&verdict))
+}
+
+/// The few words the maintenance panel shows for an early run's `verdict` (P11.4d).
+fn verdict_reason(verdict: &UpdateVerdict) -> &'static str {
+    match verdict {
+        UpdateVerdict::Kept { .. } => "kept",
+        UpdateVerdict::RolledBack { .. } => "rolled back",
+        UpdateVerdict::Postponed { .. } => "postponed by the self-check",
+        UpdateVerdict::Unverified { .. } => "unverified",
+    }
 }
 
 /// The second chance a kept yt-dlp build gives (P11.5): the jobs in review for
@@ -2585,6 +2612,21 @@ struct MaintenanceContext {
     evidence_max_bytes: u64,
     health: HealthState,
     canary: Arc<canary::CanaryEnv>,
+    /// The early yt-dlp update (P11.4d); the nightly run holds its running lock.
+    early_ytdl: Arc<early_update::EarlyYtdlUpdate>,
+}
+
+/// The early yt-dlp update (P11.4d): the nightly task's own update, under the
+/// same canary lock and gate, without the Deno update that follows it at night.
+async fn early_ytdl_update(repo: &Repository, ctx: &MaintenanceContext, drain: Duration) -> early_update::UpdateRun {
+    let dep_mgr = DependencyManager::new(&ctx.bin_dir);
+    let run = canary::with_canary_lock(&ctx.canary, async {
+        let ffmpeg = ctx.canary.ffmpeg();
+        nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref(), drain).await
+    })
+    .await;
+    selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
+    run
 }
 
 /// Run whatever is due, recording the outcome of each (plan P6.6).
@@ -2665,10 +2707,14 @@ async fn run_one_task(
                 return Ok(TaskOutcome::Skipped);
             }
             let dep_mgr = DependencyManager::new(&ctx.bin_dir);
+            // An early run (P11.4d) finding this held is dropped.
+            let _running = ctx.early_ytdl.lock_running().await;
             // No canary run (its yt-dlp starts without a gate pass) overlaps the swap.
             let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
                 let ffmpeg = ctx.canary.ffmpeg();
-                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
+                let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref(), early_update::NIGHTLY_DRAIN)
+                    .await
+                    .outcome;
                 let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
                 (ytdl, deno)
             })

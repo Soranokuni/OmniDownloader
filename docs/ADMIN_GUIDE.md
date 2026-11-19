@@ -458,6 +458,11 @@ jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build.
 
+The verified yt-dlp update also runs early when one platform has 3
+extraction failures in 30 minutes, at most once every 6 hours; it waits at
+most a minute and a half for running jobs and tries again later if they are
+still busy.
+
 The service reads the CPU of the machine it runs on. On an ARM64 Windows
 host it installs the native BtbN ARM64 ffmpeg and ffprobe, because the x64
 build runs under emulation there and has hung. Everywhere else, and whenever
