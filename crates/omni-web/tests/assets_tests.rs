@@ -378,22 +378,22 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 21),
-        ("inbox.js", 28),
-        ("approval.js", 16),
-        ("notify.js", 16),
-        ("mcr.js", 54),
-        ("status.js", 4),
-        ("status.css", 7),
-        ("worklist.js", 4),
-        ("undo.js", 5),
-        ("dialog.js", 4),
-        ("keys.js", 2),
-        ("sound.js", 1),
-        ("user.js", 14),
-        ("toast.js", 4),
-        ("text.js", 3),
-        ("text.el.js", 3),
+        ("desk.js", 22),
+        ("inbox.js", 29),
+        ("approval.js", 17),
+        ("notify.js", 17),
+        ("mcr.js", 55),
+        ("status.js", 5),
+        ("status.css", 8),
+        ("worklist.js", 5),
+        ("undo.js", 6),
+        ("dialog.js", 5),
+        ("keys.js", 3),
+        ("sound.js", 2),
+        ("user.js", 15),
+        ("toast.js", 5),
+        ("text.js", 4),
+        ("text.el.js", 4),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -1290,12 +1290,112 @@ fn the_desk_sounds_are_chosen_per_browser() {
     assert!(words["notify.remind.other"].contains("{n} λεπτά"), "the reminder does not say how long");
 }
 
+/// P12.10: only desk work on the desk. Four tabs; adding a link is a side panel opened by a
+/// button; the broadcast specification and the shortcuts are in a «Βοήθεια» menu; the journalists
+/// are not edited on the desk; every word of mcr.html and user.html comes from the dictionary; and
+/// «Να το θυμάμαι για αυτή τη διεύθυνση» appears only when the server says the sender is not on
+/// the roster (a server without `sender_on_roster` shows no button).
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v14() {
+fn only_desk_work_on_the_desk() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
+    let code = |module: &str| -> String {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    // Markup without its comments (they may span lines).
+    let markup = |page: &str| -> String {
+        let html = assets.get(page).unwrap_or_else(|| panic!("{page} shipped"));
+        let mut out = String::new();
+        let mut rest = html.as_str();
+        while let Some(at) = rest.find("<!--") {
+            out.push_str(&rest[..at]);
+            rest = rest[at..].split_once("-->").map(|(_, r)| r).unwrap_or("");
+        }
+        out.push_str(rest);
+        out
+    };
+
+    // Every word of both pages by key, and every key in the dictionary.
+    for page in ["mcr.html", "user.html"] {
+        let html = markup(page);
+        for line in html.lines() {
+            assert!(!greek(line), "{page} keeps Greek text of its own: {}", line.trim());
+        }
+        for attr in ["data-t=\"", "data-t-aria-label=\"", "data-t-placeholder=\"", "data-t-title=\""] {
+            for key in html.split(attr).skip(1).filter_map(|s| s.split('"').next()) {
+                assert!(words.contains_key(key), "{page} asks for `{key}`, which text.el.js does not have");
+            }
+        }
+    }
+    assert!(code("user.js").contains("\napplyText();"), "user.html's words are never filled");
+
+    // Four tabs; no journalists and no add-a-link tab; no specification tab or modal.
+    let page = markup("mcr.html");
+    let tabs: Vec<&str> = page.split("data-tab=\"").skip(1).filter_map(|s| s.split('"').next()).collect();
+    assert_eq!(tabs, ["email", "queue", "review", "completed"], "the desk's tabs");
+    let mcr = code("mcr.js");
+    assert!(mcr.contains("const TABS = ['email', 'queue', 'review', 'completed'];"), "mcr.js still knows other tabs");
+    for gone in ["tab-journalists", "journalist-form", "journalists-body", "tab-manual", "specs-modal", "specs-btn"] {
+        assert!(!page.contains(gone), "mcr.html still has {gone}");
+        assert!(!mcr.contains(gone), "mcr.js still uses {gone}");
+    }
+    // The journalists are edited on the administration page, not here.
+    assert!(!mcr.contains("api('/api/journalists', {") && !mcr.contains("/api/journalists/${"), "the desk still edits the journalists");
+
+    // «+ Προσθήκη συνδέσμου»: a button that opens the side panel holding the form.
+    assert!(page.contains("id=\"add-btn\" aria-expanded=\"false\" aria-controls=\"add-panel\""), "no add button for the panel");
+    let panel = page.split("<aside id=\"add-panel\"").nth(1).and_then(|s| s.split("</aside>").next()).expect("the add panel");
+    assert!(panel.contains("id=\"manual-form\"") && panel.contains("id=\"add-close\""), "the form or its close is not in the panel");
+    assert!(function_body(&mcr, "openAdd").contains("document.getElementById('m-url').focus();"), "opening the panel leaves the focus behind");
+    let close = function_body(&mcr, "closeAdd");
+    assert!(close.contains("addPanel.hidden = true;") && close.contains("if (hadFocus) addButton.focus();"), "closing the panel loses the focus");
+    assert!(mcr.contains("addPanel.addEventListener('keydown', (ev) => {\n  if (ev.key !== 'Escape') return;"), "Escape does not close the panel");
+    let submit = mcr.split("getElementById('manual-form').addEventListener('submit'").nth(1).and_then(|s| s.split("\n});").next()).expect("submit");
+    assert!(submit.contains("closeAdd();\n    switchTab('queue');"), "after adding, the panel stays and the queue is not shown");
+
+    // «Βοήθεια»: a menu button with the specification and the shortcuts.
+    assert!(page.contains("id=\"help-btn\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"help-menu\""), "no help menu button");
+    let menu = page.split("id=\"help-menu\"").nth(1).and_then(|s| s.split("</div>").next()).expect("the help menu");
+    assert!(menu.contains("role=\"menu\""), "the help menu is not a menu");
+    for item in ["id=\"help-specs\"", "id=\"help-keys\""] {
+        assert!(menu.contains(item), "the help menu lacks {item}");
+    }
+    assert!(menu.matches("role=\"menuitem\"").count() == 2, "the help menu's items are not menu items");
+    for key in ["'ArrowDown'", "'ArrowUp'", "'Home'", "'End'", "'Escape'", "'Tab'"] {
+        assert!(mcr.contains(&format!("ev.key === {key}")), "the help menu ignores {key}");
+    }
+    let rows = mcr.split("const SPEC_ROWS = [").nth(1).and_then(|s| s.split("];").next()).expect("SPEC_ROWS");
+    for row in ["video", "bitrate", "size", "scan", "chroma", "audio_layout", "audio", "channels", "wrap"] {
+        assert!(rows.contains(&format!("'{row}'")), "the specification lost its `{row}` line");
+        assert!(words.contains_key(&format!("spec.{row}")) && words.contains_key(&format!("spec.{row}.value")), "no words for `{row}`");
+    }
+    assert!(code("keys.js").contains("export function showShortcuts()"), "the shortcuts cannot be opened from the menu");
+
+    // «Να το θυμάμαι για αυτή τη διεύθυνση».
+    let inbox = code("inbox.js");
+    let offer = function_body(&inbox, "rememberOffer");
+    assert!(offer.contains("if (d.sender_on_roster !== false) return null;"), "the button shows without the server saying the sender is unknown");
+    assert!(offer.contains("d.kind === 'manual'") && offer.contains("d.outcome === 'FAILED'"), "a link added by hand or a failed mail offers it");
+    assert!(offer.contains("d.journalist === 'MCR'") && offer.contains("!d.from_address"), "it is offered for MCR or without an address");
+    assert!(offer.contains("return { surname: d.journalist, address: d.from_address };"), "the offer names the wrong journalist or address");
+    let remember = function_body(&inbox, "rememberSender");
+    let ask = remember.find("await confirmDialog({").expect("it does not ask first");
+    let post = remember.find("api('/api/mails/remember-sender', { method: 'POST', body: { key, surname: offer.surname } })").expect("the contract's request");
+    assert!(ask < post, "it remembers before asking");
+    assert!(remember.contains("e.code === 'ADDRESS_TAKEN' ? t('mail.remember.taken', offer)"), "an address of another journalist is not explained");
+    assert!(remember.contains("r.already ? 'mail.remember.already' : 'mail.remember.done'"), "an address already known is announced as new");
+    assert!(function_body(&inbox, "metaNode").contains("const offer = rememberOffer(d);"), "the open mail never offers it");
+    assert_eq!(words["mail.remember.button"], "Να το θυμάμαι για αυτή τη διεύθυνση");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v15() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=14"), "user.html does not import user.js?v=14");
-    assert!(!page.contains("/static/user.js?v=13"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=15"), "user.html does not import user.js?v=15");
+    assert!(!page.contains("/static/user.js?v=14"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

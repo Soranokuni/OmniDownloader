@@ -113,8 +113,11 @@ switched on yet at every station; ask MCR.
   elsewhere closes it.
 - **«🔔 Ήχος»** — the sound's settings: on or off, volume, which sounds,
   the reminder (§4.7).
-- **«Προδιαγραφές εκπομπής»** — at the end of the tab row: the broadcast
-  specification every delivered file meets.
+- **«+ Προσθήκη συνδέσμου»** — at the end of the tab row: opens a panel on
+  the right to queue a link by hand (§4.6).
+- **«Βοήθεια»** — beside it, a small menu: **«Προδιαγραφές εκπομπής»** (the
+  broadcast specification every delivered file meets) and
+  **«Συντομεύσεις πληκτρολογίου»** (the keyboard shortcuts).
 - **«Διαχείριση»** — the admin page (administrators only).
 - **«Καθυστερούν»** — a strip above the tabs, only while some video is late
   (§4.9).
@@ -127,10 +130,10 @@ switched on yet at every station; ask MCR.
 | **«Σε εξέλιξη»** | In progress | jobs waiting or being processed |
 | **«Χρειάζονται έλεγχο»** | Need checking | jobs that stopped and need a person, plus videos waiting for approval |
 | **«Ολοκληρωμένα»** | Completed | delivered jobs |
-| **«Δημοσιογράφοι»** | Journalists | the roster: names, addresses, aliases, groups |
-| **«Προσθήκη συνδέσμου»** | Add link | queue a link by hand |
 
-The number on each tab is how many items are in it.
+The number on each tab is how many items are in it. The roster of
+journalists (names, addresses, aliases, groups) is kept on the administration
+page («Διαχείριση»), not on the desk.
 
 **Keyboard.** **J** / **K** move to the next / previous card of the list on
 screen (the mails, the cards of «Χρειάζονται έλεγχο», the videos of
@@ -155,8 +158,13 @@ Filters along the top:
 Labels you may see on a mail:
 
 - «Χωρίς δημοσιογράφο» — the sender or name did not match anyone in the
-  roster; files are named with a placeholder. Add the person or an alias in
-  «Δημοσιογράφοι».
+  roster; files are named with a placeholder. Ask the administrator to add
+  the person or an alias.
+- **«Να το θυμάμαι για αυτή τη διεύθυνση»** — on an open mail whose
+  journalist you set, when the sender's address is not on the roster yet. It
+  asks first; after that, mails from that address go to that journalist by
+  themselves. If the address belongs to another journalist, the desk says so
+  and only the administrator can change it.
 - «Δεν βρέθηκε βίντεο» — no video found in the mail.
 - «Μόνο φωτογραφίες· τίποτα για λήψη» — only photos, nothing to download.
 - «Δεν διαβάστηκε» — the mail could not be read; open it to have it read again.
@@ -297,10 +305,12 @@ button never touches it. Pressing it twice does nothing more.
 
 ### 4.6 Adding a link by hand
 
-**«Προσθήκη συνδέσμου»**: the link, the journalist's surname, the keyword,
-the story number, and, for an article with several videos,
-«Από άρθρο: μόνο τα πρώτα … βίντεο» (only the first N videos). Tick
-**«Επείγον»** to put it first, then **«Προσθήκη στην ουρά»**.
+**«+ Προσθήκη συνδέσμου»** at the end of the tab row opens a panel on the
+right, beside the list you are working on: the link, the journalist's
+surname, the keyword, the story number, and, for an article with several
+videos, «Από άρθρο: μόνο τα πρώτα … βίντεο» (only the first N videos). Tick
+**«Επείγον»** to put it first, then **«Προσθήκη στην ουρά»**: the panel closes
+and «Σε εξέλιξη» opens. Esc or «✕» closes the panel without adding.
 
 ### 4.7 Sounds and pop-ups
 

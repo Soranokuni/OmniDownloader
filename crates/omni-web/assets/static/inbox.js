@@ -17,19 +17,20 @@
  */
 
 import { api, el, render, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=4';
+import { toast } from '/static/toast.js?v=5';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=21';
-import { visible } from '/static/undo.js?v=5';
+} from '/static/desk.js?v=22';
+import { visible } from '/static/undo.js?v=6';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
-} from '/static/status.js?v=4';
-import { whyText } from '/static/worklist.js?v=4';
-import { t, tn } from '/static/text.js?v=3';
-import { navCard } from '/static/keys.js?v=2';
+} from '/static/status.js?v=5';
+import { whyText } from '/static/worklist.js?v=5';
+import { t, tn } from '/static/text.js?v=4';
+import { navCard } from '/static/keys.js?v=3';
+import { confirmDialog } from '/static/dialog.js?v=5';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -586,13 +587,55 @@ function metaNode(d) {
     add(t('mail.meta.received'), fmtTime(d.received_at || d.processed_at));
   }
   if (d.journalist && d.outcome !== 'FAILED') {
-    add(t('mail.meta.journalist'), el('b', {}, d.journalist === 'MCR' ? t('mail.meta.nobody') : d.journalist), d.how ? el('span', { class: 'how' }, `  ·  ${d.how}`) : '');
+    const offer = rememberOffer(d);
+    add(t('mail.meta.journalist'), el('b', {}, d.journalist === 'MCR' ? t('mail.meta.nobody') : d.journalist), d.how ? el('span', { class: 'how' }, `  ·  ${d.how}`) : '',
+      offer ? el('button', {
+        class: 'btn remember-btn', type: 'button', title: t('mail.remember.title', offer),
+        onClick: (ev) => rememberSender(ev.currentTarget, offer),
+      }, t('mail.remember.button')) : null);
   }
   if (d.group_code) add(t('mail.meta.group'), `${d.group_code} — ${hooks.groupName(d.group_code)}`);
   if (d.attachments && d.attachments.length) {
     add(t('mail.attachments'), d.attachments.map((a) => chipNode(a.id, `${a.name} · ${fmtSize(a.size)}`)));
   }
   return el('dl', { class: 'md-meta' }, rows);
+}
+
+/**
+ * «Να το θυμάμαι για αυτή τη διεύθυνση» (P12.10): the sender of a mail
+ * whose journalist MCR has set is not on the roster yet. Offered only when
+ * the server says so (`sender_on_roster === false`; a server without the
+ * field offers nothing), for a real mail with a sender address and a real
+ * journalist (never MCR). Pure: what to offer, or null.
+ */
+export function rememberOffer(d) {
+  if (!d || d.kind === 'manual' || d.outcome === 'FAILED') return null;
+  if (d.sender_on_roster !== false) return null;
+  if (!d.journalist || d.journalist === 'MCR' || !d.from_address) return null;
+  return { surname: d.journalist, address: d.from_address };
+}
+
+/** Asks first (only the administrator can undo it), then remembers the address. */
+async function rememberSender(button, offer) {
+  if (!open) return;
+  const key = open.key;
+  if (!(await confirmDialog({
+    title: t('mail.remember.ask', offer),
+    body: t('mail.remember.body', offer),
+    confirm: t('mail.remember.confirm'),
+  }))) return;
+  button.disabled = true;
+  try {
+    const r = await api('/api/mails/remember-sender', { method: 'POST', body: { key, surname: offer.surname } });
+    const done = { address: r.address || offer.address, surname: r.surname || offer.surname };
+    toast(t(r.already ? 'mail.remember.already' : 'mail.remember.done', done), 'ok');
+    if (detail && open && open.key === key) detail.sender_on_roster = true;
+    button.remove();
+  } catch (e) {
+    // 409 ADDRESS_TAKEN: the address is another journalist's; only the administrator changes that.
+    toast(e.code === 'ADDRESS_TAKEN' ? t('mail.remember.taken', offer) : e.message, 'bad');
+    button.disabled = false;
+  }
 }
 
 function fmtSize(bytes) {

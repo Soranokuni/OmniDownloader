@@ -15,8 +15,8 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=3';
-import { infoDialog, dialogOpen } from '/static/dialog.js?v=4';
+import { t } from '/static/text.js?v=4';
+import { infoDialog, dialogOpen } from '/static/dialog.js?v=5';
 
 const actions = new WeakMap();
 let scope = () => null;
@@ -74,7 +74,7 @@ function onKey(ev) {
     if (field) { ev.preventDefault(); field.focus(); field.select(); }
     return;
   }
-  if (key === '?') { ev.preventDefault(); showSheet(); return; }
+  if (key === '?') { ev.preventDefault(); showShortcuts(); return; }
   if (!here || ev.target !== here.node) return; // the rest act on a focused card itself
   if (key === 'Enter' && here.acts.open) { ev.preventDefault(); here.acts.open(); return; }
   if ((key === 'r' || key === 'R') && here.acts.retry) { ev.preventDefault(); here.acts.retry(); return; }
@@ -93,7 +93,8 @@ export const SHORTCUTS = [
   ['Esc', 'keys.escape'],
 ];
 
-function showSheet() {
+/** The shortcut sheet in a window; also «Βοήθεια» → «Συντομεύσεις πληκτρολογίου» (P12.10). */
+export function showShortcuts() {
   infoDialog({
     title: t('keys.title'),
     content: el('dl', { class: 'keys-sheet' },

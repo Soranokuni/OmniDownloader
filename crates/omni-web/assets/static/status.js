@@ -13,7 +13,7 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=3';
+import { t } from '/static/text.js?v=4';
 
 /** The colour families and their marks (a text glyph: no sprite needed, so a
  *  tag keeps it at any size). The badge classes are the tone names. */

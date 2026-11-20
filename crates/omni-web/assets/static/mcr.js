@@ -15,25 +15,25 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=4';
+import { toast } from '/static/toast.js?v=5';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=21';
-import { deferAction, visible } from '/static/undo.js?v=5';
-import { confirmDialog } from '/static/dialog.js?v=4';
-import { STATUS, statusBadge } from '/static/status.js?v=4';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=4';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=28';
+} from '/static/desk.js?v=22';
+import { deferAction, visible } from '/static/undo.js?v=6';
+import { infoDialog } from '/static/dialog.js?v=5';
+import { STATUS, statusBadge } from '/static/status.js?v=5';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=5';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=29';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=16';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=16';
-import { t, tn, applyText } from '/static/text.js?v=3';
-import { initKeys, navCard } from '/static/keys.js?v=2';
+} from '/static/notify.js?v=17';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=17';
+import { t, tn, applyText } from '/static/text.js?v=4';
+import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=3';
 
 // The page's fixed words (header, tabs, the broadcast specification) come
 // from the same dictionary as everything else (P12.7).
@@ -45,10 +45,13 @@ let journalists = [];
  * Tabs
  * ------------------------------------------------------------------ */
 
-const TABS = ['email', 'queue', 'review', 'completed', 'journalists', 'manual'];
+// Only the desk's work (P12.10): adding a link is a side panel, the
+// journalists are edited on the administration page.
+const TABS = ['email', 'queue', 'review', 'completed'];
 
 /* The Email tab is where the desk opens (plan P7.10); `/mcr#review` and the
- * like open another one, so a bookmark or a second screen can keep its own. */
+ * like open another one, so a bookmark or a second screen can keep its own.
+ * An old `#journalists` or `#manual` bookmark opens the Email tab. */
 function tabFromHash() {
   const name = location.hash.replace('#', '');
   return TABS.includes(name) ? name : 'email';
@@ -72,7 +75,6 @@ function switchTab(name) {
     for (const m of document.querySelectorAll('#approval-section video, #approval-section audio')) m.pause();
   }
   if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
-  if (name === 'journalists') loadJournalists();
   refresh();
 }
 
@@ -400,8 +402,7 @@ async function refresh() {
       if (currentTab === 'email') await loadInbox();
       else if (currentTab === 'review') await loadReview();
       else if (currentTab === 'completed') await loadCompleted();
-      // The live queue (also the journalists and add-a-link tabs) keeps the
-      // tab counts current.
+      // The live queue keeps the tab counts current.
       else await loadQueue();
     } while (refreshAgain);
   } finally {
@@ -1186,81 +1187,34 @@ function completedRow(job) {
 const redownload = (job) => deskRedownload(job, refresh);
 
 /* ------------------------------------------------------------------ *
- * Journalists
+ * Add a link: a side panel opened by «+ Προσθήκη συνδέσμου» (P12.10).
+ * Not modal: the list being worked on stays usable beside it. Escape
+ * inside it or «✕» closes it and gives the focus back to the button.
  * ------------------------------------------------------------------ */
 
-async function loadJournalists() {
-  try {
-    const data = await api('/api/journalists');
-    journalists = data.journalists || [];
-  } catch (e) { failed(e); return; }
+const addPanel = document.getElementById('add-panel');
+const addButton = document.getElementById('add-btn');
 
-  if (journalists.length === 0) {
-    render('journalists-body', el('tr', {},
-      el('td', { colspan: '5', class: 'empty' }, t('journalists.empty'))));
-    return;
-  }
-
-  render('journalists-body', journalists.map((j) => el('tr', {},
-    el('td', { class: 'strong' }, j.surname),
-    el('td', {}, j.full_name),
-    el('td', { class: 'mono' }, (j.emails || []).join(', ')),
-    el('td', { class: 'num' }, String(j.default_priority)),
-    el('td', { class: 'right' },
-      j.surname === 'MCR'
-        // MCR is structural: unresolved jobs are filed under it and the desk
-        // addresses are recognised by it. It is never the journalist.
-        ? el('span', { class: 'note', title: t('journalists.fixed.title') }, t('journalists.fixed'))
-        : el('button', {
-            class: 'btn btn-icon btn-danger',
-            type: 'button',
-            title: t('journalists.delete.title', { name: j.surname }),
-            onClick: () => deleteJournalist(j.surname),
-          }, '✕'),
-    ),
-  )));
+function openAdd() {
+  addPanel.hidden = false;
+  addButton.setAttribute('aria-expanded', 'true');
+  document.getElementById('m-url').focus();
 }
 
-document.getElementById('journalist-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const emails = document.getElementById('j-emails').value
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  try {
-    await api('/api/journalists', {
-      method: 'POST',
-      body: {
-        surname: document.getElementById('j-surname').value,
-        full_name: document.getElementById('j-fullname').value,
-        emails,
-        priority: Number(document.getElementById('j-priority').value) || 0,
-      },
-    });
-    toast(t('journalists.saved'), 'ok');
-    event.target.reset();
-    document.getElementById('j-priority').value = '0';
-    loadJournalists();
-    loadFilters();
-  } catch (e) { toast(e.message, 'bad'); }
+function closeAdd() {
+  const hadFocus = addPanel.contains(document.activeElement);
+  addPanel.hidden = true;
+  addButton.setAttribute('aria-expanded', 'false');
+  if (hadFocus) addButton.focus();
+}
+
+addButton.addEventListener('click', () => (addPanel.hidden ? openAdd() : closeAdd()));
+document.getElementById('add-close').addEventListener('click', closeAdd);
+addPanel.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Escape') return;
+  ev.preventDefault();
+  closeAdd();
 });
-
-async function deleteJournalist(surname) {
-  if (!(await confirmDialog({
-    title: t('journalists.delete.ask', { name: surname }),
-    body: t('journalists.delete.body'),
-    confirm: t('journalists.delete'),
-    danger: true,
-  }))) return;
-  try {
-    await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
-    toast(t('journalists.deleted', { name: surname }), 'ok');
-    loadJournalists();
-    loadFilters();
-  } catch (e) { toast(e.message, 'bad'); }
-}
-
-/* ------------------------------------------------------------------ *
- * Add a link
- * ------------------------------------------------------------------ */
 
 const manualFields = ['m-index', 'm-journalist', 'm-keyword'].map((id) => document.getElementById(id));
 function showManualPreview() {
@@ -1296,21 +1250,70 @@ document.getElementById('manual-form').addEventListener('submit', async (event) 
     event.target.reset();
     document.getElementById('m-index').value = '1';
     showManualPreview();
+    closeAdd();
     switchTab('queue');
   } catch (e) { toast(e.message, 'bad'); }
 });
 
 /* ------------------------------------------------------------------ *
- * Chrome
+ * «Βοήθεια» (P12.10): the broadcast specification and the keyboard
+ * shortcuts, out of the tab row. A menu button: Enter, Space or ↓ opens it
+ * at the first item, ↑/↓/Home/End move, Escape closes it back to the
+ * button, Tab or a click elsewhere closes it.
  * ------------------------------------------------------------------ */
 
-const specsModal = document.getElementById('specs-modal');
-document.getElementById('specs-btn').addEventListener('click', () => { specsModal.hidden = false; });
-for (const id of ['specs-close', 'specs-close-2']) {
-  document.getElementById(id).addEventListener('click', () => { specsModal.hidden = true; });
+const helpButton = document.getElementById('help-btn');
+const helpMenu = document.getElementById('help-menu');
+const helpItems = [...helpMenu.querySelectorAll('[role="menuitem"]')];
+
+function openHelp(at = 0) {
+  helpMenu.hidden = false;
+  helpButton.setAttribute('aria-expanded', 'true');
+  helpItems[at].focus();
 }
-specsModal.addEventListener('click', (e) => { if (e.target === specsModal) specsModal.hidden = true; });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') specsModal.hidden = true; });
+
+function closeHelp(toButton) {
+  if (helpMenu.hidden) return;
+  helpMenu.hidden = true;
+  helpButton.setAttribute('aria-expanded', 'false');
+  if (toButton) helpButton.focus();
+}
+
+helpButton.addEventListener('click', () => (helpMenu.hidden ? openHelp() : closeHelp(true)));
+helpButton.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp') return;
+  ev.preventDefault();
+  openHelp(ev.key === 'ArrowUp' ? helpItems.length - 1 : 0);
+});
+helpMenu.addEventListener('keydown', (ev) => {
+  const at = helpItems.indexOf(document.activeElement);
+  let to = -1;
+  if (ev.key === 'ArrowDown') to = (at + 1) % helpItems.length;
+  else if (ev.key === 'ArrowUp') to = (at - 1 + helpItems.length) % helpItems.length;
+  else if (ev.key === 'Home') to = 0;
+  else if (ev.key === 'End') to = helpItems.length - 1;
+  else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeHelp(true); return; }
+  else if (ev.key === 'Tab') { closeHelp(false); return; }
+  if (to < 0) return;
+  ev.preventDefault();
+  helpItems[to].focus();
+});
+document.addEventListener('click', (ev) => {
+  if (!helpMenu.hidden && !ev.target.closest('.menu-wrap')) closeHelp(false);
+});
+
+/** What every delivered file is: the on-air format, word for word (`spec.*`). */
+const SPEC_ROWS = ['video', 'bitrate', 'size', 'scan', 'chroma', 'audio_layout', 'audio', 'channels', 'wrap'];
+function showSpecs() {
+  infoDialog({
+    title: t('spec.title'),
+    content: el('div', { class: 'spec-list' },
+      SPEC_ROWS.map((row) => el('div', { class: 'spec-row' }, el('span', {}, t(`spec.${row}`)), el('span', {}, t(`spec.${row}.value`))))),
+  });
+}
+
+document.getElementById('help-specs').addEventListener('click', () => { closeHelp(true); showSpecs(); });
+document.getElementById('help-keys').addEventListener('click', () => { closeHelp(true); showShortcuts(); });
 
 document.getElementById('logout-btn').addEventListener('click', logout);
 
