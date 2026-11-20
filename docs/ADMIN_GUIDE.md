@@ -203,7 +203,7 @@ Back and Next move between screens; Next stays disabled until the screen is vali
 7. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the LLM card (5.4); a button leaves the wizard and opens it. A short note explains that a NAS or IP share needs the service to run as a named account (§2.2a).
 8. **TLS, reverse proxy and metrics** (IT only). The `.pfx` certificate path and passphrase, whether to trust the proxy header and from which networks, extra allowed host names, `/metrics` on/off and its networks, and **Download answer file**. A trusted-proxy range wider than /24 (IPv4) or /64 (IPv6) is flagged: every machine in it could speak for any client address. The certificate is opened with its passphrase before it is saved; a file that is not a PKCS#12 bundle, or a wrong passphrase, is refused, because it would stop the web listener at the next start.
 9. **Check.** The daemon's current health lines, green, amber or red, each with its hint, a notice if a restart is needed, and the repair mode (`repair.mode`; a new installation runs it in `shadow`: it records what it would have done and changes nothing).
-10. **«Δοκιμαστική λήψη».** A known-good link goes through every stage like any video: the screen shows the stages as they pass and the job's last lines, and ends with the file name in the watchfolder (`1_MCR_OMNIINGEST-TEST.mxf`, or `_2`, `_3`… if one is there already). Dalet imports it like any file: remove it there if you do not want to keep it. The link is `setup_test_url` in `config.json`, by default YouTube's first video ("Me at the zoo", 19 seconds, `https://www.youtube.com/watch?v=jNQXAC9IVRw`); change it on this screen if this computer cannot reach YouTube. If the test fails, the screen names the error; fix it (Back opens the earlier steps) and start it again. **Finish** is enabled only once the file is delivered; it records `setup_completed` and the mode and opens the normal panel. **Skip for now** finishes without the test, after saying that nothing then proves a video reaches playout. The audit log says which of the two it was.
+10. **«Δοκιμαστική λήψη».** A known-good link goes through every stage like any video: the screen shows the stages as they pass and the job's last lines, and ends with the file name in the watchfolder (`1_MCR_OMNIINGEST_TEST.mxf`, or `_2`, `_3`… if one is there already). Dalet imports it like any file: remove it there if you do not want to keep it. The link is `setup_test_url` in `config.json`, by default YouTube's first video ("Me at the zoo", 19 seconds, `https://www.youtube.com/watch?v=jNQXAC9IVRw`); change it on this screen if this computer cannot reach YouTube. If the test fails, the screen names the error; fix it (Back opens the earlier steps) and start it again. **Finish** is enabled only once the file is delivered; it records `setup_completed` and the mode and opens the normal panel. **Skip for now** finishes without the test, after saying that nothing then proves a video reaches playout. The audit log says which of the two it was.
 
 Which settings apply at once and which wait for a restart of the service:
 
@@ -510,6 +510,7 @@ directory.
 |---|---|
 | `config.json` | configuration (no secrets) |
 | `config.json.prev` | `config.json` as it was before the installer last rewrote it |
+| `config.json.v1.bak` | a first-version `config.json` as it was before the move to config v2 (§5), secrets blanked |
 | `omni-ingest.exe.prev` | the previous program, kept by an upgrade |
 | `OmniIngest-Setup.exe` | the copy of Setup that Apps & Features runs for Modify and Uninstall |
 | `setup.log` | what Setup did: each run that changed something, appended under a line with its date (UTC) |
@@ -552,6 +553,28 @@ right, and running the installer again restores it.
 Most settings are on the Admin page. The rest are in `config.json`; restart
 the service after editing it. `config.example.json` shows every key.
 
+**Config v2.** The first versions kept some settings at the top of the file.
+At its first start a newer version moves them into their sections by itself:
+`ollama_endpoint` and `ollama_model` become `llm.endpoint` and `llm.model`,
+`email_poll_interval_secs` becomes `mail.poll_interval_secs`, and the IMAP-era
+`imap_*` and `email_*` keys are removed (IMAP is no longer supported; the
+mailbox is the `graph` section). The old file is kept beside it as
+`config.json.v1.bak` (`config.json.v1.2.bak` and so on if that name is taken;
+a copy is never overwritten), with any password or secret in it blanked. The
+service log lists each key it moved. If a key is in both places, the one in
+the section is kept.
+
+**A value that cannot be used.** The service names the key, the value and the
+fix, in the log and in the error when it refuses to start, for example
+``config.json: `web_port` = "eighty" cannot be read (invalid type: string
+"eighty", expected u16). Fix: write a value like the default, 8080, or remove
+`web_port` to use the default.`` It refuses to start with a value of the
+wrong kind, a `web_port` of 0 or an empty `watchfolder_path`. A value outside
+the range the service reads it in (concurrent downloads 1–10, concurrent
+encodes 1–8, `mail.poll_interval_secs` 10–3600, `retry.max_age_mins`
+30–360, `pacing.per_host_concurrency` 1–4, `pacing.min_gap_secs` 0–120) is
+logged at start with the value actually used.
+
 ### 5.1 Network and sign-in (`security`)
 
 | Key | Default | Meaning |
@@ -581,7 +604,7 @@ The client secret goes into the secret store, never into `config.json`:
 Graph client secret**, or `omni-ingest secrets set graph.client_secret`.
 **Admin → Mailbox** tests access and saves the settings; the daemon uses them
 from the next mail check, without a restart. Mail is polled every
-`email_poll_interval_secs` (30 s).
+`mail.poll_interval_secs` seconds (default 20, at least 10).
 
 The deterministic parser handles every mail on its own. Mail from an address
 that matches nobody in the roster still gets processed; the files are named

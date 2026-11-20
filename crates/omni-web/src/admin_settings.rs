@@ -288,7 +288,7 @@ fn settings_json(cfg: &AppConfig) -> serde_json::Value {
             "secret_set": !cfg.graph.client_secret.is_empty(),
             "client_secret_expires": cfg.graph.client_secret_expires,
         },
-        "llm": { "mode": cfg.llm.mode, "provider": cfg.llm.provider, "endpoint": cfg.ollama_endpoint, "model": cfg.ollama_model },
+        "llm": { "mode": cfg.llm.mode, "provider": cfg.llm.provider, "endpoint": cfg.llm.endpoint, "model": cfg.llm.model },
     })
 }
 

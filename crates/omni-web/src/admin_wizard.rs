@@ -20,10 +20,10 @@ use crate::state::AppState;
 type JsonResult = Result<Json<serde_json::Value>, ApiError>;
 
 /// The test job's name, and so its file's in the watchfolder:
-/// `1_MCR_OMNIINGEST-TEST.mxf` (`_2`, `_3`… when one is already there).
-pub const TEST_SLUG: &str = "1_MCR_OMNIINGEST-TEST";
+/// `1_MCR_OMNIINGEST_TEST.mxf` (`_2`, `_3`… when one is already there).
+pub const TEST_SLUG: &str = "1_MCR_OMNIINGEST_TEST";
 const TEST_JOURNALIST: &str = "MCR";
-const TEST_KEYWORD: &str = "OMNIINGEST-TEST";
+const TEST_KEYWORD: &str = "OMNIINGEST_TEST";
 const TEST_NOTE: &str = "Δοκιμαστική λήψη του οδηγού εγκατάστασης";
 
 /// Whether `job` is a wizard test download.

@@ -287,7 +287,7 @@ impl EmailWatcher {
     pub async fn start_polling_loop(self: Arc<Self>, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!("EmailWatcher: watching {}", self.source.describe());
 
-        let poll_interval = Duration::from_secs(self.config.email_poll_interval_secs.max(10));
+        let poll_interval = Duration::from_secs(self.config.mail.poll_interval_secs.max(10));
         let mut backoff = Backoff::default();
         let mut settings_rx = self.live.subscribe();
         // The mail given up on before this start gets its one more try (P11.11b).

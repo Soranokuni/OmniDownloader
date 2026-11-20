@@ -439,7 +439,7 @@ async fn mail_preview(
     };
 
     let assist = llm.then(|| {
-        omni_email::assist::Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
+        omni_email::assist::Assist::new(&config.llm.endpoint, &config.llm.model, config.llm.clone())
     });
     for mail in &mails {
         let parsed = omni_email::assist::interpret(mail, &roster, &groups, &config.parser, assist.as_ref()).await;
@@ -1145,8 +1145,28 @@ async fn run_daemon(
     info!("============================================================");
 
     let config_path = paths.config.clone();
+    // Config v2 (P13.7): the flat v1 keys move into their sections, once, with a
+    // copy of the old file (secrets blanked) kept beside it.
+    match omni_core::config_v2::upgrade_file(&config_path) {
+        Ok(Some(up)) => {
+            info!("config.json upgraded to the v2 layout; the old file is kept as {:?}", up.backup);
+            for m in &up.moved {
+                info!("config.json: {m}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!("config.json was not upgraded to the v2 layout ({e:#}); its v1 keys are still read"),
+    }
     let mut config = AppConfig::load_from_file(&config_path)
         .with_context(|| format!("Failed loading configuration from {:?}", config_path))?;
+    let fatal = omni_core::config_v2::fatal(&config);
+    if !fatal.is_empty() {
+        let lines: Vec<String> = fatal.iter().map(|p| p.to_string()).collect();
+        anyhow::bail!("config.json cannot be used: {}", lines.join(" "));
+    }
+    for p in omni_core::config_v2::problems(&config) {
+        warn!("config.json: {p}");
+    }
 
     // Secrets live in an encrypted store, not in config.json (plan P2.6).
     // If this deployment still has a plaintext mailbox password in the config,
@@ -1922,7 +1942,7 @@ async fn run_daemon(
     let mut repair_env = repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
     if let (true, Some(model)) = (repair_llm_cfg.active(), repair_llm_cfg.model.as_deref()) {
         let client_cfg = omni_core::config::LlmConfig { timeout_secs: repair_llm_cfg.timeout.as_secs(), ..config.llm.clone() };
-        let client = omni_email::llm::LlmClient::from_settings(&config.ollama_endpoint, model, &client_cfg)
+        let client = omni_email::llm::LlmClient::from_settings(&config.llm.endpoint, model, &client_cfg)
             .with_reasoning_effort(config.repair.llm_reasoning_effort.clone());
         info!("Repair model rung on: model {model}, at most {} call(s) a day", repair_llm_cfg.max_calls_per_day);
         repair_env = repair_env.with_model(repair::LlmModel::new(client, config.repair.llm_max_tokens));

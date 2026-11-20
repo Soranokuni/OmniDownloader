@@ -277,8 +277,9 @@ impl TlsConfig {
             // an operator who configured TLS and got HTTP would have no way to
             // tell, and the `Secure` cookie flag would be wrong either way.
             anyhow::bail!(
-                "web.tls.cert_path points at {resolved:?}, which does not exist. Refusing to \
-                 start rather than silently serving the panels over plaintext HTTP."
+                "`tls.cert_path` = {cert:?} points at {resolved:?}, which does not exist. Refusing to \
+                 start rather than silently serving the panels over plaintext HTTP. Fix: put the \
+                 .pfx file there, correct tls.cert_path, or remove it to serve plain HTTP."
             );
         }
         Ok(Some(resolved))
@@ -450,11 +451,16 @@ pub enum LlmAuth {
     ApiKeyHeader,
 }
 
-/// The LLM assist. The server itself is `ollama_endpoint` + `ollama_model`
-/// (their names predate other providers; they hold any OpenAI-compatible
-/// base URL and model id). The key is `llm.api_key` in the secret store.
+/// The LLM assist. The server is `endpoint` (any OpenAI-compatible base URL)
+/// and `model`; until config v2 (P13.7) they were the top-level
+/// `ollama_endpoint` and `ollama_model`, which [`crate::config_v2::migrate_v1`] moves here. The
+/// key is `llm.api_key` in the secret store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
+    #[serde(default = "default_llm_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
     #[serde(default)]
     pub mode: LlmMode,
     #[serde(default = "default_llm_timeout")]
@@ -486,6 +492,29 @@ fn default_llm_provider() -> String {
     "custom".into()
 }
 
+fn default_llm_endpoint() -> String {
+    "http://localhost:11434/v1".to_string()
+}
+
+fn default_llm_model() -> String {
+    "google/gemma-4-e4b".to_string()
+}
+
+/// How the mailbox is read (config v2, P13.7). The mailbox itself and its app
+/// registration are `graph`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailConfig {
+    /// Seconds between two mailbox checks; read as at least 10. Until config
+    /// v2 the top-level `email_poll_interval_secs`.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self { poll_interval_secs: default_poll_interval() }
+    }
+}
 
 fn default_llm_timeout() -> u64 {
     30
@@ -498,6 +527,8 @@ fn default_llm_max_tokens() -> u32 {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            endpoint: default_llm_endpoint(),
+            model: default_llm_model(),
             mode: LlmMode::default(),
             timeout_secs: default_llm_timeout(),
             max_tokens: default_llm_max_tokens(),
@@ -904,24 +935,18 @@ pub struct AppConfig {
     #[serde(default = "default_concurrent_transcodes")]
     pub max_concurrent_transcodes: usize,
 
-    // Email ingest: the mailbox itself is `graph` below (plan P4.7).
+    // Email ingest: the mailbox itself is `graph` above (plan P4.7).
     /// Pre-Graph IMAP password, read so [`AppConfig::adopt_secrets`] can wipe
     /// it from an old config.json. IMAP is gone; the value is never stored,
     /// used or written back.
     #[serde(default, skip_serializing, rename = "email_password")]
     legacy_email_password: String,
 
-    #[serde(default = "default_poll_interval")]
-    pub email_poll_interval_secs: u64,
+    /// How often the mailbox is read (config v2, P13.7).
+    #[serde(default)]
+    pub mail: MailConfig,
 
-    // LLM configuration
-    #[serde(default = "default_ollama_endpoint")]
-    pub ollama_endpoint: String,
-
-    #[serde(default = "default_ollama_model")]
-    pub ollama_model: String,
-
-    /// LLM assist policy (plan P4.4). Endpoint and model stay above.
+    /// The LLM assist: server, model and policy (plan P4.4; config v2).
     ///
     /// There is deliberately no `system_prompt` any more (defect E-03): the
     /// deployed config.json overrode the tuned prompt with a one-liner and
@@ -1022,12 +1047,6 @@ fn default_concurrent_transcodes() -> usize {
 fn default_poll_interval() -> u64 {
     20
 }
-fn default_ollama_endpoint() -> String {
-    "http://localhost:11434/v1".to_string()
-}
-fn default_ollama_model() -> String {
-    "google/gemma-4-e4b".to_string()
-}
 
 fn default_channel() -> String {
     "stable".to_string()
@@ -1069,9 +1088,7 @@ impl Default for AppConfig {
             max_concurrent_downloads: default_concurrent_downloads(),
             max_concurrent_transcodes: default_concurrent_transcodes(),
             legacy_email_password: String::new(),
-            email_poll_interval_secs: default_poll_interval(),
-            ollama_endpoint: default_ollama_endpoint(),
-            ollama_model: default_ollama_model(),
+            mail: MailConfig::default(),
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             retry: RetryConfig::default(),
@@ -1132,8 +1149,8 @@ impl AppConfig {
         if p.exists() {
             let content = std::fs::read_to_string(p)
                 .with_context(|| format!("Failed reading config file at {:?}", p))?;
-            let config: AppConfig = serde_json::from_str(&content)
-                .with_context(|| format!("Failed parsing JSON from {:?}", p))?;
+            // v1 keys are read as v2; a bad value names its key, value and fix (P13.7).
+            let config = crate::config_v2::parse(&content, p)?;
             warn_on_removed_auth_mode(&content, p);
             Ok(config)
         } else {

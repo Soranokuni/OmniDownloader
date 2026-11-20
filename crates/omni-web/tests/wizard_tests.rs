@@ -694,7 +694,7 @@ async fn setup_is_complete_only_after_a_delivered_test_download_or_a_skip() -> R
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let id = r.json()["job_id"].as_i64().unwrap();
     let job = app.repo.get_job(id)?.unwrap();
-    assert_eq!((job.url.as_str(), job.slug.as_str()), (omni_core::config::DEFAULT_SETUP_TEST_URL, "1_MCR_OMNIINGEST-TEST"));
+    assert_eq!((job.url.as_str(), job.slug.as_str()), (omni_core::config::DEFAULT_SETUP_TEST_URL, "1_MCR_OMNIINGEST_TEST"));
     // Asked again while it runs: the same job, not a second one.
     let again = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
     assert_eq!((again.json()["job_id"].as_i64(), again.json()["new"].as_bool()), (Some(id), Some(false)), "{}", again.body);
@@ -707,16 +707,16 @@ async fn setup_is_complete_only_after_a_delivered_test_download_or_a_skip() -> R
     assert!(s.json()["file_name"].is_null());
 
     // Delivered: the file name is shown and setup completes.
-    let file = app.dir.path().join("watchfolder").join("1_MCR_OMNIINGEST-TEST.mxf");
+    let file = app.dir.path().join("watchfolder").join("1_MCR_OMNIINGEST_TEST.mxf");
     deliver(&app, id, &file.to_string_lossy())?;
     let s = send(&app, "GET", &format!("/api/admin/setup/test-download/{id}"), Some(&tok), None).await;
     assert_eq!(s.json()["delivered"].as_bool(), Some(true), "{}", s.body);
-    assert_eq!(s.json()["file_name"].as_str(), Some("1_MCR_OMNIINGEST-TEST.mxf"), "only the name, not the path");
+    assert_eq!(s.json()["file_name"].as_str(), Some("1_MCR_OMNIINGEST_TEST.mxf"), "only the name, not the path");
     let r = complete(json!({"mode": "beginner", "test_job_id": id})).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert!(AppConfig::load_from_file(app.dir.path().join("config.json"))?.setup_completed);
     let audit: Vec<String> = app.repo.get_recent_audit_logs(20)?.into_iter().map(|a| a.message).collect();
-    assert!(audit.iter().any(|m| m.contains(&format!("test download #{id} delivered as 1_MCR_OMNIINGEST-TEST.mxf"))), "{audit:?}");
+    assert!(audit.iter().any(|m| m.contains(&format!("test download #{id} delivered as 1_MCR_OMNIINGEST_TEST.mxf"))), "{audit:?}");
 
     // A second test is a new job, not "already delivered".
     let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
@@ -745,7 +745,7 @@ async fn only_a_test_job_the_pipeline_delivered_proves_the_setup() -> Result<()>
     assert_eq!(app.state.config.read().await.setup_test_url, "https://clips.news.example/test.mp4", "a changed link is kept");
     assert_eq!(app.repo.lease_job(WORKER, 3600)?.unwrap().id, id);
     // Its rename was recorded but the job still failed (say, the verify after it).
-    assert!(app.repo.set_delivered_file(id, WORKER, "watchfolder/1_MCR_OMNIINGEST-TEST.mxf", 19.0)?);
+    assert!(app.repo.set_delivered_file(id, WORKER, "watchfolder/1_MCR_OMNIINGEST_TEST.mxf", 19.0)?);
     assert!(app.repo.finish(id, WORKER, omni_core::models::JobStatus::Failed, Some("DOWNLOAD_FAILED"), Some("test failure"), None)?);
     assert!(app.repo.mark_completed_manually(id)?);
     let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": id}))).await;
@@ -865,8 +865,8 @@ async fn the_answer_file_reads_back_into_every_exported_setting() -> Result<()> 
     c.graph.client_secret = "zzz-graph-secret".into();
     c.llm.mode = omni_core::config::LlmMode::Off;
     c.llm.provider = "openai".into();
-    c.ollama_endpoint = "http://llm.example/v1".into();
-    c.ollama_model = "model-test".into();
+    c.llm.endpoint = "http://llm.example/v1".into();
+    c.llm.model = "model-test".into();
 
     let defaults = export(AppConfig::default()).await;
     let doc = export(c).await;

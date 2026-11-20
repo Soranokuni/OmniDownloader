@@ -218,8 +218,8 @@ pub fn apply(answers: &Value, base: AppConfig) -> Result<Applied, AnswerFileErro
                                 .map_err(|_| wrong(&k, "off, assist or primary"))?
                         }
                         "provider" => c.llm.provider = string(v, &k)?,
-                        "endpoint" => c.ollama_endpoint = string(v, &k)?,
-                        "model" => c.ollama_model = string(v, &k)?,
+                        "endpoint" => c.llm.endpoint = string(v, &k)?,
+                        "model" => c.llm.model = string(v, &k)?,
                         _ => return Err(AnswerFileError::Unknown { key: k }),
                     }
                 }
@@ -275,8 +275,8 @@ mod tests {
         assert_eq!(c.graph.mailbox, "ingest@newsroom.example");
         assert_eq!(c.llm.mode, LlmMode::Off);
         assert_eq!(c.llm.provider, "openai");
-        assert_eq!(c.ollama_endpoint, "http://llm.example/v1");
-        assert_eq!(c.ollama_model, "model-x");
+        assert_eq!(c.llm.endpoint, "http://llm.example/v1");
+        assert_eq!(c.llm.model, "model-x");
         // What it does not name keeps the base's value.
         assert_eq!(c.temp_path, AppConfig::default().temp_path);
     }

@@ -2206,7 +2206,7 @@ pub async fn api_system_status(
             cfg.watchfolder_path.clone(),
             cfg.temp_path.clone(),
             cfg.bin_dir.clone(),
-            cfg.ollama_model.clone(),
+            cfg.llm.model.clone(),
         )
     };
 
@@ -2908,12 +2908,15 @@ fn llm_settings(
         p.api_key.trim().to_string()
     } else if p.clear_key {
         String::new()
-    } else if same_base(&base, &saved.ollama_endpoint) {
+    } else if same_base(&base, &saved.llm.endpoint) {
         saved.llm.api_key.clone()
     } else {
         String::new()
     };
+    let model: String = p.model.trim().chars().take(200).collect();
     let cfg = omni_core::config::LlmConfig {
+        endpoint: base.clone(),
+        model: model.clone(),
         mode: p.mode,
         timeout_secs: p.timeout_secs.clamp(5, 300),
         max_tokens: p.max_tokens.clamp(50, 8000),
@@ -2926,7 +2929,7 @@ fn llm_settings(
         disable_thinking: p.disable_thinking,
         api_key: key,
     };
-    Ok((base, p.model.trim().chars().take(200).collect(), cfg))
+    Ok((base, model, cfg))
 }
 
 pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
@@ -2934,15 +2937,15 @@ pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): Stat
     Ok(Json(serde_json::json!({
         "mode": cfg.llm.mode,
         "provider": cfg.llm.provider,
-        "base_url": cfg.ollama_endpoint,
-        "model": cfg.ollama_model,
+        "base_url": cfg.llm.endpoint,
+        "model": cfg.llm.model,
         "auth": cfg.llm.auth,
         "timeout_secs": cfg.llm.timeout_secs,
         "max_tokens": cfg.llm.max_tokens,
         "disable_thinking": cfg.llm.disable_thinking,
         "keyword_polish": cfg.llm.keyword_polish,
         "key_set": !cfg.llm.api_key.is_empty(),
-        "online": !omni_email::llm::is_local_endpoint(&cfg.ollama_endpoint),
+        "online": !omni_email::llm::is_local_endpoint(&cfg.llm.endpoint),
         "in_use": state.llm.current().describe(),
     })))
 }
@@ -2964,12 +2967,10 @@ pub async fn api_admin_save_llm(
         state.secrets.set(key_key, payload.api_key.trim()).map_err(internal_error("Could not store the API key."))?;
     } else if payload.clear_key {
         state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
-    } else if !same_base(&base, &cfg.ollama_endpoint) && !cfg.llm.api_key.is_empty() {
+    } else if !same_base(&base, &cfg.llm.endpoint) && !cfg.llm.api_key.is_empty() {
         // A new provider does not inherit the old one's key.
         state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
     }
-    cfg.ollama_endpoint = base;
-    cfg.ollama_model = model;
     cfg.llm = llm;
     cfg.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
     let assist = omni_email::assist::Assist::from_config(&cfg);

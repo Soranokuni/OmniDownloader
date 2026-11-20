@@ -396,13 +396,13 @@ pub fn apply_answer_file_with(
     } else {
         AppConfig::default()
     };
-    let old_endpoint = base.ollama_endpoint.clone();
+    let old_endpoint = base.llm.endpoint.clone();
     let applied = omni_core::answer_file::apply(&doc, base)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("The answer file {} was not applied; nothing changed", answer.display()))?;
     let not_applied = || format!("The answer file {} was not applied; nothing changed", answer.display());
     install::check_config_watchfolder(paths, &applied.config, drives).with_context(not_applied)?;
-    let endpoint = applied.config.ollama_endpoint.trim().to_string();
+    let endpoint = applied.config.llm.endpoint.trim().to_string();
     if !endpoint.is_empty() {
         omni_email::llm::check_base_url(&endpoint)
             .map_err(|why| anyhow::anyhow!("llm.endpoint ({endpoint}): {why}"))
@@ -574,7 +574,7 @@ mod tests {
     fn a_new_llm_provider_in_an_answer_file_drops_the_stored_key_and_the_same_one_keeps_it() {
         let (dir, paths) = install();
         let mut base = AppConfig::default();
-        base.ollama_endpoint = "https://llm-a.example/v1".into();
+        base.llm.endpoint = "https://llm-a.example/v1".into();
         base.save_to_file(&paths.config).unwrap();
         let key = secret_keys::LLM_API_KEY;
         store(&paths).set(key, "sk-invented-test").unwrap();

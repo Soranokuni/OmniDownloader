@@ -666,7 +666,7 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
         body: [
           field('wz-test-url', 'Test link', url,
             'Saved as setup_test_url. Change it if this computer cannot reach YouTube.', 'YouTube’s first video, "Me at the zoo", 19 seconds'),
-          el('p', { class: 'note warn' }, 'The file is delivered into the watchfolder like any video: Dalet imports it as 1_MCR_OMNIINGEST-TEST. Remove it in Dalet afterwards if you do not want to keep it.'),
+          el('p', { class: 'note warn' }, 'The file is delivered into the watchfolder like any video: Dalet imports it as 1_MCR_OMNIINGEST_TEST. Remove it in Dalet afterwards if you do not want to keep it.'),
           el('div', { class: 'row' }, start, skip),
           stages, status, events, warn,
         ],
