@@ -220,6 +220,49 @@ strong.block { display: block; }
 }
 .toast-close:hover { color: var(--text); border-color: var(--text-dim); }
 
+/* Keyboard and accessibility (plan P12.8). One focus ring for every control
+ * and every card reached with J/K; real buttons where there were clickable
+ * spans and pictures, looking as before; less motion when asked for. */
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.lnk:focus-visible, .jcard .jc-name:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+[data-nav]:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+button.lnk {
+  display: inline;
+  font-family: var(--mono);
+  line-height: inherit;
+  text-align: left;
+  white-space: normal;
+  vertical-align: baseline;
+  margin: 0;
+}
+button.jc-name {
+  appearance: none; background: none; border: 0; padding: 0; margin: 0;
+  font-family: inherit; text-align: left; cursor: pointer;
+}
+.ap-pic, .ap-sheet-btn {
+  appearance: none; background: none; border: 0; padding: 0; margin: 0;
+  cursor: pointer; display: block; max-width: 100%;
+}
+.ap-pic.ap-zoom { cursor: zoom-in; }
+.ap-large { display: block; max-width: min(1200px, 90vw); max-height: 70vh; margin: 0 auto 8px; border-radius: 6px; }
+.dlg:has(.ap-large) { max-width: min(1240px, 94vw); }
+.keys-sheet { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: 14px; }
+.keys-sheet dt { text-align: right; }
+.keys-sheet dd { margin: 0; color: var(--text-dim); }
+kbd {
+  font-family: var(--mono); font-size: 13px;
+  padding: 1px 7px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;
+  background: #0e1220; color: var(--text);
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Nothing under 12 px: app.css's smaller sizes, raised on these pages. */
 thead th { font-size: 12px; }
 .badge { font-size: 12px; }

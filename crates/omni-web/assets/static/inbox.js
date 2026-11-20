@@ -17,18 +17,19 @@
  */
 
 import { api, el, render, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=2';
+import { toast } from '/static/toast.js?v=3';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=19';
-import { visible } from '/static/undo.js?v=3';
+} from '/static/desk.js?v=20';
+import { visible } from '/static/undo.js?v=4';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
-} from '/static/status.js?v=2';
-import { whyText } from '/static/worklist.js?v=2';
-import { t, tn } from '/static/text.js?v=1';
+} from '/static/status.js?v=3';
+import { whyText } from '/static/worklist.js?v=3';
+import { t, tn } from '/static/text.js?v=2';
+import { navCard } from '/static/keys.js?v=1';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -379,6 +380,8 @@ function createCard(id) {
   const head = el('button', { class: 'mail-head', type: 'button', 'aria-expanded': 'false' });
   head.addEventListener('click', () => toggle(id));
   head.addEventListener('keydown', moveFocus);
+  // J/K walk the mails too (keys.js); Enter on the head opens it, as a button does.
+  navCard(head);
   const inner = el('div', { class: 'mail-x-inner' });
   card.append(head, el('div', { class: 'mail-x' }, inner));
   return { card, head, inner, entry: null, sig: '' };
@@ -670,7 +673,8 @@ function setFold(wrap, show) {
 
 /* A link (or an attachment) in the text, tagged with the files it became. */
 function chipNode(id, text) {
-  const chip = el('span', { class: 'lnk', role: 'button', tabindex: '0', 'data-chip': id });
+  // A real button (P12.8): Enter and Space work as they do on any button.
+  const chip = el('button', { class: 'lnk', type: 'button', 'data-chip': id });
   chip.dataset.text = text;
   paintChip(chip);
   chip.addEventListener('mouseenter', () => hover({ chip: id }, true));
@@ -678,12 +682,6 @@ function chipNode(id, text) {
   chip.addEventListener('focus', () => hover({ chip: id }, true));
   chip.addEventListener('blur', () => hover({ chip: id }, false));
   chip.addEventListener('click', () => pickChip(id));
-  chip.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Enter' || ev.key === ' ') {
-      ev.preventDefault();
-      pickChip(id);
-    }
-  });
   return chip;
 }
 
@@ -741,19 +739,16 @@ function railShape() {
   ]);
 }
 
+/* A video's card beside the text. Not a button itself (it holds buttons,
+ * P12.8): its name is the button that selects it; a click anywhere else on
+ * the card does the same, for the mouse. */
 function jobCard(j) {
-  const card = el('div', { class: 'jcard', tabindex: '0', role: 'button', 'data-job': String(j.id) });
+  const card = el('div', { class: 'jcard', 'data-job': String(j.id) });
   const id = j.id;
   card.addEventListener('mouseenter', () => hover({ job: id }, true));
   card.addEventListener('mouseleave', () => hover({ job: id }, false));
   card.addEventListener('click', (ev) => {
     if (!ev.target.closest('button, input, a, summary, details')) select({ job: id }, 'rail');
-  });
-  card.addEventListener('keydown', (ev) => {
-    if (ev.target === card && (ev.key === 'Enter' || ev.key === ' ')) {
-      ev.preventDefault();
-      select({ job: id }, 'rail');
-    }
   });
   paintJob(card, j, true);
   return card;
@@ -771,13 +766,18 @@ function paintJob(card, j, force) {
   card.dataset.sig = sig;
   card.classList.toggle('child', !!j.place.parent);
   card.classList.toggle('sel', sel);
-  card.setAttribute('aria-pressed', String(sel));
+  const hadFocus = !!card.querySelector('.jc-name') && card.querySelector('.jc-name') === document.activeElement;
 
   const done = j.status === 'COMPLETED' || j.status === 'COMPLETED_MANUAL';
+  const name = done ? deliveredName(j) : fileName(j);
   const parts = [
     el('div', { class: 'jc-top' },
       statusTag(j, j.index_str),
-      el('span', { class: 'jc-name', title: done ? deliveredName(j) : fileName(j) }, done ? deliveredName(j) : fileName(j)),
+      // The card's own button (P12.8): selects it, with its history and the link in the text.
+      el('button', {
+        class: 'jc-name', type: 'button', title: name, 'aria-pressed': String(sel),
+        onClick: () => select({ job: j.id }, 'rail'),
+      }, name),
       railBadge(j)),
     subLine(j),
   ];
@@ -793,6 +793,7 @@ function paintJob(card, j, force) {
   const more = moreNode(j, sel);
   if (more) parts.push(more);
   card.replaceChildren(...parts);
+  if (hadFocus) card.querySelector('.jc-name')?.focus({ preventScroll: true });
 }
 
 function subLine(j) {

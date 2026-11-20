@@ -3,12 +3,12 @@
 import {
   api, el, render, live, fmtTime, logout,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=2';
+import { toast } from '/static/toast.js?v=3';
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
-import { statusBadge } from '/static/status.js?v=2';
-import { deferAction, hiddenNow } from '/static/undo.js?v=3';
-import { t, tn } from '/static/text.js?v=1';
+import { statusBadge } from '/static/status.js?v=3';
+import { deferAction, hiddenNow } from '/static/undo.js?v=4';
+import { t, tn } from '/static/text.js?v=2';
 
 /** Where a working video is, in words a journalist knows (`user.stage.<STAGE>`). */
 const stageText = (stage) => (stage ? t(`user.stage.${stage}`) : '—');

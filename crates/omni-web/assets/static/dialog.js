@@ -10,15 +10,70 @@
  * outside closes it as «Άκυρο», and the focus goes back to the button that
  * opened it. One dialog at a time: a second call while one is open answers
  * `false`.
+ *
+ * infoDialog (P12.8) is the same window with one «Κλείσιμο», for something
+ * to read, such as the keyboard shortcuts.
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=1';
+import { t } from '/static/text.js?v=2';
 
 let openNow = false;
 let seq = 0;
 
 const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
+/** Whether a dialog is open (the desk's shortcuts wait while one is). */
+export function dialogOpen() {
+  return openNow;
+}
+
+/**
+ * Show `box` in front of an inert page, with the focus kept inside it.
+ * `done(answer)` closes it and gives the focus back to whatever had it.
+ */
+function present(box, onAnswer) {
+  const opener = document.activeElement;
+  const overlay = el('div', { class: 'modal dlg-overlay' }, box);
+
+  // The page behind the dialog takes no focus and no clicks.
+  const inerted = [];
+  for (const node of document.body.children) {
+    if (!node.inert) { node.inert = true; inerted.push(node); }
+  }
+
+  const close = (answer) => {
+    document.removeEventListener('keydown', onKey, true);
+    overlay.remove();
+    for (const node of inerted) node.inert = false;
+    openNow = false;
+    if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus();
+    onAnswer(answer);
+  };
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      close(false);
+    } else if (ev.key === 'Tab') {
+      const items = [...box.querySelectorAll(FOCUSABLE)].filter((n) => !n.disabled);
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (ev.shiftKey && (document.activeElement === first || !box.contains(document.activeElement))) {
+        ev.preventDefault();
+        last.focus();
+      } else if (!ev.shiftKey && (document.activeElement === last || !box.contains(document.activeElement))) {
+        ev.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(false); });
+  document.addEventListener('keydown', onKey, true);
+  document.body.append(overlay);
+  return close;
+}
 
 /**
  * `body` is a string or an array of strings (one paragraph each). `danger`
@@ -28,7 +83,6 @@ export function confirmDialog({ title, body, confirm, cancel = t('dialog.cancel'
   if (openNow) return Promise.resolve(false);
   openNow = true;
   return new Promise((resolve) => {
-    const opener = document.activeElement;
     const id = ++seq;
     const paragraphs = (Array.isArray(body) ? body : [body]).filter(Boolean);
     const no = el('button', { class: 'btn', type: 'button' }, cancel);
@@ -43,46 +97,26 @@ export function confirmDialog({ title, body, confirm, cancel = t('dialog.cancel'
     el('h2', { class: 'dlg-title', id: `dlg-title-${id}` }, title),
     el('div', { id: `dlg-body-${id}` }, paragraphs.map((p) => el('p', { class: 'dlg-text' }, p))),
     el('div', { class: 'row dlg-actions' }, no, yes));
-    const overlay = el('div', { class: 'modal dlg-overlay' }, box);
-
-    // The page behind the dialog takes no focus and no clicks.
-    const inerted = [];
-    for (const node of document.body.children) {
-      if (!node.inert) { node.inert = true; inerted.push(node); }
-    }
-
-    const close = (answer) => {
-      document.removeEventListener('keydown', onKey, true);
-      overlay.remove();
-      for (const node of inerted) node.inert = false;
-      openNow = false;
-      if (opener && opener.isConnected && typeof opener.focus === 'function') opener.focus();
-      resolve(answer);
-    };
-    const onKey = (ev) => {
-      if (ev.key === 'Escape') {
-        ev.preventDefault();
-        ev.stopPropagation();
-        close(false);
-      } else if (ev.key === 'Tab') {
-        const items = [...box.querySelectorAll(FOCUSABLE)].filter((n) => !n.disabled);
-        if (!items.length) return;
-        const first = items[0];
-        const last = items[items.length - 1];
-        if (ev.shiftKey && (document.activeElement === first || !box.contains(document.activeElement))) {
-          ev.preventDefault();
-          last.focus();
-        } else if (!ev.shiftKey && (document.activeElement === last || !box.contains(document.activeElement))) {
-          ev.preventDefault();
-          first.focus();
-        }
-      }
-    };
+    const close = present(box, resolve);
     no.addEventListener('click', () => close(false));
     yes.addEventListener('click', () => close(true));
-    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(false); });
-    document.addEventListener('keydown', onKey, true);
-    document.body.append(overlay);
     no.focus();
+  });
+}
+
+/** Something to read: `content` (nodes) under `title`, one «Κλείσιμο». */
+export function infoDialog({ title, content }) {
+  if (openNow) return Promise.resolve(false);
+  openNow = true;
+  return new Promise((resolve) => {
+    const id = ++seq;
+    const done = el('button', { class: 'btn btn-primary', type: 'button' }, t('page.close'));
+    const box = el('div', { class: 'modal-body dlg', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': `dlg-title-${id}` },
+      el('h2', { class: 'dlg-title', id: `dlg-title-${id}` }, title),
+      content,
+      el('div', { class: 'row dlg-actions' }, done));
+    const close = present(box, resolve);
+    done.addEventListener('click', () => close(true));
+    done.focus();
   });
 }

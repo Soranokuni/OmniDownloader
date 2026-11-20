@@ -15,24 +15,25 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=2';
+import { toast } from '/static/toast.js?v=3';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=19';
-import { deferAction, visible } from '/static/undo.js?v=3';
-import { confirmDialog } from '/static/dialog.js?v=2';
-import { STATUS, statusBadge } from '/static/status.js?v=2';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=2';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=26';
+} from '/static/desk.js?v=20';
+import { deferAction, visible } from '/static/undo.js?v=4';
+import { confirmDialog } from '/static/dialog.js?v=3';
+import { STATUS, statusBadge } from '/static/status.js?v=3';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=3';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=27';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=14';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=14';
-import { t, tn, applyText } from '/static/text.js?v=1';
+} from '/static/notify.js?v=15';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=15';
+import { t, tn, applyText } from '/static/text.js?v=2';
+import { initKeys, navCard } from '/static/keys.js?v=1';
 
 // The page's fixed words (header, tabs, the broadcast specification) come
 // from the same dictionary as everything else (P12.7).
@@ -74,6 +75,14 @@ function switchTab(name) {
   if (name === 'journalists') loadJournalists();
   refresh();
 }
+
+// The keyboard (P12.8): J/K walk the list of the open tab, `/` goes to its search.
+const NAV_LIST = { email: 'inbox-list', review: 'tab-review', queue: 'queue-cards' };
+const SEARCH = { email: 'inbox-search', review: 'review-search', completed: 'completed-search' };
+initKeys({
+  listOf: () => document.getElementById(NAV_LIST[currentTab] || ''),
+  searchFieldOf: () => document.getElementById(SEARCH[currentTab] || ''),
+});
 
 for (const button of document.querySelectorAll('.tab[data-tab]')) {
   button.addEventListener('click', () => switchTab(button.dataset.tab));
@@ -535,7 +544,8 @@ function queueSig(job) {
 function activeCard(job) {
   const progress = Number(job.progress) || 0;
   const running = job.status === 'RUNNING';
-  return el('div', { class: 'card stack' },
+  // J/K reach it (P12.8); its actions are its own buttons.
+  return navCard(el('div', { class: 'card stack' },
     el('div', { class: 'job-head' },
       el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
@@ -581,11 +591,11 @@ function activeCard(job) {
         el('span', {}, running && job.eta && job.eta !== '--:--' ? t('queue.eta', { eta: job.eta }) : ''),
       ),
     ),
-  );
+  ));
 }
 
 function deliveredCard(job) {
-  return el('div', { class: 'card' },
+  return navCard(el('div', { class: 'card' },
     el('div', { class: 'job-head' },
       el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
@@ -603,7 +613,7 @@ function deliveredCard(job) {
       ),
     ),
     autoDeliveredNode(job, refresh),
-  );
+  ));
 }
 
 // Nothing is deleted: the delivered videos stay in «Ολοκληρωμένα». They leave
@@ -1019,7 +1029,7 @@ function reviewCard(job) {
         : null)
     : null;
 
-  return el('div', { class: 'card attention stack', 'data-job': String(job.id) },
+  const card = el('div', { class: 'card attention stack', 'data-job': String(job.id) },
     el('div', { class: 'job-head' },
       el('div', { class: 'row head-row' },
         el('span', { class: 'job-id' }, String(job.id)),
@@ -1042,6 +1052,11 @@ function reviewCard(job) {
     more,
     tech,
   );
+  // J/K reach the card; Enter opens «Περισσότερα»; R retries (not a file-locker link) (P12.8).
+  return navCard(card, {
+    open: () => { more.open = !more.open; },
+    retry: locker ? null : () => retryJob(job),
+  });
 }
 
 const retryJob = (job) => deskRetry(job, refresh);

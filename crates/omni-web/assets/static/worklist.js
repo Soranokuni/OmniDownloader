@@ -9,8 +9,8 @@
  * Pure: no DOM, no requests. mcr.js builds the cards from what this says.
  */
 
-import { t } from '/static/text.js?v=1';
-import EL from '/static/text.el.js?v=1';
+import { t } from '/static/text.js?v=2';
+import EL from '/static/text.el.js?v=2';
 
 /** The groups after «Για έγκριση», in the order they are shown (their names
  *  are `work.group.<key>` in text.el.js). `primary` is the one action the

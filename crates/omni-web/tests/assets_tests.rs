@@ -378,20 +378,21 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 19),
-        ("inbox.js", 26),
-        ("approval.js", 14),
-        ("notify.js", 14),
-        ("mcr.js", 52),
-        ("status.js", 2),
-        ("status.css", 5),
-        ("worklist.js", 2),
-        ("undo.js", 3),
-        ("dialog.js", 2),
-        ("user.js", 12),
-        ("toast.js", 2),
-        ("text.js", 1),
-        ("text.el.js", 1),
+        ("desk.js", 20),
+        ("inbox.js", 27),
+        ("approval.js", 15),
+        ("notify.js", 15),
+        ("mcr.js", 53),
+        ("status.js", 3),
+        ("status.css", 6),
+        ("worklist.js", 3),
+        ("undo.js", 4),
+        ("dialog.js", 3),
+        ("keys.js", 1),
+        ("user.js", 13),
+        ("toast.js", 3),
+        ("text.js", 2),
+        ("text.el.js", 2),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -747,7 +748,7 @@ fn the_desk_uses_no_native_dialogs() {
     };
     let desk_modules = [
         "app.js", "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js",
-        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js",
+        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js", "keys.js",
     ];
     for module in desk_modules {
         let src = code(module);
@@ -929,7 +930,7 @@ fn the_desk_is_laid_out_for_the_control_room() {
     // No static inline styles: only a progress width, a CSS variable and a computed scroll margin.
     for module in [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js", "dialog.js",
-        "toast.js",
+        "toast.js", "keys.js",
     ] {
         let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
         for (i, _) in src.match_indices("style: ") {
@@ -1043,7 +1044,7 @@ fn every_word_of_the_desk_is_in_one_dictionary() {
     let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
     let modules = [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
-        "dialog.js", "toast.js", "text.js",
+        "dialog.js", "toast.js", "text.js", "keys.js",
     ];
 
     // The lookup: a language switch, Greek the default and the fallback.
@@ -1145,12 +1146,82 @@ fn every_word_of_the_desk_is_in_one_dictionary() {
     assert!(words["health.database.todo.down"].contains("αντίγραφο ασφαλείας"), "a damaged database does not say to restore the backup");
 }
 
+/// P12.8: keyboard and accessibility. J/K (and the arrows on a card) walk the work list, Enter
+/// opens a card, R retries, A approves through the dialog, `/` searches, `?` shows the shortcuts;
+/// none of it fires while typing, with a modifier, or under a dialog. Real buttons only (no
+/// `role=button`, so no button inside one); the pictures that seek or open large are buttons; one
+/// focus ring; less motion when the system asks for it.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v12() {
+fn the_desk_works_from_the_keyboard() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let code = |module: &str| -> String {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    let keys = code("keys.js");
+    let handler = function_body(&keys, "onKey");
+    for needle in [
+        "key === 'j'", "key === 'k'", "(key === 'ArrowDown' && here)", "(key === 'ArrowUp' && here)",
+        "key === 'Enter' && here.acts.open", "key === 'r'", "key === 'a'", "key === '/'", "key === '?'",
+    ] {
+        assert!(handler.contains(needle), "the keyboard lost {needle}");
+    }
+    for guard in ["ev.ctrlKey", "ev.metaKey", "ev.altKey", "dialogOpen()", "typing(ev.target)"] {
+        assert!(handler.contains(guard), "a shortcut fires despite {guard}");
+    }
+    let typing = function_body(&keys, "typing");
+    assert!(typing.contains("isContentEditable") && typing.contains("'INPUT', 'TEXTAREA', 'SELECT'"), "typing is not recognised");
+    // The sheet lists every shortcut, in words from the dictionary.
+    let sheet = keys.split("export const SHORTCUTS = [").nth(1).and_then(|s| s.split("];").next()).expect("SHORTCUTS");
+    for (name, key) in [("J", "keys.next"), ("K", "keys.prev"), ("Enter", "keys.open"), ("R", "keys.retry"), ("A", "keys.approve"), ("/", "keys.search"), ("?", "keys.sheet")] {
+        assert!(sheet.contains(&format!("'{name}")) && sheet.contains(&format!("'{key}'")) && words.contains_key(key), "the sheet lacks {name}");
+    }
+    // The cards take part: review cards open and retry (never a file-locker link), held videos approve via the dialog.
+    let mcr = code("mcr.js");
+    assert!(mcr.contains("initKeys({"), "the desk never listens to the keyboard");
+    let card = function_body(&mcr, "reviewCard");
+    assert!(card.contains("return navCard(card, {") && card.contains("retry: locker ? null :"), "a review card is not on the keyboard");
+    let approval = code("approval.js");
+    assert!(approval.contains("navCard(node, {") && approval.contains("approve: () => { if (!approve.disabled) approve.click(); }"), "A does not go through the approve button (and its dialog)");
+    assert!(code("inbox.js").contains("navCard(head)"), "J/K do not walk the mails");
+
+    // Real buttons only.
+    let desk_modules = [
+        "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
+        "dialog.js", "toast.js", "keys.js", "text.js",
+    ];
+    for module in desk_modules {
+        let src = code(module);
+        assert!(!src.contains("role: 'button'"), "{module} makes a button out of something else");
+        assert!(!src.contains("behavior: 'smooth'"), "{module} scrolls smoothly whatever the person asked for");
+    }
+    for page in ["mcr.html", "user.html"] {
+        assert!(!assets.get(page).unwrap().contains("role=\"button\""), "{page} makes a button out of something else");
+    }
+    let inbox = code("inbox.js");
+    assert!(function_body(&inbox, "chipNode").contains("el('button', { class: 'lnk', type: 'button'"), "a link in the text is not a button");
+    assert!(function_body(&inbox, "jobCard").contains("el('div', { class: 'jcard', 'data-job'"), "a video's card is still a button holding buttons");
+    // Pictures: buttons, from the keyboard too.
+    assert!(!approval.contains("el('img', {") || !approval.split("el('img', {").skip(1).any(|s| s.split(')').next().unwrap_or("").contains("onClick")), "a picture is clicked but is not a button");
+    assert!(function_body(&approval, "figure").contains("el('button', {"), "the article picture and frame are not buttons");
+    let sheet_btn = function_body(&approval, "sheetButton");
+    assert!(sheet_btn.contains("ev.key !== 'ArrowRight' && ev.key !== 'ArrowLeft'") && sheet_btn.contains("aria-label"), "the contact sheet does not work from the keyboard");
+
+    // One focus ring; less motion when asked.
+    let css = assets.get("static/status.css").unwrap();
+    assert!(css.contains(":focus-visible { outline: 3px solid var(--accent)"), "no focus ring");
+    let motion = css.split("@media (prefers-reduced-motion: reduce) {").nth(1).expect("no reduced-motion rule");
+    assert!(motion.contains("animation-duration: 0.01ms !important") && motion.contains("transition-duration: 0.01ms !important"), "motion is not reduced");
+    assert!(code("desk.js").contains("matchMedia('(prefers-reduced-motion: reduce)')"), "scrolling ignores the reduced-motion setting");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v13() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=12"), "user.html does not import user.js?v=12");
-    assert!(!page.contains("/static/user.js?v=11"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=13"), "user.html does not import user.js?v=13");
+    assert!(!page.contains("/static/user.js?v=12"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

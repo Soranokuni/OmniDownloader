@@ -9,11 +9,11 @@
  */
 
 import { api, el, render } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=2';
-import { STATUS } from '/static/status.js?v=2';
-import { deferAction, undoToast } from '/static/undo.js?v=3';
-import { confirmDialog } from '/static/dialog.js?v=2';
-import { t, tn } from '/static/text.js?v=1';
+import { toast } from '/static/toast.js?v=3';
+import { STATUS } from '/static/status.js?v=3';
+import { deferAction, undoToast } from '/static/undo.js?v=4';
+import { confirmDialog } from '/static/dialog.js?v=3';
+import { t, tn } from '/static/text.js?v=2';
 
 /** What a job is doing, for a person (`stage.<STAGE>` in text.el.js). */
 const STAGES = ['QUEUED', 'EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER', 'ARCHIVE', 'DONE'];
@@ -136,6 +136,12 @@ export function limitNote(job) {
   return el('span', { class: 'badge gap-left', title: t('desk.limit.title') }, tn('desk.limit', n));
 }
 
+/** 'smooth', or 'auto' for a person who asked the system for less motion (P12.8). */
+const lessMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+export function scrollBehavior() {
+  return lessMotion.matches ? 'auto' : 'smooth';
+}
+
 export function fileName(job) {
   return `${job.slug}.mxf`;
 }
@@ -159,7 +165,7 @@ export function pager(targetId, state, total, onChange) {
   }
   const first = (state.page - 1) * state.perPage + 1;
   const last = Math.min(total, state.page * state.perPage);
-  const go = (p) => { state.page = p; onChange(); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+  const go = (p) => { state.page = p; onChange(); window.scrollTo({ top: 0, behavior: scrollBehavior() }); };
   render(targetId, el('div', { class: 'section-head card pager' },
     el('span', { class: 'note' }, t('pager.showing', { first, last, total })),
     el('div', { class: 'row tight' },

@@ -10,11 +10,12 @@
  */
 
 import { api, el, fmtDuration, safeHref } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=2';
-import { fileName, clock, confirmWrongVideo } from '/static/desk.js?v=19';
-import { confirmDialog } from '/static/dialog.js?v=2';
-import { statusBadge } from '/static/status.js?v=2';
-import { t, tn } from '/static/text.js?v=1';
+import { toast } from '/static/toast.js?v=3';
+import { fileName, clock, confirmWrongVideo, scrollBehavior } from '/static/desk.js?v=20';
+import { confirmDialog, infoDialog } from '/static/dialog.js?v=3';
+import { navCard } from '/static/keys.js?v=1';
+import { statusBadge } from '/static/status.js?v=3';
+import { t, tn } from '/static/text.js?v=2';
 
 const cards = new Map(); // job id -> { node, job, expiry }
 let wantedFocus = null;
@@ -38,7 +39,7 @@ function applyFocus() {
   // Clear of the sticky page header, whatever height it has wrapped to.
   const bar = document.querySelector('.topbar');
   card.node.style.scrollMarginTop = `${(bar ? bar.offsetHeight : 60) + 12}px`;
-  card.node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  card.node.scrollIntoView({ behavior: scrollBehavior(), block: 'start' });
   card.node.focus({ preventScroll: true });
   card.node.classList.add('hl');
   setTimeout(() => card.node.classList.remove('hl'), 2500);
@@ -99,28 +100,57 @@ const previewUrl = (job, kind) => `/api/jobs/${job.id}/preview/${kind}`;
 const SHEET_COLS = 4;
 const SHEET_ROWS = 3;
 
-function seekFromSheet(ev, img, video, held) {
-  const rect = img.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
-  const col = Math.min(SHEET_COLS - 1, Math.max(0, Math.floor(((ev.clientX - rect.left) / rect.width) * SHEET_COLS)));
-  const row = Math.min(SHEET_ROWS - 1, Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * SHEET_ROWS)));
-  const tiles = SHEET_COLS * SHEET_ROWS;
+const TILES = SHEET_COLS * SHEET_ROWS;
+
+/** Put the video at the middle of tile `tile` (0..11) of the contact sheet. */
+function seekToTile(video, held, tile) {
   const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number(held.duration) || 0;
   if (!duration) return;
-  video.currentTime = ((row * SHEET_COLS + col + 0.5) * duration) / tiles;
+  video.currentTime = ((tile + 0.5) * duration) / TILES;
+}
+
+/** The tile under a pointer click on the sheet's picture. */
+function tileAt(ev, img) {
+  const rect = img.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const col = Math.min(SHEET_COLS - 1, Math.max(0, Math.floor(((ev.clientX - rect.left) / rect.width) * SHEET_COLS)));
+  const row = Math.min(SHEET_ROWS - 1, Math.max(0, Math.floor(((ev.clientY - rect.top) / rect.height) * SHEET_ROWS)));
+  return row * SHEET_COLS + col;
+}
+
+/**
+ * The contact sheet as a real button (P12.8): a click goes to the frame
+ * under the pointer; from the keyboard, ← and → pick a frame and go there,
+ * Enter goes to the one picked. Its name says which frame.
+ */
+function sheetButton(job, held, video) {
+  const img = el('img', { class: 'ap-sheet', src: previewUrl(job, 'contact'), alt: '' });
+  const button = el('button', { class: 'ap-sheet-btn', type: 'button', title: t('approval.sheet.title') }, img);
+  let tile = 0;
+  const name = () => button.setAttribute('aria-label', t('approval.sheet.frame', { n: tile + 1, of: TILES }));
+  name();
+  button.addEventListener('click', (ev) => {
+    // A pointer click knows where it landed; Enter or Space (detail 0) goes to the frame picked.
+    const at = ev.detail > 0 ? tileAt(ev, img) : null;
+    if (at !== null) tile = at;
+    name();
+    seekToTile(video, held, tile);
+  });
+  button.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'ArrowRight' && ev.key !== 'ArrowLeft') return;
+    ev.preventDefault();
+    tile = (tile + (ev.key === 'ArrowRight' ? 1 : TILES - 1)) % TILES;
+    name();
+    seekToTile(video, held, tile);
+  });
+  return button;
 }
 
 function mediaNode(job, held) {
   const pv = held.preview || {};
   if (pv.video) {
     const video = el('video', { class: 'ap-video', controls: true, preload: 'metadata', src: previewUrl(job, 'video') });
-    const sheet = pv.contact
-      ? el('img', {
-        class: 'ap-sheet', src: previewUrl(job, 'contact'), alt: t('approval.sheet.alt'),
-        title: t('approval.sheet.title'),
-        onClick: (ev) => seekFromSheet(ev, ev.currentTarget, video, held),
-      })
-      : null;
+    const sheet = pv.contact ? sheetButton(job, held, video) : null;
     return el('div', { class: 'ap-media' }, video, sheet);
   }
   if (pv.audio_only) {
@@ -244,18 +274,29 @@ function buildCard(job, ctx) {
     el('div', { class: 'row' }, approve, wrong, next, toggle, markDone, history[0], status),
     form,
     history[1]);
+  // J/K reach the card; Enter opens its history; A asks to approve, as the button does (P12.8).
+  navCard(node, {
+    open: () => history[0].click(),
+    approve: () => { if (!approve.disabled) approve.click(); },
+  });
   return { node, job, expiry };
 }
 
-/** One picture with its caption; `onClick` makes it a button that seeks the video. */
+/**
+ * One picture with its caption, as a real button (P12.8): `onClick` seeks the
+ * video (the nearest frame); without one, it opens the picture large.
+ */
 function figure(src, alt, caption, onClick) {
-  const img = el('img', { src, alt });
-  if (onClick) {
-    img.classList.add('ap-seek');
-    img.title = t('approval.seek');
-    img.addEventListener('click', onClick);
-  }
-  return el('figure', { class: 'ap-figure' }, img, el('figcaption', { class: 'note' }, caption));
+  const img = el('img', { src, alt: '' });
+  const open = onClick || (() => infoDialog({ title: caption, content: el('img', { class: 'ap-large', src, alt }) }));
+  const button = el('button', {
+    class: `ap-pic ${onClick ? 'ap-seek' : 'ap-zoom'}`,
+    type: 'button',
+    title: onClick ? t('approval.seek') : t('approval.zoom'),
+    'aria-label': `${alt} · ${onClick ? t('approval.seek') : t('approval.zoom')}`,
+    onClick: open,
+  }, img);
+  return el('figure', { class: 'ap-figure' }, button, el('figcaption', { class: 'note' }, caption));
 }
 
 /**

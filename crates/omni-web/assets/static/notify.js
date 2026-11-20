@@ -22,8 +22,8 @@
  */
 
 import { api, el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=2';
-import { t, tn, has } from '/static/text.js?v=1';
+import { toast } from '/static/toast.js?v=3';
+import { t, tn, has } from '/static/text.js?v=2';
 
 const POLL_MS = 8000;
 const PREF_KEY = 'omni.mcr.chime';

@@ -319,7 +319,6 @@ export default {
   'approval.check.passed': 'πέρασε',
   'approval.check.failed': 'απέτυχε',
   'approval.checks': 'Έλεγχοι',
-  'approval.sheet.alt': 'Καρέ από όλο το βίντεο',
   'approval.sheet.title': 'Πατήστε σε ένα καρέ για να πάτε εκεί',
   'approval.no_preview': 'Δεν υπάρχει προεπισκόπηση· ανοίξτε τον σύνδεσμο.',
   'approval.changed': 'Το βίντεο άλλαξε ή δεν περιμένει πια έγκριση',
@@ -610,6 +609,19 @@ export default {
   'spec.channels.value': '1 Αριστερό, 2 Δεξί, 3–8 σιωπή',
   'spec.wrap': 'Περιτύλιγμα',
   'spec.wrap.value': 'SMPTE RDD9 OP1a (bmxtranswrap)',
+
+  // ---- The keyboard (keys.js) and pictures (approval.js) ----
+  'keys.title': 'Συντομεύσεις πληκτρολογίου',
+  'keys.next': 'Επόμενη κάρτα της λίστας',
+  'keys.prev': 'Προηγούμενη κάρτα της λίστας',
+  'keys.open': 'Άνοιγμα της κάρτας (Περισσότερα ή Ιστορικό)',
+  'keys.retry': 'Δοκιμή ξανά για την κάρτα',
+  'keys.approve': 'Έγκριση → Dalet για το βίντεο που περιμένει (ρωτά πρώτα)',
+  'keys.search': 'Αναζήτηση στην καρτέλα',
+  'keys.sheet': 'Αυτή η λίστα',
+  'keys.escape': 'Κλείσιμο παραθύρου ή πεδίου',
+  'approval.sheet.frame': 'Καρέ {n} από {of}: πατήστε για να πάτε εκεί· τα βέλη αλλάζουν καρέ',
+  'approval.zoom': 'Πατήστε για να δείτε την εικόνα μεγάλη',
 
   // ---- «Αναίρεση», the dialog, messages (undo.js, dialog.js, toast.js) ----
   'undo.button': 'Αναίρεση',

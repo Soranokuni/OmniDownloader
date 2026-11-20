@@ -131,6 +131,14 @@ switched on yet at every station; ask MCR.
 
 The number on each tab is how many items are in it.
 
+**Keyboard.** **J** / **K** move to the next / previous card of the list on
+screen (the mails, the cards of «Χρειάζονται έλεγχο», the videos of
+«Σε εξέλιξη»); once a card has the focus, the arrow keys do the same.
+**Enter** opens the card («Περισσότερα», or a held video's history),
+**R** is «Δοκιμή ξανά», **A** is «Έγκριση → Dalet» (it still asks first),
+**/** jumps to the tab's search, **?** shows these shortcuts and **Esc**
+closes a window or a field. Nothing happens while you type in a field.
+
 ### 4.3 The «Εισερχόμενα» tab (the mails)
 
 Filters along the top:
