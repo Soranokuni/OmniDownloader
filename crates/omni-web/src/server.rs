@@ -85,6 +85,7 @@ impl WebServer {
             .route("/api/groups/:code", post(api_delete_group))
             .route("/api/journalists/:surname/groups", post(api_set_journalist_groups))
             .route("/api/system/status", get(api_system_status))
+            .route("/api/cookies/waiting", get(api_login_waits))
             .route("/api/events", get(api_events))
             // The mail view (plan P7.8).
             .route("/api/mails", get(api_get_mails))

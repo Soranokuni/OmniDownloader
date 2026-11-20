@@ -2226,6 +2226,64 @@ pub async fn api_health(State(state): State<AppState>) -> Response {
 /// checked again. A panel that reports a healthy mailbox while the mailbox is
 /// refusing the password is worse than a panel that reports nothing, because an
 /// operator who trusts it stops looking there.
+/// One site whose login wall holds jobs in review (P11.12).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LoginWaitSite {
+    /// The jar domain (`x.com`), never an address.
+    pub site: String,
+    pub count: usize,
+    /// What the site's jar lacks: `missing`, `expired` or `failed`.
+    pub jar: omni_core::cookies::JarWant,
+    pub newest_job_id: i64,
+    pub newest_slug: String,
+    pub newest_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The jobs in review behind a login wall, per site whose jar is missing,
+/// expired or failed its last test, the most jobs first (P11.12). `jobs` come
+/// newest first. A job whose site the link does not tell (a news article's
+/// embedded player) and a site whose jar looks usable are left out.
+pub fn login_waits(
+    jobs: &[omni_core::repository::LoginWallJob],
+    jars: &[omni_core::cookies::CookieJarInfo],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<LoginWaitSite> {
+    let jar_of = |d: &str| jars.iter().find(|j| j.domain == d);
+    let mut sites: Vec<LoginWaitSite> = Vec::new();
+    for job in jobs {
+        let Some((site, _)) = omni_broadcast::errors::login_wall_site(&job.url, |d| jar_of(d).is_some()) else {
+            continue;
+        };
+        let Some(want) = omni_core::cookies::jar_want(jar_of(&site), now) else {
+            continue;
+        };
+        match sites.iter_mut().find(|s| s.site == site) {
+            Some(s) => s.count += 1,
+            None => sites.push(LoginWaitSite {
+                site,
+                count: 1,
+                jar: want,
+                newest_job_id: job.id,
+                newest_slug: job.slug.clone(),
+                newest_at: job.created_at,
+            }),
+        }
+    }
+    sites.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.site.cmp(&b.site)));
+    sites
+}
+
+/// The desk's «N βίντεο περιμένουν σύνδεση στο site» card (P11.12): jobs in
+/// review behind a login wall, per site whose jar is missing, expired or
+/// failed. Sites and slugs only, never an address or a cookie.
+pub async fn api_login_waits(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let jobs = state.repo.login_wall_jobs().map_err(internal_error("Could not read the jobs in review."))?;
+    let jars = state.repo.list_cookie_jars().map_err(internal_error("Could not read the cookie jars."))?;
+    let sites = login_waits(&jobs, &jars, chrono::Utc::now());
+    let total: usize = sites.iter().map(|s| s.count).sum();
+    Ok(Json(serde_json::json!({ "total": total, "sites": sites })))
+}
+
 pub async fn api_system_status(
     RequireMcr(_): RequireMcr,
     State(state): State<AppState>,

@@ -786,8 +786,10 @@ opens Edge on its own profile; sign in, close the window, and the cookies are
 stored. The Cookies card shows this command ready to copy.
 
 `youtu.be` uses the `youtube.com` jar; `twitter.com` is stored as `x.com`.
-Every jar is re-tested nightly; the `cookies` health line warns 7 days before
-they expire.
+Every jar is re-tested nightly; the `cookies` health line is computed again
+every day and warns 7 days before they expire. While jobs in review wait for a
+site's login (no jar, an expired one, or one that failed its test), the MCR
+desk counts them per site.
 
 YouTube cookies are optional: most YouTube links work without them. Add them
 only if LOGIN_REQUIRED keeps coming back.

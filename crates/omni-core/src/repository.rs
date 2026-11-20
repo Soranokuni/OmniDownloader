@@ -784,6 +784,16 @@ pub struct ShadowJob {
     pub status: String,
 }
 
+/// A job in review behind a login wall (P11.12). The link is for grouping by
+/// site only and is never sent to a client.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoginWallJob {
+    pub id: i64,
+    pub slug: String,
+    pub url: String,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// A job that waits for a person (P11.14), and since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitingForPerson {
@@ -8189,6 +8199,31 @@ impl Repository {
     pub fn delete_cookie_jar(&self, domain: &str) -> Result<bool> {
         let conn = self.pool.get()?;
         Ok(conn.execute("DELETE FROM cookie_jars WHERE domain = ?", params![domain])? > 0)
+    }
+
+    /// The jobs in review that failed on a login wall (`LOGIN_REQUIRED`, P11.12),
+    /// newest first: on the review tab (not tidied off it) and with nothing
+    /// delivered or on its way to the watchfolder. One query.
+    pub fn login_wall_jobs(&self) -> Result<Vec<LoginWallJob>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, slug, url, created_at FROM queue
+              WHERE status = 'REQUIRES_REVIEW' AND error_code = 'LOGIN_REQUIRED'
+                AND cleared_at IS NULL AND file_path IS NULL AND delivered_at IS NULL
+                AND delivering_to IS NULL AND delivery_wait = 0
+              ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![], |r| {
+                Ok(LoginWallJob {
+                    id: r.get(0)?,
+                    slug: r.get(1)?,
+                    url: r.get(2)?,
+                    created_at: timestamps::parse_opt(r.get::<_, Option<String>>(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// The outcome of a test of the jar for `domain`, and the address it used.

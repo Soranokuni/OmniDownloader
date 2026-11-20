@@ -739,14 +739,27 @@ fn broken_sites(repo: &Repository) -> Vec<String> {
 }
 
 /// What one site's self-heal says, to the audit log: hosts and outcomes only.
-fn announce_heal(repo: &Repository, heal: &crate::repair::SiteHeal) {
+fn announce_heal(repo: &Repository, heal: &crate::repair::SiteHeal, mode: RepairMode) {
     if heal.found.is_some() {
-        info!("Self-heal: {}: a new way to find the video was found; the next job there is held for MCR", heal.domain);
-        let _ = repo.log_audit(
-            "INFO",
-            "SYSTEM",
-            &format!("Site {}: a new way to find its video was found on its canary pages; the next job there waits for MCR's approval", heal.domain),
-        );
+        let (log, audit) = heal_announcement(&heal.domain, mode);
+        info!("{log}");
+        let _ = repo.log_audit("INFO", "SYSTEM", &audit);
+    }
+}
+
+/// The log and audit lines of a self-heal that found a way, worded by `mode`:
+/// in shadow nothing is held, so they say it would be once repair is in hold.
+fn heal_announcement(domain: &str, mode: RepairMode) -> (String, String) {
+    if mode == RepairMode::Hold {
+        (
+            format!("Self-heal: {domain}: a new way to find the video was found; the next job there is held for MCR"),
+            format!("Site {domain}: a new way to find its video was found on its canary pages; the next job there waits for MCR's approval"),
+        )
+    } else {
+        (
+            format!("Self-heal: {domain}: a new way to find the video was found; it would hold the next job there for MCR once repair is in hold"),
+            format!("Site {domain}: a new way to find its video was found on its canary pages; it would hold the next job there for MCR's approval once repair is in hold (now: shadow)"),
+        )
     }
 }
 
@@ -810,7 +823,7 @@ pub(crate) async fn heal_nightly_with(env: &CanaryEnv, ctx: &crate::repair::Repa
         let site_deadline = (Instant::now() + ctx.cfg.budget * HEAL_BUDGET_FACTOR).min(deadline);
         let heal = crate::repair::probe_site_with(ctx, domain, &pages, Utc::now(), site_deadline, &llm_left).await;
         record_report(&env.repo, &heal, Utc::now());
-        announce_heal(&env.repo, &heal);
+        announce_heal(&env.repo, &heal, ctx.cfg.mode);
         probed += 1;
     }
     probed
@@ -853,7 +866,7 @@ pub(crate) async fn heal_now(env: &CanaryEnv, ctx: &crate::repair::RepairCtx, do
     let heal = crate::repair::probe_site_with(ctx, domain, &pages, Utc::now(), deadline, &left).await;
     env.add_day_llm(budget - left.load(Ordering::SeqCst).min(budget));
     record_report(&env.repo, &heal, Utc::now());
-    announce_heal(&env.repo, &heal);
+    announce_heal(&env.repo, &heal, ctx.cfg.mode);
     true
 }
 

@@ -2088,6 +2088,28 @@ async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
     }
 }
 
+/// P11.9: `run_job` reads the mode the admin's switch set after the context was
+/// built: started in shadow, switched to hold, a pending next choice is held.
+#[tokio::test]
+async fn run_job_uses_the_live_mode_switched_after_the_context_was_built() {
+    let n = next_rig();
+    let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+    let live = omni_core::config::LiveRepairMode::new(RepairMode::Shadow);
+    let mut c = cfg(RepairMode::Shadow, Duration::from_secs(5));
+    c.live = Some(live.clone());
+    let ctx = RepairCtx { repo: n.repo.clone(), cfg: c, env: env.clone() };
+    live.set(RepairMode::Hold);
+    let health = omni_core::health::HealthState::new();
+    let canary = Arc::new(crate::canary::CanaryEnv::new(n.repo.clone(), health.clone(), n.root.join("bin"), "stable".into()));
+    crate::worker::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
+        .await
+        .unwrap();
+    assert_eq!(env.downloads.lock().unwrap().len(), 1, "held in hold, not refused as in shadow");
+    let at = n.repo.latest_attempt(n.job_id).unwrap().unwrap();
+    assert_eq!((at.rung.as_deref(), at.outcome.as_deref()), (Some("next"), Some("held")));
+    assert_eq!(n.repo.get_job(n.job_id).unwrap().unwrap().status, JobStatus::AwaitingApproval);
+}
+
 #[path = "repair_dry_tests.rs"]
 mod dry_run_tests;
 

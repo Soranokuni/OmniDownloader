@@ -607,6 +607,47 @@ async fn an_admins_run_now_is_not_held_to_the_two_hour_limit_but_still_needs_rep
     assert!(!canary::heal_now(&canary_env(&r), &r.ctx, DOMAIN, false).await);
 }
 
+fn heal_audit(r: &Rig) -> String {
+    r.repo.get_recent_audit_logs(50).unwrap().into_iter().map(|a| a.message).filter(|m| m.contains("a new way to find")).collect::<Vec<_>>().join("\n")
+}
+
+/// P11.9: a heal reads the mode the admin's switch set after the context was
+/// built (here `off` at start-up, `hold` now): it runs, and its audit line says
+/// the next job is held.
+#[tokio::test]
+async fn a_heal_uses_the_live_mode_switched_after_the_context_was_built() {
+    let mut r = rig(RepairMode::Off);
+    let live = omni_core::config::LiveRepairMode::new(RepairMode::Off);
+    r.ctx.cfg.live = Some(live.clone());
+    clip_recipe(&r);
+    serve_clips(&r, 3);
+    canary_pages(&r, 3, 120.0);
+    broken(&r);
+    idle(&r);
+    let env = canary_env(&r);
+    live.set(RepairMode::Hold);
+    assert!(canary::heal_now(&env, &r.ctx, DOMAIN, false).await, "the switched mode is used, not the start-up one");
+    assert_eq!(reports(&r)[0].outcome, "found");
+    let audit = heal_audit(&r);
+    assert!(audit.contains("the next job there waits for MCR's approval") && !audit.contains("once repair is in hold"), "{audit}");
+}
+
+/// P11.9 review: in shadow a heal that found a way says it would hold the next
+/// job once repair is in hold, not that it will.
+#[tokio::test]
+async fn a_heal_in_shadow_says_it_would_hold_the_next_job_once_in_hold() {
+    let r = rig(RepairMode::Shadow);
+    clip_recipe(&r);
+    serve_clips(&r, 3);
+    canary_pages(&r, 3, 120.0);
+    broken(&r);
+    idle(&r);
+    assert!(canary::heal_now(&canary_env(&r), &r.ctx, DOMAIN, false).await);
+    assert_eq!(reports(&r)[0].outcome, "found");
+    let audit = heal_audit(&r);
+    assert!(audit.contains("once repair is in hold") && !audit.contains("the next job there waits"), "{audit}");
+}
+
 #[tokio::test]
 async fn the_nightly_heal_waits_for_the_canary_lock() {
     let r = rig(RepairMode::Shadow);

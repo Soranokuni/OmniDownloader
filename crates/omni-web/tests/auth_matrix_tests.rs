@@ -519,6 +519,14 @@ const MATRIX: &[Row] = &[
         "/api/system/status",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Admin, Reached)],
     ),
+    // The desk's «waiting for a login» card (P11.12): MCR, as the job list.
+    ("GET", "/api/cookies/waiting", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ]),
     (
         "GET",
         "/api/events",

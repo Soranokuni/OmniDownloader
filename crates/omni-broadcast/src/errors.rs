@@ -497,14 +497,22 @@ pub fn login_hint_el(domain: &str, jar_exists: bool) -> String {
 /// the embedded player's, which this link does not tell, so the generic hint stands.
 pub fn hint_for_job(code: ErrorCode, url: &str, repo: &omni_core::repository::Repository) -> String {
     if code == ErrorCode::LoginRequired {
-        if let Some(domain) = omni_core::cookies::jar_domain_for_url(url) {
-            let jar = repo.has_cookie_jar(&domain).unwrap_or(false);
-            if jar || crate::downloader::is_video_platform(url) {
-                return login_hint_el(&domain, jar);
-            }
+        if let Some((domain, jar)) = login_wall_site(url, |d| repo.has_cookie_jar(d).unwrap_or(false)) {
+            return login_hint_el(&domain, jar);
         }
     }
     code.hint_el().to_string()
+}
+
+/// The site whose login wall stopped a `LOGIN_REQUIRED` job on `url`, and
+/// whether it has a jar (`has_jar`): the link's jar domain when it is a video
+/// platform or a site that has a jar; `None` for a news article's embedded
+/// player, whose site the link does not tell. [`hint_for_job`] and the desk's
+/// «waiting for a login» card (P11.12) name the same site.
+pub fn login_wall_site(url: &str, has_jar: impl Fn(&str) -> bool) -> Option<(String, bool)> {
+    let domain = omni_core::cookies::jar_domain_for_url(url)?;
+    let jar = has_jar(&domain);
+    (jar || crate::downloader::is_video_platform(url)).then_some((domain, jar))
 }
 
 /// Classify a download failure from the tool's stderr tail.
