@@ -859,7 +859,8 @@ impl Repository {
             warn!(
                 "No active administrator account exists yet. A new installation gets the \
                  first-run account when the service starts; otherwise reactivate one with \
-                 `omni-ingest admin activate <login>`. Until then the panels cannot be administered."
+                 `omni-ingest admin activate <login>`, or create one with \
+                 `omni-ingest admin create-admin <login>`. Until then the panels cannot be administered."
             );
         }
 

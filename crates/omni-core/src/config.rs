@@ -346,6 +346,48 @@ impl Default for GraphConfig {
     }
 }
 
+/// Write `bytes` to `path` as a whole (P13.3b): into a temporary file in the
+/// same folder, flushed to disk, which then takes `path`'s place, so a crash or
+/// a full disk never leaves half a config.json. An existing file is replaced
+/// with `ReplaceFileW` on Windows, which keeps its permissions (the installer's
+/// grant on config.json); the temporary file is removed on any failure.
+pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.json".into());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // A file of the same name left by a crashed process with this process id.
+    let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    let done = written.and_then(|()| replace(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
+}
+
+#[cfg(windows)]
+fn replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return std::fs::rename(tmp, path);
+    }
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+    let wide = |p: &Path| p.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (target, source) = (wide(path), wide(tmp));
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
+    unsafe { ReplaceFileW(PCWSTR(target.as_ptr()), PCWSTR(source.as_ptr()), PCWSTR::null(), REPLACE_FILE_FLAGS(0), None, None) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+}
+
+#[cfg(not(windows))]
+fn replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
 /// Days before the Graph client secret expires that the `mail` health line turns amber.
 pub const SECRET_WARN_DAYS: i64 = 30;
 /// Days before it expires that the line turns red.
@@ -1096,9 +1138,16 @@ impl AppConfig {
         }
         let json_str = serde_json::to_string_pretty(self)
             .context("Failed serializing AppConfig to JSON")?;
-        std::fs::write(p, json_str)
-            .with_context(|| format!("Failed writing config file {:?}", p))?;
-        Ok(())
+        match write_replacing(p, json_str.as_bytes()) {
+            Ok(()) => Ok(()),
+            // The service account may modify config.json but not create files next
+            // to it (the installer grants the file, not the install folder): there
+            // the file is rewritten in place, as before.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::fs::write(p, json_str).with_context(|| format!("Failed writing config file {:?}", p))
+            }
+            Err(e) => Err(e).with_context(|| format!("Failed writing config file {:?}", p)),
+        }
     }
 
     /// Move any plaintext secret out of config.json and load the real ones
@@ -1192,6 +1241,28 @@ mod tests {
     use super::*;
     use crate::secrets::{keys, SecretStore};
     use tempfile::TempDir;
+
+    /// P13.3b: config.json is written whole, through a file that takes its place;
+    /// nothing is left next to it, and a refused write leaves it as it was.
+    #[test]
+    fn config_json_is_replaced_whole_and_nothing_is_left_beside_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let mut c = AppConfig::default();
+        c.save_to_file(&path).unwrap();
+        c.web_port = 8097;
+        c.save_to_file(&path).unwrap();
+        assert_eq!(AppConfig::load_from_file(&path).unwrap().web_port, 8097);
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["config.json"], "no temporary file is left");
+
+        // The temporary file cannot be made (its name is taken by a folder): the
+        // write fails, nothing is cut short, and config.json is as it was.
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::create_dir(dir.path().join(format!(".config.json.{}.tmp", std::process::id()))).unwrap();
+        assert!(write_replacing(&path, b"{ half").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
 
     #[test]
     fn an_old_config_without_setup_keys_reads_as_completed() {

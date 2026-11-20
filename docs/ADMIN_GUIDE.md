@@ -876,7 +876,7 @@ Run from the install folder (elevated on an installed service).
 | `omni-ingest run [--config <file>]` | run in a console window instead of as a service |
 | `omni-ingest install …` / `uninstall` | what `Install.cmd` / `Uninstall.cmd` call (§2.5) |
 | `omni-ingest service install\|start\|stop\|status\|uninstall` | the Windows service |
-| `omni-ingest setup --answer <file>` | apply an answer file (§2.1b) to this installation's `config.json`, by Setup's rules; the old file is kept as `config.json.prev`. No secrets; restart the service afterwards. The interactive setup is the wizard on `/admin` |
+| `omni-ingest setup --answer <file> [--force]` | apply an answer file (§2.1b) to this installation's `config.json`, by Setup's and the panel's rules (a watchfolder the service cannot use and an online `http://` LLM endpoint are refused; another LLM provider removes the stored LLM key); the old file is kept as `config.json.prev`. Refused while the service runs, unless `--force` (then restart it at once). No secrets; restart the service afterwards. The interactive setup is the wizard on `/admin` |
 | `omni-ingest admin list-users` | list accounts |
 | `omni-ingest admin reset-password <email>` | new password (prompted), signs the user out |
 | `omni-ingest admin activate\|deactivate <email>` | enable / disable an account |

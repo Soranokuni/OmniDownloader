@@ -187,9 +187,16 @@ pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<(
             if users.is_empty() {
                 println!(
                     "\nNo accounts. Start the service: a new installation gets the first-run account Admin / Admin, \
-                     which signs in at http://127.0.0.1:<port>/admin from this computer and opens the setup wizard."
+                     which signs in at http://127.0.0.1:<port>/admin from this computer and opens the setup wizard. \
+                     If it does not appear, create an administrator with `omni-ingest admin create-admin <login>`."
                 );
                 return Ok(());
+            }
+            if !users.iter().any(|u| u.is_active && u.role == UserRole::Admin) {
+                println!(
+                    "\nNo active administrator. Reactivate one (`omni-ingest admin activate <login>`) \
+                     or create one (`omni-ingest admin create-admin <login>`)."
+                );
             }
             println!("\n{:<40} {:<10} {}", "Sign-in address", "Role", "Active");
             for u in users {
@@ -349,7 +356,35 @@ fn ensure_known_key(key: &str) -> Result<()> {
 /// The settings the file does not name keep their values. `setup_completed`
 /// never changes and no secret is taken (a file naming one is refused). The
 /// previous file is kept as `config.json.prev`. Returns the lines to print.
-pub fn apply_answer_file(paths: &AppPaths, answer: &Path) -> Result<Vec<String>> {
+///
+/// The same rules as the installer and the panel (P13.3b): a watchfolder the
+/// service cannot use is refused with the installer's text; an online LLM
+/// endpoint must be `https://`, and when the endpoint names another provider
+/// the stored LLM key is removed, so it is never sent to the new host. While
+/// the service runs it is refused unless `force` (the daemon would write its
+/// own settings over the file on its next save).
+pub fn apply_answer_file(paths: &AppPaths, answer: &Path, force: bool) -> Result<Vec<String>> {
+    let running = omni_service::query_service_status().map(|s| s != "STOPPED").unwrap_or(false);
+    let store = SecretStore::new(paths.resolve("data/secrets.bin"));
+    apply_answer_file_with(paths, answer, &omni_core::paths::SystemDrives, &store, running, force)
+}
+
+/// [`apply_answer_file`] with the drive lookups, the secret store and the
+/// service state given (tests).
+pub fn apply_answer_file_with(
+    paths: &AppPaths,
+    answer: &Path,
+    drives: &dyn omni_core::paths::DriveLookup,
+    store: &SecretStore,
+    service_running: bool,
+    force: bool,
+) -> Result<Vec<String>> {
+    if service_running && !force {
+        anyhow::bail!(
+            "The OmniIngest service is running: on its next settings save it would write its own settings over these. \
+             Stop it first (omni-ingest service stop), apply the file, then start it; or add --force."
+        );
+    }
     let text = std::fs::read_to_string(answer)
         .with_context(|| format!("Cannot read the answer file {}", answer.display()))?;
     let doc: serde_json::Value = serde_json::from_str(&text)
@@ -361,9 +396,26 @@ pub fn apply_answer_file(paths: &AppPaths, answer: &Path) -> Result<Vec<String>>
     } else {
         AppConfig::default()
     };
+    let old_endpoint = base.ollama_endpoint.clone();
     let applied = omni_core::answer_file::apply(&doc, base)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("The answer file {} was not applied; nothing changed", answer.display()))?;
+    let not_applied = || format!("The answer file {} was not applied; nothing changed", answer.display());
+    install::check_config_watchfolder(paths, &applied.config, drives).with_context(not_applied)?;
+    let endpoint = applied.config.ollama_endpoint.trim().to_string();
+    if !endpoint.is_empty() {
+        omni_email::llm::check_base_url(&endpoint)
+            .map_err(|why| anyhow::anyhow!("llm.endpoint ({endpoint}): {why}"))
+            .with_context(not_applied)?;
+    }
+    // A new provider does not inherit the old one's key (as the LLM card).
+    let same_base = |a: &str, b: &str| a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'));
+    let key_dropped = if !same_base(&endpoint, &old_endpoint) && store.get_lossy(secret_keys::LLM_API_KEY).is_some_and(|k| !k.is_empty()) {
+        store.remove(secret_keys::LLM_API_KEY).context("Cannot remove the LLM key of the previous provider; nothing changed")?;
+        true
+    } else {
+        false
+    };
     if existing {
         let prev = paths.config.with_extension("json.prev");
         std::fs::copy(&paths.config, &prev)
@@ -372,8 +424,14 @@ pub fn apply_answer_file(paths: &AppPaths, answer: &Path) -> Result<Vec<String>>
     applied.config.save_to_file(&paths.config)?;
 
     let mut lines = vec![format!("✓ {} applied to {}.", answer.display(), paths.config.display())];
+    if service_running {
+        lines.push("! The service is running: restart it now, before anyone saves a setting in the admin panel.".into());
+    }
     if existing {
         lines.push(format!("  The previous configuration is kept as {}.", paths.config.with_extension("json.prev").display()));
+    }
+    if key_dropped {
+        lines.push("  The LLM key was removed: the answer file names another LLM provider. Enter its key on the LLM card.".into());
     }
     lines.extend(applied.notes.iter().map(|n| format!("  Note: {n}")));
     lines.push("  Secrets are not in an answer file: enter the mailbox client secret (and an LLM key) in the setup wizard.".into());
@@ -397,6 +455,29 @@ mod tests {
         p
     }
 
+    /// `Z:` is a mapped share; every other letter a local disk.
+    struct Drives;
+    impl omni_core::paths::DriveLookup for Drives {
+        fn drive_kind(&self, letter: char) -> omni_core::paths::DriveKind {
+            if letter == 'Z' { omni_core::paths::DriveKind::Remote } else { omni_core::paths::DriveKind::Other }
+        }
+        fn connection(&self, _letter: char) -> Option<String> {
+            Some(r"\\nas-test\ingest".into())
+        }
+        fn persistent_mapping(&self, _letter: char) -> Option<String> {
+            None
+        }
+    }
+
+    fn store(paths: &AppPaths) -> SecretStore {
+        SecretStore::new(paths.resolve("data/secrets.bin"))
+    }
+
+    /// The service stopped, `Z:` mapped.
+    fn apply(paths: &AppPaths, file: &Path) -> Result<Vec<String>> {
+        apply_answer_file_with(paths, file, &Drives, &store(paths), false, false)
+    }
+
     #[test]
     fn an_answer_file_is_applied_over_the_existing_config_which_is_kept() {
         let (dir, paths) = install();
@@ -412,7 +493,7 @@ mod tests {
             "tls": { "cert_path": r"C:\certs\panel.pfx" },
         }));
 
-        let lines = apply_answer_file(&paths, &file).unwrap();
+        let lines = apply(&paths, &file).unwrap();
         let after = AppConfig::load_from_file(&paths.config).unwrap();
         assert_eq!((after.web_port, after.watchfolder_path.as_str()), (8093, r"\\dalet-test\ingest"));
         assert_eq!(after.temp_path, "scratch-test", "what the file does not name is kept");
@@ -474,11 +555,52 @@ mod tests {
         for (doc, key) in [
             (serde_json::json!({ "answer_file_version": 1, "graph": { "client_secret": "value-test-only" } }), "graph.client_secret"),
             (serde_json::json!({ "answer_file_version": 1, "mcr_open_networks": ["newsroom-lan"] }), "mcr_open_networks"),
+            // P13.3b: the installer's watchfolder rules, with its text.
+            (serde_json::json!({ "answer_file_version": 1, "watchfolder_path": r"Z:\ingest" }), r"use \\nas-test\ingest\ingest instead"),
+            (serde_json::json!({ "answer_file_version": 1, "watchfolder_path": "" }), "No watchfolder was given"),
+            (serde_json::json!({ "answer_file_version": 1, "watchfolder_path": "D:x" }), "is a relative path"),
+            // P13.3b: the LLM card's rule for an online endpoint.
+            (serde_json::json!({ "answer_file_version": 1, "llm": { "endpoint": "http://llm.provider.example/v1" } }), "https://"),
         ] {
-            let err = apply_answer_file(&paths, &answers(dir.path(), doc)).unwrap_err();
-            assert!(format!("{err:#}").contains(key), "{err:#}");
+            let err = apply(&paths, &answers(dir.path(), doc)).unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
+            assert!(format!("{err:#}").contains("nothing changed"), "{err:#}");
         }
         assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), before);
         assert!(!paths.config.with_extension("json.prev").exists());
+    }
+
+    #[test]
+    fn a_new_llm_provider_in_an_answer_file_drops_the_stored_key_and_the_same_one_keeps_it() {
+        let (dir, paths) = install();
+        let mut base = AppConfig::default();
+        base.ollama_endpoint = "https://llm-a.example/v1".into();
+        base.save_to_file(&paths.config).unwrap();
+        let key = secret_keys::LLM_API_KEY;
+        store(&paths).set(key, "sk-invented-test").unwrap();
+        let llm = |endpoint: &str| serde_json::json!({ "answer_file_version": 1, "llm": { "endpoint": endpoint } });
+
+        // The same provider (case and a trailing slash aside): the key stays.
+        apply(&paths, &answers(dir.path(), llm("https://LLM-A.example/v1/"))).unwrap();
+        assert_eq!(store(&paths).get(key).unwrap().as_deref(), Some("sk-invented-test"));
+        // A local endpoint over http is allowed; it is another provider: the key goes.
+        let lines = apply(&paths, &answers(dir.path(), llm("http://127.0.0.1:1234/v1"))).unwrap();
+        assert_eq!(store(&paths).get(key).unwrap(), None, "never sent to the new host");
+        assert!(lines.iter().any(|l| l.contains("LLM key was removed")), "{lines:?}");
+        assert!(!lines.join("\n").contains("sk-invented-test"));
+    }
+
+    #[test]
+    fn while_the_service_runs_an_answer_file_is_refused_unless_forced() {
+        let (dir, paths) = install();
+        AppConfig::default().save_to_file(&paths.config).unwrap();
+        let before = std::fs::read_to_string(&paths.config).unwrap();
+        let file = answers(dir.path(), serde_json::json!({ "answer_file_version": 1, "web_port": 8095 }));
+        let err = apply_answer_file_with(&paths, &file, &Drives, &store(&paths), true, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--force"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), before);
+        let lines = apply_answer_file_with(&paths, &file, &Drives, &store(&paths), true, true).unwrap();
+        assert!(lines.iter().any(|l| l.contains("restart it now")), "{lines:?}");
+        assert_eq!(AppConfig::load_from_file(&paths.config).unwrap().web_port, 8095);
     }
 }

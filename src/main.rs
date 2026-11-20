@@ -70,6 +70,9 @@ enum Commands {
         /// The answer file (omni-answers.json)
         #[arg(long)]
         answer: std::path::PathBuf,
+        /// Apply it although the service is running (it must then be restarted at once)
+        #[arg(long)]
+        force: bool,
     },
     /// Install (or upgrade) from this release folder: copy to the install
     /// directory, register and start the Windows service, check it answers
@@ -893,8 +896,8 @@ async fn main() -> Result<()> {
                 rt.shutdown_timeout(Duration::from_secs(20));
             })?;
         }
-        Some(Commands::Setup { answer }) => {
-            for line in omni_cli::apply_answer_file(&paths, &answer)? {
+        Some(Commands::Setup { answer, force }) => {
+            for line in omni_cli::apply_answer_file(&paths, &answer, force)? {
                 println!("{line}");
             }
         }

@@ -1073,7 +1073,7 @@ cookies αποθηκεύονται. Η κάρτα «Cookies» δείχνει τ�
 | `omni-ingest run [--config <file>]` | εκτέλεση σε παράθυρο κονσόλας αντί για service |
 | `omni-ingest install …` / `uninstall` | ό,τι καλούν τα `Install.cmd` / `Uninstall.cmd` (§2.5) |
 | `omni-ingest service install\|start\|stop\|status\|uninstall` | το Windows service |
-| `omni-ingest setup --answer <file>` | εφαρμόζει ένα answer file (§2.1b) στο `config.json` αυτής της εγκατάστασης, με τους κανόνες του Setup· το προηγούμενο αρχείο κρατιέται ως `config.json.prev`. Χωρίς μυστικά· επανεκκινήστε την υπηρεσία μετά. Η διαδραστική ρύθμιση είναι ο οδηγός στο `/admin` |
+| `omni-ingest setup --answer <file> [--force]` | εφαρμόζει ένα answer file (§2.1b) στο `config.json` αυτής της εγκατάστασης, με τους κανόνες του Setup και της σελίδας (απορρίπτονται watchfolder που η υπηρεσία δεν μπορεί να χρησιμοποιήσει και διαδικτυακό endpoint LLM με `http://`· άλλος πάροχος LLM αφαιρεί το αποθηκευμένο κλειδί LLM)· το προηγούμενο αρχείο κρατιέται ως `config.json.prev`. Απορρίπτεται όσο τρέχει η υπηρεσία, εκτός με `--force` (τότε επανεκκινήστε την αμέσως). Χωρίς μυστικά· επανεκκινήστε την υπηρεσία μετά. Η διαδραστική ρύθμιση είναι ο οδηγός στο `/admin` |
 | `omni-ingest admin list-users` | λίστα λογαριασμών |
 | `omni-ingest admin reset-password <email>` | νέος κωδικός (ζητείται), αποσυνδέει τον χρήστη |
 | `omni-ingest admin activate\|deactivate <email>` | ενεργοποίηση / απενεργοποίηση λογαριασμού |

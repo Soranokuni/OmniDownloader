@@ -404,6 +404,9 @@ async fn judged_watchfolder(state: &AppState, raw: &str) -> Result<(String, std:
     let watch = raw.trim().to_string();
     let resolved = if watch.is_empty() {
         std::path::PathBuf::new()
+    } else if let Some(live) = &state.delivery {
+        // Against the daemon's own install folder, as delivery resolves it.
+        live.install.resolve(&watch)
     } else {
         state.config.read().await.resolve_path(&watch)
     };

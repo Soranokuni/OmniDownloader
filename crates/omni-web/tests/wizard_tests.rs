@@ -360,6 +360,7 @@ fn live_app(timing: (u64, u64, u64)) -> Result<(App, omni_web::admin_delivery::L
     archive_cfg.path = base.dir.path().join("arch").to_string_lossy().into_owned();
     let old = base.dir.path().join("old-watch");
     let archive = omni_core::archive::ArchiveSettings::from_config(&archive_cfg, &install, &old);
+    let old_text = old.to_string_lossy().into_owned();
     let ms = std::time::Duration::from_millis;
     let live = omni_web::admin_delivery::LiveDelivery::new(omni_broadcast::pipeline::DeliveryPaths::new(old, Some(archive)), install)
         .with_timing(ms(timing.0), ms(timing.1), ms(timing.2));
@@ -367,6 +368,7 @@ fn live_app(timing: (u64, u64, u64)) -> Result<(App, omni_web::admin_delivery::L
     {
         let mut cfg = state.config.try_write().unwrap();
         cfg.archive = archive_cfg;
+        cfg.watchfolder_path = old_text;
     }
     Ok((App { router: WebServer::build_router(state.clone()), repo: base.repo.clone(), state, dir: base.dir }, live))
 }
@@ -409,6 +411,35 @@ async fn while_a_job_runs_the_new_watchfolder_waits_and_applies_when_it_ends() -
     }
     assert_eq!(live.paths.watchfolder(), new, "applied once the job ended");
     assert!(live.pending().is_none());
+    Ok(())
+}
+
+/// P13.3b (was an `/api/setup` test): the default relative `watchfolder`, typed
+/// with spaces, is accepted, stored trimmed, and used under the install folder.
+#[tokio::test]
+async fn the_default_relative_watchfolder_is_accepted_and_stored_trimmed() -> Result<()> {
+    let (app, live) = live_app((5_000, 100, 5_000))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let r = send(&app, "POST", "/api/admin/settings/watchfolder", Some(&tok), Some(json!({"path": " watchfolder "}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(app.state.config.read().await.watchfolder_path, "watchfolder");
+    assert_eq!(AppConfig::load_from_file(app.dir.path().join("config.json"))?.watchfolder_path, "watchfolder");
+    assert_eq!(live.paths.watchfolder(), app.dir.path().join("watchfolder"), "under the install folder");
+    Ok(())
+}
+
+/// P13.3b: a relative watchfolder is tested under the daemon's install folder,
+/// where delivery writes, never next to the running executable.
+#[tokio::test]
+async fn a_relative_watchfolder_is_tested_under_the_install_folder() -> Result<()> {
+    let (app, _live) = live_app((5_000, 100, 5_000))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    // A file, not a folder, takes the name in the install folder.
+    std::fs::write(app.dir.path().join("watch-taken-test"), b"not a folder")?;
+    let r = send(&app, "POST", "/api/admin/settings/watchfolder/test", Some(&tok), Some(json!({"path": "watch-taken-test"}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["ok"], false, "{}", r.body);
+    assert!(r.json()["message"].as_str().unwrap_or("").contains("is not a folder"), "{}", r.body);
     Ok(())
 }
 

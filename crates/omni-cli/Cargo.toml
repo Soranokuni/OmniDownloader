@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 omni-core = { path = "../omni-core" }
 omni-service = { path = "../omni-service" }
+omni-email = { path = "../omni-email" }
 inquire = "0.7"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
