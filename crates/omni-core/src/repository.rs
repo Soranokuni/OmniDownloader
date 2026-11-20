@@ -6670,6 +6670,76 @@ impl Repository {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Account the approval clocks of the videos waiting for MCR up to `now`
+    /// (P11.10). The time since a row was last accounted (`clock_at`, else
+    /// `created_at`) counts against its hold only when `watched` (an MCR desk
+    /// was connected over it) and it is no longer than `max_gap`; otherwise
+    /// (no desk, or a gap such as the daemon being stopped) `expires_at` moves
+    /// on by that time. Only undecided rows of AWAITING_APPROVAL jobs; a row
+    /// whose times cannot be read is left to the sweep. One immediate
+    /// transaction. Returns how many expiries moved.
+    pub fn account_held_clocks(&self, now: chrono::DateTime<Utc>, watched: bool, max_gap: Duration) -> Result<usize> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT h.job_id, h.clock_at, h.created_at, h.expires_at
+                   FROM held_outputs h JOIN queue q ON q.id = h.job_id
+                  WHERE h.decision IS NULL AND q.status = 'AWAITING_APPROVAL'",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let stamp = timestamps::format(now);
+        let mut moved = 0;
+        for (job_id, clock_at, created_at, expires_at) in rows {
+            let since = timestamps::parse_opt(clock_at).or_else(|| timestamps::parse_opt(created_at));
+            let (Some(since), Some(expires_at)) = (since, timestamps::parse_opt(expires_at)) else {
+                continue;
+            };
+            let elapsed = now - since;
+            if elapsed <= Duration::zero() {
+                continue;
+            }
+            if watched && elapsed <= max_gap {
+                tx.execute(
+                    "UPDATE held_outputs SET clock_at = ? WHERE job_id = ? AND decision IS NULL",
+                    params![stamp, job_id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE held_outputs SET clock_at = ?, expires_at = ? WHERE job_id = ? AND decision IS NULL",
+                    params![stamp, timestamps::format(expires_at + elapsed), job_id],
+                )?;
+                moved += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// The videos waiting for MCR's approval (P11.10), for the desk's reminder:
+    /// how many, since when the oldest waits, and the soonest expiry.
+    pub fn held_waiting(&self) -> Result<HeldWaiting> {
+        let conn = self.pool.get()?;
+        let (count, oldest, soonest): (i64, Option<String>, Option<String>) = conn.query_row(
+            "SELECT COUNT(*), MIN(h.created_at), MIN(h.expires_at)
+               FROM held_outputs h JOIN queue q ON q.id = h.job_id
+              WHERE h.decision IS NULL AND q.status = 'AWAITING_APPROVAL'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(HeldWaiting { count, oldest_held_at: timestamps::parse_opt(oldest), soonest_expires_at: timestamps::parse_opt(soonest) })
+    }
+}
+
+/// The videos waiting for MCR's approval (P11.10).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct HeldWaiting {
+    pub count: i64,
+    pub oldest_held_at: Option<DateTime<Utc>>,
+    pub soonest_expires_at: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------

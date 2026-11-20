@@ -183,6 +183,9 @@ pub struct AppState {
     /// The repair mode the workers read at each job (P11.9): the switch to
     /// `hold` sets it together with config.json, so no restart is needed.
     pub repair_mode: omni_core::config::LiveRepairMode,
+    /// The MCR desks connected to `/api/events?desk=1` (P11.10): a held video's approval
+    /// clock runs only while one has been connected. Shared with the reaper.
+    pub desks: omni_core::held::DeskPresence,
 }
 
 /// Concurrent Argon2 hash/verify jobs the panel allows.
@@ -239,7 +242,14 @@ impl AppState {
             argon_permits: Arc::new(Semaphore::new(ARGON_CONCURRENCY)),
             password_checks: Arc::new(AtomicUsize::new(0)),
             repair_mode,
+            desks: omni_core::held::DeskPresence::new(),
         }
+    }
+
+    /// Share the reaper's count of connected desks (P11.10).
+    pub fn with_desks(mut self, desks: omni_core::held::DeskPresence) -> Self {
+        self.desks = desks;
+        self
     }
 
     /// Share the workers' repair mode (P11.9).

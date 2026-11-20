@@ -70,6 +70,64 @@ pub fn remove_held_dir(temp: &Path, job_id: i64) {
     }
 }
 
+/// The MCR desks connected to the live stream (P11.10), shared by the web
+/// server, which counts them, and the reaper, which runs the held videos'
+/// approval clocks only while one has been connected. Clones share one count.
+#[derive(Debug, Clone, Default)]
+pub struct DeskPresence {
+    inner: std::sync::Arc<DeskInner>,
+}
+
+#[derive(Debug, Default)]
+struct DeskInner {
+    connected: std::sync::atomic::AtomicUsize,
+    /// A desk was connected at some moment since the last [`DeskPresence::take_seen`].
+    seen: std::sync::atomic::AtomicBool,
+}
+
+/// One connected desk; dropping it (the stream closed) disconnects it.
+#[derive(Debug)]
+pub struct DeskGuard(std::sync::Arc<DeskInner>);
+
+impl Drop for DeskGuard {
+    fn drop(&mut self) {
+        self.0.connected.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl DeskPresence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A desk connected; it stays connected until the guard is dropped.
+    pub fn connect(&self) -> DeskGuard {
+        self.inner.connected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        DeskGuard(self.inner.clone())
+    }
+
+    /// Desks connected now.
+    pub fn connected(&self) -> usize {
+        self.inner.connected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a desk has been connected since the last call: one is now, or
+    /// one connected (however briefly) in between. Resets the "in between".
+    pub fn take_seen(&self) -> bool {
+        let between = self.inner.seen.swap(false, std::sync::atomic::Ordering::SeqCst);
+        between || self.connected() > 0
+    }
+}
+
+/// Run the approval clocks for one reaper tick (P11.10): the time since the
+/// last tick counts against a held video only when a desk has been connected
+/// over it; otherwise, and over a gap longer than `max_gap` (the daemon was
+/// stopped), its expiry moves on. Call before [`sweep`].
+pub fn run_clocks(repo: &Repository, desks: &DeskPresence, now: DateTime<Utc>, max_gap: chrono::Duration) -> Result<usize> {
+    repo.account_held_clocks(now, desks.take_seen(), max_gap)
+}
+
 /// What one sweep did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HeldSweepReport {
@@ -163,6 +221,24 @@ mod tests {
 
     fn repo(dir: &TempDir) -> Repository {
         Repository::new(dir.path().join("t.db")).unwrap()
+    }
+
+    /// P11.10: a desk counts while its guard lives; one that came and went
+    /// between two ticks still counts as seen for that tick, not the next.
+    #[test]
+    fn a_desk_is_seen_while_connected_and_once_after_a_brief_visit() {
+        let desks = DeskPresence::new();
+        assert!(!desks.take_seen());
+        let guard = desks.clone().connect();
+        assert_eq!(desks.connected(), 1);
+        assert!(desks.take_seen());
+        assert!(desks.take_seen(), "still connected");
+        drop(guard);
+        assert_eq!(desks.connected(), 0);
+        assert!(!desks.take_seen());
+        drop(desks.connect());
+        assert!(desks.take_seen(), "a brief visit between ticks counts");
+        assert!(!desks.take_seen(), "and only once");
     }
 
     fn job(repo: &Repository, n: u32) -> i64 {

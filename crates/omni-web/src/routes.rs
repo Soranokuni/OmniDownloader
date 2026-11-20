@@ -3234,13 +3234,46 @@ fn sse_payload(msg: Result<String, tokio_stream::wrappers::errors::BroadcastStre
     msg.unwrap_or_else(|_| r#"{"type":"lagged"}"#.to_string())
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct EventsQuery {
+    /// `1` from the MCR desk (P11.10): while such a stream is open, the held
+    /// videos' approval clocks run. Other panels (admin) leave it out.
+    #[serde(default)]
+    pub desk: Option<String>,
+}
+
 pub async fn api_events(
     RequireMcr(_): RequireMcr,
+    Query(query): Query<EventsQuery>,
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
-    let stream = BroadcastStream::new(rx).map(|msg| Ok(Event::default().data(sse_payload(msg))));
+    // Held by the stream: when the tab closes, the stream is dropped and the desk with it.
+    let desk = (query.desk.as_deref() == Some("1")).then(|| state.desks.connect());
+    let stream = BroadcastStream::new(rx).map(move |msg| {
+        let _desk = &desk;
+        Ok(Event::default().data(sse_payload(msg)))
+    });
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+/// Minutes between the desk's reminders while a video waits for approval (P11.10).
+pub const HELD_REMIND_EVERY_MINS: i64 = 30;
+
+/// What the desk needs for its reminder (P11.10): how many videos wait for
+/// approval, since when the oldest, the soonest expiry (moved on while no desk
+/// is connected), how often to remind, and whether the clock runs now.
+pub async fn api_held_waiting(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let w = state.repo.held_waiting().map_err(internal_error("Could not read the held videos."))?;
+    let desks = state.desks.connected();
+    Ok(Json(serde_json::json!({
+        "count": w.count,
+        "oldest_held_at": w.oldest_held_at.map(omni_core::timestamps::format),
+        "soonest_expires_at": w.soonest_expires_at.map(omni_core::timestamps::format),
+        "remind_every_mins": HELD_REMIND_EVERY_MINS,
+        "desks_connected": desks,
+        "clock_running": desks > 0,
+    })))
 }
 
 // ==========================================

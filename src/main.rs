@@ -1487,8 +1487,11 @@ async fn run_daemon(
     }
     // The repair mode the workers read per job and the panel's switch sets (P11.9).
     let repair_live_mode = omni_core::config::LiveRepairMode::new(config.repair.mode);
+    // The MCR desks connected to the live stream, whose presence runs the approval clocks (P11.10).
+    let desks = omni_core::held::DeskPresence::new();
     let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
         .with_repair_mode(repair_live_mode.clone())
+        .with_desks(desks.clone())
         .with_url_tester(url_tester.clone())
         .with_cookie_tester(Arc::new(CookieJarTester {
             repo: repo.clone(),
@@ -1738,6 +1741,7 @@ async fn run_daemon(
         let repo_reaper = repo.clone();
         let queue_health = health.clone();
         let reaper_temp = temp_path.clone();
+        let reaper_desks = desks.clone();
         let mut reaper_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(LEASE_REAP_INTERVAL);
@@ -1752,10 +1756,15 @@ async fn run_daemon(
                             ),
                             Err(e) => error!("Lease reaper failed: {e:?}"),
                         }
-                        // Videos held for approval (P10.5): expire, supersede, tidy.
-                        let (sweep_repo, sweep_temp) = (repo_reaper.clone(), reaper_temp.clone());
+                        // Videos held for approval (P10.5): their clocks run only while an MCR
+                        // desk has been connected (P11.10); then expire, supersede, tidy.
+                        let (sweep_repo, sweep_temp, sweep_desks) = (repo_reaper.clone(), reaper_temp.clone(), reaper_desks.clone());
                         match tokio::task::spawn_blocking(move || {
-                            omni_core::held::sweep(&sweep_repo, &sweep_temp, chrono::Utc::now())
+                            let now = chrono::Utc::now();
+                            if let Err(e) = omni_core::held::run_clocks(&sweep_repo, &sweep_desks, now, held_clock_max_gap()) {
+                                warn!("Held-video clocks not accounted: {e:#}");
+                            }
+                            omni_core::held::sweep(&sweep_repo, &sweep_temp, now)
                         })
                         .await
                         {
@@ -2148,6 +2157,13 @@ fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusH
 }
 
 /// The `queue` health check (plan P7.19). Never `down`: a slow queue is a warning.
+/// The longest time between two reaper ticks that still counts against a held
+/// video's approval clock (P11.10): three ticks. A longer gap (the daemon was
+/// stopped, the machine slept) is time no desk could have seen it.
+fn held_clock_max_gap() -> chrono::Duration {
+    chrono::Duration::from_std(worker::LEASE_REAP_INTERVAL * 3).unwrap_or_else(|_| chrono::Duration::minutes(3))
+}
+
 fn queue_check(w: &omni_core::models::QueueWatch, was_degraded: bool) -> omni_core::health::Check {
     use omni_core::health::Check;
     let limit = if was_degraded { QUEUE_RECOVER_SECS } else { QUEUE_SLOW_SECS };

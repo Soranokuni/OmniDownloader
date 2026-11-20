@@ -560,3 +560,55 @@ async fn the_import_hint_names_a_domain_the_import_accepts_and_a_barred_recipe_i
     assert_eq!(keys, ["ok.example"], "MCR said wrong video for the first: it is not carried to another installation");
     Ok(())
 }
+
+/// P11.10: a desk's live stream (`?desk=1`) counts as a connected desk while it
+/// is open and stops counting when it closes; a stream without the mark (the
+/// admin panel) does not count. The reminder route reads what waits.
+#[tokio::test]
+async fn a_desk_stream_counts_while_open_and_the_reminder_reads_what_waits() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let admin = omni_core::auth::generate_session_token();
+    repo.create_session(id, &admin, 1)?;
+    let desks = omni_core::held::DeskPresence::new();
+    let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json")).with_desks(desks.clone());
+    let app = App { router: WebServer::build_router(state), repo: repo.clone(), admin, _dir: dir };
+    let stream = |uri: &str| {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", format!("omni_session={}", app.admin))
+            .header("host", "mcr.local")
+            .body(Body::empty())
+            .unwrap();
+        app.router.clone().layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap())).oneshot(req)
+    };
+
+    let panel = stream("/api/events").await?;
+    assert_eq!(panel.status(), StatusCode::OK);
+    assert_eq!(desks.connected(), 0, "a stream without the desk mark is not a desk");
+    let desk = stream("/api/events?desk=1").await?;
+    assert_eq!(desk.status(), StatusCode::OK);
+    assert_eq!(desks.connected(), 1);
+    drop(desk);
+    assert_eq!(desks.connected(), 0, "the closed tab is no longer a desk");
+    assert!(desks.take_seen(), "but it was seen since the last tick");
+    drop(panel);
+
+    let (status, none) = app.send("GET", "/api/held/waiting", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((none["count"].as_i64(), none["remind_every_mins"].as_i64(), none["clock_running"].as_bool()), (Some(0), Some(30), Some(false)));
+    assert!(none["soonest_expires_at"].is_null(), "no video, no time: {none}");
+
+    let job = repo.enqueue(&omni_core::models::NewJob::new("https://news.example/v1", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(repo.lease_job_by_id(job, "w", 180)?);
+    let until = chrono::Utc::now() + chrono::Duration::hours(24);
+    assert!(repo.hold_output(job, "w", "temp/held/1/clip.mxf", 10, &"ab".repeat(32), None, until)?);
+    assert!(repo.finish(job, "w", omni_core::models::JobStatus::AwaitingApproval, None, None, None)?);
+    let _open = stream("/api/events?desk=1").await?;
+    let (_, one) = app.send("GET", "/api/held/waiting", None).await?;
+    assert_eq!((one["count"].as_i64(), one["desks_connected"].as_i64(), one["clock_running"].as_bool()), (Some(1), Some(1), Some(true)), "{one}");
+    assert_eq!(one["soonest_expires_at"].as_str(), Some(omni_core::timestamps::format(until).as_str()));
+    Ok(())
+}

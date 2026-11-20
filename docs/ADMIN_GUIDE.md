@@ -629,7 +629,7 @@ evidence and try saved recipes, a live page load and (optionally) a model.
 |---|---|
 | `off` | behaves exactly as without repair (the value of a config.json written before this version that names no mode) |
 | `shadow` (default of a new installation) | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. Once it would have fixed at least 3 jobs in the last 14 days, the admin Overview offers the switch to `hold` with one click (saved to config.json, used from the next job, no restart; written to the audit log) |
-| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24); the one exception is a trusted recipe (below) |
+| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24) of an MCR desk being open (time with no desk open, or the service stopped, does not count; the desk reminds every 30 minutes while a video waits); the one exception is a trusted recipe (below) |
 
 Optional model rung: `repair.llm_enabled = true` with an explicit
 `repair.llm_model`; at most `llm_max_calls_per_day` (15) calls. Make one
@@ -979,7 +979,7 @@ the second route.
 | `COMPLIANCE_FAILED` | no | the result is not to broadcast spec: **not delivered** |
 | `LEASE_EXPIRED` | no | interrupted repeatedly (crash or restart) |
 | `REJECTED_BY_MCR` | no | MCR rejected a repaired video |
-| `APPROVAL_EXPIRED` | no | not approved within 24 h; the held file was deleted |
+| `APPROVAL_EXPIRED` | no | not approved within 24 h of an MCR desk being open; the held file was deleted |
 | `HELD_FILE_CHANGED` | no | the held file changed: not delivered |
 | `REPAIR_EXHAUSTED` | no | repair ran out of time or attempts |
 | `NON_PUBLIC_ADDRESS` | no | the link, or a stream behind it, is an internal address: not downloaded (see `egress_allow_networks`) |

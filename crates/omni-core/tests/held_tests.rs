@@ -371,3 +371,83 @@ fn only_an_approved_hold_keeps_a_job_out_of_the_archive_stage_recovery() -> Resu
     assert_eq!(repo.get_job(approved)?.unwrap().status, JobStatus::Pending);
     Ok(())
 }
+
+fn expires(repo: &Repository, id: i64) -> chrono::DateTime<Utc> {
+    repo.get_held(id).unwrap().unwrap().expires_at.expect("an expiry")
+}
+
+/// Within a second: the stored times are milliseconds, `now` is finer.
+fn about(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
+    (a - b).num_milliseconds().abs() <= 1000
+}
+
+/// P11.10: a tick counts against the hold only when a desk was connected over
+/// it and it was no longer than the gap; otherwise the expiry moves on by it.
+/// A decided row is never touched.
+#[test]
+fn the_approval_clock_runs_only_while_a_desk_was_connected() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let id = held(&repo, 1);
+    let decided = held(&repo, 2);
+    assert!(repo.reject_held(decided, "not_usable", "no", "desk")?);
+    let (e0, d0) = (expires(&repo, id), repo.get_held(decided)?.unwrap().expires_at);
+    let now = Utc::now();
+    let gap = Duration::minutes(3);
+
+    assert_eq!(repo.account_held_clocks(now + Duration::minutes(1), true, gap)?, 0, "watched: the clock ran");
+    assert_eq!(expires(&repo, id), e0);
+
+    assert_eq!(repo.account_held_clocks(now + Duration::minutes(2), false, gap)?, 1, "no desk: the expiry moves");
+    assert!(about(expires(&repo, id), e0 + Duration::minutes(1)), "{} vs {}", expires(&repo, id), e0);
+
+    // The daemon was stopped for 10 hours: nobody saw it, whatever the desk says now.
+    assert_eq!(repo.account_held_clocks(now + Duration::minutes(2) + Duration::hours(10), true, gap)?, 1);
+    assert!(about(expires(&repo, id), e0 + Duration::minutes(1) + Duration::hours(10)));
+
+    assert_eq!(repo.get_held(decided)?.unwrap().expires_at, d0, "a decided row is left");
+    Ok(())
+}
+
+/// P11.10: a held video nobody's desk saw does not expire; once seen for the
+/// whole hold, it expires into review as before.
+#[test]
+fn an_unseen_held_video_does_not_expire_and_a_seen_one_ends_in_review() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let temp = dir.path().join("temp");
+    let id = held(&repo, 1);
+    let now = Utc::now();
+
+    // 30 hours with no desk: past the original 24 h, still waiting.
+    repo.account_held_clocks(now + Duration::hours(30), false, Duration::minutes(3))?;
+    let report = omni_core::held::sweep(&repo, &temp, now + Duration::hours(30))?;
+    assert!(report.expired.is_empty(), "{report:?}");
+    assert_eq!(repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+
+    // Then a desk watches it for the whole hold (one long tick, the gap allowing it).
+    let later = now + Duration::hours(30) + Duration::hours(24) + Duration::minutes(1);
+    assert_eq!(repo.account_held_clocks(later, true, Duration::hours(25))?, 0);
+    let report = omni_core::held::sweep(&repo, &temp, later)?;
+    assert_eq!(report.expired, vec![id]);
+    let job = repo.get_job(id)?.unwrap();
+    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("APPROVAL_EXPIRED")));
+    Ok(())
+}
+
+/// P11.10: the desk's reminder reads how many wait, the oldest and the soonest expiry.
+#[test]
+fn the_reminder_counts_the_videos_waiting_for_approval() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    assert_eq!(repo.held_waiting()?.count, 0);
+    let a = held(&repo, 1);
+    let b = held(&repo, 2);
+    assert!(repo.reject_held(b, "not_usable", "no", "desk")?);
+    held(&repo, 3);
+    let w = repo.held_waiting()?;
+    assert_eq!(w.count, 2);
+    assert_eq!(w.oldest_held_at, repo.get_held(a)?.unwrap().created_at);
+    assert_eq!(w.soonest_expires_at, Some(expires(&repo, a)));
+    Ok(())
+}
