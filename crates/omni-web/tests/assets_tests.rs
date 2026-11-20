@@ -378,21 +378,22 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 20),
-        ("inbox.js", 27),
-        ("approval.js", 15),
-        ("notify.js", 15),
-        ("mcr.js", 53),
-        ("status.js", 3),
-        ("status.css", 6),
-        ("worklist.js", 3),
-        ("undo.js", 4),
-        ("dialog.js", 3),
-        ("keys.js", 1),
-        ("user.js", 13),
-        ("toast.js", 3),
-        ("text.js", 2),
-        ("text.el.js", 2),
+        ("desk.js", 21),
+        ("inbox.js", 28),
+        ("approval.js", 16),
+        ("notify.js", 16),
+        ("mcr.js", 54),
+        ("status.js", 4),
+        ("status.css", 7),
+        ("worklist.js", 4),
+        ("undo.js", 5),
+        ("dialog.js", 4),
+        ("keys.js", 2),
+        ("sound.js", 1),
+        ("user.js", 14),
+        ("toast.js", 4),
+        ("text.js", 3),
+        ("text.el.js", 3),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -748,7 +749,7 @@ fn the_desk_uses_no_native_dialogs() {
     };
     let desk_modules = [
         "app.js", "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js",
-        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js", "keys.js",
+        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js", "keys.js", "sound.js",
     ];
     for module in desk_modules {
         let src = code(module);
@@ -930,7 +931,7 @@ fn the_desk_is_laid_out_for_the_control_room() {
     // No static inline styles: only a progress width, a CSS variable and a computed scroll margin.
     for module in [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js", "dialog.js",
-        "toast.js", "keys.js",
+        "toast.js", "keys.js", "sound.js",
     ] {
         let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
         for (i, _) in src.match_indices("style: ") {
@@ -1044,7 +1045,7 @@ fn every_word_of_the_desk_is_in_one_dictionary() {
     let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
     let modules = [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
-        "dialog.js", "toast.js", "text.js", "keys.js",
+        "dialog.js", "toast.js", "text.js", "keys.js", "sound.js",
     ];
 
     // The lookup: a language switch, Greek the default and the fallback.
@@ -1189,7 +1190,7 @@ fn the_desk_works_from_the_keyboard() {
     // Real buttons only.
     let desk_modules = [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
-        "dialog.js", "toast.js", "keys.js", "text.js",
+        "dialog.js", "toast.js", "keys.js", "text.js", "sound.js",
     ];
     for module in desk_modules {
         let src = code(module);
@@ -1216,12 +1217,85 @@ fn the_desk_works_from_the_keyboard() {
     assert!(code("desk.js").contains("matchMedia('(prefers-reduced-motion: reduce)')"), "scrolling ignores the reduced-motion setting");
 }
 
+/// P12.9: sound. One volume, a switch per event (delivered, needs a person, health, held video),
+/// a test button per sound, and a reminder repeated every N minutes while something has waited
+/// longer than N minutes; all stored in this browser. Each event plays its own sound, a switched
+/// off event stays quiet, and the old on/off choice («Σίγαση») still means silence.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v13() {
+fn the_desk_sounds_are_chosen_per_browser() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let code = |module: &str| -> String {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    let sound = code("sound.js");
+    let notify = code("notify.js");
+
+    // The four events, each with a sound, a switch (on by default) and words.
+    assert!(sound.contains("export const EVENTS = ['delivered', 'person', 'health', 'held'];"), "the events changed");
+    let defaults = sound.split("const DEFAULTS = {").nth(1).and_then(|s| s.split("};").next()).expect("DEFAULTS");
+    for event in ["delivered", "person", "health", "held"] {
+        assert!(defaults.contains(&format!("  {event}: true,")), "the `{event}` sound is off by default");
+        assert!(sound.contains(&format!("  {event}: (start) => {{")), "the `{event}` event has no sound");
+        assert!(words.contains_key(&format!("sound.event.{event}")), "the `{event}` switch has no words");
+    }
+    assert!(sound.contains("  remind: (start) => {"), "the reminder has no sound");
+    // A switched-off event, or the sound switched off, plays nothing.
+    let play = function_body(&sound, "play");
+    assert!(play.contains("if (!prefs.on) return false;"), "the sound plays while switched off");
+    assert!(play.contains("kind === 'remind' ? !prefs.remind : !prefs[kind]"), "a switched-off event still plays");
+    // Stored in this browser; a broken value is made safe; the old «Σίγαση» stays silent.
+    assert!(sound.contains("localStorage.setItem(PREF_KEY, JSON.stringify(prefs))"), "the settings are not kept in this browser");
+    assert!(sound.contains("sanitize({ on: localStorage.getItem(OLD_KEY) !== 'off' })"), "the old mute is forgotten");
+    let sanitize = function_body(&sound, "sanitize");
+    assert!(sanitize.contains("Math.min(100, Math.max(0, volume))"), "the volume is not kept within 0..100");
+    assert!(sanitize.contains("Math.min(REMIND_MAX, Math.max(REMIND_MIN, mins))"), "the reminder's minutes are not bounded");
+    // One volume, through one gain every note goes through.
+    assert!(sound.contains("osc.connect(amp).connect(master);") && sound.matches("ctx.destination").count() == 1, "a note bypasses the volume");
+    assert!(sound.contains("master.gain.value = gainOf(prefs.volume)"), "the volume is not applied");
+    // The window: volume, a switch and a «Δοκιμή» per event, the reminder's minutes.
+    let form = function_body(&sound, "settingsForm");
+    assert!(form.contains("type: 'range'") && form.contains("type: 'number'"), "no volume or no minutes in the settings");
+    assert!(form.contains("EVENTS.map((kind) => el('div', { class: 'snd-row' }, check(kind, t(`sound.event.${kind}`)), testButton(kind)))"), "an event has no switch or no test");
+    assert!(form.contains("check('remind'") && form.contains("testButton('remind')"), "the reminder has no switch or no test");
+    // «Δοκιμή» plays at the chosen volume even when the event is switched off.
+    assert!(function_body(&sound, "testButton").contains("onClick: () => { unlock(); sound(kind); }"), "the test button obeys the switches");
+    assert!(code("notify.js").contains("onClick: () => openSoundSettings(),"), "the header's sound button does not open the settings");
+
+    // notify.js: every event plays its own sound, and has no audio of its own.
+    assert!(!notify.contains("AudioContext") && !notify.contains("createOscillator"), "notify.js plays sound behind sound.js");
+    let watch = function_body(&notify, "watchStatus");
+    for needle in ["play('person')", "play('held')", "play('health')", "tn('notify.held', diff.newlyHeld)", "remind(data);"] {
+        assert!(watch.contains(needle), "watchStatus lost {needle}");
+    }
+    assert!(function_body(&notify, "serviceDown").contains("play('health')"), "a silent outage");
+    assert!(function_body(&notify, "announce").contains("play(allOk ? 'delivered' : 'person')"), "a finished mail plays the wrong sound");
+    // A held video is its own news, not «needs a person».
+    let diff = function_body(&notify, "diffStatus");
+    assert!(diff.contains("personCount(next.queue) - personCount(prev.queue)") && diff.contains("next.queue.approval || 0) - (prev.queue.approval || 0)"), "held videos are not told apart");
+    assert!(!function_body(&notify, "personCount").contains("approval"), "a held video counts as needing a person");
+
+    // The reminder: due after N minutes of waiting, then again only every N minutes.
+    let due = function_body(&notify, "remindDue");
+    assert!(due.contains("if (oldestAt === null || !Number.isFinite(oldestAt)) return false;"), "an unknown wait reminds");
+    assert!(due.contains("return now - oldestAt >= span && (!last || now - last >= span);"), "the reminder does not wait N minutes, or repeats faster");
+    let remind = function_body(&notify, "remind");
+    assert!(remind.contains("if (needCount(q) === 0) { lastRemind = 0; return; }"), "the reminder does not start afresh when nothing waits");
+    assert!(remind.contains("if (!p.on || !p.remind || reminding) return;"), "the reminder ignores its switch");
+    assert!(remind.contains("now - lastRemindCheck < REMIND_CHECK_MS"), "the lists are fetched on every status poll");
+    let oldest = function_body(&notify, "oldestWaitAt");
+    assert!(oldest.contains("view=review") && oldest.contains("view=approval"), "the reminder does not read both waiting lists");
+    assert!(oldest.contains("Number.isFinite(at) && (oldest === null || at < oldest)"), "a missing time is taken as some time");
+    assert!(words["notify.remind.other"].contains("{n} λεπτά"), "the reminder does not say how long");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v14() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=13"), "user.html does not import user.js?v=13");
-    assert!(!page.contains("/static/user.js?v=12"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=14"), "user.html does not import user.js?v=14");
+    assert!(!page.contains("/static/user.js?v=13"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

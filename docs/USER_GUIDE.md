@@ -111,7 +111,8 @@ switched on yet at every station; ask MCR.
   and what to do, the free space of the Dalet watchfolder and of the temporary
   folder, and the queue («N σε αναμονή · N σε εξέλιξη»). Escape or a click
   elsewhere closes it.
-- **«🔔 Ήχος»** — sound on or off (§4.7).
+- **«🔔 Ήχος»** — the sound's settings: on or off, volume, which sounds,
+  the reminder (§4.7).
 - **«Προδιαγραφές εκπομπής»** — at the end of the tab row: the broadcast
   specification every delivered file meets.
 - **«Διαχείριση»** — the admin page (administrators only).
@@ -309,6 +310,18 @@ a pop-up «✔ Email «…»» or «⚠ …». Click anywhere on the page once a
 opening it, or the browser keeps the sound muted. The desk also warns when the
 ingest service stops answering («Η υπηρεσία λήψης δεν απαντά») and when it is
 back.
+
+**«🔔 Ήχος»** in the header opens «Ρυθμίσεις ήχου»: sound on or off
+(«Ήχος ανοιχτός»), the volume («Ένταση»), and a switch with a «Δοκιμή»
+button for each of the four sounds: all the videos of a mail delivered
+(rising); something needs you, a review or a late video (falling); a problem
+with the system's health or the service (three low notes); a video waiting
+for «Έγκριση → Dalet» (two notes, up). **«Υπενθύμιση»** plays again every N
+minutes (10 unless you change it, 1 to 120) while a video has waited for you
+longer than N minutes, and says so in a message; a video you hid from the
+review list does not count. The settings belong to this computer and browser
+only: a wall screen can stay quiet while the operator's screen plays. The
+pop-up messages always appear, with or without sound.
 
 A message about something that went wrong (red) stays until you close it with
 «✕»; at most three are shown, the oldest going first. Other messages leave by

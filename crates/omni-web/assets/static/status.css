@@ -254,6 +254,20 @@ kbd {
   padding: 1px 7px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;
   background: #0e1220; color: var(--text);
 }
+/* The sound's settings window (plan P12.9). */
+.dlg:has(.snd-form) { max-width: 560px; }
+.snd-form { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+.snd-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.snd-row input[type="range"] { flex: 1; min-width: 160px; }
+.snd-check { display: inline-flex; align-items: center; gap: 8px; flex: 1; min-width: 220px; cursor: pointer; }
+.snd-check input { width: 18px; height: 18px; margin: 0; }
+.snd-value { min-width: 3.5em; text-align: right; font-family: var(--mono); }
+.snd-events { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px 10px; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.snd-events legend { padding: 0 6px; color: var(--text-dim); }
+.snd-mins { width: 5em; }
+.snd-mins-label { color: var(--text-dim); }
+.snd-test { padding: 4px 10px; font-size: 13px; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

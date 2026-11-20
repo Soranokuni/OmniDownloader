@@ -4,16 +4,17 @@
  * emails have all their videos finished (/api/mails/settled). An email that
  * was still in progress at the last answer and is finished now gets:
  *
- *   - a short jingle: rising for "all delivered", a softer falling pair
- *     for "finished, but something needs MCR";
+ *   - a short sound: «delivered» when all went out, «person» when
+ *     something needs MCR;
  *   - a toast on the desk, and a browser notification when the browser
  *     allows one (it does only on https or on this machine itself);
  *   - the tab title marked until the desk is looked at again.
  *
- * The sound is synthesised with Web Audio: no file to ship or cache, and
- * nothing loaded from anywhere. Browsers start audio only after someone has
- * clicked the page, so the first click anywhere unlocks it; until then the
- * toast and title still say what happened.
+ * The status payload (watchStatus) adds the other news: a video that needs a
+ * person, one held for approval, one running late, a health check that got
+ * worse; and, while something has waited for a person longer than the
+ * reminder's minutes, the reminder, again every so many minutes (P12.9).
+ * The sounds, their switches and the volume are in sound.js.
  *
  * Only a change seen happening is announced: an email already finished
  * when the desk is opened stays quiet.
@@ -22,79 +23,19 @@
  */
 
 import { api, el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=3';
-import { t, tn, has } from '/static/text.js?v=2';
+import { toast } from '/static/toast.js?v=4';
+import { t, tn, has } from '/static/text.js?v=3';
+import {
+  play, unlock, soundPrefs, soundLocked, onSoundChange, openSoundSettings,
+} from '/static/sound.js?v=1';
 
 const POLL_MS = 8000;
-const PREF_KEY = 'omni.mcr.chime';
 const BASE_TITLE = document.title;
 
-let ctx = null;
 let previous = null; // Map id -> settled, from the last answer
 let unseen = 0;
 let button = null;
 let onOpen = () => {};
-
-function soundOn() {
-  try {
-    return localStorage.getItem(PREF_KEY) !== 'off';
-  } catch {
-    return true;
-  }
-}
-
-function setSoundOn(on) {
-  try {
-    localStorage.setItem(PREF_KEY, on ? 'on' : 'off');
-  } catch { /* private mode: the choice lasts for this page only */ }
-}
-
-/** The AudioContext, created and resumed inside a user gesture. */
-function unlock() {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) return;
-  if (!ctx) ctx = new Ctx();
-  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
-  paintButton();
-}
-
-/** One soft bell-like note: a sine with a quiet octave, quick attack, long tail. */
-function note(freq, at, length, gain) {
-  for (const [mult, level] of [[1, 1], [2, 0.18]]) {
-    const osc = ctx.createOscillator();
-    const amp = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.value = freq * mult;
-    amp.gain.setValueAtTime(0.0001, at);
-    amp.gain.exponentialRampToValueAtTime(gain * level, at + 0.015);
-    amp.gain.exponentialRampToValueAtTime(0.0001, at + length);
-    osc.connect(amp).connect(ctx.destination);
-    osc.start(at);
-    osc.stop(at + length + 0.05);
-  }
-}
-
-/** `ok`: C5 E5 G5 C6, rising. Otherwise G5 then E5, quieter. */
-function jingle(ok) {
-  if (!soundOn() || !ctx || ctx.state !== 'running') return false;
-  const start = ctx.currentTime + 0.03;
-  if (ok) {
-    [523.25, 659.25, 783.99].forEach((f, i) => note(f, start + i * 0.12, 0.5, 0.22));
-    note(1046.5, start + 0.36, 1.1, 0.25);
-  } else {
-    note(783.99, start, 0.45, 0.2);
-    note(659.25, start + 0.22, 0.9, 0.2);
-  }
-  return true;
-}
-
-/** Three short low notes, A4 A4 E4: unlike either jingle, and not a celebration. */
-function alarm() {
-  if (!soundOn() || !ctx || ctx.state !== 'running') return false;
-  const start = ctx.currentTime + 0.03;
-  [[440, 0], [440, 0.2], [329.63, 0.4]].forEach(([f, d]) => note(f, start + d, 0.3, 0.24));
-  return true;
-}
 
 /**
  * Every health check in plain words (P12.6, P12.7), one row per check name of
@@ -202,21 +143,30 @@ function sev(check) {
   return check ? (SEVERITY[check.state] ?? 0) : 0;
 }
 
+/** Everything that waits for a person, held videos included (the reminder's gate). */
 function needCount(q) {
-  return (q.review || 0) + (q.manual || 0) + (q.failed || 0) + (q.approval || 0);
+  return personCount(q) + (q.approval || 0);
+}
+
+/** Waits for a person to fix or decide: review, file-locker links, failures. */
+function personCount(q) {
+  return (q.review || 0) + (q.manual || 0) + (q.failed || 0);
 }
 
 /**
  * Pure: what changed between two /api/system/status payloads. `prev` null
  * (first load) reports nothing, so what was already there is not alarmed.
+ * A video held for approval is its own news (`newlyHeld`, P12.9), with its
+ * own sound, not part of `needsPerson`.
  */
 export function diffStatus(prev, next) {
-  const out = { needsPerson: 0, newlyLate: 0, wentBad: [], recovered: [] };
+  const out = { needsPerson: 0, newlyHeld: 0, newlyLate: 0, wentBad: [], recovered: [] };
   if (!prev || !next) return out;
   // The server sends `queue: null` when it could not count; comparing with
   // that would announce the whole backlog as new on the next good answer.
   if (prev.queue && next.queue) {
-    out.needsPerson = Math.max(0, needCount(next.queue) - needCount(prev.queue));
+    out.needsPerson = Math.max(0, personCount(next.queue) - personCount(prev.queue));
+    out.newlyHeld = Math.max(0, (next.queue.approval || 0) - (prev.queue.approval || 0));
     // Late videos (P11.3b) are not "needs a person": they are still being tried.
     // Only a rise is news; a field an older server does not send counts nothing.
     if (typeof prev.queue.late === 'number' && typeof next.queue.late === 'number') {
@@ -264,17 +214,24 @@ export function watchStatus(data) {
     const text = tn('notify.needs', n);
     const covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
     lastBadNews = Date.now();
-    if (!covered) jingle(false);
+    if (!covered) play('person');
     toast(text, 'bad');
     plainNotification(text, 'omni-review');
     if (!covered) count(n, true);
   }
+  if (diff.newlyHeld > 0) {
+    const text = tn('notify.held', diff.newlyHeld);
+    play('held');
+    toast(text, 'warn');
+    plainNotification(text, 'omni-approval');
+    count(diff.newlyHeld, true);
+  }
   if (diff.newlyLate > 0) {
-    // The softer of the two jingles, once; no title count and no review alert.
-    jingle(false);
+    // The «person» sound, once; no title count and no review alert.
+    play('person');
     toast(tn('notify.late', diff.newlyLate), 'warn');
   }
-  if (diff.wentBad.length) alarm();
+  if (diff.wentBad.length) play('health');
   for (const bad of diff.wentBad) {
     const ct = checkTexts(bad.name, bad);
     const text = t('notify.problem', { name: ct.name, happened: ct.happened, todo: ct.todo });
@@ -284,11 +241,76 @@ export function watchStatus(data) {
   for (const name of diff.recovered) {
     toast(t('notify.recovered', { name: CHECK_INFO[name]?.name || name }), 'ok');
   }
+  remind(data);
+}
+
+/* ------------------------------------------------------------------ *
+ * The reminder (P12.9): while something has waited for a person longer
+ * than `remindMins`, the «remind» sound and a message, again every
+ * `remindMins`. «Waited» is from the job's last change (updated_at), read
+ * from the review and approval lists once a minute at most, and only while
+ * the status says something waits. A video hidden from the review list
+ * («Απόκρυψη») is not in that list, so it does not remind.
+ * ------------------------------------------------------------------ */
+
+const REMIND_CHECK_MS = 60000;
+let lastRemind = 0;
+let lastRemindCheck = 0;
+let reminding = false;
+
+/**
+ * Pure: whether the reminder is due. `oldestAt` is the time (ms) the longest
+ * waiting job last changed, or null; nothing known is never due.
+ */
+export function remindDue({ now, oldestAt, lastRemind: last, mins }) {
+  if (oldestAt === null || !Number.isFinite(oldestAt)) return false;
+  const span = mins * 60000;
+  return now - oldestAt >= span && (!last || now - last >= span);
+}
+
+/** The time (ms) of the longest wait, from the review and approval lists; null if none. */
+async function oldestWaitAt() {
+  const lists = await Promise.all([
+    api('/api/jobs?view=review&page=1&per_page=100'),
+    api('/api/jobs?view=approval&page=1&per_page=100'),
+  ]);
+  let oldest = null;
+  for (const data of lists) {
+    for (const job of data.jobs || []) {
+      // A missing or unreadable time is skipped, never taken as "now".
+      const at = job.updated_at ? Date.parse(job.updated_at) : NaN;
+      if (Number.isFinite(at) && (oldest === null || at < oldest)) oldest = at;
+    }
+  }
+  return oldest;
+}
+
+async function remind(data) {
+  const p = soundPrefs();
+  const q = data && data.queue;
+  if (!q) return; // could not count: change nothing
+  if (needCount(q) === 0) { lastRemind = 0; return; } // nothing waits: the next wait starts afresh
+  if (!p.on || !p.remind || reminding) return;
+  const now = Date.now();
+  if (now - lastRemindCheck < REMIND_CHECK_MS) return;
+  lastRemindCheck = now;
+  reminding = true;
+  try {
+    const oldestAt = await oldestWaitAt();
+    if (!remindDue({ now: Date.now(), oldestAt, lastRemind, mins: p.remindMins })) return;
+    lastRemind = Date.now();
+    play('remind');
+    toast(tn('notify.remind', p.remindMins), 'warn');
+  } catch {
+    // The status line and the outage banner say when the server is gone.
+  } finally {
+    reminding = false;
+  }
 }
 
 /** The service stopped answering: sound once and say so outside the tab too. */
 export function serviceDown() {
-  alarm();
+  play('health');
   plainNotification(t('service.down'), 'omni-offline', () => {});
 }
 
@@ -341,7 +363,7 @@ function announce(done) {
     covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
     lastBadNews = Date.now();
   }
-  if (!covered) jingle(allOk);
+  if (!covered) play(allOk ? 'delivered' : 'person');
   for (const s of done.slice(0, 3)) {
     toast(t('notify.mail.toast', { mark: s.ok ? '✔' : '⚠', subject: subjectOf(s), what: describe(s) }), s.ok ? 'ok' : 'bad');
   }
@@ -367,17 +389,17 @@ async function poll() {
 
 function paintButton() {
   if (!button) return;
-  const on = soundOn();
-  const locked = on && (!ctx || ctx.state !== 'running');
+  const on = soundPrefs().on;
+  const locked = soundLocked();
   // Short, so the header stays on one line at 1366 px (P12.5); the tooltip says the rest.
   button.textContent = on ? (locked ? t('sound.locked') : t('sound.on')) : t('sound.off');
-  button.setAttribute('aria-pressed', String(on));
   button.title = on ? t(locked ? 'sound.locked.title' : 'sound.on.title') : t('sound.off.title');
 }
 
 /**
- * Start watching. `host` gets the sound toggle; `open(id)` shows an entry
- * (`mail:<Message-ID>` or `manual:<job id>`) when a notification is clicked.
+ * Start watching. `host` gets the sound button, which opens the sound's
+ * settings (P12.9); `open(id)` shows an entry (`mail:<Message-ID>` or
+ * `manual:<job id>`) when a notification is clicked.
  */
 export function initNotify(host, open, openReview) {
   onOpen = open || onOpen;
@@ -387,27 +409,14 @@ export function initNotify(host, open, openReview) {
       class: 'btn',
       type: 'button',
       id: 'chime-btn',
-      onClick: () => {
-        const turningOn = !soundOn() || !ctx || ctx.state !== 'running';
-        setSoundOn(turningOn);
-        if (turningOn) {
-          unlock();
-          // Asked only from this click: browsers ignore an unprompted request.
-          if ('Notification' in window && Notification.permission === 'default') {
-            Notification.requestPermission().catch(() => {});
-          }
-          setTimeout(() => jingle(true), 60);
-        }
-        paintButton();
-      },
+      'aria-haspopup': 'dialog',
+      onClick: () => openSoundSettings(),
     });
     host.prepend(button);
   }
+  onSoundChange(paintButton);
   // The first click or key anywhere on the desk lets the browser play sound.
-  // Not a click on the toggle itself: unlocking first would make the toggle
-  // read "already on" and mute instead of enabling.
-  const gesture = (ev) => {
-    if (button && ev.target instanceof Node && button.contains(ev.target)) return;
+  const gesture = () => {
     unlock();
     document.removeEventListener('pointerdown', gesture, true);
     document.removeEventListener('keydown', gesture, true);

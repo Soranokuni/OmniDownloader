@@ -9,11 +9,11 @@
  */
 
 import { api, el, render } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=3';
-import { STATUS } from '/static/status.js?v=3';
-import { deferAction, undoToast } from '/static/undo.js?v=4';
-import { confirmDialog } from '/static/dialog.js?v=3';
-import { t, tn } from '/static/text.js?v=2';
+import { toast } from '/static/toast.js?v=4';
+import { STATUS } from '/static/status.js?v=4';
+import { deferAction, undoToast } from '/static/undo.js?v=5';
+import { confirmDialog } from '/static/dialog.js?v=4';
+import { t, tn } from '/static/text.js?v=3';
 
 /** What a job is doing, for a person (`stage.<STAGE>` in text.el.js). */
 const STAGES = ['QUEUED', 'EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER', 'ARCHIVE', 'DONE'];

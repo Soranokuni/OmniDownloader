@@ -15,25 +15,25 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=3';
+import { toast } from '/static/toast.js?v=4';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=20';
-import { deferAction, visible } from '/static/undo.js?v=4';
-import { confirmDialog } from '/static/dialog.js?v=3';
-import { STATUS, statusBadge } from '/static/status.js?v=3';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=3';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=27';
+} from '/static/desk.js?v=21';
+import { deferAction, visible } from '/static/undo.js?v=5';
+import { confirmDialog } from '/static/dialog.js?v=4';
+import { STATUS, statusBadge } from '/static/status.js?v=4';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=4';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=28';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=15';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=15';
-import { t, tn, applyText } from '/static/text.js?v=2';
-import { initKeys, navCard } from '/static/keys.js?v=1';
+} from '/static/notify.js?v=16';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=16';
+import { t, tn, applyText } from '/static/text.js?v=3';
+import { initKeys, navCard } from '/static/keys.js?v=2';
 
 // The page's fixed words (header, tabs, the broadcast specification) come
 // from the same dictionary as everything else (P12.7).
