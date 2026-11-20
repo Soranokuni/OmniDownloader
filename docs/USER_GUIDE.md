@@ -302,7 +302,7 @@ tries again by itself. How often depends on the reason:
 | a network problem or a time-out | 30 s, 2, 5 and 10 minutes |
 | the source refused (HTTP 403) | 30 s and 2 minutes |
 | the platform limits downloads for now (YouTube's "confirm you're not a bot", "try again later") | 2, 5, 10 and 15 minutes |
-| still a live broadcast, or a premiere not started yet | checked 10, 30, 60 and 120 minutes after it arrived |
+| still a live broadcast, or a premiere not started yet | checked 10, 30, 60 and 120 minutes after the first try found it live |
 | the disk is full | 10 minutes, three times |
 
 Nothing older than 2 hours, counted from when it arrived or from your last
@@ -310,7 +310,7 @@ Nothing older than 2 hours, counted from when it arrived or from your last
 to «Χρειάζονται έλεγχο» and its card says so, for example «Δεν τα κατάφερε
 μετά από 5 προσπάθειες. Πατήστε «Δοκιμή ξανά» ή επικολλήστε άλλον
 σύνδεσμο.», or, for a broadcast that stayed live, «Η μετάδοση ήταν ακόμη
-ζωντανή (ή δεν είχε ξεκινήσει) μετά από 2 ώρες ελέγχων. …».
+ζωντανή (ή δεν είχε ξεκινήσει) σε όλους τους αυτόματους ελέγχους. …».
 
 **One platform at a time.** Links on the same video platform (YouTube, X,
 Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) start one after

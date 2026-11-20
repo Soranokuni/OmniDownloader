@@ -1322,6 +1322,18 @@ impl Repository {
         self.requeue(job_id, owner, backoff, error_code, error_message, None)
     }
 
+    /// Whether job `job_id` was ever re-queued with `error_code` (P11.7b): its
+    /// history has the line `requeue` writes, «{code}: retrying in …».
+    pub fn was_requeued_with(&self, job_id: i64, error_code: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let prefix = format!("{error_code}: retrying in ");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM job_events WHERE job_id = ? AND substr(message, 1, ?) = ?)",
+            params![job_id, prefix.chars().count() as i64, prefix],
+            |r| r.get::<_, bool>(0),
+        )?)
+    }
+
     /// [`Self::requeue_after`] for a retry the policy decided (P11.3a): the
     /// attempt the lease spent stays spent, and `max_attempts` becomes the
     /// code's budget (first run plus its retries), so the desk's «έγιναν N

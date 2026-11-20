@@ -502,7 +502,7 @@ fn job_for_desk(
         // whose own hint says so swap it (`uses_exhausted_hint`).
         let stopped = !matches!(job.status, JobStatus::Pending | JobStatus::Running) && !job.delivery_wait;
         let hint = if code.uses_exhausted_hint() && stopped {
-            omni_broadcast::errors::stopped_hint_el(code, job.attempts, &job.url, repo)
+            omni_broadcast::errors::stopped_hint_el(code, job.attempts, job.id, &job.url, repo)
         } else {
             // A login wall names the site and says whether its cookies are there (P3.5).
             omni_broadcast::errors::hint_for_job(code, &job.url, repo)

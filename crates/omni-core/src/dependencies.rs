@@ -579,7 +579,70 @@ impl DependencyManager {
             _ => {}
         }
     }
+
+    /// Before a verified update swaps the build with hash `sha256` in (P11.7b):
+    /// written and flushed, so a stop or crash before the verdict leaves it.
+    pub fn mark_ytdl_verifying(&self, sha256: &str) -> Result<()> {
+        use std::io::Write;
+        let marker = self.bin_dir.join(YTDL_VERIFYING_MARKER);
+        let mut f = std::fs::File::create(&marker).with_context(|| format!("Failed writing {marker:?}"))?;
+        f.write_all(sha256.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    /// The update's verdict is recorded (whatever it was): nothing is left to verify.
+    pub fn clear_ytdl_verifying(&self) {
+        let marker = self.bin_dir.join(YTDL_VERIFYING_MARKER);
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("Could not remove {marker:?}: {e}"),
+            _ => {}
+        }
+    }
+
+    /// At start-up (P11.7b): an update the last run swapped in but stopped
+    /// before judging (a service stop or crash during its self-check) is
+    /// unverified, so the build that was live before it, which was, comes
+    /// back; the next update run stages and verifies the release again (it
+    /// is not marked rejected). A marker whose build is not live (the swap
+    /// never happened, or was already undone) is only removed. A failed
+    /// rollback keeps the marker, so the next start tries again.
+    pub fn recover_unverified_ytdl(&self) -> UnverifiedYtdl {
+        let marker = self.bin_dir.join(YTDL_VERIFYING_MARKER);
+        let Ok(text) = std::fs::read_to_string(&marker) else {
+            return UnverifiedYtdl::None;
+        };
+        let pending = text.trim().to_string();
+        if pending.is_empty() || self.ytdl_live_sha256().as_deref() != Some(pending.as_str()) {
+            self.clear_ytdl_verifying();
+            return UnverifiedYtdl::NotLive;
+        }
+        match self.rollback_ytdl() {
+            Ok(_) => {
+                self.clear_ytdl_verifying();
+                UnverifiedYtdl::RolledBack(pending)
+            }
+            Err(e) => UnverifiedYtdl::RollbackFailed(format!("{e:#}")),
+        }
+    }
 }
+
+/// What [`DependencyManager::recover_unverified_ytdl`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnverifiedYtdl {
+    /// No update was waiting for its verdict.
+    None,
+    /// One was, but its build is not live: the marker is removed.
+    NotLive,
+    /// The unverified build (this hash) was rolled back.
+    RolledBack(String),
+    /// The rollback failed: the unverified build stays live.
+    RollbackFailed(String),
+}
+
+/// In `bin/`: the hash of a yt-dlp build swapped in and not yet judged by its
+/// self-check (P11.7b). Removed with the verdict.
+pub const YTDL_VERIFYING_MARKER: &str = "yt-dlp.exe.verifying";
 
 /// In `bin/`, next to `yt-dlp.exe.rejected`: the nights in a row the nightly
 /// yt-dlp update was postponed, and the local date of the last one (P11.4).
@@ -1860,6 +1923,49 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  yt-dlp_macos
         // ...and the rollback itself is reversible.
         mgr.rollback_ytdl().unwrap();
         assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"new build");
+    }
+
+    /// P11.7b: a build swapped in whose self-check was cut short (the service
+    /// stopped) is rolled back at the next start; the marker goes with it.
+    #[test]
+    fn a_swapped_build_with_no_verdict_is_rolled_back_at_start_up() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None);
+
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        mgr.apply_staged_ytdl().unwrap();
+        // ...the service stops here, before the verdict.
+
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::RolledBack("bbb".into()));
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("aaa"), "the build that was verified is back");
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+        assert!(!dir.path().join("yt-dlp.exe.rejected").exists(), "not rejected: the next run verifies it again");
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None, "once");
+    }
+
+    /// P11.7b: a verdict clears the marker; a marker whose build never went
+    /// live (stopped before the swap) is removed and nothing is rolled back.
+    #[test]
+    fn a_judged_or_never_swapped_build_is_left_live() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        mgr.apply_staged_ytdl().unwrap();
+        mgr.clear_ytdl_verifying(); // the verdict: kept
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("bbb"));
+
+        mgr.mark_ytdl_verifying("ccc").unwrap(); // stopped before the swap
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::NotLive);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("bbb"));
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
     }
 
     #[test]

@@ -458,7 +458,9 @@ the pinned build", "missing" or a version) and an **Install** / **Repair**
 button. Install downloads the exact pinned build and checks its checksum;
 jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
-the previous build.
+the previous build. If the service stops while the nightly update is still
+checking a new build, the next start puts the previous build back; the next
+update run checks the release again.
 
 The verified yt-dlp update also runs early when one platform (YouTube, X,
 Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) has 3 extraction
@@ -962,7 +964,7 @@ the second route.
 | `EXTRACT_TIMEOUT`, `DOWNLOAD_TIMEOUT` | yes | download timed out |
 | `DELIVERY_FAILED`, `DELIVER_TIMEOUT` | yes | could not write to the watchfolder: check the share and the service account's rights |
 | `LOW_DISK` | yes | free disk space |
-| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after it was queued (within the same 2-hour age limit), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
+| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after the first try found it live (the checks stop at the age limit, `retry.max_age_mins`, counted from when it was queued), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
 | `LOGIN_REQUIRED` | no | the site wants a login: add cookies (§6.1) |
 | `GEO_BLOCKED` | no | not available from Greece |
 | `PRIVATE_OR_REMOVED` | no | ask for another link |

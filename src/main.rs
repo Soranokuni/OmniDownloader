@@ -1233,6 +1233,8 @@ async fn run_daemon(
             }
         }
     }
+    // A yt-dlp update the last run swapped in but stopped before judging (P11.7b).
+    report_unverified_ytdl(&repo, dep_mgr.recover_unverified_ytdl());
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
@@ -2272,10 +2274,17 @@ async fn nightly_ytdl_update(
         return UpdateRun::drain_postponed();
     }
 
+    // Until its verdict, the swapped build is unverified: a stop or crash before
+    // then rolls it back at the next start (P11.7b). No marker, no swap.
+    if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {
+        warn!("yt-dlp update postponed: the pending verdict could not be recorded: {e:#}");
+        return UpdateRun::new(TaskOutcome::Failed, "install failed");
+    }
     let outcome = dep_mgr.apply_staged_ytdl();
     let installed = match outcome {
         Ok(path) => path,
         Err(e) => {
+            dep_mgr.clear_ytdl_verifying();
             warn!("Nightly yt-dlp update failed to install: {e:#}");
             let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
             return UpdateRun::new(TaskOutcome::Failed, "install failed");
@@ -2288,6 +2297,9 @@ async fn nightly_ytdl_update(
     // the release broke it: the old build goes back and this one is marked
     // rejected. A link both fail is the site, not the update.
     let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer, ffmpeg).await;
+    // The verdict is in (kept, rolled back, postponed, or unverified by a failed swap),
+    // recorded while the swap lock is still held (P11.7b).
+    dep_mgr.clear_ytdl_verifying();
     drop(swap);
     let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
     if act.reject {
@@ -2577,6 +2589,27 @@ async fn verify_ytdl_update(
         |links, why| selfcheck::withdraw_results(repo, links, why),
     )
     .await
+}
+
+/// The log and audit lines of the start-up check for an unjudged yt-dlp update (P11.7b).
+fn report_unverified_ytdl(repo: &Repository, found: omni_core::dependencies::UnverifiedYtdl) {
+    use omni_core::dependencies::UnverifiedYtdl;
+    match found {
+        UnverifiedYtdl::None | UnverifiedYtdl::NotLive => {}
+        UnverifiedYtdl::RolledBack(sha) => {
+            let msg = format!(
+                "yt-dlp update (sha256 {}) was stopped before its self-check finished; the previous build is back, and the next update run checks the release again",
+                &sha[..sha.len().min(16)]
+            );
+            warn!("{msg}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &msg);
+        }
+        UnverifiedYtdl::RollbackFailed(why) => {
+            let msg = format!("yt-dlp update was stopped before its self-check finished, and the previous build could not be put back: {why}");
+            error!("{msg}");
+            let _ = repo.log_audit("ERROR", "SYSTEM", &msg);
+        }
+    }
 }
 
 /// Replace a one-file yt-dlp with the folder build of the *same release*

@@ -490,7 +490,7 @@ pub(crate) fn retry_by_policy(
 pub(crate) fn review_hint(repo: &Repository, job_id: i64, code: ErrorCode, url: &str) -> String {
     if code.uses_exhausted_hint() {
         let attempts = repo.get_job(job_id).ok().flatten().map_or(1, |j| j.attempts);
-        return omni_broadcast::errors::stopped_hint_el(code, attempts, url, repo);
+        return omni_broadcast::errors::stopped_hint_el(code, attempts, job_id, url, repo);
     }
     omni_broadcast::errors::hint_for_job(code, url, repo)
 }

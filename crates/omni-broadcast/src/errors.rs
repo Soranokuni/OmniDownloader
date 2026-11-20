@@ -345,7 +345,7 @@ static LIVE_STREAM_DELAYS: [Duration; 4] =
 
 /// The review card's text for a stream that was still live after its last
 /// check (P11.7).
-pub const LIVE_STREAM_EXHAUSTED_EL: &str = "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) μετά από 2 ώρες ελέγχων. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο.";
+pub const LIVE_STREAM_EXHAUSTED_EL: &str = "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) σε όλους τους αυτόματους ελέγχους. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο.";
 
 /// How long a job that failed with `code` waits before its automatic retry,
 /// or `None` when it goes to review instead (P11.3a). `attempts` is the
@@ -382,11 +382,21 @@ pub fn exhausted_hint_el(attempts: i32) -> String {
 /// A rate limit that outlasted its retries on a video platform (or on a site
 /// that has a jar) is followed by the same site's login hint a login wall
 /// gets: the station's cookies are what usually gets past it. A stream still
-/// live after its checks has its own text (P11.7); one that was never checked
-/// again (the job was already past the age limit) the plain one.
-pub fn stopped_hint_el(code: ErrorCode, attempts: i32, url: &str, repo: &omni_core::repository::Repository) -> String {
-    if code == ErrorCode::LiveStream && attempts > 1 {
-        return LIVE_STREAM_EXHAUSTED_EL.to_string();
+/// live after its checks has its own text (P11.7), but only when job `job_id`
+/// was re-queued as live (its history has a LIVE_STREAM retry, P11.7b; its
+/// `max_attempts` cannot tell, NETWORK and RATE_LIMITED give the same 5); one
+/// never checked again as live (past the age limit, or retried for another
+/// cause before) gets the code's own hint, which only says what it is.
+pub fn stopped_hint_el(
+    code: ErrorCode,
+    attempts: i32,
+    job_id: i64,
+    url: &str,
+    repo: &omni_core::repository::Repository,
+) -> String {
+    if code == ErrorCode::LiveStream {
+        let checked_as_live = attempts > 1 && repo.was_requeued_with(job_id, code.as_str()).unwrap_or(false);
+        return if checked_as_live { LIVE_STREAM_EXHAUSTED_EL } else { code.hint_el() }.to_string();
     }
     let exhausted = exhausted_hint_el(attempts);
     if code == ErrorCode::RateLimited {
@@ -1232,22 +1242,22 @@ mod tests {
         let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
         let x = "https://x.com/someone/status/1";
         assert_eq!(
-            stopped_hint_el(ErrorCode::RateLimited, 5, x, &repo),
+            stopped_hint_el(ErrorCode::RateLimited, 5, 0, x, &repo),
             format!("{} {}", exhausted_hint_el(5), login_hint_el("x.com", false))
         );
         let yt = "https://www.youtube.com/watch?v=abcdefghijk";
-        let got = stopped_hint_el(ErrorCode::RateLimited, 5, yt, &repo);
+        let got = stopped_hint_el(ErrorCode::RateLimited, 5, 0, yt, &repo);
         assert!(got.starts_with(&exhausted_hint_el(5)) && got.ends_with(&hint_for_job(ErrorCode::LoginRequired, yt, &repo)), "{got}");
         assert!(got.contains("cookies"), "{got}");
         // With a jar: the expired-jar wording, as a login wall gets it.
         let jar = omni_core::cookies::parse_netscape("x.com", ".x.com\tTRUE\t/\tTRUE\t0\tn\tvalue-123456\n").unwrap();
         repo.put_cookie_jar("x.com", &jar, "admin", chrono::Utc::now()).unwrap();
-        assert!(stopped_hint_el(ErrorCode::RateLimited, 3, x, &repo).ends_with(&login_hint_el("x.com", true)));
+        assert!(stopped_hint_el(ErrorCode::RateLimited, 3, 0, x, &repo).ends_with(&login_hint_el("x.com", true)));
         // A news page, and the other passing codes: the exhausted text only.
         let article = "https://www.news.example/story/1";
-        assert_eq!(stopped_hint_el(ErrorCode::RateLimited, 5, article, &repo), exhausted_hint_el(5));
-        assert_eq!(stopped_hint_el(ErrorCode::Network, 5, x, &repo), exhausted_hint_el(5));
-        assert_eq!(stopped_hint_el(ErrorCode::DownloadTimeout, 1, yt, &repo), exhausted_hint_el(1));
+        assert_eq!(stopped_hint_el(ErrorCode::RateLimited, 5, 0, article, &repo), exhausted_hint_el(5));
+        assert_eq!(stopped_hint_el(ErrorCode::Network, 5, 0, x, &repo), exhausted_hint_el(5));
+        assert_eq!(stopped_hint_el(ErrorCode::DownloadTimeout, 1, 0, yt, &repo), exhausted_hint_el(1));
     }
 
     /// P11.7: a stream still live is checked again 10, 30, 60 and 120 minutes
@@ -1278,13 +1288,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = omni_core::repository::Repository::new(dir.path().join("omni.db")).unwrap();
         let yt = "https://www.youtube.com/watch?v=abcdefghijk";
-        assert_eq!(stopped_hint_el(c, 5, yt, &repo), LIVE_STREAM_EXHAUSTED_EL);
+        // A job retried twice with `code` by the policy, as `retry_by_policy` re-queues it.
+        let retried = |n: u32, code: ErrorCode| -> i64 {
+            let id = repo
+                .enqueue(&omni_core::models::NewJob::new(&format!("{yt}{n}"), &format!("{n}_ANNA_TEST"), "ANNA"), 24)
+                .unwrap()
+                .job_id();
+            for _ in 0..2 {
+                assert!(repo.lease_job_by_id(id, "w", 180).unwrap());
+                let max = code.retry_max_attempts().unwrap();
+                assert!(repo.requeue_retry(id, "w", Duration::seconds(0), code.as_str(), "x", max).unwrap());
+            }
+            id
+        };
+        let live = retried(1, c);
+        assert_eq!(stopped_hint_el(c, 3, live, yt, &repo), LIVE_STREAM_EXHAUSTED_EL);
+        // Worded without the age limit, which `retry.max_age_mins` sets (P11.7b).
         assert_eq!(
             LIVE_STREAM_EXHAUSTED_EL,
-            "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) μετά από 2 ώρες ελέγχων. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο."
+            "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) σε όλους τους αυτόματους ελέγχους. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο."
         );
-        // Never checked again (already past the age limit): the plain text says why.
-        assert_eq!(stopped_hint_el(c, 1, yt, &repo), exhausted_hint_el(1));
+        assert!(!LIVE_STREAM_EXHAUSTED_EL.chars().any(|ch| ch.is_ascii_digit()), "no number of hours");
+        // Never checked again as live (already past the age limit): its own plain hint.
+        assert_eq!(stopped_hint_el(c, 1, live + 100, yt, &repo), c.hint_el());
+        // P11.7b: retried for the network (the same max_attempts, 5, as a live row), then
+        // found live past the age limit: it was never checked as live.
+        let network = retried(2, ErrorCode::Network);
+        assert_eq!(ErrorCode::Network.retry_max_attempts(), c.retry_max_attempts(), "max_attempts cannot tell them apart");
+        assert_eq!(stopped_hint_el(c, 3, network, yt, &repo), c.hint_el(), "not re-queued as live");
         // The code omni-core's late rule names is this one.
         assert_eq!(c.as_str(), omni_core::models::LIVE_STREAM_CODE);
     }

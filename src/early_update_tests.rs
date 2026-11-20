@@ -280,6 +280,26 @@ fn the_nightly_drain_stays_ten_minutes_and_the_early_one_is_ninety_seconds() {
     assert!(update.contains("if !swap.drain(drain).await {"), "the update waits the drain it is given");
 }
 
+/// P11.7b: the update records the pending verdict before it swaps the build in
+/// and clears it only once the verdict is in, under the swap lock; start-up
+/// recovers an unjudged swap before any yt-dlp is used.
+#[test]
+fn an_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it() {
+    let main = include_str!("main.rs");
+    let update = &main[main.find("async fn nightly_ytdl_update(").unwrap()..];
+    let update = &update[..update.find("\n}").unwrap()];
+    let at = |s: &str| update.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let (mark, apply) = (at("dep_mgr.mark_ytdl_verifying(&staged.sha256)"), at("dep_mgr.apply_staged_ytdl()"));
+    let verdict = at("let verdict = verify_ytdl_update(");
+    // At a line's start, so a commented-out call does not count.
+    let clear = verdict + update[verdict..].find("\n    dep_mgr.clear_ytdl_verifying();").expect("cleared after the verdict");
+    let unlock = at("drop(swap);");
+    assert!(mark < apply, "the marker is written before the swap");
+    assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
+    let start = main.find("report_unverified_ytdl(&repo, dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
+    assert!(start < main.find("ensure_ytdl_folder_build(&dep_mgr,").unwrap(), "before the tools are resolved");
+}
+
 /// The worker notes an extraction failure only for a job that ended for good
 /// (inside the no-retry branch, after it was finished), with `done` and the cancel state.
 #[test]
