@@ -309,7 +309,8 @@ async fn a_roster_journalist_keeps_their_dash_in_the_identity_() -> Result<()> {
         .send("POST", "/api/user/jobs", &token, Some(json!({"url": "https://example.test/pd/1", "keyword": "fire-in-hills"})))
         .await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(r[0]["slug"], "1_PAPA-DAKI_FIRE-IN-HILLS");
+    // The file name follows the slug rule (P12.11: `-` becomes `_`); the identity below does not.
+    assert_eq!(r[0]["slug"], "1_PAPA_DAKI_FIRE_IN_HILLS");
     let job = p.repo.get_job(r[0]["job_id"].as_i64().unwrap())?.unwrap();
     // The identity still matches the roster, so the journalist's default
     // priority (7) is applied by enqueue.
@@ -364,8 +365,9 @@ async fn a_user_jobs_slug_is_built_from_its_stored_fields() -> Result<()> {
         assert_eq!(status, StatusCode::OK);
         for item in r.as_array().unwrap() {
             let job = p.repo.get_job(item["job_id"].as_i64().unwrap())?.unwrap();
-            // What article.rs `house_slug` compares against.
-            assert_eq!(job.slug, format!("{}_{}_{}", job.index_str, job.journalist, job.keyword));
+            // What article.rs `house_slug` compares against (P12.11).
+            assert_eq!(job.slug, omni_core::slug::compose(&job.index_str, &job.journalist, &job.keyword));
+            assert!(job.slug.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'), "{}", job.slug);
         }
     }
     Ok(())

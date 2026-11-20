@@ -20,8 +20,8 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=4';
-import { infoDialog } from '/static/dialog.js?v=5';
+import { t } from '/static/text.js?v=5';
+import { infoDialog } from '/static/dialog.js?v=6';
 
 const PREF_KEY = 'omni.mcr.sound';
 // Before P12.9 there was only on/off: 'off' there still means silence.

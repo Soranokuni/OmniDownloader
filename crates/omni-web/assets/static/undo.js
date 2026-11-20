@@ -17,8 +17,8 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=5';
-import { t } from '/static/text.js?v=4';
+import { toast } from '/static/toast.js?v=6';
+import { t } from '/static/text.js?v=5';
 
 export const UNDO_MS = 8000;
 

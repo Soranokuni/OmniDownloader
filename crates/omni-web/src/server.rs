@@ -53,6 +53,8 @@ impl WebServer {
             .route("/api/auth/logout-all", post(api_logout_all))
             .route("/api/auth/password", post(api_change_password))
             .route("/api/jobs/mine", get(user_jobs::api_get_my_jobs))
+            // The file name a form will give (P12.11): /user, the desk, an allowlisted client.
+            .route("/api/slug-preview", get(api_slug_preview))
             // ---- MCR: admin, an MCR account, or an allowlisted client ----
             .route("/mcr", get(view_mcr))
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))

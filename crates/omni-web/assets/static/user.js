@@ -3,12 +3,12 @@
 import {
   api, el, render, live, fmtTime, logout,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=5';
+import { toast } from '/static/toast.js?v=6';
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
-import { statusBadge } from '/static/status.js?v=5';
-import { deferAction, hiddenNow } from '/static/undo.js?v=6';
-import { t, tn, applyText } from '/static/text.js?v=4';
+import { statusBadge } from '/static/status.js?v=6';
+import { deferAction, hiddenNow } from '/static/undo.js?v=7';
+import { t, tn, applyText } from '/static/text.js?v=5';
 
 // The page's fixed words, from the dictionary (P12.10).
 applyText();
@@ -28,6 +28,8 @@ async function loadMe() {
     // form; both are rendered as text, never as markup.
     document.getElementById('user-display').textContent =
       me.journalist_surname ? `${label} · ${me.journalist_surname}` : label;
+    myJournalist = me.journalist_surname || '';
+    showSlugPreview();
   } catch { /* the api helper already redirects on 401 */ }
 }
 
@@ -109,7 +111,34 @@ multi.addEventListener('change', () => {
   document.getElementById('multi-box').hidden = !multi.checked;
   // A hidden required field would block the submit with no visible reason.
   document.getElementById('url').required = !multi.checked;
+  showSlugPreview();
 });
+
+/* The file name the video will get (P12.11), as the server's compose makes
+ * it (ELOT 743 and the file-name rule live there only): asked 250 ms after
+ * the typing stops; an answer to older fields is dropped. With several
+ * links, the first one's name (1A, then 1B, 1C…). */
+let myJournalist = '';
+let previewTimer = null;
+let previewAsked = 0;
+function showSlugPreview() {
+  const keyword = document.getElementById('keyword').value.trim();
+  const index = document.getElementById('index').value.trim() || '1';
+  const preview = document.getElementById('slug-preview');
+  clearTimeout(previewTimer);
+  if (!keyword) { previewAsked += 1; preview.textContent = ''; return; }
+  const many = multi.checked;
+  previewTimer = setTimeout(async () => {
+    const mine = ++previewAsked;
+    try {
+      const params = new URLSearchParams({ index: many ? `${index}A` : index, journalist: myJournalist || 'MCR', keyword });
+      const r = await api(`/api/slug-preview?${params}`);
+      if (mine !== previewAsked) return;
+      preview.textContent = t(many ? 'user.preview.many' : 'manual.preview', { name: `${r.slug}.mxf` });
+    } catch { /* the preview is a help; the submit says what is wrong */ }
+  }, 250);
+}
+for (const id of ['keyword', 'index']) document.getElementById(id).addEventListener('input', showSlugPreview);
 
 /** The submit call, kept apart from `api()` because a failure part-way through
  *  a list answers 500 with the links already queued, which `api()` would drop.
@@ -177,6 +206,7 @@ document.getElementById('submit-form').addEventListener('submit', async (event) 
     document.getElementById('multi-box').hidden = true;
     document.getElementById('url').required = true;
     document.getElementById('index').value = '1';
+    showSlugPreview();
     loadMyJobs();
   } catch (e) { toast(e.message, 'bad'); }
 });

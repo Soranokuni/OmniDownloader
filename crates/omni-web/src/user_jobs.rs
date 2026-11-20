@@ -85,7 +85,7 @@ pub async fn api_user_submit(
     let mut failed = false;
     for (i, url) in urls.iter().enumerate() {
         let index = if multi { format!("{base_index}{}", index_suffix(i)) } else { base_index.clone() };
-        let slug = format!("{index}_{journalist}_{keyword}");
+        let slug = omni_core::slug::compose(&index, &journalist, &keyword);
         let mut new = NewJob::new(url.as_str(), slug.clone(), journalist.clone());
         new.keyword = keyword.clone();
         new.index_str = index;

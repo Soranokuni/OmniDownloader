@@ -21,6 +21,16 @@ station's broadcast format (XDCAM HD422 1080i50 MXF, 8 audio tracks,
 name like `1A_PAPADAKI_FOTIA.mxf`. If anything is not right, the file is
 **not** delivered; the job waits on the MCR desk with the reason.
 
+**File names.** A delivered file is named `NUMBER_JOURNALIST_KEYWORD.mxf`,
+in capital Latin letters, digits and `_` only, and at most 60 characters
+before `.mxf`. Greek is written in Latin (Σεισμός → `SEISMOS`); any other
+sign, a dash or a space, becomes `_` (`PAPA-DAKI` → `PAPA_DAKI`,
+`fire in the hills` → `FIRE_IN_THE_HILLS`). A name that would be longer loses
+letters from the end of the keyword first, then of the journalist's name. If
+a file of that name is already in the watchfolder, the new one is `…_2.mxf`;
+nothing is overwritten. Every form (adding a link, `/user`, renaming) shows
+the name the video will get while you type.
+
 You do not need to do anything for a normal mail. The desk is where you look
 when something needs a person.
 

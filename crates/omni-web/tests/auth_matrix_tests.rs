@@ -324,6 +324,18 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
+    // The forms' live file-name preview (P12.11): read-only, for /user and the desk alike.
+    (
+        "GET",
+        "/api/slug-preview",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Reached),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     // The rename field's live file-name preview (P12.4): read-only, same gate as the rename.
     (
         "GET",

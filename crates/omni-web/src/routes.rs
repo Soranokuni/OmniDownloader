@@ -496,6 +496,19 @@ fn job_for_desk(
         _ => None,
     };
     v["wait_reason"] = reason.into();
+    // What each video offered from the job's article would be delivered as
+    // (P12.11): the same `compose` the queueing uses, by offered index.
+    if let Some(offers) = job
+        .candidates_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<Vec<omni_broadcast::article::Offered>>(j).ok())
+    {
+        let names: serde_json::Map<String, serde_json::Value> = offers
+            .iter()
+            .map(|o| (o.index_str.clone(), omni_core::slug::compose(&o.index_str, &job.journalist, &job.keyword).into()))
+            .collect();
+        v["offer_slugs"] = names.into();
+    }
     if let Some(code) = job.error_code.as_deref().and_then(omni_broadcast::errors::ErrorCode::from_code) {
         // A job that stopped retrying must not say a retry is under way (P11.3a); a queued
         // or running one, or a video waiting for the watchfolder, still is. Only the codes
@@ -784,7 +797,8 @@ pub async fn api_create_job(
     let keyword = sanitize_token(payload.keyword.as_deref().unwrap_or("ASSET"), "ASSET");
     let index_str = sanitize_token(payload.index_str.as_deref().unwrap_or("1"), "1");
 
-    let slug = format!("{}_{}_{}", index_str, journalist, keyword);
+    // The stored fields keep the identity; only the file name follows the slug rule (P12.11).
+    let slug = omni_core::slug::compose(&index_str, &journalist, &keyword);
     let priority = payload.priority.unwrap_or(0).clamp(-100, 100);
     let submitted_by = auth_user.map(|u| u.id);
 
@@ -958,6 +972,45 @@ pub async fn api_keyword_preview(
 }
 
 #[derive(Deserialize)]
+pub struct SlugPreviewQuery {
+    index: Option<String>,
+    journalist: Option<String>,
+    keyword: Option<String>,
+    /// `rename`: the keyword is read as the rename stores it ([`house_keyword`]).
+    #[serde(rename = "for")]
+    purpose: Option<String>,
+}
+
+/// The file name a form's fields become (P12.11), for the live previews of
+/// the add panel, `/user` and the rename: the same reading of each field
+/// the job's creation (or the rename) does, then [`omni_core::slug::compose`],
+/// so a preview cannot promise a name the job would not get. Changes
+/// nothing. Any signed-in account or an allowlisted client; `slug` is null
+/// when a rename's keyword has under 2 letters or digits.
+pub async fn api_slug_preview(
+    MaybePrincipal(principal): MaybePrincipal,
+    State(state): State<AppState>,
+    Query(query): Query<SlugPreviewQuery>,
+) -> JsonResult {
+    match principal {
+        Some(Principal::User(u)) if state.default_admin_locks(&u) => return Err(ApiError::password_change_required()),
+        Some(_) => {}
+        None => return Err(ApiError::unauthorized()),
+    }
+    // A long paste is cut before the work: no part survives past 60 anyway.
+    let field = |v: Option<String>| -> String { v.unwrap_or_default().chars().take(200).collect() };
+    let index = sanitize_token(&field(query.index), "1");
+    let journalist = sanitize_token(&field(query.journalist), "MCR");
+    let keyword = if query.purpose.as_deref() == Some("rename") {
+        house_keyword(&field(query.keyword))
+    } else {
+        Some(sanitize_token(&field(query.keyword), "ASSET"))
+    };
+    let slug = keyword.as_deref().map(|k| omni_core::slug::compose(&index, &journalist, k));
+    Ok(Json(serde_json::json!({ "slug": slug, "keyword": keyword })))
+}
+
+#[derive(Deserialize)]
 pub struct QueueOfferPayload {
     url: String,
 }
@@ -995,7 +1048,7 @@ pub async fn api_queue_offer(
 
     let mut new = omni_core::models::NewJob::new(
         offer.url.clone(),
-        format!("{}_{}_{}", offer.index_str, job.journalist, job.keyword),
+        omni_core::slug::compose(&offer.index_str, &job.journalist, &job.keyword),
         job.journalist.clone(),
     );
     new.keyword = job.keyword.clone();
@@ -2666,7 +2719,7 @@ pub async fn api_mail_queue_link(
         .ok_or_else(|| ApiError::bad_request("Αυτός ο σύνδεσμος δεν υπάρχει στο κείμενο αυτού του email."))?;
     let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
     let subject = mail.subject.clone().unwrap_or_default();
-    let slug = format!("{index}_{journalist}_{keyword}");
+    let slug = omni_core::slug::compose(&index, &journalist, &keyword);
 
     let locker = omni_email::parser::classify(&link.url, &cfg) == omni_email::parser::Tier::Locker;
     let mut new = omni_core::models::NewJob::new(link.url.clone(), slug.clone(), journalist.clone());

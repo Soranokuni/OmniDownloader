@@ -1877,7 +1877,7 @@ impl Repository {
         let Some(job) = self.get_job(job_id)? else {
             return Ok(None);
         };
-        let slug = format!("{}_{}_{}", job.index_str, job.journalist, keyword);
+        let slug = crate::slug::compose(&job.index_str, &job.journalist, keyword);
         let conn = self.pool.get()?;
         let changed = conn.execute(
             // A waiting job keeps its updated_at: it is the start of its wait (plan P7.19).

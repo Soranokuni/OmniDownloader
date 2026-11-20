@@ -10,12 +10,12 @@
  */
 
 import { api, el, fmtDuration, safeHref } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=5';
-import { fileName, clock, confirmWrongVideo, scrollBehavior } from '/static/desk.js?v=22';
-import { confirmDialog, infoDialog } from '/static/dialog.js?v=5';
-import { navCard } from '/static/keys.js?v=3';
-import { statusBadge } from '/static/status.js?v=5';
-import { t, tn } from '/static/text.js?v=4';
+import { toast } from '/static/toast.js?v=6';
+import { fileName, clock, confirmWrongVideo, scrollBehavior } from '/static/desk.js?v=23';
+import { confirmDialog, infoDialog } from '/static/dialog.js?v=6';
+import { navCard } from '/static/keys.js?v=4';
+import { statusBadge } from '/static/status.js?v=6';
+import { t, tn } from '/static/text.js?v=5';
 
 const cards = new Map(); // job id -> { node, job, expiry }
 let wantedFocus = null;

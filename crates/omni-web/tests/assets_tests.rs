@@ -378,22 +378,22 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 22),
-        ("inbox.js", 29),
-        ("approval.js", 17),
-        ("notify.js", 17),
-        ("mcr.js", 55),
-        ("status.js", 5),
+        ("desk.js", 23),
+        ("inbox.js", 30),
+        ("approval.js", 18),
+        ("notify.js", 18),
+        ("mcr.js", 56),
+        ("status.js", 6),
         ("status.css", 8),
-        ("worklist.js", 5),
-        ("undo.js", 6),
-        ("dialog.js", 5),
-        ("keys.js", 3),
-        ("sound.js", 2),
-        ("user.js", 15),
-        ("toast.js", 5),
-        ("text.js", 4),
-        ("text.el.js", 4),
+        ("worklist.js", 6),
+        ("undo.js", 7),
+        ("dialog.js", 6),
+        ("keys.js", 4),
+        ("sound.js", 3),
+        ("user.js", 16),
+        ("toast.js", 6),
+        ("text.js", 5),
+        ("text.el.js", 5),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -804,9 +804,10 @@ fn the_desk_uses_no_native_dialogs() {
         assert!(dialog.contains(needle), "the dialog lost: {what}");
     }
 
-    // Rename is a field on the card with a live preview, from the server's own keyword rule.
+    // Rename is a field on the card with a live preview, from the server's own keyword and
+    // file-name rules (P12.11: the slug preview, read as a rename).
     let rename = function_body(&desk, "renameForm");
-    assert!(rename.contains("/api/keyword-preview?text="), "the rename field has no live preview");
+    assert!(rename.contains("slugPreview({ index: job.index_str, journalist: job.journalist, keyword: input.value, for: 'rename' })"), "the rename field has no live preview");
     assert!(rename.contains("ev.key === 'Escape'") && rename.contains("ev.key === 'Enter'"), "the rename field lacks Enter/Escape");
 
     // Every action of an Email-tab card shows without selecting it first.
@@ -1390,12 +1391,42 @@ fn only_desk_work_on_the_desk() {
     assert_eq!(words["mail.remember.button"], "Να το θυμάμαι για αυτή τη διεύθυνση");
 }
 
+/// P12.11: no page builds a file name itself. Every preview (the add panel, /user, the rename)
+/// asks `/api/slug-preview`, debounced, dropping an answer to older fields; the article offers
+/// show the name the server composed for them.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v15() {
+fn every_file_name_preview_comes_from_the_server() {
+    let assets = all_assets();
+    let code = |module: &str| -> String {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    // Nothing joins the parts in the page: `${…}_${…}_${…}` is how a page guessed a name.
+    for module in ["desk.js", "mcr.js", "inbox.js", "approval.js", "user.js"] {
+        let src = code(module);
+        assert!(!src.contains("}_${"), "{module} builds a file name of its own");
+        assert!(!src.contains(".toUpperCase()}"), "{module} guesses the upper-case form of a name");
+    }
+    let desk = code("desk.js");
+    assert!(function_body(&desk, "slugPreview").contains("api(`/api/slug-preview?${params}`)"), "the desk's preview is not the server's");
+    let mcr = code("mcr.js");
+    let manual = function_body(&mcr, "showManualPreview");
+    assert!(manual.contains("await slugPreview({ index, journalist, keyword })"), "the add panel's preview is not the server's");
+    assert!(manual.contains("setTimeout(") && manual.contains("if (mine === manualAsked)"), "the add panel's preview is not debounced or keeps stale answers");
+    assert!(mcr.contains("(job.offer_slugs || {})[offer.index_str]"), "the offers do not show the composed name");
+    let user = code("user.js");
+    let preview = function_body(&user, "showSlugPreview");
+    assert!(preview.contains("api(`/api/slug-preview?${params}`)") && preview.contains("if (mine !== previewAsked) return;"), "/user has no server preview");
+    assert!(preview.contains("index: many ? `${index}A` : index"), "/user's preview of several links is not the first one's name");
+    assert!(assets.get("user.html").unwrap().contains("id=\"slug-preview\" aria-live=\"polite\""), "/user has no place for the preview");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v16() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=15"), "user.html does not import user.js?v=15");
-    assert!(!page.contains("/static/user.js?v=14"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=16"), "user.html does not import user.js?v=16");
+    assert!(!page.contains("/static/user.js?v=15"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

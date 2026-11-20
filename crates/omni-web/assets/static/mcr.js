@@ -15,25 +15,25 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=5';
+import { toast } from '/static/toast.js?v=6';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
-  canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo,
-} from '/static/desk.js?v=22';
-import { deferAction, visible } from '/static/undo.js?v=6';
-import { infoDialog } from '/static/dialog.js?v=5';
-import { STATUS, statusBadge } from '/static/status.js?v=5';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=5';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=29';
+  canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo, slugPreview,
+} from '/static/desk.js?v=23';
+import { deferAction, visible } from '/static/undo.js?v=7';
+import { infoDialog } from '/static/dialog.js?v=6';
+import { STATUS, statusBadge } from '/static/status.js?v=6';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=6';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=30';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=17';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=17';
-import { t, tn, applyText } from '/static/text.js?v=4';
-import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=3';
+} from '/static/notify.js?v=18';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=18';
+import { t, tn, applyText } from '/static/text.js?v=5';
+import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=4';
 
 // The page's fixed words (header, tabs, the broadcast specification) come
 // from the same dictionary as everything else (P12.7).
@@ -472,7 +472,8 @@ function renderOffers(targetId, jobs) {
       return el('div', { class: 'job-head offer-row' },
         el('div', {},
           el('p', { class: 'job-meta' },
-            t('offers.from', { id: job.id, name: fileName(job), becomes: `${offer.index_str}_${job.journalist}_${job.keyword}.mxf` })),
+            // The name the server's compose gives it (P12.11), sent with the job.
+            t('offers.from', { id: job.id, name: fileName(job), becomes: `${(job.offer_slugs || {})[offer.index_str] || offer.index_str}.mxf` })),
           el('p', { class: 'job-url', title: offer.url }, offer.url),
         ),
         el('div', { class: 'row tight' },
@@ -1217,17 +1218,23 @@ addPanel.addEventListener('keydown', (ev) => {
 });
 
 const manualFields = ['m-index', 'm-journalist', 'm-keyword'].map((id) => document.getElementById(id));
+// The file name as the server will make it (P12.11: ELOT 743 and the slug
+// rule live there only), asked 250 ms after the typing stops; an answer to
+// older fields is dropped.
+let manualTimer = null;
+let manualAsked = 0;
 function showManualPreview() {
   const [index, journalist, keyword] = manualFields.map((f) => f.value.trim());
-  // The server makes the Latin form (ELOT 743). The page does not guess it:
-  // a Greek word is announced as converted, not shown as a name it will
-  // not get.
-  const greek = /[^\x00-\x7F]/.test(`${index}${journalist}${keyword}`);
-  document.getElementById('m-preview').textContent = !(index && journalist && keyword)
-    ? ''
-    : greek
-      ? t('manual.preview.greek')
-      : t('manual.preview', { name: `${index}_${journalist.toUpperCase()}_${keyword.toUpperCase()}.mxf` });
+  const preview = document.getElementById('m-preview');
+  clearTimeout(manualTimer);
+  if (!(index && journalist && keyword)) { manualAsked += 1; preview.textContent = ''; return; }
+  manualTimer = setTimeout(async () => {
+    const mine = ++manualAsked;
+    try {
+      const r = await slugPreview({ index, journalist, keyword });
+      if (mine === manualAsked) preview.textContent = t('manual.preview', { name: `${r.slug}.mxf` });
+    } catch { /* the preview is a help; the add says what is wrong */ }
+  }, 250);
 }
 for (const f of manualFields) f.addEventListener('input', showManualPreview);
 

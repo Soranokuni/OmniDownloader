@@ -9,11 +9,11 @@
  */
 
 import { api, el, render } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=5';
-import { STATUS } from '/static/status.js?v=5';
-import { deferAction, undoToast } from '/static/undo.js?v=6';
-import { confirmDialog } from '/static/dialog.js?v=5';
-import { t, tn } from '/static/text.js?v=4';
+import { toast } from '/static/toast.js?v=6';
+import { STATUS } from '/static/status.js?v=6';
+import { deferAction, undoToast } from '/static/undo.js?v=7';
+import { confirmDialog } from '/static/dialog.js?v=6';
+import { t, tn } from '/static/text.js?v=5';
 
 /** What a job is doing, for a person (`stage.<STAGE>` in text.el.js). */
 const STAGES = ['QUEUED', 'EXTRACT', 'DOWNLOAD', 'PROBE', 'TRANSCODE', 'REWRAP', 'VERIFY', 'DELIVER', 'ARCHIVE', 'DONE'];
@@ -211,6 +211,17 @@ export function canRename(job) {
   return job.status === 'RUNNING' && ['QUEUED', 'EXTRACT', 'DOWNLOAD', 'TRANSCODE'].includes(job.stage);
 }
 
+/**
+ * The file name these fields become (P12.11), from the server's one
+ * `omni_core::slug::compose`: `{ slug, keyword }`. `for: 'rename'` reads the
+ * keyword as a rename stores it (`slug` null under 2 letters or digits).
+ */
+export function slugPreview(fields) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(fields)) params.set(key, value == null ? '' : String(value));
+  return api(`/api/slug-preview?${params}`);
+}
+
 /* Rename in place (P12.4): the card shows a field instead of a prompt(),
  * with the file name it will get, as the server makes it, under it. The
  * lists keep a card's field open across their refreshes by this set. */
@@ -228,18 +239,16 @@ export function renameForm(job, after, rerender) {
     t('desk.rename.as', { name: fileName(job) }));
   let timer = null;
   let asked = 0;
-  // The page does not guess the Latin form of a Greek word (ELOT 743): the
-  // server answers with the keyword it would store.
+  // The page does not guess the Latin form of a Greek word (ELOT 743) or
+  // the file-name rule: the server answers with the name it would give (P12.11).
   const update = () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
       const mine = ++asked;
       try {
-        const r = await api(`/api/keyword-preview?text=${encodeURIComponent(input.value)}`);
+        const r = await slugPreview({ index: job.index_str, journalist: job.journalist, keyword: input.value, for: 'rename' });
         if (mine !== asked) return;
-        preview.textContent = r.keyword
-          ? t('desk.rename.as', { name: `${job.index_str}_${job.journalist}_${r.keyword}.mxf` })
-          : t('desk.rename.short');
+        preview.textContent = r.slug ? t('desk.rename.as', { name: `${r.slug}.mxf` }) : t('desk.rename.short');
       } catch { /* the preview is a help; the save says what is wrong */ }
     }, 200);
   };

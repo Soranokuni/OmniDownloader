@@ -1531,9 +1531,55 @@ async fn the_mcr_form_keeps_the_journalist_identity_and_the_slug_matches_the_sto
     let job = app.repo.get_job(json["job_id"].as_i64().unwrap())?.unwrap();
     // The identity is what the roster knows, as at base.
     assert_eq!(job.journalist, "PAPA-DAKI");
+    // The stored fields keep the form's reading; the file name follows the slug rule (P12.11).
+    assert_eq!((job.index_str.as_str(), job.keyword.as_str()), ("2-B", "FIRE-IN-THE-HILLS"));
     // The invariant the article code (`house_slug`) relies on.
-    assert_eq!(job.slug, format!("{}_{}_{}", job.index_str, job.journalist, job.keyword));
-    assert_eq!(job.slug, "2-B_PAPA-DAKI_FIRE-IN-THE-HILLS");
+    assert_eq!(job.slug, omni_core::slug::compose(&job.index_str, &job.journalist, &job.keyword));
+    assert_eq!(job.slug, "2_B_PAPA_DAKI_FIRE_IN_THE_HILLS");
+    Ok(())
+}
+
+/// P12.11: the forms' live preview promises exactly the name the job then gets, Greek and
+/// signs included; for a rename it reads the keyword as the rename stores it.
+#[tokio::test]
+async fn the_file_name_preview_is_the_name_the_job_gets() -> Result<()> {
+    let app = App::new()?;
+    // Percent-encode every byte but letters and digits (Greek included).
+    let q = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+    for (n, (index, journalist, keyword)) in [
+        ("2-B", "Papa-Daki", "fire in the hills"),
+        ("1", "Παπαδάκη", "Σεισμός Ηράκλειο"),
+        ("", "", ""),
+        ("3", "MCR", &*"K".repeat(90)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, preview) = app
+            .send(
+                "GET",
+                &format!("/api/slug-preview?index={}&journalist={}&keyword={}", q(index), q(journalist), q(keyword)),
+                &app.mcr_token,
+                None,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        let (status, created) = app
+            .send(
+                "POST",
+                "/api/jobs",
+                &app.mcr_token,
+                Some(json!({ "url": format!("https://example.test/preview/{n}"), "keyword": keyword, "journalist": journalist, "index_str": index })),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview["slug"], created["slug"], "{index}/{journalist}/{keyword}");
+        assert!(preview["slug"].as_str().unwrap().len() <= omni_core::slug::MAX_LEN);
+    }
+    let (_, r) = app.send("GET", "/api/slug-preview?index=1&journalist=MCR&keyword=fire%20in&for=rename", &app.mcr_token, None).await?;
+    assert_eq!(r["slug"], "1_MCR_FIREIN", "a rename's keyword keeps letters and digits only");
+    let (_, r) = app.send("GET", "/api/slug-preview?index=1&journalist=MCR&keyword=x&for=rename", &app.mcr_token, None).await?;
+    assert!(r["slug"].is_null(), "a rename of one letter promises a name");
     Ok(())
 }
 
