@@ -96,9 +96,14 @@ impl ImageSource for Fake {
     }
 }
 
+/// The cap for the tests that are not about the cap: ffmpeg runs below normal
+/// priority, and on a loaded machine the 45 s production cap can run out
+/// mid-comparison (P14.7). The cap has its own tests below.
+const TEST_CAP: Duration = Duration::from_secs(600);
+
 async fn run(ffmpeg: &Path, dir: &Path, urls: &[&str], src: &Fake, secs: f64) -> ImageEvidence {
     let urls: Vec<String> = urls.iter().map(|s| s.to_string()).collect();
-    card_evidence_capped(ffmpeg, dir, &urls, &facts(), secs, src, CARD_CAP).await
+    card_evidence_capped(ffmpeg, dir, &urls, &facts(), secs, src, TEST_CAP).await
 }
 
 fn leftovers(dir: &Path) -> Vec<String> {
@@ -286,17 +291,20 @@ async fn when_the_comparison_runs_out_of_time_the_complete_picture_stays_without
     let shim = dir.path().join("ffshim.cmd");
     let real = std::fs::canonicalize(&ffm).unwrap();
     let real = real.to_string_lossy().replace("\\\\?\\", "").to_string();
-    std::fs::write(&shim, format!("@echo off\r\nfor %%a in (%*) do if \"%%a\"==\"-skip_frame\" ping -n 60 127.0.0.1 >nul\r\n\"{real}\" %*\r\n")).unwrap();
+    std::fs::write(&shim, format!("@echo off\r\nfor %%a in (%*) do if \"%%a\"==\"-skip_frame\" ping -n 600 127.0.0.1 >nul\r\n\"{real}\" %*\r\n")).unwrap();
     // The shim passes ordinary calls through untouched.
     let probe = process::run(&shim, ["-v", "error", "-y", "-i", &dir.path().join(VIDEO_FILE).to_string_lossy(), "-frames:v", "1", "-vf", "scale=64:-2", &dir.path().join("probe.jpg").to_string_lossy()], RunOpts::new(Duration::from_secs(30))).await.unwrap();
     assert!(probe.success && dir.path().join("probe.jpg").is_file(), "the shim must pass calls through: {} / {}", probe.stderr_tail, std::fs::read_to_string(&shim).unwrap());
     let urls = vec![URL.to_string()];
     let src = Fake::new(vec![Reply::Bytes(body)]);
     let started = Instant::now();
-    // 20 s: the picture phase must finish inside the cap even on a loaded
-    // machine (6 s failed during a full gate); the shim's comparison hangs 60 s.
-    let ev = card_evidence_capped(&shim, dir.path(), &urls, &facts(), 4.0, &src, Duration::from_secs(20)).await;
-    assert!(started.elapsed() < Duration::from_secs(40), "took {:?}", started.elapsed());
+    // The production cap: the picture phase must finish inside it even on a
+    // loaded machine (6 s failed in a full gate; 20 s left little room beside
+    // the workspace tests, P14.7); the shim's comparison hangs 10 minutes.
+    // Without the cap the key-frame run ends at its own timeout (68 s for a
+    // 4 s clip), so the bound stays below that.
+    let ev = card_evidence_capped(&shim, dir.path(), &urls, &facts(), 4.0, &src, CARD_CAP).await;
+    assert!(started.elapsed() < CARD_CAP + Duration::from_secs(15), "took {:?}", started.elapsed());
     assert_eq!(ev.host.as_deref(), Some("img.news.example"));
     assert_eq!((ev.distance, ev.frame_secs), (None, None));
     assert!(dir.path().join(ARTICLE_FILE).is_file(), "the finished picture is kept");

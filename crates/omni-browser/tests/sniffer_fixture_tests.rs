@@ -10,6 +10,7 @@
 //!
 //! Skipped with a visible warning when no browser is installed.
 
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::http::{header, StatusCode, Uri};
@@ -19,9 +20,16 @@ use axum::Router;
 use omni_browser::adblock::UnifiedAdBlocker;
 use omni_browser::sniffer::{DiscoveredMedia, StreamSniffer};
 
-/// Wall-clock bound for one page, browser launch included. A page with a
-/// confident candidate settles in about 3.5 s (the sniffer's own minimum).
-const PAGE_BUDGET: Duration = Duration::from_secs(8);
+/// The sniffer's own deadline in these tests. It polls until this deadline
+/// unless a confident candidate lets it settle early (about 3.5 s in).
+const SNIFF_DEADLINE_SECS: u64 = 60;
+
+/// Bound for one page, from the browser's first request for it: half the
+/// deadline. A sniffer that does not settle early polls the whole 60 s after
+/// the page loads and fails; one that does settles about 3.5 s in. Measured
+/// with the browser launch, under load this reached 37 s (P14.7: an 8 s
+/// budget against an 8 s deadline failed on every loaded run).
+const PAGE_BUDGET: Duration = Duration::from_secs(SNIFF_DEADLINE_SECS / 2);
 
 const HLS_MASTER: &str = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nseg0.m3u8\n";
 
@@ -36,18 +44,28 @@ fn browser_installed() -> bool {
     .any(|p| std::path::Path::new(p).exists())
 }
 
+/// When the browser first asked for `/page`.
+type FirstRequest = Arc<OnceLock<Instant>>;
+
 /// Serve `/page` (the fixture), `/jw/playlist.json` and any `*.m3u8` /
-/// `*.mp4` under `/media/`; everything else is 404. Returns the base URL.
-async fn serve(page: &'static str) -> String {
+/// `*.mp4` under `/media/`; everything else is 404. Returns the base URL and
+/// the moment `/page` was first requested.
+async fn serve(page: &'static str) -> (String, FirstRequest) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let b = base.clone();
+    let first: FirstRequest = Arc::default();
+    let (b, f) = (base.clone(), first.clone());
     let app = Router::new().fallback(move |uri: Uri| {
-        let base = b.clone();
-        async move { respond(uri.path(), &base, page) }
+        let (base, first) = (b.clone(), f.clone());
+        async move {
+            if uri.path() == "/page" {
+                first.get_or_init(Instant::now);
+            }
+            respond(uri.path(), &base, page)
+        }
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+    (base, first)
 }
 
 fn respond(path: &str, base: &str, page: &str) -> Response {
@@ -72,18 +90,21 @@ fn respond(path: &str, base: &str, page: &str) -> Response {
 /// not six Chromes competing for the CPU.
 static ONE_BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Sniff one fixture; returns the result with the wall time taken.
+/// Sniff one fixture; returns the result with the time taken from the
+/// browser's first request for the page (the browser's launch, which a loaded
+/// machine stretches most, is not counted).
 async fn sniff(page: &'static str) -> (String, DiscoveredMedia, Duration) {
     let _turn = ONE_BROWSER.lock().await;
     let adblock = tempfile::tempdir().unwrap();
     UnifiedAdBlocker::init(adblock.path().to_path_buf());
-    let base = serve(page).await;
+    let (base, first) = serve(page).await;
     let started = Instant::now();
-    let media = StreamSniffer::extract_media_bundle(&format!("{base}/page"), 8)
+    let media = StreamSniffer::extract_media_bundle(&format!("{base}/page"), SNIFF_DEADLINE_SECS)
         .await
         .unwrap_or_else(|e| panic!("sniffer found nothing: {e:#}"));
-    let took = started.elapsed();
-    eprintln!("fixture sniff took {took:?}; streams: {:?}", media.all_streams);
+    let wall = started.elapsed();
+    let took = first.get().expect("the browser never asked for the page").elapsed();
+    eprintln!("fixture sniff took {took:?} from the page request ({wall:?} with the launch); streams: {:?}", media.all_streams);
     (base, media, took)
 }
 
