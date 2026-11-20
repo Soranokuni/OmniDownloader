@@ -86,6 +86,7 @@ impl Rig {
             repo: self.repo.clone(),
             cfg: repair::RepairCfg {
                 mode: RepairMode::Off,
+                live: None,
                 budget: Duration::from_secs(5),
                 hold_hours: 24,
                 held_max_bytes: 20 << 30,

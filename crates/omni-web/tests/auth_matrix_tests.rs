@@ -855,6 +855,21 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // What the repair ladder in shadow would have fixed, and the switch to hold (P11.9): admin only.
+    ("GET", "/api/admin/repair/shadow", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/repair/hold", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // The autonomy report (P11.0): admin only.
     ("GET", "/api/admin/autonomy-report", &[
             (Anonymous, Denied),

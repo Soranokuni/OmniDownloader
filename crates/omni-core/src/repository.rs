@@ -748,6 +748,42 @@ enum Duplicate {
     Recent(i64),
 }
 
+/// What the repair ladder in shadow mode would have fixed (P11.9).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ShadowSummary {
+    /// Shadow runs of the ladder.
+    pub runs: i64,
+    /// Runs that verified a video they would have used.
+    pub would_fix: i64,
+    /// Jobs with at least one such run.
+    pub jobs: i64,
+    /// Per site, the most would-have-fixed first.
+    pub sites: Vec<ShadowSite>,
+    /// The latest would-have-fixed runs, newest first (at most 10).
+    pub latest: Vec<ShadowJob>,
+}
+
+/// One site's shadow runs (P11.9).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShadowSite {
+    /// The registrable domain; empty when the run recorded none.
+    pub domain: String,
+    pub runs: i64,
+    pub would_fix: i64,
+    pub jobs: i64,
+}
+
+/// A job the ladder would have fixed (P11.9).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShadowJob {
+    pub job_id: i64,
+    pub slug: String,
+    pub domain: String,
+    pub at: Option<DateTime<Utc>>,
+    /// The job's status now (`REQUIRES_REVIEW`, `COMPLETED_MANUAL`, ...).
+    pub status: String,
+}
+
 /// A job that waits for a person (P11.14), and since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitingForPerson {
@@ -6399,6 +6435,59 @@ impl Repository {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// What the repair ladder in shadow mode would have fixed since `since`
+    /// (P11.9): its runs, the ones that verified a video it would have used,
+    /// per site, and the latest such jobs (at most 10). Sites only, never an
+    /// address.
+    pub fn shadow_summary(&self, since: chrono::DateTime<Utc>) -> Result<ShadowSummary> {
+        let conn = self.pool.get()?;
+        let since = timestamps::format(since);
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(domain, ''), COUNT(*), COALESCE(SUM(outcome = 'shadow_found'), 0),
+                    COUNT(DISTINCT CASE WHEN outcome = 'shadow_found' THEN job_id END)
+               FROM repair_attempts
+              WHERE mode = 'shadow' AND started_at >= ?
+              GROUP BY COALESCE(domain, '')
+              ORDER BY 3 DESC, 1",
+        )?;
+        let sites = stmt
+            .query_map(params![since], |r| {
+                Ok(ShadowSite { domain: r.get(0)?, runs: r.get(1)?, would_fix: r.get(2)?, jobs: r.get(3)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let jobs: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT job_id) FROM repair_attempts
+              WHERE mode = 'shadow' AND outcome = 'shadow_found' AND started_at >= ?",
+            params![since],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT a.job_id, q.slug, COALESCE(a.domain, ''), a.started_at, q.status
+               FROM repair_attempts a JOIN queue q ON q.id = a.job_id
+              WHERE a.mode = 'shadow' AND a.outcome = 'shadow_found' AND a.started_at >= ?
+              ORDER BY a.started_at DESC, a.id DESC
+              LIMIT 10",
+        )?;
+        let latest = stmt
+            .query_map(params![since], |r| {
+                Ok(ShadowJob {
+                    job_id: r.get(0)?,
+                    slug: r.get(1)?,
+                    domain: r.get(2)?,
+                    at: timestamps::parse_opt(r.get(3)?),
+                    status: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ShadowSummary {
+            runs: sites.iter().map(|s| s.runs).sum(),
+            would_fix: sites.iter().map(|s| s.would_fix).sum(),
+            jobs,
+            sites,
+            latest,
+        })
     }
 
     /// What the repair ladder did per site since `since` (P10.15a). Attempts

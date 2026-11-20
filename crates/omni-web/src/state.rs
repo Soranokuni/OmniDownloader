@@ -180,6 +180,9 @@ pub struct AppState {
     /// How many password verifications the login path has started. Test-visible: proves
     /// a burst was stopped by the limiter before it reached Argon2, without timing.
     pub password_checks: Arc<AtomicUsize>,
+    /// The repair mode the workers read at each job (P11.9): the switch to
+    /// `hold` sets it together with config.json, so no restart is needed.
+    pub repair_mode: omni_core::config::LiveRepairMode,
 }
 
 /// Concurrent Argon2 hash/verify jobs the panel allows.
@@ -192,6 +195,7 @@ impl AppState {
             config.security.login_rate_limit_per_account_hour,
         );
         let tls_enabled = config.tls.is_enabled();
+        let repair_mode = omni_core::config::LiveRepairMode::new(config.repair.mode);
         // One Argon2 check, and only when an `admin` account exists.
         let default_admin_live = Arc::new(AtomicBool::new(repo.default_admin_still_works()));
         let llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
@@ -234,7 +238,14 @@ impl AppState {
             allowed_hosts: None,
             argon_permits: Arc::new(Semaphore::new(ARGON_CONCURRENCY)),
             password_checks: Arc::new(AtomicUsize::new(0)),
+            repair_mode,
         }
+    }
+
+    /// Share the workers' repair mode (P11.9).
+    pub fn with_repair_mode(mut self, mode: omni_core::config::LiveRepairMode) -> Self {
+        self.repair_mode = mode;
+        self
     }
 
     /// Run `f` (anything that hashes or verifies a password) on the blocking pool, behind the

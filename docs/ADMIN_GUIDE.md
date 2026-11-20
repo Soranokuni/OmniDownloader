@@ -627,8 +627,8 @@ evidence and try saved recipes, a live page load and (optionally) a model.
 
 | `repair.mode` | Effect |
 |---|---|
-| `off` (default) | behaves exactly as without repair |
-| `shadow` | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. |
+| `off` | behaves exactly as without repair (the value of a config.json written before this version that names no mode) |
+| `shadow` (default of a new installation) | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. Once it would have fixed at least 3 jobs in the last 14 days, the admin Overview offers the switch to `hold` with one click (saved to config.json, used from the next job, no restart; written to the audit log) |
 | `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24); the one exception is a trusted recipe (below) |
 
 Optional model rung: `repair.llm_enabled = true` with an explicit

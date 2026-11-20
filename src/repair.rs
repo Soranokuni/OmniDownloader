@@ -179,7 +179,10 @@ pub struct Tried {
 
 #[derive(Debug, Clone)]
 pub struct RepairCfg {
+    /// The mode at start-up; a run reads `live` instead, through [`RepairCtx::current`].
     pub mode: RepairMode,
+    /// The mode the admin panel can switch without a restart (P11.9); `None` in tests that fix one.
+    pub live: Option<omni_core::config::LiveRepairMode>,
     pub budget: Duration,
     pub hold_hours: i64,
     pub held_max_bytes: u64,
@@ -366,6 +369,19 @@ pub struct RepairCtx {
     pub repo: Repository,
     pub cfg: RepairCfg,
     pub env: Arc<dyn Env>,
+}
+
+impl RepairCtx {
+    /// This context with the mode the panel set last (P11.9, `cfg.live`), for
+    /// one run: a job, a night's self-heal or a test reads one mode from start
+    /// to end, even when the admin switches to `hold` meanwhile.
+    pub fn current(&self) -> RepairCtx {
+        let mut cfg = self.cfg.clone();
+        if let Some(live) = &cfg.live {
+            cfg.mode = live.get();
+        }
+        RepairCtx { repo: self.repo.clone(), cfg, env: self.env.clone() }
+    }
 }
 
 /// The real world: the headless browser, the network, the tools, the pipeline.

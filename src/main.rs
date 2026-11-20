@@ -1485,7 +1485,10 @@ async fn run_daemon(
             }
         });
     }
+    // The repair mode the workers read per job and the panel's switch sets (P11.9).
+    let repair_live_mode = omni_core::config::LiveRepairMode::new(config.repair.mode);
     let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
+        .with_repair_mode(repair_live_mode.clone())
         .with_url_tester(url_tester.clone())
         .with_cookie_tester(Arc::new(CookieJarTester {
             repo: repo.clone(),
@@ -1888,6 +1891,8 @@ async fn run_daemon(
         repo: repo.clone(),
         cfg: repair::RepairCfg {
             mode: config.repair.mode,
+            // Shared with the panel, whose switch to `hold` takes effect at the next job (P11.9).
+            live: Some(repair_live_mode.clone()),
             budget: Duration::from_secs(config.repair.budget_secs),
             hold_hours: config.repair.hold_hours,
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),

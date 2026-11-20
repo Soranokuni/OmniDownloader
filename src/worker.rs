@@ -641,6 +641,8 @@ pub(crate) async fn run_job(
     health: &HealthState,
     canary: &Arc<canary::CanaryEnv>,
 ) -> Result<()> {
+    // One repair mode for the whole run, the one the panel set last (P11.9).
+    let repair = &repair.current();
     let repair_mode = repair.cfg.mode;
     let job_id = job.id;
     let orig_url = job.url.clone();

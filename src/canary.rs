@@ -764,6 +764,7 @@ pub async fn heal_nightly(env: &CanaryEnv) -> usize {
 
 pub(crate) async fn heal_nightly_with(env: &CanaryEnv, ctx: &crate::repair::RepairCtx) -> usize {
     use crate::repair::{record_report, SiteHeal};
+    let ctx = &ctx.current();
     if ctx.cfg.mode == RepairMode::Off {
         return 0;
     }
@@ -825,6 +826,7 @@ pub(crate) async fn heal_by_day(env: &CanaryEnv, ctx: &crate::repair::RepairCtx,
 /// [`heal_by_day`]; `limited` false (an admin's «Run now») skips the once-per-2-hours limit only.
 pub(crate) async fn heal_now(env: &CanaryEnv, ctx: &crate::repair::RepairCtx, domain: &str, limited: bool) -> bool {
     use crate::repair::record_report;
+    let ctx = &ctx.current();
     if ctx.cfg.mode == RepairMode::Off {
         return false;
     }

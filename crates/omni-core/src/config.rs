@@ -469,11 +469,61 @@ pub enum RepairMode {
     Hold,
 }
 
+impl RepairMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            RepairMode::Off => 0,
+            RepairMode::Shadow => 1,
+            RepairMode::Hold => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RepairMode::Shadow,
+            2 => RepairMode::Hold,
+            _ => RepairMode::Off,
+        }
+    }
+}
+
+/// The repair mode the running daemon uses, shared by the workers and the
+/// admin panel, so the panel's switch to `hold` (P11.9) takes effect without
+/// a restart. Clones share one value.
+#[derive(Debug, Clone)]
+pub struct LiveRepairMode(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl LiveRepairMode {
+    pub fn new(mode: RepairMode) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(mode.as_u8())))
+    }
+
+    pub fn get(&self) -> RepairMode {
+        RepairMode::from_u8(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    pub fn set(&self, mode: RepairMode) {
+        self.0.store(mode.as_u8(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `repair.mode` of a config.json written before P11.9, which has none: off,
+/// as it always was. A config this version creates says `shadow`.
+fn repair_mode_of_old_files() -> RepairMode {
+    RepairMode::Off
+}
+
+/// The `repair` section of a config.json written before the section existed.
+fn repair_of_old_files() -> RepairConfig {
+    RepairConfig { mode: repair_mode_of_old_files(), ..RepairConfig::default() }
+}
+
 /// Page evidence and repair (`repair` in config.json). Old files without the
-/// section load with these defaults.
+/// section load with these defaults, mode `off`; a new config is written with
+/// mode `shadow` (P11.9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairConfig {
-    #[serde(default)]
+    #[serde(default = "repair_mode_of_old_files")]
     pub mode: RepairMode,
     /// Evidence files older than this are deleted by the retention task.
     #[serde(default = "default_evidence_days")]
@@ -560,9 +610,11 @@ fn default_evidence_max_mb() -> u64 {
 }
 
 impl Default for RepairConfig {
+    /// A new installation's: the ladder runs in shadow, recording what it
+    /// would have fixed and changing nothing (P11.9).
     fn default() -> Self {
         Self {
-            mode: RepairMode::Off,
+            mode: RepairMode::Shadow,
             evidence_days: default_evidence_days(),
             evidence_max_mb: default_evidence_max_mb(),
             hold_hours: default_hold_hours(),
@@ -897,7 +949,7 @@ pub struct AppConfig {
     pub llm: LlmConfig,
 
     /// Page evidence of failed jobs and the repair mode (plan P10.1).
-    #[serde(default)]
+    #[serde(default = "repair_of_old_files")]
     pub repair: RepairConfig,
 
     /// Automatic retries of a failed job (P11.3a).
@@ -1255,6 +1307,31 @@ mod tests {
         assert!(!nets.contains("127.0.0.1".parse().unwrap()), "a set list replaces the default");
     }
 
+    /// P11.9: a config this version creates runs the ladder in shadow; it is
+    /// written out with the mode, so the next start reads shadow too.
+    #[test]
+    fn a_new_config_runs_repair_in_shadow_and_keeps_it() {
+        let fresh = AppConfig::default();
+        assert_eq!(fresh.repair.mode, RepairMode::Shadow);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let loaded = AppConfig::load_from_file(&path).unwrap();
+        assert_eq!(loaded.repair.mode, RepairMode::Shadow, "a missing config.json is created as new");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"mode\": \"shadow\""));
+        assert_eq!(AppConfig::load_from_file(&path).unwrap().repair.mode, RepairMode::Shadow);
+    }
+
+    #[test]
+    fn the_live_repair_mode_is_shared_by_its_clones() {
+        let live = LiveRepairMode::new(RepairMode::Shadow);
+        let worker = live.clone();
+        assert_eq!(worker.get(), RepairMode::Shadow);
+        live.set(RepairMode::Hold);
+        assert_eq!(worker.get(), RepairMode::Hold);
+        live.set(RepairMode::Off);
+        assert_eq!(worker.get(), RepairMode::Off);
+    }
+
     #[test]
     fn repair_section_defaults_and_parses() {
         let old: AppConfig = serde_json::from_str("{}").unwrap();
@@ -1263,6 +1340,8 @@ mod tests {
         assert_eq!(old.repair.evidence_max_mb, 200);
         assert_eq!(old.repair.hold_hours, 24);
         assert_eq!(old.repair.held_max_gb, 20);
+        let section_without_mode: AppConfig = serde_json::from_str(r#"{"repair":{"evidence_days":3}}"#).unwrap();
+        assert_eq!(section_without_mode.repair.mode, RepairMode::Off, "an old file's missing mode stays off");
         let set: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"shadow","evidence_days":3}}"#).unwrap();
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);

@@ -117,7 +117,8 @@ async fn the_site_list_shows_state_rates_canaries_and_whether_run_now_exists() -
     assert_eq!(s["recent_rate"], 0.5);
     assert_eq!(s["last_code"], "NO_VIDEO");
     assert_eq!((s["canaries"].as_i64(), s["canaries_ok"].as_i64()), (Some(1), Some(0)));
-    assert_eq!(json["repair_mode"], "off");
+    // A new configuration runs repair in shadow (P11.9).
+    assert_eq!(json["repair_mode"], "shadow");
     assert!(!json.to_string().contains("secret-path"), "a host, never a page address: {json}");
     Ok(())
 }
@@ -350,6 +351,88 @@ async fn the_report_takes_one_to_ninety_days_and_counts_what_the_period_holds() 
     assert_eq!(week["sites"][0]["next_choices"], 0);
     assert_eq!(empty["sites"], json!([]), "no run, no row: nothing to divide");
     assert!(!month.to_string().contains("secret.mp4"), "a host at most, never an address: {month}");
+    Ok(())
+}
+
+/// One repair run of a new job on `site`, `ago` days back, in `mode`, ending `outcome`.
+fn attempt(repo: &Repository, n: u32, site: &str, mode: &str, outcome: &str, ago: i64) -> Result<i64> {
+    let job = repo
+        .enqueue(&omni_core::models::NewJob::new(&format!("https://{site}/story-{n}"), &format!("{n}_ANNA_TEST"), "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?
+        .job_id();
+    let at = chrono::Utc::now() - chrono::Duration::days(ago);
+    let id = repo.start_attempt(job, mode, at)?;
+    let end = AttemptEnd { outcome: Some(outcome.into()), domain: Some(site.into()), held_url: Some(format!("https://cdn.{site}/v{n}.mp4?sig=1")), ..Default::default() };
+    repo.finish_attempt(id, &end, at)?;
+    Ok(job)
+}
+
+/// P11.9: the shadow summary counts the last 14 days' shadow runs (not hold
+/// runs, not older ones), per site, names jobs by slug and site only, and
+/// offers the switch to hold from three jobs the ladder would have fixed.
+#[tokio::test]
+async fn the_shadow_summary_counts_fourteen_days_and_offers_hold_from_three_jobs() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let admin = omni_core::auth::generate_session_token();
+    repo.create_session(id, &admin, 1)?;
+    let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));
+    assert_eq!(state.repair_mode.get(), omni_core::config::RepairMode::Shadow, "a new config runs in shadow");
+    let app = App { router: WebServer::build_router(state), repo: repo.clone(), admin, _dir: dir };
+
+    let (status, empty) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((empty["days"].as_i64(), empty["runs"].as_i64(), empty["hold_offered"].as_bool()), (Some(14), Some(0), Some(false)));
+    assert_eq!(empty["repair_mode"], "shadow");
+
+    attempt(&repo, 1, "news.example", "shadow", "shadow_found", 1)?;
+    attempt(&repo, 2, "news.example", "shadow", "shadow_found", 3)?;
+    attempt(&repo, 3, "other.example", "shadow", "nothing_verified", 2)?;
+    attempt(&repo, 4, "news.example", "hold", "held", 1)?; // not shadow
+    attempt(&repo, 5, "news.example", "shadow", "shadow_found", 20)?; // older than 14 days
+    let (_, two) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!((two["runs"].as_i64(), two["would_fix"].as_i64(), two["jobs"].as_i64()), (Some(3), Some(2), Some(2)), "{two}");
+    assert_eq!(two["hold_offered"], false, "two jobs are not yet enough");
+    assert_eq!(two["sites"][0]["domain"], "news.example");
+    assert_eq!((two["sites"][0]["would_fix"].as_i64(), two["sites"][1]["would_fix"].as_i64()), (Some(2), Some(0)));
+    assert_eq!(two["latest"][0]["slug"], "1_ANNA_TEST", "newest first");
+    assert!(!two.to_string().contains("cdn.") && !two.to_string().contains("https://"), "no address: {two}");
+
+    attempt(&repo, 6, "other.example", "shadow", "shadow_found", 5)?;
+    let (_, three) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!((three["jobs"].as_i64(), three["hold_offered"].as_bool()), (Some(3), Some(true)));
+    Ok(())
+}
+
+/// P11.9: the switch to hold is saved to config.json, reaches the workers'
+/// live mode at once, is audited, and a second click changes nothing.
+#[tokio::test]
+async fn the_switch_to_hold_is_saved_live_and_audited_once() -> Result<()> {
+    let dir = TempDir::new()?;
+    let config_path = dir.path().join("config.json");
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let admin = omni_core::auth::generate_session_token();
+    repo.create_session(id, &admin, 1)?;
+    let workers = omni_core::config::LiveRepairMode::new(omni_core::config::RepairMode::Shadow);
+    let state = AppState::new(repo.clone(), AppConfig::default(), config_path.clone()).with_repair_mode(workers.clone());
+    let app = App { router: WebServer::build_router(state), repo: repo.clone(), admin, _dir: dir };
+
+    let (status, done) = app.send("POST", "/api/admin/repair/hold", None).await?;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!((done["changed"].as_bool(), done["restart_required"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(workers.get(), omni_core::config::RepairMode::Hold, "the workers' next job runs in hold");
+    assert_eq!(AppConfig::load_from_file(&config_path)?.repair.mode, omni_core::config::RepairMode::Hold, "saved for the next start");
+    let (_, after) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!((after["repair_mode"].as_str(), after["hold_offered"].as_bool()), (Some("hold"), Some(false)));
+    let audited = |repo: &Repository| -> Result<usize> {
+        Ok(repo.get_recent_audit_logs(100)?.into_iter().filter(|l| l.message.contains("Repair mode switched from shadow to hold by it@station.gr")).count())
+    };
+    assert_eq!(audited(&repo)?, 1);
+
+    let (status, again) = app.send("POST", "/api/admin/repair/hold", None).await?;
+    assert_eq!((status, again["changed"].as_bool()), (StatusCode::OK, Some(false)));
+    assert_eq!(audited(&repo)?, 1, "nothing changed, nothing audited");
     Ok(())
 }
 

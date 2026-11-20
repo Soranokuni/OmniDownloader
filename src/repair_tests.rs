@@ -360,7 +360,7 @@ struct Rig {
 }
 
 fn cfg(mode: RepairMode, budget: Duration) -> RepairCfg {
-    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default(), egress_allow: Default::default() }
+    RepairCfg { mode, live: None, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default(), egress_allow: Default::default() }
 }
 
 fn leased_job(repo: &Repository) -> Job {
@@ -436,6 +436,28 @@ async fn shadow_records_what_it_would_use_and_never_downloads() {
     assert_eq!(list[0]["url"], A);
     assert!(list[0]["checks"].as_array().unwrap().iter().any(|c| c["name"] == "probe" && c["ok"] == true));
     assert_eq!(r.repo.get_job(r.job.id).unwrap().unwrap().extraction_method, None, "shadow changes nothing on the job");
+}
+
+/// P11.9: the panel's switch to hold reaches the next run through the live
+/// mode, without a restart; a context with no live mode keeps its own.
+#[tokio::test]
+async fn the_live_mode_switched_to_hold_is_what_the_next_run_uses() {
+    let mut r = rig(RepairMode::Shadow);
+    let live = omni_core::config::LiveRepairMode::new(RepairMode::Shadow);
+    r.ctx.cfg.live = Some(live.clone());
+    assert_eq!(r.ctx.current().cfg.mode, RepairMode::Shadow);
+    live.set(RepairMode::Hold);
+    let run_ctx = r.ctx.current();
+    assert_eq!(run_ctx.cfg.mode, RepairMode::Hold);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = run(&run_ctx, &r.job, OWNER, PAGE, Some(page(&next_data(A))), &Prior::default(), &CancellationToken::new()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.repo.latest_attempt(r.job.id).unwrap().unwrap().mode, "hold");
+    // A run that already started keeps the mode it read.
+    live.set(RepairMode::Off);
+    assert_eq!(run_ctx.cfg.mode, RepairMode::Hold);
+    r.ctx.cfg.live = None;
+    assert_eq!(r.ctx.current().cfg.mode, RepairMode::Shadow, "no live mode: the fixed one");
 }
 
 #[tokio::test]
