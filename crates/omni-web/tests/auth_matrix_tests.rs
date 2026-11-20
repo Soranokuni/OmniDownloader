@@ -645,6 +645,10 @@ const MATRIX: &[Row] = &[
     ("POST", "/api/admin/settings/mail", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("POST", "/api/admin/settings/advanced", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("POST", "/api/admin/settings/complete", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // The wizard's last steps (P13.4): admin only. Job 1 is no test download: 404 for the admin.
+    ("POST", "/api/admin/setup/test-download", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("GET", "/api/admin/setup/test-download/1", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, ReachedNoFile)]),
+    ("POST", "/api/admin/journalists/import", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     // «Επανεκκίνηση υπηρεσίας» (P13.2): admin only. The harness has no service, so the
     // admin gets 409 NOT_A_SERVICE, which is reaching it.
     ("POST", "/api/admin/restart-service", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),

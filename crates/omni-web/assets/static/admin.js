@@ -6,7 +6,7 @@
  */
 
 import { api, el, render, toast, fmtTime, logout, live } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=6';
+import { runWizard } from '/static/wizard.js?v=7';
 
 /* ------------------------------------------------------------------ *
  * First-run account (P2.14) and the setup wizard (P7.12)

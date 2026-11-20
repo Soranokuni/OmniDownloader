@@ -960,6 +960,11 @@ pub struct AppConfig {
     #[serde(default = "default_setup_mode")]
     pub setup_mode: String,
 
+    /// The link the wizard's last step, «Δοκιμαστική λήψη», runs through every
+    /// stage into the watchfolder (P13.4). Default: [`DEFAULT_SETUP_TEST_URL`].
+    #[serde(default = "default_setup_test_url")]
+    pub setup_test_url: String,
+
     // Update settings
     #[serde(default = "default_channel")]
     pub ytdl_channel: String,
@@ -1034,6 +1039,17 @@ fn default_true() -> bool {
     true
 }
 
+/// The wizard's test link (P13.4): YouTube's first upload, "Me at the zoo",
+/// 19 seconds with sound, online unchanged since 2005. Short, so the test
+/// takes about a minute; YouTube, so it uses the same download path, pacing
+/// and JavaScript runtime as the newsroom's links. Change `setup_test_url`
+/// where YouTube is not reachable.
+pub const DEFAULT_SETUP_TEST_URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
+
+fn default_setup_test_url() -> String {
+    DEFAULT_SETUP_TEST_URL.to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -1064,6 +1080,7 @@ impl Default for AppConfig {
             metrics: MetricsConfig::default(),
             setup_completed: false,
             setup_mode: default_setup_mode(),
+            setup_test_url: default_setup_test_url(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,

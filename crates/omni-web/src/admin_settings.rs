@@ -300,6 +300,12 @@ pub async fn api_admin_get_settings(RequireAdmin(_): RequireAdmin, State(state):
         doc["watchfolder_pending"] = serde_json::json!(live.pending());
     }
     doc["restart_available"] = serde_json::json!(state.restarter.is_some());
+    // The wizard's last steps (P13.4): not part of the answer file.
+    {
+        let cfg = state.config.read().await;
+        doc["setup_test_url"] = serde_json::json!(cfg.setup_test_url);
+        doc["repair_mode"] = serde_json::json!(cfg.repair.mode);
+    }
     Ok(Json(doc))
 }
 
@@ -822,8 +828,16 @@ pub async fn api_admin_save_advanced(
 #[derive(Deserialize)]
 pub struct CompletePayload {
     mode: String,
+    /// The wizard's test download that reached the watchfolder (P13.4).
+    #[serde(default)]
+    test_job_id: Option<i64>,
+    /// The administrator skipped the test download on purpose.
+    #[serde(default)]
+    skip_test: bool,
 }
 
+/// Setup is complete only after a test download was delivered or was skipped
+/// on purpose (P13.4).
 pub async fn api_admin_complete_setup(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
@@ -833,6 +847,28 @@ pub async fn api_admin_complete_setup(
     if !MODES.contains(&mode.as_str()) {
         return Err(ApiError::bad_request("The mode must be beginner, intermediate or it."));
     }
+    let proof = match (p.test_job_id, p.skip_test) {
+        (Some(id), _) => {
+            let job = state.repo.get_job(id).map_err(internal_error("Could not read the job."))?;
+            match job.filter(crate::admin_wizard::proves_delivery) {
+                Some(job) => format!(
+                    "test download #{id} delivered as {}",
+                    job.file_path.as_deref().and_then(|f| Path::new(f).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ),
+                None => {
+                    return Err(ApiError::bad_request(format!(
+                        "Test download #{id} has not been delivered to the watchfolder. Wait for it, start it again, or skip it."
+                    )))
+                }
+            }
+        }
+        (None, true) => "test download skipped".to_string(),
+        (None, false) => {
+            return Err(ApiError::bad_request(
+                "Run «Δοκιμαστική λήψη» to the end, or skip it, before setup is complete.",
+            ))
+        }
+    };
     let mut cfg = state.config.write().await;
     let mut next = cfg.clone();
     next.setup_completed = true;
@@ -840,7 +876,7 @@ pub async fn api_admin_complete_setup(
     next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
     *cfg = next;
     drop(cfg);
-    let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Setup wizard completed ({mode}) by {}", admin.email));
+    let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Setup wizard completed ({mode}; {proof}) by {}", admin.email));
     Ok(Json(serde_json::json!({ "status": "ok", "restart_required": false })))
 }
 

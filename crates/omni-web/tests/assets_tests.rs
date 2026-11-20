@@ -508,11 +508,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v32_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v33_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=32"), "admin.html does not import admin.js?v=32");
-    assert!(!admin.contains("/static/admin.js?v=31"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=33"), "admin.html does not import admin.js?v=33");
+    assert!(!admin.contains("/static/admin.js?v=32"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -625,9 +625,31 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["6".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["7".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");
     assert!(page.contains("id=\"setup-rerun\""), "the Setup card is missing");
+}
+
+/// P13.4: the wizard ends with a delivered test video. Mail's Next needs a
+/// passing «Δοκιμή σύνδεσης»; journalists and tools steps are wired; Finish
+/// sends the test job or an explicit skip; no browser dialogs.
+#[test]
+fn the_wizard_ends_with_a_test_download_and_mail_needs_a_passing_test() {
+    let assets = all_assets();
+    let wizard = assets.get("static/wizard.js").expect("wizard.js shipped");
+    let code: String = wizard.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    assert!(code.contains("ids.push('check', 'testdl')"), "the test download is not the last step");
+    assert!(code.contains("valid: () => complete() && passed()"), "mail's Next does not need a passing test");
+    assert!(code.contains("copyable('Mail.Read')"), "the exact permission has no copy button");
+    assert!(code.contains("/api/admin/journalists/import"), "the journalists step is not wired");
+    assert!(code.contains("/api/admin/tools"), "the tools step is not wired");
+    assert!(code.contains("/api/admin/setup/test-download"), "the test download is not wired");
+    assert!(code.contains("test_job_id: T.jobId") && code.contains("skip_test: true"), "Finish sends no proof");
+    assert!(code.contains("valid: () => Boolean(T.status && T.status.delivered)"), "Finish is open before delivery");
+    assert!(code.contains("playout never reads"), "the watchfolder skip does not say where files go");
+    for banned in ["confirm(", "prompt(", "alert("] {
+        assert!(!code.contains(banned), "wizard.js uses {banned}");
+    }
 }

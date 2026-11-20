@@ -9,6 +9,7 @@ use crate::admin_bench;
 use crate::admin_cookies;
 use crate::admin_settings;
 use crate::admin_sites;
+use crate::admin_wizard;
 use crate::admin_tools;
 use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, host_guard, security_headers};
@@ -111,6 +112,10 @@ impl WebServer {
             .route("/api/admin/settings/advanced", post(admin_settings::api_admin_save_advanced))
             .route("/api/admin/settings/complete", post(admin_settings::api_admin_complete_setup))
             .route("/api/admin/settings/answer-file", get(admin_settings::api_admin_answer_file))
+            // The wizard's last steps (P13.4).
+            .route("/api/admin/setup/test-download", post(admin_wizard::api_admin_start_test_download))
+            .route("/api/admin/setup/test-download/:id", get(admin_wizard::api_admin_test_download_status))
+            .route("/api/admin/journalists/import", post(admin_wizard::api_admin_import_journalists))
             .route("/api/admin/restart-service", post(crate::admin_delivery::api_admin_restart_service))
             .route("/api/admin/tools", get(admin_tools::api_admin_tools))
             .route("/api/admin/tools/:name/install", post(admin_tools::api_admin_tool_install))

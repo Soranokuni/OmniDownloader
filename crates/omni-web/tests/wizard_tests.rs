@@ -664,6 +664,129 @@ async fn advanced_settings_are_validated_and_say_what_needs_a_restart() -> Resul
     Ok(())
 }
 
+// ---- P13.4: the test download and the journalists import ----
+
+const WORKER: &str = "wizard-test-worker:1:1";
+
+/// The worker's part for job `id`: leased, delivered into the watchfolder as
+/// `file`, finished COMPLETED.
+fn deliver(app: &App, id: i64, file: &str) -> Result<()> {
+    assert_eq!(app.repo.lease_job(WORKER, 3600)?.expect("leased").id, id);
+    assert!(app.repo.set_delivered_file(id, WORKER, file, 19.0)?);
+    assert!(app.repo.finish(id, WORKER, omni_core::models::JobStatus::Completed, None, None, None)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_is_complete_only_after_a_delivered_test_download_or_a_skip() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let complete = |body: Value| send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(body));
+
+    // Neither: refused, nothing saved.
+    let r = complete(json!({"mode": "beginner"})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("Δοκιμαστική λήψη"), "{}", r.body);
+    assert!(!app.state.config.read().await.setup_completed);
+
+    // The test download with the default link, as an ordinary job.
+    let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let id = r.json()["job_id"].as_i64().unwrap();
+    let job = app.repo.get_job(id)?.unwrap();
+    assert_eq!((job.url.as_str(), job.slug.as_str()), (omni_core::config::DEFAULT_SETUP_TEST_URL, "1_MCR_OMNIINGEST-TEST"));
+    // Asked again while it runs: the same job, not a second one.
+    let again = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
+    assert_eq!((again.json()["job_id"].as_i64(), again.json()["new"].as_bool()), (Some(id), Some(false)), "{}", again.body);
+
+    // Still running: no proof.
+    let r = complete(json!({"mode": "beginner", "test_job_id": id})).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    let s = send(&app, "GET", &format!("/api/admin/setup/test-download/{id}"), Some(&tok), None).await;
+    assert_eq!((s.json()["status"].as_str(), s.json()["delivered"].as_bool()), (Some("PENDING"), Some(false)), "{}", s.body);
+    assert!(s.json()["file_name"].is_null());
+
+    // Delivered: the file name is shown and setup completes.
+    let file = app.dir.path().join("watchfolder").join("1_MCR_OMNIINGEST-TEST.mxf");
+    deliver(&app, id, &file.to_string_lossy())?;
+    let s = send(&app, "GET", &format!("/api/admin/setup/test-download/{id}"), Some(&tok), None).await;
+    assert_eq!(s.json()["delivered"].as_bool(), Some(true), "{}", s.body);
+    assert_eq!(s.json()["file_name"].as_str(), Some("1_MCR_OMNIINGEST-TEST.mxf"), "only the name, not the path");
+    let r = complete(json!({"mode": "beginner", "test_job_id": id})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(AppConfig::load_from_file(app.dir.path().join("config.json"))?.setup_completed);
+    let audit: Vec<String> = app.repo.get_recent_audit_logs(20)?.into_iter().map(|a| a.message).collect();
+    assert!(audit.iter().any(|m| m.contains(&format!("test download #{id} delivered as 1_MCR_OMNIINGEST-TEST.mxf"))), "{audit:?}");
+
+    // A second test is a new job, not "already delivered".
+    let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
+    assert_eq!(r.json()["new"].as_bool(), Some(true), "{}", r.body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_a_test_job_the_pipeline_delivered_proves_the_setup() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    // An ordinary job delivered by the pipeline is not the test download.
+    let other = app
+        .repo
+        .enqueue(&omni_core::models::NewJob::new("https://video.news.example/v/1", "1_MCR_ASSET", "MCR"), 24)?
+        .job_id();
+    deliver(&app, other, "watchfolder/1_MCR_ASSET.mxf")?;
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": other}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    let s = send(&app, "GET", &format!("/api/admin/setup/test-download/{other}"), Some(&tok), None).await;
+    assert_eq!(s.status, StatusCode::NOT_FOUND);
+
+    // A test download that failed and that someone marked done by hand did not reach playout.
+    let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({"url": "https://clips.news.example/test.mp4"}))).await;
+    let id = r.json()["job_id"].as_i64().unwrap();
+    assert_eq!(app.state.config.read().await.setup_test_url, "https://clips.news.example/test.mp4", "a changed link is kept");
+    assert_eq!(app.repo.lease_job(WORKER, 3600)?.unwrap().id, id);
+    // Its rename was recorded but the job still failed (say, the verify after it).
+    assert!(app.repo.set_delivered_file(id, WORKER, "watchfolder/1_MCR_OMNIINGEST-TEST.mxf", 19.0)?);
+    assert!(app.repo.finish(id, WORKER, omni_core::models::JobStatus::Failed, Some("DOWNLOAD_FAILED"), Some("test failure"), None)?);
+    assert!(app.repo.mark_completed_manually(id)?);
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": id}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(!app.state.config.read().await.setup_completed);
+
+    // A link that is not one is refused, with the key named.
+    let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({"url": "javascript:alert(1)"}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body.contains("setup_test_url"), "{}", r.body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pasted_journalists_are_previewed_then_added_and_people_on_the_list_are_kept() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    app.repo.save_journalist("PAPADAKI", "Anna Papadaki", &["anna@news.example".to_string()], 5)?;
+    let before = app.repo.list_journalists()?.len();
+    let text = "Επώνυμο\tΟνοματεπώνυμο\tEmail\nΠαπαδάκη\tΆλλη Άννα\tother@news.example\nΔοκιμάκης\tΝίκος Δοκιμάκης\tnikos@news.example\nKAKOS\tKakos\tnot-an-address\n";
+
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": text, "dry_run": true}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let v = r.json();
+    assert_eq!(v["add"].as_array().map(|a| a.len()), Some(1), "{v}");
+    assert_eq!(v["add"][0]["surname"], "DOKIMAKIS");
+    assert_eq!(v["existing"][0]["surname"], "PAPADAKI");
+    assert_eq!(v["problems"][0]["line"], 4);
+    assert_eq!(app.repo.list_journalists()?.len(), before, "a preview adds nobody");
+
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": text}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let people = app.repo.list_journalists()?;
+    let anna = people.iter().find(|j| j.surname == "PAPADAKI").unwrap();
+    assert_eq!((anna.full_name.as_str(), anna.emails.clone(), anna.default_priority), ("Anna Papadaki", vec!["anna@news.example".to_string()], 5), "kept as it was");
+    let nikos = people.iter().find(|j| j.surname == "DOKIMAKIS").expect("added");
+    assert_eq!(nikos.emails, ["nikos@news.example"]);
+    assert!(app.repo.data_dir().unwrap().join("backups").join("taxonomy").read_dir()?.next().is_some(), "a copy was kept first");
+    Ok(())
+}
+
 #[tokio::test]
 async fn completing_setup_records_the_mode_and_the_answer_file_has_no_secret() -> Result<()> {
     let app = app(false)?;
@@ -674,7 +797,8 @@ async fn completing_setup_records_the_mode_and_the_answer_file_has_no_secret() -
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(!app.state.config.read().await.setup_completed);
 
-    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "it"}))).await;
+    // P13.4: with the test download skipped on purpose.
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "it", "skip_test": true}))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let saved = AppConfig::load_from_file(app.dir.path().join("config.json"))?;
     assert!(saved.setup_completed);
