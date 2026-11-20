@@ -503,6 +503,8 @@ pub enum WatchfolderSwitch {
     Switched { reviewed: Vec<i64> },
     /// Jobs were still running after the drain: nothing changed.
     Busy,
+    /// A newer save replaced this change (P13.2b): nothing changed.
+    Superseded,
 }
 
 /// The message on a video that waited for the old watchfolder (P13.2).
@@ -521,21 +523,40 @@ pub fn waiting_video_review_message(old: &Path, new: &Path) -> String {
 /// finished video still waiting for the old folder goes to review as
 /// DELIVERY_UNCONFIRMED: its rename may have landed there. If the drain times
 /// out nothing changes and [`WatchfolderSwitch::Busy`] is returned; the gate
-/// opens again either way.
+/// opens again either way. A zero `drain` is a passive check: it switches only
+/// when no job holds a pass at that moment, and holds no lease back.
+///
+/// `still_wanted` is asked before the drain and again after it, before
+/// anything is touched (P13.2b): a change a newer save replaced while it
+/// waited returns [`WatchfolderSwitch::Superseded`] and changes nothing.
 pub async fn switch_watchfolder(
     gate: &omni_core::update_gate::UpdateGate,
     paths: &DeliveryPaths,
     repo: &Repository,
     new: PathBuf,
     drain: std::time::Duration,
+    still_wanted: impl Fn() -> bool,
 ) -> Result<WatchfolderSwitch> {
+    if !still_wanted() {
+        return Ok(WatchfolderSwitch::Superseded);
+    }
     let old = paths.watchfolder();
     if same_folder(&old, &new) {
         return Ok(WatchfolderSwitch::Switched { reviewed: Vec::new() });
     }
+    // The passive check does not even raise the gate while a job runs: a zero
+    // timeout still lasts a timer tick (up to ~15 ms on Windows).
+    if drain.is_zero() && gate.active() > 0 {
+        return Ok(WatchfolderSwitch::Busy);
+    }
     let Some(_swap) = gate.begin_swap(drain).await else {
         return Ok(WatchfolderSwitch::Busy);
     };
+    if !still_wanted() {
+        info!("The watchfolder change to {new:?} was replaced by a newer one while it waited; not applied");
+        return Ok(WatchfolderSwitch::Superseded);
+    }
+    let old = paths.watchfolder();
     let reviewed = repo
         .review_parked_deliveries(&waiting_video_review_message(&old, &new))
         .context(ErrorCode::DeliveryFailed.as_str())?;

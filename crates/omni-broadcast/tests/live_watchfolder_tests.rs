@@ -58,13 +58,62 @@ impl Fixture {
     }
 }
 
+/// A change nobody replaced.
+fn wanted() -> bool {
+    true
+}
+
+/// P13.2b: a change replaced by a newer save while it drained is never
+/// applied: the folder stays, no waiting video goes to review, the gate opens.
+#[tokio::test]
+async fn a_change_replaced_while_it_drained_touches_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let f = Fixture::new();
+    let parked = f.parked_pending(1);
+    let running = f.gate.try_enter().expect("a job holds a pass");
+    let replaced = Arc::new(AtomicBool::new(false));
+    let (gate, paths, repo, new, r) = (f.gate.clone(), f.paths.clone(), f.repo.clone(), f.new_folder(), replaced.clone());
+    let switching = tokio::spawn(async move {
+        switch_watchfolder(&gate, &paths, &repo, new, Duration::from_secs(30), move || !r.load(Ordering::SeqCst)).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.gate.is_paused(), "it is draining");
+    replaced.store(true, Ordering::SeqCst); // a newer save
+    drop(running);
+
+    let out = switching.await.unwrap().unwrap();
+    assert_eq!(out, WatchfolderSwitch::Superseded);
+    assert_eq!(f.paths.watchfolder(), f.dir.path().join("old-watch"), "the replaced folder is never used");
+    assert_eq!(f.repo.get_job(parked).unwrap().unwrap().status, JobStatus::Pending, "nothing goes to review for it");
+    assert!(!f.gate.is_paused(), "the queue runs again");
+}
+
+/// P13.2b: a zero drain is a passive check: with a job running it answers
+/// Busy at once and leaves the gate open; with none it switches.
+#[tokio::test]
+async fn a_zero_drain_checks_without_holding_jobs_back() {
+    let f = Fixture::new();
+    let running = f.gate.try_enter().expect("a job holds a pass");
+    let out = tokio::time::timeout(Duration::from_secs(1), switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::ZERO, wanted))
+        .await
+        .expect("answers at once")
+        .unwrap();
+    assert_eq!(out, WatchfolderSwitch::Busy);
+    assert!(!f.gate.is_paused());
+    drop(running);
+    let out = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::ZERO, wanted).await.unwrap();
+    assert_eq!(out, WatchfolderSwitch::Switched { reviewed: vec![] });
+    assert_eq!(f.paths.watchfolder(), f.new_folder());
+}
+
 #[tokio::test]
 async fn while_a_job_runs_the_change_waits_and_changes_nothing() {
     let f = Fixture::new();
     let parked = f.parked_pending(1);
     let running = f.gate.try_enter().expect("a job holds a pass");
 
-    let out = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::from_millis(100)).await.unwrap();
+    let out = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::from_millis(100), wanted).await.unwrap();
     assert_eq!(out, WatchfolderSwitch::Busy);
     assert_eq!(f.paths.watchfolder(), f.dir.path().join("old-watch"), "the folder of the running job is kept");
     assert_eq!(f.repo.get_job(parked).unwrap().unwrap().status, JobStatus::Pending);
@@ -77,7 +126,7 @@ async fn new_jobs_wait_while_it_drains_and_it_switches_once_the_last_job_ends() 
     let f = Fixture::new();
     let running = f.gate.try_enter().expect("a job holds a pass");
     let (gate, paths, repo, new) = (f.gate.clone(), f.paths.clone(), f.repo.clone(), f.new_folder());
-    let switching = tokio::spawn(async move { switch_watchfolder(&gate, &paths, &repo, new, Duration::from_secs(30)).await });
+    let switching = tokio::spawn(async move { switch_watchfolder(&gate, &paths, &repo, new, Duration::from_secs(30), wanted).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(f.gate.try_enter().is_none(), "no new job is leased while the change waits");
     assert_eq!(f.paths.watchfolder(), f.dir.path().join("old-watch"), "not under a running job");
@@ -95,7 +144,7 @@ async fn with_nothing_running_it_switches_and_waiting_videos_go_to_review() {
     let plain = f.queue(2);
     let marker_before = f.delivering_to(parked);
 
-    let out = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::from_secs(5)).await.unwrap();
+    let out = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::from_secs(5), wanted).await.unwrap();
     assert_eq!(out, WatchfolderSwitch::Switched { reviewed: vec![parked] });
     assert_eq!(f.paths.watchfolder(), f.new_folder());
 
@@ -107,6 +156,6 @@ async fn with_nothing_running_it_switches_and_waiting_videos_go_to_review() {
     assert_eq!(f.repo.get_job(plain).unwrap().unwrap().status, JobStatus::Pending, "a job not yet made is untouched");
 
     // The same folder again: nothing to do, nothing reviewed.
-    let again = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::from_secs(5)).await.unwrap();
+    let again = switch_watchfolder(&f.gate, &f.paths, &f.repo, f.new_folder(), Duration::from_secs(5), wanted).await.unwrap();
     assert_eq!(again, WatchfolderSwitch::Switched { reviewed: vec![] });
 }

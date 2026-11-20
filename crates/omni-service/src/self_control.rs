@@ -9,6 +9,8 @@
 //! service's DACL: [`dacl_granting_self_control`] builds the new DACL from the
 //! old one (pure, tested); [`grant_self_control`] reads, rewrites and writes it
 //! (Windows only, at install, upgrade and account change; never in tests).
+//! For NetworkService and LocalService the entry names the service's own SID,
+//! see [`grantee`] (P13.2b).
 
 use anyhow::{Context, Result};
 
@@ -59,6 +61,22 @@ pub fn needs_self_control(account: Option<&str>) -> bool {
     }
 }
 
+/// Who the entry is for (P13.2b). NetworkService and LocalService are shared
+/// by many services: a grant to S-1-5-20 or S-1-5-19 would let every one of
+/// them stop this service. For those the entry names this service's own SID,
+/// `NT SERVICE\<service>`, which only this service's processes carry (the
+/// installer makes the SID part of the service's token). Any other account
+/// (the virtual account, a domain account) is its own.
+pub fn grantee(service: &str, account: &str) -> String {
+    let a = account.trim().to_ascii_uppercase().replace(' ', "");
+    let a = a.strip_prefix("NTAUTHORITY\\").unwrap_or(&a);
+    if matches!(a, "NETWORKSERVICE" | "LOCALSERVICE" | "S-1-5-20" | "S-1-5-19") {
+        format!("NT SERVICE\\{service}")
+    } else {
+        account.trim().to_string()
+    }
+}
+
 #[cfg(windows)]
 mod os {
     use super::*;
@@ -72,10 +90,13 @@ mod os {
         LookupAccountNameW, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
     };
     use windows::Win32::System::Services::{
-        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceObjectSecurity, SetServiceObjectSecurity,
-        SC_MANAGER_CONNECT,
+        ChangeServiceConfig2W, CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceObjectSecurity,
+        SetServiceObjectSecurity, SC_MANAGER_CONNECT, SERVICE_CONFIG_SERVICE_SID_INFO, SERVICE_SID_INFO,
     };
 
+    const SERVICE_CHANGE_CONFIG: u32 = 0x0002;
+    /// SERVICE_SID_TYPE_UNRESTRICTED.
+    const SERVICE_SID_TYPE_UNRESTRICTED: u32 = 1;
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
 
@@ -123,12 +144,13 @@ mod os {
     }
 
     pub fn grant(service: &str, account: &str) -> Result<()> {
-        let sid = account_sid(account)?;
+        let grantee = super::grantee(service, account);
+        let service_sid = grantee != account.trim();
         let name = wide(service);
         // SAFETY: handles are closed on every path; buffers outlive the calls.
         unsafe {
             let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT).context("Opening the Service Manager")?;
-            let svc = match OpenServiceW(scm, PCWSTR(name.as_ptr()), READ_CONTROL | WRITE_DAC) {
+            let svc = match OpenServiceW(scm, PCWSTR(name.as_ptr()), READ_CONTROL | WRITE_DAC | SERVICE_CHANGE_CONFIG) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = CloseServiceHandle(scm);
@@ -136,6 +158,14 @@ mod os {
                 }
             };
             let result = (|| -> Result<()> {
+                if service_sid {
+                    // The service's SID is in its processes' token only with
+                    // this SID type; it applies from the next start.
+                    let info = SERVICE_SID_INFO { dwServiceSidType: SERVICE_SID_TYPE_UNRESTRICTED };
+                    ChangeServiceConfig2W(svc, SERVICE_CONFIG_SERVICE_SID_INFO, Some(std::ptr::from_ref(&info).cast()))
+                        .context("Adding the service's own SID to its processes")?;
+                }
+                let sid = account_sid(&grantee)?;
                 let mut needed = 0u32;
                 let _ = QueryServiceObjectSecurity(svc, DACL_SECURITY_INFORMATION.0, PSECURITY_DESCRIPTOR::default(), 0, &mut needed);
                 let mut buf = vec![0u8; needed.max(1) as usize];
@@ -219,6 +249,17 @@ mod tests {
         assert!(dacl_granting_self_control(DEFAULT, "BA").is_err(), "an alias is not a SID");
         assert!(dacl_granting_self_control(DEFAULT, "S-1-5-21)(A;;GA;;;WD").is_err(), "nothing smuggled in");
         assert!(dacl_granting_self_control("D:(A;;CC;;;SY", SID_A).is_err());
+    }
+
+    /// P13.2b: never the SID every NetworkService or LocalService process shares.
+    #[test]
+    fn a_shared_service_account_is_granted_through_the_services_own_sid() {
+        for a in ["NT AUTHORITY\\NetworkService", "NT AUTHORITY\\Network Service", "networkservice", " NT AUTHORITY\\LocalService ", "LocalService", "S-1-5-20", "S-1-5-19"] {
+            assert_eq!(grantee("OmniIngestService", a), "NT SERVICE\\OmniIngestService", "{a}");
+        }
+        for a in [crate::DEFAULT_SERVICE_ACCOUNT, "NEWSROOM\\svc_ingest", ".\\svc-test"] {
+            assert_eq!(grantee("OmniIngestService", a), a, "{a}");
+        }
     }
 
     #[test]

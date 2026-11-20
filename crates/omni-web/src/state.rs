@@ -138,6 +138,9 @@ pub struct AppState {
     pub delivery: Option<crate::admin_delivery::LiveDelivery>,
     /// Carries out «Επανεκκίνηση υπηρεσίας» (P13.2); `None` outside the Windows service.
     pub restarter: Option<Arc<dyn crate::admin_delivery::ServiceRestarter>>,
+    /// Set while a restart is under way (P13.2b): a second request starts no
+    /// second helper and no second stop.
+    pub restarting: Arc<std::sync::atomic::AtomicBool>,
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
@@ -228,6 +231,7 @@ impl AppState {
             mail: None,
             delivery: None,
             restarter: None,
+            restarting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
             site_runner: None,

@@ -302,17 +302,43 @@ mod windows_impl {
         let service = manager
             .open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
             .context("Failed opening the service to start it again")?;
+        let state = |s: ServiceState| match s {
+            ServiceState::Stopped => crate::ScmState::Stopped,
+            ServiceState::StopPending => crate::ScmState::StopPending,
+            ServiceState::StartPending => crate::ScmState::StartPending,
+            ServiceState::Running => crate::ScmState::Running,
+            _ => crate::ScmState::Other,
+        };
         let deadline = std::time::Instant::now() + timeout;
+        let mut seen_stopping = false;
         loop {
-            if service.query_status()?.current_state == ServiceState::Stopped {
-                break;
+            let now = state(service.query_status()?.current_state);
+            seen_stopping |= matches!(now, crate::ScmState::Stopped | crate::ScmState::StopPending);
+            match crate::restart_step(now, seen_stopping) {
+                crate::RestartStep::Start => break,
+                crate::RestartStep::AlreadyStarted => {
+                    info!("{SERVICE_NAME} was already started again after the stop");
+                    return Ok(());
+                }
+                crate::RestartStep::Wait => {}
             }
             if std::time::Instant::now() >= deadline {
                 anyhow::bail!("{SERVICE_NAME} did not stop within {} s; it was not started again", timeout.as_secs());
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        service.start(&[] as &[OsString]).context("Failed starting the service again")?;
+        if let Err(e) = service.start(&[] as &[OsString]) {
+            let os_error = match &e {
+                windows_service::Error::Winapi(io) => io.raw_os_error(),
+                _ => None,
+            };
+            let after = service.query_status().ok().map(|s| state(s.current_state));
+            if crate::start_refusal_is_success(os_error, after) {
+                info!("{SERVICE_NAME} was already being started again by someone else");
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("Failed starting the service again ({})", winapi_detail(&e)));
+        }
         Ok(())
     }
 
@@ -642,6 +668,48 @@ pub fn stop_service() -> Result<()> {
     return non_windows_impl::stop();
 }
 
+/// The service's state as `service restart-self` reads it (P13.2b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScmState {
+    Stopped,
+    StopPending,
+    StartPending,
+    Running,
+    Other,
+}
+
+/// What `service restart-self` does next (P13.2b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartStep {
+    /// Not stopped yet: wait.
+    Wait,
+    /// Stopped: start it.
+    Start,
+    /// Someone else (another helper, the SCM's recovery, an administrator)
+    /// already started it again after the stop: done.
+    AlreadyStarted,
+}
+
+/// The next step of `service restart-self` for the state just read.
+/// `seen_stopping`: a stop has been seen (stop-pending or stopped) since the
+/// helper began, so a running service is a started-again one, not the old one.
+pub fn restart_step(state: ScmState, seen_stopping: bool) -> RestartStep {
+    match state {
+        ScmState::Stopped => RestartStep::Start,
+        ScmState::StartPending | ScmState::Running if seen_stopping => RestartStep::AlreadyStarted,
+        _ => RestartStep::Wait,
+    }
+}
+
+/// ERROR_SERVICE_ALREADY_RUNNING.
+pub const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+
+/// Whether a refused start still means the restart succeeded (P13.2b): the
+/// service is already running, or starting, because someone else started it.
+pub fn start_refusal_is_success(os_error: Option<i32>, state_after: Option<ScmState>) -> bool {
+    os_error == Some(ERROR_SERVICE_ALREADY_RUNNING) || matches!(state_after, Some(ScmState::StartPending | ScmState::Running))
+}
+
 /// `omni-ingest service restart-self` (P13.2): wait until the service has
 /// stopped, up to `timeout`, and start it again.
 pub fn start_service_after_stop(timeout: std::time::Duration) -> Result<()> {
@@ -726,6 +794,36 @@ pub fn stop_service_and_wait(timeout: std::time::Duration) -> Result<()> {
     }
 }
 
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    /// P13.2b: the helper starts the service once it has stopped; a service
+    /// someone else already started again is a success, not a 3-minute wait
+    /// and an error; the old, not yet stopped service is waited for.
+    #[test]
+    fn the_restart_helper_waits_for_the_stop_and_accepts_a_start_by_someone_else() {
+        use RestartStep::*;
+        use ScmState::*;
+        assert_eq!(restart_step(Running, false), Wait, "the old process has not stopped yet");
+        assert_eq!(restart_step(StopPending, true), Wait);
+        assert_eq!(restart_step(Stopped, true), Start);
+        assert_eq!(restart_step(Stopped, false), Start);
+        assert_eq!(restart_step(StartPending, true), AlreadyStarted);
+        assert_eq!(restart_step(Running, true), AlreadyStarted);
+        assert_eq!(restart_step(StartPending, false), Wait);
+    }
+
+    #[test]
+    fn a_start_refused_because_it_already_runs_is_a_success() {
+        assert!(start_refusal_is_success(Some(ERROR_SERVICE_ALREADY_RUNNING), None));
+        assert!(start_refusal_is_success(Some(5), Some(ScmState::StartPending)));
+        assert!(start_refusal_is_success(None, Some(ScmState::Running)));
+        assert!(!start_refusal_is_success(Some(5), Some(ScmState::Stopped)), "access denied with the service stopped is a failure");
+        assert!(!start_refusal_is_success(Some(1053), None));
+    }
+}
 
 #[cfg(test)]
 mod tests {

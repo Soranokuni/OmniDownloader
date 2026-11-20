@@ -5,8 +5,10 @@
 //! leases on the update gate, waits for running jobs (as a yt-dlp swap does)
 //! and only then switches; videos still waiting for the old folder go to
 //! review. If jobs are still running after the drain the change stays
-//! *pending* and is tried again in the background until it applies or a newer
-//! save replaces it. The archive applies at once.
+//! *pending*: every [`RETRY_GAP`] a passive check switches as soon as no job
+//! runs, without holding new leases back again (P13.2b). A newer save
+//! replaces it, also while it drains: a replaced change is never applied.
+//! The archive applies at once.
 //!
 //! Port, TLS, allowed host names and metrics on/off are read when the listener
 //! starts: for those the panel offers «Επανεκκίνηση υπηρεσίας», which the
@@ -33,8 +35,8 @@ use crate::state::AppState;
 
 /// How long a watchfolder change waits for running jobs, as the nightly yt-dlp swap.
 pub const DRAIN: Duration = Duration::from_secs(600);
-/// Between two tries of a pending change.
-pub const RETRY_GAP: Duration = Duration::from_secs(300);
+/// Between two passive checks of a pending change (P13.2b).
+pub const RETRY_GAP: Duration = Duration::from_secs(30);
 /// How long the save waits for the change before it answers "pending".
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(20);
 
@@ -110,7 +112,7 @@ pub enum Applied {
 
 /// Put `resolved` (shown as `shown`) into use (P13.2). Answers within
 /// [`ANSWER_WITHIN`]; a change that has not applied by then goes on in the
-/// background, tried every [`RETRY_GAP`] until it applies or a newer save
+/// background, checked every [`RETRY_GAP`] until it applies or a newer save
 /// replaces it.
 pub async fn apply_watchfolder(state: &AppState, live: &LiveDelivery, resolved: PathBuf, shown: String, who: String) -> Applied {
     let generation = live.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -133,10 +135,12 @@ async fn run_switch(
     tx: tokio::sync::oneshot::Sender<usize>,
 ) {
     let mut tx = Some(tx);
+    let still_wanted = || live.generation.load(Ordering::SeqCst) == generation;
+    let mut first = true;
     loop {
         {
             let _one = live.apply_lock.lock().await;
-            if live.generation.load(Ordering::SeqCst) != generation {
+            if !still_wanted() {
                 return; // a newer save took over
             }
             live.set_pending(generation, |p| {
@@ -144,7 +148,10 @@ async fn run_switch(
                     p.attempts += 1;
                 }
             });
-            match switch_watchfolder(&state.update_gate, &live.paths, &state.repo, resolved.clone(), live.drain).await {
+            // Only the first try holds new leases back while it waits (P13.2b);
+            // after that a passive check switches the moment no job runs.
+            let drain = if std::mem::take(&mut first) { live.drain } else { Duration::ZERO };
+            match switch_watchfolder(&state.update_gate, &live.paths, &state.repo, resolved.clone(), drain, still_wanted).await {
                 Ok(WatchfolderSwitch::Switched { reviewed }) => {
                     let archive = state.config.read().await.archive.clone();
                     live.paths.set_archive(Some(live.archive_for(&archive, &resolved)));
@@ -163,9 +170,11 @@ async fn run_switch(
                     }
                     return;
                 }
-                Ok(WatchfolderSwitch::Busy) => {
-                    tracing::info!("Jobs still running; the new watchfolder waits for a quiet queue");
+                Ok(WatchfolderSwitch::Superseded) => return,
+                Ok(WatchfolderSwitch::Busy) if !drain.is_zero() => {
+                    tracing::info!("Jobs still running; the new watchfolder applies as soon as none runs");
                 }
+                Ok(WatchfolderSwitch::Busy) => {}
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "The watchfolder change could not be applied; it is tried again"),
             }
         }
@@ -196,20 +205,30 @@ pub async fn api_admin_restart_service(RequireAdmin(admin): RequireAdmin, State(
             "Η επανεκκίνηση από εδώ γίνεται μόνο όταν το πρόγραμμα τρέχει ως υπηρεσία των Windows. Κλείστε και ανοίξτε ξανά το παράθυρο εντολών.",
         ));
     };
+    // One restart at a time (P13.2b): a second click, or a second
+    // administrator, while one is under way starts nothing more.
+    if state.restarting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "restarting", "already": true }))));
+    }
     let begun = {
         let r = restarter.clone();
-        tokio::task::spawn_blocking(move || r.begin()).await.map_err(|_| ApiError::internal("The restart could not start."))?
+        tokio::task::spawn_blocking(move || r.begin()).await.unwrap_or_else(|_| Err("the helper start panicked".into()))
     };
     if let Err(why) = begun {
+        state.restarting.store(false, std::sync::atomic::Ordering::SeqCst);
         tracing::error!(error = %why, "The restart helper did not start");
         let _ = state.repo.log_audit("ERROR", "ADMIN", &format!("Service restart asked by {} did not start: {why}", admin.email));
         return Err(ApiError::internal("Η επανεκκίνηση δεν ξεκίνησε· δείτε το αρχείο καταγραφής."));
     }
     let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Service restart requested by {}", admin.email));
     let repo = state.repo.clone();
+    let restarting = state.restarting.clone();
     tokio::spawn(async move {
         tokio::time::sleep(STOP_AFTER).await;
         if let Ok(Err(why)) = tokio::task::spawn_blocking(move || restarter.stop()).await {
+            // The service keeps running: the administrator may try again (the
+            // helper already started gives up, or finds it running: success).
+            restarting.store(false, std::sync::atomic::Ordering::SeqCst);
             tracing::error!(error = %why, "The service could not be stopped for the restart");
             let _ = repo.log_audit(
                 "ERROR",

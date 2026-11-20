@@ -414,6 +414,69 @@ async fn while_a_job_runs_the_new_watchfolder_waits_and_applies_when_it_ends() -
     Ok(())
 }
 
+/// Wait up to ten seconds for `done`.
+async fn eventually(done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// P13.2b: B is saved while a job runs and drains; C replaces it before the
+/// job ends. When it ends, B is never put into use, C is.
+#[tokio::test]
+async fn a_watchfolder_replaced_while_it_waited_is_never_used() -> Result<()> {
+    let (app, live) = live_app((5_000, 50, 200))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let (b, c) = (app.dir.path().join("watch-b"), app.dir.path().join("watch-c"));
+    let running = app.state.update_gate.try_enter().expect("a job holds a pass");
+
+    for folder in [&b, &c] {
+        let r = send(&app, "POST", "/api/admin/settings/watchfolder", Some(&tok), Some(json!({"path": folder.to_string_lossy()}))).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        assert_eq!(r.json()["pending"].as_bool(), Some(true), "{}", r.body);
+    }
+    drop(running);
+    eventually(|| live.paths.watchfolder() == c).await;
+    assert_eq!(live.paths.watchfolder(), c, "the latest save is in use");
+    eventually(|| live.pending().is_none()).await;
+    assert!(live.pending().is_none());
+    let audit: Vec<String> = app.repo.get_recent_audit_logs(50)?.into_iter().map(|a| a.message).collect();
+    let in_use = |p: &std::path::Path| format!("Watchfolder {} in use", p.display());
+    assert!(audit.iter().any(|m| m.starts_with(&in_use(&c))), "{audit:?}");
+    assert!(!audit.iter().any(|m| m.starts_with(&in_use(&b))), "B was put into use: {audit:?}");
+    Ok(())
+}
+
+/// P13.2b: only the first try holds new jobs back. Once its drain has timed
+/// out, the queue runs normally and the change applies when no job runs.
+#[tokio::test]
+async fn after_the_first_drain_a_pending_watchfolder_holds_no_job_back() -> Result<()> {
+    let (app, live) = live_app((200, 30, 100))?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let new = app.dir.path().join("new-watch");
+    let running = app.state.update_gate.try_enter().expect("a job holds a pass");
+    let r = send(&app, "POST", "/api/admin/settings/watchfolder", Some(&tok), Some(json!({"path": new.to_string_lossy()}))).await;
+    assert_eq!(r.json()["pending"].as_bool(), Some(true), "{}", r.body);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await; // the first drain is over
+
+    let mut held_back = 0;
+    for _ in 0..100 {
+        match app.state.update_gate.try_enter() {
+            Some(pass) => drop(pass),
+            None => held_back += 1,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(held_back <= 2, "new jobs were held back {held_back} times out of 100");
+    assert_ne!(live.paths.watchfolder(), new, "not under the running job");
+
+    drop(running);
+    eventually(|| live.paths.watchfolder() == new).await;
+    assert_eq!(live.paths.watchfolder(), new, "applied once no job runs");
+    Ok(())
+}
+
 /// P13.3b (was an `/api/setup` test): the default relative `watchfolder`, typed
 /// with spaces, is accepted, stored trimmed, and used under the install folder.
 #[tokio::test]
@@ -519,6 +582,30 @@ async fn the_restart_button_starts_the_helper_first_then_stops_and_is_audited() 
             assert!(audit.iter().any(|m| m == "Service restart requested by it@newsroom.local"), "{audit:?}");
         }
     }
+    Ok(())
+}
+
+/// P13.2b: two restart requests at once (a double click, two administrators)
+/// start one helper and one stop.
+#[tokio::test]
+async fn two_restart_requests_start_one_helper() -> Result<()> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let base = app(false)?;
+    let tok = session_for(&base, "it@newsroom.local");
+    let (begun, stopped): (std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicUsize>) =
+        (Default::default(), Default::default());
+    let fake = FakeRestart { begun: begun.clone(), stopped: stopped.clone(), fail_begin: false };
+    let state = base.state.clone().with_restarter(std::sync::Arc::new(fake));
+    let app = App { router: WebServer::build_router(state.clone()), repo: base.repo.clone(), state, dir: TempDir::new()? };
+    let (a, b) = tokio::join!(
+        send(&app, "POST", "/api/admin/restart-service", Some(&tok), Some(json!({}))),
+        send(&app, "POST", "/api/admin/restart-service", Some(&tok), Some(json!({}))),
+    );
+    assert_eq!((a.status, b.status), (StatusCode::ACCEPTED, StatusCode::ACCEPTED), "{} / {}", a.body, b.body);
+    let again = send(&app, "POST", "/api/admin/restart-service", Some(&tok), Some(json!({}))).await;
+    assert_eq!(again.status, StatusCode::ACCEPTED, "{}", again.body);
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!((begun.load(SeqCst), stopped.load(SeqCst)), (1, 1), "one helper, one stop");
     Ok(())
 }
 
