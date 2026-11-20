@@ -93,7 +93,8 @@ The **«Αποστολή βίντεο»** (Send video) form:
 | «Σημείωση για το MCR (προαιρετικά)» | an optional note for MCR |
 | «Επείγον (μπαίνει πριν από τα άλλα)» | urgent: goes ahead of the queue |
 
-Press **«Αποστολή»** (Send). You will see one of:
+Under the list of links the page counts them («N από 20 συνδέσμους»); a list
+of more than 20 turns red and is not sent. Split it in two. Press **«Αποστολή»** (Send). You will see one of:
 
 - «Στάλθηκε στο MCR ως `<name>`.mxf» — queued under that file name.
 - «Στάλθηκαν N σύνδεσμοι στο MCR.» — several links queued.
@@ -102,7 +103,11 @@ Press **«Αποστολή»** (Send). You will see one of:
 ### 3.3 Following your submissions
 
 **«Οι αποστολές μου»** (My submissions) lists what you sent and its state.
-Press **«Ανανέωση»** to refresh. While a submission is still waiting
+The list follows the system by itself; there is nothing to refresh. A bar
+shows the progress while the system works on a video; it is not shown while
+the video waits for MCR (a check, an approval, a file-locker link). The step
+reads, among others, «Ανάγνωση του βίντεο» (reading the downloaded video) and
+«Τελικός έλεγχος» (the final check before delivery). While a submission is still waiting
 («Σε αναμονή»), you can withdraw it with **«Ακύρωση»** (Cancel); for 8 seconds
 **«Αναίρεση»** (Undo) keeps it.
 

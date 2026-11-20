@@ -281,6 +281,10 @@ kbd {
 .spec-list .spec-row { font-size: 13px; }
 .remember-btn { margin-left: 10px; padding: 3px 10px; font-size: 13px; }
 
+/* /user (P12.12): the count under the list of links, red over the limit. */
+.links-count { margin-top: 4px; }
+.links-count.bad { color: var(--bad); font-weight: 600; }
+
 /* The sound's settings window (plan P12.9). */
 .dlg:has(.snd-form) { max-width: 560px; }
 .snd-form { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }

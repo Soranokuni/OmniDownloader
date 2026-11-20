@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title data-t="user.page.title">OmniDownloader</title>
 <link rel="stylesheet" href="/static/app.css?v=12">
-<link rel="stylesheet" href="/static/status.css?v=8">
+<link rel="stylesheet" href="/static/status.css?v=9">
 <link rel="icon" href="data:,">
 </head>
 <body>
@@ -43,7 +43,8 @@
       </div>
       <div id="multi-box" hidden>
         <label for="urls" data-t="user.page.urls"></label>
-        <textarea id="urls" rows="6" placeholder="https://…&#10;https://…"></textarea>
+        <textarea id="urls" rows="6" placeholder="https://…&#10;https://…" aria-describedby="urls-count"></textarea>
+        <p class="note flat links-count" id="urls-count" aria-live="polite"></p>
       </div>
       <div class="grid-2">
         <div>
@@ -78,9 +79,9 @@
   </section>
 
   <section class="stack">
+    <!-- The list follows the server by itself; no «Ανανέωση» button (P12.12). -->
     <div class="section-head">
       <h2 class="card-title bare" data-t="user.page.mine"></h2>
-      <button class="btn" type="button" id="refresh-btn" data-t="user.page.refresh"></button>
     </div>
     <div id="my-jobs" class="stack">
       <div class="card center" data-t="loading"></div>
@@ -110,6 +111,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/user.js?v=16"></script>
+<script type="module" src="/static/user.js?v=17"></script>
 </body>
 </html>

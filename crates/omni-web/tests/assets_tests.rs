@@ -378,22 +378,22 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 23),
-        ("inbox.js", 30),
-        ("approval.js", 18),
-        ("notify.js", 18),
-        ("mcr.js", 56),
-        ("status.js", 6),
-        ("status.css", 8),
-        ("worklist.js", 6),
-        ("undo.js", 7),
-        ("dialog.js", 6),
-        ("keys.js", 4),
-        ("sound.js", 3),
-        ("user.js", 16),
-        ("toast.js", 6),
-        ("text.js", 5),
-        ("text.el.js", 5),
+        ("desk.js", 24),
+        ("inbox.js", 31),
+        ("approval.js", 19),
+        ("notify.js", 19),
+        ("mcr.js", 57),
+        ("status.js", 7),
+        ("status.css", 9),
+        ("worklist.js", 7),
+        ("undo.js", 8),
+        ("dialog.js", 7),
+        ("keys.js", 5),
+        ("sound.js", 4),
+        ("user.js", 17),
+        ("toast.js", 7),
+        ("text.js", 6),
+        ("text.el.js", 6),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -1421,12 +1421,47 @@ fn every_file_name_preview_comes_from_the_server() {
     assert!(assets.get("user.html").unwrap().contains("id=\"slug-preview\" aria-live=\"polite\""), "/user has no place for the preview");
 }
 
+/// P12.12: /user. The progress bar only while the system works on a job (never on one that
+/// waits for MCR); PROBE and VERIFY read differently; the 20-link limit is the server's and is
+/// checked in the page before anything is sent; Escape closes the password window; no
+/// «Ανανέωση» button (the list follows the server by itself).
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v16() {
+fn the_journalists_page_says_what_is_true() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let src = assets.get("static/user.js").expect("user.js shipped");
+    let user: String = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+
+    let card = function_body(&user, "jobCard");
+    assert!(card.contains("const working = job.status === 'PENDING' || job.status === 'RUNNING';"), "the bar's condition changed");
+    assert!(card.contains("working && el('div', { class: 'progress' },"), "a job waiting for MCR shows a progress bar");
+
+    assert_ne!(words["user.stage.PROBE"], words["user.stage.VERIFY"], "two steps read the same");
+
+    let server = include_str!("../src/user_jobs.rs");
+    let max = server.split("const MAX_LINKS: usize = ").nth(1).and_then(|s| s.split(';').next()).expect("the server's limit");
+    assert!(user.contains(&format!("const MAX_LINKS = {max};")), "the page's link limit is not the server's ({max})");
+    let submit = user.split("getElementById('submit-form').addEventListener('submit'").nth(1).expect("submit");
+    let check = submit.find("if (multi.checked && linksOf().length > MAX_LINKS) {").expect("the limit is not checked before sending");
+    assert!(check < submit.find("await postSubmit(body)").unwrap(), "the list is sent before the limit is checked");
+    assert!(words["user.links.over"].contains("{max}"), "the message does not say the limit");
+
+    let close = function_body(&user, "closePassword");
+    assert!(close.contains("passwordButton.focus();") && close.contains("getElementById('password-form').reset();"), "closing the password window keeps what was typed or loses the focus");
+    assert!(user.contains("if (e.key !== 'Escape' || modal.hidden) return;"), "Escape does not close the password window");
+    assert!(function_body(&user, "openPassword").contains("getElementById('pw-current').focus();"), "the password window opens without the focus");
+
+    let page = assets.get("user.html").unwrap();
+    assert!(!page.contains("refresh-btn") && !user.contains("refresh-btn"), "the «Ανανέωση» button is still there");
+    assert!(page.contains("id=\"urls-count\" aria-live=\"polite\""), "the link count has no place");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v17() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=16"), "user.html does not import user.js?v=16");
-    assert!(!page.contains("/static/user.js?v=15"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=17"), "user.html does not import user.js?v=17");
+    assert!(!page.contains("/static/user.js?v=16"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

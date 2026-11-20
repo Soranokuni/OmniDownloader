@@ -3,12 +3,12 @@
 import {
   api, el, render, live, fmtTime, logout,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=6';
+import { toast } from '/static/toast.js?v=7';
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
-import { statusBadge } from '/static/status.js?v=6';
-import { deferAction, hiddenNow } from '/static/undo.js?v=7';
-import { t, tn, applyText } from '/static/text.js?v=5';
+import { statusBadge } from '/static/status.js?v=7';
+import { deferAction, hiddenNow } from '/static/undo.js?v=8';
+import { t, tn, applyText } from '/static/text.js?v=6';
 
 // The page's fixed words, from the dictionary (P12.10).
 applyText();
@@ -58,7 +58,9 @@ async function loadMyJobs() {
 function jobCard(job) {
   const progress = Number(job.progress) || 0;
   const done = job.status === 'COMPLETED' || job.status === 'COMPLETED_MANUAL';
-  const finished = done || job.status === 'CANCELLED' || job.status === 'FAILED';
+  // The bar only while the system works on it (P12.12): a job waiting for MCR
+  // (review, approval, a file-locker link) is not moving, and a bar would say it is.
+  const working = job.status === 'PENDING' || job.status === 'RUNNING';
 
   return el('div', { class: 'card stack' },
     el('div', { class: 'job-head' },
@@ -71,7 +73,7 @@ function jobCard(job) {
       ),
       statusBadge(job, 'user'),
     ),
-    !finished && el('div', { class: 'progress' },
+    working && el('div', { class: 'progress' },
       el('span', { style: `width:${Math.max(0, Math.min(100, progress))}%` })),
     (job.status === 'REQUIRES_REVIEW' || job.status === 'FAILED')
       && el('div', { class: 'reason' }, el('strong', { class: 'block' }, t('user.not_auto'))),
@@ -180,8 +182,28 @@ function showPartialFailure(payload) {
   loadMyJobs();
 }
 
+/* At most MAX_LINKS links at once, as the server takes them (P12.12): the
+ * count is shown under the list as it is typed, and a longer list is not
+ * sent, so nothing is queued half-way. */
+const MAX_LINKS = 20;
+const urlsField = document.getElementById('urls');
+const linksOf = () => urlsField.value.split('\n').map((l) => l.trim()).filter(Boolean);
+function showLinkCount() {
+  const n = linksOf().length;
+  const line = document.getElementById('urls-count');
+  line.textContent = n ? t(n > MAX_LINKS ? 'user.links.over' : 'user.links.count', { n, max: MAX_LINKS }) : '';
+  line.classList.toggle('bad', n > MAX_LINKS);
+  urlsField.setAttribute('aria-invalid', String(n > MAX_LINKS));
+}
+urlsField.addEventListener('input', showLinkCount);
+
 document.getElementById('submit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (multi.checked && linksOf().length > MAX_LINKS) {
+    toast(t('user.links.over', { n: linksOf().length, max: MAX_LINKS }), 'bad');
+    urlsField.focus();
+    return;
+  }
   const body = {
     keyword: document.getElementById('keyword').value.trim(),
     index_str: document.getElementById('index').value.trim(),
@@ -189,7 +211,7 @@ document.getElementById('submit-form').addEventListener('submit', async (event) 
     priority: document.getElementById('priority').checked,
   };
   if (multi.checked) {
-    body.urls = document.getElementById('urls').value.split('\n').map((l) => l.trim()).filter(Boolean);
+    body.urls = linksOf();
   } else {
     body.url = document.getElementById('url').value.trim();
   }
@@ -207,11 +229,11 @@ document.getElementById('submit-form').addEventListener('submit', async (event) 
     document.getElementById('url').required = true;
     document.getElementById('index').value = '1';
     showSlugPreview();
+    showLinkCount();
     loadMyJobs();
   } catch (e) { toast(e.message, 'bad'); }
 });
 
-document.getElementById('refresh-btn').addEventListener('click', loadMyJobs);
 
 /* ------------------------------------------------------------------ *
  * Notify-on-completion preference
@@ -240,10 +262,33 @@ notify.addEventListener('change', async () => {
  * Password
  * ------------------------------------------------------------------ */
 
+/* The password window (P12.12): opens with the focus in its first field;
+ * Escape, «Άκυρο» or a click outside closes it, empties it and gives the
+ * focus back to «Αλλαγή κωδικού». */
 const modal = document.getElementById('password-modal');
-document.getElementById('password-btn').addEventListener('click', () => { modal.hidden = false; });
-document.getElementById('pw-cancel').addEventListener('click', () => { modal.hidden = true; });
-modal.addEventListener('click', (e) => { if (e.target === modal) modal.hidden = true; });
+const passwordButton = document.getElementById('password-btn');
+
+function openPassword() {
+  modal.hidden = false;
+  document.getElementById('pw-current').focus();
+}
+
+function closePassword() {
+  if (modal.hidden) return;
+  modal.hidden = true;
+  document.getElementById('password-form').reset();
+  passwordButton.focus();
+}
+
+passwordButton.addEventListener('click', openPassword);
+document.getElementById('pw-cancel').addEventListener('click', closePassword);
+modal.addEventListener('click', (e) => { if (e.target === modal) closePassword(); });
+// On the document: a click on the window's text takes the focus out of its fields.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || modal.hidden) return;
+  e.preventDefault();
+  closePassword();
+});
 
 document.getElementById('password-form').addEventListener('submit', async (event) => {
   event.preventDefault();

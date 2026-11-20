@@ -23,11 +23,11 @@
  */
 
 import { api, el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=6';
-import { t, tn, has } from '/static/text.js?v=5';
+import { toast } from '/static/toast.js?v=7';
+import { t, tn, has } from '/static/text.js?v=6';
 import {
   play, unlock, soundPrefs, soundLocked, onSoundChange, openSoundSettings,
-} from '/static/sound.js?v=3';
+} from '/static/sound.js?v=4';
 
 const POLL_MS = 8000;
 const BASE_TITLE = document.title;
