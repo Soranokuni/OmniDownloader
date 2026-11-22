@@ -148,11 +148,43 @@ impl HeldSweepReport {
 /// rows of jobs that are gone, and remove `temp/held/{id}` directories that
 /// no live row wants.
 pub fn sweep(repo: &Repository, temp: &Path, now: DateTime<Utc>) -> Result<HeldSweepReport> {
+    sweep_with(repo, temp, now, true)
+}
+
+/// The reaper's held-video step (P11.10b): run the approval clocks, then the
+/// sweep. When the clocks could not be accounted, the sweep expires nothing
+/// this tick (it still supersedes, forgets and tidies): an expiry against an
+/// `expires_at` that was not moved on would count time no desk saw.
+pub fn reaper_tick(
+    repo: &Repository,
+    temp: &Path,
+    desks: &DeskPresence,
+    now: DateTime<Utc>,
+    max_gap: chrono::Duration,
+) -> Result<HeldSweepReport> {
+    sweep_after_clocks(repo, temp, now, run_clocks(repo, desks, now, max_gap))
+}
+
+/// [`reaper_tick`] once the clocks ran with result `clocks`.
+pub fn sweep_after_clocks(repo: &Repository, temp: &Path, now: DateTime<Utc>, clocks: Result<usize>) -> Result<HeldSweepReport> {
+    let expire = match clocks {
+        Ok(_) => true,
+        Err(e) => {
+            warn!("Held-video clocks not accounted, nothing expires this time: {e:#}");
+            false
+        }
+    };
+    sweep_with(repo, temp, now, expire)
+}
+
+/// [`sweep`]; with `expire` false a row past its time is kept for a later pass.
+fn sweep_with(repo: &Repository, temp: &Path, now: DateTime<Utc>, expire: bool) -> Result<HeldSweepReport> {
     let mut report = HeldSweepReport::default();
     for (row, status) in repo.list_live_held()? {
         let id = row.job_id;
         match held_sweep_action(row.decision.as_deref(), status, row.expires_at, now) {
             HeldSweep::Keep => {}
+            HeldSweep::Expire if !expire => {}
             HeldSweep::Expire => {
                 if repo.expire_held(id, now)? {
                     info!("Job #{id}: nobody approved the held video in time; expired");

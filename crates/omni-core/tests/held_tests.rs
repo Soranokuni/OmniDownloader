@@ -451,3 +451,26 @@ fn the_reminder_counts_the_videos_waiting_for_approval() -> Result<()> {
     assert_eq!(w.soonest_expires_at, Some(expires(&repo, a)));
     Ok(())
 }
+
+/// P11.10b: when the clocks could not be accounted, the tick expires nothing
+/// (a video past its stored time stays waiting); the next good tick does.
+/// `reaper_tick` is what the daemon's reaper calls.
+#[test]
+fn a_tick_whose_clocks_failed_expires_nothing() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let temp = dir.path().join("temp");
+    let id = held(&repo, 1);
+    let late = Utc::now() + Duration::hours(25);
+
+    let report = omni_core::held::sweep_after_clocks(&repo, &temp, late, Err(anyhow::anyhow!("database locked")))?;
+    assert!(report.expired.is_empty(), "{report:?}");
+    assert_eq!(repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+
+    // A good tick with a desk watching, over a gap it may count.
+    let desks = omni_core::held::DeskPresence::new();
+    let _desk = desks.connect();
+    let report = omni_core::held::reaper_tick(&repo, &temp, &desks, late, Duration::hours(26))?;
+    assert_eq!(report.expired, vec![id]);
+    Ok(())
+}

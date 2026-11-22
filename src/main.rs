@@ -1762,11 +1762,8 @@ async fn run_daemon(
                         // desk has been connected (P11.10); then expire, supersede, tidy.
                         let (sweep_repo, sweep_temp, sweep_desks) = (repo_reaper.clone(), reaper_temp.clone(), reaper_desks.clone());
                         match tokio::task::spawn_blocking(move || {
-                            let now = chrono::Utc::now();
-                            if let Err(e) = omni_core::held::run_clocks(&sweep_repo, &sweep_desks, now, held_clock_max_gap()) {
-                                warn!("Held-video clocks not accounted: {e:#}");
-                            }
-                            omni_core::held::sweep(&sweep_repo, &sweep_temp, now)
+                            // A failed accounting expires nothing this tick (P11.10b).
+                            omni_core::held::reaper_tick(&sweep_repo, &sweep_temp, &sweep_desks, chrono::Utc::now(), held_clock_max_gap())
                         })
                         .await
                         {
