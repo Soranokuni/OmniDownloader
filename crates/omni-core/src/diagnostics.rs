@@ -73,9 +73,18 @@ fn re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
     cell.get_or_init(|| Regex::new(pattern).expect("a valid pattern"))
 }
 
+/// Whether `v` looks like a credential rather than a word or a status: at
+/// least 8 characters, not only digits, not only letters (P13.8c).
+fn credential_like(v: &str) -> bool {
+    v.chars().count() >= 8 && !v.chars().all(|c| c.is_ascii_digit()) && !v.chars().all(char::is_alphabetic)
+}
+
 /// `text` with nothing secret left in it (see the module text).
 pub fn scrub(text: &str, secrets: &[String]) -> String {
     static URL: OnceLock<Regex> = OnceLock::new();
+    static ESCAPED: OnceLock<Regex> = OnceLock::new();
+    static ARRAY: OnceLock<Regex> = OnceLock::new();
+    static FLAG: OnceLock<Regex> = OnceLock::new();
     static QUOTED2: OnceLock<Regex> = OnceLock::new();
     static QUOTED1: OnceLock<Regex> = OnceLock::new();
     static HEADER: OnceLock<Regex> = OnceLock::new();
@@ -93,23 +102,48 @@ pub fn scrub(text: &str, secrets: &[String]) -> String {
         let q = if c.get(3).is_some() || c.get(4).is_some() { "?…" } else { "" };
         format!("{}://{}{q}", &c[1], &c[2])
     });
-    // A secret-named key, its name quoted or not, before `:` or `=`
-    // (`"cookie":"…"`, `'Cookie': '…'`, `password=…`, `Authorization: Bearer …`).
-    // `max_tokens` and `client_secret_expires` do not match: the name must be whole.
-    const KEYS: &str = r#"set-cookie|cookie|authorization|proxy-authorization|x-api-key|api[_-]?key|apikey|password|passwd|pwd|secret|client[_-]?secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token"#;
-    let key = |extra: &str| format!(r#"(?i)(["']?\b(?:{KEYS})\b["']?\s*[:=]\s*){extra}"#);
-    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\]|\\.)*""#));
+    // A secret-named key, its name quoted (also `\"…\"` in escaped JSON) or not,
+    // before `:` or `=`: `"cookie":"…"`, `'Cookie': '…'`, `password=…`,
+    // `Authorization: Bearer …`, and compound names (`auth_token`,
+    // `OMNI_GRAPH_CLIENT_SECRET`, `secret_key`). The secret word must end the
+    // name, so `max_tokens` and `client_secret_expires` do not match.
+    const WORDS: &str = r#"set-cookie|cookie|proxy-authorization|authorization|x-api-key|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|password|passwd|pwd|secret|token|credentials?"#;
+    let name = format!(r#"\b(?:[A-Za-z0-9]+[_-])*(?:{WORDS})\b"#);
+    let key = |extra: &str| format!(r#"(?i)((?:\\?["'])?{name}(?:\\?["'])?\s*[:=]\s*){extra}"#);
+    // Escaped JSON first (`\"access_token\":\"…\"`), then "…", '…' and arrays.
+    // No value runs past the end of its line.
+    let escaped = re(&ESCAPED, &key(r#"\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\""#));
+    let text = escaped.replace_all(&text, "$1\\\"<removed>\\\"");
+    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\\r\n]|\\.)*""#));
     let text = quoted2.replace_all(&text, "$1\"<removed>\"");
-    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\]|\\.)*'"#));
+    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\\r\n]|\\.)*'"#));
     let text = quoted1.replace_all(&text, "$1'<removed>'");
+    let array = re(&ARRAY, &key(r#"\[[^\]\r\n]*\]"#));
+    let text = array.replace_all(&text, "$1[\"<removed>\"]");
     // A header's unquoted value runs to the end of the line.
-    let header = re(&HEADER, r#"(?i)(["']?\b(?:set-cookie|cookie|authorization|proxy-authorization|x-api-key|api-key)\b["']?\s*[:=]\s*)[^"'\s][^\r\n]*"#);
+    let header = re(&HEADER, r#"(?i)((?:\\?["'])?\b(?:set-cookie|cookie|authorization|proxy-authorization|x-api-key|api-key)\b(?:\\?["'])?\s*[:=]\s*)[^"'\s\\][^\r\n]*"#);
     let text = header.replace_all(&text, "$1<removed>");
-    // Any other key's unquoted value runs to a space, `&`, `;` or `,`.
-    let plain = re(&PLAIN, &key(r#"[^"'\s&;,]+"#));
-    let text = plain.replace_all(&text, "$1<removed>");
-    let bearer = re(&BEARER, r#"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"#);
-    let text = bearer.replace_all(&text, "$1 <removed>");
+    // Any other key's unquoted value runs to a space, `&`, `;`, `,` or a bracket.
+    // `null`, a number, and after a token name anything that is not credential-like
+    // (`…/oauth2/v2.0/token: 401`), are kept.
+    let plain = re(&PLAIN, &key(r#"([^"'\s&;,\[\]{}]+)"#));
+    let text = plain.replace_all(&text, |c: &regex::Captures| {
+        let (lead, value) = (&c[1], &c[2]);
+        let token_like = lead.trim_end_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace()).to_ascii_lowercase().trim_end_matches(['"', '\'', '\\']).ends_with("token");
+        if value.eq_ignore_ascii_case("null") || value.chars().all(|ch| ch.is_ascii_digit()) || (token_like && !credential_like(value)) {
+            c[0].to_string()
+        } else {
+            format!("{lead}<removed>")
+        }
+    });
+    // A command-line flag: `--password VALUE`, `--graph-client-secret=VALUE`.
+    let flag = re(&FLAG, &format!(r#"(?i)(--?(?:[A-Za-z0-9]+[_-])*(?:{WORDS})\b(?:=|\s+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)"#));
+    let text = flag.replace_all(&text, "$1<removed>");
+    // `Bearer <credential>`; "bearer authentication" is a word, not a credential.
+    let bearer = re(&BEARER, r#"(?i)\b(bearer)\s+([A-Za-z0-9._~+/=-]{8,})"#);
+    let text = bearer.replace_all(&text, |c: &regex::Captures| {
+        if credential_like(&c[2]) { format!("{} <removed>", &c[1]) } else { c[0].to_string() }
+    });
     let session = re(&SESSION, r#"(?i)\b(omni_session)=[^;\s"']*"#);
     session.replace_all(&text, "$1=<removed>").into_owned()
 }
@@ -443,6 +477,54 @@ mod tests {
         for kept in [r#""max_tokens": 400"#, r#""llm_max_tokens": 900"#, r#""client_secret_expires": "2027-01-31""#, "WARN token *** rejected"] {
             assert_eq!(scrub(kept, &[]), kept);
         }
+    }
+
+    /// P13.8c: compound names, escaped JSON, command-line flags.
+    #[test]
+    fn compound_names_escaped_json_and_flags_are_blanked() {
+        for (line, leak) in [
+            ("auth_token=d1-planted-x", "d1-planted"),
+            (r#"{"session_token": "d2-planted"}"#, "d2-planted"),
+            ("secret_key=d3-planted", "d3-planted"),
+            (r#"{"private_key":"d4-planted"}"#, "d4-planted"),
+            ("OMNI_GRAPH_CLIENT_SECRET=d5-planted", "d5-planted"),
+            ("OMNI_LLM_API_KEY=d6-planted", "d6-planted"),
+            (r#"{\"access_token\":\"d7-planted\",\"x\":1}"#, "d7-planted"),
+            ("run --password d8-planted --verbose", "d8-planted"),
+            ("run --graph-client-secret=d9-planted", "d9-planted"),
+            (r#"--api-key "d10-planted value""#, "d10-planted"),
+        ] {
+            let out = scrub(line, &[]);
+            assert!(!out.contains(leak), "{leak} kept: {out}");
+        }
+        assert_eq!(scrub("run --password d8-planted --verbose", &[]), "run --password <removed> --verbose");
+        assert!(scrub(r#"{\"access_token\":\"d7-planted\",\"x\":1}"#, &[]).ends_with(r#",\"x\":1}"#), "the rest of the object is kept");
+    }
+
+    /// P13.8c: an array value is blanked; `null` and a number keep their value
+    /// and the closing brace; an unclosed quote never swallows the next line.
+    #[test]
+    fn arrays_null_numbers_and_unclosed_quotes() {
+        assert_eq!(scrub(r#"{"token": ["e1-planted", "e2"]}"#, &[]), r#"{"token": ["<removed>"]}"#);
+        assert_eq!(scrub(r#"{"token": null}"#, &[]), r#"{"token": null}"#);
+        assert_eq!(scrub(r#"{"password": 12345}"#, &[]), r#"{"password": 12345}"#);
+        assert_eq!(scrub(r#"{"api_key": abc-e3-planted}"#, &[]), r#"{"api_key": <removed>}"#);
+        let two = "WARN \"password\": \"unclosed\nINFO next line \"stays\" here";
+        assert!(scrub(two, &[]).ends_with("\nINFO next line \"stays\" here"), "{}", scrub(two, &[]));
+    }
+
+    /// P13.8c: a status after a token address and the word «authentication»
+    /// after bearer are not credentials.
+    #[test]
+    fn a_status_and_a_word_are_not_taken_for_credentials() {
+        let status = "POST https://login.example/oauth2/v2.0/token: 401";
+        assert_eq!(scrub(status, &[]), status);
+        let expired = "the refresh token: expired, signing in again";
+        assert_eq!(scrub(expired, &[]), expired);
+        let word = "the server asked for bearer authentication";
+        assert_eq!(scrub(word, &[]), word);
+        assert_eq!(scrub("token: e4-planted-9", &[]), "token: <removed>");
+        assert_eq!(scrub("Bearer eyJhbGciOi.e5.planted", &[]), "Bearer <removed>");
     }
 
     #[test]

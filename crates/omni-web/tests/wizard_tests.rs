@@ -1079,7 +1079,8 @@ async fn the_diagnostics_package_downloads_with_no_stored_secret_in_it() -> Resu
     let res = app.router.clone().layer(MockConnectInfo(LOOPBACK.parse::<SocketAddr>().unwrap())).oneshot(req).await?;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["content-type"], "application/zip");
-    assert!(res.headers()["content-disposition"].to_str()?.contains("omni-diagnostics-"));
+    let disposition = res.headers()["content-disposition"].to_str()?.to_string();
+    assert!(disposition.starts_with("attachment;") && disposition.contains("omni-diagnostics-"), "{disposition}");
     let bytes = res.into_body().collect().await?.to_bytes().to_vec();
 
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
