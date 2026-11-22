@@ -76,17 +76,40 @@ fn re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
 /// `text` with nothing secret left in it (see the module text).
 pub fn scrub(text: &str, secrets: &[String]) -> String {
     static URL: OnceLock<Regex> = OnceLock::new();
+    static QUOTED2: OnceLock<Regex> = OnceLock::new();
+    static QUOTED1: OnceLock<Regex> = OnceLock::new();
     static HEADER: OnceLock<Regex> = OnceLock::new();
+    static PLAIN: OnceLock<Regex> = OnceLock::new();
+    static BEARER: OnceLock<Regex> = OnceLock::new();
     static SESSION: OnceLock<Regex> = OnceLock::new();
-    let text = crate::secrets::redact(text, secrets);
+    // Longest first (P13.8b): a shorter secret that begins a longer one must
+    // not leave the longer one's tail behind (`***456`).
+    let mut ordered: Vec<String> = secrets.to_vec();
+    ordered.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    let text = crate::secrets::redact(text, &ordered);
     // scheme :// [userinfo@] rest [?query] [#fragment]
     let url = re(&URL, r#"(?i)\b([a-z][a-z0-9+.-]*)://(?:[^\s/?#"'<>@]*@)?([^\s?#"'<>]*)(\?[^\s#"'<>]*)?(#[^\s"'<>]*)?"#);
     let text = url.replace_all(&text, |c: &regex::Captures| {
         let q = if c.get(3).is_some() || c.get(4).is_some() { "?…" } else { "" };
         format!("{}://{}{q}", &c[1], &c[2])
     });
-    let header = re(&HEADER, r#"(?i)\b(set-cookie|cookie|authorization|proxy-authorization|x-api-key|api-key)(\s*[:=]\s*)[^\r\n]*"#);
-    let text = header.replace_all(&text, "$1$2<removed>");
+    // A secret-named key, its name quoted or not, before `:` or `=`
+    // (`"cookie":"…"`, `'Cookie': '…'`, `password=…`, `Authorization: Bearer …`).
+    // `max_tokens` and `client_secret_expires` do not match: the name must be whole.
+    const KEYS: &str = r#"set-cookie|cookie|authorization|proxy-authorization|x-api-key|api[_-]?key|apikey|password|passwd|pwd|secret|client[_-]?secret|token|access[_-]?token|refresh[_-]?token|id[_-]?token"#;
+    let key = |extra: &str| format!(r#"(?i)(["']?\b(?:{KEYS})\b["']?\s*[:=]\s*){extra}"#);
+    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\]|\\.)*""#));
+    let text = quoted2.replace_all(&text, "$1\"<removed>\"");
+    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\]|\\.)*'"#));
+    let text = quoted1.replace_all(&text, "$1'<removed>'");
+    // A header's unquoted value runs to the end of the line.
+    let header = re(&HEADER, r#"(?i)(["']?\b(?:set-cookie|cookie|authorization|proxy-authorization|x-api-key|api-key)\b["']?\s*[:=]\s*)[^"'\s][^\r\n]*"#);
+    let text = header.replace_all(&text, "$1<removed>");
+    // Any other key's unquoted value runs to a space, `&`, `;` or `,`.
+    let plain = re(&PLAIN, &key(r#"[^"'\s&;,]+"#));
+    let text = plain.replace_all(&text, "$1<removed>");
+    let bearer = re(&BEARER, r#"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"#);
+    let text = bearer.replace_all(&text, "$1 <removed>");
     let session = re(&SESSION, r#"(?i)\b(omni_session)=[^;\s"']*"#);
     session.replace_all(&text, "$1=<removed>").into_owned()
 }
@@ -381,6 +404,45 @@ mod tests {
         let big_text = &files.iter().find(|(n, _)| n.ends_with("2026-11-21.log")).unwrap().1;
         assert!(big_text.len() <= 100_000 && big_text.starts_with("INFO a line"), "cut at a whole line");
         assert!(files.iter().any(|(n, s)| n == "README.txt" && s.contains("only the last part")));
+    }
+
+    /// P13.8b: a secret that begins a longer one leaves nothing of the longer.
+    #[test]
+    fn a_secret_that_is_a_prefix_of_another_leaves_no_tail() {
+        let secrets = vec!["abc123def".to_string(), "abc123def456".to_string()];
+        assert_eq!(scrub("value abc123def456 end", &secrets), "value *** end");
+        let reversed: Vec<String> = secrets.iter().rev().cloned().collect();
+        assert_eq!(scrub("value abc123def456 end", &reversed), "value *** end");
+    }
+
+    /// P13.8b: secret-named keys in every quoting a log or a message uses.
+    #[test]
+    fn secret_keys_are_blanked_quoted_or_not_and_settings_are_kept() {
+        for (line, leak) in [
+            (r#"{"cookie":"sid=c1-planted"}"#, "c1-planted"),
+            (r#"{'Cookie': 'sid=c2-planted'}"#, "c2-planted"),
+            (r#"{"Authorization": "Bearer c3-planted-xyz"}"#, "c3-planted"),
+            ("Authorization: Bearer c4-planted-xyz", "c4-planted"),
+            ("Cookie: SID=c5-planted; other=1", "c5-planted"),
+            ("login password=c6-planted&user=x", "c6-planted"),
+            (r#"{"password": "c7-planted"}"#, "c7-planted"),
+            ("secret=c8-planted next", "c8-planted"),
+            (r#"{"secret":"c9-planted"}"#, "c9-planted"),
+            ("token=c10-planted", "c10-planted"),
+            (r#"{"token": "c11-planted"}"#, "c11-planted"),
+            ("api_key=c12-planted", "c12-planted"),
+            (r#"{"api_key":"c13-planted"}"#, "c13-planted"),
+            (r#"{"access_token":"c14-planted"}"#, "c14-planted"),
+            (r#"{"client_secret": "c15-planted"}"#, "c15-planted"),
+            ("sent with bearer c16-planted-xyz", "c16-planted"),
+        ] {
+            let out = scrub(line, &[]);
+            assert!(!out.contains(leak), "{leak} kept: {out}");
+            assert!(out.contains("<removed>"), "{out}");
+        }
+        for kept in [r#""max_tokens": 400"#, r#""llm_max_tokens": 900"#, r#""client_secret_expires": "2027-01-31""#, "WARN token *** rejected"] {
+            assert_eq!(scrub(kept, &[]), kept);
+        }
     }
 
     #[test]

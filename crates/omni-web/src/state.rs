@@ -141,6 +141,8 @@ pub struct AppState {
     /// Set while a restart is under way (P13.2b): a second request starts no
     /// second helper and no second stop.
     pub restarting: Arc<std::sync::atomic::AtomicBool>,
+    /// One diagnostics package at a time (P13.8b); held until its file is written.
+    pub diagnostics_lock: Arc<tokio::sync::Mutex<()>>,
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
@@ -232,6 +234,7 @@ impl AppState {
             delivery: None,
             restarter: None,
             restarting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            diagnostics_lock: Arc::new(tokio::sync::Mutex::new(())),
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
             site_runner: None,

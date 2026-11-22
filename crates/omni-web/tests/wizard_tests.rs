@@ -1063,9 +1063,13 @@ async fn the_diagnostics_package_downloads_with_no_stored_secret_in_it() -> Resu
     let tok = session_for(&app, "it@newsroom.local");
     let planted = "graph-store-secret-planted";
     app.state.secrets.set(omni_core::secrets::keys::GRAPH_CLIENT_SECRET, planted)?;
+    // P13.8b: a cookie jar's value, echoed by a tool into the log.
+    let jar_value = "jar-cookie-value-planted-0123";
+    let jar = omni_core::cookies::parse_netscape("video.example", &format!(".video.example\tTRUE\t/\tTRUE\t1893456000\tsid\t{jar_value}\n"))?;
+    app.repo.put_cookie_jar("video.example", &jar, "it@newsroom.local", chrono::Utc::now())?;
     let logs = app.dir.path().join("logs");
     std::fs::create_dir_all(&logs)?;
-    std::fs::write(logs.join("omni-ingest.2026-11-21.log"), format!("INFO started\nWARN Graph refused {planted}\n"))?;
+    std::fs::write(logs.join("omni-ingest.2026-11-21.log"), format!("INFO started\nWARN Graph refused {planted}\nDEBUG yt-dlp sent sid {jar_value}\n"))?;
 
     let req = Request::builder()
         .method("GET")
@@ -1087,9 +1091,39 @@ async fn the_diagnostics_package_downloads_with_no_stored_secret_in_it() -> Resu
     }
     assert!(all.contains("logs/omni-ingest.2026-11-21.log") && all.contains("WARN Graph refused ***"), "{all}");
     assert!(!all.contains(planted), "the stored secret is in the package");
+    assert!(!all.contains(jar_value) && all.contains("DEBUG yt-dlp sent sid ***"), "the jar value is in the package");
     // Written under the install's temp folder.
     assert_eq!(std::fs::read_dir(app.dir.path().join("temp").join("diagnostics"))?.count(), 1);
     let audit: Vec<String> = app.repo.get_recent_audit_logs(10)?.into_iter().map(|a| a.message).collect();
     assert!(audit.iter().any(|m| m.starts_with("Diagnostics package omni-diagnostics-")), "{audit:?}");
+    Ok(())
+}
+
+/// P13.8b: while one package is being made a second is refused, and the
+/// answer is a page a person reads (the panel links here directly), never a
+/// JSON body the browser would save as a .zip.
+#[tokio::test]
+async fn a_second_package_while_one_is_made_is_refused_with_a_page() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let _busy = app.state.diagnostics_lock.clone().try_lock_owned().expect("free");
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/admin/diagnostics.zip")
+        .header("cookie", format!("omni_session={tok}"))
+        .body(Body::empty())?;
+    let res = app.router.clone().layer(MockConnectInfo(LOOPBACK.parse::<SocketAddr>().unwrap())).oneshot(req).await?;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert!(res.headers()["content-type"].to_str()?.starts_with("text/html"), "{:?}", res.headers());
+    assert!(res.headers().get("content-disposition").is_none(), "not a download");
+    let body = String::from_utf8(res.into_body().collect().await?.to_bytes().to_vec())?;
+    assert!(body.contains("ετοιμάζεται ήδη") && body.contains("href=\"/admin\""), "{body}");
+    assert!(!app.dir.path().join("temp").join("diagnostics").exists(), "nothing was written");
+
+    // Signed out: also a page, not JSON.
+    let req = Request::builder().method("GET").uri("/api/admin/diagnostics.zip").body(Body::empty())?;
+    let res = app.router.clone().layer(MockConnectInfo(LOOPBACK.parse::<SocketAddr>().unwrap())).oneshot(req).await?;
+    assert!(matches!(res.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN), "{}", res.status());
+    assert!(res.headers()["content-type"].to_str()?.starts_with("text/html"));
     Ok(())
 }

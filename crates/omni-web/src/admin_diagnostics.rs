@@ -4,13 +4,16 @@
 //! The zip is written under the install's temp folder
 //! (`temp\diagnostics\omni-diagnostics-<time>.zip`), the newest three are
 //! kept, and one package is made at a time.
+//!
+//! The panel links here directly (no script): a package downloads, anything
+//! else (busy, signed out, an error) is a short page that says what happened
+//! and links back, never a JSON body the browser would save as a `.zip`.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 
 use omni_core::dependencies::DependencyManager;
 use omni_core::diagnostics::{self, Limits, Sources};
@@ -22,9 +25,20 @@ use crate::state::AppState;
 /// Packages kept in `temp\diagnostics`.
 const KEEP: usize = 3;
 
-fn one_at_a_time() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+/// An error as a page a person reads, with its status.
+fn error_page(e: ApiError) -> Response {
+    let body = format!(
+        "<!doctype html><html lang=\"el\"><head><meta charset=\"utf-8\"><title>Διαγνωστικό πακέτο</title></head>\
+         <body style=\"font-family:sans-serif;max-width:40em;margin:3em auto\"><h1>Διαγνωστικό πακέτο</h1>\
+         <p>{}</p><p style=\"color:#666\">{}</p><p><a href=\"/admin\">Επιστροφή στη διαχείριση</a></p></body></html>",
+        escape(&e.message),
+        e.code
+    );
+    (e.status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
 }
 
 /// The install the daemon runs from (never the working directory).
@@ -46,14 +60,25 @@ async fn secret_values(state: &AppState) -> Vec<String> {
     let cfg = state.config.read().await;
     // Values from the environment (OMNI_GRAPH_CLIENT_SECRET, OMNI_LLM_API_KEY) live only here.
     values.extend([cfg.graph.client_secret.clone(), cfg.llm.api_key.clone()].into_iter().filter(|v| v.len() >= 6));
-    values.sort();
+    // Longest first (P13.8b): a value that begins a longer one must not leave its tail.
+    values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     values.dedup();
     values
 }
 
-pub async fn api_admin_diagnostics(RequireAdmin(admin): RequireAdmin, State(state): State<AppState>) -> Result<Response, ApiError> {
-    let Ok(_one) = one_at_a_time().try_lock() else {
-        return Err(ApiError::new(StatusCode::CONFLICT, "BUSY", "A diagnostics package is being made; wait for it to download."));
+pub async fn api_admin_diagnostics(admin: Result<RequireAdmin, ApiError>, State(state): State<AppState>) -> Response {
+    let made = match admin {
+        Ok(RequireAdmin(admin)) => make(admin, state).await,
+        Err(e) => Err(e),
+    };
+    made.unwrap_or_else(error_page)
+}
+
+async fn make(admin: omni_core::models::User, state: AppState) -> Result<Response, ApiError> {
+    // Owned, and moved into the blocking writer below: a browser that goes
+    // away does not free it while the file is still being written.
+    let Ok(one) = state.diagnostics_lock.clone().try_lock_owned() else {
+        return Err(ApiError::new(StatusCode::CONFLICT, "BUSY", "Ένα διαγνωστικό πακέτο ετοιμάζεται ήδη· περιμένετε να κατέβει και δοκιμάστε ξανά."));
     };
     let paths = install(&state);
     let out_dir = state.temp_dir.clone().unwrap_or_else(|| paths.temp.clone()).join("diagnostics");
@@ -91,8 +116,10 @@ pub async fn api_admin_diagnostics(RequireAdmin(admin): RequireAdmin, State(stat
     let name = format!("omni-diagnostics-{}.zip", now.format("%Y%m%d-%H%M%S"));
     let path = out_dir.join(&name);
     let (dir, file) = (out_dir.clone(), path.clone());
-    let written = tokio::task::spawn_blocking(move || {
-        let w = diagnostics::write_zip(&file, &src, limits);
+    let (written, bytes) = tokio::task::spawn_blocking(move || {
+        // Held until the file is written and read back, whatever the client does.
+        let _one = one;
+        let w = diagnostics::write_zip(&file, &src, limits).and_then(|w| Ok((w, std::fs::read(&file)?)));
         if w.is_err() {
             let _ = std::fs::remove_file(&file);
         }
@@ -105,7 +132,6 @@ pub async fn api_admin_diagnostics(RequireAdmin(admin): RequireAdmin, State(stat
         tracing::error!(error = %format!("{e:#}"), "The diagnostics package could not be made");
         ApiError::internal("The diagnostics package could not be made; see the service log.")
     })?;
-    let bytes = tokio::fs::read(&path).await.map_err(|e| ApiError::internal(format!("Could not read the package: {e}")))?;
     let _ = state.repo.log_audit(
         "INFO",
         "ADMIN",
