@@ -293,7 +293,8 @@ fn an_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it(
     let mark = at("\n        if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {");
     let apply = at("\n        match dep_mgr.apply_staged_ytdl() {");
     let verdict = at("\n    let verdict = verify_ytdl_update(");
-    let clear = verdict + update[verdict..].find("\n    if let Err(e) = dep_mgr.clear_ytdl_verifying() {").expect("cleared after the verdict");
+    // Only while a build is live: with none left, the start-up repair needs the marker (P11.7d).
+    let clear = verdict + update[verdict..].find("\n    match dep_mgr.clear_ytdl_verifying_if_live() {").expect("cleared after the verdict");
     let unlock = at("\n    drop(swap);");
     assert!(mark < apply, "the marker is written before the swap");
     assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
@@ -302,7 +303,7 @@ fn an_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it(
     assert!(failed_apply.contains("\n                if let Err(c) = dep_mgr.clear_ytdl_verifying_if_live() {"), "the failed apply keeps a needed marker");
     assert!(!failed_apply.contains("dep_mgr.clear_ytdl_verifying()"), "never the unconditional clear there");
     // A marker that could not be cleared is audited, not only logged (P11.7b2).
-    assert!(update[clear..unlock].contains("\n        let _ = repo.log_audit(\n            \"ERROR\","), "the failed clear is audited");
+    assert!(update[clear..unlock].contains("\n            let _ = repo.log_audit(\n                \"ERROR\","), "the failed clear is audited");
     let start = main.find("\n    report_unverified(&repo, \"yt-dlp\", dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
     assert!(start < main.find("ensure_ytdl_folder_build(&dep_mgr,").unwrap(), "before the tools are resolved");
 }
@@ -321,11 +322,14 @@ fn the_deno_update_marks_its_pending_verdict_around_the_swap_and_start_up_recove
     let apply = at("\n            Ok(()) => dep_mgr.apply_staged_deno(&new_version).inspect_err(|_| {");
     let failed_apply = at("\n                if let Err(c) = dep_mgr.clear_deno_verifying_if_live() {");
     let verdict = at("\n            let verdict = match selfcheck::judge_deno(&results) {");
-    let clear = at("\n            if let Err(e) = dep_mgr.clear_deno_verifying() {");
+    // Only while a Deno is live: with none left, the start-up repair needs the marker (P11.7d).
+    let clear = at("\n            match dep_mgr.clear_deno_verifying_if_live() {");
     let unlock = at("\n    drop(swap);");
     assert!(mark < apply && apply < failed_apply, "marked before the swap; a failed apply keeps a needed marker");
     assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
-    assert!(update[clear..unlock].contains("\n                let _ = repo.log_audit(\n                    \"ERROR\","), "the failed clear is audited");
+    assert!(update[clear..unlock].contains("\n                    let _ = repo.log_audit(\n                        \"ERROR\","), "the failed clear is audited");
+    // A re-check is audited as one, not as an update (P11.7d).
+    assert!(update.contains("\n                        format!(\"Deno {new_version} verified after an interrupted update\")"), "the re-check's wording");
     let start = main.find("\n    report_unverified(&repo, \"Deno\", dep_mgr.recover_unverified_deno());").expect("start-up recovery");
     assert!(start < main.find("\n    // Deno for YouTube (plan P6.8): reported now").unwrap(), "before the background install");
 }

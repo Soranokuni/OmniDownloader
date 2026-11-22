@@ -639,7 +639,7 @@ impl DependencyManager {
     fn recover_unverified(
         &self,
         marker: &str,
-        state: SwapState,
+        state: impl FnOnce() -> SwapState,
         restore: impl FnOnce(&Path) -> Result<()>,
         live_sha256: impl FnOnce() -> Option<String>,
         rollback: impl FnOnce() -> Result<()>,
@@ -651,6 +651,8 @@ impl DependencyManager {
             self.clear_verifying_or_warn(marker);
             return UnverifiedUpdate::NotLive;
         };
+        // Only now, with a marker: the state may hash files of ~100 MB (P11.7d).
+        let state = state();
         if !state.live_exists {
             let verified = state.aside.iter().find(|(_, sha)| sha.as_deref().is_some_and(|s| s != pending));
             if let Some((from, _)) = verified {
@@ -710,10 +712,14 @@ impl DependencyManager {
                 .map(|s| s.trim().to_string());
             (dir, sha)
         };
-        let state = SwapState {
-            live_exists: live.exists(),
-            aside: vec![folder_sha(self.ytdl_dir_previous()), folder_sha(self.ytdl_dir_staged())],
-            other_live: self.ytdl_legacy().is_file(),
+        let state = || {
+            let live_exists = live.exists();
+            SwapState {
+                live_exists,
+                // Read only when there is something to repair.
+                aside: if live_exists { Vec::new() } else { vec![folder_sha(self.ytdl_dir_previous()), folder_sha(self.ytdl_dir_staged())] },
+                other_live: self.ytdl_legacy().is_file(),
+            }
         };
         self.recover_unverified(
             YTDL_VERIFYING_MARKER,
@@ -777,10 +783,14 @@ impl DependencyManager {
             let sha = std::fs::read(&path).ok().map(|b| sha256_hex(&b));
             (path, sha)
         };
-        let state = SwapState {
-            live_exists: live.exists(),
-            aside: vec![file_sha(self.deno_previous()), file_sha(self.deno_staged())],
-            other_live: false,
+        let state = || {
+            let live_exists = live.exists();
+            SwapState {
+                live_exists,
+                // Hashed (about 100 MB each) only when there is something to repair (P11.7d).
+                aside: if live_exists { Vec::new() } else { vec![file_sha(self.deno_previous()), file_sha(self.deno_staged())] },
+                other_live: false,
+            }
         };
         self.recover_unverified(
             DENO_VERIFYING_MARKER,
@@ -2234,6 +2244,22 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  yt-dlp_macos
         mgr.apply_staged_ytdl().unwrap();
         assert!(mgr.clear_ytdl_verifying_if_live().unwrap());
         assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7d: a start with no marker reads nothing of the builds (no file of
+    /// ~100 MB is hashed): the swap state is never asked for.
+    #[test]
+    fn a_start_without_a_marker_reads_no_build() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        let got = mgr.recover_unverified(
+            DENO_VERIFYING_MARKER,
+            || panic!("the swap state was read with no marker"),
+            |_| panic!("restore"),
+            || panic!("live hash"),
+            || panic!("rollback"),
+        );
+        assert_eq!(got, UnverifiedUpdate::None);
     }
 
     /// A Deno as `stage_deno` leaves it, staged (no process is run).

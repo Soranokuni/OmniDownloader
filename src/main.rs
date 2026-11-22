@@ -2318,13 +2318,19 @@ async fn nightly_ytdl_update(
     // The verdict is in (kept, rolled back, postponed, or unverified by a failed swap),
     // recorded while the swap lock is still held (P11.7b). A marker that stays would
     // have the next start roll this build back as unverified (P11.7b2): said loudly.
-    if let Err(e) = dep_mgr.clear_ytdl_verifying() {
-        error!("yt-dlp update: the verdict was reached but its marker could not be removed: {e:#}");
-        let _ = repo.log_audit(
-            "ERROR",
-            "SYSTEM",
-            &format!("yt-dlp update: the verdict marker could not be removed ({e}); remove bin\\yt-dlp.exe.verifying by hand, or the next start rolls the build back"),
-        );
+    // With no build left live (a swap back that failed), it stays for the start-up
+    // repair to put the old build back (P11.7d).
+    match dep_mgr.clear_ytdl_verifying_if_live() {
+        Ok(true) => {}
+        Ok(false) => warn!("yt-dlp update: no build is live after the verdict; the next start puts the previous one back"),
+        Err(e) => {
+            error!("yt-dlp update: the verdict was reached but its marker could not be removed: {e:#}");
+            let _ = repo.log_audit(
+                "ERROR",
+                "SYSTEM",
+                &format!("yt-dlp update: the verdict marker could not be removed ({e}); remove bin\\yt-dlp.exe.verifying by hand, or the next start rolls the build back"),
+            );
+        }
     }
     drop(swap);
     let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
@@ -2614,18 +2620,29 @@ async fn nightly_deno_update(
                 v => v,
             };
             // The verdict is in, under the swap lock (P11.7c). A marker that stays would
-            // have the next start roll this Deno back as unverified: said loudly.
-            if let Err(e) = dep_mgr.clear_deno_verifying() {
-                error!("Deno update: the verdict was reached but its marker could not be removed: {e:#}");
-                let _ = repo.log_audit(
-                    "ERROR",
-                    "SYSTEM",
-                    &format!("Deno update: the verdict marker could not be removed ({e}); remove bin\\deno.exe.verifying by hand, or the next start rolls Deno back"),
-                );
+            // have the next start roll this Deno back as unverified: said loudly. With no
+            // Deno left live, it stays for the start-up repair (P11.7d).
+            match dep_mgr.clear_deno_verifying_if_live() {
+                Ok(true) => {}
+                Ok(false) => warn!("Deno update: no Deno is live after the verdict; the next start puts the previous one back"),
+                Err(e) => {
+                    error!("Deno update: the verdict was reached but its marker could not be removed: {e:#}");
+                    let _ = repo.log_audit(
+                        "ERROR",
+                        "SYSTEM",
+                        &format!("Deno update: the verdict marker could not be removed ({e}); remove bin\\deno.exe.verifying by hand, or the next start rolls Deno back"),
+                    );
+                }
             }
             match verdict {
                 UpdateVerdict::Kept { .. } => {
-                    let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                    // A re-check of a Deno an interrupted update left live is not an update (P11.7d).
+                    let audit = if reverify {
+                        format!("Deno {new_version} verified after an interrupted update")
+                    } else {
+                        format!("Deno updated {installed} → {new_version}")
+                    };
+                    let _ = repo.log_audit("INFO", "SYSTEM", &audit);
                     // yt-dlp reads YouTube through Deno: a second chance for extraction failures (P11.5).
                     omni_core::second_chance::after_deno_update(repo, &new_version);
                     TaskOutcome::Ok
