@@ -26,7 +26,9 @@ in capital Latin letters, digits and `_` only, and at most 60 characters
 before `.mxf`. Greek is written in Latin (Σεισμός → `SEISMOS`); any other
 sign, a dash or a space, becomes `_` (`PAPA-DAKI` → `PAPA_DAKI`,
 `fire in the hills` → `FIRE_IN_THE_HILLS`). A name that would be longer loses
-letters from the end of the keyword first, then of the journalist's name. If
+letters from the end of the keyword first, then of the journalist's name. The
+story number you type has at most 9 characters, so the A, B, C of a story's
+further videos always stay in their names. If
 a file of that name is already in the watchfolder, the new one is `…_2.mxf`;
 nothing is overwritten. Every form (adding a link, `/user`, renaming) shows
 the name the video will get while you type.

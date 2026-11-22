@@ -1539,6 +1539,33 @@ async fn the_mcr_form_keeps_the_journalist_identity_and_the_slug_matches_the_sto
     Ok(())
 }
 
+/// P12.11b: a typed story number is at most `MAX_TYPED_INDEX` characters, so the A/B/C of a
+/// story's further videos always survive in the file name. Longer is refused with a Greek
+/// message and nothing is queued; the forms do not let it be typed.
+#[tokio::test]
+async fn a_story_number_longer_than_a_file_name_keeps_is_refused() -> Result<()> {
+    use omni_core::slug::MAX_TYPED_INDEX;
+    let app = App::new()?;
+    let longest = "9".repeat(MAX_TYPED_INDEX);
+    let (status, ok) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({ "url": "https://example.test/idx/1", "keyword": "kw", "index_str": longest })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{ok}");
+    let (status, refused) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({ "url": "https://example.test/idx/2", "keyword": "kw", "index_str": format!("{longest}9") })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(refused.to_string().contains("έως 9 χαρακτήρες"), "{refused}");
+    assert!(!app.repo.get_all_jobs()?.iter().any(|j| j.url == "https://example.test/idx/2"), "a refused link was queued");
+
+    for page in ["mcr.html", "user.html"] {
+        let html = omni_web::assets::WebAssets::get(page).expect("page shipped");
+        let html = String::from_utf8_lossy(&html.data).to_string();
+        assert!(html.contains(&format!("required maxlength=\"{MAX_TYPED_INDEX}\"")), "{page}: the story number has no limit");
+    }
+    Ok(())
+}
+
 /// P12.11: the forms' live preview promises exactly the name the job then gets, Greek and
 /// signs included; for a rename it reads the keyword as the rename stores it.
 #[tokio::test]

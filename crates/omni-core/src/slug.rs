@@ -20,6 +20,10 @@ use crate::translit::translit;
 pub const MAX_LEN: usize = 60;
 /// Longest index (story number); `1`, `12`, `3A` in practice.
 pub const MAX_INDEX: usize = 10;
+/// Longest index a person may type (P12.11b): one shorter than [`MAX_INDEX`],
+/// so the letter a second video of the same story gets (`…A`, `…B`) is never
+/// cut off and two videos never compose to the same name.
+pub const MAX_TYPED_INDEX: usize = MAX_INDEX - 1;
 /// A part that has to be cut keeps at least this much.
 const MIN_PART: usize = 2;
 
@@ -143,6 +147,17 @@ mod tests {
     fn the_index_is_capped_at_ten() {
         let s = compose("123456789012345", "MCR", "KAIROS");
         assert_eq!(s, "1234567890_MCR_KAIROS");
+    }
+
+    #[test]
+    fn a_typed_index_at_its_longest_keeps_the_videos_of_a_story_apart() {
+        let typed = "9".repeat(MAX_TYPED_INDEX);
+        let names: Vec<String> = ["A", "B", "C"]
+            .iter()
+            .map(|letter| compose(&format!("{typed}{letter}"), "PAPADAKI", "SEISMOS"))
+            .collect();
+        assert!(names[0] != names[1] && names[1] != names[2] && names[0] != names[2], "{names:?}");
+        assert!(names[0].starts_with(&format!("{typed}A_")), "{}", names[0]);
     }
 
     #[test]

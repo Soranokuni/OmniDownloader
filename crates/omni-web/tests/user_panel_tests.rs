@@ -140,11 +140,28 @@ async fn many_links_get_index_suffixes_and_one_bad_link_queues_nothing() -> Resu
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(p.job_count(), 3);
 
+    // P12.11b: a story number too long for its A/B/C to survive in the name queues nothing;
+    // at the longest allowed, the three names stay apart.
+    let typed = "9".repeat(omni_core::slug::MAX_TYPED_INDEX);
+    let three: Vec<String> = (1..=3).map(|n| format!("https://example.test/long/{n}")).collect();
+    let (status, _) = p
+        .send("POST", "/api/user/jobs", &p.ben, Some(json!({"urls": three, "keyword": "X", "index_str": format!("{typed}9")})))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(p.job_count(), 3, "a refused story number queued something");
+    let (status, json) = p
+        .send("POST", "/api/user/jobs", &p.ben, Some(json!({"urls": three, "keyword": "X", "index_str": typed})))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let names: std::collections::BTreeSet<&str> = json.as_array().unwrap().iter().map(|r| r["slug"].as_str().unwrap()).collect();
+    assert_eq!(names.len(), 3, "the videos of one story got the same name: {names:?}");
+
     // Exactly one of url / urls.
     let (status, _) = p
         .send("POST", "/api/user/jobs", &p.ben, Some(json!({"url": "https://example.test/a", "urls": ["https://example.test/b"], "keyword": "X"})))
         .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(p.job_count(), 6);
     Ok(())
 }
 

@@ -72,7 +72,7 @@ pub async fn api_user_submit(
 
     let journalist = journalist_of(&user);
     let keyword = sanitize_token(&payload.keyword, "ASSET");
-    let base_index = sanitize_token(payload.index_str.as_deref().unwrap_or("1"), "1");
+    let base_index = crate::routes::typed_index(payload.index_str.as_deref())?;
     let notes = payload
         .notes
         .as_deref()

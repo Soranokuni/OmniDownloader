@@ -795,7 +795,7 @@ pub async fn api_create_job(
     };
 
     let keyword = sanitize_token(payload.keyword.as_deref().unwrap_or("ASSET"), "ASSET");
-    let index_str = sanitize_token(payload.index_str.as_deref().unwrap_or("1"), "1");
+    let index_str = typed_index(payload.index_str.as_deref())?;
 
     // The stored fields keep the identity; only the file name follows the slug rule (P12.11).
     let slug = omni_core::slug::compose(&index_str, &journalist, &keyword);
@@ -835,6 +835,21 @@ pub(crate) fn is_submittable_url(url: &str) -> bool {
     (lower.starts_with("http://") || lower.starts_with("https://"))
         && url.len() <= 2048
         && !url.chars().any(|c| c.is_control())
+}
+
+/// The story number a person typed (P12.11b), as a form reads it, at most
+/// [`omni_core::slug::MAX_TYPED_INDEX`] characters: one fewer than a file
+/// name keeps, so the `A`, `B`, `C` of a story's further videos are never cut
+/// off. Longer is refused (400), never cut: a cut number is another story's.
+pub(crate) fn typed_index(raw: Option<&str>) -> Result<String, ApiError> {
+    let index = sanitize_token(raw.unwrap_or("1"), "1");
+    if index.chars().count() > omni_core::slug::MAX_TYPED_INDEX {
+        return Err(ApiError::bad_request(format!(
+            "Ο αριθμός θέματος έχει έως {} χαρακτήρες.",
+            omni_core::slug::MAX_TYPED_INDEX
+        )));
+    }
+    Ok(index)
 }
 
 /// Reduce an operator-supplied token to what may appear in a filename.
