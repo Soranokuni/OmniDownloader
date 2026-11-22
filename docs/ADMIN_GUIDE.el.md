@@ -781,8 +781,10 @@ Dalet πριν ξαναδοκιμάσετε), και σε κάθε άλλη πε
 **Τιμή που δεν μπορεί να χρησιμοποιηθεί.** Η υπηρεσία ονομάζει το κλειδί, την
 τιμή και τη διόρθωση, στο αρχείο καταγραφής και στο σφάλμα όταν αρνείται να
 ξεκινήσει, για παράδειγμα ``config.json: `web_port` = "eighty" cannot be read
-(invalid type: string "eighty", expected u16). Fix: write a value like the
-default, 8080, or remove `web_port` to use the default.`` Αρνείται να
+(expected u16). Fix: write a value like the default, 8080, or remove
+`web_port` to use the default.`` Μια διεύθυνση web εμφανίζεται χωρίς όνομα
+χρήστη, κωδικό ή query, οι μεγάλες τιμές κόβονται, και η τιμή ενός κωδικού,
+μυστικού, κλειδιού, token ή cookie εμφανίζεται ως `<removed>`. Αρνείται να
 ξεκινήσει με τιμή λάθος είδους, `web_port` 0 ή κενό `watchfolder_path`. Μια
 τιμή έξω από το εύρος στο οποίο τη διαβάζει η υπηρεσία (ταυτόχρονες λήψεις
 1–10, ταυτόχρονες κωδικοποιήσεις 1–8, `mail.poll_interval_secs` 10–3600,

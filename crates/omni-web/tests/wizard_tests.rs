@@ -770,6 +770,22 @@ fn test_job(app: &App, url: &str, slug: &str, parent: Option<i64>) -> Result<i64
     Ok(app.repo.enqueue(&j, 0)?.job_id())
 }
 
+/// P13.4c: journalist and keyword alone do not make a test job; the note does.
+#[tokio::test]
+async fn a_delivered_job_without_the_test_note_proves_nothing() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let mut j = omni_core::models::NewJob::new("https://video.example/v/lookalike-test", "1_MCR_OMNIINGEST_TEST", "MCR");
+    j.keyword = "OMNIINGEST_TEST".into();
+    j.notes = Some("Βάλτε το στο δελτίο των 8".into());
+    let id = app.repo.enqueue(&j, 0)?.job_id();
+    deliver(&app, id, "watchfolder/1_MCR_OMNIINGEST_TEST.mxf")?;
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": id}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(!app.state.config.read().await.setup_completed);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_completed_test_job_with_no_delivered_file_proves_nothing() -> Result<()> {
     let app = app(false)?;

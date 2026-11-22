@@ -93,9 +93,12 @@ pub fn migrate_v1(doc: &mut Value) -> Vec<Moved> {
 }
 
 /// Keys whose value is a secret or may hold one: blanked in a backup.
+/// By whole name or `_name` suffix (P13.7b): `max_tokens` and
+/// `client_secret_expires` are settings, not secrets.
 fn is_secret_key(key: &str) -> bool {
+    const NAMES: [&str; 7] = ["password", "secret", "api_key", "apikey", "token", "cookie", "cookies"];
     let k = key.to_ascii_lowercase();
-    ["password", "secret", "api_key", "apikey", "token", "cookie"].iter().any(|s| k.contains(s))
+    NAMES.iter().any(|n| k == *n || k.ends_with(&format!("_{n}")))
 }
 
 /// `doc` with every secret-looking value replaced by `"<removed>"`, at any depth.
@@ -148,15 +151,28 @@ pub fn upgrade_file(config: &Path) -> Result<Option<Upgrade>> {
         return Ok(None); // `parse` names what is wrong
     };
     let original = doc.clone();
-    let moved = migrate_v1(&mut doc);
+    let mut moved = migrate_v1(&mut doc);
     if moved.is_empty() {
         return Ok(None);
     }
+    // The rewrite drops the IMAP password; adopt_secrets will no longer see it to say so.
+    if original.get("email_password").and_then(Value::as_str).is_some_and(|p| !p.is_empty()) {
+        moved.push(Moved { from: "email_password".into(), to: None, note: "IMAP is no longer supported; the password is not kept anywhere".into() });
+    }
+    // Check first, copy only when the rewrite will happen (P13.7b): a bad
+    // value or a file the service may not write leaves no copy behind.
+    let upgraded = from_value(doc, config)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(config)
+        .with_context(|| format!("{} cannot be written; it is read as v2 but left as it is", config.display()))?;
     let backup = backup_path(config);
     let copy = serde_json::to_string_pretty(&without_secrets(&original))?;
     std::fs::write(&backup, copy).with_context(|| format!("Cannot keep a copy of the old settings as {}; config.json is unchanged", backup.display()))?;
-    let upgraded = from_value(doc, config)?;
-    upgraded.save_to_file(config).with_context(|| format!("Cannot write the new settings to {}; the old file is unchanged", config.display()))?;
+    if let Err(e) = upgraded.save_to_file(config) {
+        let _ = std::fs::remove_file(&backup);
+        return Err(e).with_context(|| format!("Cannot write the new settings to {}; the old file is unchanged", config.display()));
+    }
     Ok(Some(Upgrade { backup, moved }))
 }
 
@@ -204,19 +220,33 @@ fn at<'a>(doc: &'a Value, path: &serde_path_to_error::Path) -> Option<&'a Value>
 /// value and the fix.
 fn from_value(doc: Value, file: &Path) -> Result<AppConfig> {
     serde_path_to_error::deserialize::<_, AppConfig>(doc.clone()).map_err(|e| {
+        use serde_path_to_error::Segment;
         let key = e.path().to_string();
-        let value = at(&doc, e.path()).map(shown).unwrap_or_else(|| "(missing)".into());
+        // The value only through `shown` (P13.7b), and never under a secret's name.
+        let secret = e.path().iter().any(|s| matches!(s, Segment::Map { key } if is_secret_key(key)));
+        let value = if secret {
+            "<removed>".to_string()
+        } else {
+            at(&doc, e.path()).map(shown).unwrap_or_else(|| "(missing)".into())
+        };
         let default = serde_json::to_value(AppConfig::default()).ok().and_then(|d| at(&d, e.path()).cloned());
         let fix = match default {
+            _ if secret => format!("remove `{key}`; secrets are kept in the encrypted store, not in config.json"),
             Some(Value::Null) | None => format!("correct it, or remove `{key}`"),
             Some(d) => format!("write a value like the default, {}, or remove `{key}` to use the default", shown(&d)),
         };
-        anyhow::anyhow!(
-            "{}: `{key}` = {value} cannot be read ({}). Fix: {fix}.",
-            file.display(),
-            e.inner()
-        )
+        anyhow::anyhow!("{}: `{key}` = {value} cannot be read ({}). Fix: {fix}.", file.display(), why(&e.inner().to_string()))
     })
+}
+
+/// What serde says is wrong, without the value it repeats ("invalid type:
+/// string \"…\", expected u16" → "expected u16").
+fn why(inner: &str) -> String {
+    match inner.rfind(", expected ") {
+        Some(i) => inner[i + 2..].chars().take(160).collect(),
+        None if inner.starts_with("missing field") => inner.chars().take(160).collect(),
+        None => "not a valid value here".to_string(),
+    }
 }
 
 /// Read config.json's text: not JSON, or a value of the wrong kind, is an
@@ -442,13 +472,25 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, r#"{ "web_port": 8091, "ollama_endpoint": "http://127.0.0.1:1234/v1", "email_poll_interval_secs": 30,
-            "imap_server": "mail.example.invalid", "email_password": "imap-secret-test", "graph": { "mailbox": "ingest@station.example" } }"#).unwrap();
+            "imap_server": "mail.example.invalid", "email_password": "imap-secret-test",
+            "graph": { "mailbox": "ingest@station.example", "client_secret": "nested-secret-test", "client_secret_expires": "2027-01-31" },
+            "llm": { "api_key": "sk-nested-test", "max_tokens": 600 },
+            "repair": { "llm_max_tokens": 900 },
+            "extra_accounts": [ { "name": "a", "token": "array-secret-test" } ] }"#).unwrap();
 
         let up = upgrade_file(&path).unwrap().expect("upgraded");
         assert_eq!(up.backup, dir.path().join("config.json.v1.bak"));
         let copy = std::fs::read_to_string(&up.backup).unwrap();
         assert!(copy.contains("imap_server") && copy.contains("8091"), "the copy is the old file");
-        assert!(!copy.contains("imap-secret-test"), "no secret in the copy: {copy}");
+        for secret in ["imap-secret-test", "nested-secret-test", "sk-nested-test", "array-secret-test"] {
+            assert!(!copy.contains(secret), "{secret} in the copy: {copy}");
+        }
+        // The IMAP password the rewrite drops is reported (P13.7b).
+        assert!(up.moved.iter().any(|m| m.from == "email_password" && m.to.is_none()), "{:?}", up.moved);
+        // Settings that only look like secrets are kept, so the copy can be restored as it is.
+        let restored = parse(&copy, &up.backup).expect("the copy parses");
+        assert_eq!((restored.llm.max_tokens, restored.repair.llm_max_tokens), (600, 900));
+        assert_eq!(restored.graph.client_secret_expires.map(|d| d.to_string()).as_deref(), Some("2027-01-31"));
 
         let text = std::fs::read_to_string(&path).unwrap();
         let doc: Value = serde_json::from_str(&text).unwrap();
@@ -474,6 +516,31 @@ mod tests {
         let err = upgrade_file(&path).unwrap_err().to_string();
         assert!(err.contains("`web_port` = \"eighty\""), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v1, "config.json is as it was");
+        // P13.7b: no copy is left behind, start after start.
+        let _ = upgrade_file(&path);
+        let left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["config.json"]);
+    }
+
+    /// P13.7b: the message carries the value only as `shown` gives it, and
+    /// never a secret's.
+    #[test]
+    fn a_bad_value_message_holds_no_credential_query_or_secret() {
+        let file = Path::new("config.json");
+        let err = parse(r#"{ "web_port": "https://user:pw-test@host.example/x?key=query-secret-test" }"#, file).unwrap_err().to_string();
+        assert!(err.contains("`web_port` = \"https://host.example/x\""), "{err}");
+        for leak in ["pw-test", "query-secret-test", "user:"] {
+            assert!(!err.contains(leak), "{leak} in: {err}");
+        }
+        assert!(err.contains("expected u16"), "{err}");
+
+        let err = parse(r#"{ "email_password": 12345678 }"#, file).unwrap_err().to_string();
+        assert!(err.contains("`email_password` = <removed>"), "{err}");
+        assert!(!err.contains("12345678"), "{err}");
+
+        let err = parse(r#"{ "llm": { "mode": "very-secret-mode" } }"#, file).unwrap_err().to_string();
+        assert!(!err.contains("very-secret-mode") || err.contains("= \"very-secret-mode\""), "only in the shown value: {err}");
+        assert!(err.contains("expected one of"), "{err}");
     }
 
     #[test]

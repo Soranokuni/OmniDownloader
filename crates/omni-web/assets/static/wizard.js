@@ -622,8 +622,15 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
         try { r = await api(`/api/admin/setup/test-download/${T.jobId}`); } catch (err) {
           // P13.4b: a lost answer (a restart, the network) is not the end of the test.
           if (gen !== T.poll) return;
-          status.className = 'note warn'; status.textContent = `«Επανασύνδεση…» (${err.message})`;
-          setTimeout(() => poll(gen), 3000);
+          // P13.4c: only a lost connection or a server error is retried; a job that is
+          // gone (404) or a refusal (403) ends the wait, and Start can begin a new test.
+          if (err.code === 'NETWORK' || err.status >= 500) {
+            status.className = 'note warn'; status.textContent = `«Επανασύνδεση…» (${err.message})`;
+            setTimeout(() => poll(gen), 3000);
+          } else {
+            status.className = 'note bad'; status.textContent = err.message;
+            T.jobId = null; T.status = null; start.disabled = false; refresh();
+          }
           return;
         }
         if (gen !== T.poll) return;
