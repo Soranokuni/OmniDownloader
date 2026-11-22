@@ -2,6 +2,7 @@
 name = "omni-setup"
 version = "1.0.0"
 edition = "2021"
+publish = false
 description = "OmniIngest-Setup.exe: the release folder in one executable that installs, upgrades and removes OmniIngest"
 
 # Windows "installer detection" runs any unmanifested executable whose name
