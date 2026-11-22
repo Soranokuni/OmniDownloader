@@ -13,6 +13,19 @@
 
 use std::collections::BTreeMap;
 
+/// The version of [`normalize`]'s rules (P14.8b). Bump it with every change to
+/// what `normalize` returns: at the next start the stored keys of the rows a
+/// duplicate check can still meet are computed again
+/// (`Repository::renormalize_if_needed`), so a link sent before the change and
+/// again after it is still one job.
+///
+/// 1: the rules before P14.8. 2: P14.8 (YouTube playlist embeds, Facebook,
+/// Instagram and TikTok keys).
+pub const NORMALIZE_VERSION: i64 = 2;
+
+/// Instagram path words that are pages, not shortcodes (P14.8b).
+const INSTAGRAM_PATH_WORDS: &[&str] = &["audio", "tagged", "saved", "explore", "stories", "accounts", "direct", "about", "legal"];
+
 /// Query parameters that never identify the asset: analytics, share tracking,
 /// and playback state. Removing them is what makes two forwarded links equal.
 ///
@@ -227,10 +240,18 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
         }
         "www.instagram.com" => {
             // A post, a reel or an IGTV video by its shortcode, with or without
-            // the account's name in front, is /p/{shortcode}.
+            // the account's name in front, is /p/{shortcode}. Only a code that
+            // looks like a shortcode counts: `/reels/audio/{id}` is an audio page,
+            // not a reel called «audio» (P14.8b).
+            let shortcode = |c: &str| {
+                c.len() >= 5
+                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !INSTAGRAM_PATH_WORDS.contains(&c.to_ascii_lowercase().as_str())
+            };
+            let kind = |k: &str| matches!(k, "p" | "reel" | "reels" | "tv");
             let at = match segs.as_slice() {
-                [kind, code, ..] if matches!(kind.as_str(), "p" | "reel" | "reels" | "tv") => Some(code.clone()),
-                [_, kind, code, ..] if matches!(kind.as_str(), "p" | "reel" | "reels" | "tv") => Some(code.clone()),
+                [k, code, ..] if kind(k) && shortcode(code) => Some(code.clone()),
+                [_, k, code, ..] if kind(k) && shortcode(code) => Some(code.clone()),
                 _ => None,
             };
             if let Some(code) = at {
@@ -543,7 +564,12 @@ mod tests {
         assert_ne!(normalize("https://www.facebook.com/watch/?v=1"), normalize("https://www.facebook.com/watch/?v=2"));
         assert_ne!(normalize("https://www.facebook.com/Page/videos/1"), normalize("https://www.facebook.com/Page/videos/2"));
         assert_ne!(normalize("https://www.facebook.com/reel/1"), normalize("https://www.facebook.com/reel/2"));
-        assert_ne!(normalize("https://www.instagram.com/reel/AAA"), normalize("https://www.instagram.com/reel/BBB"));
+        assert_ne!(normalize("https://www.instagram.com/reel/AAAAAAA"), normalize("https://www.instagram.com/reel/BBBBBBB"));
+        // Two audio pages are not one «reel» called audio (P14.8b).
+        assert_ne!(
+            normalize("https://www.instagram.com/reels/audio/111111111/"),
+            normalize("https://www.instagram.com/reels/audio/222222222/")
+        );
         assert_ne!(normalize("https://www.tiktok.com/@a/video/1"), normalize("https://www.tiktok.com/@a/video/2"));
         // A Facebook page's video list is not one of its videos.
         assert_ne!(normalize("https://www.facebook.com/Page/videos"), normalize("https://www.facebook.com/watch?v=1"));
@@ -556,6 +582,15 @@ mod tests {
             "https://m.youtube.com/shorts/xyz?feature=share",
             "https://twitter.com/u/status/1?ref_src=x",
             "https://www.iefimerida.gr/news/story/amp",
+            // The P14.8 keys.
+            "https://www.youtube.com/embed/videoseries?list=PLabc123&index=2",
+            "https://www.youtube.com/embed/live_stream?channel=UCxyz",
+            "https://www.facebook.com/NewsPage/videos/storm/99/?__cft__=x",
+            "https://www.facebook.com/reel/123?mibextid=abc",
+            "https://m.instagram.com/newsdesk/reel/CxYz123/?igsh=abc",
+            "https://www.instagram.com/reels/audio/123456789/",
+            "https://www.tiktok.com/@newsdesk/video/7301234567890?is_from_webapp=1",
+            "https://m.tiktok.com/v/7301234567890.html",
         ] {
             let once = normalize(url);
             let twice = normalize(&once);

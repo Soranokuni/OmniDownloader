@@ -927,6 +927,18 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         UPDATE held_outputs SET clock_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE decision IS NULL;
         "#,
     ),
+    (
+        41,
+        // Small facts about the database itself (P14.8b): first the version of the
+        // URL normalization its stored dedup keys were made with
+        // (`url_normalize_version`). No row: made before P14.8, version 1.
+        r#"
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from

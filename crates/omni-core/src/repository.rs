@@ -26,6 +26,14 @@ use crate::timestamps;
 /// news cycle) without blocking a genuine re-ingest the next day.
 pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 
+/// How far back [`Repository::renormalize_if_needed`] makes finished rows' keys again
+/// (P14.8b): longer than the dedup window (a day) and the second-chance window (at
+/// most 6 hours) with room to spare.
+pub const RENORMALIZE_DAYS: i64 = 7;
+
+/// Rows per transaction when the keys are made again (P14.8b).
+pub const RENORMALIZE_BATCH: usize = 500;
+
 /// One page-evidence file of a failed job (plan P10.1).
 #[derive(Debug, Clone)]
 pub struct EvidenceRow {
@@ -924,6 +932,58 @@ impl Repository {
         self
     }
 
+    /// Bring the stored dedup keys (`queue.url_normalized`) up to
+    /// [`crate::urlnorm::NORMALIZE_VERSION`] (P14.8b). Does nothing when the
+    /// version stored in `app_meta` is current. Otherwise every row a duplicate
+    /// check or a second chance can still compare against gets
+    /// `normalize(url)` again: any status but a finished one, at any age, and
+    /// any row finished or touched in the last [`RENORMALIZE_DAYS`] days (the
+    /// dedup window is a day, the second-chance window at most 6 hours). In
+    /// batches of [`RENORMALIZE_BATCH`], each one transaction; the version is
+    /// stored last, so a stop half-way does the rest at the next start.
+    /// Returns how many keys changed.
+    pub fn renormalize_if_needed(conn: &mut rusqlite::Connection, now: DateTime<Utc>) -> Result<usize> {
+        let stored: Option<String> = conn
+            .query_row("SELECT value FROM app_meta WHERE key = 'url_normalize_version'", [], |r| r.get(0))
+            .optional()?;
+        let stored = stored.and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(1);
+        if stored == crate::urlnorm::NORMALIZE_VERSION {
+            return Ok(0);
+        }
+        let cutoff = timestamps::format(now - Duration::days(RENORMALIZE_DAYS));
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, url, url_normalized FROM queue
+                  WHERE status IN ('PENDING','RUNNING','AWAITING_APPROVAL','REQUIRES_REVIEW','MANUAL_DOWNLOAD')
+                     OR COALESCE(completed_at, updated_at, created_at) >= ?
+                  ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut changed = 0;
+        for batch in rows.chunks(RENORMALIZE_BATCH) {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            for (id, url, old) in batch {
+                let key = crate::urlnorm::normalize(url);
+                if old.as_deref() != Some(key.as_str()) {
+                    tx.execute("UPDATE queue SET url_normalized = ? WHERE id = ?", params![key, id])?;
+                    changed += 1;
+                }
+            }
+            tx.commit()?;
+        }
+        conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES ('url_normalize_version', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![crate::urlnorm::NORMALIZE_VERSION.to_string()],
+        )?;
+        if changed > 0 {
+            info!("Dedup keys: {changed} brought up to normalization version {}", crate::urlnorm::NORMALIZE_VERSION);
+        }
+        Ok(changed)
+    }
+
     /// The window the second-chance triggers use (P11.5).
     pub fn second_chance_window(&self) -> Duration {
         self.second_chance_window
@@ -935,6 +995,10 @@ impl Repository {
         conn.execute_batch(migrations::DATABASE_PRAGMAS)?;
         migrations::apply(&mut conn, self.db_path.as_deref())
             .context("Schema migration failed; refusing to start against a half-migrated database")?;
+        // The dedup keys of the rows a duplicate check can still meet, made again
+        // when the normalization rules changed (P14.8b): a link sent before an
+        // upgrade and again after it must still be one job.
+        Self::renormalize_if_needed(&mut conn, Utc::now()).context("Could not bring the stored dedup keys up to date")?;
 
         // No default admin is seeded (plan P2.4, defect W-04).
         //
