@@ -1053,3 +1053,43 @@ async fn the_settings_report_where_the_default_watchfolder_resolves() -> Result<
     assert!(std::path::Path::new(&resolved).is_absolute(), "{resolved}");
     Ok(())
 }
+
+// ---- P13.8: the diagnostics package ----
+
+#[tokio::test]
+async fn the_diagnostics_package_downloads_with_no_stored_secret_in_it() -> Result<()> {
+    use std::io::Read;
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let planted = "graph-store-secret-planted";
+    app.state.secrets.set(omni_core::secrets::keys::GRAPH_CLIENT_SECRET, planted)?;
+    let logs = app.dir.path().join("logs");
+    std::fs::create_dir_all(&logs)?;
+    std::fs::write(logs.join("omni-ingest.2026-11-21.log"), format!("INFO started\nWARN Graph refused {planted}\n"))?;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/admin/diagnostics.zip")
+        .header("cookie", format!("omni_session={tok}"))
+        .body(Body::empty())?;
+    let res = app.router.clone().layer(MockConnectInfo(LOOPBACK.parse::<SocketAddr>().unwrap())).oneshot(req).await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "application/zip");
+    assert!(res.headers()["content-disposition"].to_str()?.contains("omni-diagnostics-"));
+    let bytes = res.into_body().collect().await?.to_bytes().to_vec();
+
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+    let mut all = String::new();
+    for i in 0..z.len() {
+        let mut f = z.by_index(i)?;
+        all.push_str(f.name());
+        f.read_to_string(&mut all)?;
+    }
+    assert!(all.contains("logs/omni-ingest.2026-11-21.log") && all.contains("WARN Graph refused ***"), "{all}");
+    assert!(!all.contains(planted), "the stored secret is in the package");
+    // Written under the install's temp folder.
+    assert_eq!(std::fs::read_dir(app.dir.path().join("temp").join("diagnostics"))?.count(), 1);
+    let audit: Vec<String> = app.repo.get_recent_audit_logs(10)?.into_iter().map(|a| a.message).collect();
+    assert!(audit.iter().any(|m| m.starts_with("Diagnostics package omni-diagnostics-")), "{audit:?}");
+    Ok(())
+}

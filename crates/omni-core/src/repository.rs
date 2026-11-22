@@ -3108,6 +3108,19 @@ impl Repository {
         Ok(list)
     }
 
+    /// The last `limit` jobs that ended without a delivery (FAILED, in
+    /// review, or waiting for a manual download), newest first: the
+    /// diagnostics package (P13.8).
+    pub fn recent_failed_jobs(&self, limit: usize) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM queue WHERE status IN ('FAILED','REQUIRES_REVIEW','MANUAL_DOWNLOAD')
+             ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::map_job_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn get_jobs_by_journalist(&self, journalist: &str) -> Result<Vec<Job>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT * FROM queue WHERE journalist = ? ORDER BY created_at DESC")?;
