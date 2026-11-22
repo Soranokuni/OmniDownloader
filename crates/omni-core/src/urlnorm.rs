@@ -136,11 +136,20 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
         }
         "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" => {
             *host = "www.youtube.com".into();
-            // /shorts/ID and /live/ID and /embed/ID are all /watch?v=ID.
+            // /shorts/ID and /live/ID and /embed/ID are all /watch?v=ID. Two embed
+            // names are not videos (P14.8): `videoseries` is the playlist in `list`
+            // (every playlist embed was one key, `watch?v=videoseries`), and
+            // `live_stream` is a channel's live stream; neither is a `v`.
             for prefix in ["/shorts/", "/live/", "/embed/", "/v/"] {
                 if let Some(id) = path.strip_prefix(prefix) {
                     let id = id.split('/').next().unwrap_or("").to_string();
-                    if !id.is_empty() {
+                    if prefix == "/embed/" && id == "videoseries" {
+                        if params.contains_key("list") {
+                            *path = "/playlist".into();
+                        }
+                    } else if prefix == "/embed/" && id == "live_stream" {
+                        // Left as it is: the channel parameter names the stream.
+                    } else if !id.is_empty() {
                         *path = "/watch".into();
                         params.insert("v".into(), id);
                     }
@@ -151,7 +160,13 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             if path == "/watch" {
                 params.retain(|k, _| k == "v");
             }
+            // A playlist is its list.
+            if path == "/playlist" {
+                params.retain(|k, _| k == "list");
+            }
         }
+        "instagram.com" | "m.instagram.com" => *host = "www.instagram.com".into(),
+        "tiktok.com" => *host = "www.tiktok.com".into(),
         // X and Twitter are one service; journalists send both.
         "twitter.com" | "www.twitter.com" | "mobile.twitter.com" | "www.x.com" | "mobile.x.com" => {
             *host = "x.com".into();
@@ -188,6 +203,55 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
                 params.clear();
             }
         }
+    }
+
+    // P14.8: one key per video on Facebook, Instagram and TikTok. Only shapes
+    // that certainly name the same video are merged; the rest lose the share
+    // link's tracking query and keep their path.
+    let segs: Vec<String> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match host.as_str() {
+        "www.facebook.com" => {
+            // /watch?v=N, /watch/?v=N and /video.php?v=N are one video.
+            if matches!(segs.as_slice(), [w] if w == "watch" || w == "video.php") && params.get("v").is_some_and(|v| digits(v)) {
+                *path = "/watch".into();
+                params.retain(|k, _| k == "v");
+            // /{page}/videos/N and /{page}/videos/{title}/N are the same video N.
+            } else if let Some(id) = segs.iter().position(|s| s == "videos").filter(|&i| i == 1).and_then(|_| segs.last().filter(|s| digits(s))) {
+                *path = "/watch".into();
+                params.clear();
+                params.insert("v".into(), id.clone());
+            } else if matches!(segs.first().map(String::as_str), Some("reel" | "share")) {
+                params.clear();
+            }
+        }
+        "www.instagram.com" => {
+            // A post, a reel or an IGTV video by its shortcode, with or without
+            // the account's name in front, is /p/{shortcode}.
+            let at = match segs.as_slice() {
+                [kind, code, ..] if matches!(kind.as_str(), "p" | "reel" | "reels" | "tv") => Some(code.clone()),
+                [_, kind, code, ..] if matches!(kind.as_str(), "p" | "reel" | "reels" | "tv") => Some(code.clone()),
+                _ => None,
+            };
+            if let Some(code) = at {
+                *path = format!("/p/{code}");
+                params.clear();
+            }
+        }
+        "www.tiktok.com" => {
+            // /@{account}/video/N: the account is decoration, as on X; the old
+            // mobile /v/N.html is the same video.
+            let id = match segs.as_slice() {
+                [_, kind, id, ..] if kind == "video" && digits(id) => Some(id.clone()),
+                [v, file] if v == "v" => file.strip_suffix(".html").filter(|s| digits(s)).map(str::to_string),
+                _ => None,
+            };
+            if let Some(id) = id {
+                *path = format!("/video/{id}");
+                params.clear();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -390,9 +454,31 @@ mod tests {
             // Not a post: left alone.
             ("https://x.com/NewsDeskOne", "https://x.com/NewsDeskOne"),
 
+            // --- YouTube embeds that are not one video (P14.8) ---
+            ("https://www.youtube.com/embed/videoseries?list=PLabc123&index=2", "https://www.youtube.com/playlist?list=PLabc123"),
+            ("https://www.youtube.com/playlist?list=PLabc123&si=x", "https://www.youtube.com/playlist?list=PLabc123"),
+            ("https://www.youtube.com/embed/live_stream?channel=UCxyz", "https://www.youtube.com/embed/live_stream?channel=UCxyz"),
+
             // --- Facebook / TikTok ---
             ("https://m.facebook.com/watch?v=99", "https://www.facebook.com/watch?v=99"),
             ("https://vm.tiktok.com/ZMabc/", "https://www.tiktok.com/ZMabc"),
+            // One Facebook video, every shape (P14.8).
+            ("https://www.facebook.com/watch/?v=99&mibextid=abc", "https://www.facebook.com/watch?v=99"),
+            ("https://web.facebook.com/video.php?v=99", "https://www.facebook.com/watch?v=99"),
+            ("https://www.facebook.com/NewsPage/videos/99/?__cft__=x&__tn__=y", "https://www.facebook.com/watch?v=99"),
+            ("https://facebook.com/NewsPage/videos/storm-in-the-port/99/", "https://www.facebook.com/watch?v=99"),
+            ("https://www.facebook.com/reel/123?mibextid=abc&rdid=x", "https://www.facebook.com/reel/123"),
+            ("https://www.facebook.com/share/v/AbC12/?mibextid=xyz", "https://www.facebook.com/share/v/AbC12"),
+            // Instagram: post, reel and IGTV by shortcode, with or without the account.
+            ("https://www.instagram.com/reel/CxYz123/?igsh=abc", "https://www.instagram.com/p/CxYz123"),
+            ("https://instagram.com/p/CxYz123/?img_index=1", "https://www.instagram.com/p/CxYz123"),
+            ("https://m.instagram.com/newsdesk/reel/CxYz123/", "https://www.instagram.com/p/CxYz123"),
+            ("https://www.instagram.com/tv/CxYz123", "https://www.instagram.com/p/CxYz123"),
+            ("https://www.instagram.com/newsdesk/", "https://www.instagram.com/newsdesk"),
+            // TikTok: the account in front of the id is decoration.
+            ("https://www.tiktok.com/@newsdesk/video/7301234567890?is_from_webapp=1&sender_device=pc", "https://www.tiktok.com/video/7301234567890"),
+            ("https://tiktok.com/@other.account/video/7301234567890", "https://www.tiktok.com/video/7301234567890"),
+            ("https://m.tiktok.com/v/7301234567890.html", "https://www.tiktok.com/video/7301234567890"),
 
             // --- News portals: tracking and AMP ---
             ("https://www.lifo.gr/now/sport/story?utm_source=newsletter&utm_medium=email",
@@ -448,6 +534,19 @@ mod tests {
             normalize("https://www.lifo.gr/now/story"),
             normalize("https://www.newsit.gr/now/story")
         );
+
+        // P14.8: two playlists, two Facebook videos, two reels, two posts, two TikToks.
+        assert_ne!(
+            normalize("https://www.youtube.com/embed/videoseries?list=PLone"),
+            normalize("https://www.youtube.com/embed/videoseries?list=PLtwo")
+        );
+        assert_ne!(normalize("https://www.facebook.com/watch/?v=1"), normalize("https://www.facebook.com/watch/?v=2"));
+        assert_ne!(normalize("https://www.facebook.com/Page/videos/1"), normalize("https://www.facebook.com/Page/videos/2"));
+        assert_ne!(normalize("https://www.facebook.com/reel/1"), normalize("https://www.facebook.com/reel/2"));
+        assert_ne!(normalize("https://www.instagram.com/reel/AAA"), normalize("https://www.instagram.com/reel/BBB"));
+        assert_ne!(normalize("https://www.tiktok.com/@a/video/1"), normalize("https://www.tiktok.com/@a/video/2"));
+        // A Facebook page's video list is not one of its videos.
+        assert_ne!(normalize("https://www.facebook.com/Page/videos"), normalize("https://www.facebook.com/watch?v=1"));
     }
 
     #[test]
