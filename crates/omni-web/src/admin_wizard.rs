@@ -12,6 +12,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use omni_core::models::{Job, JobStatus, NewJob};
+use omni_core::repository::NewJournalist;
 
 use crate::admin_roster;
 use crate::auth::{internal_error, ApiError, RequireAdmin};
@@ -26,9 +27,15 @@ const TEST_JOURNALIST: &str = "MCR";
 const TEST_KEYWORD: &str = "OMNIINGEST_TEST";
 const TEST_NOTE: &str = "Δοκιμαστική λήψη του οδηγού εγκατάστασης";
 
-/// Whether `job` is a wizard test download.
+/// Whether `job` is a wizard test download: by its marker (journalist,
+/// keyword and note), not its slug, which an article with several videos
+/// renames `1A_…` (P13.4b). A sibling job made from the test page is not
+/// the test job.
 pub fn is_test_job(job: &Job) -> bool {
-    job.slug == TEST_SLUG && job.journalist == TEST_JOURNALIST
+    job.journalist == TEST_JOURNALIST
+        && job.keyword == TEST_KEYWORD
+        && job.notes.as_deref() == Some(TEST_NOTE)
+        && job.parent_job_id.is_none()
 }
 
 /// Whether `job` proves that a video reaches the watchfolder: a test job,
@@ -154,15 +161,28 @@ pub async fn api_admin_import_journalists(
         .into_iter()
         .map(|j| (j.surname, j.emails))
         .collect();
-    let plan = admin_roster::plan(rows, problems, &existing);
+    let mut plan = admin_roster::plan(rows, problems, &existing);
     if !p.dry_run && !plan.add.is_empty() {
         state.repo.backup_taxonomy("before-import").map_err(internal_error("Could not keep a copy of the list; nothing was imported."))?;
-        for row in &plan.add {
-            state
+        // Insert-only, checked again row by row (P13.4b): someone saved on the
+        // desk since the list above was read is never overwritten.
+        let mut added = Vec::new();
+        for row in std::mem::take(&mut plan.add) {
+            match state
                 .repo
-                .save_journalist(&row.surname, &row.full_name, &row.emails, 0)
-                .map_err(internal_error("Could not save a journalist; the copy of the list made before the import is in data/backups/taxonomy."))?;
+                .add_new_journalist(&row.surname, &row.full_name, &row.emails)
+                .map_err(internal_error("Could not save a journalist; the copy of the list made before the import is in data/backups/taxonomy."))?
+            {
+                NewJournalist::Added => added.push(row),
+                NewJournalist::AlreadyListed => plan.existing.push(row),
+                NewJournalist::AddressTaken { address, surname } => plan.problems.push(admin_roster::RosterProblem {
+                    line: row.line,
+                    message: format!("{address} already belongs to {surname} on the list."),
+                }),
+            }
         }
+        plan.problems.sort_by_key(|p| p.line);
+        plan.add = added;
         let _ = state.repo.log_audit("INFO", "ADMIN", &format!("{} journalist(s) imported by {} (setup)", plan.add.len(), admin.email));
     }
     Ok(Json(serde_json::json!({

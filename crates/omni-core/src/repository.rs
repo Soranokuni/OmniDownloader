@@ -81,6 +81,16 @@ pub enum AddressAdded {
     Full,
 }
 
+/// What [`Repository::add_new_journalist`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewJournalist {
+    Added,
+    /// The surname is on the list already: nothing changed.
+    AlreadyListed,
+    /// `address` belongs to the journalist `surname`: nothing changed.
+    AddressTaken { address: String, surname: String },
+}
+
 /// The finished jobs retention may delete: terminal, past the cutoff (?1), not held (?2 = batch).
 pub const PURGE_JOB_IDS_SQL: &str = "SELECT id FROM queue
      WHERE status IN ('COMPLETED','COMPLETED_MANUAL','FAILED','REQUIRES_REVIEW','MANUAL_DOWNLOAD','CANCELLED')
@@ -4881,6 +4891,38 @@ impl Repository {
         )?;
         tx.commit()?;
         Ok(AddressAdded::Added)
+    }
+
+    /// Add a journalist who is not on the list (P13.4b, the wizard's import):
+    /// never changes one who is, and refuses an address that belongs to
+    /// someone else. The check and the insert are one transaction, so a save
+    /// on the desk between an import's preview and the import is kept.
+    pub fn add_new_journalist(&self, surname: &str, full_name: &str, emails: &[String]) -> Result<NewJournalist> {
+        let surname = surname.trim().to_uppercase();
+        let emails: Vec<String> = emails.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT surname, emails FROM journalists ORDER BY surname")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if rows.iter().any(|(who, _)| *who == surname) {
+            return Ok(NewJournalist::AlreadyListed);
+        }
+        for (who, raw) in &rows {
+            let theirs: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+            if let Some(address) = emails.iter().find(|e| theirs.iter().any(|t| t.trim().to_lowercase() == **e)) {
+                return Ok(NewJournalist::AddressTaken { address: address.clone(), surname: who.clone() });
+            }
+        }
+        let n = tx.execute(
+            "INSERT INTO journalists (surname, full_name, emails, default_priority) VALUES (?, ?, ?, 0)
+             ON CONFLICT(surname) DO NOTHING",
+            params![surname, full_name, serde_json::to_string(&emails)?],
+        )?;
+        tx.commit()?;
+        Ok(if n == 1 { NewJournalist::Added } else { NewJournalist::AlreadyListed })
     }
 
     pub fn delete_journalist(&self, surname: &str) -> Result<()> {

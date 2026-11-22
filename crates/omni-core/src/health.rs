@@ -156,6 +156,8 @@ pub mod checks {
     pub const ARCHIVE: &str = "archive";
     /// Job runs that hit an internal error (a panic) in the last 24 h (P11.8).
     pub const WORKERS: &str = "workers";
+    /// config.json has keys no setting reads, or values read differently (P13.4b).
+    pub const CONFIG: &str = "config";
 }
 
 impl Default for HealthState {

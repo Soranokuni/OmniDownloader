@@ -620,7 +620,11 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
         if (gen !== T.poll || S.step !== 'testdl' || !T.jobId) return;
         let r;
         try { r = await api(`/api/admin/setup/test-download/${T.jobId}`); } catch (err) {
-          status.className = 'note bad'; status.textContent = err.message; return;
+          // P13.4b: a lost answer (a restart, the network) is not the end of the test.
+          if (gen !== T.poll) return;
+          status.className = 'note warn'; status.textContent = `«Επανασύνδεση…» (${err.message})`;
+          setTimeout(() => poll(gen), 3000);
+          return;
         }
         if (gen !== T.poll) return;
         T.status = r;

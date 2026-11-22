@@ -287,10 +287,118 @@ pub fn fatal(c: &AppConfig) -> Vec<Problem> {
     out
 }
 
+/// A key config.json has that no setting reads (P13.4b): ignored, usually a typo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    /// `watchfoldr_path`, `graph.mailbx`.
+    pub key: String,
+    /// The known key it most resembles, if any is close.
+    pub closest: Option<String>,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.closest {
+            Some(c) => write!(f, "`{}` is not a setting and is ignored. Fix: did you mean `{c}`? Rename it, or remove it.", self.key),
+            None => write!(f, "`{}` is not a setting and is ignored. Fix: remove it (config.example.json lists every key).", self.key),
+        }
+    }
+}
+
+/// Keys read but not written back, or kept for the warnings they give.
+const KNOWN_EXTRA: &[&str] = &["email_password", "auth_mode", "system_prompt", "graph.client_secret_expires"];
+
+/// Edit distance, for the closest known name.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+fn closest<'a>(key: &str, known: impl Iterator<Item = &'a String>) -> Option<String> {
+    let limit = (key.chars().count() / 3).max(2);
+    known.map(|k| (distance(key, k), k)).filter(|(d, _)| *d <= limit).min_by_key(|(d, _)| *d).map(|(_, k)| k.clone())
+}
+
+/// The keys of `doc` (top level, and one level into each section) that no
+/// setting reads, with the closest known name. `_comment` keys are notes.
+/// v1 keys count as known: they are read through [`migrate_v1`].
+pub fn unknown_keys(doc: &Value) -> Vec<UnknownKey> {
+    let mut doc = doc.clone();
+    migrate_v1(&mut doc);
+    let Some(top) = doc.as_object() else { return Vec::new() };
+    let defaults = serde_json::to_value(AppConfig::default()).unwrap_or(Value::Null);
+    let Some(known_top) = defaults.as_object() else { return Vec::new() };
+    let extra = |key: &str| KNOWN_EXTRA.contains(&key) || key == "_comment";
+    let mut out = Vec::new();
+    for (key, value) in top {
+        if extra(key) {
+            continue;
+        }
+        let Some(default) = known_top.get(key) else {
+            out.push(UnknownKey { key: key.clone(), closest: closest(key, known_top.keys()) });
+            continue;
+        };
+        if let (Some(section), Some(known)) = (value.as_object(), default.as_object()) {
+            for inner in section.keys() {
+                let full = format!("{key}.{inner}");
+                if !known.contains_key(inner) && !extra(inner) && !extra(&full) {
+                    let near = closest(inner, known.keys()).map(|c| format!("{key}.{c}"));
+                    out.push(UnknownKey { key: full, closest: near });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+/// [`unknown_keys`] of the file at `path`; empty when it cannot be read.
+pub fn unknown_keys_in_file(path: &Path) -> Vec<UnknownKey> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .map(|d| unknown_keys(&d))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_unknown_key_is_named_with_the_closest_known_one() {
+        let doc = json!({
+            "watchfoldr_path": "\\\\nas-test\\ingest",
+            "graph": { "mailbx": "ingest@station.example", "tenant_id": "t", "client_secret_expires": "2027-01-01", "_comment": "note" },
+            "security": { "mcr_open_networks": [] },
+            "completely_unrelated_setting": 1,
+            "ollama_endpoint": "http://127.0.0.1:1234/v1",
+            "email_password": "",
+            "_comment": "note",
+        });
+        let u = unknown_keys(&doc);
+        let named: Vec<(&str, Option<&str>)> = u.iter().map(|k| (k.key.as_str(), k.closest.as_deref())).collect();
+        assert_eq!(
+            named,
+            [("completely_unrelated_setting", None), ("graph.mailbx", Some("graph.mailbox")), ("watchfoldr_path", Some("watchfolder_path"))],
+            "{u:?}"
+        );
+        assert!(u[2].to_string().contains("did you mean `watchfolder_path`"), "{}", u[2]);
+        assert!(unknown_keys(&serde_json::to_value(AppConfig::default()).unwrap()).is_empty(), "every written key is known");
+        let example: Value = serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+        assert!(unknown_keys(&example).is_empty(), "{:?}", unknown_keys(&example));
+    }
 
     #[test]
     fn v1_keys_move_into_their_sections_and_imap_keys_are_dropped() {

@@ -1164,8 +1164,15 @@ async fn run_daemon(
         let lines: Vec<String> = fatal.iter().map(|p| p.to_string()).collect();
         anyhow::bail!("config.json cannot be used: {}", lines.join(" "));
     }
+    // What is ignored or read differently: logged now, and the `config` health line (P13.4b).
+    let mut config_notes: Vec<String> = Vec::new();
     for p in omni_core::config_v2::problems(&config) {
         warn!("config.json: {p}");
+        config_notes.push(p.to_string());
+    }
+    for u in omni_core::config_v2::unknown_keys_in_file(&config_path) {
+        warn!("config.json: {u}");
+        config_notes.push(u.to_string());
     }
 
     // Secrets live in an encrypted store, not in config.json (plan P2.6).
@@ -1434,6 +1441,14 @@ async fn run_daemon(
 
     // Live subsystem health, shared with the web panels (plan P6.2, W-09).
     let health = HealthState::new();
+    health.set(
+        omni_core::health::checks::CONFIG,
+        if config_notes.is_empty() {
+            omni_core::health::Check::ok("every key in config.json is read as written")
+        } else {
+            omni_core::health::Check::degraded(config_notes.join(" "))
+        },
+    );
 
     // Everything the self-test finds used to surface as a *job* failure,
     // attributed to whatever link happened to be at the front of the queue —

@@ -573,7 +573,9 @@ wrong kind, a `web_port` of 0 or an empty `watchfolder_path`. A value outside
 the range the service reads it in (concurrent downloads 1–10, concurrent
 encodes 1–8, `mail.poll_interval_secs` 10–3600, `retry.max_age_mins`
 30–360, `pacing.per_host_concurrency` 1–4, `pacing.min_gap_secs` 0–120) is
-logged at start with the value actually used.
+logged at start with the value actually used. A key no setting reads (a typo
+such as `watchfoldr_path`) is ignored, and logged at start with the closest
+known key (`watchfolder_path`); both turn the `config` health line amber.
 
 ### 5.1 Network and sign-in (`security`)
 
@@ -889,6 +891,7 @@ Green = ok, amber = degraded, red = down.
 | `cookies` | a jar failed its test or expires within 7 days |
 | `lockdown` | the `data` and `temp` folders are not restricted to SYSTEM, Administrators and the service account |
 | `archive` | the archive disk is low |
+| `config` | `config.json` has a key no setting reads (amber; usually a typo, named with the closest known key, e.g. `watchfoldr_path` → `watchfolder_path`), or a value outside the range the service reads it in (§5). Correct the file and restart the service |
 | `workers` | a job run hit an internal error in the last 24 hours (amber). Before delivery the job goes back to the queue once (after 30 s), then to review; during delivery it is never queued again: it is finished as delivered when its file is in the watchfolder, otherwise it goes to review with `DELIVERY_UNCONFIRMED`. If it repeats, send `logs\` to support |
 
 ---

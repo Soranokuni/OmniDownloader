@@ -759,6 +759,109 @@ async fn only_a_test_job_the_pipeline_delivered_proves_the_setup() -> Result<()>
     Ok(())
 }
 
+// ---- P13.4b ----
+
+/// A test job as the wizard makes it, with `slug` (an article renames `1_` to `1A_`).
+fn test_job(app: &App, url: &str, slug: &str, parent: Option<i64>) -> Result<i64> {
+    let mut j = omni_core::models::NewJob::new(url, slug, "MCR");
+    j.keyword = "OMNIINGEST_TEST".into();
+    j.notes = Some("Δοκιμαστική λήψη του οδηγού εγκατάστασης".into());
+    j.parent_job_id = parent;
+    Ok(app.repo.enqueue(&j, 0)?.job_id())
+}
+
+#[tokio::test]
+async fn a_completed_test_job_with_no_delivered_file_proves_nothing() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
+    let id = r.json()["job_id"].as_i64().unwrap();
+    assert_eq!(app.repo.lease_job(WORKER, 3600)?.unwrap().id, id);
+    // Finished COMPLETED (delivered_at is set) but no file was ever recorded.
+    assert!(app.repo.finish(id, WORKER, omni_core::models::JobStatus::Completed, None, None, None)?);
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": id}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    let s = send(&app, "GET", &format!("/api/admin/setup/test-download/{id}"), Some(&tok), None).await;
+    assert_eq!(s.json()["delivered"].as_bool(), Some(false), "{}", s.body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_test_link_is_refused_while_a_newsroom_job_has_it() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let url = omni_core::config::DEFAULT_SETUP_TEST_URL;
+    let newsroom = app.repo.enqueue(&omni_core::models::NewJob::new(url, "1_PAPADAKI_ZOO", "PAPADAKI"), 24)?.job_id();
+    let r = send(&app, "POST", "/api/admin/setup/test-download", Some(&tok), Some(json!({}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains(&format!("job #{newsroom}")), "{}", r.body);
+    let job = app.repo.get_job(newsroom)?.unwrap();
+    assert_eq!((job.slug.as_str(), job.journalist.as_str()), ("1_PAPADAKI_ZOO", "PAPADAKI"), "the newsroom job is untouched");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_test_job_renamed_by_an_article_still_proves_and_its_sibling_does_not() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let renamed = test_job(&app, "https://news.example/article-test", "1A_MCR_OMNIINGEST_TEST", None)?;
+    deliver(&app, renamed, "watchfolder/1A_MCR_OMNIINGEST_TEST.mxf")?;
+    let sibling = test_job(&app, "https://video.example/v/sibling-test", "1B_MCR_OMNIINGEST_TEST", Some(renamed))?;
+    deliver(&app, sibling, "watchfolder/1B_MCR_OMNIINGEST_TEST.mxf")?;
+
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": sibling}))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "a sibling is not the test: {}", r.body);
+    let s = send(&app, "GET", &format!("/api/admin/setup/test-download/{renamed}"), Some(&tok), None).await;
+    assert_eq!(s.json()["file_name"].as_str(), Some("1A_MCR_OMNIINGEST_TEST.mxf"), "{}", s.body);
+    let r = send(&app, "POST", "/api/admin/settings/complete", Some(&tok), Some(json!({"mode": "beginner", "test_job_id": renamed}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    Ok(())
+}
+
+/// The race itself: the import planned to add NEOS from its snapshot; the
+/// desk saved NEOS (and gave an address away) before the insert. The insert
+/// adds nothing and changes nobody.
+#[test]
+fn the_import_insert_never_overwrites_a_person_saved_after_its_snapshot() -> Result<()> {
+    use omni_core::repository::NewJournalist;
+    let app = app(false)?;
+    app.repo.save_journalist("NEOS", "Neos (desk)", &["desk@news.example".to_string()], 7)?;
+    app.repo.save_journalist("TRITOS", "Tritos", &["allos@news.example".to_string()], 0)?;
+
+    let r = app.repo.add_new_journalist("neos", "Neos Testakis", &["neos@news.example".to_string()])?;
+    assert_eq!(r, NewJournalist::AlreadyListed);
+    let r = app.repo.add_new_journalist("ALLOS", "Allos", &["Allos@News.example".to_string()])?;
+    assert_eq!(r, NewJournalist::AddressTaken { address: "allos@news.example".into(), surname: "TRITOS".into() });
+    let people = app.repo.list_journalists()?;
+    let neos = people.iter().find(|j| j.surname == "NEOS").unwrap();
+    assert_eq!((neos.full_name.as_str(), neos.emails.clone(), neos.default_priority), ("Neos (desk)", vec!["desk@news.example".to_string()], 7));
+    assert!(people.iter().all(|j| j.surname != "ALLOS"));
+
+    assert_eq!(app.repo.add_new_journalist("PEMPTOS", "Pemptos", &["pemptos@news.example".to_string()])?, NewJournalist::Added);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_person_saved_on_the_desk_between_preview_and_import_is_not_changed() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let text = "NEOS\tNeos Testakis\tneos@news.example\nALLOS\tAllos Testakis\tallos@news.example\n";
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": text, "dry_run": true}))).await;
+    assert_eq!(r.json()["add"].as_array().map(|a| a.len()), Some(2), "{}", r.body);
+
+    // Meanwhile on the desk: NEOS saved with other details, and ALLOS's address given to someone else.
+    app.repo.save_journalist("NEOS", "Neos (desk)", &["desk@news.example".to_string()], 7)?;
+    app.repo.save_journalist("TRITOS", "Tritos", &["allos@news.example".to_string()], 0)?;
+
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": text}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let people = app.repo.list_journalists()?;
+    let neos = people.iter().find(|j| j.surname == "NEOS").unwrap();
+    assert_eq!((neos.full_name.as_str(), neos.emails.clone(), neos.default_priority), ("Neos (desk)", vec!["desk@news.example".to_string()], 7));
+    assert!(people.iter().all(|j| j.surname != "ALLOS"), "an address that is someone else's now is refused");
+    Ok(())
+}
+
 #[tokio::test]
 async fn pasted_journalists_are_previewed_then_added_and_people_on_the_list_are_kept() -> Result<()> {
     let app = app(false)?;
