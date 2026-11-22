@@ -110,7 +110,7 @@ async function loadHealth() {
 
   const needs = [];
   if (settings && settings.setup_completed === false) {
-    needs.push(['settings', 'Setup is not finished: run the wizard to the test download from the Setup card.']);
+    needs.push(['wizard', 'Setup is not finished: the wizard ends with a test download that reaches the watchfolder (or an explicit skip).']);
   }
   if (settings && settings.watchfolder_pending) {
     needs.push(['settings', `A new watchfolder waits for the videos being made now: ${settings.watchfolder_pending.path}.`]);
@@ -122,7 +122,10 @@ async function loadHealth() {
     ? el('p', { class: 'note ok' }, 'Nothing needs the administrator now.')
     : needs.map(([section, text]) => el('div', { class: 'row tight', style: 'justify-content:space-between' },
       el('span', {}, text),
-      el('button', { class: 'btn', type: 'button', onclick: () => { location.hash = section; } }, SECTION_NAME[section] || section))));
+      section === 'wizard'
+        // Back into the wizard (P13.5b): the page shows it again while setup is unfinished.
+        ? el('button', { class: 'btn btn-primary', type: 'button', onclick: () => { sessionStorage.removeItem('omni.setup.leave'); location.reload(); } }, 'Continue the setup wizard')
+        : el('button', { class: 'btn', type: 'button', onclick: () => { location.hash = section; } }, SECTION_NAME[section] || section))));
 }
 
 /* ------------------------------------------------------------------ *

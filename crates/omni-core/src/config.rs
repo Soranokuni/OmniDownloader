@@ -1144,6 +1144,20 @@ fn warn_on_removed_auth_mode(raw: &str, path: &Path) {
 }
 
 impl AppConfig {
+    /// A brand-new installation (its database was just created, with the
+    /// first-run account) always starts with setup pending (P13.5b), whatever
+    /// config.json says: a hand-made or copied config.json without the key
+    /// reads as completed (the rule for upgrades), and must not skip the
+    /// wizard's test download. Returns whether it changed anything; the caller
+    /// saves. Setup becomes complete only through the wizard's Finish or Skip.
+    pub fn pending_setup_for_new_installation(&mut self, brand_new_database: bool) -> bool {
+        if brand_new_database && self.setup_completed {
+            self.setup_completed = false;
+            return true;
+        }
+        false
+    }
+
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref();
         if p.exists() {
@@ -1296,6 +1310,21 @@ mod tests {
         std::fs::create_dir(dir.path().join(format!(".config.json.{}.tmp", std::process::id()))).unwrap();
         assert!(write_replacing(&path, b"{ half").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// P13.5b: a config.json without the key reads as completed (an upgrade),
+    /// but on a brand-new installation setup is pending all the same.
+    #[test]
+    fn a_new_installation_starts_with_setup_pending_whatever_config_json_says() {
+        let mut copied: AppConfig = serde_json::from_str(r#"{ "web_port": 8085 }"#).unwrap();
+        assert!(copied.setup_completed, "the upgrade rule");
+        assert!(copied.pending_setup_for_new_installation(true));
+        assert!(!copied.setup_completed);
+        assert!(!copied.pending_setup_for_new_installation(true), "once");
+
+        let mut used: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!used.pending_setup_for_new_installation(false), "an installation in use keeps what it has");
+        assert!(used.setup_completed);
     }
 
     #[test]

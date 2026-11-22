@@ -84,7 +84,7 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 
 // One URL per module; each is imported once, when its section is first opened.
 const MODULES = {
-  overview: () => import('/static/admin-overview.js?v=1'),
+  overview: () => import('/static/admin-overview.js?v=2'),
   settings: () => import('/static/admin-settings.js?v=1'),
   people: () => import('/static/admin-people.js?v=1'),
   sites: () => import('/static/admin-sites.js?v=1'),

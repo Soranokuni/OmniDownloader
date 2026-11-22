@@ -1155,3 +1155,19 @@ async fn the_operation_form_saves_in_range_values_and_names_a_bad_one() -> Resul
     assert_eq!(AppConfig::load_from_file(app.dir.path().join("config.json"))?.max_concurrent_transcodes, 2, "nothing saved");
     Ok(())
 }
+
+// ---- P13.5b: leaving the wizard after the account step leaves setup unfinished ----
+
+#[tokio::test]
+async fn creating_the_admin_does_not_complete_setup() -> Result<()> {
+    let app = app(true)?;
+    let old = session_for(&app, "admin");
+    let r = send(&app, "POST", "/api/setup/wizard/account", Some(&old), Some(account("station.admin", "a-long-passphrase-1"))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let new = token_of(&r);
+    // The wizard was left here («Open the admin panel»): no /settings/complete.
+    let s = send(&app, "GET", "/api/admin/settings", Some(&new), None).await;
+    assert_eq!(s.json()["setup_completed"], false, "{}", s.body);
+    assert!(!AppConfig::load_from_file(app.dir.path().join("config.json"))?.setup_completed);
+    Ok(())
+}
