@@ -288,16 +288,32 @@ fn an_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it(
     let main = include_str!("main.rs");
     let update = &main[main.find("async fn nightly_ytdl_update(").unwrap()..];
     let update = &update[..update.find("\n}").unwrap()];
+    // Every needle at a line's start, so a commented-out call does not count (P11.7b2).
     let at = |s: &str| update.find(s).unwrap_or_else(|| panic!("{s} missing"));
-    let (mark, apply) = (at("dep_mgr.mark_ytdl_verifying(&staged.sha256)"), at("dep_mgr.apply_staged_ytdl()"));
-    let verdict = at("let verdict = verify_ytdl_update(");
-    // At a line's start, so a commented-out call does not count.
-    let clear = verdict + update[verdict..].find("\n    dep_mgr.clear_ytdl_verifying();").expect("cleared after the verdict");
-    let unlock = at("drop(swap);");
+    let mark = at("\n        if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {");
+    let apply = at("\n        match dep_mgr.apply_staged_ytdl() {");
+    let verdict = at("\n    let verdict = verify_ytdl_update(");
+    let clear = verdict + update[verdict..].find("\n    if let Err(e) = dep_mgr.clear_ytdl_verifying() {").expect("cleared after the verdict");
+    let unlock = at("\n    drop(swap);");
     assert!(mark < apply, "the marker is written before the swap");
     assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
-    let start = main.find("report_unverified_ytdl(&repo, dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
+    // A marker that could not be cleared is audited, not only logged (P11.7b2).
+    assert!(update[clear..unlock].contains("\n        let _ = repo.log_audit(\n            \"ERROR\","), "the failed clear is audited");
+    let start = main.find("\n    report_unverified_ytdl(&repo, dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
     assert!(start < main.find("ensure_ytdl_folder_build(&dep_mgr,").unwrap(), "before the tools are resolved");
+}
+
+/// P11.7b2: a staged release that is already live is left alone, unless the
+/// live build still waits for its verdict: then it is verified as it stands.
+#[test]
+fn a_live_release_still_waiting_for_its_verdict_is_verified_not_skipped() {
+    use crate::{staged_release_action as act, StagedRelease::*};
+    assert_eq!(act(Some("bbb"), "bbb", None), AlreadyLatest);
+    assert_eq!(act(Some("bbb"), "bbb", Some("aaa")), AlreadyLatest, "a stale marker for another build");
+    assert_eq!(act(Some("bbb"), "bbb", Some("bbb")), Reverify);
+    assert_eq!(act(Some("aaa"), "bbb", None), Install);
+    assert_eq!(act(Some("aaa"), "bbb", Some("bbb")), Install, "not live yet: swapped in and verified");
+    assert_eq!(act(None, "bbb", None), Install);
 }
 
 /// The worker notes an extraction failure only for a job that ended for good

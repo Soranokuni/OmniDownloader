@@ -248,8 +248,8 @@ fn a_live_stream_past_the_age_limit_goes_to_review_at_once() {
     r.fail_like_run_job(id, &every_video_is_live(&r.repo, id).unwrap());
     let job = r.row(id);
     assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("LIVE_STREAM")));
-    // Never checked again as live: its own plain hint, not the «after all the checks» text (P11.7b).
-    assert_eq!(failure_errors(&r, id), vec![ErrorCode::LiveStream.hint_el().to_string()]);
+    // Never checked again as live: the exhausted text, never the «wait» hint (P11.7b2).
+    assert_eq!(failure_errors(&r, id), vec![omni_broadcast::errors::exhausted_hint_el(1)]);
 }
 
 /// The job's ERROR lines about its failure: every one but the repository's

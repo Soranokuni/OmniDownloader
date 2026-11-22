@@ -2246,13 +2246,25 @@ async fn nightly_ytdl_update(
         return UpdateRun::new(TaskOutcome::Skipped, "rolled back before");
     }
     // Live and also the release: nothing to do. (The download is still made,
-    // to know; it is a few seconds at 03:00.)
-    if dep_mgr.ytdl_live_sha256().as_deref() == Some(staged.sha256.as_str()) {
+    // to know; it is a few seconds at 03:00.) Unless that live build still waits
+    // for its verdict (a start-up rollback of it failed, P11.7b2): then it is
+    // verified now, as if just swapped in.
+    let release = staged_release_action(
+        dep_mgr.ytdl_live_sha256().as_deref(),
+        &staged.sha256,
+        dep_mgr.ytdl_verifying_sha256().as_deref(),
+    );
+    let reverify = release == StagedRelease::Reverify;
+    if release == StagedRelease::AlreadyLatest {
         dep_mgr.discard_staged_ytdl();
         info!("yt-dlp is already the latest release");
         // No update is waiting any more (P11.4).
         selfcheck::note_postponed(&dep_mgr.get_bin_dir(), false);
         return UpdateRun::new(TaskOutcome::Ok, "already the latest");
+    }
+    if reverify {
+        dep_mgr.discard_staged_ytdl();
+        warn!("yt-dlp: the live build was never verified; checking it now");
     }
 
     // At night up to ten minutes for in-flight downloads: longer than any sane
@@ -2271,20 +2283,27 @@ async fn nightly_ytdl_update(
         return UpdateRun::drain_postponed();
     }
 
-    // Until its verdict, the swapped build is unverified: a stop or crash before
-    // then rolls it back at the next start (P11.7b). No marker, no swap.
-    if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {
-        warn!("yt-dlp update postponed: the pending verdict could not be recorded: {e:#}");
-        return UpdateRun::new(TaskOutcome::Failed, "install failed");
-    }
-    let outcome = dep_mgr.apply_staged_ytdl();
-    let installed = match outcome {
-        Ok(path) => path,
-        Err(e) => {
-            dep_mgr.clear_ytdl_verifying();
-            warn!("Nightly yt-dlp update failed to install: {e:#}");
-            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+    let installed = if reverify {
+        // Already live, its marker already written.
+        dep_mgr.ytdl_live()
+    } else {
+        // Until its verdict, the swapped build is unverified: a stop or crash before
+        // then rolls it back at the next start (P11.7b). No marker, no swap.
+        if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {
+            warn!("yt-dlp update postponed: the pending verdict could not be recorded: {e:#}");
             return UpdateRun::new(TaskOutcome::Failed, "install failed");
+        }
+        match dep_mgr.apply_staged_ytdl() {
+            Ok(path) => path,
+            Err(e) => {
+                // Nothing was swapped in: a marker left behind only names a build that is not live.
+                if let Err(c) = dep_mgr.clear_ytdl_verifying() {
+                    warn!("{c:#}");
+                }
+                warn!("Nightly yt-dlp update failed to install: {e:#}");
+                let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+                return UpdateRun::new(TaskOutcome::Failed, "install failed");
+            }
         }
     };
 
@@ -2295,8 +2314,16 @@ async fn nightly_ytdl_update(
     // rejected. A link both fail is the site, not the update.
     let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer, ffmpeg).await;
     // The verdict is in (kept, rolled back, postponed, or unverified by a failed swap),
-    // recorded while the swap lock is still held (P11.7b).
-    dep_mgr.clear_ytdl_verifying();
+    // recorded while the swap lock is still held (P11.7b). A marker that stays would
+    // have the next start roll this build back as unverified (P11.7b2): said loudly.
+    if let Err(e) = dep_mgr.clear_ytdl_verifying() {
+        error!("yt-dlp update: the verdict was reached but its marker could not be removed: {e:#}");
+        let _ = repo.log_audit(
+            "ERROR",
+            "SYSTEM",
+            &format!("yt-dlp update: the verdict marker could not be removed ({e}); remove bin\\yt-dlp.exe.verifying by hand, or the next start rolls the build back"),
+        );
+    }
     drop(swap);
     let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
     if act.reject {
@@ -2319,6 +2346,28 @@ async fn nightly_ytdl_update(
     }
     ytdl_second_chance(repo, &act);
     UpdateRun::new(act.outcome, verdict_reason(&verdict))
+}
+
+/// What the yt-dlp update does with the release it staged (P11.7b2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedRelease {
+    /// The live build is the release and was judged: nothing to do.
+    AlreadyLatest,
+    /// The live build is the release but still waits for its verdict (its
+    /// start-up rollback failed): verify it as it stands.
+    Reverify,
+    /// Swap the release in and verify it.
+    Install,
+}
+
+/// [`StagedRelease`] for a live build with hash `live`, the staged release
+/// `staged`, and the pending-verdict marker's hash `verifying`.
+fn staged_release_action(live: Option<&str>, staged: &str, verifying: Option<&str>) -> StagedRelease {
+    match (live == Some(staged), verifying == Some(staged)) {
+        (true, true) => StagedRelease::Reverify,
+        (true, false) => StagedRelease::AlreadyLatest,
+        (false, _) => StagedRelease::Install,
+    }
 }
 
 /// The few words the maintenance panel shows for an early run's `verdict` (P11.4d).
@@ -2600,6 +2649,11 @@ fn report_unverified_ytdl(repo: &Repository, found: omni_core::dependencies::Unv
             );
             warn!("{msg}");
             let _ = repo.log_audit("WARN", "SYSTEM", &msg);
+        }
+        UnverifiedYtdl::SwapRepaired => {
+            let msg = "yt-dlp update was stopped in the middle of swapping builds; the previous build is back, and the next update run tries the release again";
+            warn!("{msg}");
+            let _ = repo.log_audit("WARN", "SYSTEM", msg);
         }
         UnverifiedYtdl::RollbackFailed(why) => {
             let msg = format!("yt-dlp update was stopped before its self-check finished, and the previous build could not be put back: {why}");

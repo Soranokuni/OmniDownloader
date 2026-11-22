@@ -386,7 +386,8 @@ pub fn exhausted_hint_el(attempts: i32) -> String {
 /// was re-queued as live (its history has a LIVE_STREAM retry, P11.7b; its
 /// `max_attempts` cannot tell, NETWORK and RATE_LIMITED give the same 5); one
 /// never checked again as live (past the age limit, or retried for another
-/// cause before) gets the code's own hint, which only says what it is.
+/// cause before) gets the exhausted text: nothing will check it again, so it
+/// must not say to wait (P11.7b2).
 pub fn stopped_hint_el(
     code: ErrorCode,
     attempts: i32,
@@ -396,7 +397,7 @@ pub fn stopped_hint_el(
 ) -> String {
     if code == ErrorCode::LiveStream {
         let checked_as_live = attempts > 1 && repo.was_requeued_with(job_id, code.as_str()).unwrap_or(false);
-        return if checked_as_live { LIVE_STREAM_EXHAUSTED_EL } else { code.hint_el() }.to_string();
+        return if checked_as_live { LIVE_STREAM_EXHAUSTED_EL.to_string() } else { exhausted_hint_el(attempts) };
     }
     let exhausted = exhausted_hint_el(attempts);
     if code == ErrorCode::RateLimited {
@@ -1309,13 +1310,15 @@ mod tests {
             "Η μετάδοση ήταν ακόμη ζωντανή (ή δεν είχε ξεκινήσει) σε όλους τους αυτόματους ελέγχους. Δοκιμάστε ξανά όταν ανέβει η εγγραφή, ή δώστε άλλον σύνδεσμο."
         );
         assert!(!LIVE_STREAM_EXHAUSTED_EL.chars().any(|ch| ch.is_ascii_digit()), "no number of hours");
-        // Never checked again as live (already past the age limit): its own plain hint.
-        assert_eq!(stopped_hint_el(c, 1, live + 100, yt, &repo), c.hint_el());
+        // Never checked again as live (already past the age limit): the exhausted text,
+        // never the «wait» hint, since nothing will check it again (P11.7b2).
+        assert_eq!(stopped_hint_el(c, 1, live + 100, yt, &repo), exhausted_hint_el(1));
         // P11.7b: retried for the network (the same max_attempts, 5, as a live row), then
         // found live past the age limit: it was never checked as live.
         let network = retried(2, ErrorCode::Network);
         assert_eq!(ErrorCode::Network.retry_max_attempts(), c.retry_max_attempts(), "max_attempts cannot tell them apart");
-        assert_eq!(stopped_hint_el(c, 3, network, yt, &repo), c.hint_el(), "not re-queued as live");
+        assert_eq!(stopped_hint_el(c, 3, network, yt, &repo), exhausted_hint_el(3), "not re-queued as live");
+        assert_ne!(exhausted_hint_el(3), c.hint_el());
         // The code omni-core's late rule names is this one.
         assert_eq!(c.as_str(), omni_core::models::LIVE_STREAM_CODE);
     }

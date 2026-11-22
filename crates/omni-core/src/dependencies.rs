@@ -591,12 +591,27 @@ impl DependencyManager {
         Ok(())
     }
 
-    /// The update's verdict is recorded (whatever it was): nothing is left to verify.
-    pub fn clear_ytdl_verifying(&self) {
+    /// The update's verdict is recorded (whatever it was): nothing is left to
+    /// verify. An error when the marker is there and stays (P11.7b2): left
+    /// behind a kept build, it would have the next start roll that build back.
+    pub fn clear_ytdl_verifying(&self) -> Result<()> {
         let marker = self.bin_dir.join(YTDL_VERIFYING_MARKER);
         match std::fs::remove_file(&marker) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!("Could not remove {marker:?}: {e}"),
-            _ => {}
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("Could not remove {marker:?}")),
+            _ => Ok(()),
+        }
+    }
+
+    /// The hash in the pending-verdict marker, if an update is waiting for one (P11.7b2).
+    pub fn ytdl_verifying_sha256(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.bin_dir.join(YTDL_VERIFYING_MARKER)).ok()?;
+        Some(text.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    /// [`Self::clear_ytdl_verifying`] where a failure is only worth a warning.
+    fn clear_ytdl_verifying_or_warn(&self) {
+        if let Err(e) = self.clear_ytdl_verifying() {
+            tracing::warn!("{e:#}");
         }
     }
 
@@ -606,20 +621,35 @@ impl DependencyManager {
     /// back; the next update run stages and verifies the release again (it
     /// is not marked rejected). A marker whose build is not live (the swap
     /// never happened, or was already undone) is only removed. A failed
-    /// rollback keeps the marker, so the next start tries again.
+    /// rollback keeps the marker, so the next start tries again (and the next
+    /// update run verifies the live build, P11.7b2).
+    ///
+    /// A swap cut between its two renames (P11.7b2) left no `yt-dlp/` and the
+    /// build that was live as `yt-dlp.prev/`: that build is moved back first.
     pub fn recover_unverified_ytdl(&self) -> UnverifiedYtdl {
         let marker = self.bin_dir.join(YTDL_VERIFYING_MARKER);
-        let Ok(text) = std::fs::read_to_string(&marker) else {
+        if !marker.exists() {
             return UnverifiedYtdl::None;
+        }
+        let (live, prev) = (self.ytdl_dir(), self.ytdl_dir_previous());
+        if !live.exists() && prev.join("yt-dlp.exe").is_file() {
+            if let Err(e) = rename_patiently(&prev, &live) {
+                return UnverifiedYtdl::RollbackFailed(format!("the previous build could not be moved back from {prev:?}: {e}"));
+            }
+            self.clear_ytdl_verifying_or_warn();
+            return UnverifiedYtdl::SwapRepaired;
+        }
+        let Some(pending) = self.ytdl_verifying_sha256() else {
+            self.clear_ytdl_verifying_or_warn();
+            return UnverifiedYtdl::NotLive;
         };
-        let pending = text.trim().to_string();
-        if pending.is_empty() || self.ytdl_live_sha256().as_deref() != Some(pending.as_str()) {
-            self.clear_ytdl_verifying();
+        if self.ytdl_live_sha256().as_deref() != Some(pending.as_str()) {
+            self.clear_ytdl_verifying_or_warn();
             return UnverifiedYtdl::NotLive;
         }
         match self.rollback_ytdl() {
             Ok(_) => {
-                self.clear_ytdl_verifying();
+                self.clear_ytdl_verifying_or_warn();
                 UnverifiedYtdl::RolledBack(pending)
             }
             Err(e) => UnverifiedYtdl::RollbackFailed(format!("{e:#}")),
@@ -636,6 +666,9 @@ pub enum UnverifiedYtdl {
     NotLive,
     /// The unverified build (this hash) was rolled back.
     RolledBack(String),
+    /// The swap was cut between its renames: the build that was live before
+    /// it was moved back.
+    SwapRepaired,
     /// The rollback failed: the unverified build stays live.
     RollbackFailed(String),
 }
@@ -1958,7 +1991,7 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  yt-dlp_macos
         stage_folder(&mgr, b"new build", "bbb");
         mgr.mark_ytdl_verifying("bbb").unwrap();
         mgr.apply_staged_ytdl().unwrap();
-        mgr.clear_ytdl_verifying(); // the verdict: kept
+        mgr.clear_ytdl_verifying().unwrap(); // the verdict: kept
         assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None);
         assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("bbb"));
 
@@ -1966,6 +1999,37 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  yt-dlp_macos
         assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::NotLive);
         assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("bbb"));
         assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b2: a swap cut between its renames (no `yt-dlp/`, the old build in
+    /// `yt-dlp.prev/`) gets the old build back at start-up.
+    #[test]
+    fn a_swap_cut_between_its_renames_gets_the_previous_build_back() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        // The first rename of the swap, and the service stops.
+        std::fs::rename(mgr.ytdl_dir(), mgr.ytdl_dir_previous()).unwrap();
+        assert!(!mgr.ytdl_dir().exists());
+
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::SwapRepaired);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("aaa"));
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"old build");
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b2: a marker that cannot be removed is an error the caller sees.
+    #[test]
+    fn a_verdict_marker_that_cannot_be_removed_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        assert!(mgr.clear_ytdl_verifying().is_ok(), "no marker: nothing to do");
+        // A directory under the marker's name cannot be removed as a file.
+        std::fs::create_dir(dir.path().join(YTDL_VERIFYING_MARKER)).unwrap();
+        assert!(mgr.clear_ytdl_verifying().is_err());
     }
 
     #[test]
