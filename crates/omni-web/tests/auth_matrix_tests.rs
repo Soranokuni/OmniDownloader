@@ -286,6 +286,19 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
+    // The wall board (P12.13): the desk's access rule, read-only.
+    (
+        "GET",
+        "/board",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Loopback, Denied),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     (
         "GET",
         "/api/jobs",

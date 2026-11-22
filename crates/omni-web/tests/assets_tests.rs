@@ -378,22 +378,23 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 24),
-        ("inbox.js", 31),
-        ("approval.js", 19),
-        ("notify.js", 19),
-        ("mcr.js", 57),
-        ("status.js", 7),
-        ("status.css", 9),
-        ("worklist.js", 7),
-        ("undo.js", 8),
-        ("dialog.js", 7),
-        ("keys.js", 5),
-        ("sound.js", 4),
-        ("user.js", 17),
-        ("toast.js", 7),
-        ("text.js", 6),
-        ("text.el.js", 6),
+        ("desk.js", 25),
+        ("inbox.js", 32),
+        ("approval.js", 20),
+        ("notify.js", 20),
+        ("mcr.js", 58),
+        ("status.js", 8),
+        ("status.css", 10),
+        ("worklist.js", 8),
+        ("undo.js", 9),
+        ("dialog.js", 8),
+        ("keys.js", 6),
+        ("sound.js", 5),
+        ("board.js", 1),
+        ("user.js", 18),
+        ("toast.js", 8),
+        ("text.js", 7),
+        ("text.el.js", 7),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -749,7 +750,7 @@ fn the_desk_uses_no_native_dialogs() {
     };
     let desk_modules = [
         "app.js", "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js",
-        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js", "keys.js", "sound.js",
+        "status.js", "worklist.js", "undo.js", "dialog.js", "toast.js", "keys.js", "sound.js", "board.js",
     ];
     for module in desk_modules {
         let src = code(module);
@@ -932,7 +933,7 @@ fn the_desk_is_laid_out_for_the_control_room() {
     // No static inline styles: only a progress width, a CSS variable and a computed scroll margin.
     for module in [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js", "dialog.js",
-        "toast.js", "keys.js", "sound.js",
+        "toast.js", "keys.js", "sound.js", "board.js",
     ] {
         let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
         for (i, _) in src.match_indices("style: ") {
@@ -948,7 +949,7 @@ fn the_desk_is_laid_out_for_the_control_room() {
             );
         }
     }
-    for page in ["mcr.html", "user.html"] {
+    for page in ["mcr.html", "user.html", "board.html"] {
         assert!(!assets.get(page).unwrap().contains("style=\""), "{page} has an inline style");
     }
 }
@@ -1046,7 +1047,7 @@ fn every_word_of_the_desk_is_in_one_dictionary() {
     let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
     let modules = [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
-        "dialog.js", "toast.js", "text.js", "keys.js", "sound.js",
+        "dialog.js", "toast.js", "text.js", "keys.js", "sound.js", "board.js",
     ];
 
     // The lookup: a language switch, Greek the default and the fallback.
@@ -1191,7 +1192,7 @@ fn the_desk_works_from_the_keyboard() {
     // Real buttons only.
     let desk_modules = [
         "desk.js", "mcr.js", "inbox.js", "approval.js", "notify.js", "user.js", "status.js", "worklist.js", "undo.js",
-        "dialog.js", "toast.js", "keys.js", "text.js", "sound.js",
+        "dialog.js", "toast.js", "keys.js", "text.js", "sound.js", "board.js",
     ];
     for module in desk_modules {
         let src = code(module);
@@ -1456,12 +1457,67 @@ fn the_journalists_page_says_what_is_true() {
     assert!(page.contains("id=\"urls-count\" aria-live=\"polite\""), "the link count has no place");
 }
 
+/// P12.13: the wall board. Read-only (it only asks: no button, no POST, no action of the
+/// desk); what is running, what waits for a person and the health, in the desk's own words;
+/// the held count from `/api/held/waiting`, where a 404 shows no number; a count the server
+/// could not make is blank, never 0; every word by key; large type.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v17() {
+fn the_wall_board_only_shows() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c));
+    let src = assets.get("static/board.js").expect("board.js shipped");
+    let board: String = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+
+    // Read-only.
+    for action in ["method:", "el('button'", "onClick", "addEventListener('click'", "deferAction", "confirmDialog"] {
+        assert!(!board.contains(action), "the board acts: {action}");
+    }
+    let page = assets.get("board.html").expect("board.html shipped");
+    assert!(!page.contains("<button") && !page.contains("<form") && !page.contains("<input"), "the board has controls");
+
+    // What it reads, every 5 s.
+    for source in ["api('/api/system/status')", "api('/api/jobs?view=live&page=1&per_page=50')", "api('/api/held/waiting')"] {
+        assert!(board.contains(source), "the board does not read {source}");
+    }
+    assert!(board.contains("setInterval(poll, POLL_MS);") && board.contains("const POLL_MS = 5000;"), "the board does not refresh");
+
+    // The held count: a 404 is no number, not an error; anything else stays an error for that part only.
+    let held = function_body(&board, "heldWaiting");
+    assert!(held.contains("if (e.status === 404) return null;"), "a server without the held route shows an error or a zero");
+    assert!(function_body(&board, "paintHeld").contains("held && typeof held.count === 'number' ? held.count : null"), "an unknown held count shows a number");
+    // Unknown is blank, never 0.
+    assert!(function_body(&board, "setNumber").contains("n === null || n === undefined ? '' : String(n)"), "an unknown count shows as 0");
+    let status = function_body(&board, "paintStatus");
+    assert!(status.contains("setNumber('board-review', q ? personCount(q) : null);"), "a failed count shows zeros");
+    assert!(!function_body(&board, "personCount").contains("approval"), "held videos are counted twice");
+    assert!(board.contains("Promise.allSettled(["), "one failed answer blanks the whole board");
+
+    // The desk's own words and health, by key; the page is all keys.
+    assert!(board.contains("healthSummary(data.checks)") && board.contains("checkTexts(name, check)"), "the board words health its own way");
+    assert!(board.contains("stageLine(job)"), "the board words a step its own way");
+    for line in page.lines() {
+        assert!(!greek(line), "board.html keeps Greek text of its own: {}", line.trim());
+    }
+    for attr in ["data-t=\"", "data-t-aria-label=\""] {
+        for key in page.split(attr).skip(1).filter_map(|s| s.split('"').next()) {
+            assert!(words.contains_key(key), "board.html asks for `{key}`, which text.el.js does not have");
+        }
+    }
+    assert!(board.contains("\napplyText();"), "the board's words are never filled");
+
+    // Large type for across the room.
+    let css = assets.get("static/status.css").unwrap();
+    assert!(css.contains(".board-number { font-size: 96px;"), "the numbers are not large");
+    assert!(css.contains(".board-page { font-size: 22px; }"), "the board's text is not large");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v18() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=17"), "user.html does not import user.js?v=17");
-    assert!(!page.contains("/static/user.js?v=16"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=18"), "user.html does not import user.js?v=18");
+    assert!(!page.contains("/static/user.js?v=17"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

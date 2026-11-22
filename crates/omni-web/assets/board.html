@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-t="board.title">OmniDownloader</title>
+<link rel="stylesheet" href="/static/app.css?v=12">
+<link rel="stylesheet" href="/static/status.css?v=10">
+<link rel="icon" href="data:,">
+</head>
+<body class="board-page">
+
+<!-- The wall board (plan P12.13): read-only, large type, for a monitor in the
+     control room. What is running, what waits for a person, health. Nothing
+     here can be clicked into an action; the desk (/mcr) is where work is done.
+     Every word comes from text.el.js by key (data-t). -->
+<header class="board-head">
+  <div class="board-brand">
+    <div class="brand-mark" aria-hidden="true">O</div>
+    <h1>OmniDownloader <span class="board-sub" data-t="board.heading"></span></h1>
+  </div>
+  <div class="board-health" id="board-health" role="status" aria-live="polite">
+    <span id="board-health-dot" class="dot" aria-hidden="true"></span>
+    <span id="board-health-text" data-t="health.pill.checking"></span>
+  </div>
+  <div class="board-clock mono" id="board-clock" aria-hidden="true"></div>
+</header>
+
+<main class="board-main">
+  <!-- Shown when the service stops answering. -->
+  <div id="board-offline" class="board-offline" role="alert" hidden data-t="service.down"></div>
+
+  <section class="board-waits" aria-labelledby="board-waits-title">
+    <h2 id="board-waits-title" data-t="board.waits"></h2>
+    <div class="board-tiles">
+      <div class="board-tile" id="tile-review">
+        <div class="board-number" id="board-review"></div>
+        <div class="board-label" data-t="board.review"></div>
+      </div>
+      <div class="board-tile" id="tile-held">
+        <div class="board-number" id="board-held"></div>
+        <div class="board-label" data-t="board.held"></div>
+        <div class="board-since" id="board-held-since"></div>
+      </div>
+      <div class="board-tile" id="tile-late">
+        <div class="board-number" id="board-late"></div>
+        <div class="board-label" data-t="board.late"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="board-running" aria-labelledby="board-running-title">
+    <h2 id="board-running-title"><span data-t="board.running"></span> <span class="board-pending" id="board-pending"></span></h2>
+    <div id="board-jobs" class="board-jobs"></div>
+  </section>
+
+  <section class="board-problems" aria-labelledby="board-problems-title">
+    <h2 id="board-problems-title" data-t="board.health"></h2>
+    <div id="board-problems"></div>
+  </section>
+
+  <p class="board-updated note" id="board-updated"></p>
+</main>
+
+<script type="module" src="/static/board.js?v=1"></script>
+</body>
+</html>

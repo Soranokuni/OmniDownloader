@@ -15,8 +15,8 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=6';
-import { infoDialog, dialogOpen } from '/static/dialog.js?v=7';
+import { t } from '/static/text.js?v=7';
+import { infoDialog, dialogOpen } from '/static/dialog.js?v=8';
 
 const actions = new WeakMap();
 let scope = () => null;

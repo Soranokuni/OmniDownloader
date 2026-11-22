@@ -463,6 +463,25 @@ waits for a person. It is also left alone when the same link is already in
 the queue or was delivered meanwhile, and when its video may already be in
 Dalet.
 
+### 4.11 The wall board (`/board`)
+
+`/board` is a page for a monitor on the control-room wall, in large type. It
+shows, and changes nothing:
+
+- **«Περιμένουν εσάς»** — three numbers: videos that need checking, videos
+  waiting for «Έγκριση → Dalet» (with the time of the oldest), and videos
+  running late. A number that is not zero is amber. A number the system
+  could not count is left blank, never shown as 0.
+- **«Σε εξέλιξη τώρα»** — every video being processed, with its step and its
+  progress, and how many wait in the queue.
+- **«Υγεία του συστήματος»** — «Όλα καλά», or each problem in the same words
+  as the desk.
+
+It refreshes every 5 seconds and shows the time. If the service stops
+answering, a red line says so. The same people who may open the desk may open
+the board; on the wall screen, sign in once with an MCR account or use a
+machine on the MCR network.
+
 ---
 
 ## 5. Common reasons a job stops, and what to do

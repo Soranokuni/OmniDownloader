@@ -64,10 +64,20 @@ pub async fn view_user(principal: Option<RequireUser>) -> Response {
 }
 
 pub async fn view_mcr(State(state): State<AppState>, principal: MaybePrincipal) -> Response {
+    desk_page(&state, principal, "mcr.html")
+}
+
+/// The wall board (P12.13): a read-only page in large type for a control-room
+/// monitor. The same access rule as the desk, since it shows the same work.
+pub async fn view_board(State(state): State<AppState>, principal: MaybePrincipal) -> Response {
+    desk_page(&state, principal, "board.html")
+}
+
+fn desk_page(state: &AppState, principal: MaybePrincipal, page: &'static str) -> Response {
     match principal.0 {
         // The first-run account has only the change-password card, on /admin.
         Some(Principal::User(u)) if state.default_admin_locks(&u) => Redirect::temporary("/admin").into_response(),
-        Some(p) if p.is_mcr() => EmbeddedFile("mcr.html").into_response(),
+        Some(p) if p.is_mcr() => EmbeddedFile(page).into_response(),
         _ => Redirect::temporary("/login").into_response(),
     }
 }

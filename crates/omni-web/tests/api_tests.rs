@@ -347,6 +347,8 @@ async fn html_pages_render_for_the_roles_that_may_see_them() -> Result<()> {
 
     for (uri, token, needle) in [
         ("/mcr", &app.mcr_token, "MCR"),
+        // The wall board (P12.13), marked by its own script.
+        ("/board", &app.mcr_token, "/static/board.js?v="),
         // Its words come from the dictionary since P12.10: the page's own script marks it.
         ("/user", &app.user_token, "/static/user.js?v="),
         ("/admin", &app.admin_token, "Administration"),

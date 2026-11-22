@@ -57,6 +57,7 @@ impl WebServer {
             .route("/api/slug-preview", get(api_slug_preview))
             // ---- MCR: admin, an MCR account, or an allowlisted client ----
             .route("/mcr", get(view_mcr))
+            .route("/board", get(view_board))
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))
             .route("/api/jobs/:id", get(api_get_job))
             .route("/api/jobs/:id/override", post(api_override_job))

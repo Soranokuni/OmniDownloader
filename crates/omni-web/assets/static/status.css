@@ -281,6 +281,54 @@ kbd {
 .spec-list .spec-row { font-size: 13px; }
 .remember-btn { margin-left: 10px; padding: 3px 10px; font-size: 13px; }
 
+/* The wall board (plan P12.13): read from across the room. Numbers are huge,
+ * labels large, colour always with a word; nothing to click. */
+.board-page { font-size: 22px; }
+.board-head {
+  display: flex; align-items: center; gap: 28px; padding: 18px 32px;
+  border-bottom: 1px solid var(--line); background: #0b0e17;
+}
+.board-brand { display: flex; align-items: center; gap: 14px; flex: 1; }
+.board-brand h1 { margin: 0; font-size: 30px; }
+.board-sub { color: var(--text-dim); font-weight: 600; margin-left: 10px; }
+.board-health {
+  display: inline-flex; align-items: center; gap: 12px; font-size: 28px; font-weight: 700;
+  padding: 8px 20px; border-radius: 999px; border: 2px solid var(--line);
+}
+.board-health .dot { width: 20px; height: 20px; }
+.board-health.ok { border-color: var(--ok); color: var(--ok); }
+.board-health.warn { border-color: var(--warn); color: var(--warn); }
+.board-health.bad { border-color: var(--bad); color: var(--bad); }
+.board-clock { font-size: 40px; font-weight: 700; color: var(--text); }
+.board-main { max-width: none; padding: 24px 32px; display: flex; flex-direction: column; gap: 28px; }
+.board-main h2 { margin: 0 0 14px; font-size: 26px; color: var(--text-dim); font-weight: 700; }
+.board-offline {
+  font-size: 34px; font-weight: 800; text-align: center; padding: 18px;
+  border: 3px solid var(--bad); border-radius: 14px; color: var(--bad);
+}
+.board-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.board-tile { border: 2px solid var(--line); border-radius: 16px; padding: 18px 24px; background: #12141d; }
+.board-tile.attention { border-color: var(--warn); }
+.board-number { font-size: 96px; font-weight: 800; line-height: 1.05; min-height: 1.05em; font-variant-numeric: tabular-nums; }
+.board-tile.attention .board-number { color: var(--warn); }
+.board-label { font-size: 26px; font-weight: 600; }
+.board-since { font-size: 20px; color: var(--text-dim); min-height: 1.3em; }
+.board-pending { font-size: 22px; font-weight: 600; margin-left: 12px; }
+.board-jobs { display: flex; flex-direction: column; gap: 12px; }
+.board-job {
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.4fr) minmax(0, 1fr) 4.5em;
+  align-items: center; gap: 18px; padding: 12px 18px; border: 1px solid var(--line); border-radius: 12px;
+}
+.board-job-name { font-size: 24px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.board-job-step { font-size: 22px; color: var(--text-dim); }
+.board-progress { height: 14px; }
+.board-job-pct { font-size: 24px; text-align: right; }
+.board-idle, .board-ok, .board-more { font-size: 24px; color: var(--text-dim); }
+.board-ok { color: var(--ok); font-weight: 700; }
+.board-problem { font-size: 24px; padding: 10px 16px; border-left: 6px solid var(--warn); margin-bottom: 8px; }
+.board-problem.bad { border-left-color: var(--bad); }
+.board-updated { font-size: 16px; }
+
 /* /user (P12.12): the count under the list of links, red over the limit. */
 .links-count { margin-top: 4px; }
 .links-count.bad { color: var(--bad); font-weight: 600; }
