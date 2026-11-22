@@ -508,11 +508,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v36_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v37_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=36"), "admin.html does not import admin.js?v=36");
-    assert!(!admin.contains("/static/admin.js?v=35"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=37"), "admin.html does not import admin.js?v=37");
+    assert!(!admin.contains("/static/admin.js?v=36"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -523,23 +523,23 @@ fn the_first_run_password_card_ships_with_admin_v36_and_login_v7() {
     assert!(login_js.contains("password_change_required"), "login.js ignores the first-run flag");
 }
 
-/// The Autonomy card (P11.0) opens the right-hand column and its loader asks
+/// The Autonomy card (P11.0) is on the Overview (P13.5) and its loader asks
 /// the admin endpoint, building nodes rather than writing HTML.
 #[test]
-fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
+fn the_autonomy_card_is_on_the_overview_and_loads_the_report() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    let right = admin.find(r#"<div class="stack" style="grid-column:span 2">"#).expect("the right-hand column");
-    let first = admin[right..].find("<section").map(|i| right + i).expect("a card in it");
-    assert!(admin[first..].starts_with(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not first");
+    let overview = admin.find(r#"data-section="overview""#).expect("the Overview section");
+    let next = admin[overview + 10..].find("data-section=").map(|i| overview + 10 + i).expect("the next section");
+    assert!(admin[overview..next].contains(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not on the Overview");
     assert!(admin.contains("A video later marked as wrong counts as touched."));
     for id in ["autonomy-days", "autonomy-refresh", "autonomy-figures", "autonomy-tables"] {
         assert!(admin.contains(&format!(r#"id="{id}""#)), "{id} missing");
     }
-    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    let js = assets.get("static/admin-overview.js").expect("admin-overview.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
     let code = code.join("\n");
-    assert!(code.contains("/api/admin/autonomy-report?days="), "admin.js does not load the autonomy report");
+    assert!(code.contains("/api/admin/autonomy-report?days="), "the Overview does not load the autonomy report");
     assert!(code.contains("Delivered untouched"));
     assert!(code.contains("No finished jobs in this period yet."));
     assert!(code.contains("Queued by MCR from an offer or a skipped link"));
@@ -556,7 +556,7 @@ fn the_restart_button_asks_in_the_page_and_the_pending_watchfolder_is_shown() {
         assert!(html.contains(&format!(r#"id="{id}""#)), "{id} missing");
     }
     assert!(html.contains("Επανεκκίνηση υπηρεσίας"));
-    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    let js = assets.get("static/admin-settings.js").expect("admin-settings.js shipped");
     let code: String = js.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
     // The restart block runs up to the next section heading of the raw file.
     let raw = &js[js.find("restart_available").expect("the restart block")..];
@@ -592,7 +592,7 @@ fn the_wizard_and_the_mailbox_card_ask_for_the_secret_expiry() {
     };
     let wizard = code("static/wizard.js");
     assert!(wizard.contains("client_secret_expires: expires.value"), "the wizard does not send the expiry");
-    let admin = code("static/admin.js");
+    let admin = code("static/admin-settings.js");
     assert!(admin.contains("'/api/admin/settings/mail'"), "the Mailbox card does not save");
     assert!(admin.contains("client_secret_expires: document.getElementById('test-mail-expires').value"));
     assert!(!admin.contains("/api/setup/state"), "the Mailbox card must not read the first-run endpoint");
@@ -657,4 +657,51 @@ fn the_wizard_ends_with_a_test_download_and_mail_needs_a_passing_test() {
     for banned in ["confirm(", "prompt(", "alert("] {
         assert!(!code.contains(banned), "wizard.js uses {banned}");
     }
+}
+
+/// P13.5: the admin panel is five hash-routed sections, each a module imported
+/// when first opened (one URL each); no browser dialog in any admin module;
+/// the Benchmarks card no longer refetches on every server event.
+#[test]
+fn the_admin_panel_is_five_sections_with_one_module_each_and_no_browser_dialogs() {
+    let assets = all_assets();
+    let html = assets.get("admin.html").expect("admin.html shipped");
+    let sections = ["overview", "settings", "people", "sites", "maintenance"];
+    for s in sections {
+        assert!(html.contains(&format!(r#"data-section="{s}""#)), "section {s} missing");
+        assert!(html.contains(&format!(r##"href="#{s}" data-nav="{s}""##)), "sidebar link {s} missing");
+    }
+    assert!(html.contains(r#"id="admin-search""#), "no search box");
+    for id in ["needs-list", "health-list", "shadow-body", "wf-path", "op-repair", "op-poll", "op-write", "op-gap", "op-age", "net-port"] {
+        assert!(html.contains(&format!(r#"id="{id}""#)), "{id} missing");
+    }
+
+    let shell = assets.get("static/admin.js").expect("admin.js shipped");
+    for s in sections {
+        let module = format!("static/admin-{s}.js");
+        assert!(assets.contains_key(&module), "{module} not shipped");
+        assert!(shell.contains(&format!("import('/static/admin-{s}.js?v=")), "{s} is not imported on demand");
+        let src = &assets[&module];
+        assert!(src.contains("export function init()"), "{module} has no init");
+    }
+    // One URL per module.
+    for m in ["admin-overview.js", "admin-settings.js", "admin-people.js", "admin-sites.js", "admin-maintenance.js", "admin-common.js", "dialog.js"] {
+        let needle = format!("/static/{m}?v=");
+        let versions: std::collections::BTreeSet<String> = assets
+            .values()
+            .flat_map(|s| s.match_indices(needle.as_str()).map(|(i, _)| s[i + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(versions.len(), 1, "{m} is imported under {versions:?}");
+    }
+
+    for (name, src) in assets.iter().filter(|(n, _)| n.starts_with("static/admin") || *n == "static/dialog.js") {
+        let code: String = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+        for banned in ["confirm(", "prompt(", "alert(", "innerHTML"] {
+            let hits = code.match_indices(banned).filter(|(i, _)| !code[..*i].ends_with("Dialog") && !code[..*i].ends_with('.')).count();
+            assert_eq!(hits, 0, "{name} uses {banned}");
+        }
+    }
+    let maint = &assets["static/admin-maintenance.js"];
+    assert!(!maint.contains("live(loadBenchmarks"), "the Benchmarks card still refetches on every event");
+    assert!(maint.contains("if (going && sectionShown('maintenance'))"), "the Benchmarks card is not polled only while a run goes");
 }

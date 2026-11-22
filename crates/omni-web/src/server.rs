@@ -116,6 +116,8 @@ impl WebServer {
             .route("/api/admin/setup/test-download", post(admin_wizard::api_admin_start_test_download))
             .route("/api/admin/setup/test-download/:id", get(admin_wizard::api_admin_test_download_status))
             .route("/api/admin/journalists/import", post(admin_wizard::api_admin_import_journalists))
+            // The Settings section's operation form (P13.5).
+            .route("/api/admin/settings/operation", post(crate::admin_operation::api_admin_save_operation))
             // The diagnostics package (P13.8).
             .route("/api/admin/diagnostics.zip", get(crate::admin_diagnostics::api_admin_diagnostics))
             .route("/api/admin/restart-service", post(crate::admin_delivery::api_admin_restart_service))

@@ -1127,3 +1127,30 @@ async fn a_second_package_while_one_is_made_is_refused_with_a_page() -> Result<(
     assert!(res.headers()["content-type"].to_str()?.starts_with("text/html"));
     Ok(())
 }
+
+// ---- P13.5: the Settings section's operation form ----
+
+#[tokio::test]
+async fn the_operation_form_saves_in_range_values_and_names_a_bad_one() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    let g = send(&app, "GET", "/api/admin/settings", Some(&tok), None).await;
+    assert_eq!(g.json()["operation"]["max_concurrent_downloads"], 3, "{}", g.body);
+
+    let r = send(&app, "POST", "/api/admin/settings/operation", Some(&tok), Some(json!({
+        "repair_mode": "shadow", "max_concurrent_downloads": 5, "retry_late_after_mins": 12,
+        "graph_processed_folder": "Omni/Done",
+    }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["restart_required"], true, "repair mode and concurrency are read at start");
+    let saved = AppConfig::load_from_file(app.dir.path().join("config.json"))?;
+    assert_eq!((saved.max_concurrent_downloads, saved.retry.late_after_mins, saved.graph.processed_folder.as_str()), (5, 12, "Omni/Done"));
+    assert_eq!(saved.repair.mode, omni_core::config::RepairMode::Shadow);
+    assert_eq!(app.state.config.read().await.retry.late_after_mins, 12, "the late strip reads it now");
+
+    let r = send(&app, "POST", "/api/admin/settings/operation", Some(&tok), Some(json!({ "max_concurrent_transcodes": 20 }))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body.contains("max_concurrent_transcodes = 20 is outside 1..8"), "{}", r.body);
+    assert_eq!(AppConfig::load_from_file(app.dir.path().join("config.json"))?.max_concurrent_transcodes, 2, "nothing saved");
+    Ok(())
+}

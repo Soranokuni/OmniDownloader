@@ -305,6 +305,8 @@ pub async fn api_admin_get_settings(RequireAdmin(_): RequireAdmin, State(state):
         let cfg = state.config.read().await;
         doc["setup_test_url"] = serde_json::json!(cfg.setup_test_url);
         doc["repair_mode"] = serde_json::json!(cfg.repair.mode);
+        // The Settings section's operation form (P13.5).
+        doc["operation"] = crate::admin_operation::operation_json(&cfg);
     }
     Ok(Json(doc))
 }

@@ -2,6 +2,7 @@ pub mod admin_bench;
 pub mod admin_cookies;
 pub mod admin_delivery;
 pub mod admin_diagnostics;
+pub mod admin_operation;
 pub mod admin_roster;
 pub mod admin_settings;
 pub mod admin_sites;

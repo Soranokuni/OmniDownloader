@@ -649,6 +649,8 @@ const MATRIX: &[Row] = &[
     ("POST", "/api/admin/setup/test-download", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("GET", "/api/admin/setup/test-download/1", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, ReachedNoFile)]),
     ("POST", "/api/admin/journalists/import", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // The operation form (P13.5): admin only.
+    ("POST", "/api/admin/settings/operation", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     // The diagnostics package (P13.8): admin only; it holds the logs.
     ("GET", "/api/admin/diagnostics.zip", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     // «Επανεκκίνηση υπηρεσίας» (P13.2): admin only. The harness has no service, so the

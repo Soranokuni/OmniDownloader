@@ -754,8 +754,29 @@ Prometheus handles as a counter reset.
 
 ## 6. The Admin page
 
+The page has five sections in a sidebar on the left; the address ends in the
+section's name (`/admin#settings`), so a bookmark opens it directly, and each
+section loads only when it is first opened. The search box at the top of the
+sidebar finds a setting by name (accents and case do not matter) and shows
+only the cards that match, in every section.
+
+- **Επισκόπηση**: Χρειάζεται τον διαχειριστή, Health, Autonomy, Repair in shadow.
+- **Ρυθμίσεις**: Setup, Watchfolder, Mailbox, Credentials, LLM assist, Network, TLS and archive, Λειτουργία.
+- **Άνθρωποι**: User accounts, Newsroom taxonomy (journalists and groups).
+- **Ιστότοποι**: Sites, Cookies, Recipes, Repair report, Test URL, Self-heal, Self-check.
+- **Συντήρηση**: Toolchain, Download engine, Database maintenance, Διαγνωστικό πακέτο, Scheduled maintenance, Benchmarks, Audit log, Recent mail.
+
+Every action that removes or replaces something asks in the page first; the
+action button names what it does.
+
 | Card | Use |
 |---|---|
+| **Χρειάζεται τον διαχειριστή** | what needs the administrator now: unfinished setup, a pending watchfolder, every amber or red health line, each with a button to the section that fixes it |
+| **Health** | every health line (§8) with its detail |
+| **Repair in shadow** | what the repair ladder would have done while `repair.mode` is `shadow` |
+| **Watchfolder** | test and save the watchfolder (the same rules as the wizard); used between jobs |
+| **Network, TLS and archive** | web port, MCR open networks, TLS certificate and passphrase, trusted proxies, allowed host names, archive on/off and days |
+| **Λειτουργία** | repair mode, downloads and encodes at once, how often the mailbox is read, Graph write access and its two folders, yt-dlp pacing, the retry, second-chance and late-strip windows. A value outside its range is refused with its name and range. The late strip and the Graph settings apply at once; the rest after «Επανεκκίνηση υπηρεσίας» |
 | **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b); a pending watchfolder; **Επανεκκίνηση υπηρεσίας** |
 | **Download engine** | yt-dlp version, update now, roll back |
 | **Toolchain** | install or repair ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno |
@@ -779,7 +800,7 @@ Prometheus handles as a counter reset.
 | **Scheduled maintenance** | the nightly tasks (§7), run one now |
 | **Mailbox** | check Graph access with given or stored credentials; save the mailbox, a new client secret and its expiry date (used from the next mail check) |
 
-**Autonomy report.** The first card on the right. *Delivered untouched* is the
+**Autonomy report.** On the Επισκόπηση. *Delivered untouched* is the
 share of the videos that reached air (delivered to the watchfolder, or put into
 Dalet by hand) that nobody touched: no retry, rename, approval or rejection,
 next choice, cancel, re-download, "wrong video", "run now", discard or manual
