@@ -297,10 +297,48 @@ fn an_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it(
     let unlock = at("\n    drop(swap);");
     assert!(mark < apply, "the marker is written before the swap");
     assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
+    // A failed apply clears the marker only while a build is live (P11.7b3).
+    let failed_apply = &update[apply..verdict];
+    assert!(failed_apply.contains("\n                if let Err(c) = dep_mgr.clear_ytdl_verifying_if_live() {"), "the failed apply keeps a needed marker");
+    assert!(!failed_apply.contains("dep_mgr.clear_ytdl_verifying()"), "never the unconditional clear there");
     // A marker that could not be cleared is audited, not only logged (P11.7b2).
     assert!(update[clear..unlock].contains("\n        let _ = repo.log_audit(\n            \"ERROR\","), "the failed clear is audited");
-    let start = main.find("\n    report_unverified_ytdl(&repo, dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
+    let start = main.find("\n    report_unverified(&repo, \"yt-dlp\", dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
     assert!(start < main.find("ensure_ytdl_folder_build(&dep_mgr,").unwrap(), "before the tools are resolved");
+}
+
+/// P11.7c: the Deno update marks its pending verdict before the swap, clears it
+/// only after the verdict (rollbacks included) and before the lock is released,
+/// audits a failed clear, keeps the marker after a failed apply that left no
+/// Deno, and start-up recovers an unjudged Deno before the background install.
+#[test]
+fn the_deno_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it() {
+    let main = include_str!("main.rs");
+    let update = &main[main.find("async fn nightly_deno_update(").unwrap()..];
+    let update = &update[..update.find("\n}").unwrap()];
+    let at = |s: &str| update.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let mark = at("\n            .and_then(|sha| dep_mgr.mark_deno_verifying(&sha));");
+    let apply = at("\n            Ok(()) => dep_mgr.apply_staged_deno(&new_version).inspect_err(|_| {");
+    let failed_apply = at("\n                if let Err(c) = dep_mgr.clear_deno_verifying_if_live() {");
+    let verdict = at("\n            let verdict = match selfcheck::judge_deno(&results) {");
+    let clear = at("\n            if let Err(e) = dep_mgr.clear_deno_verifying() {");
+    let unlock = at("\n    drop(swap);");
+    assert!(mark < apply && apply < failed_apply, "marked before the swap; a failed apply keeps a needed marker");
+    assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
+    assert!(update[clear..unlock].contains("\n                let _ = repo.log_audit(\n                    \"ERROR\","), "the failed clear is audited");
+    let start = main.find("\n    report_unverified(&repo, \"Deno\", dep_mgr.recover_unverified_deno());").expect("start-up recovery");
+    assert!(start < main.find("\n    // Deno for YouTube (plan P6.8): reported now").unwrap(), "before the background install");
+}
+
+/// P11.7c: a live build waits for its verdict only when the marker names it.
+#[test]
+fn a_live_build_awaits_its_verdict_only_when_the_marker_names_it() {
+    use crate::awaits_verdict;
+    assert!(awaits_verdict(Some("aaa"), Some("aaa")));
+    assert!(!awaits_verdict(Some("aaa"), Some("bbb")));
+    assert!(!awaits_verdict(Some("aaa"), None));
+    assert!(!awaits_verdict(None, None), "no live build waits for nothing");
+    assert!(!awaits_verdict(None, Some("aaa")));
 }
 
 /// P11.7b2: a staged release that is already live is left alone, unless the

@@ -459,7 +459,7 @@ button. Install downloads the exact pinned build and checks its checksum;
 jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
 the previous build. If the service stops while the nightly update is still
-checking a new build, the next start puts the previous build back; the next
+checking a new yt-dlp or Deno build, the next start puts the previous build back; the next
 update run checks the release again.
 
 The verified yt-dlp update also runs early when one platform (YouTube, X,

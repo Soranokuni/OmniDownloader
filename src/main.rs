@@ -1234,7 +1234,8 @@ async fn run_daemon(
         }
     }
     // A yt-dlp update the last run swapped in but stopped before judging (P11.7b).
-    report_unverified_ytdl(&repo, dep_mgr.recover_unverified_ytdl());
+    report_unverified(&repo, "yt-dlp", dep_mgr.recover_unverified_ytdl());
+    report_unverified(&repo, "Deno", dep_mgr.recover_unverified_deno());
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
@@ -2296,8 +2297,9 @@ async fn nightly_ytdl_update(
         match dep_mgr.apply_staged_ytdl() {
             Ok(path) => path,
             Err(e) => {
-                // Nothing was swapped in: a marker left behind only names a build that is not live.
-                if let Err(c) = dep_mgr.clear_ytdl_verifying() {
+                // Nothing was swapped in. The marker goes only while a build is still live:
+                // with none (both renames failed) the start-up repair needs it (P11.7b3).
+                if let Err(c) = dep_mgr.clear_ytdl_verifying_if_live() {
                     warn!("{c:#}");
                 }
                 warn!("Nightly yt-dlp update failed to install: {e:#}");
@@ -2363,11 +2365,17 @@ enum StagedRelease {
 /// [`StagedRelease`] for a live build with hash `live`, the staged release
 /// `staged`, and the pending-verdict marker's hash `verifying`.
 fn staged_release_action(live: Option<&str>, staged: &str, verifying: Option<&str>) -> StagedRelease {
-    match (live == Some(staged), verifying == Some(staged)) {
+    match (live == Some(staged), awaits_verdict(live, verifying)) {
         (true, true) => StagedRelease::Reverify,
         (true, false) => StagedRelease::AlreadyLatest,
         (false, _) => StagedRelease::Install,
     }
+}
+
+/// Whether the live build (hash `live`) still waits for its verdict: the
+/// pending-verdict marker (hash `verifying`) names it (P11.7b2, P11.7c).
+fn awaits_verdict(live: Option<&str>, verifying: Option<&str>) -> bool {
+    live.is_some() && live == verifying
 }
 
 /// The few words the maintenance panel shows for an early run's `verdict` (P11.4d).
@@ -2519,31 +2527,66 @@ async fn nightly_deno_update(
         let _swap = gate.lock_swaps().await;
         return if ensure_deno(dep_mgr, health, true).await { TaskOutcome::Ok } else { TaskOutcome::Failed };
     };
-    let latest = match dep_mgr.latest_deno_tag().await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("Deno update check failed: {e:#}");
-            return TaskOutcome::Skipped;
+    // The live Deno still waits for its verdict (its start-up rollback failed,
+    // P11.7c): it is verified now, as if just swapped in, instead of looking for
+    // a newer one.
+    let reverify = awaits_verdict(dep_mgr.deno_live_sha256().as_deref(), dep_mgr.deno_verifying_sha256().as_deref());
+    if !reverify {
+        let latest = match dep_mgr.latest_deno_tag().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Deno update check failed: {e:#}");
+                return TaskOutcome::Skipped;
+            }
+        };
+        if latest.trim_start_matches('v') == installed {
+            return TaskOutcome::Ok;
         }
-    };
-    if latest.trim_start_matches('v') == installed {
-        return TaskOutcome::Ok;
+    } else {
+        warn!("Deno {installed} was never verified; checking it now");
     }
     // Download first; pause only around the rename.
     let mut swap = gate.lock_swaps().await;
-    let new_version = match dep_mgr.stage_deno().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Deno update not installed: {e:#}");
-            let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
-            return TaskOutcome::Failed;
+    let new_version = if reverify {
+        installed.clone()
+    } else {
+        match dep_mgr.stage_deno().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Deno update not installed: {e:#}");
+                let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
+                return TaskOutcome::Failed;
+            }
         }
     };
+    // What the messages call the Deno a rollback puts back.
+    let installed = if reverify { "the previous Deno".to_string() } else { installed };
     if !swap.drain(Duration::from_secs(600)).await {
-        dep_mgr.discard_staged_deno();
+        if !reverify {
+            dep_mgr.discard_staged_deno();
+        }
         return TaskOutcome::Skipped;
     }
-    let result = dep_mgr.apply_staged_deno(&new_version);
+    let result = if reverify {
+        // Already live, its marker already written.
+        Ok(())
+    } else {
+        // Until its verdict, the swapped Deno is unverified: a stop or crash before
+        // then rolls it back at the next start (P11.7c). No marker, no swap.
+        let marked = dep_mgr
+            .deno_staged_sha256()
+            .ok_or_else(|| anyhow::anyhow!("the staged Deno could not be read"))
+            .and_then(|sha| dep_mgr.mark_deno_verifying(&sha));
+        match marked {
+            Err(e) => Err(e.context("the pending verdict could not be recorded")),
+            Ok(()) => dep_mgr.apply_staged_deno(&new_version).inspect_err(|_| {
+                // Nothing was swapped in. The marker goes only while a Deno is still live (P11.7b3).
+                if let Err(c) = dep_mgr.clear_deno_verifying_if_live() {
+                    warn!("{c:#}");
+                }
+            }),
+        }
+    };
     let outcome = match result {
         Err(e) => {
             dep_mgr.discard_staged_deno();
@@ -2570,6 +2613,16 @@ async fn nightly_deno_update(
                 }
                 v => v,
             };
+            // The verdict is in, under the swap lock (P11.7c). A marker that stays would
+            // have the next start roll this Deno back as unverified: said loudly.
+            if let Err(e) = dep_mgr.clear_deno_verifying() {
+                error!("Deno update: the verdict was reached but its marker could not be removed: {e:#}");
+                let _ = repo.log_audit(
+                    "ERROR",
+                    "SYSTEM",
+                    &format!("Deno update: the verdict marker could not be removed ({e}); remove bin\\deno.exe.verifying by hand, or the next start rolls Deno back"),
+                );
+            }
             match verdict {
                 UpdateVerdict::Kept { .. } => {
                     let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
@@ -2637,26 +2690,34 @@ async fn verify_ytdl_update(
     .await
 }
 
-/// The log and audit lines of the start-up check for an unjudged yt-dlp update (P11.7b).
-fn report_unverified_ytdl(repo: &Repository, found: omni_core::dependencies::UnverifiedYtdl) {
-    use omni_core::dependencies::UnverifiedYtdl;
+/// The log and audit lines of the start-up check for an unjudged `tool` update (P11.7b, P11.7c).
+fn report_unverified(repo: &Repository, tool: &str, found: omni_core::dependencies::UnverifiedUpdate) {
+    use omni_core::dependencies::UnverifiedUpdate;
     match found {
-        UnverifiedYtdl::None | UnverifiedYtdl::NotLive => {}
-        UnverifiedYtdl::RolledBack(sha) => {
+        UnverifiedUpdate::None | UnverifiedUpdate::NotLive => {}
+        UnverifiedUpdate::RolledBack(sha) => {
             let msg = format!(
-                "yt-dlp update (sha256 {}) was stopped before its self-check finished; the previous build is back, and the next update run checks the release again",
+                "{tool} update (sha256 {}) was stopped before its self-check finished; the previous build is back, and the next update run checks the release again",
                 &sha[..sha.len().min(16)]
             );
             warn!("{msg}");
             let _ = repo.log_audit("WARN", "SYSTEM", &msg);
         }
-        UnverifiedYtdl::SwapRepaired => {
-            let msg = "yt-dlp update was stopped in the middle of swapping builds; the previous build is back, and the next update run tries the release again";
+        UnverifiedUpdate::SwapRepaired => {
+            let msg = format!("{tool} update was stopped in the middle of swapping builds; the previous build is back, and the next update run tries the release again");
             warn!("{msg}");
-            let _ = repo.log_audit("WARN", "SYSTEM", msg);
+            let _ = repo.log_audit("WARN", "SYSTEM", &msg);
         }
-        UnverifiedYtdl::RollbackFailed(why) => {
-            let msg = format!("yt-dlp update was stopped before its self-check finished, and the previous build could not be put back: {why}");
+        UnverifiedUpdate::SetAside(sha) => {
+            let msg = format!(
+                "{tool} update (sha256 {}) was stopped before its self-check finished; it stays set aside and the one-file build is in use, and the next update run checks the release again",
+                &sha[..sha.len().min(16)]
+            );
+            warn!("{msg}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &msg);
+        }
+        UnverifiedUpdate::RollbackFailed(why) => {
+            let msg = format!("{tool} update was stopped before its self-check finished, and the previous build could not be put back: {why}");
             error!("{msg}");
             let _ = repo.log_audit("ERROR", "SYSTEM", &msg);
         }
