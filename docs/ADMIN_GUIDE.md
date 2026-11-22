@@ -560,7 +560,11 @@ At its first start a newer version moves them into their sections by itself:
 `imap_*` and `email_*` keys are removed (IMAP is no longer supported; the
 mailbox is the `graph` section). The old file is kept beside it as
 `config.json.v1.bak` (`config.json.v1.2.bak` and so on if that name is taken;
-a copy is never overwritten), with any password or secret in it blanked. The
+a copy is never overwritten), with any password or secret in it blanked. If
+the service account may not create files in the installation folder, the copy
+goes to `data\backups\config\` instead, and the log says so. If the new file
+cannot be written and `config.json` is no longer as it was, the log names the
+copy that holds the previous settings. The
 service log lists each key it moved. If a key is in both places, the one in
 the section is kept.
 
@@ -568,9 +572,11 @@ the section is kept.
 fix, in the log and in the error when it refuses to start, for example
 ``config.json: `web_port` = "eighty" cannot be read (expected u16). Fix:
 write a value like the default, 8080, or remove `web_port` to use the
-default.`` A web address is shown without its user name, password or query,
-long values are cut, and the value of a password, secret, key, token or
-cookie is shown as `<removed>`. It refuses to start with a value of the
+default.`` A value is shown only where a number or yes/no belongs; a web
+address is shown without its user name, password or query, long values are
+cut, the value of a password, secret, key, token, cookie or credential is
+`<removed>`, and a section, a list, a mode or a path in the wrong place is
+named without its value. It refuses to start with a value of the
 wrong kind, a `web_port` of 0 or an empty `watchfolder_path`. A value outside
 the range the service reads it in (concurrent downloads 1–10, concurrent
 encodes 1–8, `mail.poll_interval_secs` 10–3600, `retry.max_age_mins`

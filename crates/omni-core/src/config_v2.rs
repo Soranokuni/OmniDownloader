@@ -92,13 +92,42 @@ pub fn migrate_v1(doc: &mut Value) -> Vec<Moved> {
     done
 }
 
-/// Keys whose value is a secret or may hold one: blanked in a backup.
-/// By whole name or `_name` suffix (P13.7b): `max_tokens` and
-/// `client_secret_expires` are settings, not secrets.
+/// The key, lower case, without `_` and `-`: `clientSecret`, `client_secret`
+/// and `client-secret` are one name.
+fn normalised(key: &str) -> String {
+    key.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect()
+}
+
+/// Words that make a key secret wherever they appear in its name (P13.7c).
+const SECRET_WORDS: [&str; 10] =
+    ["password", "passwd", "secret", "token", "apikey", "cookie", "privatekey", "bearer", "credential", "auth"];
+
+/// Real settings whose names contain a secret word but whose values are not
+/// secrets (normalised names). `every_real_setting_survives_the_secret_filter`
+/// derives this list from `AppConfig`: a new setting that trips the filter
+/// fails that test until it is named here.
+const NOT_SECRETS: [&str; 4] = ["maxtokens", "llmmaxtokens", "clientsecretexpires", "auth"];
+
+/// `llm.auth`'s values: how the key is sent, not the key.
+const AUTH_MODES: [&str; 3] = ["none", "bearer", "api_key_header"];
+
+/// Keys whose value is a secret or may hold one: blanked in a backup, never
+/// shown in a message.
 fn is_secret_key(key: &str) -> bool {
-    const NAMES: [&str; 7] = ["password", "secret", "api_key", "apikey", "token", "cookie", "cookies"];
-    let k = key.to_ascii_lowercase();
-    NAMES.iter().any(|n| k == *n || k.ends_with(&format!("_{n}")))
+    let k = normalised(key);
+    !NOT_SECRETS.contains(&k.as_str()) && SECRET_WORDS.iter().any(|w| k.contains(w))
+}
+
+/// Whether `value` under `key` is blanked by [`without_secrets`]: a secret
+/// key's, or an `auth` that is not one of the modes (`"Bearer sk-…"`).
+fn hides(key: &str, value: &Value) -> bool {
+    if value.is_null() || value == &Value::String(String::new()) {
+        return false;
+    }
+    if normalised(key) == "auth" {
+        return !value.as_str().is_some_and(|v| AUTH_MODES.contains(&v));
+    }
+    is_secret_key(key)
 }
 
 /// `doc` with every secret-looking value replaced by `"<removed>"`, at any depth.
@@ -107,7 +136,7 @@ pub fn without_secrets(doc: &Value) -> Value {
         Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(k, v)| {
-                    let v = if is_secret_key(k) && !v.is_null() && v != &Value::String(String::new()) {
+                    let v = if hides(k, v) {
                         Value::String("<removed>".into())
                     } else {
                         without_secrets(v)
@@ -129,20 +158,50 @@ pub struct Upgrade {
     pub moved: Vec<Moved>,
 }
 
-/// `config.json.v1.bak`, or the first `config.json.v1.N.bak` not taken.
-fn backup_path(config: &Path) -> PathBuf {
+/// `config.json.v1.bak` in `dir`, or the first `config.json.v1.N.bak` not taken.
+fn backup_path(config: &Path, dir: &Path) -> PathBuf {
     let name = config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.json".into());
-    let first = config.with_file_name(format!("{name}.v1.bak"));
+    let first = dir.join(format!("{name}.v1.bak"));
     if !first.exists() {
         return first;
     }
-    (2..).map(|n| config.with_file_name(format!("{name}.v1.{n}.bak"))).find(|p| !p.exists()).expect("a free name")
+    (2..).map(|n| dir.join(format!("{name}.v1.{n}.bak"))).find(|p| !p.exists()).expect("a free name")
+}
+
+/// Write the copy beside config.json, or, when that folder refuses it (the
+/// service account may modify config.json but not create files next to it),
+/// in `fallback` (P13.7c). Returns where it went.
+fn write_backup(config: &Path, fallback: &Path, copy: &str, write: &dyn Fn(&Path, &str) -> std::io::Result<()>) -> Result<PathBuf> {
+    let beside = backup_path(config, config.parent().unwrap_or(Path::new(".")));
+    match write(&beside, copy) {
+        Ok(()) => Ok(beside),
+        Err(first) => {
+            std::fs::create_dir_all(fallback)
+                .with_context(|| format!("Cannot keep a copy of the old settings ({first} beside config.json, and {} cannot be made); config.json is unchanged", fallback.display()))?;
+            let there = backup_path(config, fallback);
+            write(&there, copy).with_context(|| {
+                format!("Cannot keep a copy of the old settings beside config.json ({first}) or as {}; config.json is unchanged", there.display())
+            })?;
+            Ok(there)
+        }
+    }
 }
 
 /// Rewrite `config` as v2 when it still has v1 keys (P13.7); `None` when it
-/// is v2 already or missing. The copy is written before the file is changed;
-/// a failure to write either leaves config.json as it was.
-pub fn upgrade_file(config: &Path) -> Result<Option<Upgrade>> {
+/// is v2 already or missing. The copy is written before the file is changed,
+/// beside config.json or in `fallback` (`data\backups\config`); a failure
+/// to write either leaves config.json as it was.
+pub fn upgrade_file(config: &Path, fallback: &Path) -> Result<Option<Upgrade>> {
+    upgrade_file_with(config, fallback, &|p, s| std::fs::write(p, s), &|c, p| c.save_to_file(p))
+}
+
+/// The copy's writer.
+pub type WriteCopy<'a> = &'a dyn Fn(&Path, &str) -> std::io::Result<()>;
+/// The v2 file's writer.
+pub type SaveConfig<'a> = &'a dyn Fn(&AppConfig, &Path) -> Result<()>;
+
+/// [`upgrade_file`] with the copy's and the new file's writers given (tests).
+pub fn upgrade_file_with(config: &Path, fallback: &Path, write: WriteCopy, save: SaveConfig) -> Result<Option<Upgrade>> {
     if !config.exists() {
         return Ok(None);
     }
@@ -166,12 +225,22 @@ pub fn upgrade_file(config: &Path) -> Result<Option<Upgrade>> {
         .write(true)
         .open(config)
         .with_context(|| format!("{} cannot be written; it is read as v2 but left as it is", config.display()))?;
-    let backup = backup_path(config);
     let copy = serde_json::to_string_pretty(&without_secrets(&original))?;
-    std::fs::write(&backup, copy).with_context(|| format!("Cannot keep a copy of the old settings as {}; config.json is unchanged", backup.display()))?;
-    if let Err(e) = upgraded.save_to_file(config) {
-        let _ = std::fs::remove_file(&backup);
-        return Err(e).with_context(|| format!("Cannot write the new settings to {}; the old file is unchanged", config.display()));
+    let backup = write_backup(config, fallback, &copy, write)?;
+    if let Err(e) = save(&upgraded, config) {
+        // The in-place fallback of save_to_file may have cut config.json short:
+        // the copy goes only when config.json is exactly as it was (P13.7c).
+        if std::fs::read_to_string(config).is_ok_and(|now| now == text) {
+            let _ = std::fs::remove_file(&backup);
+            return Err(e).with_context(|| format!("Cannot write the new settings to {}; the old file is unchanged", config.display()));
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "Cannot write the new settings to {}, and it is no longer as it was: the previous settings are in {} (secrets blanked); copy it back over config.json",
+                config.display(),
+                backup.display()
+            )
+        });
     }
     Ok(Some(Upgrade { backup, moved }))
 }
@@ -222,21 +291,33 @@ fn from_value(doc: Value, file: &Path) -> Result<AppConfig> {
     serde_path_to_error::deserialize::<_, AppConfig>(doc.clone()).map_err(|e| {
         use serde_path_to_error::Segment;
         let key = e.path().to_string();
-        // The value only through `shown` (P13.7b), and never under a secret's name.
         let secret = e.path().iter().any(|s| matches!(s, Segment::Map { key } if is_secret_key(key)));
-        let value = if secret {
-            "<removed>".to_string()
-        } else {
-            at(&doc, e.path()).map(shown).unwrap_or_else(|| "(missing)".into())
-        };
         let default = serde_json::to_value(AppConfig::default()).ok().and_then(|d| at(&d, e.path()).cloned());
+        let value = shown_bad_value(&doc, e.path(), default.as_ref(), secret);
         let fix = match default {
             _ if secret => format!("remove `{key}`; secrets are kept in the encrypted store, not in config.json"),
             Some(Value::Null) | None => format!("correct it, or remove `{key}`"),
             Some(d) => format!("write a value like the default, {}, or remove `{key}` to use the default", shown(&d)),
         };
-        anyhow::anyhow!("{}: `{key}` = {value} cannot be read ({}). Fix: {fix}.", file.display(), why(&e.inner().to_string()))
+        let value = value.map(|v| format!(" = {v}")).unwrap_or_default();
+        anyhow::anyhow!("{}: `{key}`{value} cannot be read ({}). Fix: {fix}.", file.display(), why(&e.inner().to_string()))
     })
+}
+
+/// The bad value as a message may show it (P13.7c), or `None` for no value:
+/// `<removed>` under a secret's name; otherwise only a plain number, bool or
+/// string written where a number or bool belongs (`web_port: "eighty"`),
+/// through [`shown`]. Never an object or array (it may hold a secret), never
+/// a string where a string, an enum or a path belongs (`"auth": "Bearer …"`).
+fn shown_bad_value(doc: &Value, path: &serde_path_to_error::Path, default: Option<&Value>, secret: bool) -> Option<String> {
+    if secret {
+        return Some("<removed>".into());
+    }
+    let scalar_field = matches!(default, Some(Value::Number(_) | Value::Bool(_)));
+    match at(&without_secrets(doc), path)? {
+        v @ (Value::Number(_) | Value::Bool(_) | Value::String(_)) if scalar_field => Some(shown(v)),
+        _ => None,
+    }
 }
 
 /// What serde says is wrong, without the value it repeats ("invalid type:
@@ -406,6 +487,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// `data\backups\config` of the install `path` belongs to.
+    fn fallback(path: &Path) -> PathBuf {
+        path.parent().unwrap().join("data").join("backups").join("config")
+    }
+
     #[test]
     fn an_unknown_key_is_named_with_the_closest_known_one() {
         let doc = json!({
@@ -478,7 +564,7 @@ mod tests {
             "repair": { "llm_max_tokens": 900 },
             "extra_accounts": [ { "name": "a", "token": "array-secret-test" } ] }"#).unwrap();
 
-        let up = upgrade_file(&path).unwrap().expect("upgraded");
+        let up = upgrade_file(&path, &fallback(&path)).unwrap().expect("upgraded");
         assert_eq!(up.backup, dir.path().join("config.json.v1.bak"));
         let copy = std::fs::read_to_string(&up.backup).unwrap();
         assert!(copy.contains("imap_server") && copy.contains("8091"), "the copy is the old file");
@@ -499,10 +585,10 @@ mod tests {
         assert_eq!(doc["mail"]["poll_interval_secs"], 30);
         assert_eq!((doc["web_port"].as_u64(), doc["graph"]["mailbox"].as_str()), (Some(8091), Some("ingest@station.example")));
 
-        assert!(upgrade_file(&path).unwrap().is_none(), "once");
+        assert!(upgrade_file(&path, &fallback(&path)).unwrap().is_none(), "once");
         // A later v1 file (restored by hand) never overwrites the first copy.
         std::fs::write(&path, r#"{ "ollama_model": "model-test" }"#).unwrap();
-        let second = upgrade_file(&path).unwrap().expect("upgraded");
+        let second = upgrade_file(&path, &fallback(&path)).unwrap().expect("upgraded");
         assert_eq!(second.backup, dir.path().join("config.json.v1.2.bak"));
         assert_eq!(std::fs::read_to_string(&up.backup).unwrap(), copy);
     }
@@ -513,11 +599,11 @@ mod tests {
         let path = dir.path().join("config.json");
         let v1 = r#"{ "ollama_model": "model-test", "web_port": "eighty" }"#;
         std::fs::write(&path, v1).unwrap();
-        let err = upgrade_file(&path).unwrap_err().to_string();
+        let err = upgrade_file(&path, &fallback(&path)).unwrap_err().to_string();
         assert!(err.contains("`web_port` = \"eighty\""), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v1, "config.json is as it was");
         // P13.7b: no copy is left behind, start after start.
-        let _ = upgrade_file(&path);
+        let _ = upgrade_file(&path, &fallback(&path));
         let left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(left, ["config.json"]);
     }
@@ -529,6 +615,7 @@ mod tests {
         let file = Path::new("config.json");
         let err = parse(r#"{ "web_port": "https://user:pw-test@host.example/x?key=query-secret-test" }"#, file).unwrap_err().to_string();
         assert!(err.contains("`web_port` = \"https://host.example/x\""), "{err}");
+        assert_eq!(err.matches("host.example").count(), 1, "the value once, as shown: {err}");
         for leak in ["pw-test", "query-secret-test", "user:"] {
             assert!(!err.contains(leak), "{leak} in: {err}");
         }
@@ -539,8 +626,96 @@ mod tests {
         assert!(!err.contains("12345678"), "{err}");
 
         let err = parse(r#"{ "llm": { "mode": "very-secret-mode" } }"#, file).unwrap_err().to_string();
-        assert!(!err.contains("very-secret-mode") || err.contains("= \"very-secret-mode\""), "only in the shown value: {err}");
-        assert!(err.contains("expected one of"), "{err}");
+        assert!(!err.contains("very-secret-mode"), "an enum's value is never shown: {err}");
+        assert!(err.contains("`llm.mode` cannot be read") && err.contains("expected one of"), "{err}");
+    }
+
+    /// P13.7c: an object or array in the wrong place, a string where a mode or
+    /// a path belongs: no value at all, only the key and what is expected.
+    #[test]
+    fn no_value_is_shown_from_an_object_an_enum_or_a_path() {
+        let file = Path::new("config.json");
+        for (doc, key, leak) in [
+            (r#"{ "llm": { "auth": { "api_key": "sk-nested-planted" } } }"#, "llm.auth", "sk-nested-planted"),
+            (r#"{ "tls": { "cert_path": { "password": "pfx-pw-planted" } } }"#, "tls.cert_path", "pfx-pw-planted"),
+            (r#"{ "llm": { "auth": "Bearer sk-bearer-planted" } }"#, "llm.auth", "sk-bearer-planted"),
+            (r#"{ "web_port": { "token": "tok-planted" } }"#, "web_port", "tok-planted"),
+        ] {
+            let err = parse(doc, file).unwrap_err().to_string();
+            assert!(err.contains(&format!("`{key}` cannot be read")), "{err}");
+            assert!(!err.contains(leak), "{leak} in: {err}");
+        }
+    }
+
+    /// P13.7c: every real setting survives the filter (or a new one is named in
+    /// NOT_SECRETS), and secret-looking names in any spelling are blanked.
+    #[test]
+    fn every_real_setting_survives_the_secret_filter() {
+        let mut c = AppConfig::default();
+        c.graph.client_secret_expires = chrono::NaiveDate::from_ymd_opt(2027, 1, 31);
+        let doc = serde_json::to_value(&c).unwrap();
+        assert_eq!(without_secrets(&doc), doc, "a real setting is blanked as a secret");
+        for auth in AUTH_MODES {
+            let d = json!({ "llm": { "auth": auth } });
+            assert_eq!(without_secrets(&d), d);
+        }
+        let planted = json!({
+            "clientSecret": "a1", "accessToken": "a2", "secret_key": "a3", "private_key": "a4", "tokens": "a5",
+            "Api-Key": "a6", "refresh-token": "a7", "x": { "Authorization": "a8", "auth": "Bearer a9" }, "list": [{ "cookie": "a10" }],
+        });
+        let text = without_secrets(&planted).to_string();
+        for n in 1..=10 {
+            assert!(!text.contains(&format!("\"a{n}\"")), "a{n} kept: {text}");
+        }
+    }
+
+    /// P13.7c: a failed rewrite removes the copy only when config.json is
+    /// still byte for byte as it was; a cut-short file keeps it, and the
+    /// error says where the good settings are.
+    #[test]
+    fn a_failed_rewrite_keeps_the_copy_unless_config_json_is_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let v1 = r#"{ "ollama_model": "model-test", "web_port": 8092 }"#;
+        let write = |p: &Path, s: &str| std::fs::write(p, s);
+
+        std::fs::write(&path, v1).unwrap();
+        let untouched = |_: &AppConfig, _: &Path| -> Result<()> { anyhow::bail!("disk full (test)") };
+        let err = upgrade_file_with(&path, &fallback(&path), &write, &untouched).unwrap_err();
+        assert!(format!("{err:#}").contains("unchanged"), "{err:#}");
+        assert!(!dir.path().join("config.json.v1.bak").exists(), "an unchanged file needs no copy");
+
+        let cut_short = |_: &AppConfig, p: &Path| -> Result<()> {
+            std::fs::write(p, "{ \"web_po").unwrap();
+            anyhow::bail!("disk full (test)")
+        };
+        let err = format!("{:#}", upgrade_file_with(&path, &fallback(&path), &write, &cut_short).unwrap_err());
+        let copy = dir.path().join("config.json.v1.bak");
+        assert!(copy.exists(), "the only good copy is kept");
+        assert!(err.contains(&copy.display().to_string()), "{err}");
+        assert!(std::fs::read_to_string(&copy).unwrap().contains("8092"));
+    }
+
+    /// P13.7c: the copy goes to data\backups\config when the folder of
+    /// config.json refuses new files.
+    #[test]
+    fn the_copy_goes_to_the_data_folder_when_the_install_folder_refuses_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{ "ollama_model": "model-test" }"#).unwrap();
+        let fb = fallback(&path);
+        let refuse_beside = |p: &Path, s: &str| {
+            if p.parent() == Some(dir.path()) {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                std::fs::write(p, s)
+            }
+        };
+        let up = upgrade_file_with(&path, &fb, &refuse_beside, &|c, p| c.save_to_file(p)).unwrap().expect("upgraded");
+        assert_eq!(up.backup, fb.join("config.json.v1.bak"));
+        assert!(std::fs::read_to_string(&up.backup).unwrap().contains("model-test"));
+        assert!(!dir.path().join("config.json.v1.bak").exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"model\": \"model-test\""), "upgraded");
     }
 
     #[test]
@@ -551,7 +726,7 @@ mod tests {
         assert!(err.contains("default, 8080"), "{err}");
 
         let err = parse(r#"{ "security": { "trusted_proxies": ["10.0.0.5/32", 7] } }"#, file).unwrap_err().to_string();
-        assert!(err.contains("`security.trusted_proxies[1]` = 7"), "{err}");
+        assert!(err.contains("`security.trusted_proxies[1]` cannot be read"), "no value where a string belongs: {err}");
 
         // A v1 key with a bad value is named by its v2 place.
         let err = parse(r#"{ "email_poll_interval_secs": "often" }"#, file).unwrap_err().to_string();

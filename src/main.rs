@@ -1147,9 +1147,12 @@ async fn run_daemon(
     let config_path = paths.config.clone();
     // Config v2 (P13.7): the flat v1 keys move into their sections, once, with a
     // copy of the old file (secrets blanked) kept beside it.
-    match omni_core::config_v2::upgrade_file(&config_path) {
+    match omni_core::config_v2::upgrade_file(&config_path, &paths.data.join("backups").join("config")) {
         Ok(Some(up)) => {
             info!("config.json upgraded to the v2 layout; the old file is kept as {:?}", up.backup);
+            if up.backup.parent() != config_path.parent() {
+                info!("The folder of config.json does not accept new files from this account, so the copy is in {:?} instead", up.backup.parent().unwrap_or(&up.backup));
+            }
             for m in &up.moved {
                 info!("config.json: {m}");
             }
