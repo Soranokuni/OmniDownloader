@@ -106,7 +106,7 @@ const SECRET_WORDS: [&str; 10] =
 /// secrets (normalised names). `every_real_setting_survives_the_secret_filter`
 /// derives this list from `AppConfig`: a new setting that trips the filter
 /// fails that test until it is named here.
-const NOT_SECRETS: [&str; 4] = ["maxtokens", "llmmaxtokens", "clientsecretexpires", "auth"];
+const NOT_SECRETS: [&str; 5] = ["maxtokens", "llmmaxtokens", "clientsecretexpires", "auth", "authmode"];
 
 /// `llm.auth`'s values: how the key is sent, not the key.
 const AUTH_MODES: [&str; 3] = ["none", "bearer", "api_key_header"];
@@ -176,12 +176,17 @@ fn write_backup(config: &Path, fallback: &Path, copy: &str, write: &dyn Fn(&Path
     match write(&beside, copy) {
         Ok(()) => Ok(beside),
         Err(first) => {
+            // A copy cut short there is no copy (P13.7d). The name was free, so this is ours.
+            let _ = std::fs::remove_file(&beside);
             std::fs::create_dir_all(fallback)
                 .with_context(|| format!("Cannot keep a copy of the old settings ({first} beside config.json, and {} cannot be made); config.json is unchanged", fallback.display()))?;
             let there = backup_path(config, fallback);
-            write(&there, copy).with_context(|| {
-                format!("Cannot keep a copy of the old settings beside config.json ({first}) or as {}; config.json is unchanged", there.display())
-            })?;
+            if let Err(e) = write(&there, copy) {
+                let _ = std::fs::remove_file(&there);
+                return Err(e).with_context(|| {
+                    format!("Cannot keep a copy of the old settings beside config.json ({first}) or as {}; config.json is unchanged", there.display())
+                });
+            }
             Ok(there)
         }
     }
@@ -315,7 +320,10 @@ fn shown_bad_value(doc: &Value, path: &serde_path_to_error::Path, default: Optio
     }
     let scalar_field = matches!(default, Some(Value::Number(_) | Value::Bool(_)));
     match at(&without_secrets(doc), path)? {
-        v @ (Value::Number(_) | Value::Bool(_) | Value::String(_)) if scalar_field => Some(shown(v)),
+        v @ (Value::Number(_) | Value::Bool(_)) if scalar_field => Some(shown(v)),
+        // Text where a number or yes/no belongs may be a key pasted in the
+        // wrong place (P13.7d): its kind and length only, never the text.
+        Value::String(s) if scalar_field => Some(format!("(text, {} characters)", s.chars().count())),
         _ => None,
     }
 }
@@ -335,7 +343,7 @@ fn why(inner: &str) -> String {
 pub fn parse(text: &str, file: &Path) -> Result<AppConfig> {
     let mut doc: Value = serde_json::from_str(text).map_err(|e| {
         anyhow::anyhow!(
-            "{} is not valid JSON: {e}. Fix: correct line {} (a missing comma or quote is the usual cause), or restore {} from a copy (config.json.prev, config.json.v1.bak).",
+            "{} is not valid JSON: {e}. Fix: correct line {} (a missing comma or quote is the usual cause), or restore {} from a copy: config.json.prev or config.json.v1.bak beside it, or config.json.v1.bak in data\\backups\\config\\.",
             file.display(),
             e.line(),
             file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
@@ -600,7 +608,7 @@ mod tests {
         let v1 = r#"{ "ollama_model": "model-test", "web_port": "eighty" }"#;
         std::fs::write(&path, v1).unwrap();
         let err = upgrade_file(&path, &fallback(&path)).unwrap_err().to_string();
-        assert!(err.contains("`web_port` = \"eighty\""), "{err}");
+        assert!(err.contains("`web_port` = (text, 6 characters)"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), v1, "config.json is as it was");
         // P13.7b: no copy is left behind, start after start.
         let _ = upgrade_file(&path, &fallback(&path));
@@ -614,9 +622,9 @@ mod tests {
     fn a_bad_value_message_holds_no_credential_query_or_secret() {
         let file = Path::new("config.json");
         let err = parse(r#"{ "web_port": "https://user:pw-test@host.example/x?key=query-secret-test" }"#, file).unwrap_err().to_string();
-        assert!(err.contains("`web_port` = \"https://host.example/x\""), "{err}");
-        assert_eq!(err.matches("host.example").count(), 1, "the value once, as shown: {err}");
-        for leak in ["pw-test", "query-secret-test", "user:"] {
+        // P13.7d: text where a number belongs is described, never shown.
+        assert!(err.contains("`web_port` = (text, 57 characters)"), "{err}");
+        for leak in ["pw-test", "query-secret-test", "user:", "host.example"] {
             assert!(!err.contains(leak), "{leak} in: {err}");
         }
         assert!(err.contains("expected u16"), "{err}");
@@ -659,6 +667,11 @@ mod tests {
             let d = json!({ "llm": { "auth": auth } });
             assert_eq!(without_secrets(&d), d);
         }
+        // Read but not written back: the removed auth_mode is a setting too (P13.7d).
+        for extra in KNOWN_EXTRA.iter().filter(|k| !k.contains('.') && !is_secret_key(k) || **k == "auth_mode") {
+            let d = json!({ *extra: "open_mcr" });
+            assert_eq!(without_secrets(&d), d, "{extra}");
+        }
         let planted = json!({
             "clientSecret": "a1", "accessToken": "a2", "secret_key": "a3", "private_key": "a4", "tokens": "a5",
             "Api-Key": "a6", "refresh-token": "a7", "x": { "Authorization": "a8", "auth": "Bearer a9" }, "list": [{ "cookie": "a10" }],
@@ -696,6 +709,27 @@ mod tests {
         assert!(std::fs::read_to_string(&copy).unwrap().contains("8092"));
     }
 
+    /// P13.7d: a copy cut short beside config.json is removed before the
+    /// fallback is used, so no half copy is left to be restored by mistake.
+    #[test]
+    fn a_copy_cut_short_beside_config_json_is_removed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{ "ollama_model": "model-test" }"#).unwrap();
+        let fb = fallback(&path);
+        let half_then_fail = |p: &Path, s: &str| {
+            if p.parent() == Some(dir.path()) {
+                std::fs::write(p, &s[..s.len() / 2])?;
+                Err(std::io::Error::other("disk full (test)"))
+            } else {
+                std::fs::write(p, s)
+            }
+        };
+        let up = upgrade_file_with(&path, &fb, &half_then_fail, &|c, p| c.save_to_file(p)).unwrap().expect("upgraded");
+        assert_eq!(up.backup, fb.join("config.json.v1.bak"));
+        assert!(!dir.path().join("config.json.v1.bak").exists(), "the half copy is gone");
+    }
+
     /// P13.7c: the copy goes to data\backups\config when the folder of
     /// config.json refuses new files.
     #[test]
@@ -722,19 +756,27 @@ mod tests {
     fn a_value_of_the_wrong_kind_names_the_key_the_value_and_the_default() {
         let file = Path::new("config.json");
         let err = parse(r#"{ "web_port": "eighty" }"#, file).unwrap_err().to_string();
-        assert!(err.contains("`web_port` = \"eighty\""), "{err}");
+        assert!(err.contains("`web_port` = (text, 6 characters)"), "{err}");
         assert!(err.contains("default, 8080"), "{err}");
+        let err = parse(r#"{ "web_port": 70000 }"#, file).unwrap_err().to_string();
+        assert!(err.contains("`web_port` = 70000"), "a number is shown as written: {err}");
+
+        // P13.7d: a key pasted into a number field never reaches the message.
+        let err = parse(r#"{ "max_concurrent_downloads": "sk-proj-pasted-planted-0123456789abcdefghijklmnopqrstu" }"#, file).unwrap_err().to_string();
+        assert!(!err.contains("sk-proj") && !err.contains("planted"), "{err}");
+        assert!(err.contains("`max_concurrent_downloads` = (text, 54 characters)"), "{err}");
 
         let err = parse(r#"{ "security": { "trusted_proxies": ["10.0.0.5/32", 7] } }"#, file).unwrap_err().to_string();
         assert!(err.contains("`security.trusted_proxies[1]` cannot be read"), "no value where a string belongs: {err}");
 
         // A v1 key with a bad value is named by its v2 place.
         let err = parse(r#"{ "email_poll_interval_secs": "often" }"#, file).unwrap_err().to_string();
-        assert!(err.contains("`mail.poll_interval_secs` = \"often\""), "{err}");
+        assert!(err.contains("`mail.poll_interval_secs` = (text, 5 characters)"), "{err}");
         assert!(err.contains("default, 20"), "{err}");
 
         let err = parse("{ \"web_port\": 8080,, }", file).unwrap_err().to_string();
         assert!(err.contains("not valid JSON") && err.contains("line 1"), "{err}");
+        assert!(err.contains("config.json.v1.bak beside it") && err.contains(r"data\backups\config\"), "both places for the copy: {err}");
     }
 
     /// Every reader (the CLI, the installer) sees a v1 file as v2 before the

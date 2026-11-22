@@ -570,13 +570,13 @@ the section is kept.
 
 **A value that cannot be used.** The service names the key, the value and the
 fix, in the log and in the error when it refuses to start, for example
-``config.json: `web_port` = "eighty" cannot be read (expected u16). Fix:
-write a value like the default, 8080, or remove `web_port` to use the
-default.`` A value is shown only where a number or yes/no belongs; a web
-address is shown without its user name, password or query, long values are
-cut, the value of a password, secret, key, token, cookie or credential is
-`<removed>`, and a section, a list, a mode or a path in the wrong place is
-named without its value. It refuses to start with a value of the
+``config.json: `web_port` = (text, 6 characters) cannot be read (expected
+u16). Fix: write a value like the default, 8080, or remove `web_port` to use
+the default.`` A wrong number or yes/no is shown as written; text written
+where a number or yes/no belongs is described by its length only (it may be
+a key pasted in the wrong place); the value of a password, secret, key,
+token, cookie or credential is `<removed>`; and a section, a list, a mode or
+a path in the wrong place is named without its value. It refuses to start with a value of the
 wrong kind, a `web_port` of 0 or an empty `watchfolder_path`. A value outside
 the range the service reads it in (concurrent downloads 1–10, concurrent
 encodes 1–8, `mail.poll_interval_secs` 10–3600, `retry.max_age_mins`
