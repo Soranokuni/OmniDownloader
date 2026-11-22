@@ -655,6 +655,17 @@ export default {
   'user.page.send': 'Αποστολή',
   'user.page.notify': 'Ειδοποίησέ με όταν ολοκληρωθεί ένα βίντεο μου',
   'user.page.mine': 'Οι αποστολές μου',
+  // ---- Held videos' reminder (notify.js) and the cookie sites (mcr.js), P12.14 ----
+  'notify.held.waiting.one': 'Ένα βίντεο περιμένει έγκριση',
+  'notify.held.waiting.other': '{n} βίντεο περιμένουν έγκριση',
+  'cookies.wait.title.one': '1 βίντεο περιμένει σύνδεση στο {site}',
+  'cookies.wait.title.other': '{n} βίντεο περιμένουν σύνδεση στο {site}',
+  'cookies.wait.missing': 'Δεν υπάρχουν cookies σύνδεσης για το {site}, και ο ιστότοπος δίνει τα βίντεο μόνο σε συνδεδεμένους.',
+  'cookies.wait.expired': 'Τα cookies σύνδεσης για το {site} έληξαν.',
+  'cookies.wait.failed': 'Τα cookies σύνδεσης για το {site} δεν κάνουν πια σύνδεση (απέτυχαν στον τελευταίο έλεγχο).',
+  'cookies.wait.todo': 'Τι γίνεται: ο διαχειριστής ανεβάζει νέα cookies για το {site} στη Διαχείριση → Cookies. Μετά τα βίντεο ξαναδοκιμάζονται μόνα τους· δεν χρειάζεται να πατήσετε κάτι.',
+  'cookies.wait.newest': 'Το νεότερο: {name}, {at}',
+  'help.board': 'Πίνακας τοίχου (ανοίγει σε νέα καρτέλα)',
   // ---- The wall board (board.html, board.js, P12.13) ----
   'board.title': 'OmniDownloader — Πίνακας MCR',
   'board.heading': 'Πίνακας MCR',

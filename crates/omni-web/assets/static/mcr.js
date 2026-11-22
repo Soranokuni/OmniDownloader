@@ -15,25 +15,25 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=8';
+import { toast } from '/static/toast.js?v=9';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo, slugPreview,
-} from '/static/desk.js?v=25';
-import { deferAction, visible } from '/static/undo.js?v=9';
-import { infoDialog } from '/static/dialog.js?v=8';
-import { STATUS, statusBadge } from '/static/status.js?v=8';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=8';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=32';
+} from '/static/desk.js?v=26';
+import { deferAction, visible } from '/static/undo.js?v=10';
+import { infoDialog } from '/static/dialog.js?v=9';
+import { STATUS, statusBadge } from '/static/status.js?v=9';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=9';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=33';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=20';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=20';
-import { t, tn, applyText } from '/static/text.js?v=7';
-import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=6';
+} from '/static/notify.js?v=21';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=21';
+import { t, tn, applyText } from '/static/text.js?v=8';
+import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=7';
 
 // The page's fixed words (header, tabs, the broadcast specification) come
 // from the same dictionary as everything else (P12.7).
@@ -759,7 +759,7 @@ function reconcileChildren(host, wanted) {
  *  of every job whose `sig(job)` is unchanged. With `heading(job)` (a label,
  *  or null), a small heading precedes the first job of each run of one label;
  *  `headingText(label, n)` words it, with `n` the jobs under it. */
-function syncKeyedList(list, host, jobs, { build, sig, heading = null, headingText = (label) => label }) {
+function syncKeyedList(list, host, jobs, { build, sig, heading = null, headingText = (label) => label, afterHeading = null }) {
   if (!host) return;
   const wanted = [];
   const restores = [];
@@ -794,6 +794,9 @@ function syncKeyedList(list, host, jobs, { build, sig, heading = null, headingTe
         if (node.textContent !== text) node.textContent = text;
         days.set(key, node);
         wanted.push(node);
+        // A group's own block under its heading (the cookie sites, P12.14), the first time only.
+        const extra = afterHeading && n === 0 ? afterHeading(label) : null;
+        if (extra) wanted.push(extra);
       }
       day = label;
     }
@@ -864,15 +867,60 @@ async function loadReview() {
     render('review-cards', el('div', { class: 'card center' },
       t(filtered ? 'review.no_match' : 'review.empty')));
   } else {
+    await loadCookieWaits();
     syncKeyedList(reviewList, document.getElementById('review-cards'), jobs, {
       build: reviewCard,
       sig: (job) => JSON.stringify([job, renameOpen.has(job.id)]),
       heading: (job) => groupLabel(groupOf(job)) || null,
       headingText: (label, n) => `${label} · ${n}`,
+      afterHeading: (label) => (label === groupLabel('cookies') && cookieWaits.childElementCount ? cookieWaits : null),
     });
     for (const id of historyOpen) restoreHistoryScroll(id);
   }
   pager('review-pager', pages.review, data.total || 0, loadReview);
+}
+
+/* The sites whose login holds videos back (P11.12, P12.14): one card per
+ * site at the top of «Χρειάζεται σύνδεση (cookies)», from
+ * `/api/cookies/waiting`. It says how many videos wait, why (the site's
+ * cookie jar is missing, expired or failed its test) and that the
+ * administrator renews it in Διαχείριση → Cookies; the videos stay listed
+ * under it, and go again by themselves once the jar works (P11.5). A server
+ * without the route (404) shows no card; another failure keeps the last one. */
+const cookieWaits = el('div', { class: 'cookie-waits stack' });
+const JAR_REASON = {
+  missing: 'cookies.wait.missing',
+  expired: 'cookies.wait.expired',
+  failed: 'cookies.wait.failed',
+};
+
+/** The cards for an answer of `/api/cookies/waiting` (pure: nodes only). */
+function cookieWaitCards(data) {
+  return (data && Array.isArray(data.sites) ? data.sites : []).filter((s) => s && s.site && s.count > 0).map((s) => {
+    const newest = s.newest_slug
+      ? t('cookies.wait.newest', { name: `${s.newest_slug}.mxf`, at: fmtTime(s.newest_at) })
+      : '';
+    return el('div', { class: 'card attention cookie-wait', 'data-site': s.site },
+      el('h3', { class: 'job-name' }, tn('cookies.wait.title', s.count, { site: s.site })),
+      el('p', { class: 'wl-why' }, t(JAR_REASON[s.jar] || 'cookies.wait.failed', { site: s.site })),
+      el('p', { class: 'note' }, t('cookies.wait.todo', { site: s.site })),
+      newest ? el('p', { class: 'note' }, newest) : null);
+  });
+}
+
+async function loadCookieWaits() {
+  let data;
+  try {
+    data = await api('/api/cookies/waiting');
+  } catch (e) {
+    // An older server has no such route: no card. Anything else keeps what is shown.
+    if (e.status === 404) { cookieWaits.replaceChildren(); cookieWaits.dataset.sig = ''; }
+    return;
+  }
+  const sig = JSON.stringify(data && data.sites);
+  if (cookieWaits.dataset.sig === sig) return;
+  cookieWaits.dataset.sig = sig;
+  cookieWaits.replaceChildren(...cookieWaitCards(data));
 }
 
 /* A review card's history (P7.15). The cards are rebuilt every 5 s, so what is
@@ -1321,6 +1369,8 @@ function showSpecs() {
 
 document.getElementById('help-specs').addEventListener('click', () => { closeHelp(true); showSpecs(); });
 document.getElementById('help-keys').addEventListener('click', () => { closeHelp(true); showShortcuts(); });
+// The board opens in a tab of its own; the menu closes behind it.
+document.getElementById('help-board').addEventListener('click', () => closeHelp(false));
 
 document.getElementById('logout-btn').addEventListener('click', logout);
 
@@ -1449,7 +1499,10 @@ const seenStage = new Map();
 
 let liveSource = null;
 try {
-  liveSource = new EventSource('/api/events');
+  // `desk=1`: this is an MCR desk (P11.10). The server counts the desks that
+  // are open, and a held video's approval clock runs only while one is. Only
+  // the desk says so: the admin panel and the wall board open no such stream.
+  liveSource = new EventSource('/api/events?desk=1');
   liveSource.onmessage = onLiveMessage;
 } catch { /* polling alone */ }
 // Events are an accelerator; the poll stays the source of truth (new, requeued

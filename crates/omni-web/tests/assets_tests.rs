@@ -378,23 +378,23 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 25),
-        ("inbox.js", 32),
-        ("approval.js", 20),
-        ("notify.js", 20),
-        ("mcr.js", 58),
-        ("status.js", 8),
-        ("status.css", 10),
-        ("worklist.js", 8),
-        ("undo.js", 9),
-        ("dialog.js", 8),
-        ("keys.js", 6),
-        ("sound.js", 5),
-        ("board.js", 1),
-        ("user.js", 18),
-        ("toast.js", 8),
-        ("text.js", 7),
-        ("text.el.js", 7),
+        ("desk.js", 26),
+        ("inbox.js", 33),
+        ("approval.js", 21),
+        ("notify.js", 21),
+        ("mcr.js", 59),
+        ("status.js", 9),
+        ("status.css", 11),
+        ("worklist.js", 9),
+        ("undo.js", 10),
+        ("dialog.js", 9),
+        ("keys.js", 7),
+        ("sound.js", 6),
+        ("board.js", 2),
+        ("user.js", 19),
+        ("toast.js", 9),
+        ("text.js", 8),
+        ("text.el.js", 8),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -409,7 +409,8 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     }
     let mcr = assets.get("static/mcr.js").expect("mcr.js shipped");
     assert!(mcr.contains("applyJobEvent"), "mcr.js does not apply job events in place");
-    assert!(mcr.contains("new EventSource('/api/events')"), "mcr.js opens no stream of its own");
+    // P12.14: the desk's stream carries `desk=1` (it counts as an open desk).
+    assert!(mcr.contains("new EventSource('/api/events?desk=1')"), "mcr.js opens no stream of its own");
     assert!(!mcr.contains("live(() =>"), "mcr.js still refetches everything per event");
     // Events are an accelerator: the 5 s poll must not depend on the stream, or new, requeued
     // and reaped jobs and health changes (which send no event) would lag.
@@ -472,7 +473,8 @@ fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
     let notify = assets.get("static/notify.js").expect("notify.js shipped");
     assert!(notify.contains("  workers: '"), "CHECK_WHO has no entry for the workers check");
     assert!(notify.contains("queue.late"), "notify.js does not read queue.late");
-    let need = notify.split("function needCount").nth(1).and_then(|s| s.split('}').next()).unwrap();
+    // P12.14: the needs-a-person count is `personCount` (held videos have their own reminder).
+    let need = notify.split("function personCount").nth(1).and_then(|s| s.split('}').next()).unwrap();
     assert!(!need.contains("late"), "late videos must not count as needing a person");
 
     let desk = assets.get("static/desk.js").expect("desk.js shipped");
@@ -1283,11 +1285,12 @@ fn the_desk_sounds_are_chosen_per_browser() {
     assert!(due.contains("if (oldestAt === null || !Number.isFinite(oldestAt)) return false;"), "an unknown wait reminds");
     assert!(due.contains("return now - oldestAt >= span && (!last || now - last >= span);"), "the reminder does not wait N minutes, or repeats faster");
     let remind = function_body(&notify, "remind");
-    assert!(remind.contains("if (needCount(q) === 0) { lastRemind = 0; return; }"), "the reminder does not start afresh when nothing waits");
+    assert!(remind.contains("if (personCount(q) === 0) { lastRemind = 0; return; }"), "the reminder does not start afresh when nothing waits");
     assert!(remind.contains("if (!p.on || !p.remind || reminding) return;"), "the reminder ignores its switch");
     assert!(remind.contains("now - lastRemindCheck < REMIND_CHECK_MS"), "the lists are fetched on every status poll");
     let oldest = function_body(&notify, "oldestWaitAt");
-    assert!(oldest.contains("view=review") && oldest.contains("view=approval"), "the reminder does not read both waiting lists");
+    // P12.14: held videos have their own reminder (`checkHeld`), so this one reads the review list only.
+    assert!(oldest.contains("view=review") && !oldest.contains("view=approval"), "a held video is reminded twice");
     assert!(oldest.contains("Number.isFinite(at) && (oldest === null || at < oldest)"), "a missing time is taken as some time");
     assert!(words["notify.remind.other"].contains("{n} λεπτά"), "the reminder does not say how long");
 }
@@ -1361,10 +1364,10 @@ fn only_desk_work_on_the_desk() {
     assert!(page.contains("id=\"help-btn\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"help-menu\""), "no help menu button");
     let menu = page.split("id=\"help-menu\"").nth(1).and_then(|s| s.split("</div>").next()).expect("the help menu");
     assert!(menu.contains("role=\"menu\""), "the help menu is not a menu");
-    for item in ["id=\"help-specs\"", "id=\"help-keys\""] {
+    for item in ["id=\"help-specs\"", "id=\"help-keys\"", "id=\"help-board\""] {
         assert!(menu.contains(item), "the help menu lacks {item}");
     }
-    assert!(menu.matches("role=\"menuitem\"").count() == 2, "the help menu's items are not menu items");
+    assert!(menu.matches("role=\"menuitem\"").count() == 3, "the help menu's items are not menu items");
     for key in ["'ArrowDown'", "'ArrowUp'", "'Home'", "'End'", "'Escape'", "'Tab'"] {
         assert!(mcr.contains(&format!("ev.key === {key}")), "the help menu ignores {key}");
     }
@@ -1512,12 +1515,74 @@ fn the_wall_board_only_shows() {
     assert!(css.contains(".board-page { font-size: 22px; }"), "the board's text is not large");
 }
 
+/// P12.14, the desk side of P11.10 and P11.12. Only the desk marks its event stream `desk=1`
+/// (the held videos' clock runs while a desk is open); the held reminder comes 15 min after the
+/// oldest was held, then every `remind_every_mins`, with the held sound and the reminder switch;
+/// one card per site whose login holds videos, at the top of the cookies group; a server
+/// without either route (404) shows nothing and no error; every word by key.
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v18() {
+fn the_desk_counts_itself_reminds_held_videos_and_names_the_login_sites() {
+    let assets = all_assets();
+    let words = desk_dictionary(&assets);
+    let code = |module: &str| -> String {
+        let src = assets.get(&format!("static/{module}")).unwrap_or_else(|| panic!("{module} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+
+    // Desk presence: the desk, and nothing else.
+    for (path, src) in &assets {
+        if !path.ends_with(".js") && !path.ends_with(".html") {
+            continue;
+        }
+        let marks = src.matches("desk=1").count();
+        if path == "static/mcr.js" {
+            assert!(code("mcr.js").contains("new EventSource('/api/events?desk=1')"), "the desk does not count itself");
+            assert_eq!(src.matches("EventSource(").count(), 1, "the desk opens a second stream");
+        } else {
+            assert_eq!(marks, 0, "{path} counts itself as a desk");
+        }
+    }
+    assert!(code("app.js").contains("new EventSource('/api/events')"), "the admin panel's stream changed");
+
+    // The held reminder: pure timing, then the switches.
+    let notify = code("notify.js");
+    let due = function_body(&notify, "heldReminderDue");
+    assert!(due.contains("if (now - oldestAt < firstMins * 60000) return false;"), "the first reminder does not wait 15 minutes");
+    assert!(due.contains("return !last || now - last >= everyMins * 60000;"), "the reminder does not repeat at the server's interval");
+    assert!(due.contains("oldestAt === null || !Number.isFinite(oldestAt)"), "an unknown time reminds");
+    assert!(notify.contains("const HELD_FIRST_MINS = 15;"), "the first reminder is not at 15 minutes");
+    let check = function_body(&notify, "checkHeld");
+    assert!(check.contains("api('/api/held/waiting')"), "the reminder does not read the held videos");
+    assert!(check.contains("if (e.status === 404) heldGone = true;"), "a server without the held route errs or keeps asking");
+    assert!(check.contains("if (!p.on || !p.remind) return;"), "the held reminder ignores the reminder switch");
+    assert!(check.contains("play('held')") && check.contains("tn('notify.held.waiting', held.count)"), "the held reminder has the wrong sound or words");
+    assert!(check.contains("Number(held.remind_every_mins) || 30"), "the server's interval is not used");
+    assert!(words["notify.held.waiting.other"] == "{n} βίντεο περιμένουν έγκριση", "the held reminder's words");
+
+    // The cookie sites.
+    let mcr = code("mcr.js");
+    let cards = function_body(&mcr, "cookieWaitCards");
+    assert!(cards.contains("tn('cookies.wait.title', s.count, { site: s.site })"), "the card does not say how many wait where");
+    assert!(cards.contains("t(JAR_REASON[s.jar] || 'cookies.wait.failed', { site: s.site })") && cards.contains("t('cookies.wait.todo'"), "the card does not say why or what to do");
+    for (jar, key) in [("missing", "cookies.wait.missing"), ("expired", "cookies.wait.expired"), ("failed", "cookies.wait.failed")] {
+        assert!(mcr.contains(&format!("  {jar}: '{key}',")) && words.contains_key(key), "no reason for a jar that is {jar}");
+    }
+    assert!(words["cookies.wait.todo"].contains("Διαχείριση → Cookies"), "the card does not send the administrator to the cookies");
+    let load = function_body(&mcr, "loadCookieWaits");
+    assert!(load.contains("api('/api/cookies/waiting')") && load.contains("if (e.status === 404) { cookieWaits.replaceChildren();"), "a server without the route shows an error or an old card");
+    assert!(mcr.contains("afterHeading: (label) => (label === groupLabel('cookies') && cookieWaits.childElementCount ? cookieWaits : null),"), "the cards are not in the cookies group");
+
+    // «Βοήθεια» → the board, in a tab of its own.
+    let page = assets.get("mcr.html").unwrap();
+    assert!(page.contains("id=\"help-board\" tabindex=\"-1\" href=\"/board\" target=\"_blank\" rel=\"noopener\""), "no way to the board from the desk");
+}
+
+#[test]
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v19() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=18"), "user.html does not import user.js?v=18");
-    assert!(!page.contains("/static/user.js?v=17"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=19"), "user.html does not import user.js?v=19");
+    assert!(!page.contains("/static/user.js?v=18"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();

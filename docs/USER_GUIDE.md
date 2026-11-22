@@ -134,7 +134,8 @@ switched on yet at every station; ask MCR.
   the right to queue a link by hand (§4.6).
 - **«Βοήθεια»** — beside it, a small menu: **«Προδιαγραφές εκπομπής»** (the
   broadcast specification every delivered file meets) and
-  **«Συντομεύσεις πληκτρολογίου»** (the keyboard shortcuts).
+  **«Συντομεύσεις πληκτρολογίου»** (the keyboard shortcuts) and
+  **«Πίνακας τοίχου»** (the wall board, §4.11, in a new tab).
 - **«Διαχείριση»** — the admin page (administrators only).
 - **«Καθυστερούν»** — a strip above the tabs, only while some video is late
   (§4.9).
@@ -291,6 +292,13 @@ you, grouped by what you have to do, not by date:
 | «Χειροκίνητη λήψη» | download the file by hand, put it into Dalet and press «Το έβαλα στο Dalet» |
 | «Άλλο» | usually «Δοκιμή ξανά»; the card says what to do |
 
+At the top of «Χρειάζεται σύνδεση (cookies)», a card per site says how many
+videos wait for a login there («3 βίντεο περιμένουν σύνδεση στο x.com»),
+why (the site's cookies are missing, expired, or no longer log in) and what
+to do: the administrator uploads new cookies in «Διαχείριση» → Cookies. The
+videos stay listed under it and are tried again by themselves once the
+cookies work; you do not need to press anything.
+
 Each card says in one sentence why the video waits, and shows one main
 action. Everything else («Δοκιμή ξανά», «Το έβαλα στο Dalet», «Μετονομασία…»,
 «Αφαίρεση», «Ιστορικό», another link) is under **«Περισσότερα»**. The error
@@ -349,6 +357,12 @@ longer than N minutes, and says so in a message; a video you hid from the
 review list does not count. The settings belong to this computer and browser
 only: a wall screen can stay quiet while the operator's screen plays. The
 pop-up messages always appear, with or without sound.
+
+While a video waits for «Έγκριση → Dalet», the desk reminds you 15 minutes
+after the oldest was held, and then every 30 minutes: «N βίντεο περιμένουν
+έγκριση», with the sound «Ένα βίντεο περιμένει έγκριση». It follows the same
+settings: nothing with «Υπενθύμιση» off, no sound with that sound off. A held video's approval
+time runs only while a desk is open (the wall board does not count).
 
 A message about something that went wrong (red) stays until you close it with
 «✕»; at most three are shown, the oldest going first. Other messages leave by

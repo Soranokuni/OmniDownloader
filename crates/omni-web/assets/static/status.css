@@ -162,7 +162,8 @@ body { font-size: 15px; }
     align-items: start;
   }
   #queue-cards > *, #review-cards > * { margin-top: 0; }
-  #queue-cards > .card.center, #review-cards > .card.center, #review-cards > .wl-group { grid-column: 1 / -1; }
+  #queue-cards > .card.center, #review-cards > .card.center, #review-cards > .wl-group,
+  #review-cards > .cookie-waits { grid-column: 1 / -1; }
 }
 
 /* What used to be inline styles in the desk's JS and pages. */
@@ -270,6 +271,10 @@ kbd {
   color: var(--text); cursor: pointer;
 }
 .menu-item:hover, .menu-item:focus-visible { background: rgba(34, 211, 238, 0.12); }
+a.menu-item { display: block; text-decoration: none; }
+/* The cookie sites at the top of their group (P12.14). */
+.cookie-waits { margin-bottom: 12px; }
+.cookie-wait .job-name { margin: 0 0 6px; }
 .side-panel {
   position: fixed; top: 0; right: 0; bottom: 0; z-index: 55;
   width: min(480px, 100vw); overflow-y: auto; padding: 20px;

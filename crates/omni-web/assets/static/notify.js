@@ -23,11 +23,11 @@
  */
 
 import { api, el } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=8';
-import { t, tn, has } from '/static/text.js?v=7';
+import { toast } from '/static/toast.js?v=9';
+import { t, tn, has } from '/static/text.js?v=8';
 import {
   play, unlock, soundPrefs, soundLocked, onSoundChange, openSoundSettings,
-} from '/static/sound.js?v=5';
+} from '/static/sound.js?v=6';
 
 const POLL_MS = 8000;
 const BASE_TITLE = document.title;
@@ -143,12 +143,8 @@ function sev(check) {
   return check ? (SEVERITY[check.state] ?? 0) : 0;
 }
 
-/** Everything that waits for a person, held videos included (the reminder's gate). */
-function needCount(q) {
-  return personCount(q) + (q.approval || 0);
-}
-
-/** Waits for a person to fix or decide: review, file-locker links, failures. */
+/** Waits for a person to fix or decide: review, file-locker links, failures
+ *  (a held video is its own news, with its own reminder). */
 function personCount(q) {
   return (q.review || 0) + (q.manual || 0) + (q.failed || 0);
 }
@@ -248,9 +244,10 @@ export function watchStatus(data) {
  * The reminder (P12.9): while something has waited for a person longer
  * than `remindMins`, the «remind» sound and a message, again every
  * `remindMins`. «Waited» is from the job's last change (updated_at), read
- * from the review and approval lists once a minute at most, and only while
- * the status says something waits. A video hidden from the review list
- * («Απόκρυψη») is not in that list, so it does not remind.
+ * from the review list once a minute at most, and only while the status
+ * says something waits. A video hidden from the review list («Απόκρυψη») is
+ * not in that list, so it does not remind. A held video has a reminder of
+ * its own (P12.14, below), so it is not counted here twice.
  * ------------------------------------------------------------------ */
 
 const REMIND_CHECK_MS = 60000;
@@ -268,19 +265,14 @@ export function remindDue({ now, oldestAt, lastRemind: last, mins }) {
   return now - oldestAt >= span && (!last || now - last >= span);
 }
 
-/** The time (ms) of the longest wait, from the review and approval lists; null if none. */
+/** The time (ms) of the longest wait, from the review list; null if none. */
 async function oldestWaitAt() {
-  const lists = await Promise.all([
-    api('/api/jobs?view=review&page=1&per_page=100'),
-    api('/api/jobs?view=approval&page=1&per_page=100'),
-  ]);
+  const data = await api('/api/jobs?view=review&page=1&per_page=100');
   let oldest = null;
-  for (const data of lists) {
-    for (const job of data.jobs || []) {
-      // A missing or unreadable time is skipped, never taken as "now".
-      const at = job.updated_at ? Date.parse(job.updated_at) : NaN;
-      if (Number.isFinite(at) && (oldest === null || at < oldest)) oldest = at;
-    }
+  for (const job of data.jobs || []) {
+    // A missing or unreadable time is skipped, never taken as "now".
+    const at = job.updated_at ? Date.parse(job.updated_at) : NaN;
+    if (Number.isFinite(at) && (oldest === null || at < oldest)) oldest = at;
   }
   return oldest;
 }
@@ -289,7 +281,7 @@ async function remind(data) {
   const p = soundPrefs();
   const q = data && data.queue;
   if (!q) return; // could not count: change nothing
-  if (needCount(q) === 0) { lastRemind = 0; return; } // nothing waits: the next wait starts afresh
+  if (personCount(q) === 0) { lastRemind = 0; return; } // nothing waits: the next wait starts afresh
   if (!p.on || !p.remind || reminding) return;
   const now = Date.now();
   if (now - lastRemindCheck < REMIND_CHECK_MS) return;
@@ -306,6 +298,53 @@ async function remind(data) {
   } finally {
     reminding = false;
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * The held videos' reminder (P11.10, P12.14): while a video waits for
+ * «Έγκριση → Dalet», a message and the «held video» sound 15 minutes after
+ * the oldest was held, then every `remind_every_mins` the server says (30).
+ * Read from `/api/held/waiting` once a minute. It follows the sound
+ * settings (P12.9): nothing at all with the reminder switched off; no sound
+ * with the «held video» sound off. A server without the route (404) gets no
+ * reminder and no error.
+ * ------------------------------------------------------------------ */
+
+const HELD_CHECK_MS = 60000;
+const HELD_FIRST_MINS = 15;
+let heldLast = 0;
+let heldGone = false;
+
+/**
+ * Pure: whether the held reminder is due at `now` (ms). `oldestAt` is when
+ * the oldest held video was held (ms), `last` when it last reminded (0:
+ * never). Due `firstMins` after `oldestAt`, then every `everyMins`; an
+ * unknown time is never due.
+ */
+export function heldReminderDue({ now, oldestAt, last, firstMins, everyMins }) {
+  if (oldestAt === null || !Number.isFinite(oldestAt) || !(everyMins > 0)) return false;
+  if (now - oldestAt < firstMins * 60000) return false;
+  return !last || now - last >= everyMins * 60000;
+}
+
+async function checkHeld() {
+  if (heldGone) return;
+  let held;
+  try {
+    held = await api('/api/held/waiting');
+  } catch (e) {
+    if (e.status === 404) heldGone = true; // an older server: no reminder, and no asking again
+    return;
+  }
+  if (!held || !(held.count > 0)) { heldLast = 0; return; } // none waits: the next wait starts afresh
+  const p = soundPrefs();
+  if (!p.on || !p.remind) return;
+  const oldestAt = held.oldest_held_at ? Date.parse(held.oldest_held_at) : NaN;
+  const everyMins = Number(held.remind_every_mins) || 30;
+  if (!heldReminderDue({ now: Date.now(), oldestAt, last: heldLast, firstMins: HELD_FIRST_MINS, everyMins })) return;
+  heldLast = Date.now();
+  play('held');
+  toast(tn('notify.held.waiting', held.count), 'warn');
 }
 
 /** The service stopped answering: sound once and say so outside the tab too. */
@@ -433,4 +472,5 @@ export function initNotify(host, open, openReview) {
   paintButton();
   poll();
   setInterval(poll, POLL_MS);
+  setInterval(checkHeld, HELD_CHECK_MS);
 }

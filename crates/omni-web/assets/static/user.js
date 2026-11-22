@@ -3,12 +3,12 @@
 import {
   api, el, render, live, fmtTime, logout,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=8';
+import { toast } from '/static/toast.js?v=9';
 // A job's state, for the journalist who sent it: the `user` words of the
 // one table the desk uses too (P12.1), in the same colours.
-import { statusBadge } from '/static/status.js?v=8';
-import { deferAction, hiddenNow } from '/static/undo.js?v=9';
-import { t, tn, applyText } from '/static/text.js?v=7';
+import { statusBadge } from '/static/status.js?v=9';
+import { deferAction, hiddenNow } from '/static/undo.js?v=10';
+import { t, tn, applyText } from '/static/text.js?v=8';
 
 // The page's fixed words, from the dictionary (P12.10).
 applyText();
