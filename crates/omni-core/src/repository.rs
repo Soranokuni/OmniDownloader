@@ -26,11 +26,6 @@ use crate::timestamps;
 /// news cycle) without blocking a genuine re-ingest the next day.
 pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 
-/// How far back [`Repository::renormalize_if_needed`] makes finished rows' keys again
-/// (P14.8b): longer than the dedup window (a day) and the second-chance window (at
-/// most 6 hours) with room to spare.
-pub const RENORMALIZE_DAYS: i64 = 7;
-
 /// Rows per transaction when the keys are made again (P14.8b).
 pub const RENORMALIZE_BATCH: usize = 500;
 
@@ -829,6 +824,20 @@ impl DeskExtras {
     }
 }
 
+/// The SQL functions every pooled connection has (P14.8c):
+/// `omni_normalize(url)` is [`crate::urlnorm::normalize`], so a statement that
+/// brings a row back to the queue writes its dedup key by today's rules in the
+/// same UPDATE (`url_normalized = omni_normalize(url)`). NULL stays NULL.
+fn register_sql_functions(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    c.create_scalar_function(
+        "omni_normalize",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|url| crate::urlnorm::normalize(&url))),
+    )
+}
+
 /// The columns [`attempt_from_row`] reads, in its order.
 const ATTEMPT_COLUMNS: &str = "id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
     llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
@@ -894,8 +903,10 @@ impl Repository {
                 .with_context(|| format!("Failed creating directory for DB {:?}", parent))?;
         }
 
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|c| c.execute_batch(migrations::PER_CONNECTION_PRAGMAS));
+        let manager = SqliteConnectionManager::file(path).with_init(|c| {
+            c.execute_batch(migrations::PER_CONNECTION_PRAGMAS)?;
+            register_sql_functions(c)
+        });
         let pool = Pool::builder()
             .max_size(16)
             .build(manager)
@@ -933,16 +944,16 @@ impl Repository {
     }
 
     /// Bring the stored dedup keys (`queue.url_normalized`) up to
-    /// [`crate::urlnorm::NORMALIZE_VERSION`] (P14.8b). Does nothing when the
-    /// version stored in `app_meta` is current. Otherwise every row a duplicate
-    /// check or a second chance can still compare against gets
-    /// `normalize(url)` again: any status but a finished one, at any age, and
-    /// any row finished or touched in the last [`RENORMALIZE_DAYS`] days (the
-    /// dedup window is a day, the second-chance window at most 6 hours). In
-    /// batches of [`RENORMALIZE_BATCH`], each one transaction; the version is
-    /// stored last, so a stop half-way does the rest at the next start.
-    /// Returns how many keys changed.
-    pub fn renormalize_if_needed(conn: &mut rusqlite::Connection, now: DateTime<Utc>) -> Result<usize> {
+    /// [`crate::urlnorm::NORMALIZE_VERSION`] (P14.8b, P14.8c). Does nothing when
+    /// the version stored in `app_meta` is current. Otherwise EVERY row gets
+    /// `normalize(url)` again, whatever its status and age: a finished row can be
+    /// brought back to the queue (re-download, retry), and its old key would let
+    /// the same link in twice. In batches of [`RENORMALIZE_BATCH`] rows by id,
+    /// each read and written in one transaction; a row whose `url` changed in
+    /// between is left to the statement that changed it (which writes its key,
+    /// `omni_normalize`). The version is stored last, so a stop half-way does
+    /// the rest at the next start. Returns how many keys changed.
+    pub fn renormalize_if_needed(conn: &mut rusqlite::Connection) -> Result<usize> {
         let stored: Option<String> = conn
             .query_row("SELECT value FROM app_meta WHERE key = 'url_normalize_version'", [], |r| r.get(0))
             .optional()?;
@@ -950,28 +961,27 @@ impl Repository {
         if stored == crate::urlnorm::NORMALIZE_VERSION {
             return Ok(0);
         }
-        let cutoff = timestamps::format(now - Duration::days(RENORMALIZE_DAYS));
-        let rows: Vec<(i64, String, Option<String>)> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, url, url_normalized FROM queue
-                  WHERE status IN ('PENDING','RUNNING','AWAITING_APPROVAL','REQUIRES_REVIEW','MANUAL_DOWNLOAD')
-                     OR COALESCE(completed_at, updated_at, created_at) >= ?
-                  ORDER BY id",
-            )?;
-            let rows = stmt.query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
         let mut changed = 0;
-        for batch in rows.chunks(RENORMALIZE_BATCH) {
+        let mut after: i64 = i64::MIN;
+        loop {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            for (id, url, old) in batch {
+            let batch: Vec<(i64, String, Option<String>)> = {
+                let mut stmt = tx.prepare("SELECT id, url, url_normalized FROM queue WHERE id > ? ORDER BY id LIMIT ?")?;
+                let rows = stmt.query_map(params![after, RENORMALIZE_BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let Some(last) = batch.last().map(|(id, _, _)| *id) else {
+                tx.commit()?;
+                break;
+            };
+            for (id, url, old) in &batch {
                 let key = crate::urlnorm::normalize(url);
                 if old.as_deref() != Some(key.as_str()) {
-                    tx.execute("UPDATE queue SET url_normalized = ? WHERE id = ?", params![key, id])?;
-                    changed += 1;
+                    changed += tx.execute("UPDATE queue SET url_normalized = ? WHERE id = ? AND url = ?", params![key, id, url])?;
                 }
             }
             tx.commit()?;
+            after = last;
         }
         conn.execute(
             "INSERT INTO app_meta (key, value) VALUES ('url_normalize_version', ?)
@@ -998,7 +1008,7 @@ impl Repository {
         // The dedup keys of the rows a duplicate check can still meet, made again
         // when the normalization rules changed (P14.8b): a link sent before an
         // upgrade and again after it must still be one job.
-        Self::renormalize_if_needed(&mut conn, Utc::now()).context("Could not bring the stored dedup keys up to date")?;
+        Self::renormalize_if_needed(&mut conn).context("Could not bring the stored dedup keys up to date")?;
 
         // No default admin is seeded (plan P2.4, defect W-04).
         //
@@ -1487,7 +1497,7 @@ impl Repository {
         let now = timestamps::now_string();
         let not_before = timestamps::format(Utc::now() + backoff);
         let changed = conn.execute(
-            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+            "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
              lease_expires_at=NULL, not_before=?, error_code=?, first_error_code = COALESCE(first_error_code, ?),
              error_message=?, max_attempts = COALESCE(?, max_attempts),
              progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
@@ -1562,7 +1572,7 @@ impl Repository {
             .optional()?
             .flatten();
         let changed = conn.execute(
-            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+            "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL, lease_expires_at=NULL,
              not_before=?, error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
              error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
              updated_at=?
@@ -1589,7 +1599,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let changed = conn.execute(
-            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+            "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL, lease_expires_at=NULL,
              not_before=NULL, error_code=NULL, error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
              delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
              delivering_to=NULL, delivering_bytes=NULL, delivering_recorded=NULL, updated_at=?
@@ -2648,7 +2658,7 @@ impl Repository {
             }
             if attempts < max_attempts {
                 tx.execute(
-                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
                      lease_expires_at=NULL, progress=0.0, updated_at=? WHERE id=?",
                     params![now, id],
                 )?;
@@ -2738,7 +2748,7 @@ impl Repository {
                 // it to review or delivers it twice. The attempt was given back when it parked.
                 requeued += 1;
                 tx.execute(
-                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
                      lease_expires_at=NULL, not_before=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
                      error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
                      updated_at=?
@@ -2764,7 +2774,7 @@ impl Repository {
                 warn!("Job #{id}: cannot tell whether {name} was delivered before the restart: {reason}");
                 requeued += 1;
                 tx.execute(
-                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL, lease_expires_at=NULL,
                      not_before=?, progress=0.0, speed='0 Mbps', eta='--:--', delivery_wait=1,
                      ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
                      error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
@@ -2785,7 +2795,7 @@ impl Repository {
             }
             requeued += 1;
             tx.execute(
-                "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
                  lease_expires_at=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
                  delivering_to=NULL, delivering_bytes=NULL, updated_at=?
                  WHERE id=?",
@@ -3509,7 +3519,7 @@ impl Repository {
         let n = tx.execute(
             r#"
             UPDATE queue
-            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+            SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 file_path = NULL, delivered_at = NULL, completed_at = NULL, cleared_at = NULL,
@@ -3552,7 +3562,8 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
-                url_normalized = COALESCE(?, url_normalized),
+                -- The key of the link it runs with, by today's rules (P14.8c).
+                url_normalized = COALESCE(?, omni_normalize(url)),
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 human_touched = 1, touch_reason = COALESCE(touch_reason, ?),
                 retry_from = ?, updated_at = ?
@@ -3707,7 +3718,7 @@ impl Repository {
             }
             let n = tx.execute(
                 "UPDATE queue
-                 SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                 SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                      attempts = 0, not_before = NULL, lease_owner = NULL, lease_expires_at = NULL,
                      stage_started_at = NULL, completed_at = NULL,
                      second_chances = CASE WHEN second_chances IS NULL OR second_chances = '' THEN ?1
@@ -5430,7 +5441,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let n = conn.execute(
-            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?, cleared_at = NULL
+            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), updated_at = ?, cleared_at = NULL
              WHERE id = ? AND status = 'MANUAL_DOWNLOAD'",
             params![source_path, now, id],
         )?;
@@ -6143,7 +6154,7 @@ impl Repository {
         let queued = tx.execute(
             r#"
             UPDATE queue
-            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+            SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
@@ -6278,7 +6289,7 @@ impl Repository {
         let queued = tx.execute(
             r#"
             UPDATE queue
-            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+            SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
