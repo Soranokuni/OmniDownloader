@@ -1158,6 +1158,20 @@ impl AppConfig {
         false
     }
 
+    /// The daemon's start-up step (P13.5b): on a brand-new database, setup is
+    /// pending in memory and in config.json. The file is re-read and saved
+    /// with only that change: environment overrides in `self` are never
+    /// written (P4.9). Returns whether anything changed.
+    pub fn settle_new_installation(&mut self, path: &Path, brand_new_database: bool) -> Result<bool> {
+        if !self.pending_setup_for_new_installation(brand_new_database) {
+            return Ok(false);
+        }
+        let mut on_disk = AppConfig::load_from_file(path)?;
+        on_disk.setup_completed = false;
+        on_disk.save_to_file(path)?;
+        Ok(true)
+    }
+
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref();
         if p.exists() {
@@ -1325,6 +1339,31 @@ mod tests {
         let mut used: AppConfig = serde_json::from_str("{}").unwrap();
         assert!(!used.pending_setup_for_new_installation(false), "an installation in use keeps what it has");
         assert!(used.setup_completed);
+    }
+
+    /// P13.5b/P13.8d: the start-up step as the daemon runs it: a fresh
+    /// database (the first-run account was just created) and a config.json
+    /// without the key end with setup pending, in memory and in the file, and
+    /// the environment's values are not written.
+    #[test]
+    fn the_start_up_step_leaves_a_fresh_installation_pending_in_the_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{ "web_port": 8086 }"#).unwrap();
+        let repo = crate::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let brand_new = repo.ensure_default_admin().unwrap();
+        assert!(brand_new);
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        assert!(config.setup_completed, "no key: read as completed");
+        config.graph.mailbox = "from-env@station.example".into(); // an environment override
+        assert!(config.settle_new_installation(&path, brand_new).unwrap());
+        assert!(!config.setup_completed);
+        let on_disk = AppConfig::load_from_file(&path).unwrap();
+        assert!(!on_disk.setup_completed);
+        assert_eq!((on_disk.web_port, on_disk.graph.mailbox.as_str()), (8086, ""), "only the flag changed");
+        // The next start: the database is no longer new; nothing changes.
+        assert!(!repo.ensure_default_admin().unwrap());
+        assert!(!config.settle_new_installation(&path, false).unwrap());
     }
 
     #[test]

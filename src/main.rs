@@ -1244,16 +1244,10 @@ async fn run_daemon(
     };
     // A new installation starts with setup pending, whatever config.json says (P13.5b).
     let mut config = config;
-    if config.pending_setup_for_new_installation(brand_new) {
-        // From the file, not from memory: environment overrides are never written (P4.9).
-        let saved = AppConfig::load_from_file(&config_path).and_then(|mut on_disk| {
-            on_disk.setup_completed = false;
-            on_disk.save_to_file(&config_path)
-        });
-        match saved {
-            Ok(()) => info!("New installation: setup is pending until the wizard's test download is delivered or skipped"),
-            Err(e) => warn!("Could not mark setup as pending in config.json ({e:#}); the wizard still opens for this run"),
-        }
+    match config.settle_new_installation(&config_path, brand_new) {
+        Ok(true) => info!("New installation: setup is pending until the wizard's test download is delivered or skipped"),
+        Ok(false) => {}
+        Err(e) => warn!("Could not mark setup as pending in config.json ({e:#}); the wizard still opens for this run"),
     }
     let config = config;
 

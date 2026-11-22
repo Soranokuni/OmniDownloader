@@ -109,14 +109,17 @@ pub fn scrub(text: &str, secrets: &[String]) -> String {
     // name, so `max_tokens` and `client_secret_expires` do not match.
     const WORDS: &str = r#"set-cookie|cookie|proxy-authorization|authorization|x-api-key|api[_-]?key|apikey|access[_-]?key|secret[_-]?key|private[_-]?key|password|passwd|pwd|secret|token|credentials?"#;
     let name = format!(r#"\b(?:[A-Za-z0-9]+[_-])*(?:{WORDS})\b"#);
-    let key = |extra: &str| format!(r#"(?i)((?:\\?["'])?{name}(?:\\?["'])?\s*[:=]\s*){extra}"#);
+    // `m` and `R`: `$` is the end of a line, `\n` or `\r\n`.
+    let key = |extra: &str| format!(r#"(?imR)((?:\\?["'])?{name}(?:\\?["'])?\s*[:=]\s*){extra}"#);
     // Escaped JSON first (`\"access_token\":\"…\"`), then "…", '…' and arrays.
-    // No value runs past the end of its line.
-    let escaped = re(&ESCAPED, &key(r#"\\"(?:[^"\\\r\n]|\\[^"\r\n])*\\""#));
+    // A quoted value ends at its closing quote, or at the end of its line when
+    // the line was cut before it (P13.8d); never past the line. In escaped
+    // JSON, `\\\"` is a quote inside the value, not its end.
+    let escaped = re(&ESCAPED, &key(r#"\\"(?:\\\\\\"|[^"\\\r\n]|\\[^"\r\n])*(?:\\"|$)"#));
     let text = escaped.replace_all(&text, "$1\\\"<removed>\\\"");
-    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\\r\n]|\\.)*""#));
+    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\\r\n]|\\[^\r\n])*(?:"|$)"#));
     let text = quoted2.replace_all(&text, "$1\"<removed>\"");
-    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\\r\n]|\\.)*'"#));
+    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\\r\n]|\\[^\r\n])*(?:'|$)"#));
     let text = quoted1.replace_all(&text, "$1'<removed>'");
     let array = re(&ARRAY, &key(r#"\[[^\]\r\n]*\]"#));
     let text = array.replace_all(&text, "$1[\"<removed>\"]");
@@ -124,13 +127,14 @@ pub fn scrub(text: &str, secrets: &[String]) -> String {
     let header = re(&HEADER, r#"(?i)((?:\\?["'])?\b(?:set-cookie|cookie|authorization|proxy-authorization|x-api-key|api-key)\b(?:\\?["'])?\s*[:=]\s*)[^"'\s\\][^\r\n]*"#);
     let text = header.replace_all(&text, "$1<removed>");
     // Any other key's unquoted value runs to a space, `&`, `;`, `,` or a bracket.
-    // `null`, a number, and after a token name anything that is not credential-like
-    // (`…/oauth2/v2.0/token: 401`), are kept.
+    // `null` is kept. After a token name only, a value that is not
+    // credential-like (a status: `…/oauth2/v2.0/token: 401`) is kept too; a
+    // password, secret, key or credential is always blanked, digits included (P13.8d).
     let plain = re(&PLAIN, &key(r#"([^"'\s&;,\[\]{}]+)"#));
     let text = plain.replace_all(&text, |c: &regex::Captures| {
         let (lead, value) = (&c[1], &c[2]);
         let token_like = lead.trim_end_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace()).to_ascii_lowercase().trim_end_matches(['"', '\'', '\\']).ends_with("token");
-        if value.eq_ignore_ascii_case("null") || value.chars().all(|ch| ch.is_ascii_digit()) || (token_like && !credential_like(value)) {
+        if value.eq_ignore_ascii_case("null") || (token_like && !credential_like(value)) {
             c[0].to_string()
         } else {
             format!("{lead}<removed>")
@@ -507,10 +511,30 @@ mod tests {
     fn arrays_null_numbers_and_unclosed_quotes() {
         assert_eq!(scrub(r#"{"token": ["e1-planted", "e2"]}"#, &[]), r#"{"token": ["<removed>"]}"#);
         assert_eq!(scrub(r#"{"token": null}"#, &[]), r#"{"token": null}"#);
-        assert_eq!(scrub(r#"{"password": 12345}"#, &[]), r#"{"password": 12345}"#);
+        // P13.8d: digits are a secret too under a password, secret, key or credential name.
+        assert_eq!(scrub(r#"{"password": 12345}"#, &[]), r#"{"password": <removed>}"#);
+        for (line, leak) in [("password=48151623", "48151623"), ("pwd: 20261122", "20261122"), ("OMNI_IMAP_PASSWORD=12345678", "12345678"), ("secret_key=99887766", "99887766")] {
+            assert!(!scrub(line, &[]).contains(leak), "{leak} kept: {}", scrub(line, &[]));
+        }
         assert_eq!(scrub(r#"{"api_key": abc-e3-planted}"#, &[]), r#"{"api_key": <removed>}"#);
         let two = "WARN \"password\": \"unclosed\nINFO next line \"stays\" here";
-        assert!(scrub(two, &[]).ends_with("\nINFO next line \"stays\" here"), "{}", scrub(two, &[]));
+        let out = scrub(two, &[]);
+        assert!(out.ends_with("\nINFO next line \"stays\" here"), "{out}");
+        // P13.8d: a value cut before its closing quote is blanked to the end of its line.
+        assert!(!out.contains("unclosed"), "{out}");
+        let cut = "DEBUG {\"password\": \"s3cr3t-tail\r\nINFO \"x\": 1";
+        let out = scrub(cut, &[]);
+        assert!(!out.contains("s3cr3t-tail") && out.ends_with("\r\nINFO \"x\": 1"), "{out:?}");
+        assert!(!scrub("{'token': 'f1-planted-cut", &[]).contains("f1-planted"));
+    }
+
+    /// P13.8d: in escaped JSON a quote inside the value (`\\\"`) does not end it.
+    #[test]
+    fn an_escaped_quote_inside_an_escaped_json_value_is_blanked_with_it() {
+        let line = r#"{\"password\":\"ab\\\"cd-planted\",\"x\":1}"#;
+        let out = scrub(line, &[]);
+        assert!(!out.contains("cd-planted") && !out.contains("ab"), "{out}");
+        assert!(out.ends_with(r#",\"x\":1}"#), "{out}");
     }
 
     /// P13.8c: a status after a token address and the word «authentication»
