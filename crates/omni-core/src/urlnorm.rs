@@ -496,6 +496,7 @@ mod tests {
         // The whole Public Suffix List (P14.6): deeper suffixes, and an address is its own.
         assert_eq!(registrable_domain("https://news.site.com.gr/a").as_deref(), Some("site.com.gr"));
         assert_eq!(registrable_domain("https://www.ypes.gov.gr/a").as_deref(), Some("ypes.gov.gr"));
+        assert_eq!(registrable_domain("https://www.pio.gov.cy/a").as_deref(), Some("pio.gov.cy"), "a suffix the old table lacked");
         assert_eq!(registrable_domain("http://192.168.10.4:8080/x").as_deref(), Some("192.168.10.4"));
     }
 

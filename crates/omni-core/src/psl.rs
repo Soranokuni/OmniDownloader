@@ -77,11 +77,22 @@ fn punycode(domain: &str) -> Option<String> {
     url.host_str().map(str::to_string).filter(|h| h != domain)
 }
 
+/// The longest host DNS allows, in bytes; a longer one is not a host name
+/// and is not looked up (P14.6b).
+pub const MAX_HOST_BYTES: usize = 253;
+
+/// The labels at the end of a host that are matched: the list's longest rule
+/// has 5 (with an exception's extra one, 6), so 8 is ample and keeps a long
+/// host's lookup short (P14.6b).
+const MATCHED_LABELS: usize = 8;
+
 /// How many of `labels` (a host's labels, left to right) form its public
 /// suffix, by the list's rules: an exception rule wins, then the longest
-/// matching rule; with none, the last label (the list's implicit `*`).
+/// matching rule; with none, the last label (the list's implicit `*`). Only
+/// the last [`MATCHED_LABELS`] are looked at.
 pub fn suffix_labels(labels: &[&str]) -> usize {
     let rules = rules();
+    let labels = &labels[labels.len().saturating_sub(MATCHED_LABELS)..];
     let n = labels.len();
     for i in 0..n {
         let candidate = labels[i..].join(".");
@@ -99,10 +110,11 @@ pub fn suffix_labels(labels: &[&str]) -> usize {
 }
 
 /// The registrable domain of `host` (already lowercased): its public suffix
-/// and one label more. A host that is a public suffix itself, or an IP
-/// address, is returned as it is.
+/// and one label more. A host that is a public suffix itself, an IP address,
+/// or longer than [`MAX_HOST_BYTES`] (no host name; a mailed link can be any
+/// length, P14.6b) is returned as it is.
 pub fn registrable(host: &str) -> String {
-    if host.parse::<std::net::IpAddr>().is_ok() {
+    if host.len() > MAX_HOST_BYTES || host.parse::<std::net::IpAddr>().is_ok() {
         return host.to_string();
     }
     let lowered;
@@ -155,8 +167,24 @@ mod tests {
             ("192.168.10.4", "192.168.10.4"),
             ("co.uk", "co.uk"),
             ("localhost", "localhost"),
+            ("pio.gov.cy", "pio.gov.cy"), // `gov.cy`: a suffix the old two-label table lacked
+            ("www.pio.gov.cy", "pio.gov.cy"),
         ] {
             assert_eq!(registrable(host), want, "{host}");
         }
+    }
+
+    /// P14.6b: a host of any length is answered at once. Longer than DNS allows,
+    /// it is returned as it is; within the limit, only its last labels are matched.
+    #[test]
+    fn a_huge_host_is_answered_at_once() {
+        let huge = "a.".repeat(512 * 1024) + "example.com"; // about 1 MB
+        let started = std::time::Instant::now();
+        assert_eq!(registrable(&huge), huge, "not a host name: returned as it is");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        let long = "a.".repeat(120) + "news.example.com.gr"; // 259 bytes: over the limit
+        assert_eq!(registrable(&long), long);
+        let deep = "a.".repeat(110) + "example.com.gr"; // 234 bytes, 113 labels
+        assert_eq!(registrable(&deep), "example.com.gr");
     }
 }

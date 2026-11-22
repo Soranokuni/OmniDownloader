@@ -511,3 +511,51 @@ fn the_desk_batch_gives_what_the_per_job_queries_give() -> Result<()> {
     assert!(repo.desk_extras(&[])?.held.is_empty(), "an empty page asks nothing");
     Ok(())
 }
+
+/// P14.6b: the batch's recipe part. A held attempt found by a recipe that MCR
+/// approved on two sites gets the recipe's origin and only its own site's
+/// approvals, as the per-job `recipe_origin` and `recipe_site_approvals` give.
+#[test]
+fn the_desk_batch_gives_a_recipes_origin_and_its_own_sites_approvals() -> Result<()> {
+    use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, ScopeKind};
+    use omni_core::repository::AttemptEnd;
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let now = Utc::now();
+    let recipe = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: "news.example".into(),
+        family: None,
+        recipe_json: "{}".into(),
+        hash: "h-desk-1".into(),
+        steps_hash: "s-desk-1".into(),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let rid = match repo.insert_recipe(&recipe, now)? {
+        InsertOutcome::Inserted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    for _ in 0..2 {
+        repo.recipe_event(rid, "news.example", Event::Approval, now)?;
+    }
+    for _ in 0..3 {
+        repo.recipe_event(rid, "other.example", Event::Approval, now)?;
+    }
+
+    let waiting = held(&repo, 1);
+    let attempt = repo.start_attempt(waiting, "hold", now)?;
+    let end = AttemptEnd { outcome: Some("held".into()), domain: Some("news.example".into()), recipe_id: Some(rid), ..Default::default() };
+    repo.finish_attempt(attempt, &end, now)?;
+
+    let job = repo.get_job(waiting)?.unwrap();
+    let extras = repo.desk_extras(&[&job])?;
+    let a = extras.held_attempts.get(&waiting).expect("the held attempt");
+    assert_eq!(extras.origins.get(&rid).cloned(), repo.recipe_origin(rid)?);
+    assert!(extras.origins.contains_key(&rid));
+    let per_job = repo.recipe_site_approvals(rid, "news.example")?;
+    assert_eq!(per_job, 2);
+    assert_eq!(extras.approvals_of(a.recipe_id, a.domain.as_deref()), per_job, "its own site's approvals only");
+    assert_eq!(extras.approvals_of(Some(rid), Some("other.example")), 0, "another site's are not read for this page");
+    Ok(())
+}
