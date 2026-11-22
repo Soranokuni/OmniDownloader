@@ -4,6 +4,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -794,6 +795,64 @@ pub struct LoginWallJob {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// What the desk's cards need beyond the job rows, for one page (P14.6,
+/// [`Repository::desk_extras`]).
+#[derive(Debug, Default)]
+pub struct DeskExtras {
+    /// Undecided held videos, by job.
+    pub held: HashMap<i64, HeldOutput>,
+    /// The latest attempt that ended held, of each job awaiting approval.
+    pub held_attempts: HashMap<i64, RepairAttempt>,
+    /// The latest attempt of each completed job.
+    pub attempts: HashMap<i64, RepairAttempt>,
+    /// Recipe origins, by recipe id.
+    pub origins: HashMap<i64, String>,
+    /// MCR approvals of a recipe on a site.
+    pub approvals: HashMap<(i64, String), i64>,
+}
+
+impl DeskExtras {
+    /// The approvals of `recipe_id` on `domain`, 0 when none are recorded.
+    pub fn approvals_of(&self, recipe_id: Option<i64>, domain: Option<&str>) -> i64 {
+        match (recipe_id, domain) {
+            (Some(id), Some(d)) => self.approvals.get(&(id, d.to_string())).copied().unwrap_or(0),
+            _ => 0,
+        }
+    }
+}
+
+/// The columns [`attempt_from_row`] reads, in its order.
+const ATTEMPT_COLUMNS: &str = "id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
+    llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
+    held_url, mcr_decision, image_distance, image_frame_secs, image_host, expected_secs";
+
+fn attempt_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepairAttempt> {
+    Ok(RepairAttempt {
+        id: r.get(0)?,
+        job_id: r.get(1)?,
+        started_at: timestamps::parse(&r.get::<_, String>(2)?),
+        finished_at: timestamps::parse_opt(r.get(3)?),
+        mode: r.get(4)?,
+        rung: r.get(5)?,
+        outcome: r.get(6)?,
+        recipe_hash: r.get(7)?,
+        recipe_id: r.get(8)?,
+        domain: r.get(9)?,
+        llm_calls: r.get(10)?,
+        tokens_in: r.get(11)?,
+        tokens_out: r.get(12)?,
+        candidates_json: r.get(13)?,
+        next_index: r.get(14)?,
+        duration_ms: r.get(15)?,
+        held_url: r.get(16)?,
+        mcr_decision: r.get(17)?,
+        image_distance: r.get(18)?,
+        image_frame_secs: r.get(19)?,
+        image_host: r.get(20)?,
+        expected_secs: r.get(21)?,
+    })
+}
+
 /// A job that waits for a person (P11.14), and since when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitingForPerson {
@@ -1120,7 +1179,7 @@ impl Repository {
                 self.log_audit(
                     "INFO",
                     "QUEUE",
-                    &format!("Duplicate of active job #{existing_id} ignored: {}", job.url),
+                    &format!("Duplicate of active job #{existing_id} ignored ({})", crate::urlnorm::site_for_log(&job.url)),
                 )?;
                 return Ok(Enqueued::DuplicateActive { existing_id });
             }
@@ -1129,7 +1188,7 @@ impl Repository {
                 self.log_audit(
                     "INFO",
                     "QUEUE",
-                    &format!("Duplicate of recently completed job #{existing_id}: {}", job.url),
+                    &format!("Duplicate of recently completed job #{existing_id} ({})", crate::urlnorm::site_for_log(&job.url)),
                 )?;
                 return Ok(Enqueued::DuplicateRecent { existing_id });
             }
@@ -2067,41 +2126,78 @@ impl Repository {
     /// `extra` is fixed text from the two callers above, never a value.
     fn attempt_where(&self, job_id: i64, extra: &str) -> Result<Option<RepairAttempt>> {
         let conn = self.pool.get()?;
+        let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM repair_attempts WHERE job_id = ? {extra} ORDER BY id DESC LIMIT 1");
+        Ok(conn.query_row(&sql, params![job_id], attempt_from_row).optional()?)
+    }
+
+    /// The latest attempt (`held_only`: the latest that ended held) of each of
+    /// `job_ids`, in one query (P14.6: the desk's pages without one query per
+    /// job). Only the placeholders are formatted in; the ids are bound.
+    fn latest_attempts_of(conn: &rusqlite::Connection, job_ids: &[i64], held_only: bool) -> Result<HashMap<i64, RepairAttempt>> {
+        if job_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let marks = vec!["?"; job_ids.len()].join(",");
+        let held = if held_only { "AND outcome = 'held'" } else { "" };
         let sql = format!(
-            "SELECT id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
-                    llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
-                    held_url, mcr_decision, image_distance, image_frame_secs, image_host, expected_secs
-             FROM repair_attempts WHERE job_id = ? {extra} ORDER BY id DESC LIMIT 1"
+            "SELECT {ATTEMPT_COLUMNS} FROM repair_attempts
+              WHERE id IN (SELECT MAX(id) FROM repair_attempts WHERE job_id IN ({marks}) {held} GROUP BY job_id)"
         );
-        let row = conn
-            .query_row(&sql, params![job_id], |r| {
-                Ok(RepairAttempt {
-                    id: r.get(0)?,
-                    job_id: r.get(1)?,
-                    started_at: timestamps::parse(&r.get::<_, String>(2)?),
-                    finished_at: timestamps::parse_opt(r.get(3)?),
-                    mode: r.get(4)?,
-                    rung: r.get(5)?,
-                    outcome: r.get(6)?,
-                    recipe_hash: r.get(7)?,
-                    recipe_id: r.get(8)?,
-                    domain: r.get(9)?,
-                    llm_calls: r.get(10)?,
-                    tokens_in: r.get(11)?,
-                    tokens_out: r.get(12)?,
-                    candidates_json: r.get(13)?,
-                    next_index: r.get(14)?,
-                    duration_ms: r.get(15)?,
-                    held_url: r.get(16)?,
-                    mcr_decision: r.get(17)?,
-                    image_distance: r.get(18)?,
-                    image_frame_secs: r.get(19)?,
-                    image_host: r.get(20)?,
-                    expected_secs: r.get(21)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(job_ids.iter()), attempt_from_row)?;
+        let mut out = HashMap::new();
+        for a in rows {
+            let a = a?;
+            out.insert(a.job_id, a);
+        }
+        Ok(out)
+    }
+
+    /// What the desk's cards need beyond the job rows (P14.6), for a whole page
+    /// in a handful of queries instead of several per job: the waiting held
+    /// video and latest held attempt of each job awaiting approval, the latest
+    /// attempt of each completed job, and the origin and site approvals of the
+    /// recipes those attempts name.
+    pub fn desk_extras(&self, jobs: &[&crate::models::Job]) -> Result<DeskExtras> {
+        let conn = self.pool.get()?;
+        let ids_of = |s: JobStatus| jobs.iter().filter(|j| j.status == s).map(|j| j.id).collect::<Vec<_>>();
+        let (waiting, completed) = (ids_of(JobStatus::AwaitingApproval), ids_of(JobStatus::Completed));
+        let mut extras = DeskExtras::default();
+        if !waiting.is_empty() {
+            let marks = vec!["?"; waiting.len()].join(",");
+            let mut stmt = conn.prepare(&format!("SELECT * FROM held_outputs WHERE job_id IN ({marks}) AND decision IS NULL"))?;
+            for h in stmt.query_map(rusqlite::params_from_iter(waiting.iter()), Self::held_from_row)? {
+                let h = h?;
+                extras.held.insert(h.job_id, h);
+            }
+        }
+        extras.held_attempts = Self::latest_attempts_of(&conn, &waiting, true)?;
+        extras.attempts = Self::latest_attempts_of(&conn, &completed, false)?;
+        let recipes: Vec<(i64, Option<String>)> = extras
+            .held_attempts
+            .values()
+            .chain(extras.attempts.values())
+            .filter_map(|a| a.recipe_id.map(|id| (id, a.domain.clone())))
+            .collect();
+        if !recipes.is_empty() {
+            let ids: Vec<i64> = recipes.iter().map(|(id, _)| *id).collect();
+            let marks = vec!["?"; ids.len()].join(",");
+            let mut stmt = conn.prepare(&format!("SELECT id, origin FROM recipes WHERE id IN ({marks})"))?;
+            for row in stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                let (id, origin) = row?;
+                extras.origins.insert(id, origin);
+            }
+            let mut stmt = conn.prepare(&format!("SELECT recipe_id, domain, approvals FROM recipe_sites WHERE recipe_id IN ({marks})"))?;
+            for row in stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })? {
+                let (id, domain, n) = row?;
+                if recipes.iter().any(|(rid, d)| *rid == id && d.as_deref() == Some(domain.as_str())) {
+                    extras.approvals.insert((id, domain), n);
+                }
+            }
+        }
+        Ok(extras)
     }
 
     /// The article-picture evidence of a held attempt (P10.11b), written only
@@ -6222,6 +6318,13 @@ impl Repository {
     /// of this job (the count behind «Επόμενη επιλογή (n)»).
     pub fn next_left(&self, job_id: i64, now: chrono::DateTime<Utc>) -> Result<usize> {
         let Some(hold) = self.latest_held_attempt(job_id)? else { return Ok(0) };
+        self.next_left_of(&hold, now)
+    }
+
+    /// [`Self::next_left`] for the job's latest held attempt `hold`, already
+    /// read (P14.6: the desk's page has it from [`Self::desk_extras`]).
+    pub fn next_left_of(&self, hold: &RepairAttempt, now: chrono::DateTime<Utc>) -> Result<usize> {
+        let job_id = hold.job_id;
         let Some(domain) = hold.domain.as_deref() else { return Ok(0) };
         let mut excluded = self.rejected_held_urls(job_id)?;
         excluded.extend(hold.held_url.clone());

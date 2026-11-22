@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 use omni_core::auth::generate_session_token;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStatus, User, UserRole};
-use omni_core::repository::{DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
+use omni_core::repository::{DeskExtras, DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
 
 use crate::assets::EmbeddedFile;
 use crate::auth::{
@@ -514,13 +514,13 @@ fn job_for_desk(
 
 /// What the desk needs to approve a held video: the file's SHA-256 (sent
 /// back with the approval), its size and its deadline. `null` unless a video
-/// is waiting for this job (P10.5).
-fn held_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+/// is waiting for this job (P10.5). From the page's `extras` (P14.6).
+fn held_for_desk(extras: &DeskExtras, job: &omni_core::models::Job) -> serde_json::Value {
     if job.status != JobStatus::AwaitingApproval {
         return serde_json::Value::Null;
     }
-    match state.repo.waiting_held(job.id) {
-        Ok(Some(h)) => serde_json::json!({
+    match extras.held.get(&job.id) {
+        Some(h) => serde_json::json!({
             "sha256": h.sha256,
             "bytes": h.bytes,
             "duration": h.duration,
@@ -553,42 +553,46 @@ async fn next_choice_allowed(state: &AppState) -> bool {
 
 /// How a repaired video was found and why it can be trusted (P10.11b), for the
 /// approval card: `null` unless this job's latest held repair attempt exists.
-fn repair_for_desk(state: &AppState, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
+/// From the page's `extras` (P14.6); only «Επόμενη επιλογή»'s count reads more.
+fn repair_for_desk(state: &AppState, extras: &DeskExtras, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
     if job.status == JobStatus::Completed {
-        return auto_delivered_for_desk(state, job);
+        return auto_delivered_for_desk(extras, job);
     }
     if job.status != JobStatus::AwaitingApproval {
         return serde_json::Value::Null;
     }
-    let Ok(Some(attempt)) = state.repo.latest_held_attempt(job.id) else {
+    let Some(attempt) = extras.held_attempts.get(&job.id) else {
         return serde_json::Value::Null;
     };
-    let origin = attempt.recipe_id.and_then(|id| state.repo.recipe_origin(id).ok().flatten());
-    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
-        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
-        _ => 0,
-    };
+    let origin = attempt.recipe_id.and_then(|id| extras.origins.get(&id)).map(String::as_str);
+    let approvals = extras.approvals_of(attempt.recipe_id, attempt.domain.as_deref());
     // `next_ok`: only `hold` mode lets MCR walk the verified list (P10.13); the handler read the live mode.
-    let next_left = if next_ok { state.repo.next_left(job.id, chrono::Utc::now()).unwrap_or(0) } else { 0 };
-    crate::repair_card::build(&attempt, origin.as_deref(), approvals)
+    let next_left = if next_ok { state.repo.next_left_of(attempt, chrono::Utc::now()).unwrap_or(0) } else { 0 };
+    crate::repair_card::build(attempt, origin, approvals)
         .map(|card| crate::repair_card::with_next_left(card, next_left))
         .unwrap_or(serde_json::Value::Null)
 }
 
 /// The Completed card's provenance of a video a trusted recipe delivered without
 /// approval (P10.16a): `null` for every other completed job.
-fn auto_delivered_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
-    let Ok(Some(attempt)) = state.repo.latest_attempt(job.id) else {
+fn auto_delivered_for_desk(extras: &DeskExtras, job: &omni_core::models::Job) -> serde_json::Value {
+    let Some(attempt) = extras.attempts.get(&job.id) else {
         return serde_json::Value::Null;
     };
     if !matches!(attempt.outcome.as_deref(), Some("auto_delivered" | "auto_delivering")) {
         return serde_json::Value::Null;
     }
-    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
-        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
-        _ => 0,
-    };
-    crate::repair_card::build_auto_delivered(&attempt, approvals).unwrap_or(serde_json::Value::Null)
+    let approvals = extras.approvals_of(attempt.recipe_id, attempt.domain.as_deref());
+    crate::repair_card::build_auto_delivered(attempt, approvals).unwrap_or(serde_json::Value::Null)
+}
+
+/// [`omni_core::repository::Repository::desk_extras`] for `jobs`; empty on a
+/// database error (the cards then show no held or repair details, as before).
+fn extras_for(state: &AppState, jobs: &[&omni_core::models::Job]) -> DeskExtras {
+    state.repo.desk_extras(jobs).unwrap_or_else(|e| {
+        tracing::warn!("The desk's held and repair details could not be read: {e:#}");
+        DeskExtras::default()
+    })
 }
 
 /// The directory a job's preview files are in: the parent of the held row's
@@ -687,13 +691,15 @@ pub async fn api_get_jobs(
             Default::default()
         };
         let next_ok = next_choice_allowed(&state).await;
+        // The held and repair details of the whole page, in a few queries (P14.6).
+        let extras = extras_for(&state, &page.jobs.iter().collect::<Vec<_>>());
         let jobs: Vec<serde_json::Value> = page
             .jobs
             .iter()
             .map(|j| {
                 let mut v = job_for_desk(&state.repo, j, late);
-                v["held"] = held_for_desk(&state, j);
-                v["repair"] = repair_for_desk(&state, j, next_ok);
+                v["held"] = held_for_desk(&extras, j);
+                v["repair"] = repair_for_desk(&state, &extras, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -741,9 +747,10 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
+    let extras = extras_for(&state, &[&job]);
     let mut desk_job = job_for_desk(&state.repo, &job, late_after(&state).await);
-    desk_job["held"] = held_for_desk(&state, &job);
-    desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
+    desk_job["held"] = held_for_desk(&extras, &job);
+    desk_job["repair"] = repair_for_desk(&state, &extras, &job, next_choice_allowed(&state).await);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
 }
 
@@ -2614,14 +2621,16 @@ pub async fn api_get_mail_view(
     let positions = state.repo.pending_positions().unwrap_or_default();
     let next_ok = next_choice_allowed(&state).await;
     let late = late_after(&state).await;
+    // The held and repair details of the mail's jobs, in a few queries (P14.6).
+    let extras = extras_for(&state, &jobs.iter().collect::<Vec<_>>());
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
                 let mut v = job_for_desk(&state.repo, j, late);
-                v["held"] = held_for_desk(&state, j);
-                v["repair"] = repair_for_desk(&state, j, next_ok);
+                v["held"] = held_for_desk(&extras, j);
+                v["repair"] = repair_for_desk(&state, &extras, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }

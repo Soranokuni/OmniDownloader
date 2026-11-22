@@ -623,10 +623,10 @@ impl EmailWatcher {
             match &result {
                 Enqueued::Created { id } => info!("EmailWatcher: queued job #{id} {slug} ({})", status.as_str()),
                 Enqueued::DuplicateActive { existing_id } => {
-                    info!("EmailWatcher: {} already queued as job #{existing_id}", job.url)
+                    info!("EmailWatcher: a link on {} already queued as job #{existing_id}", omni_core::urlnorm::site_for_log(&job.url))
                 }
                 Enqueued::DuplicateRecent { existing_id } => {
-                    info!("EmailWatcher: {} delivered recently as job #{existing_id}", job.url)
+                    info!("EmailWatcher: a link on {} delivered recently as job #{existing_id}", omni_core::urlnorm::site_for_log(&job.url))
                 }
             }
             out.push(QueuedFromMail {

@@ -206,11 +206,20 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
     map
 }
 
-/// Registrable-ish domain for per-domain routing, stats and cookie jars.
-///
-/// Handles the two-label public suffixes this newsroom actually meets
-/// (`co.uk`, `com.gr`, …); it is not a full Public Suffix List, and does not
-/// need to be — a wrong answer costs one misfiled statistic, not a bad file.
+/// What a log or audit line may say about a link (P14.6): its site (the
+/// registrable domain), never the address, whose path and query can carry a
+/// token. A link that is not http(s) (an attachment) is «a non-web link».
+pub fn site_for_log(raw: &str) -> String {
+    let norm = normalize(raw);
+    if !(norm.starts_with("http://") || norm.starts_with("https://")) {
+        return "a non-web link".to_string();
+    }
+    registrable_domain(&norm).unwrap_or_else(|| "a link with no host".to_string())
+}
+
+/// Registrable domain for per-domain routing, stats and cookie jars: the
+/// host's public suffix by the embedded Public Suffix List (ICANN section,
+/// P14.6, [`crate::psl`]) and one label more. An IP address is its own.
 pub fn registrable_domain(raw: &str) -> Option<String> {
     let norm = normalize(raw);
     let rest = norm.split("://").nth(1)?;
@@ -218,20 +227,7 @@ pub fn registrable_domain(raw: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() <= 2 {
-        return Some(host.to_string());
-    }
-    const TWO_LABEL_SUFFIXES: &[&str] = &[
-        "co.uk", "org.uk", "ac.uk", "com.gr", "net.gr", "org.gr", "edu.gr", "gov.gr",
-        "com.au", "co.jp", "com.br", "co.nz", "com.tr", "com.cy",
-    ];
-    let last_two = labels[labels.len() - 2..].join(".");
-    if TWO_LABEL_SUFFIXES.contains(&last_two.as_str()) && labels.len() >= 3 {
-        Some(labels[labels.len() - 3..].join("."))
-    } else {
-        Some(last_two)
-    }
+    Some(crate::psl::registrable(host))
 }
 
 /// What MCR's «Λάθος βίντεο» remembers about a video's address (P10.13): the
@@ -497,5 +493,18 @@ mod tests {
         // Two-label public suffix.
         assert_eq!(registrable_domain("https://www.theguardian.co.uk/x").as_deref(), Some("theguardian.co.uk"));
         assert_eq!(registrable_domain("").is_none(), true);
+        // The whole Public Suffix List (P14.6): deeper suffixes, and an address is its own.
+        assert_eq!(registrable_domain("https://news.site.com.gr/a").as_deref(), Some("site.com.gr"));
+        assert_eq!(registrable_domain("https://www.ypes.gov.gr/a").as_deref(), Some("ypes.gov.gr"));
+        assert_eq!(registrable_domain("http://192.168.10.4:8080/x").as_deref(), Some("192.168.10.4"));
+    }
+
+    /// P14.6: a log line names the site, never the address with its path and query.
+    #[test]
+    fn a_log_line_names_the_site_never_the_address() {
+        assert_eq!(site_for_log("https://www.news.example.gr/story/1?token=abc#t"), "example.gr");
+        assert_eq!(site_for_log("https://x.com/someone/status/1?s=20"), "x.com");
+        assert_eq!(site_for_log("attachment://clip.mp4"), "a non-web link");
+        assert!(!site_for_log("https://cdn.news.example/v.mp4?sig=SECRET").contains("SECRET"));
     }
 }

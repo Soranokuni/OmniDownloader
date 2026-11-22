@@ -17,6 +17,7 @@ pub mod maintenance;
 pub mod migrations;
 pub mod paths;
 pub mod process;
+pub mod psl;
 pub mod recipe_score;
 pub mod repository;
 pub mod scheduler;

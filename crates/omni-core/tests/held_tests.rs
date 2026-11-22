@@ -474,3 +474,40 @@ fn a_tick_whose_clocks_failed_expires_nothing() -> Result<()> {
     assert_eq!(report.expired, vec![id]);
     Ok(())
 }
+
+/// P14.6: the desk's page reads its held and repair details in one batch, and
+/// gets what the per-job queries give: the waiting held video and the latest
+/// HELD attempt of a job awaiting approval (not a later attempt that did not
+/// hold), the latest attempt of a completed job, nothing for the others.
+#[test]
+fn the_desk_batch_gives_what_the_per_job_queries_give() -> Result<()> {
+    use omni_core::repository::AttemptEnd;
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let now = Utc::now();
+    let end = |outcome: &str| AttemptEnd { outcome: Some(outcome.into()), domain: Some("news.example".into()), ..Default::default() };
+
+    let waiting = held(&repo, 1);
+    let held_try = repo.start_attempt(waiting, "hold", now)?;
+    repo.finish_attempt(held_try, &end("held"), now)?;
+    let later = repo.start_attempt(waiting, "hold", now)?;
+    repo.finish_attempt(later, &end("next_failed"), now)?;
+
+    let done = queue(&repo, 2);
+    assert_eq!(repo.lease_job("w", 180)?.expect("leased").id, done);
+    let auto = repo.start_attempt(done, "hold", now)?;
+    repo.finish_attempt(auto, &end("auto_delivered"), now)?;
+    assert!(repo.finish(done, "w", JobStatus::Completed, None, None, None)?);
+    let plain = queue(&repo, 3);
+
+    let jobs: Vec<_> = [waiting, done, plain].iter().map(|id| repo.get_job(*id).unwrap().unwrap()).collect();
+    let extras = repo.desk_extras(&jobs.iter().collect::<Vec<_>>())?;
+    assert_eq!(extras.held.get(&waiting).map(|h| h.sha256.clone()), repo.waiting_held(waiting)?.map(|h| h.sha256));
+    assert_eq!(extras.held_attempts.get(&waiting).map(|a| a.id), Some(held_try), "the latest held one, not the later failed one");
+    assert_eq!(repo.latest_held_attempt(waiting)?.map(|a| a.id), Some(held_try));
+    assert_eq!(extras.attempts.get(&done).map(|a| a.id), repo.latest_attempt(done)?.map(|a| a.id));
+    assert_eq!(extras.attempts.get(&done).map(|a| a.id), Some(auto));
+    assert!(!extras.held.contains_key(&plain) && !extras.attempts.contains_key(&plain) && !extras.held_attempts.contains_key(&done));
+    assert!(repo.desk_extras(&[])?.held.is_empty(), "an empty page asks nothing");
+    Ok(())
+}

@@ -2044,7 +2044,7 @@ async fn without_videoless_posts(
             None
         };
         if ask && has_video == Some(false) {
-            info!("Job #{job_id}: {url} has no video; not a candidate");
+            info!("Job #{job_id}: an embedded post on {} has no video; not a candidate", omni_core::urlnorm::site_for_log(url));
             let _ = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Embedded post without a video, skipped: {url}"));
             continue;
         }

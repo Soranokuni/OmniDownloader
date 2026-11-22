@@ -230,6 +230,19 @@ impl HeadlessBrowserManager {
 mod tests {
     use super::*;
 
+    /// P14.6: our flags never fix the debugging port nor bind it beyond the
+    /// loopback, so chromiumoxide's own `--remote-debugging-port=0` (a fresh
+    /// random port on 127.0.0.1 for each launch) stands.
+    #[test]
+    fn the_debugging_port_stays_random_and_on_the_loopback() {
+        for edge in [false, true] {
+            for a in headless_args(edge, 141) {
+                assert!(!a.starts_with("--remote-debugging-port") && !a.starts_with("--remote-debugging-address"), "{a}");
+                assert!(!a.starts_with("--remote-allow-origins"), "no web origin may drive it: {a}");
+            }
+        }
+    }
+
     #[test]
     fn the_user_agent_follows_the_installed_version() {
         let dirs = ["141.0.7390.55", "140.0.7339.208", "SetupMetrics", "Dictionaries", "141.0", "1.2.3.x"];
