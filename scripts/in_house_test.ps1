@@ -230,8 +230,7 @@ try {
 $failed = @($results | Where-Object { -not $_.Ok }).Count
 $passed = @($results | Where-Object { $_.Ok }).Count
 Write-Host ""
-foreach ($w in ($script:OnAirWarnings | Sort-Object -Unique)) { Write-Host "[WARN] $w" -ForegroundColor Yellow }
-Write-Host "Passed: $passed  Failed: $failed  Warnings: $(@($script:OnAirWarnings).Count)"
+Write-Host "Passed: $passed  Failed: $failed"
 if ($failed -eq 0 -and -not $Keep) {
     Start-Sleep -Seconds 2
     Remove-Item -LiteralPath $Scratch -Recurse -Force -ErrorAction SilentlyContinue

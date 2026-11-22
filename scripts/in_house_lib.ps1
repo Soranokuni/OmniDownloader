@@ -93,8 +93,6 @@ function Get-OmniJob([string]$Base, [int]$Id) {
     }
 }
 
-$script:OnAirWarnings = @()
-
 $script:EndStates =@("COMPLETED", "COMPLETED_MANUAL", "REQUIRES_REVIEW", "FAILED", "CANCELLED", "AWAITING_APPROVAL", "MANUAL_DOWNLOAD")
 
 # Jobs 1..Count once each has stopped moving (or at the deadline, as they are).
@@ -148,12 +146,12 @@ function Test-OnAir([string]$Ffprobe, [string]$File, [string]$Watch, [double]$So
     if ($v.r_frame_rate -ne "25/1") { $p += "frame rate $($v.r_frame_rate)" }
     if ($v.field_order -ne "tt") { $p += "field order $($v.field_order), not tt (interlaced, top field first)" }
     if ([int64]$v.bit_rate -ne 50000000) { $p += "video bit rate $($v.bit_rate), not 50000000" }
-    # Rec.709. As the daemon's own gate (verify.rs): a different value fails; an
-    # unset one is a warning, because ffprobe leaves some unset on MXF.
+    # Rec.709, all three labels (P14.9): in the MXF descriptor (stream) and in
+    # the MPEG-2 bitstream (the decoded frames). Unset is a failure too.
+    $frame = & $Ffprobe -v error -select_streams v:0 -read_intervals "%+#1" -show_entries frame=color_primaries,color_transfer,color_space -print_format json $File | Out-String | ConvertFrom-Json
     foreach ($k in @("color_primaries", "color_transfer", "color_space")) {
-        $val = "$($v.$k)"
-        if ($val -eq "" -or $val -eq "unknown") { $script:OnAirWarnings += "$k unset in $(Split-Path -Leaf $File)" }
-        elseif ($val -ne "bt709") { $p += "$k $val, not bt709" }
+        if ("$($v.$k)" -ne "bt709") { $p += "stream $k '$($v.$k)', not bt709" }
+        if ("$($frame.frames[0].$k)" -ne "bt709") { $p += "bitstream $k '$($frame.frames[0].$k)', not bt709" }
     }
     # GOP 12: the distance between successive I pictures in the first 4 s.
     $types = & $Ffprobe -v error -select_streams v:0 -read_intervals "%+4" -show_entries frame=pict_type -of csv=p=0 $File

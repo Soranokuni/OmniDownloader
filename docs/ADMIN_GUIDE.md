@@ -457,6 +457,9 @@ if you want.
 | yt-dlp | latest stable | verified nightly update at 03:00, previous build kept for rollback |
 | Deno | latest | needed by yt-dlp for YouTube; kept current |
 
+Every delivered file is labelled BT.709 (colour primaries, transfer and
+matrix), both in the MPEG-2 video and in the MXF picture descriptor.
+
 **Admin → Toolchain** lists each tool with its state ("pinned build", "not
 the pinned build", "missing" or a version) and an **Install** / **Repair**
 button. Install downloads the exact pinned build and checks its checksum;

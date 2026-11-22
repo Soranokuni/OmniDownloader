@@ -139,6 +139,18 @@ pub struct TranscodePlan {
 /// Silence source for the six EBU R48 pad channels.
 pub const SILENCE_SOURCE: &str = "anullsrc=r=48000:cl=mono";
 
+/// Labels every output frame with Rec.709 primaries and transfer (P14.9).
+///
+/// The encoder writes its colour description from the frames it receives,
+/// and the `-color_primaries` / `-color_trc` options below do not reach it:
+/// without this the sequence display extension said 2/2/1 (unspecified,
+/// unspecified, BT.709). The matrix and range are deliberately NOT set here:
+/// `-colorspace bt709 -color_range tv` already make FFmpeg convert the
+/// pixels from the source's own matrix, and labelling the frames bt709 first
+/// would skip that conversion and change the picture (framemd5 checked:
+/// with only these two keys the decoded video is identical to before).
+pub const COLOUR_LABELS: &str = "setparams=color_primaries=bt709:color_trc=bt709";
+
 /// Scale and pad to the full 1920x1080 raster.
 ///
 /// `force_original_aspect_ratio=decrease` plus `pad` is what pillarboxes a
@@ -364,7 +376,8 @@ pub fn build_plan(
     ];
 
     // ---- filter graph -----------------------------------------------------
-    let mut graph = format!("[0:v:0]{video_chain}[v]");
+    // Every branch ends labelled Rec.709 (COLOUR_LABELS), after all pixel work.
+    let mut graph = format!("[0:v:0]{video_chain},{COLOUR_LABELS}[v]");
     let mut audio_branch = "no_audio";
     let note;
     let has_audio = probe.audio.is_some();
