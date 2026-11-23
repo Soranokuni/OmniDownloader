@@ -637,6 +637,27 @@ async fn a_skipped_link_can_be_queued_from_its_mail_once() -> Result<()> {
     Ok(())
 }
 
+/// P11.15a: from the mail view, a locker share of one file fetched directly
+/// is queued for the pipeline; a locker a person must fetch waits for MCR.
+#[tokio::test]
+async fn a_direct_locker_link_from_a_mail_is_queued_for_the_pipeline() -> Result<()> {
+    let app = App::new()?;
+    let body = "1. ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=api00000004\n\
+                Το βίντεο: https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing\n\
+                Και εδώ: https://we.tl/t-desk00001";
+    seed_mail(&app, "<m4@example.gr>", body, "https://www.youtube.com/watch?v=api00000004")?;
+    let send = |url: &str| json!({ "key": "<m4@example.gr>", "url": url });
+    let mut queued = Vec::new();
+    for url in ["https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing", "https://we.tl/t-desk00001"] {
+        let (status, body) = app.send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send(url))).await?;
+        assert_eq!(status, StatusCode::OK, "{url}: {body}");
+        queued.push(app.repo.get_job(body["job_id"].as_i64().unwrap())?.unwrap());
+    }
+    assert_eq!((queued[0].status, queued[0].extraction_method.as_deref()), (JobStatus::Pending, Some("locker")));
+    assert_eq!((queued[1].status, queued[1].extraction_method.as_deref()), (JobStatus::ManualDownload, Some("locker")));
+    Ok(())
+}
+
 #[tokio::test]
 async fn only_a_mail_the_watcher_gave_up_on_can_be_read_again_from_the_desk() -> Result<()> {
     let app = App::new()?;

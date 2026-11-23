@@ -4,9 +4,9 @@
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
-import { saveJson } from '/static/admin-common.js?v=2';
+import { saveJson } from '/static/admin-common.js?v=3';
 import { confirmDialog, promptDialog } from '/static/dialog.js?v=10';
-import { t } from '/static/admin-text.js?v=2';
+import { t } from '/static/admin-text.js?v=3';
 
 /* ------------------------------------------------------------------ *
  * Users

@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 use omni_core::auth::generate_session_token;
 use omni_core::dependencies::DependencyManager;
 use omni_core::models::{JobStatus, User, UserRole};
-use omni_core::repository::{DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
+use omni_core::repository::{DeskExtras, DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
 
 use crate::assets::EmbeddedFile;
 use crate::auth::{
@@ -494,7 +494,7 @@ fn job_for_desk(
         // whose own hint says so swap it (`uses_exhausted_hint`).
         let stopped = !matches!(job.status, JobStatus::Pending | JobStatus::Running) && !job.delivery_wait;
         let hint = if code.uses_exhausted_hint() && stopped {
-            omni_broadcast::errors::stopped_hint_el(code, job.attempts, &job.url, repo)
+            omni_broadcast::errors::stopped_hint_el(code, job.attempts, job.id, &job.url, repo)
         } else {
             // A login wall names the site and says whether its cookies are there (P3.5).
             omni_broadcast::errors::hint_for_job(code, &job.url, repo)
@@ -506,13 +506,13 @@ fn job_for_desk(
 
 /// What the desk needs to approve a held video: the file's SHA-256 (sent
 /// back with the approval), its size and its deadline. `null` unless a video
-/// is waiting for this job (P10.5).
-fn held_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
+/// is waiting for this job (P10.5). From the page's `extras` (P14.6).
+fn held_for_desk(extras: &DeskExtras, job: &omni_core::models::Job) -> serde_json::Value {
     if job.status != JobStatus::AwaitingApproval {
         return serde_json::Value::Null;
     }
-    match state.repo.waiting_held(job.id) {
-        Ok(Some(h)) => serde_json::json!({
+    match extras.held.get(&job.id) {
+        Some(h) => serde_json::json!({
             "sha256": h.sha256,
             "bytes": h.bytes,
             "duration": h.duration,
@@ -545,42 +545,46 @@ async fn next_choice_allowed(state: &AppState) -> bool {
 
 /// How a repaired video was found and why it can be trusted (P10.11b), for the
 /// approval card: `null` unless this job's latest held repair attempt exists.
-fn repair_for_desk(state: &AppState, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
+/// From the page's `extras` (P14.6); only «Επόμενη επιλογή»'s count reads more.
+fn repair_for_desk(state: &AppState, extras: &DeskExtras, job: &omni_core::models::Job, next_ok: bool) -> serde_json::Value {
     if job.status == JobStatus::Completed {
-        return auto_delivered_for_desk(state, job);
+        return auto_delivered_for_desk(extras, job);
     }
     if job.status != JobStatus::AwaitingApproval {
         return serde_json::Value::Null;
     }
-    let Ok(Some(attempt)) = state.repo.latest_held_attempt(job.id) else {
+    let Some(attempt) = extras.held_attempts.get(&job.id) else {
         return serde_json::Value::Null;
     };
-    let origin = attempt.recipe_id.and_then(|id| state.repo.recipe_origin(id).ok().flatten());
-    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
-        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
-        _ => 0,
-    };
+    let origin = attempt.recipe_id.and_then(|id| extras.origins.get(&id)).map(String::as_str);
+    let approvals = extras.approvals_of(attempt.recipe_id, attempt.domain.as_deref());
     // `next_ok`: only `hold` mode lets MCR walk the verified list (P10.13); the handler read the live mode.
-    let next_left = if next_ok { state.repo.next_left(job.id, chrono::Utc::now()).unwrap_or(0) } else { 0 };
-    crate::repair_card::build(&attempt, origin.as_deref(), approvals)
+    let next_left = if next_ok { state.repo.next_left_of(attempt, chrono::Utc::now()).unwrap_or(0) } else { 0 };
+    crate::repair_card::build(attempt, origin, approvals)
         .map(|card| crate::repair_card::with_next_left(card, next_left))
         .unwrap_or(serde_json::Value::Null)
 }
 
 /// The Completed card's provenance of a video a trusted recipe delivered without
 /// approval (P10.16a): `null` for every other completed job.
-fn auto_delivered_for_desk(state: &AppState, job: &omni_core::models::Job) -> serde_json::Value {
-    let Ok(Some(attempt)) = state.repo.latest_attempt(job.id) else {
+fn auto_delivered_for_desk(extras: &DeskExtras, job: &omni_core::models::Job) -> serde_json::Value {
+    let Some(attempt) = extras.attempts.get(&job.id) else {
         return serde_json::Value::Null;
     };
     if !matches!(attempt.outcome.as_deref(), Some("auto_delivered" | "auto_delivering")) {
         return serde_json::Value::Null;
     }
-    let approvals = match (attempt.recipe_id, attempt.domain.as_deref()) {
-        (Some(id), Some(domain)) => state.repo.recipe_site_approvals(id, domain).unwrap_or(0),
-        _ => 0,
-    };
-    crate::repair_card::build_auto_delivered(&attempt, approvals).unwrap_or(serde_json::Value::Null)
+    let approvals = extras.approvals_of(attempt.recipe_id, attempt.domain.as_deref());
+    crate::repair_card::build_auto_delivered(attempt, approvals).unwrap_or(serde_json::Value::Null)
+}
+
+/// [`omni_core::repository::Repository::desk_extras`] for `jobs`; empty on a
+/// database error (the cards then show no held or repair details, as before).
+fn extras_for(state: &AppState, jobs: &[&omni_core::models::Job]) -> DeskExtras {
+    state.repo.desk_extras(jobs).unwrap_or_else(|e| {
+        tracing::warn!("The desk's held and repair details could not be read: {e:#}");
+        DeskExtras::default()
+    })
 }
 
 /// The directory a job's preview files are in: the parent of the held row's
@@ -679,13 +683,15 @@ pub async fn api_get_jobs(
             Default::default()
         };
         let next_ok = next_choice_allowed(&state).await;
+        // The held and repair details of the whole page, in a few queries (P14.6).
+        let extras = extras_for(&state, &page.jobs.iter().collect::<Vec<_>>());
         let jobs: Vec<serde_json::Value> = page
             .jobs
             .iter()
             .map(|j| {
                 let mut v = job_for_desk(&state.repo, j, late);
-                v["held"] = held_for_desk(&state, j);
-                v["repair"] = repair_for_desk(&state, j, next_ok);
+                v["held"] = held_for_desk(&extras, j);
+                v["repair"] = repair_for_desk(&state, &extras, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -733,9 +739,10 @@ pub async fn api_get_job(
         .repo
         .recent_job_events(job_id, 80)
         .map_err(internal_error("Could not read the job."))?;
+    let extras = extras_for(&state, &[&job]);
     let mut desk_job = job_for_desk(&state.repo, &job, late_after(&state).await);
-    desk_job["held"] = held_for_desk(&state, &job);
-    desk_job["repair"] = repair_for_desk(&state, &job, next_choice_allowed(&state).await);
+    desk_job["held"] = held_for_desk(&extras, &job);
+    desk_job["repair"] = repair_for_desk(&state, &extras, &job, next_choice_allowed(&state).await);
     Ok(Json(serde_json::json!({ "job": desk_job, "events": events })))
 }
 
@@ -1943,9 +1950,13 @@ pub async fn api_admin_vacuum(
     RequireAdmin(_): RequireAdmin,
     State(state): State<AppState>,
 ) -> JsonResult {
-    state
-        .repo
-        .vacuum_database()
+    // Off the async threads (P11.13): a VACUUM of a large database takes
+    // minutes, and the rest of the panel must keep answering meanwhile.
+    let repo = state.repo.clone();
+    tokio::task::spawn_blocking(move || repo.vacuum_database())
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r)
         .map_err(internal_error("Could not compact the database."))?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
@@ -2281,6 +2292,64 @@ pub async fn api_health(State(state): State<AppState>) -> Response {
         _ => StatusCode::OK,
     };
     (code, Json(body)).into_response()
+}
+
+/// One site whose login wall holds jobs in review (P11.12).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LoginWaitSite {
+    /// The jar domain (`x.com`), never an address.
+    pub site: String,
+    pub count: usize,
+    /// What the site's jar lacks: `missing`, `expired` or `failed`.
+    pub jar: omni_core::cookies::JarWant,
+    pub newest_job_id: i64,
+    pub newest_slug: String,
+    pub newest_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The jobs in review behind a login wall, per site whose jar is missing,
+/// expired or failed its last test, the most jobs first (P11.12). `jobs` come
+/// newest first. A job whose site the link does not tell (a news article's
+/// embedded player) and a site whose jar looks usable are left out.
+pub fn login_waits(
+    jobs: &[omni_core::repository::LoginWallJob],
+    jars: &[omni_core::cookies::CookieJarInfo],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<LoginWaitSite> {
+    let jar_of = |d: &str| jars.iter().find(|j| j.domain == d);
+    let mut sites: Vec<LoginWaitSite> = Vec::new();
+    for job in jobs {
+        let Some((site, _)) = omni_broadcast::errors::login_wall_site(&job.url, |d| jar_of(d).is_some()) else {
+            continue;
+        };
+        let Some(want) = omni_core::cookies::jar_want(jar_of(&site), now) else {
+            continue;
+        };
+        match sites.iter_mut().find(|s| s.site == site) {
+            Some(s) => s.count += 1,
+            None => sites.push(LoginWaitSite {
+                site,
+                count: 1,
+                jar: want,
+                newest_job_id: job.id,
+                newest_slug: job.slug.clone(),
+                newest_at: job.created_at,
+            }),
+        }
+    }
+    sites.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.site.cmp(&b.site)));
+    sites
+}
+
+/// The desk's «N βίντεο περιμένουν σύνδεση στο site» card (P11.12): jobs in
+/// review behind a login wall, per site whose jar is missing, expired or
+/// failed. Sites and slugs only, never an address or a cookie.
+pub async fn api_login_waits(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let jobs = state.repo.login_wall_jobs().map_err(internal_error("Could not read the jobs in review."))?;
+    let jars = state.repo.list_cookie_jars().map_err(internal_error("Could not read the cookie jars."))?;
+    let sites = login_waits(&jobs, &jars, chrono::Utc::now());
+    let total: usize = sites.iter().map(|s| s.count).sum();
+    Ok(Json(serde_json::json!({ "total": total, "sites": sites })))
 }
 
 /// The full picture, for the MCR panel (plan P6.2, defect W-09).
@@ -2620,14 +2689,16 @@ pub async fn api_get_mail_view(
     let positions = state.repo.pending_positions().unwrap_or_default();
     let next_ok = next_choice_allowed(&state).await;
     let late = late_after(&state).await;
+    // The held and repair details of the mail's jobs, in a few queries (P14.6).
+    let extras = extras_for(&state, &jobs.iter().collect::<Vec<_>>());
     let desk_jobs: Vec<serde_json::Value> = view
         .jobs
         .iter()
         .filter_map(|p| {
             by_id.get(&p.job_id).map(|j| {
                 let mut v = job_for_desk(&state.repo, j, late);
-                v["held"] = held_for_desk(&state, j);
-                v["repair"] = repair_for_desk(&state, j, next_ok);
+                v["held"] = held_for_desk(&extras, j);
+                v["repair"] = repair_for_desk(&state, &extras, j, next_ok);
                 if let Some(pos) = positions.get(&j.id) {
                     v["queue_position"] = serde_json::json!(pos);
                 }
@@ -2712,6 +2783,7 @@ pub async fn api_mail_queue_link(
     Json(payload): Json<QueueLinkPayload>,
 ) -> JsonResult {
     let cfg = state.config.read().await.parser.clone();
+    let locker_cfg = state.config.read().await.locker.clone();
     let (mail, jobs) = load_mail(&state, None, &payload.key)?;
     let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
     let wanted = payload.url.trim();
@@ -2738,7 +2810,8 @@ pub async fn api_mail_queue_link(
     let mut new = omni_core::models::NewJob::new(link.url.clone(), slug.clone(), journalist.clone());
     new.keyword = keyword;
     new.index_str = index.clone();
-    new.status = if locker { JobStatus::ManualDownload } else { JobStatus::Pending };
+    // A locker link a worker can take goes to the pipeline (P11.15a, P11.15b), each while its switch is on.
+    new.status = if locker && !omni_core::locker::queued_for_a_worker(&link.url, &locker_cfg) { JobStatus::ManualDownload } else { JobStatus::Pending };
     new.extraction_method = locker.then(|| "locker".to_string());
     new.email_message_id = Some(mail.internet_message_id.clone());
     new.email_source = mail.from_address.clone();
@@ -3142,13 +3215,46 @@ fn sse_payload(msg: Result<String, tokio_stream::wrappers::errors::BroadcastStre
     msg.unwrap_or_else(|_| r#"{"type":"lagged"}"#.to_string())
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct EventsQuery {
+    /// `1` from the MCR desk (P11.10): while such a stream is open, the held
+    /// videos' approval clocks run. Other panels (admin) leave it out.
+    #[serde(default)]
+    pub desk: Option<String>,
+}
+
 pub async fn api_events(
     RequireMcr(_): RequireMcr,
+    Query(query): Query<EventsQuery>,
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
-    let stream = BroadcastStream::new(rx).map(|msg| Ok(Event::default().data(sse_payload(msg))));
+    // Held by the stream: when the tab closes, the stream is dropped and the desk with it.
+    let desk = (query.desk.as_deref() == Some("1")).then(|| state.desks.connect());
+    let stream = BroadcastStream::new(rx).map(move |msg| {
+        let _desk = &desk;
+        Ok(Event::default().data(sse_payload(msg)))
+    });
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+/// Minutes between the desk's reminders while a video waits for approval (P11.10).
+pub const HELD_REMIND_EVERY_MINS: i64 = 30;
+
+/// What the desk needs for its reminder (P11.10): how many videos wait for
+/// approval, since when the oldest, the soonest expiry (moved on while no desk
+/// is connected), how often to remind, and whether the clock runs now.
+pub async fn api_held_waiting(RequireMcr(_): RequireMcr, State(state): State<AppState>) -> JsonResult {
+    let w = state.repo.held_waiting().map_err(internal_error("Could not read the held videos."))?;
+    let desks = state.desks.connected();
+    Ok(Json(serde_json::json!({
+        "count": w.count,
+        "oldest_held_at": w.oldest_held_at.map(omni_core::timestamps::format),
+        "soonest_expires_at": w.soonest_expires_at.map(omni_core::timestamps::format),
+        "remind_every_mins": HELD_REMIND_EVERY_MINS,
+        "desks_connected": desks,
+        "clock_running": desks > 0,
+    })))
 }
 
 // ==========================================

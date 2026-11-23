@@ -5,13 +5,13 @@
  * is kept in this browser (text.js); the desk and the journalist's page stay
  * Greek, since only these pages add an English dictionary.
  *
- *   import { t, applyText } from '/static/admin-text.js?v=2';
+ *   import { t, applyText } from '/static/admin-text.js?v=3';
  */
 
 import { t, tn, applyText, addLanguage, setLanguage, language } from '/static/text.js?v=9';
 import DESK from '/static/text.el.js?v=9';
-import ADMIN_EL from '/static/admin-text.el.js?v=2';
-import ADMIN_EN from '/static/admin-text.en.js?v=2';
+import ADMIN_EL from '/static/admin-text.el.js?v=3';
+import ADMIN_EN from '/static/admin-text.en.js?v=3';
 
 addLanguage('el', { ...DESK, ...ADMIN_EL });
 addLanguage('en', ADMIN_EN);

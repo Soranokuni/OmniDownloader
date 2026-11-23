@@ -1603,8 +1603,8 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
 fn the_first_run_password_card_ships_with_admin_v42_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=42"), "admin.html does not import admin.js?v=42");
-    assert!(!admin.contains("/static/admin.js?v=41"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=43"), "admin.html does not import admin.js?v=43");
+    assert!(!admin.contains("/static/admin.js?v=42"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -1729,7 +1729,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["12".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["13".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");

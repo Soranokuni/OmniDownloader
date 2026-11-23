@@ -4,7 +4,7 @@
  */
 
 import { api, el, render, toast, fmtTime } from '/static/app.js?v=6';
-import { t } from '/static/admin-text.js?v=2';
+import { t } from '/static/admin-text.js?v=3';
 
 // The autonomy report (P11.0): the soak test's figure and why people were needed.
 // Each touch reason has its words under `admin.touch.<reason>`.
@@ -129,25 +129,73 @@ async function loadHealth() {
 }
 
 /* ------------------------------------------------------------------ *
- * Repair in shadow (P11.9): what the repair ladder would have done.
- * Lane auto serves the report; until its shape is final the card shows
- * its figures as they come, and says so when the report is not there.
+ * Repair in shadow (P11.9): what the repair ladder would have done over
+ * the last `days` days (GET /api/admin/repair/shadow: runs, would_fix,
+ * jobs, sites[], latest[], repair_mode, hold_offered, offer_min_jobs), and
+ * the one-click switch to hold when it is offered (POST /api/admin/repair/hold).
+ * Sites and job names only, never an address.
  * ------------------------------------------------------------------ */
 
 const SHADOW_URL = '/api/admin/repair/shadow';
+const HOLD_URL = '/api/admin/repair/hold';
+const modeLabel = (mode) => (['off', 'shadow', 'hold'].includes(mode) ? t(`admin.op.mode.${mode}`) : String(mode));
 
-function shadowRows(value, prefix = '') {
-  if (value === null || typeof value !== 'object') return [[prefix, String(value)]];
-  return Object.entries(value).flatMap(([k, v]) => (v !== null && typeof v === 'object' && !Array.isArray(v)
-    ? shadowRows(v, `${prefix}${k}.`)
-    : [[`${prefix}${k}`, Array.isArray(v) ? t('admin.shadow.items', { n: v.length }) : String(v)]]));
+function shadowSites(sites) {
+  return autonomyTable(t('admin.shadow.sites'), [t('admin.shadow.site'), t('admin.shadow.would_fix'), t('admin.shadow.runs'), t('admin.shadow.jobs')],
+    sites.slice(0, 10).map((s) => el('tr', {},
+      el('td', {}, s.domain || t('admin.shadow.no_site')),
+      el('td', { class: 'right' }, String(s.would_fix)),
+      el('td', { class: 'right' }, String(s.runs)),
+      el('td', { class: 'right' }, String(s.jobs)))));
+}
+
+function shadowLatest(latest) {
+  return autonomyTable(t('admin.shadow.latest'), [t('admin.shadow.job'), t('admin.shadow.site'), t('admin.shadow.when'), t('admin.shadow.status')],
+    latest.map((j) => el('tr', {},
+      el('td', {}, el('span', { class: 'mono' }, `#${j.job_id}`), ' ', j.slug),
+      el('td', {}, j.domain || t('admin.shadow.no_site')),
+      el('td', {}, fmtTime(j.at)),
+      el('td', {}, el('span', { class: 'mono' }, j.status)))));
+}
+
+async function switchToHold(button) {
+  button.disabled = true;
+  try {
+    await api(HOLD_URL, { method: 'POST' });
+    toast(t('admin.shadow.hold_done'));
+    loadShadow();
+  } catch (e) {
+    button.disabled = false;
+    toast(e.message, 'bad');
+  }
+}
+
+function shadowOffer(report) {
+  if (report.hold_offered) {
+    const button = el('button', { class: 'btn btn-primary', type: 'button' }, t('admin.shadow.hold_button'));
+    button.addEventListener('click', () => switchToHold(button));
+    return el('div', { class: 'stack' }, el('p', { class: 'note' }, t('admin.shadow.offer', { jobs: report.jobs })), button);
+  }
+  if (report.repair_mode === 'shadow') {
+    return el('p', { class: 'note' }, t('admin.shadow.offer_later', { min: report.offer_min_jobs }));
+  }
+  return null;
 }
 
 async function loadShadow() {
   try {
     const report = await api(SHADOW_URL);
-    render('shadow-body', shadowRows(report).slice(0, 40).map(([k, v]) => el('div', { class: 'spec-row' },
-      el('span', { class: 'mono' }, k), el('span', {}, v))));
+    const parts = [
+      el('p', {}, t('admin.shadow.mode', { mode: modeLabel(report.repair_mode) })),
+      el('p', {}, report.runs === 0
+        ? t('admin.shadow.no_runs', { days: report.days })
+        : t('admin.shadow.summary', { days: report.days, runs: report.runs, would_fix: report.would_fix, jobs: report.jobs })),
+    ];
+    if (report.sites.length > 0) parts.push(shadowSites(report.sites));
+    if (report.latest.length > 0) parts.push(shadowLatest(report.latest));
+    const offer = shadowOffer(report);
+    if (offer) parts.push(offer);
+    render('shadow-body', parts);
   } catch (e) {
     render('shadow-body', el('p', { class: 'note' }, e.status === 404 ? t('admin.shadow.none') : e.message));
   }

@@ -11,6 +11,7 @@ pub mod preview;
 pub mod probe;
 pub mod repair;
 pub mod repair_gate;
+pub mod second_route;
 pub mod verify;
 pub mod rewrapper;
 pub mod selftest;

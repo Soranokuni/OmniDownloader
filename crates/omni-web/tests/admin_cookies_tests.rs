@@ -344,3 +344,49 @@ async fn a_passing_test_gives_a_second_chance_and_a_failing_one_does_not() -> Re
     assert_eq!(status_of(&app.repo, id), JobStatus::Pending, "a passing test did not move the login job");
     Ok(())
 }
+
+/// P11.12: the desk card lists the login-wall jobs in review per site whose jar
+/// is missing, expired or failed, the most first, with the newest job. A site
+/// with a usable jar, a news article's player, another code and a tidied job
+/// are left out; no address leaves the server.
+#[tokio::test]
+async fn the_desk_card_counts_login_waits_per_site_without_a_usable_jar() -> Result<()> {
+    let app = App::new(None)?;
+    app.upload("x.com", &jar_text(VALUE, 4_102_444_800)).await?;
+    let past = chrono::Utc::now() - chrono::Duration::days(30);
+    let expired = format!(".youtube.com\tTRUE\t/\tTRUE\t{}\tSID\t{OTHER_VALUE}\n", (past + chrono::Duration::days(1)).timestamp());
+    let jar = omni_core::cookies::parse_netscape_at("youtube.com", &expired, past)?;
+    app.repo.put_cookie_jar("youtube.com", &jar, "admin", past)?;
+
+    // Tidied off the review tab: left out.
+    let tidied = job_in_review(&app.repo, "https://www.tiktok.com/@a/video/2", "1_ANNA_TEST", "LOGIN_REQUIRED")?;
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(app.repo.hide_old_review(0)?, 1);
+    assert!(app.repo.get_job(tidied)?.unwrap().cleared_at.is_some());
+
+    job_in_review(&app.repo, "https://www.instagram.com/p/abc", "2_ANNA_TEST", "LOGIN_REQUIRED")?;
+    let insta_new = job_in_review(&app.repo, "https://www.instagram.com/reel/def", "3_ANNA_TEST", "LOGIN_REQUIRED")?;
+    let yt = job_in_review(&app.repo, "https://www.youtube.com/watch?v=abc123", "4_ANNA_TEST", "LOGIN_REQUIRED")?;
+    job_in_review(&app.repo, "https://news.example/story/1", "5_ANNA_TEST", "LOGIN_REQUIRED")?; // the player's wall, site unknown
+    job_in_review(&app.repo, "https://www.tiktok.com/@a/video/1", "6_ANNA_TEST", "NO_STREAM_FOUND")?; // not a login wall
+    let x = job_in_review(&app.repo, "https://x.com/someone/status/1?s=20", "7_ANNA_TEST", "LOGIN_REQUIRED")?;
+
+    let (status, body) = app.send("GET", "/api/cookies/waiting", None, false).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body)?;
+    assert_eq!(v["total"], 3, "{v}");
+    assert_eq!(v["sites"][0]["site"], "instagram.com");
+    assert_eq!((v["sites"][0]["count"].as_i64(), v["sites"][0]["jar"].as_str()), (Some(2), Some("missing")));
+    assert_eq!((v["sites"][0]["newest_job_id"].as_i64(), v["sites"][0]["newest_slug"].as_str()), (Some(insta_new), Some("3_ANNA_TEST")));
+    assert_eq!((v["sites"][1]["site"].as_str(), v["sites"][1]["jar"].as_str(), v["sites"][1]["newest_job_id"].as_i64()), (Some("youtube.com"), Some("expired"), Some(yt)));
+    assert!(v["sites"].as_array().unwrap().iter().all(|s| s["site"] != "x.com"), "a usable jar is not waited for: {v}");
+    assert!(!body.contains("https://") && !body.contains(VALUE) && !body.contains(OTHER_VALUE), "{body}");
+
+    // The x.com jar stops logging in: its jobs now wait for it.
+    app.repo.record_cookie_test("x.com", false, "login required", "https://x.com/a/status/1", chrono::Utc::now())?;
+    let (_, body) = app.send("GET", "/api/cookies/waiting", None, false).await?;
+    let v: Value = serde_json::from_str(&body)?;
+    let xs = v["sites"].as_array().unwrap().iter().find(|s| s["site"] == "x.com").cloned().unwrap_or_default();
+    assert_eq!((xs["count"].as_i64(), xs["jar"].as_str(), xs["newest_job_id"].as_i64()), (Some(1), Some("failed"), Some(x)), "{v}");
+    Ok(())
+}

@@ -524,6 +524,22 @@ mod tests {
         assert!(unknown_keys(&example).is_empty(), "{:?}", unknown_keys(&example));
     }
 
+    /// The settings lane auto added (P11.9, P11.15, P14.4) are known keys, and a
+    /// slip in one of them is named.
+    #[test]
+    fn the_locker_alerts_and_repair_settings_are_known() {
+        let doc = json!({
+            "locker": { "max_file_gb": 20, "direct_shares": true, "browser_capture": false },
+            "alerts": { "waiting_for_person_mins": 30 },
+            "repair": { "mode": "shadow" },
+            "retry": { "max_age_mins": 120 },
+        });
+        assert!(unknown_keys(&doc).is_empty(), "{:?}", unknown_keys(&doc));
+        let slip = unknown_keys(&json!({ "locker": { "browser_captur": true } }));
+        assert_eq!(slip.len(), 1);
+        assert_eq!(slip[0].closest.as_deref(), Some("locker.browser_capture"));
+    }
+
     #[test]
     fn v1_keys_move_into_their_sections_and_imap_keys_are_dropped() {
         let mut doc = json!({

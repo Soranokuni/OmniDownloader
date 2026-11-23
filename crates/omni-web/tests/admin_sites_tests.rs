@@ -117,7 +117,8 @@ async fn the_site_list_shows_state_rates_canaries_and_whether_run_now_exists() -
     assert_eq!(s["recent_rate"], 0.5);
     assert_eq!(s["last_code"], "NO_VIDEO");
     assert_eq!((s["canaries"].as_i64(), s["canaries_ok"].as_i64()), (Some(1), Some(0)));
-    assert_eq!(json["repair_mode"], "off");
+    // A new configuration runs repair in shadow (P11.9).
+    assert_eq!(json["repair_mode"], "shadow");
     assert!(!json.to_string().contains("secret-path"), "a host, never a page address: {json}");
     Ok(())
 }
@@ -353,6 +354,88 @@ async fn the_report_takes_one_to_ninety_days_and_counts_what_the_period_holds() 
     Ok(())
 }
 
+/// One repair run of a new job on `site`, `ago` days back, in `mode`, ending `outcome`.
+fn attempt(repo: &Repository, n: u32, site: &str, mode: &str, outcome: &str, ago: i64) -> Result<i64> {
+    let job = repo
+        .enqueue(&omni_core::models::NewJob::new(&format!("https://{site}/story-{n}"), &format!("{n}_ANNA_TEST"), "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?
+        .job_id();
+    let at = chrono::Utc::now() - chrono::Duration::days(ago);
+    let id = repo.start_attempt(job, mode, at)?;
+    let end = AttemptEnd { outcome: Some(outcome.into()), domain: Some(site.into()), held_url: Some(format!("https://cdn.{site}/v{n}.mp4?sig=1")), ..Default::default() };
+    repo.finish_attempt(id, &end, at)?;
+    Ok(job)
+}
+
+/// P11.9: the shadow summary counts the last 14 days' shadow runs (not hold
+/// runs, not older ones), per site, names jobs by slug and site only, and
+/// offers the switch to hold from three jobs the ladder would have fixed.
+#[tokio::test]
+async fn the_shadow_summary_counts_fourteen_days_and_offers_hold_from_three_jobs() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let admin = omni_core::auth::generate_session_token();
+    repo.create_session(id, &admin, 1)?;
+    let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));
+    assert_eq!(state.repair_mode.get(), omni_core::config::RepairMode::Shadow, "a new config runs in shadow");
+    let app = App { router: WebServer::build_router(state), repo: repo.clone(), admin, _dir: dir };
+
+    let (status, empty) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((empty["days"].as_i64(), empty["runs"].as_i64(), empty["hold_offered"].as_bool()), (Some(14), Some(0), Some(false)));
+    assert_eq!(empty["repair_mode"], "shadow");
+
+    attempt(&repo, 1, "news.example", "shadow", "shadow_found", 1)?;
+    attempt(&repo, 2, "news.example", "shadow", "shadow_found", 3)?;
+    attempt(&repo, 3, "other.example", "shadow", "nothing_verified", 2)?;
+    attempt(&repo, 4, "news.example", "hold", "held", 1)?; // not shadow
+    attempt(&repo, 5, "news.example", "shadow", "shadow_found", 20)?; // older than 14 days
+    let (_, two) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!((two["runs"].as_i64(), two["would_fix"].as_i64(), two["jobs"].as_i64()), (Some(3), Some(2), Some(2)), "{two}");
+    assert_eq!(two["hold_offered"], false, "two jobs are not yet enough");
+    assert_eq!(two["sites"][0]["domain"], "news.example");
+    assert_eq!((two["sites"][0]["would_fix"].as_i64(), two["sites"][1]["would_fix"].as_i64()), (Some(2), Some(0)));
+    assert_eq!(two["latest"][0]["slug"], "1_ANNA_TEST", "newest first");
+    assert!(!two.to_string().contains("cdn.") && !two.to_string().contains("https://"), "no address: {two}");
+
+    attempt(&repo, 6, "other.example", "shadow", "shadow_found", 5)?;
+    let (_, three) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!((three["jobs"].as_i64(), three["hold_offered"].as_bool()), (Some(3), Some(true)));
+    Ok(())
+}
+
+/// P11.9: the switch to hold is saved to config.json, reaches the workers'
+/// live mode at once, is audited, and a second click changes nothing.
+#[tokio::test]
+async fn the_switch_to_hold_is_saved_live_and_audited_once() -> Result<()> {
+    let dir = TempDir::new()?;
+    let config_path = dir.path().join("config.json");
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let admin = omni_core::auth::generate_session_token();
+    repo.create_session(id, &admin, 1)?;
+    let workers = omni_core::config::LiveRepairMode::new(omni_core::config::RepairMode::Shadow);
+    let state = AppState::new(repo.clone(), AppConfig::default(), config_path.clone()).with_repair_mode(workers.clone());
+    let app = App { router: WebServer::build_router(state), repo: repo.clone(), admin, _dir: dir };
+
+    let (status, done) = app.send("POST", "/api/admin/repair/hold", None).await?;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!((done["changed"].as_bool(), done["restart_required"].as_bool()), (Some(true), Some(false)));
+    assert_eq!(workers.get(), omni_core::config::RepairMode::Hold, "the workers' next job runs in hold");
+    assert_eq!(AppConfig::load_from_file(&config_path)?.repair.mode, omni_core::config::RepairMode::Hold, "saved for the next start");
+    let (_, after) = app.send("GET", "/api/admin/repair/shadow", None).await?;
+    assert_eq!((after["repair_mode"].as_str(), after["hold_offered"].as_bool()), (Some("hold"), Some(false)));
+    let audited = |repo: &Repository| -> Result<usize> {
+        Ok(repo.get_recent_audit_logs(100)?.into_iter().filter(|l| l.message.contains("Repair mode switched from shadow to hold by it@station.gr")).count())
+    };
+    assert_eq!(audited(&repo)?, 1);
+
+    let (status, again) = app.send("POST", "/api/admin/repair/hold", None).await?;
+    assert_eq!((status, again["changed"].as_bool()), (StatusCode::OK, Some(false)));
+    assert_eq!(audited(&repo)?, 1, "nothing changed, nothing audited");
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_autonomy_report_has_its_shape_clamps_the_days_and_names_no_address() -> Result<()> {
     let app = App::new(None)?;
@@ -475,5 +558,57 @@ async fn the_import_hint_names_a_domain_the_import_accepts_and_a_barred_recipe_i
     let (_, export) = app.send("GET", "/api/admin/recipes/export", None).await?;
     let keys: Vec<&str> = export["recipes"].as_array().unwrap().iter().map(|r| r["scope_key"].as_str().unwrap()).collect();
     assert_eq!(keys, ["ok.example"], "MCR said wrong video for the first: it is not carried to another installation");
+    Ok(())
+}
+
+/// P11.10: a desk's live stream (`?desk=1`) counts as a connected desk while it
+/// is open and stops counting when it closes; a stream without the mark (the
+/// admin panel) does not count. The reminder route reads what waits.
+#[tokio::test]
+async fn a_desk_stream_counts_while_open_and_the_reminder_reads_what_waits() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let admin = omni_core::auth::generate_session_token();
+    repo.create_session(id, &admin, 1)?;
+    let desks = omni_core::held::DeskPresence::new();
+    let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json")).with_desks(desks.clone());
+    let app = App { router: WebServer::build_router(state), repo: repo.clone(), admin, _dir: dir };
+    let stream = |uri: &str| {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", format!("omni_session={}", app.admin))
+            .header("host", "mcr.local")
+            .body(Body::empty())
+            .unwrap();
+        app.router.clone().layer(MockConnectInfo(PEER.parse::<SocketAddr>().unwrap())).oneshot(req)
+    };
+
+    let panel = stream("/api/events").await?;
+    assert_eq!(panel.status(), StatusCode::OK);
+    assert_eq!(desks.connected(), 0, "a stream without the desk mark is not a desk");
+    let desk = stream("/api/events?desk=1").await?;
+    assert_eq!(desk.status(), StatusCode::OK);
+    assert_eq!(desks.connected(), 1);
+    drop(desk);
+    assert_eq!(desks.connected(), 0, "the closed tab is no longer a desk");
+    assert!(desks.take_seen(), "but it was seen since the last tick");
+    drop(panel);
+
+    let (status, none) = app.send("GET", "/api/held/waiting", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((none["count"].as_i64(), none["remind_every_mins"].as_i64(), none["clock_running"].as_bool()), (Some(0), Some(30), Some(false)));
+    assert!(none["soonest_expires_at"].is_null(), "no video, no time: {none}");
+
+    let job = repo.enqueue(&omni_core::models::NewJob::new("https://news.example/v1", "1_ANNA_TEST", "ANNA"), DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+    assert!(repo.lease_job_by_id(job, "w", 180)?);
+    let until = chrono::Utc::now() + chrono::Duration::hours(24);
+    assert!(repo.hold_output(job, "w", "temp/held/1/clip.mxf", 10, &"ab".repeat(32), None, until)?);
+    assert!(repo.finish(job, "w", omni_core::models::JobStatus::AwaitingApproval, None, None, None)?);
+    let _open = stream("/api/events?desk=1").await?;
+    let (_, one) = app.send("GET", "/api/held/waiting", None).await?;
+    assert_eq!((one["count"].as_i64(), one["desks_connected"].as_i64(), one["clock_running"].as_bool()), (Some(1), Some(1), Some(true)), "{one}");
+    assert_eq!(one["soonest_expires_at"].as_str(), Some(omni_core::timestamps::format(until).as_str()));
     Ok(())
 }

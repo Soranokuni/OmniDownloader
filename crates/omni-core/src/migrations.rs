@@ -9,6 +9,9 @@
 //!
 //! * Append to [`MIGRATIONS`]; never edit or renumber an existing entry. A
 //!   deployed daemon has already recorded that version as applied.
+//! * Versions are consecutive, 1 to the last, with no gaps. (Once, at the
+//!   wave-2 merge, the mail auto-retry table moved from 45 to 42 so the list
+//!   closes up after 39-41; no installation had applied a version above 38.)
 //! * Each entry runs exactly once, inside a transaction. A failure rolls the
 //!   whole entry back and aborts start-up rather than leaving a half-migrated
 //!   database feeding playout.
@@ -910,7 +913,37 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         "#,
     ),
     (
-        45,
+        39,
+        // When the job took its second route through the pipeline (P11.6): downloaded again with
+        // other formats and remuxed before the encode, once per job. NULL: not taken.
+        r#"
+        ALTER TABLE queue ADD COLUMN second_route_at TEXT;
+        "#,
+    ),
+    (
+        40,
+        // Until when a held video's approval clock was last accounted (P11.10): the clock
+        // runs only while an MCR desk is connected; time no desk saw moves `expires_at` on.
+        // Rows already waiting are accounted up to the upgrade (the old rule, the clock ran).
+        r#"
+        ALTER TABLE held_outputs ADD COLUMN clock_at TEXT;
+        UPDATE held_outputs SET clock_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE decision IS NULL;
+        "#,
+    ),
+    (
+        41,
+        // Small facts about the database itself (P14.8b): first the version of the
+        // URL normalization its stored dedup keys were made with
+        // (`url_normalize_version`). No row: made before P14.8, version 1.
+        r#"
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    ),
+    (
+        42,
         // A mail the watcher gave up on (FAILED) is read again automatically once, after the
         // first good poll that follows a restart or a tool update (P11.11b). One row per mail
         // that was given that chance, so it is never given twice; `cause` says what set it off,
@@ -1773,6 +1806,7 @@ mod tests {
         let mut last = 0;
         for (v, _) in MIGRATIONS {
             assert!(*v > last, "migration versions must ascend: {v} after {last}");
+            assert_eq!(*v, last + 1, "migration versions are consecutive: {v} after {last}");
             last = *v;
         }
     }
@@ -1926,5 +1960,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!((attempts, max_attempts, stage.as_str()), (0, 3, "QUEUED"));
+    }
+
+    /// P11.10: migration 40 gives a held video still waiting a `clock_at` (its
+    /// clock accounted up to the upgrade) and leaves a decided one without.
+    #[test]
+    fn migration_40_accounts_waiting_held_clocks_up_to_the_upgrade() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        for (v, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 39) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (?, 'x')", rusqlite::params![v])
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO queue (id, url, slug, status) VALUES (5, 'https://a.example/1', '1_ANNA_X', 'AWAITING_APPROVAL');
+             INSERT INTO queue (id, url, slug, status) VALUES (6, 'https://a.example/2', '2_ANNA_X', 'REQUIRES_REVIEW');
+             INSERT INTO held_outputs (job_id, path, bytes, sha256, created_at, expires_at)
+                VALUES (5, 'p', 1, 'abc', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
+             INSERT INTO held_outputs (job_id, path, bytes, sha256, created_at, expires_at, decision)
+                VALUES (6, 'q', 1, 'abc', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z', 'expired');",
+        )
+        .unwrap();
+        assert_eq!(apply(&mut conn, None).unwrap(), target_version());
+        let clock = |id: i64| -> Option<String> {
+            conn.query_row("SELECT clock_at FROM held_outputs WHERE job_id = ?", rusqlite::params![id], |r| r.get(0)).unwrap()
+        };
+        let waiting = clock(5).expect("a waiting row is accounted");
+        assert!(crate::timestamps::parse_opt(Some(waiting.clone())).is_some_and(|t| t > chrono::Utc::now() - chrono::Duration::minutes(5)), "{waiting}");
+        assert_eq!(clock(6), None, "a decided row is left");
     }
 }

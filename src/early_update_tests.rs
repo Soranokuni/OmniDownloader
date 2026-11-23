@@ -280,15 +280,95 @@ fn the_nightly_drain_stays_ten_minutes_and_the_early_one_is_ninety_seconds() {
     assert!(update.contains("if !swap.drain(drain).await {"), "the update waits the drain it is given");
 }
 
+/// P11.7b: the update records the pending verdict before it swaps the build in
+/// and clears it only once the verdict is in, under the swap lock; start-up
+/// recovers an unjudged swap before any yt-dlp is used.
+#[test]
+fn an_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it() {
+    let main = include_str!("main.rs");
+    let update = &main[main.find("async fn nightly_ytdl_update(").unwrap()..];
+    let update = &update[..update.find("\n}").unwrap()];
+    // Every needle at a line's start, so a commented-out call does not count (P11.7b2).
+    let at = |s: &str| update.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let mark = at("\n        if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {");
+    let apply = at("\n        match dep_mgr.apply_staged_ytdl() {");
+    let verdict = at("\n    let verdict = verify_ytdl_update(");
+    // Only while a build is live: with none left, the start-up repair needs the marker (P11.7d).
+    let clear = verdict + update[verdict..].find("\n    match dep_mgr.clear_ytdl_verifying_if_live() {").expect("cleared after the verdict");
+    let unlock = at("\n    drop(swap);");
+    assert!(mark < apply, "the marker is written before the swap");
+    assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
+    // A failed apply clears the marker only while a build is live (P11.7b3).
+    let failed_apply = &update[apply..verdict];
+    assert!(failed_apply.contains("\n                if let Err(c) = dep_mgr.clear_ytdl_verifying_if_live() {"), "the failed apply keeps a needed marker");
+    assert!(!failed_apply.contains("dep_mgr.clear_ytdl_verifying()"), "never the unconditional clear there");
+    // A marker that could not be cleared is audited, not only logged (P11.7b2).
+    assert!(update[clear..unlock].contains("\n            let _ = repo.log_audit(\n                \"ERROR\","), "the failed clear is audited");
+    let start = main.find("\n    report_unverified(&repo, \"yt-dlp\", dep_mgr.recover_unverified_ytdl());").expect("start-up recovery");
+    assert!(start < main.find("ensure_ytdl_folder_build(&dep_mgr,").unwrap(), "before the tools are resolved");
+}
+
+/// P11.7c: the Deno update marks its pending verdict before the swap, clears it
+/// only after the verdict (rollbacks included) and before the lock is released,
+/// audits a failed clear, keeps the marker after a failed apply that left no
+/// Deno, and start-up recovers an unjudged Deno before the background install.
+#[test]
+fn the_deno_update_marks_its_pending_verdict_around_the_swap_and_start_up_recovers_it() {
+    let main = include_str!("main.rs");
+    let update = &main[main.find("async fn nightly_deno_update(").unwrap()..];
+    let update = &update[..update.find("\n}").unwrap()];
+    let at = |s: &str| update.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let mark = at("\n            .and_then(|sha| dep_mgr.mark_deno_verifying(&sha));");
+    let apply = at("\n            Ok(()) => dep_mgr.apply_staged_deno(&new_version).inspect_err(|_| {");
+    let failed_apply = at("\n                if let Err(c) = dep_mgr.clear_deno_verifying_if_live() {");
+    let verdict = at("\n            let verdict = match selfcheck::judge_deno(&results) {");
+    // Only while a Deno is live: with none left, the start-up repair needs the marker (P11.7d).
+    let clear = at("\n            match dep_mgr.clear_deno_verifying_if_live() {");
+    let unlock = at("\n    drop(swap);");
+    assert!(mark < apply && apply < failed_apply, "marked before the swap; a failed apply keeps a needed marker");
+    assert!(verdict < clear && clear < unlock, "cleared after the verdict, before the lock is released");
+    assert!(update[clear..unlock].contains("\n                    let _ = repo.log_audit(\n                        \"ERROR\","), "the failed clear is audited");
+    // A re-check is audited as one, not as an update (P11.7d).
+    assert!(update.contains("\n                        format!(\"Deno {new_version} verified after an interrupted update\")"), "the re-check's wording");
+    let start = main.find("\n    report_unverified(&repo, \"Deno\", dep_mgr.recover_unverified_deno());").expect("start-up recovery");
+    assert!(start < main.find("\n    // Deno for YouTube (plan P6.8): reported now").unwrap(), "before the background install");
+}
+
+/// P11.7c: a live build waits for its verdict only when the marker names it.
+#[test]
+fn a_live_build_awaits_its_verdict_only_when_the_marker_names_it() {
+    use crate::awaits_verdict;
+    assert!(awaits_verdict(Some("aaa"), Some("aaa")));
+    assert!(!awaits_verdict(Some("aaa"), Some("bbb")));
+    assert!(!awaits_verdict(Some("aaa"), None));
+    assert!(!awaits_verdict(None, None), "no live build waits for nothing");
+    assert!(!awaits_verdict(None, Some("aaa")));
+}
+
+/// P11.7b2: a staged release that is already live is left alone, unless the
+/// live build still waits for its verdict: then it is verified as it stands.
+#[test]
+fn a_live_release_still_waiting_for_its_verdict_is_verified_not_skipped() {
+    use crate::{staged_release_action as act, StagedRelease::*};
+    assert_eq!(act(Some("bbb"), "bbb", None), AlreadyLatest);
+    assert_eq!(act(Some("bbb"), "bbb", Some("aaa")), AlreadyLatest, "a stale marker for another build");
+    assert_eq!(act(Some("bbb"), "bbb", Some("bbb")), Reverify);
+    assert_eq!(act(Some("aaa"), "bbb", None), Install);
+    assert_eq!(act(Some("aaa"), "bbb", Some("bbb")), Install, "not live yet: swapped in and verified");
+    assert_eq!(act(None, "bbb", None), Install);
+}
+
 /// The worker notes an extraction failure only for a job that ended for good
 /// (inside the no-retry branch, after it was finished), with `done` and the cancel state.
 #[test]
 fn the_worker_notes_extraction_trouble_after_finishing_a_job_it_will_not_retry() {
     let src = include_str!("worker.rs");
-    let call = "note_extraction_trouble(repo, canary, done, cancel.is_cancelled(), &orig_url, site_code.as_str());";
+    // `done`, but never for a file-locker share, which says nothing about a platform (P11.15a2).
+    let call = "note_extraction_trouble(repo, canary, done_for_site, cancel.is_cancelled(), &orig_url, site_code.as_str());";
     assert_eq!(src.matches(call).count(), 1, "the call in run_job");
     let at = src.find(call).unwrap();
     let before = &src[..at];
+    assert!(before.ends_with("let done_for_site = done && !locker_direct;\n                "), "done_for_site is `done` of a non-locker job");
     let branch = before.rfind("if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {").expect("the no-retry branch");
     let finish = before.rfind("let done = repo.finish(").expect("the job is finished first");
     assert!(branch < finish, "the finish belongs to the branch");

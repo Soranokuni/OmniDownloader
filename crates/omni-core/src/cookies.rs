@@ -341,18 +341,56 @@ pub fn refresh_health(repo: &crate::repository::Repository, health: &crate::heal
     }
 }
 
-/// What the «Cookies» line was last computed from: the jar count and the newest `updated_at`.
-pub type JarsSeen = Option<(usize, Option<DateTime<Utc>>)>;
+/// What the «Cookies» line was last computed from: the jar count, the newest
+/// `updated_at`, and the local day it was computed on.
+pub type JarsSeen = Option<(usize, Option<DateTime<Utc>>, chrono::NaiveDate)>;
 
-/// [`refresh_health`] only when the stored jars changed since `seen`: a jar the
-/// sign-in command wrote from another process shows on the line without a restart.
-/// One indexed query per call.
+/// [`refresh_health`] only when the stored jars changed since `seen`, or on a
+/// new local day: a jar the sign-in command wrote from another process shows on
+/// the line without a restart, and a jar crossing the 7-day mark (or the 30
+/// days untested) turns it amber by the next day at the latest (P11.12). One
+/// indexed query per call.
 pub fn refresh_health_if_changed(repo: &crate::repository::Repository, health: &crate::health::HealthState, seen: &mut JarsSeen) {
+    refresh_health_if_changed_at(repo, health, seen, Utc::now());
+}
+
+/// [`refresh_health_if_changed`] at `now`.
+pub fn refresh_health_if_changed_at(
+    repo: &crate::repository::Repository,
+    health: &crate::health::HealthState,
+    seen: &mut JarsSeen,
+    now: DateTime<Utc>,
+) {
     let Ok(jars) = repo.list_cookie_jars() else { return };
-    let now_seen = Some((jars.len(), jars.iter().filter_map(|j| j.updated_at).max()));
+    let day = now.with_timezone(&chrono::Local).date_naive();
+    let now_seen = Some((jars.len(), jars.iter().filter_map(|j| j.updated_at).max(), day));
     if *seen != now_seen {
         *seen = now_seen;
-        health.set(crate::health::checks::COOKIES, health_check(&jars, Utc::now()));
+        health.set(crate::health::checks::COOKIES, health_check(&jars, now));
+    }
+}
+
+/// What a site's jar lacks for the jobs waiting on its login wall (P11.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JarWant {
+    /// The site has no jar.
+    Missing,
+    /// The jar's earliest login cookie has expired.
+    Expired,
+    /// The jar's last test did not log in.
+    Failed,
+}
+
+/// What `jar` lacks at `now`, `None` when it looks usable: no jar is
+/// [`JarWant::Missing`], an expired one [`JarWant::Expired`], one whose last
+/// test failed [`JarWant::Failed`].
+pub fn jar_want(jar: Option<&CookieJarInfo>, now: DateTime<Utc>) -> Option<JarWant> {
+    match jar {
+        None => Some(JarWant::Missing),
+        Some(j) if j.expires_min.is_some_and(|e| e <= now) => Some(JarWant::Expired),
+        Some(j) if j.last_test_ok == Some(false) => Some(JarWant::Failed),
+        Some(_) => None,
     }
 }
 
@@ -387,6 +425,50 @@ mod tests {
 
         refresh_health_if_changed(&repo, &health, &mut seen);
         assert!(health.get(crate::health::checks::COOKIES).unwrap().detail.unwrap().contains("1 cookie jar"));
+    }
+
+    /// P11.12: with no jar changed, the line is computed again on a new day, so
+    /// a jar crossing the 7-day mark turns it amber; within one day it is not.
+    #[test]
+    fn a_jar_crossing_the_seven_day_mark_turns_the_line_amber_the_next_day() {
+        use crate::health::{checks::COOKIES, Health};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let health = crate::health::HealthState::new();
+        let now = Utc::now();
+        let expiry = (now + Duration::days(8)).timestamp();
+        let raw = format!(".youtube.com\tTRUE\t/\tTRUE\t{expiry}\tSID\t{VALUE_A}\n");
+        let jar = parse_netscape("youtube.com", &raw).unwrap();
+        repo.put_cookie_jar("youtube.com", &jar, "admin", now).unwrap();
+
+        let mut seen = None;
+        refresh_health_if_changed_at(&repo, &health, &mut seen, now);
+        assert_eq!(health.get(COOKIES).unwrap().state, Health::Ok);
+        // Later the same day nothing is recomputed.
+        health.set(COOKIES, Check::ok("marker"));
+        refresh_health_if_changed_at(&repo, &health, &mut seen, now + Duration::minutes(1));
+        assert_eq!(health.get(COOKIES).unwrap().detail.as_deref(), Some("marker"));
+        // Two days on, the jar expires within 7 days: amber without any jar change.
+        refresh_health_if_changed_at(&repo, &health, &mut seen, now + Duration::days(2));
+        let c = health.get(COOKIES).unwrap();
+        assert_eq!(c.state, Health::Degraded, "{c:?}");
+        assert!(c.detail.unwrap().contains("youtube.com: expires within 7 days"));
+    }
+
+    #[test]
+    fn what_a_jar_lacks() {
+        let now = Utc::now();
+        assert_eq!(jar_want(None, now), Some(JarWant::Missing));
+        assert_eq!(jar_want(Some(&jar("x.com")), now), None);
+        let mut expired = jar("x.com");
+        expired.expires_min = Some(now - Duration::hours(1));
+        assert_eq!(jar_want(Some(&expired), now), Some(JarWant::Expired));
+        let mut failed = jar("x.com");
+        failed.last_test_ok = Some(false);
+        assert_eq!(jar_want(Some(&failed), now), Some(JarWant::Failed));
+        let mut soon = jar("x.com");
+        soon.expires_min = Some(now + Duration::days(3));
+        assert_eq!(jar_want(Some(&soon), now), None, "expiring soon still logs in");
     }
 
     const VALUE_A: &str = "tok-secret-value-AAA111";

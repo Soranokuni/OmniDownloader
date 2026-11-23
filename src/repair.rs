@@ -179,7 +179,10 @@ pub struct Tried {
 
 #[derive(Debug, Clone)]
 pub struct RepairCfg {
+    /// The mode at start-up; a run reads `live` instead, through [`RepairCtx::current`].
     pub mode: RepairMode,
+    /// The mode the admin panel can switch without a restart (P11.9); `None` in tests that fix one.
+    pub live: Option<omni_core::config::LiveRepairMode>,
     pub budget: Duration,
     pub hold_hours: i64,
     pub held_max_bytes: u64,
@@ -368,6 +371,19 @@ pub struct RepairCtx {
     pub env: Arc<dyn Env>,
 }
 
+impl RepairCtx {
+    /// This context with the mode the panel set last (P11.9, `cfg.live`), for
+    /// one run: a job, a night's self-heal or a test reads one mode from start
+    /// to end, even when the admin switches to `hold` meanwhile.
+    pub fn current(&self) -> RepairCtx {
+        let mut cfg = self.cfg.clone();
+        if let Some(live) = &cfg.live {
+            cfg.mode = live.get();
+        }
+        RepairCtx { repo: self.repo.clone(), cfg, env: self.env.clone() }
+    }
+}
+
 /// The real world: the headless browser, the network, the tools, the pipeline.
 pub struct RealEnv {
     engine: Arc<BroadcastEngine>,
@@ -553,11 +569,11 @@ pub fn job_kind(job: &Job, url: &str) -> JobKind {
 
 /// [`job_kind`] from its facts: whether the job was marked a locker, and whether it is an article's sibling.
 pub fn kind_of(url: &str, marked_locker: bool, sibling: bool) -> JobKind {
-    use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
     if url.starts_with("attachment://") {
         return JobKind::Attachment;
     }
-    if marked_locker || ComputerUseAgentPlaceholder::new(None, None).can_handle(url) {
+    // Any file-locker link, direct or not (P11.15a): the ladder is for article pages.
+    if marked_locker || omni_core::locker::is_locker(url) {
         return JobKind::Locker;
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {

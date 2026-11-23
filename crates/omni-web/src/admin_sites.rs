@@ -415,6 +415,65 @@ pub async fn api_admin_repair_report(
     })))
 }
 
+// ---------------------------------------------------------- shadow repair
+
+/// The days the shadow summary looks back (P11.9).
+pub const SHADOW_DAYS: i64 = 14;
+/// Jobs the ladder must have verified a video for in shadow, over
+/// [`SHADOW_DAYS`], before the panel offers the switch to `hold`.
+pub const SHADOW_OFFER_MIN_JOBS: i64 = 3;
+
+/// Whether the switch to `hold` is offered: repair runs in shadow and the
+/// ladder would have fixed at least [`SHADOW_OFFER_MIN_JOBS`] jobs.
+pub fn hold_offered(mode: omni_core::config::RepairMode, jobs_fixed: i64) -> bool {
+    mode == omni_core::config::RepairMode::Shadow && jobs_fixed >= SHADOW_OFFER_MIN_JOBS
+}
+
+/// What the repair ladder in shadow mode would have fixed over the last 14
+/// days, and whether the switch to `hold` is offered (P11.9). Sites and job
+/// slugs only, never an address.
+pub async fn api_admin_repair_shadow(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    let summary = state
+        .repo
+        .shadow_summary(Utc::now() - Duration::days(SHADOW_DAYS))
+        .map_err(internal_error("Could not read the shadow repair runs."))?;
+    let mode = state.repair_mode.get();
+    Ok(Json(json!({
+        "days": SHADOW_DAYS,
+        "repair_mode": mode,
+        "runs": summary.runs,
+        "would_fix": summary.would_fix,
+        "jobs": summary.jobs,
+        "sites": summary.sites,
+        "latest": summary.latest,
+        "hold_offered": hold_offered(mode, summary.jobs),
+        "offer_min_jobs": SHADOW_OFFER_MIN_JOBS,
+    })))
+}
+
+/// The one-click switch to `hold` (P11.9): saved to config.json and taken by
+/// the workers at their next job, no restart. Audited. From `hold` already it
+/// changes nothing.
+pub async fn api_admin_repair_hold(RequireAdmin(admin): RequireAdmin, State(state): State<AppState>) -> JsonResult {
+    use omni_core::config::RepairMode;
+    let mut cfg = state.config.write().await;
+    let before = cfg.repair.mode;
+    if before == RepairMode::Hold {
+        return Ok(Json(json!({ "status": "ok", "repair_mode": RepairMode::Hold, "changed": false, "restart_required": false })));
+    }
+    let mut next = cfg.clone();
+    next.repair.mode = RepairMode::Hold;
+    next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
+    *cfg = next;
+    state.repair_mode.set(RepairMode::Hold);
+    drop(cfg);
+    let from = serde_json::to_value(before).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+    let _ = state
+        .repo
+        .log_audit("WARN", "ADMIN", &format!("Repair mode switched from {from} to hold by {} (repair)", admin.email));
+    Ok(Json(json!({ "status": "ok", "repair_mode": RepairMode::Hold, "changed": true, "restart_required": false })))
+}
+
 // ------------------------------------------------------------- autonomy
 
 /// Longest period the autonomy report may ask for (outcome rows are kept 400 days).

@@ -555,6 +555,22 @@ const MATRIX: &[Row] = &[
         "/api/system/status",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Admin, Reached)],
     ),
+    // The desk's reminder of videos waiting for approval (P11.10): MCR, as the job list.
+    ("GET", "/api/held/waiting", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ]),
+    // The desk's «waiting for a login» card (P11.12): MCR, as the job list.
+    ("GET", "/api/cookies/waiting", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ]),
     (
         "GET",
         "/api/events",
@@ -908,6 +924,21 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // What the repair ladder in shadow would have fixed, and the switch to hold (P11.9): admin only.
+    ("GET", "/api/admin/repair/shadow", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/repair/hold", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // The autonomy report (P11.0): admin only.
     ("GET", "/api/admin/autonomy-report", &[
             (Anonymous, Denied),
@@ -1130,7 +1161,6 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
         ("POST", "/api/auth/logout"),
         ("POST", "/api/auth/logout-all"),
         ("POST", "/api/admin/users"),
-        ("POST", "/api/setup/wizard/account"),
         ("POST", "/api/setup/wizard/account"),
         ("GET", "/api/admin/users"),
     ];

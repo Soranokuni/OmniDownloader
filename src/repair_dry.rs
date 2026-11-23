@@ -411,6 +411,7 @@ fn finish(
 pub async fn dry_run(ctx: &RepairCtx, url: &str, use_llm: bool, deadline: Instant) -> std::result::Result<DryRunReport, String> {
     let (parsed, host) = omni_core::net::parse_public_url(url)?;
     let started = Instant::now();
+    let ctx = &ctx.current();
     let env: Arc<dyn Env> = Arc::new(ProbeOnly(ctx.env.clone()));
     let dry = RepairCtx { repo: ctx.repo.clone(), cfg: ctx.cfg.clone(), env: env.clone() };
     let mode = ctx.cfg.mode;

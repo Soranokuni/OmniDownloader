@@ -234,6 +234,35 @@ async fn a_parsed_message_queues_its_jobs_then_is_marked() {
     assert_eq!(recorded[0]["result"]["outcome"], "created");
 }
 
+/// P11.15a: a mailed share of one file the vendor serves directly (here
+/// Dropbox) goes to the pipeline like any link, still marked a locker; a
+/// WeTransfer link and a shared folder wait for MCR as before.
+#[tokio::test]
+async fn a_direct_locker_share_is_queued_for_the_pipeline_and_the_others_wait_for_mcr() {
+    let (_dir, repo) = repo();
+    let body = "1. ΚΑΥΣΩΝΑΣ\nhttps://www.dropbox.com/s/abc123/kafsonas.mp4?dl=0\n\n\
+                2. ΠΑΡΕΛΑΣΗ\nhttps://we.tl/t-w0002\n\n\
+                3. ΣΕΙΣΜΟΣ\nhttps://www.dropbox.com/sh/folder1/AAB?dl=0";
+    let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", body)]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    assert_eq!(watcher.poll_once().await.unwrap().processed, 1);
+
+    let mut jobs = repo.get_all_jobs().unwrap();
+    jobs.sort_by_key(|j| j.id);
+    let state: Vec<(JobStatus, Option<&str>)> = jobs.iter().map(|j| (j.status, j.extraction_method.as_deref())).collect();
+    assert_eq!(
+        state,
+        vec![
+            (JobStatus::Pending, Some("locker")),
+            (JobStatus::ManualDownload, Some("locker")),
+            (JobStatus::ManualDownload, Some("locker")),
+        ],
+        "{jobs:?}"
+    );
+    // The job keeps the link that was sent; the direct address is worked out when it runs.
+    assert_eq!(jobs[0].url, "https://www.dropbox.com/s/abc123/kafsonas.mp4?dl=0");
+}
+
 /// E-07: the same message seen again must not queue again — even when URL
 /// dedup would let it through because the first job is no longer active.
 #[tokio::test]
@@ -623,4 +652,32 @@ async fn a_saved_mail_is_queued_like_one_from_the_mailbox_and_only_once() {
 
     assert_eq!(watcher.ingest(&mail).await.unwrap(), Ingested::AlreadyHandled);
     assert_eq!(repo.get_all_jobs().unwrap().len(), 2);
+}
+
+/// P11.15b: the `locker` switches decide which locker links a worker takes:
+/// with `direct_shares` off a share waits for MCR; with `browser_capture` on a
+/// WeTransfer page is queued for the browser; a folder always waits.
+#[tokio::test]
+async fn the_locker_switches_decide_what_a_worker_takes() {
+    let body = "1. ΚΑΥΣΩΝΑΣ\nhttps://www.dropbox.com/s/abc123/kafsonas.mp4?dl=0\n\n\
+                2. ΠΑΡΕΛΑΣΗ\nhttps://we.tl/t-w0002\n\n\
+                3. ΣΕΙΣΜΟΣ\nhttps://www.dropbox.com/sh/folder1/AAB?dl=0";
+    for (direct_shares, browser_capture, want) in [
+        (false, false, [JobStatus::ManualDownload, JobStatus::ManualDownload, JobStatus::ManualDownload]),
+        (true, true, [JobStatus::Pending, JobStatus::Pending, JobStatus::ManualDownload]),
+        (false, true, [JobStatus::ManualDownload, JobStatus::Pending, JobStatus::ManualDownload]),
+    ] {
+        let (_dir, repo) = repo();
+        let mut config = test_config();
+        config.locker.direct_shares = direct_shares;
+        config.locker.browser_capture = browser_capture;
+        let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", body)]);
+        let watcher = EmailWatcher::with_source(config, repo.clone(), source.clone());
+        assert_eq!(watcher.poll_once().await.unwrap().processed, 1);
+        let mut jobs = repo.get_all_jobs().unwrap();
+        jobs.sort_by_key(|j| j.id);
+        let got: Vec<JobStatus> = jobs.iter().map(|j| j.status).collect();
+        assert_eq!(got, want.to_vec(), "direct_shares {direct_shares}, browser_capture {browser_capture}");
+        assert!(jobs.iter().all(|j| j.extraction_method.as_deref() == Some("locker")));
+    }
 }

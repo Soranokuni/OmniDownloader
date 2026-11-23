@@ -88,6 +88,8 @@ impl WebServer {
             .route("/api/groups/:code", post(api_delete_group))
             .route("/api/journalists/:surname/groups", post(api_set_journalist_groups))
             .route("/api/system/status", get(api_system_status))
+            .route("/api/cookies/waiting", get(api_login_waits))
+            .route("/api/held/waiting", get(api_held_waiting))
             .route("/api/events", get(api_events))
             // The mail view (plan P7.8).
             .route("/api/mails", get(api_get_mails))
@@ -152,6 +154,8 @@ impl WebServer {
             .route("/api/admin/recipes/:id/suspend", post(admin_sites::api_admin_recipe_suspend))
             .route("/api/admin/recipes/:id/retire", post(admin_sites::api_admin_recipe_retire))
             .route("/api/admin/repair-report", get(admin_sites::api_admin_repair_report))
+            .route("/api/admin/repair/shadow", get(admin_sites::api_admin_repair_shadow))
+            .route("/api/admin/repair/hold", post(admin_sites::api_admin_repair_hold))
             .route("/api/admin/autonomy-report", get(admin_sites::api_admin_autonomy_report))
             .route("/api/admin/test-url", get(admin_sites::api_admin_test_url_info).post(admin_sites::api_admin_test_url))
             .route("/api/admin/cookies", get(admin_cookies::api_admin_cookies).post(admin_cookies::api_admin_cookies_put))

@@ -786,6 +786,10 @@ impl EmailWatcher {
             // first. If the download fails they stay there, for MCR.
             let (status, method) = match job.tier {
                 Tier::Attachment => (JobStatus::ManualDownload, Some("attachment")),
+                // A locker link a worker can take (P11.15a, P11.15b: a share of one file fetched
+                // directly, a locker page the browser opens, each while its switch is on) goes to
+                // the pipeline; the others wait for MCR as before.
+                Tier::Locker if omni_core::locker::queued_for_a_worker(&job.url, &self.config.locker) => (JobStatus::Pending, Some("locker")),
                 Tier::Locker => (job.status, Some("locker")),
                 _ => (job.status, None),
             };
@@ -815,10 +819,10 @@ impl EmailWatcher {
             match &result {
                 Enqueued::Created { id } => info!("EmailWatcher: queued job #{id} {slug} ({})", status.as_str()),
                 Enqueued::DuplicateActive { existing_id } => {
-                    info!("EmailWatcher: {} already queued as job #{existing_id}", job.url)
+                    info!("EmailWatcher: a link on {} already queued as job #{existing_id}", omni_core::urlnorm::site_for_log(&job.url))
                 }
                 Enqueued::DuplicateRecent { existing_id } => {
-                    info!("EmailWatcher: {} delivered recently as job #{existing_id}", job.url)
+                    info!("EmailWatcher: a link on {} delivered recently as job #{existing_id}", omni_core::urlnorm::site_for_log(&job.url))
                 }
             }
             out.push(QueuedFromMail {

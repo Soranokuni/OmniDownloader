@@ -21,6 +21,7 @@ use omni_email::watcher::EmailWatcher;
 use omni_web::server::WebServer;
 use omni_web::state::AppState;
 
+mod alerts;
 mod benchmark;
 mod canary;
 mod cookies_cli;
@@ -1350,6 +1351,9 @@ async fn run_daemon(
             }
         }
     }
+    // A yt-dlp update the last run swapped in but stopped before judging (P11.7b).
+    report_unverified(&repo, "yt-dlp", dep_mgr.recover_unverified_ytdl());
+    report_unverified(&repo, "Deno", dep_mgr.recover_unverified_deno());
     if config.ytdl_path.is_none() {
         ensure_ytdl_folder_build(&dep_mgr, &config.ytdl_channel, config.ytdl_auto_update_nightly).await;
     }
@@ -1455,11 +1459,24 @@ async fn run_daemon(
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
     .with_delivery_paths(delivery_paths.clone())
+    // A file-locker share's download is bounded (P11.15a2).
+    .with_locker_max_file_bytes(config.locker.max_file_bytes())
+    // `locker.direct_shares`, and the headless browser for locker pages when
+    // `locker.browser_capture` is on (P11.15b), under the job path's egress rule.
+    .with_locker(omni_core::locker::LockerSettings {
+        direct_shares: config.locker.direct_shares,
+        capture: config.locker.browser_capture.then(|| {
+            Arc::new(omni_browser::capture::BrowserCapture { allow: config.security.egress_allow_networks() })
+                as Arc<dyn omni_core::locker::LockerCapture>
+        }),
+    })
     .with_watchfolder_state(watchfolder_state.clone())
     .with_retry_max_age(config.retry.max_age_mins)
     // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,
     // the canaries, the self-check and the benchmark take turns at a platform.
-    .with_pacing(config.pacing.per_host_concurrency, config.pacing.min_gap_secs));
+    .with_pacing(config.pacing.per_host_concurrency, config.pacing.min_gap_secs)
+    // A source that failed probe, encode, wrap or the gate gets one more way in (P11.6).
+    .with_second_route(true));
 
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
 
@@ -1613,7 +1630,13 @@ async fn run_daemon(
             }
         });
     }
+    // The repair mode the workers read per job and the panel's switch sets (P11.9).
+    let repair_live_mode = omni_core::config::LiveRepairMode::new(config.repair.mode);
+    // The MCR desks connected to the live stream, whose presence runs the approval clocks (P11.10).
+    let desks = omni_core::held::DeskPresence::new();
     let mut web_state = AppState::new(repo.clone(), config.clone(), config_path.to_path_buf())
+        .with_repair_mode(repair_live_mode.clone())
+        .with_desks(desks.clone())
         .with_url_tester(url_tester.clone())
         .with_cookie_tester(Arc::new(CookieJarTester {
             repo: repo.clone(),
@@ -1746,6 +1769,8 @@ async fn run_daemon(
         let specs = omni_core::scheduler::default_tasks();
         repo.ensure_scheduled_tasks(&specs)
             .context("Failed registering the maintenance tasks")?;
+        // The `maintenance` and `database` lines from what the tasks did before this start (P11.13).
+        omni_core::maintenance::refresh_health(&repo, &health);
 
         let repo_sched = repo.clone();
         let mut sched_rx = shutdown_tx.subscribe();
@@ -1753,6 +1778,7 @@ async fn run_daemon(
             bin_dir: bin_dir.clone(),
             temp_path: temp_path.clone(),
             paths: paths.clone(),
+            db_path: db_path.clone(),
             ytdl_channel: config.ytdl_channel.clone(),
             ytdl_enabled: config.ytdl_auto_update_nightly,
             adblock_enabled: config.adblock_auto_update_nightly,
@@ -1787,6 +1813,44 @@ async fn run_daemon(
                         ctx.early_ytdl
                             .run_requested(&repo_sched, platform, chrono::Utc::now(), |drain| early_ytdl_update(&repo_sched, &ctx, drain))
                             .await;
+                    }
+                }
+            }
+        });
+    }
+
+    // 3b. Alerts beyond the open tab (P11.14): a red health line, jobs waiting for a
+    // person, a silent mailbox, written to the Event Log once per transition. A console
+    // run writes them to the file log only.
+    {
+        let (repo_alerts, health_alerts) = (repo.clone(), health.clone());
+        let mut alerts_rx = shutdown_tx.subscribe();
+        let event_log = service_shutdown_rx.is_some();
+        let mut alerter = alerts::Alerter::new(config.alerts.waiting_for_person_mins).with_redactions(log_redactions.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = alerts_rx.recv() => break,
+                    _ = tick.tick() => {
+                        let waiting = match repo_alerts.jobs_waiting_for_person() {
+                            Ok(w) => Some(w),
+                            Err(e) => {
+                                warn!("Alerts: could not read the jobs waiting for a person: {e:#}");
+                                None
+                            }
+                        };
+                        let checks = health_alerts.all();
+                        let snapshot = alerts::Snapshot {
+                            now: chrono::Utc::now(),
+                            checks: &checks,
+                            last_mail_poll: health_alerts.last_mail_poll(),
+                            started_at: health_alerts.started_at(),
+                            waiting: waiting.as_deref(),
+                        };
+                        for alert in alerter.tick(&snapshot) {
+                            alerts::write(&alert, event_log);
+                        }
                     }
                 }
             }
@@ -1836,6 +1900,7 @@ async fn run_daemon(
         let repo_reaper = repo.clone();
         let queue_health = health.clone();
         let reaper_temp = temp_path.clone();
+        let reaper_desks = desks.clone();
         let mut reaper_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(LEASE_REAP_INTERVAL);
@@ -1850,10 +1915,12 @@ async fn run_daemon(
                             ),
                             Err(e) => error!("Lease reaper failed: {e:?}"),
                         }
-                        // Videos held for approval (P10.5): expire, supersede, tidy.
-                        let (sweep_repo, sweep_temp) = (repo_reaper.clone(), reaper_temp.clone());
+                        // Videos held for approval (P10.5): their clocks run only while an MCR
+                        // desk has been connected (P11.10); then expire, supersede, tidy.
+                        let (sweep_repo, sweep_temp, sweep_desks) = (repo_reaper.clone(), reaper_temp.clone(), reaper_desks.clone());
                         match tokio::task::spawn_blocking(move || {
-                            omni_core::held::sweep(&sweep_repo, &sweep_temp, chrono::Utc::now())
+                            // A failed accounting expires nothing this tick (P11.10b).
+                            omni_core::held::reaper_tick(&sweep_repo, &sweep_temp, &sweep_desks, chrono::Utc::now(), held_clock_max_gap())
                         })
                         .await
                         {
@@ -1978,7 +2045,10 @@ async fn run_daemon(
     if config.repair.llm_enabled && repair_llm_cfg.model.is_none() {
         warn!("repair.llm_enabled is on but repair.llm_model is not set: the repair model rung stays off");
     }
-    let mut repair_env = repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
+    // The ladder's candidates do not take the second route (P11.6): the ladder has its own
+    // budget and its own next candidate. A clone shares every slot, the pacer and the stop flag.
+    let ladder_engine = Arc::new((*broadcast_engine).clone().with_second_route(false));
+    let mut repair_env = repair::RealEnv::new(ladder_engine, repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
     if let (true, Some(model)) = (repair_llm_cfg.active(), repair_llm_cfg.model.as_deref()) {
         let client_cfg = omni_core::config::LlmConfig { timeout_secs: repair_llm_cfg.timeout.as_secs(), ..config.llm.clone() };
         let client = omni_email::llm::LlmClient::from_settings(&config.llm.endpoint, model, &client_cfg)
@@ -1990,6 +2060,8 @@ async fn run_daemon(
         repo: repo.clone(),
         cfg: repair::RepairCfg {
             mode: config.repair.mode,
+            // Shared with the panel, whose switch to `hold` takes effect at the next job (P11.9).
+            live: Some(repair_live_mode.clone()),
             budget: Duration::from_secs(config.repair.budget_secs),
             hold_hours: config.repair.hold_hours,
             held_max_bytes: config.repair.held_max_gb.saturating_mul(1024 * 1024 * 1024),
@@ -2248,6 +2320,13 @@ fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusH
 }
 
 /// The `queue` health check (plan P7.19). Never `down`: a slow queue is a warning.
+/// The longest time between two reaper ticks that still counts against a held
+/// video's approval clock (P11.10): three ticks. A longer gap (the daemon was
+/// stopped, the machine slept) is time no desk could have seen it.
+fn held_clock_max_gap() -> chrono::Duration {
+    chrono::Duration::from_std(worker::LEASE_REAP_INTERVAL * 3).unwrap_or_else(|_| chrono::Duration::minutes(3))
+}
+
 fn queue_check(w: &omni_core::models::QueueWatch, was_degraded: bool) -> omni_core::health::Check {
     use omni_core::health::Check;
     let limit = if was_degraded { QUEUE_RECOVER_SECS } else { QUEUE_SLOW_SECS };
@@ -2331,13 +2410,25 @@ async fn nightly_ytdl_update(
         return UpdateRun::new(TaskOutcome::Skipped, "rolled back before");
     }
     // Live and also the release: nothing to do. (The download is still made,
-    // to know; it is a few seconds at 03:00.)
-    if dep_mgr.ytdl_live_sha256().as_deref() == Some(staged.sha256.as_str()) {
+    // to know; it is a few seconds at 03:00.) Unless that live build still waits
+    // for its verdict (a start-up rollback of it failed, P11.7b2): then it is
+    // verified now, as if just swapped in.
+    let release = staged_release_action(
+        dep_mgr.ytdl_live_sha256().as_deref(),
+        &staged.sha256,
+        dep_mgr.ytdl_verifying_sha256().as_deref(),
+    );
+    let reverify = release == StagedRelease::Reverify;
+    if release == StagedRelease::AlreadyLatest {
         dep_mgr.discard_staged_ytdl();
         info!("yt-dlp is already the latest release");
         // No update is waiting any more (P11.4).
         selfcheck::note_postponed(&dep_mgr.get_bin_dir(), false);
         return UpdateRun::new(TaskOutcome::Ok, "already the latest");
+    }
+    if reverify {
+        dep_mgr.discard_staged_ytdl();
+        warn!("yt-dlp: the live build was never verified; checking it now");
     }
 
     // At night up to ten minutes for in-flight downloads: longer than any sane
@@ -2356,13 +2447,28 @@ async fn nightly_ytdl_update(
         return UpdateRun::drain_postponed();
     }
 
-    let outcome = dep_mgr.apply_staged_ytdl();
-    let installed = match outcome {
-        Ok(path) => path,
-        Err(e) => {
-            warn!("Nightly yt-dlp update failed to install: {e:#}");
-            let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+    let installed = if reverify {
+        // Already live, its marker already written.
+        dep_mgr.ytdl_live()
+    } else {
+        // Until its verdict, the swapped build is unverified: a stop or crash before
+        // then rolls it back at the next start (P11.7b). No marker, no swap.
+        if let Err(e) = dep_mgr.mark_ytdl_verifying(&staged.sha256) {
+            warn!("yt-dlp update postponed: the pending verdict could not be recorded: {e:#}");
             return UpdateRun::new(TaskOutcome::Failed, "install failed");
+        }
+        match dep_mgr.apply_staged_ytdl() {
+            Ok(path) => path,
+            Err(e) => {
+                // Nothing was swapped in. The marker goes only while a build is still live:
+                // with none (both renames failed) the start-up repair needs it (P11.7b3).
+                if let Err(c) = dep_mgr.clear_ytdl_verifying_if_live() {
+                    warn!("{c:#}");
+                }
+                warn!("Nightly yt-dlp update failed to install: {e:#}");
+                let _ = repo.log_audit("ERROR", "SYSTEM", &format!("yt-dlp update failed: {e}"));
+                return UpdateRun::new(TaskOutcome::Failed, "install failed");
+            }
         }
     };
 
@@ -2372,6 +2478,23 @@ async fn nightly_ytdl_update(
     // the release broke it: the old build goes back and this one is marked
     // rejected. A link both fail is the site, not the update.
     let verdict = verify_ytdl_update(dep_mgr, &installed, repo, pacer, ffmpeg).await;
+    // The verdict is in (kept, rolled back, postponed, or unverified by a failed swap),
+    // recorded while the swap lock is still held (P11.7b). A marker that stays would
+    // have the next start roll this build back as unverified (P11.7b2): said loudly.
+    // With no build left live (a swap back that failed), it stays for the start-up
+    // repair to put the old build back (P11.7d).
+    match dep_mgr.clear_ytdl_verifying_if_live() {
+        Ok(true) => {}
+        Ok(false) => warn!("yt-dlp update: no build is live after the verdict; the next start puts the previous one back"),
+        Err(e) => {
+            error!("yt-dlp update: the verdict was reached but its marker could not be removed: {e:#}");
+            let _ = repo.log_audit(
+                "ERROR",
+                "SYSTEM",
+                &format!("yt-dlp update: the verdict marker could not be removed ({e}); remove bin\\yt-dlp.exe.verifying by hand, or the next start rolls the build back"),
+            );
+        }
+    }
     drop(swap);
     let act = ytdl_verdict_action(&verdict, channel, &staged.sha256[..16]);
     if act.reject {
@@ -2394,6 +2517,34 @@ async fn nightly_ytdl_update(
     }
     ytdl_second_chance(repo, &act);
     UpdateRun::new(act.outcome, verdict_reason(&verdict))
+}
+
+/// What the yt-dlp update does with the release it staged (P11.7b2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedRelease {
+    /// The live build is the release and was judged: nothing to do.
+    AlreadyLatest,
+    /// The live build is the release but still waits for its verdict (its
+    /// start-up rollback failed): verify it as it stands.
+    Reverify,
+    /// Swap the release in and verify it.
+    Install,
+}
+
+/// [`StagedRelease`] for a live build with hash `live`, the staged release
+/// `staged`, and the pending-verdict marker's hash `verifying`.
+fn staged_release_action(live: Option<&str>, staged: &str, verifying: Option<&str>) -> StagedRelease {
+    match (live == Some(staged), awaits_verdict(live, verifying)) {
+        (true, true) => StagedRelease::Reverify,
+        (true, false) => StagedRelease::AlreadyLatest,
+        (false, _) => StagedRelease::Install,
+    }
+}
+
+/// Whether the live build (hash `live`) still waits for its verdict: the
+/// pending-verdict marker (hash `verifying`) names it (P11.7b2, P11.7c).
+fn awaits_verdict(live: Option<&str>, verifying: Option<&str>) -> bool {
+    live.is_some() && live == verifying
 }
 
 /// The few words the maintenance panel shows for an early run's `verdict` (P11.4d).
@@ -2546,31 +2697,66 @@ async fn nightly_deno_update(
         let _swap = gate.lock_swaps().await;
         return if ensure_deno(dep_mgr, health, true).await { TaskOutcome::Ok } else { TaskOutcome::Failed };
     };
-    let latest = match dep_mgr.latest_deno_tag().await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("Deno update check failed: {e:#}");
-            return TaskOutcome::Skipped;
+    // The live Deno still waits for its verdict (its start-up rollback failed,
+    // P11.7c): it is verified now, as if just swapped in, instead of looking for
+    // a newer one.
+    let reverify = awaits_verdict(dep_mgr.deno_live_sha256().as_deref(), dep_mgr.deno_verifying_sha256().as_deref());
+    if !reverify {
+        let latest = match dep_mgr.latest_deno_tag().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Deno update check failed: {e:#}");
+                return TaskOutcome::Skipped;
+            }
+        };
+        if latest.trim_start_matches('v') == installed {
+            return TaskOutcome::Ok;
         }
-    };
-    if latest.trim_start_matches('v') == installed {
-        return TaskOutcome::Ok;
+    } else {
+        warn!("Deno {installed} was never verified; checking it now");
     }
     // Download first; pause only around the rename.
     let mut swap = gate.lock_swaps().await;
-    let new_version = match dep_mgr.stage_deno().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("Deno update not installed: {e:#}");
-            let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
-            return TaskOutcome::Failed;
+    let new_version = if reverify {
+        installed.clone()
+    } else {
+        match dep_mgr.stage_deno().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Deno update not installed: {e:#}");
+                let _ = repo.log_audit("WARN", "SYSTEM", &format!("Deno update skipped: {e}"));
+                return TaskOutcome::Failed;
+            }
         }
     };
+    // What the messages call the Deno a rollback puts back.
+    let installed = if reverify { "the previous Deno".to_string() } else { installed };
     if !swap.drain(Duration::from_secs(600)).await {
-        dep_mgr.discard_staged_deno();
+        if !reverify {
+            dep_mgr.discard_staged_deno();
+        }
         return TaskOutcome::Skipped;
     }
-    let result = dep_mgr.apply_staged_deno(&new_version);
+    let result = if reverify {
+        // Already live, its marker already written.
+        Ok(())
+    } else {
+        // Until its verdict, the swapped Deno is unverified: a stop or crash before
+        // then rolls it back at the next start (P11.7c). No marker, no swap.
+        let marked = dep_mgr
+            .deno_staged_sha256()
+            .ok_or_else(|| anyhow::anyhow!("the staged Deno could not be read"))
+            .and_then(|sha| dep_mgr.mark_deno_verifying(&sha));
+        match marked {
+            Err(e) => Err(e.context("the pending verdict could not be recorded")),
+            Ok(()) => dep_mgr.apply_staged_deno(&new_version).inspect_err(|_| {
+                // Nothing was swapped in. The marker goes only while a Deno is still live (P11.7b3).
+                if let Err(c) = dep_mgr.clear_deno_verifying_if_live() {
+                    warn!("{c:#}");
+                }
+            }),
+        }
+    };
     let outcome = match result {
         Err(e) => {
             dep_mgr.discard_staged_deno();
@@ -2597,9 +2783,30 @@ async fn nightly_deno_update(
                 }
                 v => v,
             };
+            // The verdict is in, under the swap lock (P11.7c). A marker that stays would
+            // have the next start roll this Deno back as unverified: said loudly. With no
+            // Deno left live, it stays for the start-up repair (P11.7d).
+            match dep_mgr.clear_deno_verifying_if_live() {
+                Ok(true) => {}
+                Ok(false) => warn!("Deno update: no Deno is live after the verdict; the next start puts the previous one back"),
+                Err(e) => {
+                    error!("Deno update: the verdict was reached but its marker could not be removed: {e:#}");
+                    let _ = repo.log_audit(
+                        "ERROR",
+                        "SYSTEM",
+                        &format!("Deno update: the verdict marker could not be removed ({e}); remove bin\\deno.exe.verifying by hand, or the next start rolls Deno back"),
+                    );
+                }
+            }
             match verdict {
                 UpdateVerdict::Kept { .. } => {
-                    let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
+                    // A re-check of a Deno an interrupted update left live is not an update (P11.7d).
+                    let audit = if reverify {
+                        format!("Deno {new_version} verified after an interrupted update")
+                    } else {
+                        format!("Deno updated {installed} → {new_version}")
+                    };
+                    let _ = repo.log_audit("INFO", "SYSTEM", &audit);
                     // yt-dlp reads YouTube through Deno: a second chance for extraction failures (P11.5).
                     omni_core::second_chance::after_deno_update(repo, &new_version);
                     mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
@@ -2663,6 +2870,40 @@ async fn verify_ytdl_update(
         |links, why| selfcheck::withdraw_results(repo, links, why),
     )
     .await
+}
+
+/// The log and audit lines of the start-up check for an unjudged `tool` update (P11.7b, P11.7c).
+fn report_unverified(repo: &Repository, tool: &str, found: omni_core::dependencies::UnverifiedUpdate) {
+    use omni_core::dependencies::UnverifiedUpdate;
+    match found {
+        UnverifiedUpdate::None | UnverifiedUpdate::NotLive => {}
+        UnverifiedUpdate::RolledBack(sha) => {
+            let msg = format!(
+                "{tool} update (sha256 {}) was stopped before its self-check finished; the previous build is back, and the next update run checks the release again",
+                &sha[..sha.len().min(16)]
+            );
+            warn!("{msg}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &msg);
+        }
+        UnverifiedUpdate::SwapRepaired => {
+            let msg = format!("{tool} update was stopped in the middle of swapping builds; the previous build is back, and the next update run tries the release again");
+            warn!("{msg}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &msg);
+        }
+        UnverifiedUpdate::SetAside(sha) => {
+            let msg = format!(
+                "{tool} update (sha256 {}) was stopped before its self-check finished; it stays set aside and the one-file build is in use, and the next update run checks the release again",
+                &sha[..sha.len().min(16)]
+            );
+            warn!("{msg}");
+            let _ = repo.log_audit("WARN", "SYSTEM", &msg);
+        }
+        UnverifiedUpdate::RollbackFailed(why) => {
+            let msg = format!("{tool} update was stopped before its self-check finished, and the previous build could not be put back: {why}");
+            error!("{msg}");
+            let _ = repo.log_audit("ERROR", "SYSTEM", &msg);
+        }
+    }
 }
 
 /// Replace a one-file yt-dlp with the folder build of the *same release*
@@ -2755,6 +2996,8 @@ struct MaintenanceContext {
     bin_dir: PathBuf,
     temp_path: PathBuf,
     paths: AppPaths,
+    /// `omni.db`, whose size the nightly backup needs room for (P11.13).
+    db_path: PathBuf,
     ytdl_channel: String,
     ytdl_enabled: bool,
     adblock_enabled: bool,
@@ -2856,6 +3099,8 @@ async fn run_due_tasks(
             }
         };
         let _ = repo.record_task_run(&name, outcome, error.as_deref(), elapsed_ms);
+        // A failed task turns the `maintenance` line amber and names it; the next good run clears it (P11.13).
+        omni_core::maintenance::refresh_health(repo, &ctx.health);
     }
 }
 
@@ -3062,6 +3307,13 @@ async fn run_one_task(
             if removed > 0 {
                 info!("Retention: removed {removed} saved email attachment(s)");
             }
+            // Files a locker capture got (P11.15b2) live outside temp/jobs for the
+            // same reason; a job's own run removes them when it ends, and this
+            // takes what a crash or a locked file left.
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join(omni_core::locker::CAPTURES_DIR), ctx.retention_days).await;
+            if removed > 0 {
+                info!("Retention: removed {removed} locker capture folder(s)");
+            }
             // Delivered sources past their days (P1.7), by the date in the
             // directory name.
             if let Some(a) = ctx.archive.current().archive.filter(|a| a.purges()) {
@@ -3079,9 +3331,39 @@ async fn run_one_task(
         }
 
         "vacuum" => {
-            // Blocking, and it holds a write lock, which is why it is monthly
-            // and at 04:30 rather than opportunistic.
-            repo.vacuum_database().context("VACUUM failed")?;
+            // It holds a write lock, which is why it is monthly and at 04:30
+            // rather than opportunistic; off the async threads (P11.13), so
+            // the web panel and the workers' heartbeats keep running.
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || repo.vacuum_database())
+                .await
+                .context("the VACUUM task did not finish")?
+                .context("VACUUM failed")?;
+            Ok(TaskOutcome::Ok)
+        }
+
+        omni_core::maintenance::BACKUP_TASK => {
+            let (repo, dir) = (repo.clone(), ctx.paths.db_backups());
+            let db_bytes = std::fs::metadata(&ctx.db_path).map(|m| m.len()).unwrap_or(0);
+            let today = chrono::Local::now().date_naive();
+            let report = tokio::task::spawn_blocking(move || omni_core::maintenance::nightly_backup(&repo, db_bytes, &dir, today))
+                .await
+                .context("the backup task did not finish")??;
+            info!(
+                "Database backed up to {:?} ({} MB); {} old backup(s) removed",
+                report.path,
+                report.bytes / (1024 * 1024),
+                report.removed
+            );
+            Ok(TaskOutcome::Ok)
+        }
+
+        omni_core::maintenance::CHECK_TASK => {
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || omni_core::maintenance::integrity_check(&repo))
+                .await
+                .context("the integrity check task did not finish")??;
+            info!("Database integrity check passed");
             Ok(TaskOutcome::Ok)
         }
 

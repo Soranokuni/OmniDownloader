@@ -13,6 +13,22 @@
 
 use std::collections::BTreeMap;
 
+/// The version of [`normalize`]'s rules (P14.8b). Bump it with every change to
+/// what `normalize` returns: at the next start the stored keys of the rows a
+/// duplicate check can still meet are computed again
+/// (`Repository::renormalize_if_needed`), so a link sent before the change and
+/// again after it is still one job.
+///
+/// 1: the rules before P14.8. 2: P14.8 (YouTube playlist embeds, Facebook,
+/// Instagram and TikTok keys). 3: P11.15a2 (file-locker shares: Dropbox, Google Drive,
+/// OneDrive, SharePoint). 4: P11.15a3 (OneDrive personal shares by item id, Dropbox
+/// without the file name). 5: P11.15a4 (Drive by its file id alone: the resource key is
+/// needed to download, not to tell two files apart).
+pub const NORMALIZE_VERSION: i64 = 5;
+
+/// Instagram path words that are pages, not shortcodes (P14.8b).
+const INSTAGRAM_PATH_WORDS: &[&str] = &["audio", "tagged", "saved", "explore", "stories", "accounts", "direct", "about", "legal"];
+
 /// Query parameters that never identify the asset: analytics, share tracking,
 /// and playback state. Removing them is what makes two forwarded links equal.
 ///
@@ -136,11 +152,20 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
         }
         "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" => {
             *host = "www.youtube.com".into();
-            // /shorts/ID and /live/ID and /embed/ID are all /watch?v=ID.
+            // /shorts/ID and /live/ID and /embed/ID are all /watch?v=ID. Two embed
+            // names are not videos (P14.8): `videoseries` is the playlist in `list`
+            // (every playlist embed was one key, `watch?v=videoseries`), and
+            // `live_stream` is a channel's live stream; neither is a `v`.
             for prefix in ["/shorts/", "/live/", "/embed/", "/v/"] {
                 if let Some(id) = path.strip_prefix(prefix) {
                     let id = id.split('/').next().unwrap_or("").to_string();
-                    if !id.is_empty() {
+                    if prefix == "/embed/" && id == "videoseries" {
+                        if params.contains_key("list") {
+                            *path = "/playlist".into();
+                        }
+                    } else if prefix == "/embed/" && id == "live_stream" {
+                        // Left as it is: the channel parameter names the stream.
+                    } else if !id.is_empty() {
                         *path = "/watch".into();
                         params.insert("v".into(), id);
                     }
@@ -151,7 +176,13 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             if path == "/watch" {
                 params.retain(|k, _| k == "v");
             }
+            // A playlist is its list.
+            if path == "/playlist" {
+                params.retain(|k, _| k == "list");
+            }
         }
+        "instagram.com" | "m.instagram.com" => *host = "www.instagram.com".into(),
+        "tiktok.com" => *host = "www.tiktok.com".into(),
         // X and Twitter are one service; journalists send both.
         "twitter.com" | "www.twitter.com" | "mobile.twitter.com" | "www.x.com" | "mobile.x.com" => {
             *host = "x.com".into();
@@ -163,6 +194,7 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             *host = "www.tiktok.com".into();
         }
         "m.vimeo.com" => *host = "vimeo.com".into(),
+        "dropbox.com" => *host = "www.dropbox.com".into(),
         _ => {
             // Generic mobile subdomain folding for news portals.
             if let Some(rest) = host.strip_prefix("m.") {
@@ -189,6 +221,111 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             }
         }
     }
+
+    // P14.8: one key per video on Facebook, Instagram and TikTok. Only shapes
+    // that certainly name the same video are merged; the rest lose the share
+    // link's tracking query and keep their path.
+    let segs: Vec<String> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match host.as_str() {
+        "www.facebook.com" => {
+            // /watch?v=N, /watch/?v=N and /video.php?v=N are one video.
+            if matches!(segs.as_slice(), [w] if w == "watch" || w == "video.php") && params.get("v").is_some_and(|v| digits(v)) {
+                *path = "/watch".into();
+                params.retain(|k, _| k == "v");
+            // /{page}/videos/N and /{page}/videos/{title}/N are the same video N.
+            } else if let Some(id) = segs.iter().position(|s| s == "videos").filter(|&i| i == 1).and_then(|_| segs.last().filter(|s| digits(s))) {
+                *path = "/watch".into();
+                params.clear();
+                params.insert("v".into(), id.clone());
+            } else if matches!(segs.first().map(String::as_str), Some("reel" | "share")) {
+                params.clear();
+            }
+        }
+        "www.instagram.com" => {
+            // A post, a reel or an IGTV video by its shortcode, with or without
+            // the account's name in front, is /p/{shortcode}. Only a code that
+            // looks like a shortcode counts: `/reels/audio/{id}` is an audio page,
+            // not a reel called «audio» (P14.8b).
+            let shortcode = |c: &str| {
+                c.len() >= 5
+                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !INSTAGRAM_PATH_WORDS.contains(&c.to_ascii_lowercase().as_str())
+            };
+            let kind = |k: &str| matches!(k, "p" | "reel" | "reels" | "tv");
+            let at = match segs.as_slice() {
+                [k, code, ..] if kind(k) && shortcode(code) => Some(code.clone()),
+                [_, k, code, ..] if kind(k) && shortcode(code) => Some(code.clone()),
+                _ => None,
+            };
+            if let Some(code) = at {
+                *path = format!("/p/{code}");
+                params.clear();
+            }
+        }
+        "www.tiktok.com" => {
+            // /@{account}/video/N: the account is decoration, as on X; the old
+            // mobile /v/N.html is the same video.
+            let id = match segs.as_slice() {
+                [_, kind, id, ..] if kind == "video" && digits(id) => Some(id.clone()),
+                [v, file] if v == "v" => file.strip_suffix(".html").filter(|s| digits(s)).map(str::to_string),
+                _ => None,
+            };
+            if let Some(id) = id {
+                *path = format!("/video/{id}");
+                params.clear();
+            }
+        }
+        // File-locker shares (P11.15a2): since P11.15a they download by
+        // themselves, so every form of one share must be one key, or the same
+        // file goes on air twice.
+        "www.dropbox.com" => {
+            // A shared file is its key (`/s/{key}`) or id (`/scl/fi/{id}`) and its
+            // `rlkey`; the file name after it (raw or percent-encoded) and `dl`/`raw`
+            // only say how to show or serve it (P11.15a3).
+            match segs.as_slice() {
+                [s, key, ..] if s == "s" => *path = format!("/s/{key}"),
+                [scl, fi, id, ..] if scl == "scl" && fi == "fi" => *path = format!("/scl/fi/{id}"),
+                _ => {}
+            }
+            params.retain(|k, _| k == "rlkey");
+        }
+        "drive.google.com" => {
+            // A file is its id: /file/d/{id}/view?usp=…, open?id=, uc?id=&export=…,
+            // its `resourcekey` is needed to download, not to tell two files apart (P11.15a4).
+            let id = match segs.as_slice() {
+                [f, d, id, ..] if f == "file" && d == "d" => Some(id.clone()),
+                [one] if one == "open" || one == "uc" => params.get("id").cloned(),
+                _ => None,
+            };
+            if let Some(id) = id.filter(|id| !id.is_empty()) {
+                *path = format!("/file/d/{id}");
+                params.clear();
+            }
+        }
+        // A OneDrive short link, or a SharePoint share: the path is the share;
+        // `e`, `usp`, `download` and the like only say how to show it.
+        "1drv.ms" => params.clear(),
+        h if h.ends_with(".sharepoint.com") && segs.first().is_some_and(|s| s.len() == 3 && s.starts_with(':') && s.ends_with(':')) => {
+            params.clear();
+        }
+        "onedrive.live.com" => {
+            // A personal share is its item id, whatever page opens it (`/redir`,
+            // `/embed`, `/`) and whichever parameter carries it (`resid` or `id`),
+            // `!` written as is or as `%21` (P11.15a3). `cid`, `authkey`,
+            // `ithint` and the like only say how to show it.
+            let item = params.get("resid").or_else(|| params.get("id")).cloned();
+            if let Some(item) = item.filter(|v| !v.is_empty()) {
+                let item = item.replace("%21", "!");
+                *path = "/".into();
+                params.clear();
+                params.insert("resid".into(), item);
+            } else {
+                params.retain(|k, _| k == "redeem");
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_query(query: &str) -> BTreeMap<String, String> {
@@ -206,11 +343,20 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
     map
 }
 
-/// Registrable-ish domain for per-domain routing, stats and cookie jars.
-///
-/// Handles the two-label public suffixes this newsroom actually meets
-/// (`co.uk`, `com.gr`, …); it is not a full Public Suffix List, and does not
-/// need to be — a wrong answer costs one misfiled statistic, not a bad file.
+/// What a log or audit line may say about a link (P14.6): its site (the
+/// registrable domain), never the address, whose path and query can carry a
+/// token. A link that is not http(s) (an attachment) is «a non-web link».
+pub fn site_for_log(raw: &str) -> String {
+    let norm = normalize(raw);
+    if !(norm.starts_with("http://") || norm.starts_with("https://")) {
+        return "a non-web link".to_string();
+    }
+    registrable_domain(&norm).unwrap_or_else(|| "a link with no host".to_string())
+}
+
+/// Registrable domain for per-domain routing, stats and cookie jars: the
+/// host's public suffix by the embedded Public Suffix List (ICANN section,
+/// P14.6, [`crate::psl`]) and one label more. An IP address is its own.
 pub fn registrable_domain(raw: &str) -> Option<String> {
     let norm = normalize(raw);
     let rest = norm.split("://").nth(1)?;
@@ -218,20 +364,7 @@ pub fn registrable_domain(raw: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() <= 2 {
-        return Some(host.to_string());
-    }
-    const TWO_LABEL_SUFFIXES: &[&str] = &[
-        "co.uk", "org.uk", "ac.uk", "com.gr", "net.gr", "org.gr", "edu.gr", "gov.gr",
-        "com.au", "co.jp", "com.br", "co.nz", "com.tr", "com.cy",
-    ];
-    let last_two = labels[labels.len() - 2..].join(".");
-    if TWO_LABEL_SUFFIXES.contains(&last_two.as_str()) && labels.len() >= 3 {
-        Some(labels[labels.len() - 3..].join("."))
-    } else {
-        Some(last_two)
-    }
+    Some(crate::psl::registrable(host))
 }
 
 /// What MCR's «Λάθος βίντεο» remembers about a video's address (P10.13): the
@@ -394,9 +527,31 @@ mod tests {
             // Not a post: left alone.
             ("https://x.com/NewsDeskOne", "https://x.com/NewsDeskOne"),
 
+            // --- YouTube embeds that are not one video (P14.8) ---
+            ("https://www.youtube.com/embed/videoseries?list=PLabc123&index=2", "https://www.youtube.com/playlist?list=PLabc123"),
+            ("https://www.youtube.com/playlist?list=PLabc123&si=x", "https://www.youtube.com/playlist?list=PLabc123"),
+            ("https://www.youtube.com/embed/live_stream?channel=UCxyz", "https://www.youtube.com/embed/live_stream?channel=UCxyz"),
+
             // --- Facebook / TikTok ---
             ("https://m.facebook.com/watch?v=99", "https://www.facebook.com/watch?v=99"),
             ("https://vm.tiktok.com/ZMabc/", "https://www.tiktok.com/ZMabc"),
+            // One Facebook video, every shape (P14.8).
+            ("https://www.facebook.com/watch/?v=99&mibextid=abc", "https://www.facebook.com/watch?v=99"),
+            ("https://web.facebook.com/video.php?v=99", "https://www.facebook.com/watch?v=99"),
+            ("https://www.facebook.com/NewsPage/videos/99/?__cft__=x&__tn__=y", "https://www.facebook.com/watch?v=99"),
+            ("https://facebook.com/NewsPage/videos/storm-in-the-port/99/", "https://www.facebook.com/watch?v=99"),
+            ("https://www.facebook.com/reel/123?mibextid=abc&rdid=x", "https://www.facebook.com/reel/123"),
+            ("https://www.facebook.com/share/v/AbC12/?mibextid=xyz", "https://www.facebook.com/share/v/AbC12"),
+            // Instagram: post, reel and IGTV by shortcode, with or without the account.
+            ("https://www.instagram.com/reel/CxYz123/?igsh=abc", "https://www.instagram.com/p/CxYz123"),
+            ("https://instagram.com/p/CxYz123/?img_index=1", "https://www.instagram.com/p/CxYz123"),
+            ("https://m.instagram.com/newsdesk/reel/CxYz123/", "https://www.instagram.com/p/CxYz123"),
+            ("https://www.instagram.com/tv/CxYz123", "https://www.instagram.com/p/CxYz123"),
+            ("https://www.instagram.com/newsdesk/", "https://www.instagram.com/newsdesk"),
+            // TikTok: the account in front of the id is decoration.
+            ("https://www.tiktok.com/@newsdesk/video/7301234567890?is_from_webapp=1&sender_device=pc", "https://www.tiktok.com/video/7301234567890"),
+            ("https://tiktok.com/@other.account/video/7301234567890", "https://www.tiktok.com/video/7301234567890"),
+            ("https://m.tiktok.com/v/7301234567890.html", "https://www.tiktok.com/video/7301234567890"),
 
             // --- News portals: tracking and AMP ---
             ("https://www.lifo.gr/now/sport/story?utm_source=newsletter&utm_medium=email",
@@ -452,6 +607,97 @@ mod tests {
             normalize("https://www.lifo.gr/now/story"),
             normalize("https://www.newsit.gr/now/story")
         );
+
+        // P14.8: two playlists, two Facebook videos, two reels, two posts, two TikToks.
+        assert_ne!(
+            normalize("https://www.youtube.com/embed/videoseries?list=PLone"),
+            normalize("https://www.youtube.com/embed/videoseries?list=PLtwo")
+        );
+        assert_ne!(normalize("https://www.facebook.com/watch/?v=1"), normalize("https://www.facebook.com/watch/?v=2"));
+        assert_ne!(normalize("https://www.facebook.com/Page/videos/1"), normalize("https://www.facebook.com/Page/videos/2"));
+        assert_ne!(normalize("https://www.facebook.com/reel/1"), normalize("https://www.facebook.com/reel/2"));
+        assert_ne!(normalize("https://www.instagram.com/reel/AAAAAAA"), normalize("https://www.instagram.com/reel/BBBBBBB"));
+        // Two audio pages are not one «reel» called audio (P14.8b).
+        assert_ne!(
+            normalize("https://www.instagram.com/reels/audio/111111111/"),
+            normalize("https://www.instagram.com/reels/audio/222222222/")
+        );
+        assert_ne!(normalize("https://www.tiktok.com/@a/video/1"), normalize("https://www.tiktok.com/@a/video/2"));
+        // A Facebook page's video list is not one of its videos.
+        assert_ne!(normalize("https://www.facebook.com/Page/videos"), normalize("https://www.facebook.com/watch?v=1"));
+    }
+
+    #[test]
+    fn every_form_of_one_locker_share_is_one_key_and_two_files_are_two() {
+        // P11.15a2: a share that downloads by itself, sent twice in two forms, is one job.
+        let one = |forms: &[&str]| {
+            let keys: Vec<String> = forms.iter().map(|u| normalize(u)).collect();
+            assert!(keys.windows(2).all(|w| w[0] == w[1]), "{forms:?} -> {keys:?}");
+            keys[0].clone()
+        };
+        let drive = one(&[
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=drive_link",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/",
+            "https://drive.google.com/open?id=1AbC_dEf-GhIjKlMn",
+            "https://drive.google.com/uc?id=1AbC_dEf-GhIjKlMn&export=download",
+        ]);
+        assert_eq!(drive, "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn");
+        let dropbox_old = one(&[
+            "https://www.dropbox.com/s/abc123/clip.mp4?dl=0",
+            "https://www.dropbox.com/s/abc123/clip.mp4?dl=1",
+            "https://dropbox.com/s/abc123/clip.mp4?raw=1",
+            "https://www.dropbox.com/s/abc123/clip.mp4",
+        ]);
+        let dropbox_new = one(&[
+            "https://www.dropbox.com/scl/fi/x1y2/clip.mov?rlkey=k9k9&dl=0",
+            "https://www.dropbox.com/scl/fi/x1y2/clip.mov?dl=1&rlkey=k9k9&st=abc",
+        ]);
+        assert!(dropbox_new.contains("rlkey=k9k9"), "the rlkey is part of the share: {dropbox_new}");
+        let onedrive = one(&["https://1drv.ms/v/s!AkExample123?e=Xy1", "https://1drv.ms/v/s!AkExample123"]);
+        let sharepoint = one(&[
+            "https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Xy1",
+            "https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Zz9&download=1",
+        ]);
+        // P11.15a3: a OneDrive personal share by its item id, whichever page and parameter carry it.
+        let live = one(&[
+            "https://onedrive.live.com/?cid=ABC&resid=ABC%21123&authkey=x",
+            "https://onedrive.live.com/?resid=ABC%21123&cid=ABC&ithint=video",
+            "https://onedrive.live.com/redir?resid=ABC!123&authkey=!AbCdE",
+            "https://onedrive.live.com/embed?resid=ABC!123",
+            "https://onedrive.live.com/?cid=ABC&id=ABC%21123",
+        ]);
+        assert_eq!(live, "https://onedrive.live.com/?resid=ABC!123");
+        // P11.15a3: a Dropbox file is its key and rlkey, its name raw or percent-encoded.
+        let dropbox_named = one(&[
+            "https://www.dropbox.com/scl/fi/x1y2/%CE%B2%CE%AF%CE%BD%CF%84%CE%B5%CE%BF.mov?rlkey=k9k9&dl=0",
+            "https://www.dropbox.com/scl/fi/x1y2/βίντεο.mov?rlkey=k9k9",
+            "https://www.dropbox.com/scl/fi/x1y2?rlkey=k9k9",
+        ]);
+        assert_eq!(dropbox_named, "https://www.dropbox.com/scl/fi/x1y2?rlkey=k9k9");
+        assert_eq!(dropbox_old, "https://www.dropbox.com/s/abc123");
+        // P11.15a4: a Drive file is its id, with or without a resource key.
+        let drive_keyed = one(&[
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing&resourcekey=0-AbCdE",
+            "https://drive.google.com/open?id=1AbC_dEf-GhIjKlMn&resourcekey=0-AbCdE",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?resourcekey=0-Other",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view",
+        ]);
+        assert_eq!(drive_keyed, drive);
+
+        // Two different files stay two.
+        assert_ne!(drive, normalize("https://drive.google.com/file/d/2ZzZ_other-file00/view"));
+        assert_ne!(dropbox_old, normalize("https://www.dropbox.com/s/def456/clip.mp4?dl=0"));
+        assert_ne!(dropbox_new, normalize("https://www.dropbox.com/scl/fi/x1y2/clip.mov?rlkey=other1"));
+        assert_ne!(onedrive, normalize("https://1drv.ms/v/s!AkOther456"));
+        assert_ne!(sharepoint, normalize("https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EfGhI?e=Xy1"));
+        assert_ne!(live, normalize("https://onedrive.live.com/?cid=ABC&resid=ABC%21124"));
+        assert_ne!(live, normalize("https://onedrive.live.com/redir?resid=ABC!125"));
+        assert_ne!(dropbox_named, normalize("https://www.dropbox.com/scl/fi/x1y3/clip.mov?rlkey=k9k9"));
+        assert_ne!(drive_keyed, normalize("https://drive.google.com/file/d/2ZzZ_other-file00/view?resourcekey=0-AbCdE"));
+        for u in [&drive, &dropbox_old, &dropbox_new, &dropbox_named, &drive_keyed, &onedrive, &sharepoint, &live] {
+            assert_eq!(normalize(u), *u, "idempotent: {u}");
+        }
     }
 
     #[test]
@@ -461,6 +707,15 @@ mod tests {
             "https://m.youtube.com/shorts/xyz?feature=share",
             "https://twitter.com/u/status/1?ref_src=x",
             "https://www.iefimerida.gr/news/story/amp",
+            // The P14.8 keys.
+            "https://www.youtube.com/embed/videoseries?list=PLabc123&index=2",
+            "https://www.youtube.com/embed/live_stream?channel=UCxyz",
+            "https://www.facebook.com/NewsPage/videos/storm/99/?__cft__=x",
+            "https://www.facebook.com/reel/123?mibextid=abc",
+            "https://m.instagram.com/newsdesk/reel/CxYz123/?igsh=abc",
+            "https://www.instagram.com/reels/audio/123456789/",
+            "https://www.tiktok.com/@newsdesk/video/7301234567890?is_from_webapp=1",
+            "https://m.tiktok.com/v/7301234567890.html",
         ] {
             let once = normalize(url);
             let twice = normalize(&once);
@@ -497,5 +752,19 @@ mod tests {
         // Two-label public suffix.
         assert_eq!(registrable_domain("https://www.theguardian.co.uk/x").as_deref(), Some("theguardian.co.uk"));
         assert_eq!(registrable_domain("").is_none(), true);
+        // The whole Public Suffix List (P14.6): deeper suffixes, and an address is its own.
+        assert_eq!(registrable_domain("https://news.site.com.gr/a").as_deref(), Some("site.com.gr"));
+        assert_eq!(registrable_domain("https://www.ypes.gov.gr/a").as_deref(), Some("ypes.gov.gr"));
+        assert_eq!(registrable_domain("https://www.pio.gov.cy/a").as_deref(), Some("pio.gov.cy"), "a suffix the old table lacked");
+        assert_eq!(registrable_domain("http://192.168.10.4:8080/x").as_deref(), Some("192.168.10.4"));
+    }
+
+    /// P14.6: a log line names the site, never the address with its path and query.
+    #[test]
+    fn a_log_line_names_the_site_never_the_address() {
+        assert_eq!(site_for_log("https://www.news.example.gr/story/1?token=abc#t"), "example.gr");
+        assert_eq!(site_for_log("https://x.com/someone/status/1?s=20"), "x.com");
+        assert_eq!(site_for_log("attachment://clip.mp4"), "a non-web link");
+        assert!(!site_for_log("https://cdn.news.example/v.mp4?sig=SECRET").contains("SECRET"));
     }
 }

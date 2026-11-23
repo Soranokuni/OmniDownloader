@@ -5,9 +5,9 @@
  */
 
 import { api, el, render, toast, fmtTime } from '/static/app.js?v=6';
-import { copyText, saveJson } from '/static/admin-common.js?v=2';
+import { copyText, saveJson } from '/static/admin-common.js?v=3';
 import { confirmDialog } from '/static/dialog.js?v=10';
-import { t } from '/static/admin-text.js?v=2';
+import { t } from '/static/admin-text.js?v=3';
 
 /** A word for a server code: `prefix.<code>` when `codes` has it, else the code itself. */
 const word = (prefix, codes, code) => (codes.includes(code) ? t(`${prefix}.${code}`) : code);

@@ -158,6 +158,10 @@ pub mod checks {
     pub const WORKERS: &str = "workers";
     /// config.json has keys no setting reads, or values read differently (P13.4b).
     pub const CONFIG: &str = "config";
+    /// A scheduled maintenance task failed on its last run (P11.13).
+    pub const MAINTENANCE: &str = "maintenance";
+    /// The weekly integrity check of `omni.db` and the last backup (P11.13).
+    pub const DATABASE: &str = "database";
 }
 
 impl Default for HealthState {

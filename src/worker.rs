@@ -12,7 +12,6 @@ use tracing::{error, info, warn};
 
 use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
-use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
 use omni_browser::evidence::{Evidence, EvidenceClass};
 use omni_browser::sniffer::StreamSniffer;
 use omni_core::config::RepairMode;
@@ -490,7 +489,7 @@ pub(crate) fn retry_by_policy(
 pub(crate) fn review_hint(repo: &Repository, job_id: i64, code: ErrorCode, url: &str) -> String {
     if code.uses_exhausted_hint() {
         let attempts = repo.get_job(job_id).ok().flatten().map_or(1, |j| j.attempts);
-        return omni_broadcast::errors::stopped_hint_el(code, attempts, url, repo);
+        return omni_broadcast::errors::stopped_hint_el(code, attempts, job_id, url, repo);
     }
     omni_broadcast::errors::hint_for_job(code, url, repo)
 }
@@ -626,6 +625,45 @@ pub(crate) async fn run_approved_delivery(
     Ok(())
 }
 
+/// What the MCR desk is told about a file-locker link a person must fetch
+/// (P11.15a): a shared folder, or a locker with no direct address. `None` for
+/// a link that is not one, or a share of one file fetched directly.
+///
+/// With `locker.direct_shares` off a share of one file is sent to the desk as
+/// before P11.15a; with `locker.browser_capture` on a locker page is left to
+/// the capture (P11.15b), which sends it to the desk itself if it fails.
+pub(crate) fn locker_manual_message(locker: &omni_core::locker::Locker, settings: &omni_core::locker::LockerSettings) -> Option<String> {
+    use omni_core::locker::Locker;
+    match locker {
+        Locker::Folder { vendor } => {
+            Some(format!("Shared {vendor} folder link: open it and send the video's own link, or download the file and use 'Upload file' on this job."))
+        }
+        Locker::Manual { .. } if settings.capture.is_some() => None,
+        Locker::Manual { vendor } => Some(format!("File-locker link ({vendor}): download the file and use 'Upload file' on this job.")),
+        Locker::Direct { vendor, .. } if !settings.direct_shares => Some(format!(
+            "File-locker link ({vendor}): direct downloads are switched off (locker.direct_shares); download the file and use 'Upload file' on this job."
+        )),
+        Locker::Direct { .. } | Locker::No => None,
+    }
+}
+
+/// The file a locker capture got for job `job_id` (P11.15b2), once the job no
+/// longer needs it: delivered, held, sent to the desk or to review, cancelled.
+/// Kept while the job waits for a retry (PENDING) or runs (RUNNING: this run,
+/// or another worker's after a reaped lease).
+pub(crate) fn discard_finished_capture(repo: &Repository, engine: &BroadcastEngine, job_id: i64) {
+    if !engine.capture_dir(job_id).exists() {
+        return;
+    }
+    match repo.get_job(job_id) {
+        Ok(Some(job)) if matches!(job.status, JobStatus::Pending | JobStatus::Running) => {}
+        // Gone, or finished: nothing will come back for the file.
+        Ok(_) => engine.discard_capture_dir(job_id),
+        // Unknown: the retention sweep decides later.
+        Err(e) => warn!("Job #{job_id}: the captured file's job could not be read ({e:#}); kept for now"),
+    }
+}
+
 /// Run one leased job through the pipeline.
 ///
 /// Extracted from the worker loop so the lease, the heartbeat and the permit are
@@ -641,32 +679,29 @@ pub(crate) async fn run_job(
     health: &HealthState,
     canary: &Arc<canary::CanaryEnv>,
 ) -> Result<()> {
+    let job_id = job.id;
+    let result = run_job_steps(repo, engine, owner, job, cancel, evidence_dir, repair, health, canary).await;
+    // Whatever way the run ended (P11.15b2).
+    discard_finished_capture(repo, engine, job_id);
+    result
+}
+
+async fn run_job_steps(
+    repo: &Repository,
+    engine: &Arc<BroadcastEngine>,
+    owner: &str,
+    job: omni_core::models::Job,
+    cancel: CancellationToken,
+    evidence_dir: &std::path::Path,
+    repair: &repair::RepairCtx,
+    health: &HealthState,
+    canary: &Arc<canary::CanaryEnv>,
+) -> Result<()> {
+    // One repair mode for the whole run, the one the panel set last (P11.9).
+    let repair = &repair.current();
     let repair_mode = repair.cfg.mode;
     let job_id = job.id;
     let orig_url = job.url.clone();
-
-    // File lockers (WeTransfer and friends) are never handed to yt-dlp: the
-    // link is a landing page, not a media URL. Plan P8 may resolve them
-    // automatically; until then an operator fetches the file.
-    let locker_resolver = ComputerUseAgentPlaceholder::new(None, None);
-    if locker_resolver.can_handle(&orig_url) {
-        warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
-        repo.record_event(
-            job_id,
-            "WARN",
-            Some(JobStage::Extract),
-            "File-locker link (WeTransfer/AirBridge/…); needs a manual download",
-        )?;
-        repo.finish(
-            job_id,
-            owner,
-            JobStatus::ManualDownload,
-            Some(ErrorCode::ManualDownload.as_str()),
-            Some("File-locker link: download the file and use 'Upload file' on this job."),
-            None,
-        )?;
-        return Ok(());
-    }
 
     // MCR approved the video this job held back: deliver that file, and do
     // nothing of what follows (no download, no page scan, no sniffing).
@@ -678,6 +713,21 @@ pub(crate) async fn run_job(
     // and nothing else (no download, no encode, no page scan).
     if job.delivery_wait {
         return run_waiting_delivery(repo, engine, owner, &job, &cancel, repair).await;
+    }
+
+    // File lockers are never handed to yt-dlp as they are: the link is a landing
+    // page, not a media URL. A share of one file the vendor serves directly
+    // (Dropbox, Google Drive, OneDrive, SharePoint) is fetched from its direct
+    // address below (P11.15a); a folder, and every other locker (WeTransfer and
+    // friends), goes to the MCR desk for a person to fetch. Only after the two
+    // steps above (P11.15b2): a video MCR approved, or one made and waiting for
+    // the watchfolder, is delivered whatever the locker switches say now.
+    let locker = omni_core::locker::classify(&orig_url);
+    if let Some(message) = locker_manual_message(&locker, engine.locker()) {
+        warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
+        repo.record_event(job_id, "WARN", Some(JobStage::Extract), &message)?;
+        repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
+        return Ok(());
     }
 
     // MCR asked for the next verified candidate of this job (P10.13): hold that
@@ -781,8 +831,11 @@ pub(crate) async fn run_job(
                     Ok(normal) => normal,
                     Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
                 };
-                info!("Job #{job_id}: {} -> {}", omni_core::cookies::host_and_path(&orig_url), omni_core::cookies::host_and_path(&fixed));
-                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed}"))?;
+                // A file-locker link is named by its site only: its query or path can carry the key (P11.15a4).
+                let shown = |u: &str| if omni_core::locker::is_locker(u) { omni_core::urlnorm::site_for_log(u) } else { omni_core::cookies::host_and_path(u) };
+                info!("Job #{job_id}: {} -> {}", shown(&orig_url), shown(&fixed));
+                let fixed_said = if omni_core::locker::is_locker(&fixed) { omni_core::urlnorm::site_for_log(&fixed) } else { fixed.clone() };
+                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed_said}"))?;
                 if let Err(e) = repo.set_leased_job_url(job_id, owner, &fixed) {
                     warn!("Job #{job_id}: could not store the corrected link: {e:#}");
                 }
@@ -795,11 +848,116 @@ pub(crate) async fn run_job(
         orig_url
     };
 
+    // A locker share of one file (P11.15a): from here on the job fetches the
+    // vendor's direct address, judged by the same egress rule, and goes through
+    // the normal pipeline, transcoded and verified like any video. Not stored:
+    // the desk keeps showing the link that was sent, and a retry works it out
+    // again. The direct address carries the share's key; it is never logged.
+    //
+    // P11.15a2: such a job is a download only, as an attachment is: no site API, no
+    // page scan, no browser, no page assessment, no repair ladder. Its size is
+    // bounded (`locker.max_file_gb`), the direct address's keys are kept out of the
+    // log, and every error text says the link that was sent instead of it.
+    let sent_link = orig_url.clone();
+    let mut locker_direct = false;
+    let mut _size_guard: Option<omni_broadcast::pipeline::MaxFilesizeGuard> = None;
+    let mut _link_guard: Option<omni_broadcast::pipeline::LockerLinkGuard> = None;
+    let mut _redaction: Option<omni_core::logging::TemporaryRedaction> = None;
+    // What a log line, an event or an audit row may say of a share: its site,
+    // never the sent link (its query or path can carry the key) nor the direct
+    // address (P11.15a4).
+    let locker_label = omni_core::urlnorm::site_for_log(&sent_link);
+    let orig_url = match omni_core::locker::direct_download_if(engine.locker().direct_shares, &orig_url) {
+        Some(direct) => {
+            // Held for the run, removed when it ends (P11.15a4).
+            _redaction = repo.redact_in_logs(omni_core::locker::secret_parts(&direct));
+            let direct = match egress::vet_url(&direct, egress_allow).await {
+                Ok(normal) => normal,
+                Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
+            };
+            let vendor = match &locker {
+                omni_core::locker::Locker::Direct { vendor, .. } => *vendor,
+                _ => "file-locker",
+            };
+            info!("Job #{job_id}: a {vendor} share of one file; downloading it from the direct address");
+            repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("{vendor} share: the file is downloaded directly"))?;
+            locker_direct = true;
+            _size_guard = Some(engine.set_max_filesize(job_id, engine.locker_max_file_bytes()));
+            // The engine's own lines say the site too (P11.15a3, P11.15a4).
+            _link_guard = Some(engine.set_locker_link(job_id, &locker_label));
+            job.url = direct.clone();
+            direct
+        }
+        None => orig_url,
+    };
+
+    // A locker page a person would fetch (WeTransfer and the like), with
+    // `locker.browser_capture` on (P11.15b): the browser opens it (the link is
+    // already judged by the egress rule, and so is every request of the page)
+    // and keeps the one file it hands out, in `temp/captures/{id}`, outside the
+    // job's workspace: the pipeline's own clean-up of a failed run does not take
+    // it, so a retry uses it again instead of opening the page again (P11.15b2).
+    // It goes when the job ends ([`discard_finished_capture`]). That file then
+    // goes through the pipeline as an attachment does. Any failure ends at the
+    // desk, with the service named; nothing retries the capture by itself. A
+    // cancel stops it at once (the browser is killed) and writes nothing more.
+    // What is written of the page is its site, never its link (P11.15a4).
+    let orig_url = match (&locker, engine.locker().capture.clone()) {
+        (omni_core::locker::Locker::Manual { vendor }, Some(capturer)) if orig_url.starts_with("http") => {
+            let dir = engine.capture_dir(job_id);
+            let got = match omni_core::locker::captured_file(&dir) {
+                Some(file) => {
+                    info!("Job #{job_id}: the {vendor} file the browser downloaded before is used again");
+                    repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the file the browser downloaded before is used again"))?;
+                    Ok(file)
+                }
+                None => {
+                    info!("Job #{job_id}: a {vendor} page; the browser tries to download its file");
+                    repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser tries to download the file"))?;
+                    // Whatever an interrupted capture left.
+                    let _ = std::fs::remove_dir_all(&dir);
+                    let limits = omni_core::locker::CaptureLimits { budget: omni_core::locker::CAPTURE_BUDGET, max_bytes: engine.locker_max_file_bytes() };
+                    let captured = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => None,
+                        got = capturer.capture(&orig_url, &dir, limits) => Some(got),
+                    };
+                    let Some(got) = captured else {
+                        info!("Job #{job_id}: cancelled while the browser was on the {vendor} page; stopped");
+                        return Ok(());
+                    };
+                    if let Ok(_) = &got {
+                        repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser downloaded the file"))?;
+                    }
+                    got
+                }
+            };
+            match got {
+                Ok(file) => {
+                    job.source_path = Some(file.to_string_lossy().into_owned());
+                    job.url = omni_core::locker::CAPTURE_URL.to_string();
+                    job.url.clone()
+                }
+                Err(why) => {
+                    // The capture names sites only; an address that slipped in is cut to its site too.
+                    let why = omni_core::locker::addresses_to_sites(&why);
+                    let message = format!("File-locker link ({vendor}): the browser could not get the file ({why}); download it and use 'Upload file' on this job.");
+                    warn!("Job #{job_id}: {message}");
+                    repo.record_event(job_id, "WARN", Some(JobStage::Download), &message)?;
+                    repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => orig_url,
+    };
+
     // A news page yt-dlp reads as several videos (an article with four
     // Streamable embeds): this job takes the first, the others become
     // sibling jobs or offers, as when the sniffer finds them. Before, all
     // were downloaded into this job and one was delivered.
-    let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
+    // A file-locker share's direct address is a file, not a page (P11.15a2).
+    let is_web = (orig_url.starts_with("http://") || orig_url.starts_with("https://")) && !locker_direct;
     let mut page_referer: Option<String> = None;
     // How many videos yt-dlp's page scan named (P10.2).
     let mut scanned_videos = 0usize;
@@ -862,7 +1020,11 @@ pub(crate) async fn run_job(
     // own pick waits as the fallback.
     // Where the page lands is judged by the egress rule too; an internal landing ends the job.
     let landed_refusal = std::sync::Mutex::new(None);
-    let route = omni_broadcast::downloader::first_attempt_resolved(
+    // A direct share is yt-dlp's download only: its address is not opened as a page (P11.15a2).
+    let route = if locker_direct {
+        omni_broadcast::downloader::FirstAttempt::YtDlp
+    } else {
+        omni_broadcast::downloader::first_attempt_resolved(
         page_referer.is_some(),
         is_platform,
         job.parent_job_id.is_some(),
@@ -881,7 +1043,8 @@ pub(crate) async fn run_job(
             }
         },
     )
-    .await;
+    .await
+    };
     if let Some(why) = landed_refusal.into_inner().unwrap_or_else(|p| p.into_inner()) {
         return egress::end_job_internal_address(repo, job_id, owner, &why);
     }
@@ -921,6 +1084,10 @@ pub(crate) async fn run_job(
         }
     };
 
+    // A direct share's error text says the link that was sent, never the direct address (P11.15a2).
+    if locker_direct {
+        process_result = process_result.map_err(|e| scrub_locker_error(e, &locker_label));
+    }
     if lost_lease(&process_result) {
         warn!("Job #{job_id}: no longer ours; nothing more to do");
         return Ok(());
@@ -948,7 +1115,7 @@ pub(crate) async fn run_job(
     let mut sniff_referer: Option<String> = None;
     let sniff = sniff_first
         || match &process_result {
-            Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
+            Err(e) => !locker_direct && classify_pipeline_error(e).should_sniff(&orig_url),
             Ok(_) => false,
         };
     // The sniffer, taken first, found no usable video: yt-dlp's own pick is tried (P3.15).
@@ -1295,7 +1462,8 @@ pub(crate) async fn run_job(
             if done && !cancel.is_cancelled() {
                 // An article's sibling job holds a sniffed stream or post,
                 // not a page of the site: it says nothing about the site.
-                if job.parent_job_id.is_none() {
+                // Nor does a file-locker share (P11.15a2).
+                if job.parent_job_id.is_none() && !locker_direct {
                     note_site_outcome(repo, health, job_id, &orig_url, SiteOutcome::Success);
                 }
             }
@@ -1365,7 +1533,8 @@ pub(crate) async fn run_job(
                 // the repair ladder (P10.11a). Only here, only for a web page,
                 // only with repair on; a held video waits for MCR.
                 let tried = repair::Tried::of(&job, &orig_url, page_referer.as_deref(), &sniffed_streams, sniff_referer.as_deref());
-                let ladder = if siblings_hold_the_rest {
+                // Never for a file-locker share: its link is not a page (P11.15a2).
+                let ladder = if siblings_hold_the_rest || locker_direct {
                     None
                 } else {
                     repair::after_failure_with(repair, &job, owner, &orig_url, code, &snapshot, tried, furniture_urls.clone(), &cancel).await
@@ -1426,7 +1595,8 @@ pub(crate) async fn run_job(
 
                 // Nothing more is written for a job that is no longer ours.
                 if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, login_site.as_deref().unwrap_or(&job.url)))?;
+                    let hint_url = if locker_direct { sent_link.as_str() } else { login_site.as_deref().unwrap_or(&job.url) };
+                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, hint_url))?;
                 }
                 // Only the job's owner writes evidence: a job MCR cancelled
                 // or the reaper gave away has no business leaving a file.
@@ -1448,8 +1618,10 @@ pub(crate) async fn run_job(
                 // A repair that ran out of time counts as the unresolved video it was.
                 let site_code = repair::site_code(code);
                 // A platform's extractor may have broken: an early yt-dlp update (P11.4d).
-                note_extraction_trouble(repo, canary, done, cancel.is_cancelled(), &orig_url, site_code.as_str());
-                if site_failure_counts(done, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
+                // A file-locker share says nothing about a site or a platform's extractor (P11.15a2).
+                let done_for_site = done && !locker_direct;
+                note_extraction_trouble(repo, canary, done_for_site, cancel.is_cancelled(), &orig_url, site_code.as_str());
+                if site_failure_counts(done_for_site, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
                 {
                     let noted = note_site_outcome(
                         repo,
@@ -2042,7 +2214,7 @@ async fn without_videoless_posts(
             None
         };
         if ask && has_video == Some(false) {
-            info!("Job #{job_id}: {url} has no video; not a candidate");
+            info!("Job #{job_id}: an embedded post on {} has no video; not a candidate", omni_core::urlnorm::site_for_log(url));
             let _ = repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("Embedded post without a video, skipped: {url}"));
             continue;
         }
@@ -2071,6 +2243,19 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
 /// Whether the engine stopped because this worker no longer holds the job
 /// (P1.14). Nothing more may be written for it: `finish` and `requeue_after`
 /// would refuse, but the events and sniffing would not.
+/// A file-locker share's failure, with every address in its text replaced by
+/// the link that was sent (P11.15a2): what the card, the history and the log
+/// show never holds the share's key or a signed download link. The code stays
+/// readable in the chain; a lost lease is passed on as it is (it names no address).
+pub(crate) fn scrub_locker_error(e: anyhow::Error, sent: &str) -> anyhow::Error {
+    if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some() {
+        return e;
+    }
+    let cause = omni_core::locker::scrub_addresses(&readable_cause(&e), sent);
+    let chain = omni_core::locker::scrub_addresses(&diagnostic_chain(&e), sent);
+    anyhow::anyhow!(cause).context(chain)
+}
+
 fn lost_lease<T>(result: &anyhow::Result<T>) -> bool {
     matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
 }

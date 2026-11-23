@@ -9,7 +9,7 @@
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
-import { t, onLanguageChange } from '/static/admin-text.js?v=2';
+import { t, onLanguageChange } from '/static/admin-text.js?v=3';
 
 // Each mode's name and summary are `wizard.mode.<id>` and `wizard.mode.<id>.about`.
 const MODES = ['beginner', 'intermediate', 'it'];

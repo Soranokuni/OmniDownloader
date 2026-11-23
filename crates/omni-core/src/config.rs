@@ -554,11 +554,61 @@ pub enum RepairMode {
     Hold,
 }
 
+impl RepairMode {
+    fn as_u8(self) -> u8 {
+        match self {
+            RepairMode::Off => 0,
+            RepairMode::Shadow => 1,
+            RepairMode::Hold => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RepairMode::Shadow,
+            2 => RepairMode::Hold,
+            _ => RepairMode::Off,
+        }
+    }
+}
+
+/// The repair mode the running daemon uses, shared by the workers and the
+/// admin panel, so the panel's switch to `hold` (P11.9) takes effect without
+/// a restart. Clones share one value.
+#[derive(Debug, Clone)]
+pub struct LiveRepairMode(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl LiveRepairMode {
+    pub fn new(mode: RepairMode) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(mode.as_u8())))
+    }
+
+    pub fn get(&self) -> RepairMode {
+        RepairMode::from_u8(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    pub fn set(&self, mode: RepairMode) {
+        self.0.store(mode.as_u8(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `repair.mode` of a config.json written before P11.9, which has none: off,
+/// as it always was. A config this version creates says `shadow`.
+fn repair_mode_of_old_files() -> RepairMode {
+    RepairMode::Off
+}
+
+/// The `repair` section of a config.json written before the section existed.
+fn repair_of_old_files() -> RepairConfig {
+    RepairConfig { mode: repair_mode_of_old_files(), ..RepairConfig::default() }
+}
+
 /// Page evidence and repair (`repair` in config.json). Old files without the
-/// section load with these defaults.
+/// section load with these defaults, mode `off`; a new config is written with
+/// mode `shadow` (P11.9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairConfig {
-    #[serde(default)]
+    #[serde(default = "repair_mode_of_old_files")]
     pub mode: RepairMode,
     /// Evidence files older than this are deleted by the retention task.
     #[serde(default = "default_evidence_days")]
@@ -645,9 +695,11 @@ fn default_evidence_max_mb() -> u64 {
 }
 
 impl Default for RepairConfig {
+    /// A new installation's: the ladder runs in shadow, recording what it
+    /// would have fixed and changing nothing (P11.9).
     fn default() -> Self {
         Self {
-            mode: RepairMode::Off,
+            mode: RepairMode::Shadow,
             evidence_days: default_evidence_days(),
             evidence_max_mb: default_evidence_max_mb(),
             hold_hours: default_hold_hours(),
@@ -661,6 +713,45 @@ impl Default for RepairConfig {
             llm_max_calls_per_day: default_repair_llm_calls_per_day(),
             auto_deliver_after_approvals: default_auto_deliver_after_approvals(),
         }
+    }
+}
+
+/// File-locker links (`locker` in config.json, P11.15). Old files without the
+/// section load with these defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockerConfig {
+    /// The largest file a share's direct download may bring (P11.15a2), in GB
+    /// (read as at least 1): a bigger one is not downloaded and waits for
+    /// MCR, with its size named.
+    #[serde(default = "default_locker_max_file_gb")]
+    pub max_file_gb: u64,
+    /// A share of one file on Dropbox, Google Drive, OneDrive or SharePoint is
+    /// downloaded from its direct address (P11.15a). Off: every locker link
+    /// waits for MCR (MANUAL_DOWNLOAD), as before P11.15a.
+    #[serde(default = "default_true")]
+    pub direct_shares: bool,
+    /// The other lockers (WeTransfer and the like) are opened in the headless
+    /// browser, which presses their download button and keeps the one file it
+    /// gets (P11.15b). Off by default: those pages change, and every failure
+    /// still ends at MCR, with the service named.
+    #[serde(default)]
+    pub browser_capture: bool,
+}
+
+fn default_locker_max_file_gb() -> u64 {
+    20
+}
+
+impl LockerConfig {
+    /// [`Self::max_file_gb`] in bytes, at least 1 GB.
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_gb.max(1).saturating_mul(1 << 30)
+    }
+}
+
+impl Default for LockerConfig {
+    fn default() -> Self {
+        Self { max_file_gb: default_locker_max_file_gb(), direct_shares: true, browser_capture: false }
     }
 }
 
@@ -711,6 +802,26 @@ impl Default for RetryConfig {
             late_after_urgent_mins: default_late_after_urgent_mins(),
             second_chance_window_mins: default_second_chance_window_mins(),
         }
+    }
+}
+
+/// Alerts written to the Windows Event Log (`alerts` in config.json, P11.14).
+/// Old files without the section load with these defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsConfig {
+    /// A job waiting for a person (review, manual download, approval) longer
+    /// than this many minutes gets one Event Log warning (read as 1..=1440).
+    #[serde(default = "default_waiting_for_person_mins")]
+    pub waiting_for_person_mins: i64,
+}
+
+fn default_waiting_for_person_mins() -> i64 {
+    15
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self { waiting_for_person_mins: default_waiting_for_person_mins() }
     }
 }
 
@@ -956,12 +1067,20 @@ pub struct AppConfig {
     pub llm: LlmConfig,
 
     /// Page evidence of failed jobs and the repair mode (plan P10.1).
-    #[serde(default)]
+    #[serde(default = "repair_of_old_files")]
     pub repair: RepairConfig,
 
     /// Automatic retries of a failed job (P11.3a).
     #[serde(default)]
     pub retry: RetryConfig,
+
+    /// File-locker links (P11.15).
+    #[serde(default)]
+    pub locker: LockerConfig,
+
+    /// Event Log alerts (P11.14).
+    #[serde(default)]
+    pub alerts: AlertsConfig,
 
     /// yt-dlp paced per video platform (P11.4).
     #[serde(default)]
@@ -1092,6 +1211,8 @@ impl Default for AppConfig {
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             retry: RetryConfig::default(),
+            locker: LockerConfig::default(),
+            alerts: AlertsConfig::default(),
             pacing: PacingConfig::default(),
             archive: ArchiveConfig::default(),
             metrics: MetricsConfig::default(),
@@ -1415,6 +1536,49 @@ mod tests {
         assert!(!nets.contains("127.0.0.1".parse().unwrap()), "a set list replaces the default");
     }
 
+    /// P11.9: a config this version creates runs the ladder in shadow; it is
+    /// written out with the mode, so the next start reads shadow too.
+    #[test]
+    fn a_new_config_runs_repair_in_shadow_and_keeps_it() {
+        let fresh = AppConfig::default();
+        assert_eq!(fresh.repair.mode, RepairMode::Shadow);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let loaded = AppConfig::load_from_file(&path).unwrap();
+        assert_eq!(loaded.repair.mode, RepairMode::Shadow, "a missing config.json is created as new");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"mode\": \"shadow\""));
+        assert_eq!(AppConfig::load_from_file(&path).unwrap().repair.mode, RepairMode::Shadow);
+    }
+
+    #[test]
+    fn the_live_repair_mode_is_shared_by_its_clones() {
+        let live = LiveRepairMode::new(RepairMode::Shadow);
+        let worker = live.clone();
+        assert_eq!(worker.get(), RepairMode::Shadow);
+        live.set(RepairMode::Hold);
+        assert_eq!(worker.get(), RepairMode::Hold);
+        live.set(RepairMode::Off);
+        assert_eq!(worker.get(), RepairMode::Off);
+    }
+
+    #[test]
+    fn the_locker_section_defaults_and_its_size_limit_is_at_least_a_gigabyte() {
+        // P11.15a2: an old file without the section gets 20 GB.
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.locker.max_file_gb, 20);
+        assert_eq!(old.locker.max_file_bytes(), 20 << 30);
+        let set: AppConfig = serde_json::from_str(r#"{"locker":{"max_file_gb":5}}"#).unwrap();
+        assert_eq!(set.locker.max_file_bytes(), 5 << 30);
+        let zero: AppConfig = serde_json::from_str(r#"{"locker":{"max_file_gb":0}}"#).unwrap();
+        assert_eq!(zero.locker.max_file_bytes(), 1 << 30, "read as at least 1 GB");
+        // P11.15b: direct shares on, the browser capture off, unless the file says otherwise.
+        assert!(old.locker.direct_shares && !old.locker.browser_capture);
+        assert!(set.locker.direct_shares && !set.locker.browser_capture, "a section without the switches");
+        let switched: AppConfig = serde_json::from_str(r#"{"locker":{"direct_shares":false,"browser_capture":true}}"#).unwrap();
+        assert!(!switched.locker.direct_shares && switched.locker.browser_capture);
+        assert_eq!(AppConfig::default().locker, LockerConfig::default());
+    }
+
     #[test]
     fn repair_section_defaults_and_parses() {
         let old: AppConfig = serde_json::from_str("{}").unwrap();
@@ -1423,6 +1587,8 @@ mod tests {
         assert_eq!(old.repair.evidence_max_mb, 200);
         assert_eq!(old.repair.hold_hours, 24);
         assert_eq!(old.repair.held_max_gb, 20);
+        let section_without_mode: AppConfig = serde_json::from_str(r#"{"repair":{"evidence_days":3}}"#).unwrap();
+        assert_eq!(section_without_mode.repair.mode, RepairMode::Off, "an old file's missing mode stays off");
         let set: AppConfig = serde_json::from_str(r#"{"repair":{"mode":"shadow","evidence_days":3}}"#).unwrap();
         assert_eq!(set.repair.mode, RepairMode::Shadow);
         assert_eq!(set.repair.evidence_days, 3);

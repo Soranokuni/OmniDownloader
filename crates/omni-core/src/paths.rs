@@ -86,6 +86,12 @@ impl AppPaths {
         self.temp.join("held").join(job_id.to_string())
     }
 
+    /// Where a locker capture keeps the page's file for job `job_id`
+    /// (P11.15b2): one directory per job, removed as a whole.
+    pub fn locker_capture(&self, job_id: i64) -> PathBuf {
+        crate::locker::capture_dir(&self.temp, job_id)
+    }
+
     /// Scratch space of one benchmark target (P6.4): `temp/benchmark/{run}/{idx}`,
     /// removed as a whole when the target is done. Never a queue job's directory.
     pub fn benchmark_target_temp(&self, run_id: i64, idx: i64) -> PathBuf {
@@ -100,6 +106,12 @@ impl AppPaths {
     /// Where a benchmark run's `report.json` and `report.md` are written.
     pub fn benchmark_report_dir(&self, run_id: i64) -> PathBuf {
         self.data.join("benchmarks").join(run_id.to_string())
+    }
+
+    /// The nightly database backups (P11.13): `data\backups`, inside the
+    /// restricted data folder.
+    pub fn db_backups(&self) -> PathBuf {
+        self.data.join("backups")
     }
 
     /// Create every directory the daemon writes to.
@@ -469,6 +481,8 @@ mod tests {
         // would conflate (defect D-04).
         assert_ne!(paths.job_temp(1), paths.job_temp(19));
         assert!(!paths.job_temp(19).starts_with(paths.job_temp(1)));
+        // A locker capture's file lives outside the job's workspace (P11.15b2).
+        assert_eq!(paths.locker_capture(7), PathBuf::from("C:/omni/temp/captures/7"));
     }
 
     #[test]

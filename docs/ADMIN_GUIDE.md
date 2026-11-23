@@ -470,7 +470,9 @@ the pinned build", "missing" or a version) and an **Install** / **Repair**
 button. Install downloads the exact pinned build and checks its checksum;
 jobs wait while the file is swapped. **Admin → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
-the previous build.
+the previous build. If the service stops while the nightly update is still
+checking a new yt-dlp or Deno build, the next start puts the previous build back; the next
+update run checks the release again.
 
 The verified yt-dlp update also runs early when one platform (YouTube, X,
 Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) has 3 extraction
@@ -652,11 +654,27 @@ again on its own.
 | `retry.max_age_mins` | 120 | no automatic retry for a job older than this, counted from when it was queued or from MCR's last «Δοκιμή ξανά» (read as 30 to 360); see §10 |
 | `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | minutes after which a job that is waiting or running (not yet delivered) counts as late, ordinary and urgent, counted like `retry.max_age_mins` (read as 1 to 120). A late job is listed in the desk's «Καθυστερούν» strip with its reason, and the desk sounds once; a live stream waiting for its next check is listed whatever its age. See the User Guide, §4.9 |
 | `retry.second_chance_window_mins` | 120 | a job waiting in review goes back to the queue on its own when what it failed on is fixed: a new yt-dlp or Deno kept after the nightly self-check (jobs that failed to find or read the video), a cookie jar uploaded, signed in or tested good (that site's jobs that needed a login or were rate-limited), a news site that works again (that site's jobs that failed to find the video). Once per cause, at most once for a site and three times in all, never a job a person acted on («Δοκιμή ξανά», cancel, «Το έβαλα στο Dalet», reject, wrong video, an offered video queued…), never a job whose link is already queued or was delivered again meanwhile, and only while the job is younger than this, counted like `retry.max_age_mins` (read as 30 to 360, and never longer than `retry.max_age_mins`). The job's history says «Αυτόματη επανάληψη» and why |
+| `locker.max_file_gb` | 20 | the largest file a one-file share on Dropbox, Google Drive, OneDrive or SharePoint may bring when it downloads by itself (read as at least 1). A bigger one is not downloaded: the job waits for MCR (`MANUAL_DOWNLOAD`) and its card names the limit |
+| `locker.direct_shares` | true | a one-file share on Dropbox, Google Drive, OneDrive or SharePoint downloads by itself through its direct address. `false`: every such link waits for MCR (`MANUAL_DOWNLOAD`) and its card says direct downloads are switched off |
+| `locker.browser_capture` | false | `true`: a file-locker page that needs a person (WeTransfer and similar, or a share without a direct address) is opened once in the headless browser, which presses its «Download» / «I agree» buttons and keeps the one file it downloads (at most 15 minutes and `locker.max_file_gb`; every connection the browser opens, from the page, a popup, a worker or a WebSocket, passes the outbound rule of `security.egress_allow_networks` first and goes only to the address the rule checked, on port 80 or 443 (or the link's own), and a name that does not resolve is refused; WebRTC sends nothing; the file is kept in `temp\captures\{job}` until the job ends, so a retry uses it again). If that fails for any reason the job waits for MCR (`MANUAL_DOWNLOAD`) once, its card naming the service and why; it is never tried again by itself. `false`: such links wait for MCR straight away, as before |
 | `pacing.per_host_concurrency` | 1 | yt-dlp runs starting at one video platform (YouTube, X, Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) at a time, so a mail with many links does not trip the platform's bot check (read as 1 to 4). A download gives its turn back as soon as the video starts transferring, so downloads still overlap; a probe keeps it until it ends. A job waiting for its turn keeps its download slot; a wait over 2 s is written to its history |
 | `pacing.min_gap_secs` | 8 | seconds between two starts on one platform, plus up to 4 s at random (read as 0 to 120; 0 switches the gap off). After a platform refuses a run as a rate limit (`RATE_LIMITED`), nothing new starts there for 2 minutes |
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
 | `adblock_*` | on | blocklists for the page reader, updated nightly |
+| `alerts.waiting_for_person_mins` | 15 | a video waiting for a person (in review, for a manual download, or held for approval) longer than this is written to the Windows Event Log once (read as 1 to 1440) |
+
+The service writes to the Windows **Application** log (source `OmniIngestService`)
+when nobody has the panel open, once when a condition starts and once when it
+ends, never repeatedly: a health line turning red (Error, event id 3000; back
+to normal: Information, 1000), videos waiting for a person past
+`alerts.waiting_for_person_mins` (Warning, 2000; one entry naming them), and
+the mailbox not answering for 10 minutes (Error, 3000; answering again:
+Information, 1000). A health line's change is written once it has held for 3
+minutes, so a line flapping at a threshold writes nothing. E-mail addresses and
+known secrets are masked in these entries. After a restart a condition that
+still holds is written once more. A console run (`omni-ingest.exe run`) writes these lines to its log
+file only.
 
 ### 5.4 LLM assist (optional)
 
@@ -675,9 +693,9 @@ evidence and try saved recipes, a live page load and (optionally) a model.
 
 | `repair.mode` | Effect |
 |---|---|
-| `off` (default) | behaves exactly as without repair |
-| `shadow` | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. |
-| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24); the one exception is a trusted recipe (below) |
+| `off` | behaves exactly as without repair (the value of a config.json written before this version that names no mode) |
+| `shadow` (default of a new installation) | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. Once it would have fixed at least 3 jobs in the last 14 days, the admin Overview offers the switch to `hold` with one click (saved to config.json, used from the next job, no restart; written to the audit log) |
+| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24) of an MCR desk being open (time with no desk open, or the service stopped, does not count; the desk reminds every 30 minutes while a video waits); the one exception is a trusted recipe (below) |
 
 Optional model rung: `repair.llm_enabled = true` with an explicit
 `repair.llm_model`; at most `llm_max_calls_per_day` (15) calls. Make one
@@ -877,8 +895,10 @@ window stays open until you press Enter, so the result can be read. Uninstall
 removes the entry. An entry that runs another installation, or one that cannot be read, is never replaced or removed; setup.log says so.
 
 `youtu.be` uses the `youtube.com` jar; `twitter.com` is stored as `x.com`.
-Every jar is re-tested nightly; the `cookies` health line warns 7 days before
-they expire.
+Every jar is re-tested nightly; the `cookies` health line is computed again
+every day and warns 7 days before they expire. While jobs in review wait for a
+site's login (no jar, an expired one, or one that failed its test), the MCR
+desk counts them per site.
 
 YouTube cookies are optional: most YouTube links work without them. Add them
 only if LOGIN_REQUIRED keeps coming back.
@@ -906,12 +926,24 @@ before every delete or import.
 
 | Task | When (local time) | What |
 |---|---|---|
+| `db_backup` | daily 02:30 | back up the database while the service runs into `data\backups\omni-YYYY-MM-DD.db`; the copy is checked before it counts; the 7 newest and one for each of the 4 weeks before them are kept |
+| `db_check` | every 7 days, 02:45 | integrity check of the database (`PRAGMA quick_check`) |
 | `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp; also run early when a platform starts failing, noted `early: …` (§3) |
 | `adblock_update` | daily 03:30 | refresh blocklists |
 | `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text, and the old database records below |
 | `selfcheck` | daily 05:15 | browser check and per-site check links |
 | `cookie_test` | daily 05:30 | test each cookie jar |
 | `vacuum` | every 30 days, 04:30 | compact the database |
+
+A task that fails on its last run turns the **maintenance** health line amber
+and names it; its next good run clears it. The **database** line shows the
+last integrity check and the last backup; it turns red if the check finds the
+database damaged. Then stop the service, move `data\omni.db` together with
+`omni.db-wal` and `omni.db-shm` (if present) to another folder, copy the newest
+`omni-YYYY-MM-DD.db` from `data\backups\` (never a `.tmp`: that is a copy that
+was not finished or failed its check) to `data\omni.db`, and start the service
+again. The backups hold the whole database, accounts and sessions included:
+they stay in `data\`, which only the service and administrators can read.
 
 What the `retention` task keeps in the database, and for how long (fixed, not configurable):
 
@@ -1020,6 +1052,19 @@ good), or with `NO_STREAM_FOUND`, `VIDEO_UNRESOLVED`, `HTTP_403` or
 may go back to the queue on its own: the second chance of §5.3
 (`retry.second_chance_window_mins`).
 
+A job that fails with `PROBE_FAILED`, `TRANSCODE_FAILED`, `REWRAP_FAILED` or
+`COMPLIANCE_FAILED` first takes a second route, once per job and without anyone
+acting: a link is downloaded again with other formats (another video codec, or
+a file the site serves already merged as MP4, either at least 720 lines high),
+an attached file is taken as it is, and the file is copied into a clean
+container (fresh timestamps) before the usual encode, wrap and compliance
+check. The job's history says «second route», the new source's size, and how
+it ended. If it does not help, the job goes to review with its first code. A
+file is never shortened to fit: one whose own index lists more frames than it
+holds (a download cut part way), or whose copy is shorter than the file says
+(a clock that jumps), goes to review. A daemon that is stopping does not take
+the second route.
+
 | Code | Auto | Meaning / action |
 |---|---|---|
 | `NETWORK` | yes | network problem |
@@ -1028,7 +1073,7 @@ may go back to the queue on its own: the second chance of §5.3
 | `EXTRACT_TIMEOUT`, `DOWNLOAD_TIMEOUT` | yes | download timed out |
 | `DELIVERY_FAILED`, `DELIVER_TIMEOUT` | yes | could not write to the watchfolder: check the share and the service account's rights |
 | `LOW_DISK` | yes | free disk space |
-| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after it was queued (within the same 2-hour age limit), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
+| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after the first try found it live (the checks stop at the age limit, `retry.max_age_mins`, counted from when it was queued), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
 | `LOGIN_REQUIRED` | no | the site wants a login: add cookies (§6.1) |
 | `GEO_BLOCKED` | no | not available from Greece |
 | `PRIVATE_OR_REMOVED` | no | ask for another link |
@@ -1038,14 +1083,14 @@ may go back to the queue on its own: the second chance of §5.3
 | `VIDEO_UNRESOLVED` | no | a video is there but was not fetched; download by hand |
 | `DRM_PROTECTED` | no | copy-protected; get the file from the source |
 | `SOURCE_TOO_LONG` | no | over the duration limit |
-| `MANUAL_DOWNLOAD` | no | file-transfer link (WeTransfer etc.): download by hand, mark done |
+| `MANUAL_DOWNLOAD` | no | file-transfer link a person must fetch (WeTransfer, MyAirBridge, TransferNow, Filemail, MEGA, or a shared folder): download by hand, mark done. One-file shares on Dropbox, Google Drive, OneDrive and SharePoint are downloaded directly, no account needed |
 | `PROBE_FAILED` | no | the downloaded file is unreadable, or is not an accepted video container. Accepted: MP4/MOV/3GP, MKV/WebM, MPEG-TS, MPEG-PS, AVI, WMV, FLV, MXF, DV, GXF, Ogg, raw H.264/HEVC/MPEG video and still images. Playlists (HLS, DASH, concat) and scripts (AviSynth, VapourSynth) are always refused |
 | `TRANSCODE_FAILED`, `TRANSCODE_TIMEOUT` | no | encoding failed; report if it repeats |
 | `REWRAP_FAILED`, `REWRAP_TIMEOUT` | no | MXF wrapping failed; report if it repeats |
 | `COMPLIANCE_FAILED` | no | the result is not to broadcast spec: **not delivered** |
 | `LEASE_EXPIRED` | no | interrupted repeatedly (crash or restart) |
 | `REJECTED_BY_MCR` | no | MCR rejected a repaired video |
-| `APPROVAL_EXPIRED` | no | not approved within 24 h; the held file was deleted |
+| `APPROVAL_EXPIRED` | no | not approved within 24 h of an MCR desk being open; the held file was deleted |
 | `HELD_FILE_CHANGED` | no | the held file changed: not delivered |
 | `REPAIR_EXHAUSTED` | no | repair ran out of time or attempts |
 | `NON_PUBLIC_ADDRESS` | no | the link, or a stream behind it, is an internal address: not downloaded (see `egress_allow_networks`) |
