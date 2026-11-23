@@ -65,7 +65,7 @@ fn attachment(bytes: Vec<u8>) -> Response {
 }
 
 /// The fixture locker's pages; `canary` is the canary's port on 127.0.0.2.
-fn respond(path: &str, canary: u16) -> Response {
+fn respond(path: &str, canary: u16, udp: u16) -> Response {
     let refused = format!("http://127.0.0.2:{canary}");
     match path {
         // A WeTransfer-like page: terms first, then the download button.
@@ -87,6 +87,20 @@ fn respond(path: &str, canary: u16) -> Response {
         "/socket" => page(&format!("<script>try {{ new WebSocket('ws://127.0.0.2:{canary}/socket'); }} catch (e) {{}}</script>")),
         "/worker" => page(&format!(
             "<script>new Worker(URL.createObjectURL(new Blob([\"fetch('{refused}/worker').catch(function(){{}})\"], {{type: 'text/javascript'}})));</script>"
+        )),
+        // WebRTC: a STUN server and a remote candidate on the UDP canary.
+        "/webrtc" => page(&format!(
+            "<script>(async () => {{\
+               const pc = new RTCPeerConnection({{iceServers: [{{urls: 'stun:127.0.0.2:{udp}'}}]}});\
+               pc.createDataChannel('x');\
+               await pc.setLocalDescription(await pc.createOffer());\
+               const peer = new RTCPeerConnection();\
+               await peer.setRemoteDescription(pc.localDescription);\
+               await peer.setLocalDescription(await peer.createAnswer());\
+               await pc.setRemoteDescription(peer.localDescription);\
+               const mid = (pc.localDescription.sdp.match(/a=mid:(\\S+)/) || [null, '0'])[1];\
+               await pc.addIceCandidate({{candidate: 'candidate:1 1 udp 2122260223 127.0.0.2 {udp} typ host', sdpMid: mid, sdpMLineIndex: 0}});\
+             }})().catch(() => {{}});</script><p>Nothing to press here</p>"
         )),
         "/hints" => page(&format!(
             "<link rel=preconnect href=\"{refused}\"><link rel=dns-prefetch href=\"//{REBIND}\"><link rel=prefetch href=\"{refused}/hint\">\
@@ -156,8 +170,18 @@ async fn serve() -> (String, u16, Arc<AtomicUsize>) {
     let fport = listener.local_addr().unwrap().port();
     let twin = tokio::net::TcpListener::bind(("127.0.0.2", fport)).await.expect("the canary takes the fixture's port on 127.0.0.2");
     canary_on(twin, hits.clone());
+    // And for UDP: every datagram counts.
+    let udp = tokio::net::UdpSocket::bind("127.0.0.2:0").await.expect("a UDP canary on 127.0.0.2");
+    let uport = udp.local_addr().unwrap().port();
+    let datagrams = hits.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        while udp.recv_from(&mut buf).await.is_ok() {
+            datagrams.fetch_add(1, Ordering::SeqCst);
+        }
+    });
     let base = format!("http://127.0.0.1:{fport}");
-    let app = Router::new().fallback(move |uri: Uri| async move { respond(uri.path(), cport) });
+    let app = Router::new().fallback(move |uri: Uri| async move { respond(uri.path(), cport, uport) });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (base, cport, hits)
 }
@@ -359,4 +383,16 @@ async fn of_two_downloads_only_the_first_is_kept() {
     // The second was cancelled; at most its empty start may linger until the capture's folder goes.
     let files: Vec<String> = left.into_iter().filter(|f| !f.ends_with(".crdownload")).collect();
     assert_eq!(files, vec!["files/capture.mp4".to_string()], "one file");
+}
+
+/// P11.15b3: WebRTC sends no UDP: neither to a STUN server nor to a remote
+/// candidate, both on the UDP canary.
+#[tokio::test]
+async fn webrtc_sends_nothing() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    let (got, left, hits, _job) = capture("/webrtc", 8, 1 << 20).await;
+    assert!(got.is_err(), "no file");
+    assert_eq!(hits, 0, "no datagram reached the canary");
+    assert!(left.is_empty(), "{left:?}");
 }

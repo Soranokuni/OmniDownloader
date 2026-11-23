@@ -34,7 +34,10 @@ use chromiumoxide::cdp::browser_protocol::browser::{
     CancelDownloadParams, DownloadProgressState, EventDownloadProgress, EventDownloadWillBegin, SetDownloadBehaviorBehavior,
     SetDownloadBehaviorParams,
 };
-use chromiumoxide::cdp::browser_protocol::fetch::{ContinueRequestParams, EnableParams as FetchEnable, EventRequestPaused, FailRequestParams};
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    AuthChallengeResponse, AuthChallengeResponseResponse, AuthChallengeSource, ContinueRequestParams, ContinueWithAuthParams, EnableParams as FetchEnable,
+    EventAuthRequired, EventRequestPaused, FailRequestParams,
+};
 use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, EventResponseReceived};
 use chromiumoxide::cdp::browser_protocol::target::{EventTargetCreated, TargetId};
 use chromiumoxide::Page;
@@ -60,14 +63,22 @@ const CLICK_EVERY: Duration = Duration::from_secs(3);
 const LOOKUP: Duration = Duration::from_secs(5);
 
 /// The browser predicts, prefetches and preconnects nothing: a preconnect
-/// opens a connection no request (and so no egress check) goes with.
+/// opens a connection no request (and so no egress check) goes with. WebRTC
+/// sends no UDP the proxy does not carry, which is none (P11.15b3): STUN and
+/// ICE would otherwise reach any address, inside the network too.
+///
+/// chromiumoxide puts its own `--disable-features=TranslateUI` before these;
+/// Chrome keeps the last one, so this one names TranslateUI as well.
 const QUIET_FLAGS: &[&str] = &[
     "--dns-prefetch-disable",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-features=TranslateUI,NetworkPrediction,Prerender2,SpeculationRulesPrefetchProxy,PreloadingHeuristics,LoadingPredictorUseLocalPredictions",
 ];
 
-/// The same, in the profile: `network_prediction_options` 2 is «never».
-const QUIET_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2}}"#;
+/// The same, in the profile: `network_prediction_options` 2 is «never». The
+/// WebRTC policy here is the one that holds (measured: with the flag above
+/// alone, ICE still sent UDP; with this alone, none); the flag stays as well.
+const QUIET_PREFERENCES: &str = r#"{"net":{"network_prediction_options":2},"webrtc":{"ip_handling_policy":"disable_non_proxied_udp"}}"#;
 
 /// Finds the first visible control that says «download» (or «agree»,
 /// «accept», in English and Greek) and was not clicked yet, marks it and
@@ -133,7 +144,9 @@ where
         return Err(format!("the capture folder could not be made: {e}"));
     }
     let deadline = Instant::now() + options.limits.budget;
-    let mut proxy = match proxy::start(options.allow.clone(), resolve.clone(), LOOKUP).await {
+    // The sent link's own port, when it is not 80 or 443, is the one other port the proxy reaches.
+    let own_port = reqwest::Url::parse(url).ok().and_then(|u| u.port_or_known_default());
+    let mut proxy = match proxy::start(options.allow.clone(), resolve.clone(), LOOKUP, own_port).await {
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_dir_all(dir);
@@ -258,7 +271,12 @@ where
     // before it runs, so none is missed while it starts (P11.15b2).
     let mut paused = browser.event_listener::<EventRequestPaused>().await.map_err(|e| format!("no request control: {e}"))?;
     let mut created = browser.event_listener::<EventTargetCreated>().await.map_err(|e| format!("no request control: {e}"))?;
-    browser.execute(FetchEnable::default()).await.map_err(|e| format!("no request control: {e}"))?;
+    // The proxy asks for this capture's credentials (P11.15b3): they are given
+    // to the proxy's own challenge only, never to a site's.
+    let mut challenged = browser.event_listener::<EventAuthRequired>().await.map_err(|e| format!("no request control: {e}"))?;
+    let proxy_origin = format!("http://{}", proxy.addr);
+    let fetch = FetchEnable::builder().handle_auth_requests(true).build();
+    browser.execute(fetch).await.map_err(|e| format!("no request control: {e}"))?;
 
     let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel::<String>();
     let page = browser.new_page("about:blank").await.map_err(|e| format!("no page: {e}"))?;
@@ -336,6 +354,21 @@ where
                 // A connection the proxy refused (a WebSocket, a preconnect, …).
                 Some(site) = proxy.refused.recv() => {
                     refused_by_proxy.get_or_insert(site);
+                }
+                Some(ev) = challenged.next() => {
+                    let challenge = &ev.auth_challenge;
+                    let ours = challenge.source == Some(AuthChallengeSource::Proxy)
+                        && challenge.origin.trim_end_matches('/').eq_ignore_ascii_case(&proxy_origin);
+                    let answer = if ours {
+                        AuthChallengeResponse {
+                            response: AuthChallengeResponseResponse::ProvideCredentials,
+                            username: Some(proxy::PROXY_USER.to_string()),
+                            password: Some(proxy.password.clone()),
+                        }
+                    } else {
+                        AuthChallengeResponse { response: AuthChallengeResponseResponse::CancelAuth, username: None, password: None }
+                    };
+                    let _ = browser.execute(ContinueWithAuthParams::new(ev.request_id.clone(), answer)).await;
                 }
                 Some(ev) = paused.next() => {
                     let id = ev.request_id.clone();
