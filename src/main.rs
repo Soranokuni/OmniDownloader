@@ -3140,6 +3140,13 @@ async fn run_one_task(
             if removed > 0 {
                 info!("Retention: removed {removed} saved email attachment(s)");
             }
+            // Files a locker capture got (P11.15b2) live outside temp/jobs for the
+            // same reason; a job's own run removes them when it ends, and this
+            // takes what a crash or a locked file left.
+            let removed = sweep_orphan_job_dirs(repo, &ctx.temp_path.join(omni_core::locker::CAPTURES_DIR), ctx.retention_days).await;
+            if removed > 0 {
+                info!("Retention: removed {removed} locker capture folder(s)");
+            }
             // Delivered sources past their days (P1.7), by the date in the
             // directory name.
             if let Some(a) = ctx.archive.clone().filter(|a| a.purges()) {

@@ -1,17 +1,26 @@
 //! P11.15b: the file-locker capture in real Chrome/Edge, against invented
 //! locker pages a local axum server serves on 127.0.0.1. Nothing leaves the
-//! machine: the browser runs offline (it resolves no host name but 127.0.0.1),
-//! the egress rule's resolver refuses every lookup, and the fixtures' hosts are
-//! address literals.
+//! machine, even with a guard broken: the egress rule's resolver answers no
+//! real lookup (one test name is 127.0.0.1), the browser's own resolver maps
+//! every name to nothing but that one (to 127.0.0.2), and the fixtures' hosts
+//! are loopback addresses.
+//!
+//! The canary (P11.15b2) is a listener on 127.0.0.2, which the rule refuses
+//! (only 127.0.0.1/32 is admitted). It counts every connection it accepts, so
+//! a popup, a tab, a worker, a WebSocket or a preconnect that slipped past the
+//! gate shows up there, even when no request follows.
 //!
 //! Skipped with a visible warning when no browser is installed.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use omni_browser::capture::{capture_with, CaptureOptions};
 use omni_core::locker::CaptureLimits;
@@ -43,6 +52,10 @@ static ONE_BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The file the fixture locker hands out.
 const FILE: &[u8] = b"invented clip bytes, 40 of them........";
 
+/// The one name both resolvers know, and disagree on: the rule's says the
+/// fixture, the browser's own says the canary (a rebinding name).
+const REBIND: &str = "rebind.test";
+
 fn page(body: &str) -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], format!("<!doctype html><html><body>{body}</body></html>")).into_response()
 }
@@ -51,7 +64,9 @@ fn attachment(bytes: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/octet-stream"), (header::CONTENT_DISPOSITION, "attachment; filename=\"clip.mp4\"")], bytes).into_response()
 }
 
-fn respond(path: &str) -> Response {
+/// The fixture locker's pages; `canary` is the canary's port on 127.0.0.2.
+fn respond(path: &str, canary: u16) -> Response {
+    let refused = format!("http://127.0.0.2:{canary}");
     match path {
         // A WeTransfer-like page: terms first, then the download button.
         "/locker" => page(
@@ -63,11 +78,21 @@ fn respond(path: &str) -> Response {
         "/big-locker" => page("<button onclick=\"location.href='/big'\">Download</button>"),
         "/big" => attachment(vec![7u8; 4096]),
         "/empty" => page("<p>Nothing to press here</p>"),
-        // A download button that points at an address the rule refuses (127.0.0.2 is
-        // outside the allowed 127.0.0.1/32 and nothing listens there, so even a
-        // broken rule reaches nothing).
-        "/internal" => page("<button onclick=\"location.href='http://127.0.0.2:'+location.port+'/file'\">Download</button>"),
-        // The same file, in four pieces a second apart.
+        // A download button that points at the canary.
+        "/internal" => page(&format!("<button onclick=\"location.href='{refused}/file'\">Download</button>")),
+        // A popup, and a link that opens a tab, to the canary.
+        "/popup" => page(&format!("<button onclick=\"window.open('{refused}/file')\">Download</button>")),
+        "/tab" => page(&format!("<a href=\"{refused}/file\" target=\"_blank\">Download</a>")),
+        // Ways around a page's own requests: a WebSocket, a worker, and hints.
+        "/socket" => page(&format!("<script>try {{ new WebSocket('ws://127.0.0.2:{canary}/socket'); }} catch (e) {{}}</script>")),
+        "/worker" => page(&format!(
+            "<script>new Worker(URL.createObjectURL(new Blob([\"fetch('{refused}/worker').catch(function(){{}})\"], {{type: 'text/javascript'}})));</script>"
+        )),
+        "/hints" => page(&format!(
+            "<link rel=preconnect href=\"{refused}\"><link rel=dns-prefetch href=\"//{REBIND}\"><link rel=prefetch href=\"{refused}/hint\">\
+             <p>Nothing to press here</p>"
+        )),
+        // The same file in four pieces a second apart.
         "/slow" => {
             let pieces = futures::stream::unfold(0usize, |i| async move {
                 if i >= 4 {
@@ -95,17 +120,56 @@ fn respond(path: &str) -> Response {
     }
 }
 
-async fn serve() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let app = Router::new().fallback(|uri: Uri| async move { respond(uri.path()) });
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    base
+/// A canary listener: counts every connection; answers `/page` with a page
+/// and everything else with the file.
+fn canary_on(listener: tokio::net::TcpListener, hits: Arc<AtomicUsize>) {
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            hits.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut head = vec![0u8; 4096];
+                let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut head)).await.ok().and_then(Result::ok).unwrap_or(0);
+                let line = String::from_utf8_lossy(&head[..n]).lines().next().unwrap_or_default().to_string();
+                let (kind, extra, body): (&str, &str, &[u8]) = if line.contains(" /page ") {
+                    ("text/html", "", b"<!doctype html><p>hello</p>")
+                } else {
+                    ("application/octet-stream", "Content-Disposition: attachment; filename=\"clip.mp4\"\r\n", FILE)
+                };
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = conn.write_all(reply.as_bytes()).await;
+                let _ = conn.write_all(body).await;
+            });
+        }
+    });
 }
 
-/// The egress resolver of these tests: no name is looked up.
-async fn refuse(_host: String, _port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
-    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no lookups in tests"))
+/// The fixture server on 127.0.0.1 and the canary on 127.0.0.2: (base,
+/// canary port, canary hits). The canary also listens on the fixture's own
+/// port, so that a browser sent to 127.0.0.2 instead of 127.0.0.1 (by its own
+/// resolver) lands there.
+async fn serve() -> (String, u16, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let canary = tokio::net::TcpListener::bind("127.0.0.2:0").await.expect("127.0.0.2 is a loopback address");
+    let cport = canary.local_addr().unwrap().port();
+    canary_on(canary, hits.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fport = listener.local_addr().unwrap().port();
+    let twin = tokio::net::TcpListener::bind(("127.0.0.2", fport)).await.expect("the canary takes the fixture's port on 127.0.0.2");
+    canary_on(twin, hits.clone());
+    let base = format!("http://127.0.0.1:{fport}");
+    let app = Router::new().fallback(move |uri: Uri| async move { respond(uri.path(), cport) });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, cport, hits)
+}
+
+/// The egress resolver of these tests: the rebinding name is the fixture on
+/// 127.0.0.1, which the rule admits; every other name fails. The browser's
+/// own resolver sends the same name to the canary (`host_rules`).
+async fn resolve(host: String, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    if host == REBIND {
+        return Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]);
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no lookups in tests"))
 }
 
 fn options(budget_secs: u64, max_bytes: u64) -> CaptureOptions {
@@ -113,7 +177,7 @@ fn options(budget_secs: u64, max_bytes: u64) -> CaptureOptions {
         limits: CaptureLimits { budget: Duration::from_secs(budget_secs), max_bytes },
         // The fixture server is on 127.0.0.1, which the rule otherwise refuses.
         allow: CidrSet::parse(&["127.0.0.1/32".to_string()]).unwrap(),
-        offline: true,
+        host_rules: Some(format!("MAP {REBIND} 127.0.0.2, MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE 127.0.0.2")),
     }
 }
 
@@ -137,67 +201,162 @@ fn left(dir: &Path) -> Vec<String> {
     out
 }
 
+/// Run the capture of `path` on the fixture server: (result, what is left, canary hits).
+async fn capture(path: &str, budget_secs: u64, max_bytes: u64) -> (Result<std::path::PathBuf, String>, Vec<String>, usize, tempfile::TempDir) {
+    let (base, _, hits) = serve().await;
+    let url = if path.starts_with("http") { path.to_string() } else { format!("{base}{path}") };
+    capture_url(&url, budget_secs, max_bytes, hits).await
+}
+
+async fn capture_url(url: &str, budget_secs: u64, max_bytes: u64, hits: Arc<AtomicUsize>) -> (Result<std::path::PathBuf, String>, Vec<String>, usize, tempfile::TempDir) {
+    let job = tempfile::tempdir().unwrap();
+    let dir = job.path().join("capture");
+    let got = capture_with(url, &dir, &options(budget_secs, max_bytes), resolve).await;
+    let left = left(&dir);
+    // A connection the page opened late still counts.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (got, left, hits.load(Ordering::SeqCst), job)
+}
+
 #[tokio::test]
 async fn the_capture_presses_agree_then_download_and_keeps_the_one_file() {
     need_browser!();
     let _turn = ONE_BROWSER.lock().await;
-    let base = serve().await;
-    let job = tempfile::tempdir().unwrap();
-    let dir = job.path().join("capture");
-    let file = capture_with(&format!("{base}/locker"), &dir, &options(60, 1 << 20), refuse).await.unwrap_or_else(|e| panic!("no file: {e}"));
+    let (got, left, hits, _job) = capture("/locker", 60, 1 << 20).await;
+    let file = got.unwrap_or_else(|e| panic!("no file: {e}"));
     assert_eq!(std::fs::read(&file).unwrap(), FILE);
-    assert!(file.starts_with(&dir), "inside the capture folder: {file:?}");
-    assert_eq!(left(&dir), vec!["files/capture.mp4".to_string()], "only the file is left (no profile, no partial file)");
+    assert!(file.ends_with("files/capture.mp4") || file.ends_with("files\\capture.mp4"), "{file:?}");
+    assert_eq!(left, vec!["files/capture.mp4".to_string()], "only the file is left (no profile, no partial file)");
+    assert_eq!(hits, 0);
 }
 
 #[tokio::test]
 async fn a_file_over_the_limit_is_cancelled_and_nothing_is_left() {
     need_browser!();
     let _turn = ONE_BROWSER.lock().await;
-    let base = serve().await;
-    let job = tempfile::tempdir().unwrap();
-    let dir = job.path().join("capture");
-    let why = capture_with(&format!("{base}/big-locker"), &dir, &options(60, 1000), refuse).await.unwrap_err();
+    let (got, left, _, _job) = capture("/big-locker", 60, 1000).await;
+    let why = got.unwrap_err();
     assert!(why.contains("larger than"), "{why}");
-    assert!(left(&dir).is_empty(), "{:?}", left(&dir));
+    assert!(left.is_empty(), "{left:?}");
 }
 
 #[tokio::test]
 async fn a_page_without_a_download_ends_within_its_budget() {
     need_browser!();
     let _turn = ONE_BROWSER.lock().await;
-    let base = serve().await;
-    let job = tempfile::tempdir().unwrap();
-    let dir = job.path().join("capture");
     let started = std::time::Instant::now();
-    let why = capture_with(&format!("{base}/empty"), &dir, &options(8, 1 << 20), refuse).await.unwrap_err();
-    assert!(why.contains("no download started"), "{why}");
+    let (got, left, _, _job) = capture("/empty", 8, 1 << 20).await;
+    let why = got.unwrap_err();
+    // The browser's own background traffic, refused by the proxy here, may be named.
+    assert!(why.starts_with("no download started"), "{why}");
     assert!(started.elapsed() < Duration::from_secs(40), "took {:?}", started.elapsed());
-    assert!(left(&dir).is_empty(), "{:?}", left(&dir));
+    assert!(left.is_empty(), "{left:?}");
 }
 
 #[tokio::test]
 async fn an_internal_address_is_refused_by_the_egress_rule() {
     need_browser!();
     let _turn = ONE_BROWSER.lock().await;
-    let base = serve().await;
-    let job = tempfile::tempdir().unwrap();
-    let dir = job.path().join("capture");
-    let why = capture_with(&format!("{base}/internal"), &dir, &options(10, 1 << 20), refuse).await.unwrap_err();
-    assert!(why.contains("not allowed"), "the page's request to 127.0.0.2 is refused: {why}");
-    assert!(left(&dir).is_empty(), "{:?}", left(&dir));
+    let (got, left, hits, _job) = capture("/internal", 10, 1 << 20).await;
+    let why = got.unwrap_err();
+    assert!(why.contains("not allowed (127.0.0.2)"), "the page's request to the canary is refused, named by its site only: {why}");
+    assert_eq!(hits, 0, "nothing reached the canary");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// P11.15b2: the rule fails closed. A name that does not resolve is refused,
+/// not handed to the browser.
+#[tokio::test]
+async fn a_name_that_does_not_resolve_is_refused() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    let (got, left, _, _job) = capture("http://nowhere.test/locker", 10, 1 << 20).await;
+    let why = got.unwrap_err();
+    assert!(why.contains("not allowed (nowhere.test)"), "{why}");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// P11.15b2: the browser goes to the address the rule checked, never to the
+/// one its own resolver would give (DNS rebinding). The rule's resolver says
+/// the fixture (127.0.0.1); the browser's own says the canary (127.0.0.2, on
+/// the same port). The file comes from the fixture and the canary sees nothing.
+#[tokio::test]
+async fn the_browser_goes_where_the_rule_looked_not_where_its_own_resolver_points() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    let (base, _, hits) = serve().await;
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let (got, left, hits, _job) = capture_url(&format!("http://{REBIND}:{port}/locker"), 60, 1 << 20, hits).await;
+    let file = got.unwrap_or_else(|e| panic!("no file: {e}"));
+    assert_eq!(std::fs::read(&file).unwrap(), FILE);
+    assert_eq!(hits, 0, "the browser's own answer (the canary) was never used");
+    assert_eq!(left, vec!["files/capture.mp4".to_string()]);
+}
+
+/// P11.15b2: a popup is gated like the page that opened it.
+#[tokio::test]
+async fn a_popup_to_a_refused_address_is_refused() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    let (got, left, hits, _job) = capture("/popup", 10, 1 << 20).await;
+    let why = got.unwrap_err();
+    assert!(why.contains("not allowed (127.0.0.2)"), "{why}");
+    assert_eq!(hits, 0, "nothing reached the canary");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// P11.15b2: a download link that opens a tab is gated too.
+#[tokio::test]
+async fn a_download_link_that_opens_a_tab_is_still_gated() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    let (got, left, hits, _job) = capture("/tab", 10, 1 << 20).await;
+    let why = got.unwrap_err();
+    assert!(why.contains("not allowed (127.0.0.2)"), "{why}");
+    assert_eq!(hits, 0, "nothing reached the canary");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// The page at `path` gets no file, reaches nothing and leaves nothing.
+async fn reaches_nothing(path: &str) {
+    let (got, left, hits, _job) = capture(path, 6, 1 << 20).await;
+    assert!(got.is_err(), "{path}: no file");
+    assert_eq!(hits, 0, "{path}: nothing reached the canary");
+    assert!(left.is_empty(), "{path}: {left:?}");
+}
+
+/// P11.15b2: a WebSocket reaches nothing (`Fetch` never sees one; the proxy does).
+#[tokio::test]
+async fn a_websocket_reaches_nothing() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    reaches_nothing("/socket").await;
+}
+
+/// P11.15b2: nor does a worker's fetch.
+#[tokio::test]
+async fn a_workers_request_reaches_nothing() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    reaches_nothing("/worker").await;
+}
+
+/// P11.15b2: nor do the page's preconnect, DNS-prefetch and prefetch hints.
+#[tokio::test]
+async fn the_pages_hints_reach_nothing() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    reaches_nothing("/hints").await;
 }
 
 #[tokio::test]
 async fn of_two_downloads_only_the_first_is_kept() {
     need_browser!();
     let _turn = ONE_BROWSER.lock().await;
-    let base = serve().await;
-    let job = tempfile::tempdir().unwrap();
-    let dir = job.path().join("capture");
-    let file = capture_with(&format!("{base}/two"), &dir, &options(60, 1 << 20), refuse).await.unwrap_or_else(|e| panic!("no file: {e}"));
+    let (got, left, _, _job) = capture("/two", 60, 1 << 20).await;
+    let file = got.unwrap_or_else(|e| panic!("no file: {e}"));
     assert_eq!(std::fs::read(&file).unwrap(), FILE, "the first download");
-    // The second was cancelled; at most its empty start may linger until the job's workspace goes.
-    let files: Vec<String> = left(&dir).into_iter().filter(|f| !f.ends_with(".crdownload")).collect();
+    // The second was cancelled; at most its empty start may linger until the capture's folder goes.
+    let files: Vec<String> = left.into_iter().filter(|f| !f.ends_with(".crdownload")).collect();
     assert_eq!(files, vec!["files/capture.mp4".to_string()], "one file");
 }

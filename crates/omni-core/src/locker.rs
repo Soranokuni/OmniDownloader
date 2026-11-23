@@ -206,6 +206,17 @@ pub const MAX_SECRET_PARTS: usize = 4;
 /// link it was sent on to) says the link that was sent instead, on the card,
 /// in the job's history and in the log.
 pub fn scrub_addresses(text: &str, sent: &str) -> String {
+    replace_addresses(text, |_| sent.to_string())
+}
+
+/// `text` with every web address in it replaced by its site
+/// ([`crate::urlnorm::site_for_log`]) (P11.15b2): what a capture's failure
+/// says names the site it was refused or failed on, never its address.
+pub fn addresses_to_sites(text: &str) -> String {
+    replace_addresses(text, crate::urlnorm::site_for_log)
+}
+
+fn replace_addresses(text: &str, with: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("http://").into_iter().chain(rest.find("https://")).min() {
@@ -216,11 +227,44 @@ pub fn scrub_addresses(text: &str, sent: &str) -> String {
         while end > 0 && tail[..end].ends_with([':', ',', '.', ';']) {
             end -= 1;
         }
-        out.push_str(sent);
+        out.push_str(&with(&tail[..end]));
         rest = &tail[end..];
     }
     out.push_str(rest);
     out
+}
+
+/// The directory under `temp` that holds every job's capture directory.
+pub const CAPTURES_DIR: &str = "captures";
+
+/// Where a locker capture of job `job_id` keeps the page's file (P11.15b2):
+/// `temp/captures/{id}`, outside the job's workspace, so the pipeline's
+/// clean-up of a failed run does not take it and a retry finds it. One
+/// directory per job, removed as a whole, never matched by prefix.
+pub fn capture_dir(temp: &std::path::Path, job_id: i64) -> std::path::PathBuf {
+    temp.join(CAPTURES_DIR).join(job_id.to_string())
+}
+
+/// Remove job `job_id`'s capture directory, if any.
+pub fn remove_capture_dir(temp: &std::path::Path, job_id: i64) {
+    let dir = capture_dir(temp, job_id);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("Job #{job_id}: the captured file could not be removed yet ({e}); the retention sweep removes it");
+        }
+    }
+}
+
+/// The file a finished capture left in `dir` (`files/capture` or
+/// `files/capture.{ext}`, named so only after its checks), if any. A partial
+/// download is never named so.
+pub fn captured_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(dir.join("files")).ok()?;
+    entries.flatten().map(|e| e.path()).find(|p| {
+        p.is_file()
+            && p.file_stem().and_then(|s| s.to_str()) == Some("capture")
+            && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+    })
 }
 
 fn dropbox(parsed: &reqwest::Url, segs: &[&str]) -> Locker {
@@ -433,6 +477,35 @@ mod tests {
         }
         assert_eq!(direct_download_if(false, share), None);
         assert!(direct_download_if(true, share).is_some());
+    }
+
+    #[test]
+    fn an_address_in_a_reason_becomes_its_own_site() {
+        assert_eq!(
+            addresses_to_sites("refused (https://cdn.files.example/x?token=SECRET9), then http://10.0.0.5:8080/a."),
+            "refused (files.example), then 10.0.0.5."
+        );
+        assert_eq!(addresses_to_sites("no download started"), "no download started");
+        assert_eq!(scrub_addresses("at https://a.example/k?x=1.", "we.tl"), "at we.tl.", "the share scrub is unchanged");
+    }
+
+    #[test]
+    fn a_capture_folder_is_per_job_and_only_a_finished_file_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(capture_dir(tmp.path(), 7), tmp.path().join("captures").join("7"));
+        assert!(!capture_dir(tmp.path(), 19).starts_with(capture_dir(tmp.path(), 1)));
+        let dir = capture_dir(tmp.path(), 7);
+        assert_eq!(captured_file(&dir), None, "no folder");
+        let files = dir.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("8f2c-guid"), b"partial").unwrap();
+        std::fs::write(files.join("capture.mp4"), b"").unwrap();
+        assert_eq!(captured_file(&dir), None, "a partial download or an empty file is not a capture");
+        std::fs::write(files.join("capture.mp4"), b"clip").unwrap();
+        assert_eq!(captured_file(&dir), Some(files.join("capture.mp4")));
+        remove_capture_dir(tmp.path(), 7);
+        assert!(!dir.exists());
+        remove_capture_dir(tmp.path(), 7);
     }
 
     #[test]

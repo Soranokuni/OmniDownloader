@@ -706,37 +706,67 @@ fn an_earlier_runs_guard_does_not_remove_a_later_runs_values() {
     assert_eq!(r.engine.job_locker_state(7), (None, None));
 }
 
-/// A capturer for the tests (P11.15b): records each call, and either fails with
-/// `fail` or writes a small file where the browser's would go.
+/// A capturer for the tests (P11.15b): records each call; then fails with
+/// `fail`, hangs until it is dropped (`hang`, which sets `dropped`), or puts
+/// `file` (else a small one) where the browser's would go.
+#[derive(Default)]
 struct FakeCapture {
     fail: Option<String>,
+    hang: bool,
+    file: Option<PathBuf>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
     calls: std::sync::Mutex<Vec<(String, PathBuf, omni_core::locker::CaptureLimits)>>,
+}
+
+/// Sets its flag when dropped: the capture's future was dropped mid-way.
+struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl omni_core::locker::LockerCapture for FakeCapture {
     fn capture<'a>(&'a self, url: &'a str, dir: &'a Path, limits: omni_core::locker::CaptureLimits) -> omni_core::locker::CaptureFuture<'a> {
         Box::pin(async move {
             self.calls.lock().unwrap().push((url.to_string(), dir.to_path_buf(), limits));
+            if self.hang {
+                let _armed = SetOnDrop(self.dropped.clone());
+                std::future::pending::<()>().await;
+            }
             if let Some(why) = &self.fail {
                 return Err(why.clone());
             }
             let files = dir.join("files");
             std::fs::create_dir_all(&files).unwrap();
-            let file = files.join("capture.mp4");
-            std::fs::write(&file, b"not really a video").unwrap();
-            Ok(file)
+            match &self.file {
+                Some(src) => {
+                    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+                    let to = files.join(format!("capture.{ext}"));
+                    std::fs::copy(src, &to).unwrap();
+                    Ok(to)
+                }
+                None => {
+                    let to = files.join("capture.mp4");
+                    std::fs::write(&to, b"not really a video").unwrap();
+                    Ok(to)
+                }
+            }
         })
     }
 }
 
-/// [`rig`] whose engine handles locker links as `settings` says.
-fn rig_locker(settings: omni_core::locker::LockerSettings) -> Rig {
+/// [`rig`] whose engine uses `tools` (made-up paths when `None`) and handles
+/// locker links as `settings` says. Deliveries fail at once, as in [`rig`].
+fn rig_locker_with(tools: Option<(PathBuf, PathBuf)>, settings: omni_core::locker::LockerSettings) -> Rig {
     let r = rig();
+    let (ffmpeg, ffprobe) = tools.unwrap_or_else(|| (r.root.join("no-ffmpeg.exe"), r.root.join("no-ffprobe.exe")));
     let engine = BroadcastEngine::new(
         r.repo.clone(),
         r.root.join("no-yt-dlp.exe"),
-        r.root.join("no-ffmpeg.exe"),
-        r.root.join("no-ffprobe.exe"),
+        ffmpeg,
+        ffprobe,
         r.root.join("no-bmx.exe"),
         r.root.join("temp"),
         r.root.join("watch"),
@@ -746,12 +776,39 @@ fn rig_locker(settings: omni_core::locker::LockerSettings) -> Rig {
     Rig { engine: Arc::new(engine), ..r }
 }
 
+fn rig_locker(settings: omni_core::locker::LockerSettings) -> Rig {
+    rig_locker_with(None, settings)
+}
+
+fn capturing(fake: &Arc<FakeCapture>) -> omni_core::locker::LockerSettings {
+    omni_core::locker::LockerSettings { direct_shares: true, capture: Some(fake.clone()) }
+}
+
+impl Rig {
+    /// [`Rig::run_job`] with the worker's cancel token.
+    async fn run_job_with(&self, job: Job, cancel: CancellationToken) {
+        let health = HealthState::new();
+        let canary = Arc::new(canary::CanaryEnv::new(self.repo.clone(), health.clone(), self.root.join("bin"), "stable".into()));
+        run_job(&self.repo, &self.engine, OWNER, job, cancel, &self.root.join("evidence"), &self.ctx(), &health, &canary).await.unwrap();
+    }
+
+    fn all_events(&self, id: i64) -> Vec<String> {
+        self.repo.get_job_events(id, 500).unwrap().into_iter().map(|e| e.message).collect()
+    }
+}
+
+const WE_TL: &str = "https://we.tl/t-abc123";
+
+fn queue_locker(r: &Rig, url: &str) -> i64 {
+    r.repo.enqueue(&NewJob::new(url, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id()
+}
+
 /// P11.15b: with `locker.direct_shares` off a share of one file waits for MCR, as before P11.15a.
 #[tokio::test]
 async fn with_direct_shares_off_a_share_waits_for_mcr() {
     omni_core::net::refuse_lookups_for_tests();
     let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: false, capture: None });
-    let id = r.repo.enqueue(&NewJob::new("https://www.dropbox.com/s/abc123/clip.mp4?dl=0", "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let id = queue_locker(&r, "https://www.dropbox.com/s/abc123/clip.mp4?dl=0");
     let job = r.lease(id);
     r.run_job(job).await;
     let row = r.row(id);
@@ -760,51 +817,203 @@ async fn with_direct_shares_off_a_share_waits_for_mcr() {
     assert!(said.contains("Dropbox") && said.contains("locker.direct_shares"), "{said}");
 }
 
+/// P11.15b2: a switch turned off does not move a job whose video is already
+/// made and waits for the watchfolder: that delivery goes ahead.
+#[tokio::test]
+async fn a_switch_turned_off_does_not_move_a_job_waiting_for_the_watchfolder() {
+    omni_core::net::refuse_lookups_for_tests();
+    let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: false, capture: None });
+    let id = queue_locker(&r, "https://www.dropbox.com/s/abc123/clip.mp4?dl=0");
+    assert_eq!(r.repo.lease_job(OWNER, 600).unwrap().unwrap().id, id);
+    let ws = r.root.join("temp").join("jobs").join(id.to_string());
+    std::fs::create_dir_all(&ws).unwrap();
+    let ready = ws.join(format!("{id}_output.mxf"));
+    std::fs::write(&ready, b"verified").unwrap();
+    assert!(r.repo.park_for_delivery(id, OWNER, &ready.to_string_lossy(), 8, "00", 1.0).unwrap());
+    assert!(r.repo.requeue_waiting_delivery(id, OWNER, chrono::Duration::zero(), "waits").unwrap());
+    let job = r.lease(id);
+    assert!(job.delivery_wait);
+    r.run_job(job).await;
+    let row = r.row(id);
+    assert_ne!(row.status, JobStatus::ManualDownload, "{:?}", row.error_message);
+    assert!(!r.all_events(id).iter().any(|t| t.contains("locker.direct_shares")), "{:?}", r.all_events(id));
+}
+
 /// P11.15b: with the capture on, a locker page the browser cannot get ends at
-/// the desk at once, the service named, the reason's addresses replaced by the
-/// sent link, and the capture asked once only (no retry loop).
+/// the desk at once, the service named, the reason as the capture gives it
+/// (sites only), and the capture asked once only (no retry loop).
 #[tokio::test]
 async fn a_failed_capture_ends_at_the_desk_once_with_the_service_named() {
     omni_core::net::refuse_lookups_for_tests();
-    let fake = Arc::new(FakeCapture { fail: Some("no download started (https://cdn.example/x?token=SECRET9)".into()), calls: Default::default() });
-    let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: true, capture: Some(fake.clone()) });
-    let sent = "https://we.tl/t-abc123";
-    let id = r.repo.enqueue(&NewJob::new(sent, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let why = "no download started; the page asked for an address that is not allowed (cdn.example)";
+    let fake = Arc::new(FakeCapture { fail: Some(why.into()), ..Default::default() });
+    let r = rig_locker(capturing(&fake));
+    let id = queue_locker(&r, WE_TL);
     let job = r.lease(id);
     r.run_job(job).await;
     let row = r.row(id);
     assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::ManualDownload, Some("MANUAL_DOWNLOAD")));
     let said = row.error_message.unwrap_or_default();
-    // The reason's address is named by the sent link's site (P11.15a4).
-    assert!(said.contains("WeTransfer") && said.contains("no download started (we.tl)"), "{said}");
-    assert!(!said.contains("SECRET9") && !said.contains("cdn.example"), "{said}");
+    assert!(said.contains("WeTransfer") && said.contains(&format!("({why})")), "{said}");
     assert_eq!(fake.calls.lock().unwrap().len(), 1, "asked once");
     assert!(r.repo.lease_job("w2", 600).unwrap().is_none(), "nothing is queued again");
+    assert!(!r.engine.capture_dir(id).exists(), "nothing is left of the capture");
+}
+
+/// P11.15b2: an address that slipped into a capture's reason is cut to its
+/// own site, not to the sent link's.
+#[tokio::test]
+async fn an_address_in_a_capture_failure_is_cut_to_its_own_site() {
+    omni_core::net::refuse_lookups_for_tests();
+    let fake = Arc::new(FakeCapture { fail: Some("the download stopped (https://cdn.files.example/x?token=SECRET9)".into()), ..Default::default() });
+    let r = rig_locker(capturing(&fake));
+    let id = queue_locker(&r, WE_TL);
+    let job = r.lease(id);
+    r.run_job(job).await;
+    let said = r.row(id).error_message.unwrap_or_default();
+    assert!(said.contains("(the download stopped (files.example))"), "{said}");
+    assert!(!said.contains("SECRET9") && !said.contains("cdn."), "{said}");
 }
 
 /// P11.15b: a file the capture got goes through the pipeline as an attachment
-/// does, from the job's own workspace, bounded by `locker.max_file_gb`; the job
-/// keeps the link that was sent.
+/// does, bounded by `locker.max_file_gb`; the job keeps the link that was sent.
+/// P11.15b2: it is kept in `temp/captures/{id}`, not in the job's workspace,
+/// and removed when the job ends (here: in review, the source unreadable).
 #[tokio::test]
-async fn a_captured_file_goes_through_the_pipeline_from_the_jobs_workspace() {
+async fn a_captured_file_goes_through_the_pipeline_from_its_capture_folder() {
     omni_core::net::refuse_lookups_for_tests();
-    let fake = Arc::new(FakeCapture { fail: None, calls: Default::default() });
-    let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: true, capture: Some(fake.clone()) });
-    let sent = "https://we.tl/t-abc123";
-    let id = r.repo.enqueue(&NewJob::new(sent, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let fake = Arc::new(FakeCapture::default());
+    let r = rig_locker(capturing(&fake));
+    let id = queue_locker(&r, WE_TL);
     let job = r.lease(id);
     r.run_job(job).await;
     let calls = fake.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1);
     let (url, dir, limits) = &calls[0];
-    assert_eq!(url, sent);
-    assert_eq!(dir, &r.engine.job_temp(id).join("capture"), "inside the job's own workspace");
+    assert_eq!(url, WE_TL);
+    assert_eq!(dir, &r.engine.capture_dir(id));
+    assert_eq!(dir, &r.root.join("temp").join("captures").join(id.to_string()), "outside the job's workspace");
     assert_eq!(limits.max_bytes, r.engine.locker_max_file_bytes());
     assert_eq!(limits.budget, omni_core::locker::CAPTURE_BUDGET);
-    let texts: Vec<String> = r.repo.get_job_events(id, 500).unwrap().into_iter().map(|e| e.message).collect();
+    let texts = r.all_events(id);
     assert!(texts.iter().any(|t| t.contains("WeTransfer page: the browser downloaded the file")), "{texts:?}");
     assert!(texts.iter().any(|t| t.contains("Source is the file the browser downloaded from the file-locker page")), "the pipeline took it as its source: {texts:?}");
     let row = r.row(id);
-    assert_eq!(row.url, sent);
+    assert_eq!(row.url, WE_TL);
     assert_ne!(row.status, JobStatus::ManualDownload, "a captured file is not sent to the desk: {:?}", row.error_message);
+    assert!(row.status.is_terminal(), "{:?} {:?}", row.status, row.error_code);
+    assert!(!dir.exists(), "the job ended: its captured file goes");
+}
+
+/// P11.15b2: a run that fails after the capture (here LOW_DISK, before the
+/// encode) and is retried keeps the captured file; the retry takes it again
+/// instead of opening the page again.
+#[tokio::test]
+async fn a_captured_file_survives_a_failed_run_and_the_retry_uses_it_again() {
+    let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
+        eprintln!("WARNING: skipping the capture retry test -- ffmpeg/ffprobe not in bin/");
+        return;
+    };
+    omni_core::net::refuse_lookups_for_tests();
+    // Two frames 100,000,000 s apart: the probe reads a clip of about three years.
+    let scratch = tempfile::tempdir().unwrap();
+    let long = scratch.path().join("long.mkv");
+    let args: Vec<String> = [
+        "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=0.08", "-vf",
+        "setpts=N*100000000/TB", "-fps_mode", "passthrough", "-c:v", "mjpeg",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([long.to_string_lossy().into_owned()])
+    .collect();
+    let made = omni_core::process::run(&ffmpeg, &args, omni_core::process::RunOpts::new(Duration::from_secs(60))).await.unwrap();
+    assert!(made.success, "could not build the long clip");
+    let fake = Arc::new(FakeCapture { file: Some(long), ..Default::default() });
+    let r = rig_locker_with(Some((ffmpeg, ffprobe)), capturing(&fake));
+    let id = queue_locker(&r, WE_TL);
+
+    let job = r.lease(id);
+    r.run_job(job).await;
+    let row = r.row(id);
+    assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::Pending, Some("LOW_DISK")), "{:?}", row.error_message);
+    let kept = r.engine.capture_dir(id).join("files").join("capture.mkv");
+    assert!(kept.is_file(), "the failed run's clean-up left the captured file");
+
+    let job = r.lease(id);
+    r.run_job(job).await;
+    assert_eq!(fake.calls.lock().unwrap().len(), 1, "the page was not opened again");
+    assert!(r.all_events(id).iter().any(|t| t.contains("WeTransfer page: the file the browser downloaded before is used again")), "{:?}", r.all_events(id));
+    assert_eq!(r.row(id).error_code.as_deref(), Some("LOW_DISK"), "the retry ran on the same file");
+}
+
+/// P11.15b2: a cancel stops the capture at once (its future, and with it the
+/// browser, is dropped) and nothing more is written to the job.
+#[tokio::test]
+async fn a_cancel_stops_the_capture_at_once_and_writes_nothing_more() {
+    omni_core::net::refuse_lookups_for_tests();
+    let fake = Arc::new(FakeCapture { hang: true, ..Default::default() });
+    let r = Arc::new(rig_locker(capturing(&fake)));
+    let id = queue_locker(&r, WE_TL);
+    let job = r.lease(id);
+    let cancel = CancellationToken::new();
+    let run = {
+        let (r, cancel) = (r.clone(), cancel.clone());
+        tokio::spawn(async move { r.run_job_with(job, cancel).await })
+    };
+    for _ in 0..100 {
+        if !fake.calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fake.calls.lock().unwrap().len(), 1, "the capture started");
+    let before = r.all_events(id);
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), run).await.expect("the run stopped at once").unwrap();
+    assert!(fake.dropped.load(std::sync::atomic::Ordering::SeqCst), "the capture was dropped");
+    assert_eq!(r.all_events(id), before, "nothing more was written");
+    let row = r.row(id);
+    assert_eq!(row.status, JobStatus::Running, "no status was set by the stopped run");
+}
+
+/// P11.15b2: the capture folder goes when the job ends, whatever the end,
+/// and stays while the job may run again.
+#[test]
+fn the_capture_folder_goes_when_the_job_ends_and_stays_while_it_may_run_again() {
+    let r = rig();
+    let id = r.queue(1);
+    let dir = r.engine.capture_dir(id);
+    for (status, kept) in [
+        ("PENDING", true),
+        ("RUNNING", true),
+        ("COMPLETED", false),
+        ("MANUAL_DOWNLOAD", false),
+        ("REQUIRES_REVIEW", false),
+        ("CANCELLED", false),
+    ] {
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("capture.mp4"), b"x").unwrap();
+        r.sql("UPDATE queue SET status = ?1 WHERE id = ?2", rusqlite::params![status, id]);
+        discard_finished_capture(&r.repo, &r.engine, id);
+        assert_eq!(dir.exists(), kept, "{status}");
+    }
+    // A job that is gone.
+    std::fs::create_dir_all(dir.join("files")).unwrap();
+    let gone = r.engine.capture_dir(9_999);
+    std::fs::create_dir_all(&gone).unwrap();
+    discard_finished_capture(&r.repo, &r.engine, 9_999);
+    assert!(!gone.exists());
+    assert!(dir.exists(), "another job's folder is not touched");
+}
+
+/// P11.15b2: the nightly retention pass also sweeps `temp/captures`.
+#[test]
+fn the_retention_pass_sweeps_the_capture_folders() {
+    let src = include_str!("main.rs");
+    let retention = &src[src.find("\"retention\" => {").unwrap()..];
+    let retention = &retention[..retention.find("\n        \"").unwrap_or(retention.len())];
+    assert!(
+        retention.contains("sweep_orphan_job_dirs(repo, &ctx.temp_path.join(omni_core::locker::CAPTURES_DIR), ctx.retention_days)"),
+        "the retention pass sweeps temp/captures"
+    );
 }

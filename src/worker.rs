@@ -647,11 +647,46 @@ pub(crate) fn locker_manual_message(locker: &omni_core::locker::Locker, settings
     }
 }
 
+/// The file a locker capture got for job `job_id` (P11.15b2), once the job no
+/// longer needs it: delivered, held, sent to the desk or to review, cancelled.
+/// Kept while the job waits for a retry (PENDING) or runs (RUNNING: this run,
+/// or another worker's after a reaped lease).
+pub(crate) fn discard_finished_capture(repo: &Repository, engine: &BroadcastEngine, job_id: i64) {
+    if !engine.capture_dir(job_id).exists() {
+        return;
+    }
+    match repo.get_job(job_id) {
+        Ok(Some(job)) if matches!(job.status, JobStatus::Pending | JobStatus::Running) => {}
+        // Gone, or finished: nothing will come back for the file.
+        Ok(_) => engine.discard_capture_dir(job_id),
+        // Unknown: the retention sweep decides later.
+        Err(e) => warn!("Job #{job_id}: the captured file's job could not be read ({e:#}); kept for now"),
+    }
+}
+
 /// Run one leased job through the pipeline.
 ///
 /// Extracted from the worker loop so the lease, the heartbeat and the permit are
 /// all managed in one place and cannot be forgotten on an early return.
 pub(crate) async fn run_job(
+    repo: &Repository,
+    engine: &Arc<BroadcastEngine>,
+    owner: &str,
+    job: omni_core::models::Job,
+    cancel: CancellationToken,
+    evidence_dir: &std::path::Path,
+    repair: &repair::RepairCtx,
+    health: &HealthState,
+    canary: &Arc<canary::CanaryEnv>,
+) -> Result<()> {
+    let job_id = job.id;
+    let result = run_job_steps(repo, engine, owner, job, cancel, evidence_dir, repair, health, canary).await;
+    // Whatever way the run ended (P11.15b2).
+    discard_finished_capture(repo, engine, job_id);
+    result
+}
+
+async fn run_job_steps(
     repo: &Repository,
     engine: &Arc<BroadcastEngine>,
     owner: &str,
@@ -668,19 +703,6 @@ pub(crate) async fn run_job(
     let job_id = job.id;
     let orig_url = job.url.clone();
 
-    // File lockers are never handed to yt-dlp as they are: the link is a landing
-    // page, not a media URL. A share of one file the vendor serves directly
-    // (Dropbox, Google Drive, OneDrive, SharePoint) is fetched from its direct
-    // address below (P11.15a); a folder, and every other locker (WeTransfer and
-    // friends), goes to the MCR desk for a person to fetch.
-    let locker = omni_core::locker::classify(&orig_url);
-    if let Some(message) = locker_manual_message(&locker, engine.locker()) {
-        warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
-        repo.record_event(job_id, "WARN", Some(JobStage::Extract), &message)?;
-        repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
-        return Ok(());
-    }
-
     // MCR approved the video this job held back: deliver that file, and do
     // nothing of what follows (no download, no page scan, no sniffing).
     if let Some(held) = repo.approved_held(job_id)? {
@@ -691,6 +713,21 @@ pub(crate) async fn run_job(
     // and nothing else (no download, no encode, no page scan).
     if job.delivery_wait {
         return run_waiting_delivery(repo, engine, owner, &job, &cancel, repair).await;
+    }
+
+    // File lockers are never handed to yt-dlp as they are: the link is a landing
+    // page, not a media URL. A share of one file the vendor serves directly
+    // (Dropbox, Google Drive, OneDrive, SharePoint) is fetched from its direct
+    // address below (P11.15a); a folder, and every other locker (WeTransfer and
+    // friends), goes to the MCR desk for a person to fetch. Only after the two
+    // steps above (P11.15b2): a video MCR approved, or one made and waiting for
+    // the watchfolder, is delivered whatever the locker switches say now.
+    let locker = omni_core::locker::classify(&orig_url);
+    if let Some(message) = locker_manual_message(&locker, engine.locker()) {
+        warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
+        repo.record_event(job_id, "WARN", Some(JobStage::Extract), &message)?;
+        repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
+        return Ok(());
     }
 
     // MCR asked for the next verified candidate of this job (P10.13): hold that
@@ -857,25 +894,53 @@ pub(crate) async fn run_job(
     // A locker page a person would fetch (WeTransfer and the like), with
     // `locker.browser_capture` on (P11.15b): the browser opens it (the link is
     // already judged by the egress rule, and so is every request of the page)
-    // and keeps the one file it hands out, in this job's own workspace. That file
-    // then goes through the pipeline as an attachment does. Any failure ends at
-    // the desk, with the service named; nothing retries the capture by itself.
+    // and keeps the one file it hands out, in `temp/captures/{id}`, outside the
+    // job's workspace: the pipeline's own clean-up of a failed run does not take
+    // it, so a retry uses it again instead of opening the page again (P11.15b2).
+    // It goes when the job ends ([`discard_finished_capture`]). That file then
+    // goes through the pipeline as an attachment does. Any failure ends at the
+    // desk, with the service named; nothing retries the capture by itself. A
+    // cancel stops it at once (the browser is killed) and writes nothing more.
     // What is written of the page is its site, never its link (P11.15a4).
     let orig_url = match (&locker, engine.locker().capture.clone()) {
         (omni_core::locker::Locker::Manual { vendor }, Some(capturer)) if orig_url.starts_with("http") => {
-            info!("Job #{job_id}: a {vendor} page; the browser tries to download its file");
-            repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser tries to download the file"))?;
-            let dir = engine.job_temp(job_id).join("capture");
-            let limits = omni_core::locker::CaptureLimits { budget: omni_core::locker::CAPTURE_BUDGET, max_bytes: engine.locker_max_file_bytes() };
-            match capturer.capture(&orig_url, &dir, limits).await {
+            let dir = engine.capture_dir(job_id);
+            let got = match omni_core::locker::captured_file(&dir) {
+                Some(file) => {
+                    info!("Job #{job_id}: the {vendor} file the browser downloaded before is used again");
+                    repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the file the browser downloaded before is used again"))?;
+                    Ok(file)
+                }
+                None => {
+                    info!("Job #{job_id}: a {vendor} page; the browser tries to download its file");
+                    repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser tries to download the file"))?;
+                    // Whatever an interrupted capture left.
+                    let _ = std::fs::remove_dir_all(&dir);
+                    let limits = omni_core::locker::CaptureLimits { budget: omni_core::locker::CAPTURE_BUDGET, max_bytes: engine.locker_max_file_bytes() };
+                    let captured = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => None,
+                        got = capturer.capture(&orig_url, &dir, limits) => Some(got),
+                    };
+                    let Some(got) = captured else {
+                        info!("Job #{job_id}: cancelled while the browser was on the {vendor} page; stopped");
+                        return Ok(());
+                    };
+                    if let Ok(_) = &got {
+                        repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser downloaded the file"))?;
+                    }
+                    got
+                }
+            };
+            match got {
                 Ok(file) => {
-                    repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser downloaded the file"))?;
                     job.source_path = Some(file.to_string_lossy().into_owned());
                     job.url = omni_core::locker::CAPTURE_URL.to_string();
                     job.url.clone()
                 }
                 Err(why) => {
-                    let why = omni_core::locker::scrub_addresses(&why, &locker_label);
+                    // The capture names sites only; an address that slipped in is cut to its site too.
+                    let why = omni_core::locker::addresses_to_sites(&why);
                     let message = format!("File-locker link ({vendor}): the browser could not get the file ({why}); download it and use 'Upload file' on this job.");
                     warn!("Job #{job_id}: {message}");
                     repo.record_event(job_id, "WARN", Some(JobStage::Download), &message)?;

@@ -715,10 +715,16 @@ impl BroadcastEngine {
         &self.locker
     }
 
-    /// Job `job_id`'s own workspace, `temp/jobs/{id}`: everything a run writes
-    /// goes in it, and it is removed as a whole (D-04).
-    pub fn job_temp(&self, job_id: i64) -> PathBuf {
-        self.temp_dir.join("jobs").join(job_id.to_string())
+    /// Where a locker capture of job `job_id` keeps the page's file,
+    /// `temp/captures/{id}` (P11.15b2): outside the job's workspace, so a
+    /// failed run's clean-up does not take it and a retry finds it.
+    pub fn capture_dir(&self, job_id: i64) -> PathBuf {
+        omni_core::locker::capture_dir(&self.temp_dir, job_id)
+    }
+
+    /// Remove job `job_id`'s capture directory (the job no longer needs it).
+    pub fn discard_capture_dir(&self, job_id: i64) {
+        omni_core::locker::remove_capture_dir(&self.temp_dir, job_id);
     }
 
     /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
