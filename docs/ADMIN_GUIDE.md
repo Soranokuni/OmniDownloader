@@ -848,6 +848,13 @@ omni-ingest cookies sign-in youtube.com
 opens Edge on its own profile; sign in, close the window, and the cookies are
 stored. The Cookies card shows this command ready to copy.
 
+**From the Start menu** (no prompt at all): Setup adds **Start → «OmniIngest –
+Σύνδεση σε ιστότοπο»** for all users. It asks for administrator rights, lists
+the sites (1 youtube.com, 2 x.com, 3 facebook.com, 4 instagram.com, or type
+another site's domain; Enter alone stops) and then runs the same sign-in; the
+window stays open until you press Enter, so the result can be read. Uninstall
+removes the entry (one that points at another installation is kept).
+
 `youtu.be` uses the `youtube.com` jar; `twitter.com` is stored as `x.com`.
 Every jar is re-tested nightly; the `cookies` health line warns 7 days before
 they expire.
@@ -941,7 +948,7 @@ Run from the install folder (elevated on an installed service).
 | `omni-ingest admin activate\|deactivate <email>` | enable / disable an account |
 | `omni-ingest admin create-admin <username> [--force]` | create an administrator when none can sign in (password prompted twice, never shown or logged); refused while an active administrator exists unless `--force` |
 | `omni-ingest secrets list\|set <key>\|clear <key>` | the secret store (values prompted, never shown) |
-| `omni-ingest cookies sign-in <domain> [--browser edge\|chrome]` | sign in once and store the site's cookies |
+| `omni-ingest cookies sign-in [<domain>] [--browser edge\|chrome]` | sign in once and store the site's cookies; without a domain, a list of sites to choose from (what the Start-menu entry runs) |
 | `omni-ingest cookies list` | the cookie jars (no contents) |
 | `omni-ingest mail-preview [--last 10] [--hours 72] [--eml <file>] [--llm]` | what the parser would do; changes nothing |
 | `omni-ingest mail-ingest --eml <file>…` | queue saved `.eml` files as if they had arrived |

@@ -87,7 +87,7 @@ const MODULES = {
   overview: () => import('/static/admin-overview.js?v=2'),
   settings: () => import('/static/admin-settings.js?v=1'),
   people: () => import('/static/admin-people.js?v=1'),
-  sites: () => import('/static/admin-sites.js?v=1'),
+  sites: () => import('/static/admin-sites.js?v=2'),
   maintenance: () => import('/static/admin-maintenance.js?v=1'),
 };
 const SECTIONS = Object.keys(MODULES);

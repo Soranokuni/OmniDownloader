@@ -508,11 +508,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v7() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v38_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v39_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=38"), "admin.html does not import admin.js?v=38");
-    assert!(!admin.contains("/static/admin.js?v=37"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=39"), "admin.html does not import admin.js?v=39");
+    assert!(!admin.contains("/static/admin.js?v=38"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -701,6 +701,8 @@ fn the_admin_panel_is_five_sections_with_one_module_each_and_no_browser_dialogs(
             assert_eq!(hits, 0, "{name} uses {banned}");
         }
     }
+    // P13.9: the Cookies card names the Start-menu entry.
+    assert!(assets["static/admin-sites.js"].contains("«OmniIngest – Σύνδεση σε ιστότοπο»"), "the Cookies card does not point to the Start-menu entry");
     // P13.5b: unfinished setup is listed with a way back into the wizard.
     let overview = &assets["static/admin-overview.js"];
     assert!(overview.contains("sessionStorage.removeItem('omni.setup.leave')"), "no way back into the wizard");

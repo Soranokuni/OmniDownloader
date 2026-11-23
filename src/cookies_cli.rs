@@ -20,8 +20,9 @@ pub enum CookiesAction {
     /// Administrator" (Εκτέλεση ως διαχειριστής). Domains: youtube.com, x.com,
     /// facebook.com, instagram.com, or another site's registrable domain.
     SignIn {
-        /// The site, e.g. youtube.com
-        domain: String,
+        /// The site, e.g. youtube.com. Without one, a numbered list to choose
+        /// from (what the Start-menu entry «OmniIngest – Σύνδεση σε ιστότοπο» runs).
+        domain: Option<String>,
         /// The browser to use: edge (default) or chrome
         #[arg(long)]
         browser: Option<String>,
@@ -52,8 +53,71 @@ async fn run_inner(paths: &AppPaths, action: CookiesAction) -> Result<()> {
     let repo = Repository::new(paths.resolve(&config.database_path))?.with_second_chance_window(&config.retry);
     match action {
         CookiesAction::List => list(&repo),
-        CookiesAction::SignIn { domain, browser } => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
+        CookiesAction::SignIn { domain: Some(domain), browser } => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
+        // From the Start menu (P13.9): choose a site, and keep the window open to read the result.
+        CookiesAction::SignIn { domain: None, browser } => {
+            let stdin = std::io::stdin();
+            let picked = pick_site(&mut stdin.lock(), &mut std::io::stdout());
+            let out = match picked {
+                Ok(Some(domain)) => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
+                Ok(None) => {
+                    println!("Nothing was changed. / Δεν άλλαξε τίποτα.");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = &out {
+                println!("\n{:#}", explain_access(anyhow::anyhow!("{e:#}")));
+            }
+            println!("\nPress Enter to close this window. / Πατήστε Enter για να κλείσει το παράθυρο.");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            out
+        }
     }
+}
+
+/// The sites the list offers, in order.
+pub const PICK_SITES: [&str; 4] = ["youtube.com", "x.com", "facebook.com", "instagram.com"];
+
+/// Ask which site to sign in to (P13.9): a number from the list, another
+/// site's domain typed in full, or nothing to stop. `None`: the operator
+/// stopped. Asks again after an answer it cannot use, at most five times.
+pub fn pick_site(input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write) -> Result<Option<String>> {
+    writeln!(out, "Σε ποιον ιστότοπο να συνδεθεί ο λογαριασμός του σταθμού; / Which site do you want to sign in to?")?;
+    for (i, site) in PICK_SITES.iter().enumerate() {
+        writeln!(out, "  {}. {site}", i + 1)?;
+    }
+    writeln!(out, "  Or type another site's domain (example.com). Enter alone: stop. / Ή γράψτε άλλον ιστότοπο. Μόνο Enter: έξοδος.")?;
+    for _ in 0..5 {
+        write!(out, "> ")?;
+        out.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let answer = line.trim();
+        if answer.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(n) = answer.parse::<usize>() {
+            if (1..=PICK_SITES.len()).contains(&n) {
+                return Ok(Some(PICK_SITES[n - 1].to_string()));
+            }
+        } else {
+            // The site's registrable domain, as the jars are keyed (news.example.com → example.com).
+            let host = answer.to_ascii_lowercase();
+            let domain = (!host.contains(['/', ' ', ':']))
+                .then(|| cookies::jar_domain_for_url(&format!("https://{host}/")))
+                .flatten()
+                .filter(|d| cookies::is_registrable_domain(d));
+            if let Some(domain) = domain {
+                return Ok(Some(domain));
+            }
+        }
+        writeln!(out, "\"{}\" is not on the list or a site domain; type 1 to {} or a domain such as example.com.", answer.chars().take(60).collect::<String>(), PICK_SITES.len())?;
+    }
+    bail!("No site was chosen.")
 }
 
 fn list(repo: &Repository) -> Result<()> {
@@ -142,6 +206,27 @@ async fn sign_in(paths: &AppPaths, config: &AppConfig, repo: &Repository, raw_do
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pick(answers: &str) -> (Result<Option<String>>, String) {
+        let mut out = Vec::new();
+        let got = pick_site(&mut answers.as_bytes(), &mut out);
+        (got, String::from_utf8(out).unwrap())
+    }
+
+    /// P13.9: the Start-menu entry's site list.
+    #[test]
+    fn the_site_list_takes_a_number_or_a_domain_and_stops_on_enter() {
+        let (got, shown) = pick("2\n");
+        assert_eq!(got.unwrap().as_deref(), Some("x.com"));
+        assert!(shown.contains("1. youtube.com") && shown.contains("4. instagram.com"), "{shown}");
+        assert_eq!(pick("www.News.Example.com\n").0.unwrap().as_deref(), Some("example.com"));
+        assert_eq!(pick("\n").0.unwrap(), None, "Enter alone stops");
+        assert_eq!(pick("").0.unwrap(), None, "a closed input stops");
+        let (got, shown) = pick("9\nnot a site\n1\n");
+        assert_eq!(got.unwrap().as_deref(), Some("youtube.com"), "asked again after two bad answers");
+        assert_eq!(shown.matches("is not on the list").count(), 2, "{shown}");
+        assert!(pick("9\n9\n9\n9\n9\n").0.is_err(), "five bad answers end it");
+    }
 
     #[test]
     fn a_denied_folder_or_database_says_to_use_an_administrator_prompt() {

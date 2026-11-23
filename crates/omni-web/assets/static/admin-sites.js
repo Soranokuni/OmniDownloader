@@ -630,6 +630,8 @@ function renderSignin(data) {
   render('cookies-signin',
     el('p', { class: 'note' }, 'Εκτελέστε την εντολή στο γραφείο (desktop) του server, από τον χειριστή, σε παράθυρο εντολών που άνοιξε «Εκτέλεση ως διαχειριστής»· χρησιμοποιεί ξεχωριστό προφίλ browser, όχι το δικό σας.'),
     el('p', { class: 'note' }, 'Run it on the server desktop, by the operator, in a prompt opened "as Administrator". It uses a separate browser profile, not yours.'),
+    // P13.9: no terminal needed: Setup puts the same command in the Start menu.
+    el('p', { class: 'note ok' }, 'Χωρίς γραμμή εντολών: στον server, Έναρξη → «OmniIngest – Σύνδεση σε ιστότοπο». Ζητά άδεια διαχειριστή, δείχνει λίστα ιστοτόπων και ανοίγει το παράθυρο σύνδεσης. / Without a prompt: on the server, Start → «OmniIngest – Σύνδεση σε ιστότοπο» asks for administrator rights, lists the sites and opens the sign-in window.'),
     ...SIGNIN_SITES.map((domain) => {
       const jar = jars.find((j) => j.domain === domain);
       const command = prefix ? `${prefix} ${domain}` : `& ".\\omni-ingest.exe" cookies sign-in ${domain}`;
