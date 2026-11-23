@@ -1600,11 +1600,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v41_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v42_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=41"), "admin.html does not import admin.js?v=41");
-    assert!(!admin.contains("/static/admin.js?v=40"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=42"), "admin.html does not import admin.js?v=42");
+    assert!(!admin.contains("/static/admin.js?v=41"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -1729,7 +1729,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["11".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["12".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");
@@ -1808,8 +1808,11 @@ fn the_admin_panel_is_five_sections_with_one_module_each_and_no_browser_dialogs(
             assert_eq!(hits, 0, "{name} uses {banned}");
         }
     }
-    // P13.9: the Cookies card names the Start-menu entry.
-    assert!(assets["static/admin-sites.js"].contains("«OmniIngest – Σύνδεση σε ιστότοπο»"), "the Cookies card does not point to the Start-menu entry");
+    // P13.9: the Cookies card names the Start-menu entry (P13.6b: in both languages, by key).
+    assert!(assets["static/admin-sites.js"].contains("t('admin.cookies.signin_start')"), "the Cookies card does not show the Start-menu entry");
+    for dict in ["static/admin-text.el.js", "static/admin-text.en.js"] {
+        assert!(dictionary(&assets, dict)["admin.cookies.signin_start"].contains("«OmniIngest – Σύνδεση σε ιστότοπο»"), "{dict}: the Cookies card does not point to the Start-menu entry");
+    }
     // P13.5b: unfinished setup is listed with a way back into the wizard.
     let overview = &assets["static/admin-overview.js"];
     assert!(overview.contains("sessionStorage.removeItem('omni.setup.leave')"), "no way back into the wizard");
@@ -1818,11 +1821,11 @@ fn the_admin_panel_is_five_sections_with_one_module_each_and_no_browser_dialogs(
     assert!(maint.contains("if (going && sectionShown('maintenance'))"), "the Benchmarks card is not polled only while a run goes");
 }
 
-/// P13.6: the setup wizard and the admin panel's shell, Overview and Settings are Greek by default,
-/// with an English switch, through the desk's lookup (text.js). The two admin dictionaries hold the
-/// same keys with the same `{names}`; every key the pages ask for is in both; the converted modules
-/// and the converted part of admin.html keep no words of their own; the jargon (CIDR, proxy headers,
-/// recipes, canaries) has its one-line explanation; each new module has one URL.
+/// P13.6/P13.6b: the setup wizard and the whole admin panel are Greek by default, with an English
+/// switch, through the desk's lookup (text.js). The two admin dictionaries hold the same keys with
+/// the same `{names}`; every key the pages ask for is in both; no admin module and no part of
+/// admin.html keeps words of its own; the jargon (CIDR, proxy headers, recipes, canaries) has its
+/// one-line explanation; the Sites note names its buttons as they read; one URL per module.
 #[test]
 fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() {
     let assets = all_assets();
@@ -1845,9 +1848,11 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
     for key in ["dialog.cancel", "page.close"] {
         assert!(en.contains_key(key), "the in-page dialog has no English `{key}`");
     }
-    // English is English (the switch names Greek in Greek); the same names are filled in both.
+    // English is English (the switch names Greek in Greek; the Start-menu entry has its Greek
+    // name, and «για …» is the word the parser reads in a mail); the same names are filled in both.
     for (key, text) in &en {
-        assert!(key == "lang.switch" || !greek(text), "English `{key}` has Greek: {text}");
+        let text = text.replace("«OmniIngest – Σύνδεση σε ιστότοπο»", "").replace("“για …”", "");
+        assert!(key == "lang.switch" || !greek(&text), "English `{key}` has Greek: {text}");
     }
     let names = |s: &str| -> std::collections::BTreeSet<String> {
         s.split('{').skip(1).filter_map(|p| p.split('}').next()).map(String::from).collect()
@@ -1875,7 +1880,11 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
 
     // Every key asked for, in both languages: t('…') in the modules, data-t* in admin.html, and
     // the keys the modules build from a name.
-    let modules = ["static/admin.js", "static/admin-overview.js", "static/admin-settings.js", "static/wizard.js", "static/admin-text.js"];
+    // P13.6b: every admin module, People, Sites, Maintenance and the shared helpers included.
+    let modules = [
+        "static/admin.js", "static/admin-overview.js", "static/admin-settings.js", "static/admin-people.js", "static/admin-sites.js",
+        "static/admin-maintenance.js", "static/admin-common.js", "static/wizard.js", "static/admin-text.js",
+    ];
     let mut asked: Vec<String> = Vec::new();
     for m in modules {
         let src = code(m);
@@ -1909,23 +1918,53 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
     }
     for mode in ["off", "shadow", "hold"] {
         asked.push(format!("wizard.check.repair.{mode}"));
+        asked.push(format!("admin.op.mode.{mode}"));
     }
-    assert!(asked.len() > 300, "too few keys found ({}): the scan is broken", asked.len());
+    // P13.6b: the server codes People, Sites and Maintenance put into words.
+    let families: [(&str, &[&str]); 8] = [
+        ("admin.role", &["admin", "open_mcr", "user"]),
+        ("admin.groups.kind", &["news", "show", "desk", "other"]),
+        ("admin.sites.state", &["healthy", "degraded", "broken"]),
+        ("admin.recipes.state", &["candidate", "active", "suspended", "retired"]),
+        ("admin.recipes.import", &["inserted", "merged", "revived", "refused", "over_cap"]),
+        ("admin.selfheal", &["found", "nothing", "skipped", "outage"]),
+        ("admin.tasks.outcome", &["ok", "skipped", "failed"]),
+        ("admin.bench.state", &["running", "done", "failed", "abandoned"]),
+    ];
+    for (prefix, codes) in families {
+        for code in codes {
+            asked.push(format!("{prefix}.{code}"));
+        }
+    }
+    // Keys chosen by a condition (`t(ok ? 'a.b' : 'a.c')`): every quoted admin/wizard key, except a
+    // prefix that a module completes with a code (`word('admin.sites.state', …)`).
+    for m in modules {
+        let src = code(m);
+        for quoted in src.split('\'').skip(1).step_by(2) {
+            let looks_like_key = (quoted.starts_with("admin.") || quoted.starts_with("wizard."))
+                && quoted.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                && !quoted.ends_with('.');
+            let prefix = en.keys().any(|k| k.starts_with(&format!("{quoted}.")));
+            if looks_like_key && !(prefix && !en.contains_key(quoted)) {
+                asked.push(quoted.to_string());
+            }
+        }
+    }
+    assert!(asked.len() > 700, "too few keys found ({}): the scan is broken", asked.len());
     for key in &asked {
         assert!(el.contains_key(key) || desk.contains_key(key), "`{key}` has no Greek");
         assert!(en.contains_key(key), "`{key}` has no English");
     }
 
     // The converted modules keep no Greek of their own (comments aside)…
-    for m in ["static/admin.js", "static/admin-overview.js", "static/admin-settings.js", "static/wizard.js"] {
+    for m in modules.iter().filter(|m| **m != "static/admin-text.js") {
         for line in code(m).lines() {
             assert!(!greek(line), "{m} keeps Greek text of its own: {}", line.trim());
         }
     }
-    // …and admin.html's shell, Overview and Settings no text outside data-t.
-    let converted = &html[..html.find(r#"data-section="people""#).expect("the People section")];
+    // …and admin.html no text outside data-t, in every section and the account dialog (P13.6b).
     let mut text = String::new();
-    let mut rest = converted;
+    let mut rest = html.as_str();
     while let Some(start) = rest.find('<') {
         text.push_str(&rest[..start]);
         text.push('\n');
@@ -1937,10 +1976,9 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
         } else {
             tail.find('>').map(|e| e + 1)
         };
-        // The slice ends inside the People section's opening tag.
-        let Some(end) = end else { break };
-        rest = &tail[end..];
+        rest = &tail[end.expect("a closed tag")..];
     }
+    text.push_str(rest);
     for word in text.lines().map(str::trim).filter(|w| !w.is_empty()) {
         assert!(["OmniDownloader", "A"].contains(&word), "admin.html has a word of its own: {word:?}");
     }
@@ -1952,4 +1990,10 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
     }
     let wizard = code("static/wizard.js");
     assert!(wizard.contains("t('admin.help.cidr')") && wizard.contains("t('admin.help.proxy')"), "the wizard does not explain CIDR and the proxy header");
+    // P13.6b: the Sites note names the buttons as they read, in each language.
+    for words in [&el, &en] {
+        for button in ["admin.sites.run_now", "admin.refresh"] {
+            assert!(words["admin.sites.about"].contains(&words[button]), "the Sites note does not name «{}»", words[button]);
+        }
+    }
 }

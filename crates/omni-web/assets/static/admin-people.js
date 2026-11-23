@@ -1,20 +1,20 @@
 /* Admin panel, «Άνθρωποι» (P13.5): accounts, journalists and groups.
- * Loaded when the section is first opened.
+ * Loaded when the section is first opened. Words by key from
+ * admin-text.*.js (P13.6b).
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
-import { saveJson } from '/static/admin-common.js?v=1';
+import { saveJson } from '/static/admin-common.js?v=2';
 import { confirmDialog, promptDialog } from '/static/dialog.js?v=10';
+import { t } from '/static/admin-text.js?v=2';
 
 /* ------------------------------------------------------------------ *
  * Users
  * ------------------------------------------------------------------ */
 
-const ROLE_LABEL = {
-  admin: 'Administrator',
-  open_mcr: 'MCR operator',
-  user: 'Journalist',
-};
+// Each role's name is `admin.role.<role>`.
+const ROLES = ['admin', 'open_mcr', 'user'];
+const roleLabel = (role) => (ROLES.includes(role) ? t(`admin.role.${role}`) : role);
 
 async function loadUsers() {
   let users = [];
@@ -28,55 +28,55 @@ async function loadUsers() {
 
   if (users.length === 0) {
     render('users-body', el('tr', {},
-      el('td', { colspan: '6', class: 'empty' }, 'No accounts yet.')));
+      el('td', { colspan: '6', class: 'empty' }, t('admin.users.none'))));
     return;
   }
 
   render('users-body', users.map((user) => el('tr', {},
     el('td', { class: 'strong' }, user.email),
     el('td', {}, user.full_name),
-    el('td', {}, el('span', { class: user.role === 'admin' ? 'badge bad' : 'badge' },
-      ROLE_LABEL[user.role] || user.role)),
+    el('td', {}, el('span', { class: user.role === 'admin' ? 'badge bad' : 'badge' }, roleLabel(user.role))),
     el('td', {}, user.journalist_surname || '—'),
-    el('td', {}, el('span', { class: user.is_active ? 'badge ok' : 'badge bad' }, user.is_active ? 'active' : 'deactivated')),
+    el('td', {}, el('span', { class: user.is_active ? 'badge ok' : 'badge bad' },
+      user.is_active ? t('admin.users.active') : t('admin.users.inactive'))),
     el('td', { class: 'right' },
       el('div', { class: 'row tight', style: 'justify-content:flex-end' },
         el('button', {
           class: 'btn',
           type: 'button',
           onClick: () => resetPassword(user.id, user.email),
-        }, 'Reset password'),
+        }, t('admin.users.reset')),
         el('button', {
           class: user.is_active ? 'btn btn-danger' : 'btn',
           type: 'button',
           onClick: () => setActive(user, !user.is_active),
-        }, user.is_active ? 'Deactivate' : 'Reactivate'),
+        }, user.is_active ? t('admin.users.deactivate') : t('admin.users.reactivate')),
       ),
     ),
   )));
 }
 
 async function setActive(user, active) {
-  if (!active && !await confirmDialog(`Deactivate ${user.email}? They are signed out at once and cannot sign in until reactivated.`, { okLabel: 'Deactivate', danger: true })) return;
+  if (!active && !await confirmDialog(t('admin.users.deactivate_ask', { email: user.email }), { okLabel: t('admin.users.deactivate'), danger: true })) return;
   try {
     await api(`/api/admin/users/${user.id}/active`, { method: 'POST', body: { active } });
-    toast(`${user.email} ${active ? 'reactivated' : 'deactivated'}.`, 'ok');
+    toast(t(active ? 'admin.users.reactivated' : 'admin.users.deactivated', { email: user.email }), 'ok');
     loadUsers();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
 async function resetPassword(id, email) {
-  const next = await promptDialog(`New password for ${email} (at least 12 characters):`, {
+  const next = await promptDialog(t('admin.users.reset_ask', { email }), {
     type: 'password',
-    okLabel: 'Reset password',
-    validate: (v) => (v.length >= 12 ? '' : 'At least 12 characters.'),
+    okLabel: t('admin.users.reset'),
+    validate: (v) => (v.length >= 12 ? '' : t('admin.users.reset_short')),
   });
   if (next === null) return;
   try {
     await api(`/api/admin/users/${id}/password`, { method: 'POST', body: { password: next } });
     // The server also ends that account's sessions, so the operator is not
     // left believing a reset took effect while the old session is still live.
-    toast(`Password reset for ${email}; their sessions were ended.`, 'ok');
+    toast(t('admin.users.reset_done', { email }), 'ok');
   } catch (e) { toast(e.message, 'bad'); }
 }
 
@@ -99,7 +99,7 @@ document.getElementById('create-user-form').addEventListener('submit', async (ev
         journalist_surname: surname || null,
       },
     });
-    toast('Account created.', 'ok');
+    toast(t('admin.users.created'), 'ok');
     event.target.reset();
     userModal.hidden = true;
     loadUsers();
@@ -120,6 +120,10 @@ function showTaxonomy(message, ok) {
 
 const splitList = (text) => text.split(',').map((s) => s.trim()).filter(Boolean);
 
+// Each group kind's name is `admin.groups.kind.<kind>`.
+const KINDS = ['news', 'show', 'desk', 'other'];
+const kindLabel = (kind) => (KINDS.includes(kind) ? t(`admin.groups.kind.${kind}`) : kind);
+
 async function loadTaxonomy() {
   let groups;
   let people;
@@ -133,24 +137,24 @@ async function loadTaxonomy() {
   knownGroups = groups;
 
   render('groups-body', groups.length === 0
-    ? el('tr', {}, el('td', { colspan: '6', class: 'empty' }, 'No groups yet. Add one below or import taxonomy.json.'))
+    ? el('tr', {}, el('td', { colspan: '6', class: 'empty' }, t('admin.groups.none')))
     : groups.map((g) => el('tr', {},
       el('td', { class: 'mono strong' }, g.code),
       el('td', {}, g.name),
-      el('td', {}, el('span', { class: 'badge info' }, g.kind)),
+      el('td', {}, el('span', { class: 'badge info', title: g.kind }, kindLabel(g.kind))),
       el('td', {}, (g.keywords || []).join(', ')),
       el('td', {}, g.description || ''),
       el('td', { class: 'right' },
         el('div', { class: 'row tight', style: 'justify-content:flex-end' },
-          el('button', { class: 'btn', type: 'button', onClick: () => editGroup(g) }, 'Edit'),
-          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => deleteGroup(g.code) }, 'Delete'),
+          el('button', { class: 'btn', type: 'button', onClick: () => editGroup(g) }, t('admin.edit')),
+          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => deleteGroup(g.code) }, t('admin.delete')),
         )),
     )));
 
   const staff = people.filter((p) => p.surname !== 'MCR');
   const known = new Set(groups.map((g) => g.code));
   render('people-body', staff.length === 0
-    ? el('tr', {}, el('td', { colspan: '7', class: 'empty' }, 'Nobody yet. Add people below or import taxonomy.json.'))
+    ? el('tr', {}, el('td', { colspan: '7', class: 'empty' }, t('admin.people.none')))
     : staff.map((p) => el('tr', {},
       el('td', { class: 'mono strong' }, p.surname),
       el('td', {}, p.full_name),
@@ -160,14 +164,14 @@ async function loadTaxonomy() {
         ? (p.groups || []).map((code, i) => el('span', {
           class: known.has(code) ? (i === 0 ? 'badge info' : 'badge') : 'badge bad',
           style: 'margin-right:4px',
-          title: i === 0 ? 'default group' : '',
+          title: i === 0 ? t('admin.people.default_group') : '',
         }, code))
         : '—'),
       el('td', { class: 'num' }, String(p.default_priority || 0)),
       el('td', { class: 'right' },
         el('div', { class: 'row tight', style: 'justify-content:flex-end' },
-          el('button', { class: 'btn', type: 'button', onClick: () => editPerson(p) }, 'Edit'),
-          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => deletePerson(p.surname) }, 'Delete'),
+          el('button', { class: 'btn', type: 'button', onClick: () => editPerson(p) }, t('admin.edit')),
+          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => deletePerson(p.surname) }, t('admin.delete')),
         )),
     )));
   loadBackups();
@@ -205,17 +209,17 @@ pf('person-form').addEventListener('submit', async (event) => {
       method: 'POST',
       body: { groups: splitList(pf('pf-groups').value).map((c) => c.toUpperCase()) },
     });
-    toast(`${surname} saved.`, 'ok');
+    toast(t('admin.people.saved', { name: surname }), 'ok');
     pf('person-form').reset();
     loadTaxonomy();
   } catch (e) { toast(e.message, 'bad'); }
 });
 
 async function deletePerson(surname) {
-  if (!await confirmDialog(`Delete ${surname}? Their jobs keep their name; a backup is taken first.`, { okLabel: 'Delete', danger: true })) return;
+  if (!await confirmDialog(t('admin.people.delete_ask', { name: surname }), { okLabel: t('admin.delete'), danger: true })) return;
   try {
     await api(`/api/journalists/${encodeURIComponent(surname)}`, { method: 'POST' });
-    toast(`${surname} deleted.`, 'ok');
+    toast(t('admin.people.deleted', { name: surname }), 'ok');
     loadTaxonomy();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -229,15 +233,15 @@ async function loadBackups() {
     return;
   }
   render('backups-body', backups.length === 0
-    ? el('tr', {}, el('td', { colspan: '4', class: 'empty' }, 'No backups yet.'))
+    ? el('tr', {}, el('td', { colspan: '4', class: 'empty' }, t('admin.backups.none')))
     : backups.map((b) => el('tr', {},
       el('td', { class: 'mono' }, b.name),
       el('td', { class: 'num' }, String(b.groups)),
       el('td', { class: 'num' }, String(b.people)),
       el('td', { class: 'right' },
         el('div', { class: 'row tight', style: 'justify-content:flex-end' },
-          el('button', { class: 'btn', type: 'button', onClick: () => downloadBackup(b.name) }, 'Download'),
-          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => restoreBackup(b.name) }, 'Restore'),
+          el('button', { class: 'btn', type: 'button', onClick: () => downloadBackup(b.name) }, t('admin.download')),
+          el('button', { class: 'btn btn-danger', type: 'button', onClick: () => restoreBackup(b.name) }, t('admin.backups.restore')),
         )),
     )));
 }
@@ -250,10 +254,13 @@ async function downloadBackup(name) {
 }
 
 async function restoreBackup(name) {
-  if (!await confirmDialog(`Restore ${name}? Groups and people are set back exactly as in that backup; what is there now is backed up first.`, { okLabel: 'Restore', danger: true })) return;
+  if (!await confirmDialog(t('admin.backups.restore_ask', { name }), { okLabel: t('admin.backups.restore'), danger: true })) return;
   try {
     const { report } = await api(`/api/admin/taxonomy/backups/${encodeURIComponent(name)}/restore`, { method: 'POST' });
-    showTaxonomy(`Restored ${name}: ${report.groups_saved} groups and ${report.people_saved} people; ${report.groups_removed} groups and ${report.people_removed} people removed.`, true);
+    showTaxonomy(t('admin.backups.restored', {
+      name, groups: report.groups_saved, people: report.people_saved,
+      groups_removed: report.groups_removed, people_removed: report.people_removed,
+    }), true);
     loadTaxonomy();
   } catch (e) { showTaxonomy(e.message, false); }
 }
@@ -261,7 +268,7 @@ async function restoreBackup(name) {
 document.getElementById('taxonomy-backup-now').addEventListener('click', async () => {
   try {
     const { backup } = await api('/api/admin/taxonomy/backups', { method: 'POST' });
-    toast(`Backed up: ${backup.name}`, 'ok');
+    toast(t('admin.backups.done', { name: backup.name }), 'ok');
     loadBackups();
   } catch (e) { toast(e.message, 'bad'); }
 });
@@ -288,17 +295,17 @@ document.getElementById('group-form').addEventListener('submit', async (event) =
         description: document.getElementById('g-description').value.trim(),
       },
     });
-    toast('Group saved.', 'ok');
+    toast(t('admin.groups.saved'), 'ok');
     event.target.reset();
     loadTaxonomy();
   } catch (e) { toast(e.message, 'bad'); }
 });
 
 async function deleteGroup(code) {
-  if (!await confirmDialog(`Delete group ${code}? People lose this membership; jobs keep their label.`, { okLabel: 'Delete', danger: true })) return;
+  if (!await confirmDialog(t('admin.groups.delete_ask', { code }), { okLabel: t('admin.delete'), danger: true })) return;
   try {
     await api(`/api/groups/${encodeURIComponent(code)}`, { method: 'POST' });
-    toast('Group deleted.', 'ok');
+    toast(t('admin.groups.deleted'), 'ok');
     loadTaxonomy();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -307,7 +314,7 @@ async function deleteGroup(code) {
 document.getElementById('taxonomy-export').addEventListener('click', async () => {
   try {
     saveJson('taxonomy.json', await api('/api/admin/taxonomy'));
-    showTaxonomy('Exported. The file lists staff and their addresses: keep it out of shared folders and git.', true);
+    showTaxonomy(t('admin.taxonomy.exported'), true);
   } catch (e) { showTaxonomy(e.message, false); }
 });
 
@@ -321,18 +328,18 @@ fileInput.addEventListener('change', async () => {
   try {
     taxonomy = JSON.parse(await file.text());
   } catch {
-    showTaxonomy(`${file.name} is not valid JSON.`, false);
+    showTaxonomy(t('admin.taxonomy.bad_json', { name: file.name }), false);
     return;
   }
   const replace = document.getElementById('taxonomy-replace').checked;
-  if (replace && !await confirmDialog('Replace: groups and people not in the file will be removed. Continue?', { okLabel: 'Replace', danger: true })) return;
+  if (replace && !await confirmDialog(t('admin.taxonomy.replace_ask'), { okLabel: t('admin.taxonomy.replace'), danger: true })) return;
   try {
     const { report } = await api('/api/admin/taxonomy', { method: 'POST', body: { taxonomy, replace } });
-    showTaxonomy(
-      `Imported ${file.name}: ${report.groups_saved} groups and ${report.people_saved} people saved` +
-      (replace ? `, ${report.groups_removed} groups and ${report.people_removed} people removed.` : '.'),
-      true,
-    );
+    const vars = {
+      name: file.name, groups: report.groups_saved, people: report.people_saved,
+      groups_removed: report.groups_removed, people_removed: report.people_removed,
+    };
+    showTaxonomy(t(replace ? 'admin.taxonomy.imported_replace' : 'admin.taxonomy.imported', vars), true);
     loadTaxonomy();
   } catch (e) { showTaxonomy(e.message, false); }
 });

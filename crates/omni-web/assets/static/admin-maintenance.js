@@ -1,11 +1,14 @@
 /* Admin panel, «Συντήρηση» (P13.5): toolchain, download engine, database,
  * diagnostics, scheduled tasks, benchmarks, the audit log and the mail log.
- * Loaded when the section is first opened.
+ * Loaded when the section is first opened. Words by key from
+ * admin-text.*.js (P13.6b); what the server reports in its own words (task
+ * descriptions, audit messages, error codes) is shown as it comes.
  */
 
 import { api, el, render, toast, fmtTime } from '/static/app.js?v=6';
-import { sectionShown } from '/static/admin-common.js?v=1';
+import { sectionShown } from '/static/admin-common.js?v=2';
 import { confirmDialog } from '/static/dialog.js?v=10';
+import { t } from '/static/admin-text.js?v=2';
 
 /* ------------------------------------------------------------------ *
  * Dependencies
@@ -16,14 +19,14 @@ let toolsTimer = null;
 const megabytes = (n) => `${Math.round((n || 0) / 1048576)} MB`;
 
 function toolRow(tool, busy) {
-  const pin = tool.matches_pin === true ? 'pinned build'
-    : (tool.installed && tool.matches_pin === false ? 'not the pinned build' : null);
-  const label = tool.action === 'install' ? 'Install' : 'Repair';
+  const pin = tool.matches_pin === true ? t('admin.tools.pinned')
+    : (tool.installed && tool.matches_pin === false ? t('wizard.tools.not_pinned') : null);
+  const label = tool.action === 'install' ? t('wizard.tools.install') : t('wizard.tools.repair');
   const lines = [
     el('div', { class: 'spec-row' },
       el('span', {}, tool.name),
       el('span', { class: tool.installed && tool.action !== 'repair' ? 'badge ok' : 'badge bad' },
-        tool.installed ? (tool.version || 'does not run') : 'missing'),
+        tool.installed ? (tool.version || t('admin.tools.does_not_run')) : t('wizard.tools.missing')),
       pin ? el('span', { class: 'note' }, pin) : null,
       tool.action
         ? el('button', {
@@ -36,7 +39,7 @@ function toolRow(tool, busy) {
   if (tool.running) {
     const r = tool.running;
     const sized = r.bytes_total > 0 && r.stage === 'downloading'
-      ? ` ${megabytes(r.bytes_done)} of ${megabytes(r.bytes_total)}` : '';
+      ? ` ${t('admin.tools.of', { done: megabytes(r.bytes_done), total: megabytes(r.bytes_total) })}` : '';
     lines.push(el('p', { class: 'note' }, `${r.stage}…${sized}`));
   } else if (tool.last_result) {
     lines.push(el('p', { class: tool.last_result.ok ? 'note ok' : 'note bad' }, tool.last_result.message));
@@ -51,7 +54,7 @@ async function loadTools() {
     data = await api('/api/admin/tools');
   } catch (e) {
     if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
-    render('dependencies', el('p', { class: 'note' }, 'No toolchain information.'));
+    render('dependencies', el('p', { class: 'note' }, t('admin.tools.none')));
     return;
   }
   const tools = data.tools || [];
@@ -62,10 +65,10 @@ async function loadTools() {
 }
 
 async function installTool(name, label) {
-  if (!await confirmDialog(`${label} ${name}? Jobs wait while the file is swapped.`, { okLabel: label })) return;
+  if (!await confirmDialog(t('admin.tools.ask', { action: label, name }), { okLabel: label })) return;
   try {
     await api(`/api/admin/tools/${encodeURIComponent(name)}/install`, { method: 'POST' });
-    toast(`${label} of ${name} started.`, 'ok');
+    toast(t('admin.tools.started', { action: label, name }), 'ok');
   } catch (e) {
     toast(e.message, 'bad');
   }
@@ -81,20 +84,20 @@ async function loadDependencies() {
     data = await api('/api/admin/dependencies');
   } catch (e) {
     if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
-    document.getElementById('ytdl-installed').textContent = 'unavailable';
-    document.getElementById('ytdl-remote').textContent = 'unavailable';
+    document.getElementById('ytdl-installed').textContent = t('admin.ytdl.unavailable');
+    document.getElementById('ytdl-remote').textContent = t('admin.ytdl.unavailable');
     return;
   }
 
-  document.getElementById('ytdl-installed').textContent = data.ytdl_installed || 'unknown';
-  document.getElementById('ytdl-remote').textContent = data.ytdl_remote || 'unknown';
+  document.getElementById('ytdl-installed').textContent = data.ytdl_installed || t('admin.ytdl.unknown');
+  document.getElementById('ytdl-remote').textContent = data.ytdl_remote || t('admin.ytdl.unknown');
 
   const note = document.getElementById('ytdl-note');
   if (data.ytdl_update_available) {
-    note.textContent = 'A newer yt-dlp is available.';
+    note.textContent = t('admin.ytdl.newer');
     note.className = 'note ok';
   } else {
-    note.textContent = 'yt-dlp is up to date.';
+    note.textContent = t('admin.ytdl.current');
     note.className = 'note';
   }
 
@@ -103,24 +106,24 @@ async function loadDependencies() {
 document.getElementById('ytdl-update').addEventListener('click', async (event) => {
   const button = event.currentTarget;
   button.disabled = true;
-  button.textContent = 'Updating…';
+  button.textContent = t('admin.ytdl.updating');
   try {
     await api('/api/admin/update-ytdl', { method: 'POST' });
-    toast('yt-dlp updated.', 'ok');
+    toast(t('admin.ytdl.updated'), 'ok');
     loadDependencies();
   } catch (e) {
     toast(e.message, 'bad');
   } finally {
     button.disabled = false;
-    button.textContent = 'Update yt-dlp now';
+    button.textContent = t('admin.ytdl.update');
   }
 });
 
 document.getElementById('ytdl-rollback').addEventListener('click', async () => {
-  if (!await confirmDialog('Put the previous yt-dlp build back?', { okLabel: 'Roll back' })) return;
+  if (!await confirmDialog(t('admin.ytdl.rollback_ask'), { okLabel: t('admin.ytdl.rollback_ok') })) return;
   try {
     await api('/api/admin/rollback-ytdl', { method: 'POST' });
-    toast('Rolled back to the previous yt-dlp build.', 'ok');
+    toast(t('admin.ytdl.rolled_back'), 'ok');
     loadDependencies();
   } catch (e) { toast(e.message, 'bad'); }
 });
@@ -131,13 +134,13 @@ document.getElementById('ytdl-rollback').addEventListener('click', async () => {
 
 document.getElementById('purge-btn').addEventListener('click', async () => {
   const days = Number(document.getElementById('purge-days').value);
-  if (!await confirmDialog(`Permanently remove completed jobs older than ${days} days?`, { okLabel: 'Purge', danger: true })) return;
+  if (!await confirmDialog(t('admin.db.purge_ask', { days }), { okLabel: t('admin.db.purge'), danger: true })) return;
   try {
     const result = await api('/api/admin/purge', {
       method: 'POST',
       body: { older_than_days: days },
     });
-    toast(`Purged ${result.purged_count} job(s).`, 'ok');
+    toast(t('admin.db.purged', { n: result.purged_count }), 'ok');
     loadLogs();
   } catch (e) { toast(e.message, 'bad'); }
 });
@@ -145,7 +148,7 @@ document.getElementById('purge-btn').addEventListener('click', async () => {
 document.getElementById('vacuum-btn').addEventListener('click', async () => {
   try {
     await api('/api/admin/vacuum', { method: 'POST' });
-    toast('Database compacted.', 'ok');
+    toast(t('admin.db.compacted'), 'ok');
   } catch (e) { toast(e.message, 'bad'); }
 });
 
@@ -154,6 +157,8 @@ document.getElementById('vacuum-btn').addEventListener('click', async () => {
  * ------------------------------------------------------------------ */
 
 const OUTCOME_CLASS = { ok: 'ok', skipped: '', failed: 'bad' };
+// Each outcome's word is `admin.tasks.outcome.<outcome>`.
+const outcomeWord = (o) => (o in OUTCOME_CLASS ? t(`admin.tasks.outcome.${o}`) : o);
 
 async function loadMaintenance() {
   let tasks = [];
@@ -167,7 +172,7 @@ async function loadMaintenance() {
 
   if (tasks.length === 0) {
     render('maintenance-body', el('tr', {},
-      el('td', { colspan: '5', class: 'empty' }, 'No maintenance tasks registered.')));
+      el('td', { colspan: '5', class: 'empty' }, t('admin.tasks.none'))));
     return;
   }
 
@@ -185,15 +190,15 @@ async function loadMaintenance() {
             // The failure reason belongs on hover: the column stays readable
             // and the detail is one gesture away.
             title: task.last_error || '',
-          }, task.last_outcome)
-        : el('span', { class: 'note' }, 'never run'),
+          }, outcomeWord(task.last_outcome))
+        : el('span', { class: 'note' }, t('admin.tasks.never')),
     ),
     el('td', { class: 'right' },
       el('button', {
         class: 'btn',
         type: 'button',
         onClick: () => runTask(task.name),
-      }, 'Run now'),
+      }, t('admin.sites.run_now')),
     ),
   )));
 }
@@ -203,7 +208,7 @@ async function runTask(name) {
     const result = await api(`/api/admin/maintenance/${encodeURIComponent(name)}/run`, {
       method: 'POST',
     });
-    toast(result.message || 'Scheduled.', 'ok');
+    toast(result.message || t('admin.tasks.scheduled'), 'ok');
     // The scheduler picks it up on its own tick, so re-read shortly after
     // rather than pretending it has already run.
     setTimeout(loadMaintenance, 2000);
@@ -230,7 +235,7 @@ async function loadLogs() {
 
   if (logs.length === 0) {
     render('logs-body', el('tr', {},
-      el('td', { colspan: '4', class: 'empty' }, 'Nothing logged yet.')));
+      el('td', { colspan: '4', class: 'empty' }, t('admin.audit.none'))));
     return;
   }
 
@@ -258,27 +263,27 @@ async function loadMail() {
     return;
   }
   render('mail-body', mails.length === 0
-    ? el('tr', {}, el('td', { colspan: '6', class: 'empty' }, 'No mail handled yet.'))
+    ? el('tr', {}, el('td', { colspan: '6', class: 'empty' }, t('admin.mail_log.none')))
     : mails.map((m) => el('tr', {},
       el('td', { class: 'num' }, fmtTime(m.processed_at)),
-      el('td', {}, m.subject || '(no subject)'),
+      el('td', {}, m.subject || t('admin.mail_log.no_subject')),
       el('td', { class: 'mono' }, m.from_address || ''),
       el('td', {}, el('span', { class: m.outcome === 'JOBS' ? 'badge ok' : (m.outcome === 'FAILED' ? 'badge bad' : 'badge warn') }, m.outcome), ' ',
         // Read again once already (P11.11b) and still failed: the system leaves it to a person.
         m.read_again && !m.reprocess_pending
-          ? el('span', { class: 'badge warn', title: 'Read again once (after a restart, a tool update or on request); it still failed. The system will not try it again on its own.' }, 'needs a person')
+          ? el('span', { class: 'badge warn', title: t('admin.mail_log.person_title') }, t('admin.mail_log.person'))
           : ''),
       el('td', { class: 'num' }, String(m.jobs)),
       el('td', { class: 'right' }, m.reprocess_pending
-        ? el('span', { class: 'badge info' }, 'next poll')
-        : el('button', { class: 'btn', type: 'button', onClick: () => reprocessMail(m) }, 'Reprocess')),
+        ? el('span', { class: 'badge info' }, t('admin.mail_log.next_poll'))
+        : el('button', { class: 'btn', type: 'button', onClick: () => reprocessMail(m) }, t('admin.mail_log.reprocess'))),
     )));
 }
 
 async function reprocessMail(m) {
   try {
     await api('/api/admin/mail/reprocess', { method: 'POST', body: { internet_message_id: m.internet_message_id } });
-    toast(`'${m.subject || 'mail'}' will be read again on the next poll.`, 'ok');
+    toast(t('admin.mail_log.queued', { subject: m.subject || t('admin.mail_log.no_subject') }), 'ok');
     loadMail();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -303,7 +308,8 @@ function showBench(message, ok) {
 
 const benchSecs = (ms) => (ms === null || ms === undefined ? '' : (ms / 1000).toFixed(1));
 const benchPct = (v) => (v === null || v === undefined ? '' : `${v.toFixed(1)} %`);
-const benchYes = (v) => (v === null || v === undefined ? '' : v ? 'yes' : 'NO');
+const benchYes = (v) => (v === null || v === undefined ? '' : v ? t('admin.bench.yes') : t('admin.bench.no'));
+const benchMode = (mode) => (mode === 'full' ? t('admin.bench.mode.full') : t('admin.bench.mode.extract'));
 
 function benchVerdict(pass) {
   if (pass === true) return el('span', { class: 'badge ok' }, 'PASS');
@@ -312,7 +318,7 @@ function benchVerdict(pass) {
 }
 
 function benchList(indices) {
-  return indices && indices.length ? indices.map((i) => `#${i}`).join(', ') : 'none';
+  return indices && indices.length ? indices.map((i) => `#${i}`).join(', ') : t('admin.bench.list_none');
 }
 
 function benchTable(head, rows) {
@@ -326,11 +332,12 @@ function renderBenchReport(report) {
   const { run, summary, deltas, targets } = report;
   const parts = [
     el('h3', { class: 'card-title', style: 'font-size:0.95rem' },
-      `Run ${run.id} (${run.mode === 'full' ? 'full' : 'extraction only'}) `, benchVerdict(summary.pass)),
-    el('p', { class: 'note' },
-      `${run.state}. Started ${fmtTime(run.started_at)}, finished ${fmtTime(run.finished_at)}. ` +
-      `${summary.targets_run} targets run, ${summary.counted} counted (the rest are expected to fail).`),
-    benchTable(['Threshold', 'Limit', 'Measured', 'Result'], summary.checks.map((c) => [
+      `${t('admin.bench.run_title', { id: run.id, mode: benchMode(run.mode) })} `, benchVerdict(summary.pass)),
+    el('p', { class: 'note' }, t('admin.bench.run_about', {
+      state: run.state, started: fmtTime(run.started_at), finished: fmtTime(run.finished_at),
+      run: summary.targets_run, counted: summary.counted,
+    })),
+    benchTable([t('admin.bench.threshold'), t('admin.bench.limit'), t('admin.bench.measured'), t('admin.bench.result')], summary.checks.map((c) => [
       c.name,
       `${c.op} ${c.limit}${c.unit ? ` ${c.unit}` : ''}`,
       c.value === null || c.value === undefined ? '' : `${c.value.toFixed(1)}${c.unit ? ` ${c.unit}` : ''}`,
@@ -339,36 +346,40 @@ function renderBenchReport(report) {
   ];
   const signed = (v, unit) => (v === null || v === undefined ? 'n/a' : `${v > 0 ? '+' : ''}${v.toFixed(1)}${unit}`);
   if (deltas) {
-    parts.push(el('p', { class: 'note' },
-      `Against run ${deltas.previous_run_id} (the last finished ${run.mode} run): ` +
-      `extraction ${signed(deltas.extract_pct, ' points')}, delivery ${signed(deltas.delivery_pct, ' points')}, ` +
-      `mean extraction ${signed(deltas.mean_extract_ms === null ? null : deltas.mean_extract_ms / 1000, ' s')}, ` +
-      `compliance failures ${deltas.compliance_fails === null ? 'n/a' : (deltas.compliance_fails > 0 ? '+' : '') + deltas.compliance_fails}. ` +
-      `Newly failing: ${benchList(deltas.regressions)}. Newly working: ${benchList(deltas.fixes)}.`));
+    parts.push(el('p', { class: 'note' }, t('admin.bench.deltas', {
+      id: deltas.previous_run_id, mode: benchMode(run.mode),
+      extract: signed(deltas.extract_pct, ''), delivery: signed(deltas.delivery_pct, ''),
+      mean: signed(deltas.mean_extract_ms === null ? null : deltas.mean_extract_ms / 1000, ' s'),
+      fails: deltas.compliance_fails === null ? 'n/a' : (deltas.compliance_fails > 0 ? '+' : '') + deltas.compliance_fails,
+      worse: benchList(deltas.regressions), better: benchList(deltas.fixes),
+    })));
   } else {
-    parts.push(el('p', { class: 'note' }, `No earlier finished ${run.mode} run to compare with.`));
+    parts.push(el('p', { class: 'note' }, t('admin.bench.no_earlier', { mode: benchMode(run.mode) })));
   }
-  const t = summary.timings;
+  const tm = summary.timings;
   parts.push(
-    el('h4', { class: 'note strong' }, 'Mean seconds per stage'),
-    benchTable(['Extract', 'Download', 'Transcode + rewrap', 'Per target'], [[
-      benchSecs(t.extract_mean_ms), benchSecs(t.download_mean_ms), benchSecs(t.transcode_mean_ms), benchSecs(t.total_mean_ms),
+    el('h4', { class: 'note strong' }, t('admin.bench.mean_title')),
+    benchTable([t('admin.bench.col.extract'), t('admin.bench.col.download'), t('admin.bench.col.transcode'), t('admin.bench.col.per_target')], [[
+      benchSecs(tm.extract_mean_ms), benchSecs(tm.download_mean_ms), benchSecs(tm.transcode_mean_ms), benchSecs(tm.total_mean_ms),
     ]]),
-    el('h4', { class: 'note strong' }, 'By domain'),
-    benchTable(['Domain', 'Targets', 'Extracted', 'Delivery-equivalent', 'Mean extract (s)'], summary.by_domain.map((d) => [
-      d.domain, String(d.targets), String(d.extract_ok), String(d.delivery_ok), benchSecs(d.mean_extract_ms),
-    ])),
+    el('h4', { class: 'note strong' }, t('admin.bench.by_domain')),
+    benchTable([t('admin.bench.col.domain'), t('admin.bench.col.targets'), t('admin.bench.col.extracted'), t('admin.bench.col.delivery'), t('admin.bench.col.mean_extract')],
+      summary.by_domain.map((d) => [
+        d.domain, String(d.targets), String(d.extract_ok), String(d.delivery_ok), benchSecs(d.mean_extract_ms),
+      ])),
     summary.skipped && summary.skipped.length
-      ? el('p', { class: 'note' }, `Skipped, the source is over ten minutes (not counted in the delivery rate): ${benchList(summary.skipped)}.`)
+      ? el('p', { class: 'note' }, t('admin.bench.skipped', { list: benchList(summary.skipped) }))
       : null,
-    el('h4', { class: 'note strong' }, 'By target'),
+    el('h4', { class: 'note strong' }, t('admin.bench.by_target')),
     benchTable(
-      ['#', 'Domain', 'Category', 'Expected', 'Extract', 's', 'Method', 'Streams', 'Download', 's', 'Transcode s', 'Verify', 'Total s', 'Error', 'Stream host'],
+      ['#', t('admin.bench.col.domain'), t('admin.bench.col.category'), t('admin.bench.col.expected'), t('admin.bench.col.extract'), 's',
+        t('admin.bench.col.method'), t('admin.bench.col.streams'), t('admin.bench.col.download'), 's', t('admin.bench.col.transcode_s'),
+        t('admin.bench.col.verify'), t('admin.bench.col.total_s'), t('admin.bench.col.error'), t('admin.bench.col.host')],
       targets.map((l) => [
-        String(l.idx), l.domain, l.category, l.expected === 'expected_fail' ? 'expected fail' : 'pass',
+        String(l.idx), l.domain, l.category, l.expected === 'expected_fail' ? t('admin.bench.expected_fail') : t('admin.bench.expected_pass'),
         benchYes(l.extract_ok), benchSecs(l.extract_ms), l.method || '', l.candidates === null || l.candidates === undefined ? '' : String(l.candidates),
         benchYes(l.download_ok), benchSecs(l.download_ms), benchSecs(l.transcode_ms), benchYes(l.verify_ok), benchSecs(l.total_ms),
-        l.skipped ? 'SOURCE_TOO_LONG (skipped)' : (l.error_code || ''), l.stream_host || '',
+        l.skipped ? t('admin.bench.too_long') : (l.error_code || ''), l.stream_host || '',
       ])),
   );
   render('bench-report', parts);
@@ -383,6 +394,11 @@ async function loadBenchReport(id) {
     return false;
   }
 }
+
+// Each run state's word is `admin.bench.state.<state>`.
+const BENCH_STATES = ['running', 'done', 'failed', 'abandoned'];
+const benchState = (r) => (r.state === 'running' && r.paused ? t('admin.bench.paused')
+  : (BENCH_STATES.includes(r.state) ? t(`admin.bench.state.${r.state}`) : r.state));
 
 async function loadBenchmarks() {
   if (benchBusy) return;
@@ -399,18 +415,18 @@ async function loadBenchmarks() {
     document.getElementById('bench-parallel').max = String(data.max_parallel);
     const runs = data.runs || [];
     if (runs.length === 0) {
-      render('bench-runs', el('tr', {}, el('td', { colspan: '9', class: 'empty' }, 'No run yet.')));
+      render('bench-runs', el('tr', {}, el('td', { colspan: '9', class: 'empty' }, t('admin.bench.none'))));
       render('bench-report', []);
       render('bench-progress', []);
       return;
     }
     render('bench-runs', runs.map((r) => {
-      const open = el('button', { class: 'btn', type: 'button' }, 'Report');
+      const open = el('button', { class: 'btn', type: 'button' }, t('admin.bench.report'));
       open.addEventListener('click', () => { benchSelected = r.id; loadBenchmarks(); });
       return el('tr', {},
         el('td', { class: 'strong' }, String(r.id)),
-        el('td', {}, r.mode === 'full' ? 'full' : 'extraction'),
-        el('td', {}, el('span', { class: r.state === 'done' ? 'badge ok' : r.state === 'running' ? 'badge' : 'badge bad' }, r.state === 'running' && r.paused ? 'paused for on-air jobs' : r.state)),
+        el('td', {}, benchMode(r.mode)),
+        el('td', {}, el('span', { class: r.state === 'done' ? 'badge ok' : r.state === 'running' ? 'badge' : 'badge bad' }, benchState(r))),
         el('td', {}, fmtTime(r.started_at)),
         el('td', { class: 'right' }, r.targets_run === null || r.targets_run === undefined ? '' : String(r.targets_run)),
         el('td', { class: 'right' }, benchPct(r.extract_pct)),
@@ -428,7 +444,9 @@ async function loadBenchmarks() {
       const of = going.params && going.params.targets ? going.params.targets.length : 0;
       try {
         const current = await api(`/api/admin/benchmarks/runs/${going.id}`);
-        render('bench-progress', el('span', {}, `Run ${going.id} is going: ${current.summary.targets_run} of ${of} targets done.${going.paused ? ' Paused for on-air jobs; it goes on when none is running.' : ''}`));
+        render('bench-progress', el('span', {},
+          t('admin.bench.progress', { id: going.id, done: current.summary.targets_run, of })
+          + (going.paused ? ` ${t('admin.bench.progress_paused')}` : '')));
       } catch { /* the next event tries again */ }
     } else {
       render('bench-progress', []);
@@ -456,7 +474,7 @@ document.getElementById('bench-form').addEventListener('submit', async (event) =
       },
     });
     benchSelected = out.run_id;
-    showBench(`Run ${out.run_id} started: ${out.targets} targets, ${out.parallel} at once.`, true);
+    showBench(t('admin.bench.started', { id: out.run_id, n: out.targets, parallel: out.parallel }), true);
   } catch (e) {
     // 409 carries the reason (a job is running, or a run is going).
     showBench(e.message, false);

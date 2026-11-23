@@ -772,15 +772,20 @@ at the top switches them to English, and **Ελληνικά** switches back; the
 kept in that browser only (the MCR desk stays in Greek). The panel reloads on a
 switch; the wizard redraws the step that is open, so a value typed on it and not
 yet saved is filled again from the saved settings. Terms such as CIDR, the proxy
-header, recipes and canaries have a one-line explanation where they appear. So
-far the shell, Επισκόπηση, Ρυθμίσεις and the wizard are translated; Άνθρωποι,
-Ιστότοποι and Συντήρηση follow (their cards still show English text).
+header, recipes and canaries have a one-line explanation where they appear. What a
+tool or the server reports in its own words (an error detail, a task's
+description, an audit message) is shown as it comes.
 
 - **Επισκόπηση**: Χρειάζεται τον διαχειριστή, Υγεία, Αυτονομία, Επιδιόρθωση σε σκιά.
 - **Ρυθμίσεις**: Εγκατάσταση, Watchfolder, Γραμματοκιβώτιο, Διαπιστευτήρια, Βοήθεια LLM, Δίκτυο, TLS και αρχείο, Λειτουργία.
-- **Άνθρωποι**: User accounts, Newsroom taxonomy (journalists and groups).
-- **Ιστότοποι**: Sites, Cookies, Recipes, Repair report, Test URL, Self-heal, Self-check.
-- **Συντήρηση**: Toolchain, Download engine, Database maintenance, Διαγνωστικό πακέτο, Scheduled maintenance, Benchmarks, Audit log, Recent mail.
+- **Άνθρωποι**: Λογαριασμοί χρηστών, Ταξινόμηση της σύνταξης (journalists and groups).
+- **Ιστότοποι**: Ιστότοποι, Cookies, Συνταγές, Αναφορά επιδιόρθωσης, Δοκιμή διεύθυνσης, Αυτοΐαση, Αυτοέλεγχος.
+- **Συντήρηση**: Εργαλεία, Μηχανή λήψης, Συντήρηση βάσης δεδομένων, Διαγνωστικό πακέτο, Προγραμματισμένη συντήρηση, Μετρήσεις απόδοσης, Ημερολόγιο ελέγχου, Πρόσφατα mail.
+
+With English chosen the same cards read User accounts, Newsroom taxonomy; Sites,
+Cookies, Recipes, Repair report, Test URL, Self-heal, Self-check; Toolchain,
+Download engine, Database maintenance, Diagnostic bundle, Scheduled maintenance,
+Benchmarks, Audit log, Recent mail.
 
 Every action that removes or replaces something asks in the page first; the
 action button names what it does.

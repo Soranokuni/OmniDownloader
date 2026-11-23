@@ -1,18 +1,19 @@
 /* Helpers shared by the admin panel's section modules (P13.5). */
 
 import { el, toast } from '/static/app.js?v=6';
+import { t } from '/static/admin-text.js?v=2';
 
 /** Put `text` on the clipboard; plain HTTP on the LAN has no clipboard API. */
 export function copyText(text, button) {
-  const done = () => { button.textContent = 'Copied'; setTimeout(() => { button.textContent = 'Copy'; }, 1500); };
+  const done = () => { button.textContent = t('wizard.copied'); setTimeout(() => { button.textContent = t('wizard.copy'); }, 1500); };
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).then(done, () => toast('Could not copy; select the command and copy it.', 'bad'));
+    navigator.clipboard.writeText(text).then(done, () => toast(t('admin.copy_failed'), 'bad'));
     return;
   }
   const box = el('textarea', { readonly: '', style: 'position:fixed;left:-9999px' }, text);
   document.body.appendChild(box);
   box.select();
-  try { document.execCommand('copy'); done(); } catch (e) { toast('Could not copy; select the command and copy it.', 'bad'); }
+  try { document.execCommand('copy'); done(); } catch (e) { toast(t('admin.copy_failed'), 'bad'); }
   box.remove();
 }
 
