@@ -628,13 +628,21 @@ pub(crate) async fn run_approved_delivery(
 /// What the MCR desk is told about a file-locker link a person must fetch
 /// (P11.15a): a shared folder, or a locker with no direct address. `None` for
 /// a link that is not one, or a share of one file fetched directly.
-pub(crate) fn locker_manual_message(locker: &omni_core::locker::Locker) -> Option<String> {
+///
+/// With `locker.direct_shares` off a share of one file is sent to the desk as
+/// before P11.15a; with `locker.browser_capture` on a locker page is left to
+/// the capture (P11.15b), which sends it to the desk itself if it fails.
+pub(crate) fn locker_manual_message(locker: &omni_core::locker::Locker, settings: &omni_core::locker::LockerSettings) -> Option<String> {
     use omni_core::locker::Locker;
     match locker {
         Locker::Folder { vendor } => {
             Some(format!("Shared {vendor} folder link: open it and send the video's own link, or download the file and use 'Upload file' on this job."))
         }
+        Locker::Manual { .. } if settings.capture.is_some() => None,
         Locker::Manual { vendor } => Some(format!("File-locker link ({vendor}): download the file and use 'Upload file' on this job.")),
+        Locker::Direct { vendor, .. } if !settings.direct_shares => Some(format!(
+            "File-locker link ({vendor}): direct downloads are switched off (locker.direct_shares); download the file and use 'Upload file' on this job."
+        )),
         Locker::Direct { .. } | Locker::No => None,
     }
 }
@@ -666,7 +674,7 @@ pub(crate) async fn run_job(
     // address below (P11.15a); a folder, and every other locker (WeTransfer and
     // friends), goes to the MCR desk for a person to fetch.
     let locker = omni_core::locker::classify(&orig_url);
-    if let Some(message) = locker_manual_message(&locker) {
+    if let Some(message) = locker_manual_message(&locker, engine.locker()) {
         warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
         repo.record_event(job_id, "WARN", Some(JobStage::Extract), &message)?;
         repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
@@ -822,7 +830,7 @@ pub(crate) async fn run_job(
     // never the sent link (its query or path can carry the key) nor the direct
     // address (P11.15a4).
     let locker_label = omni_core::urlnorm::site_for_log(&sent_link);
-    let orig_url = match omni_core::locker::direct_download(&orig_url) {
+    let orig_url = match omni_core::locker::direct_download_if(engine.locker().direct_shares, &orig_url) {
         Some(direct) => {
             // Held for the run, removed when it ends (P11.15a4).
             _redaction = repo.redact_in_logs(omni_core::locker::secret_parts(&direct));
@@ -844,6 +852,39 @@ pub(crate) async fn run_job(
             direct
         }
         None => orig_url,
+    };
+
+    // A locker page a person would fetch (WeTransfer and the like), with
+    // `locker.browser_capture` on (P11.15b): the browser opens it (the link is
+    // already judged by the egress rule, and so is every request of the page)
+    // and keeps the one file it hands out, in this job's own workspace. That file
+    // then goes through the pipeline as an attachment does. Any failure ends at
+    // the desk, with the service named; nothing retries the capture by itself.
+    // What is written of the page is its site, never its link (P11.15a4).
+    let orig_url = match (&locker, engine.locker().capture.clone()) {
+        (omni_core::locker::Locker::Manual { vendor }, Some(capturer)) if orig_url.starts_with("http") => {
+            info!("Job #{job_id}: a {vendor} page; the browser tries to download its file");
+            repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser tries to download the file"))?;
+            let dir = engine.job_temp(job_id).join("capture");
+            let limits = omni_core::locker::CaptureLimits { budget: omni_core::locker::CAPTURE_BUDGET, max_bytes: engine.locker_max_file_bytes() };
+            match capturer.capture(&orig_url, &dir, limits).await {
+                Ok(file) => {
+                    repo.record_event(job_id, "INFO", Some(JobStage::Download), &format!("{vendor} page: the browser downloaded the file"))?;
+                    job.source_path = Some(file.to_string_lossy().into_owned());
+                    job.url = omni_core::locker::CAPTURE_URL.to_string();
+                    job.url.clone()
+                }
+                Err(why) => {
+                    let why = omni_core::locker::scrub_addresses(&why, &locker_label);
+                    let message = format!("File-locker link ({vendor}): the browser could not get the file ({why}); download it and use 'Upload file' on this job.");
+                    warn!("Job #{job_id}: {message}");
+                    repo.record_event(job_id, "WARN", Some(JobStage::Download), &message)?;
+                    repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => orig_url,
     };
 
     // A news page yt-dlp reads as several videos (an article with four

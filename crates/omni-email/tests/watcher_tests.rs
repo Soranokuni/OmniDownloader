@@ -653,3 +653,31 @@ async fn a_saved_mail_is_queued_like_one_from_the_mailbox_and_only_once() {
     assert_eq!(watcher.ingest(&mail).await.unwrap(), Ingested::AlreadyHandled);
     assert_eq!(repo.get_all_jobs().unwrap().len(), 2);
 }
+
+/// P11.15b: the `locker` switches decide which locker links a worker takes:
+/// with `direct_shares` off a share waits for MCR; with `browser_capture` on a
+/// WeTransfer page is queued for the browser; a folder always waits.
+#[tokio::test]
+async fn the_locker_switches_decide_what_a_worker_takes() {
+    let body = "1. ΚΑΥΣΩΝΑΣ\nhttps://www.dropbox.com/s/abc123/kafsonas.mp4?dl=0\n\n\
+                2. ΠΑΡΕΛΑΣΗ\nhttps://we.tl/t-w0002\n\n\
+                3. ΣΕΙΣΜΟΣ\nhttps://www.dropbox.com/sh/folder1/AAB?dl=0";
+    for (direct_shares, browser_capture, want) in [
+        (false, false, [JobStatus::ManualDownload, JobStatus::ManualDownload, JobStatus::ManualDownload]),
+        (true, true, [JobStatus::Pending, JobStatus::Pending, JobStatus::ManualDownload]),
+        (false, true, [JobStatus::ManualDownload, JobStatus::Pending, JobStatus::ManualDownload]),
+    ] {
+        let (_dir, repo) = repo();
+        let mut config = test_config();
+        config.locker.direct_shares = direct_shares;
+        config.locker.browser_capture = browser_capture;
+        let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", body)]);
+        let watcher = EmailWatcher::with_source(config, repo.clone(), source.clone());
+        assert_eq!(watcher.poll_once().await.unwrap().processed, 1);
+        let mut jobs = repo.get_all_jobs().unwrap();
+        jobs.sort_by_key(|j| j.id);
+        let got: Vec<JobStatus> = jobs.iter().map(|j| j.status).collect();
+        assert_eq!(got, want.to_vec(), "direct_shares {direct_shares}, browser_capture {browser_capture}");
+        assert!(jobs.iter().all(|j| j.extraction_method.as_deref() == Some("locker")));
+    }
+}

@@ -2699,6 +2699,7 @@ pub async fn api_mail_queue_link(
     Json(payload): Json<QueueLinkPayload>,
 ) -> JsonResult {
     let cfg = state.config.read().await.parser.clone();
+    let locker_cfg = state.config.read().await.locker.clone();
     let (mail, jobs) = load_mail(&state, None, &payload.key)?;
     let view = omni_email::mail_view::build(&mail, &jobs, &cfg);
     let wanted = payload.url.trim();
@@ -2725,8 +2726,8 @@ pub async fn api_mail_queue_link(
     let mut new = omni_core::models::NewJob::new(link.url.clone(), slug.clone(), journalist.clone());
     new.keyword = keyword;
     new.index_str = index.clone();
-    // A locker share of one file that can be fetched directly goes to the pipeline (P11.15a).
-    new.status = if locker && omni_core::locker::direct_download(&link.url).is_none() { JobStatus::ManualDownload } else { JobStatus::Pending };
+    // A locker link a worker can take goes to the pipeline (P11.15a, P11.15b), each while its switch is on.
+    new.status = if locker && !omni_core::locker::queued_for_a_worker(&link.url, &locker_cfg) { JobStatus::ManualDownload } else { JobStatus::Pending };
     new.extraction_method = locker.then(|| "locker".to_string());
     new.email_message_id = Some(mail.internet_message_id.clone());
     new.email_source = mail.from_address.clone();

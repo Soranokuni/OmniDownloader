@@ -186,7 +186,19 @@ impl HeadlessBrowserManager {
         Self::launch_in(Some(exe.to_path_buf()), profile.to_path_buf(), true).await
     }
 
+    /// Launch headless on `profile` (removed on shutdown) with `extra_args`
+    /// after the usual flags: the locker capture's own launch (P11.15b), whose
+    /// profile lives in the job's workspace.
+    pub async fn launch_with(profile: PathBuf, extra_args: Vec<String>) -> Result<BrowserSession> {
+        std::fs::create_dir_all(&profile).with_context(|| format!("Failed creating browser profile {profile:?}"))?;
+        Self::launch_in_with(Self::find_system_browser(), profile, false, extra_args).await
+    }
+
     async fn launch_in(exe: Option<PathBuf>, profile: PathBuf, keep_profile: bool) -> Result<BrowserSession> {
+        Self::launch_in_with(exe, profile, keep_profile, Vec::new()).await
+    }
+
+    async fn launch_in_with(exe: Option<PathBuf>, profile: PathBuf, keep_profile: bool, extra_args: Vec<String>) -> Result<BrowserSession> {
         let mut builder = BrowserConfig::builder().user_data_dir(&profile);
 
         if let Some(edge_or_chrome) = &exe {
@@ -202,7 +214,7 @@ impl HeadlessBrowserManager {
         let major = exe.as_deref().and_then(installed_major_version).unwrap_or(FALLBACK_MAJOR);
 
         let config = builder
-            .args(headless_args(edge, major))
+            .args(headless_args(edge, major).into_iter().chain(extra_args))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building BrowserConfig: {}", e))?;
 

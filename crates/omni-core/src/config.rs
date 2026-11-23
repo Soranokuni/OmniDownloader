@@ -640,6 +640,17 @@ pub struct LockerConfig {
     /// MCR, with its size named.
     #[serde(default = "default_locker_max_file_gb")]
     pub max_file_gb: u64,
+    /// A share of one file on Dropbox, Google Drive, OneDrive or SharePoint is
+    /// downloaded from its direct address (P11.15a). Off: every locker link
+    /// waits for MCR (MANUAL_DOWNLOAD), as before P11.15a.
+    #[serde(default = "default_true")]
+    pub direct_shares: bool,
+    /// The other lockers (WeTransfer and the like) are opened in the headless
+    /// browser, which presses their download button and keeps the one file it
+    /// gets (P11.15b). Off by default: those pages change, and every failure
+    /// still ends at MCR, with the service named.
+    #[serde(default)]
+    pub browser_capture: bool,
 }
 
 fn default_locker_max_file_gb() -> u64 {
@@ -655,7 +666,7 @@ impl LockerConfig {
 
 impl Default for LockerConfig {
     fn default() -> Self {
-        Self { max_file_gb: default_locker_max_file_gb() }
+        Self { max_file_gb: default_locker_max_file_gb(), direct_shares: true, browser_capture: false }
     }
 }
 
@@ -1375,6 +1386,12 @@ mod tests {
         assert_eq!(set.locker.max_file_bytes(), 5 << 30);
         let zero: AppConfig = serde_json::from_str(r#"{"locker":{"max_file_gb":0}}"#).unwrap();
         assert_eq!(zero.locker.max_file_bytes(), 1 << 30, "read as at least 1 GB");
+        // P11.15b: direct shares on, the browser capture off, unless the file says otherwise.
+        assert!(old.locker.direct_shares && !old.locker.browser_capture);
+        assert!(set.locker.direct_shares && !set.locker.browser_capture, "a section without the switches");
+        let switched: AppConfig = serde_json::from_str(r#"{"locker":{"direct_shares":false,"browser_capture":true}}"#).unwrap();
+        assert!(!switched.locker.direct_shares && switched.locker.browser_capture);
+        assert_eq!(AppConfig::default().locker, LockerConfig::default());
     }
 
     #[test]

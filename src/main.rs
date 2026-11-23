@@ -1341,6 +1341,15 @@ async fn run_daemon(
     .with_archive(Some(archive_settings.clone()))
     // A file-locker share's download is bounded (P11.15a2).
     .with_locker_max_file_bytes(config.locker.max_file_bytes())
+    // `locker.direct_shares`, and the headless browser for locker pages when
+    // `locker.browser_capture` is on (P11.15b), under the job path's egress rule.
+    .with_locker(omni_core::locker::LockerSettings {
+        direct_shares: config.locker.direct_shares,
+        capture: config.locker.browser_capture.then(|| {
+            Arc::new(omni_browser::capture::BrowserCapture { allow: config.security.egress_allow_networks() })
+                as Arc<dyn omni_core::locker::LockerCapture>
+        }),
+    })
     .with_watchfolder_state(watchfolder_state.clone())
     .with_retry_max_age(config.retry.max_age_mins)
     // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,

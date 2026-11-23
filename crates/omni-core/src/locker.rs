@@ -18,6 +18,73 @@
 //! locker (WeTransfer, MyAirBridge, TransferNow, Filemail, MEGA) stays a
 //! manual download for MCR.
 
+/// The address a job runs under once the browser captured its locker's file
+/// (P11.15b): an `attachment://` address, so the pipeline takes the file on
+/// disk (`source_path`) as its source and nothing else downloads anything.
+/// Only in memory for that run; the job keeps the link that was sent.
+pub const CAPTURE_URL: &str = "attachment://locker-capture";
+
+/// The longest a browser capture may take, page and download together.
+pub const CAPTURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The bounds of one browser capture: its time, and the largest file it keeps
+/// (`locker.max_file_gb`, as for a direct share).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureLimits {
+    pub budget: std::time::Duration,
+    pub max_bytes: u64,
+}
+
+/// The future a [`LockerCapture`] returns: the file's path, or why there is none.
+pub type CaptureFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::path::PathBuf, String>> + Send + 'a>>;
+
+/// Opens a locker page and keeps the one file it hands out (P11.15b), into
+/// `dir` and nowhere else. The daemon's is the headless browser
+/// (`omni_browser::capture`); tests give a fake.
+pub trait LockerCapture: Send + Sync {
+    fn capture<'a>(&'a self, url: &'a str, dir: &'a std::path::Path, limits: CaptureLimits) -> CaptureFuture<'a>;
+}
+
+/// What the worker does with locker links (P11.15): the two switches of
+/// `locker` in config.json, the second as the capturer itself.
+#[derive(Clone)]
+pub struct LockerSettings {
+    /// `locker.direct_shares`.
+    pub direct_shares: bool,
+    /// Set when `locker.browser_capture` is on.
+    pub capture: Option<std::sync::Arc<dyn LockerCapture>>,
+}
+
+impl Default for LockerSettings {
+    fn default() -> Self {
+        Self { direct_shares: true, capture: None }
+    }
+}
+
+impl std::fmt::Debug for LockerSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockerSettings").field("direct_shares", &self.direct_shares).field("capture", &self.capture.is_some()).finish()
+    }
+}
+
+/// [`direct_download`], only while `direct_shares` is on: with it off, every
+/// locker link waits for MCR as before P11.15a.
+pub fn direct_download_if(direct_shares: bool, url: &str) -> Option<String> {
+    direct_shares.then(|| direct_download(url)).flatten()
+}
+
+/// Whether a locker link is queued for a worker (PENDING) rather than left for
+/// MCR (MANUAL_DOWNLOAD) when it arrives (P11.15b): a share of one file while
+/// `locker.direct_shares` is on, a locker page while `locker.browser_capture`
+/// is on. A folder always waits for MCR.
+pub fn queued_for_a_worker(url: &str, cfg: &crate::config::LockerConfig) -> bool {
+    match classify(url) {
+        Locker::Direct { .. } => cfg.direct_shares,
+        Locker::Manual { .. } => cfg.browser_capture,
+        Locker::Folder { .. } | Locker::No => false,
+    }
+}
+
 /// What a link is, as a file locker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Locker {
@@ -348,6 +415,24 @@ mod tests {
             "https://drive.usercontent.google.com/download?id=1AbC_dEf-GhIjKlMn&export=download&confirm=t&resourcekey=0-AbCdEfGh"
         );
         assert!(!direct("https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view").contains("resourcekey"));
+    }
+
+    /// P11.15b: which locker links a worker takes, by the two switches.
+    #[test]
+    fn the_switches_decide_which_locker_links_a_worker_takes() {
+        let cfg = |direct_shares, browser_capture| crate::config::LockerConfig { direct_shares, browser_capture, ..Default::default() };
+        let share = "https://www.dropbox.com/s/abc123/clip.mp4?dl=0";
+        let page = "https://we.tl/t-abc123";
+        let folder = "https://www.dropbox.com/sh/folder1/AAB?dl=0";
+        for (d, b) in [(false, false), (true, false), (false, true), (true, true)] {
+            let c = cfg(d, b);
+            assert_eq!(queued_for_a_worker(share, &c), d, "share, {d} {b}");
+            assert_eq!(queued_for_a_worker(page, &c), b, "page, {d} {b}");
+            assert!(!queued_for_a_worker(folder, &c), "a folder always waits");
+            assert!(!queued_for_a_worker("https://news.example/story", &c), "not a locker");
+        }
+        assert_eq!(direct_download_if(false, share), None);
+        assert!(direct_download_if(true, share).is_some());
     }
 
     #[test]

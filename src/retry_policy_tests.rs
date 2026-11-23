@@ -562,9 +562,9 @@ async fn a_locker_a_person_must_fetch_goes_to_the_desk_and_a_direct_share_does_n
         assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::ManualDownload, Some("MANUAL_DOWNLOAD")), "{url}");
         assert!(row.error_message.as_deref().unwrap_or("").contains(vendor), "{url}: {:?}", row.error_message);
     }
-    assert!(locker_manual_message(&classify("https://www.dropbox.com/s/abc/clip.mp4")).is_none(), "a direct share is not sent to the desk");
+    assert!(locker_manual_message(&classify("https://www.dropbox.com/s/abc/clip.mp4"), &Default::default()).is_none(), "a direct share is not sent to the desk");
     assert!(matches!(classify("https://www.dropbox.com/s/abc/clip.mp4"), Locker::Direct { .. }));
-    assert!(locker_manual_message(&classify("https://news.example/story")).is_none());
+    assert!(locker_manual_message(&classify("https://news.example/story"), &Default::default()).is_none());
 }
 
 /// P11.15a: run_job fetches a direct share from its direct address, judged by
@@ -575,10 +575,13 @@ fn run_job_turns_a_direct_share_into_its_address_after_the_egress_check() {
     let run = &src[src.find("pub(crate) async fn run_job(").unwrap()..];
     let at = |s: &str| run.find(s).unwrap_or_else(|| panic!("{s} missing"));
     let vet = at("\n        match egress::vet_url(&orig_url, egress_allow).await {");
-    let direct = at("\n    let orig_url = match omni_core::locker::direct_download(&orig_url) {");
+    let direct = at("\n    let orig_url = match omni_core::locker::direct_download_if(engine.locker().direct_shares, &orig_url) {");
     let direct_vet = direct + run[direct..].find("egress::vet_url(&direct, egress_allow)").expect("the direct address is vetted");
     let page_scan = at("\n    let is_web = (orig_url.starts_with(\"http://\") || orig_url.starts_with(\"https://\")) && !locker_direct;");
     assert!(vet < direct && direct < direct_vet && direct_vet < page_scan);
+    // P11.15b: the capture, only for a locker page, after the egress check and before the page scan.
+    let capture = at("\n        (omni_core::locker::Locker::Manual { vendor }, Some(capturer)) if orig_url.starts_with(\"http\") => {");
+    assert!(vet < capture && direct < capture && capture < page_scan);
     // P11.15a2: a direct share is a download only. Its address is never opened as a
     // page, no sniffer, no repair ladder, no site health, and its error is scrubbed.
     for gate in [
@@ -701,4 +704,107 @@ fn an_earlier_runs_guard_does_not_remove_a_later_runs_values() {
     assert_eq!(r.engine.job_locker_state(7), (Some(2 << 30), Some("second.example".to_string())), "the later run's values stay");
     drop((second_size, second_link));
     assert_eq!(r.engine.job_locker_state(7), (None, None));
+}
+
+/// A capturer for the tests (P11.15b): records each call, and either fails with
+/// `fail` or writes a small file where the browser's would go.
+struct FakeCapture {
+    fail: Option<String>,
+    calls: std::sync::Mutex<Vec<(String, PathBuf, omni_core::locker::CaptureLimits)>>,
+}
+
+impl omni_core::locker::LockerCapture for FakeCapture {
+    fn capture<'a>(&'a self, url: &'a str, dir: &'a Path, limits: omni_core::locker::CaptureLimits) -> omni_core::locker::CaptureFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((url.to_string(), dir.to_path_buf(), limits));
+            if let Some(why) = &self.fail {
+                return Err(why.clone());
+            }
+            let files = dir.join("files");
+            std::fs::create_dir_all(&files).unwrap();
+            let file = files.join("capture.mp4");
+            std::fs::write(&file, b"not really a video").unwrap();
+            Ok(file)
+        })
+    }
+}
+
+/// [`rig`] whose engine handles locker links as `settings` says.
+fn rig_locker(settings: omni_core::locker::LockerSettings) -> Rig {
+    let r = rig();
+    let engine = BroadcastEngine::new(
+        r.repo.clone(),
+        r.root.join("no-yt-dlp.exe"),
+        r.root.join("no-ffmpeg.exe"),
+        r.root.join("no-ffprobe.exe"),
+        r.root.join("no-bmx.exe"),
+        r.root.join("temp"),
+        r.root.join("watch"),
+    )
+    .with_locker(settings);
+    engine.stop_new_deliveries();
+    Rig { engine: Arc::new(engine), ..r }
+}
+
+/// P11.15b: with `locker.direct_shares` off a share of one file waits for MCR, as before P11.15a.
+#[tokio::test]
+async fn with_direct_shares_off_a_share_waits_for_mcr() {
+    omni_core::net::refuse_lookups_for_tests();
+    let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: false, capture: None });
+    let id = r.repo.enqueue(&NewJob::new("https://www.dropbox.com/s/abc123/clip.mp4?dl=0", "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let job = r.lease(id);
+    r.run_job(job).await;
+    let row = r.row(id);
+    assert_eq!(row.status, JobStatus::ManualDownload);
+    let said = row.error_message.unwrap_or_default();
+    assert!(said.contains("Dropbox") && said.contains("locker.direct_shares"), "{said}");
+}
+
+/// P11.15b: with the capture on, a locker page the browser cannot get ends at
+/// the desk at once, the service named, the reason's addresses replaced by the
+/// sent link, and the capture asked once only (no retry loop).
+#[tokio::test]
+async fn a_failed_capture_ends_at_the_desk_once_with_the_service_named() {
+    omni_core::net::refuse_lookups_for_tests();
+    let fake = Arc::new(FakeCapture { fail: Some("no download started (https://cdn.example/x?token=SECRET9)".into()), calls: Default::default() });
+    let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: true, capture: Some(fake.clone()) });
+    let sent = "https://we.tl/t-abc123";
+    let id = r.repo.enqueue(&NewJob::new(sent, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let job = r.lease(id);
+    r.run_job(job).await;
+    let row = r.row(id);
+    assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::ManualDownload, Some("MANUAL_DOWNLOAD")));
+    let said = row.error_message.unwrap_or_default();
+    // The reason's address is named by the sent link's site (P11.15a4).
+    assert!(said.contains("WeTransfer") && said.contains("no download started (we.tl)"), "{said}");
+    assert!(!said.contains("SECRET9") && !said.contains("cdn.example"), "{said}");
+    assert_eq!(fake.calls.lock().unwrap().len(), 1, "asked once");
+    assert!(r.repo.lease_job("w2", 600).unwrap().is_none(), "nothing is queued again");
+}
+
+/// P11.15b: a file the capture got goes through the pipeline as an attachment
+/// does, from the job's own workspace, bounded by `locker.max_file_gb`; the job
+/// keeps the link that was sent.
+#[tokio::test]
+async fn a_captured_file_goes_through_the_pipeline_from_the_jobs_workspace() {
+    omni_core::net::refuse_lookups_for_tests();
+    let fake = Arc::new(FakeCapture { fail: None, calls: Default::default() });
+    let r = rig_locker(omni_core::locker::LockerSettings { direct_shares: true, capture: Some(fake.clone()) });
+    let sent = "https://we.tl/t-abc123";
+    let id = r.repo.enqueue(&NewJob::new(sent, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let job = r.lease(id);
+    r.run_job(job).await;
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let (url, dir, limits) = &calls[0];
+    assert_eq!(url, sent);
+    assert_eq!(dir, &r.engine.job_temp(id).join("capture"), "inside the job's own workspace");
+    assert_eq!(limits.max_bytes, r.engine.locker_max_file_bytes());
+    assert_eq!(limits.budget, omni_core::locker::CAPTURE_BUDGET);
+    let texts: Vec<String> = r.repo.get_job_events(id, 500).unwrap().into_iter().map(|e| e.message).collect();
+    assert!(texts.iter().any(|t| t.contains("WeTransfer page: the browser downloaded the file")), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("Source is the file the browser downloaded from the file-locker page")), "the pipeline took it as its source: {texts:?}");
+    let row = r.row(id);
+    assert_eq!(row.url, sent);
+    assert_ne!(row.status, JobStatus::ManualDownload, "a captured file is not sent to the desk: {:?}", row.error_message);
 }

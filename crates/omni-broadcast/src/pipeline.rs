@@ -528,6 +528,9 @@ pub struct BroadcastEngine {
     locker_links: JobSlot<String>,
     /// `locker.max_file_gb` in bytes: the limit of a file-locker share's download (P11.15a2).
     locker_max_file_bytes: u64,
+    /// What the worker does with file-locker links (P11.15): `locker.direct_shares`, and
+    /// the browser capture when `locker.browser_capture` is on.
+    locker: omni_core::locker::LockerSettings,
     /// The H.264 encoder previews use, found on first use (P10.6).
     preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
     /// Where a delivered job's source goes instead of the bin (P1.7); `None`
@@ -701,6 +704,23 @@ impl BroadcastEngine {
         self.locker_max_file_bytes
     }
 
+    /// Handle file-locker links as `settings` says (P11.15b).
+    pub fn with_locker(mut self, settings: omni_core::locker::LockerSettings) -> Self {
+        self.locker = settings;
+        self
+    }
+
+    /// The file-locker settings (P11.15b).
+    pub fn locker(&self) -> &omni_core::locker::LockerSettings {
+        &self.locker
+    }
+
+    /// Job `job_id`'s own workspace, `temp/jobs/{id}`: everything a run writes
+    /// goes in it, and it is removed as a whole (D-04).
+    pub fn job_temp(&self, job_id: i64) -> PathBuf {
+        self.temp_dir.join("jobs").join(job_id.to_string())
+    }
+
     /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
     pub fn set_login_site(&self, job_id: i64, video_url: &str) -> LoginSiteGuard {
         self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, video_url.to_string());
@@ -755,6 +775,7 @@ impl BroadcastEngine {
             max_filesizes: Arc::new(Mutex::new(HashMap::new())),
             locker_links: Arc::new(Mutex::new(HashMap::new())),
             locker_max_file_bytes: omni_core::config::LockerConfig::default().max_file_bytes(),
+            locker: omni_core::locker::LockerSettings::default(),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
             archive: None,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1012,12 +1033,13 @@ impl BroadcastEngine {
                 WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
                 return Err(anyhow::anyhow!(err_msg).context(ErrorCode::ManualDownload.as_str()));
             };
-            let _ = self.repo.record_event(
-                job_id,
-                "INFO",
-                Some(JobStage::Download),
-                "Source is the file attached to the email; nothing to download",
-            );
+            // A file-locker page's file the browser already downloaded (P11.15b) takes this path too.
+            let said = if url == omni_core::locker::CAPTURE_URL {
+                "Source is the file the browser downloaded from the file-locker page; nothing more to download"
+            } else {
+                "Source is the file attached to the email; nothing to download"
+            };
+            let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Download), said);
             let first = self.finish_from_source(job.clone(), owner, source, job_temp.clone(), cancel.clone(), delivery).await;
             let context = SourceContext { referer, user_agent, cookies };
             return self.or_second_route(first, job, owner, context, cancel, delivery, job_temp).await;

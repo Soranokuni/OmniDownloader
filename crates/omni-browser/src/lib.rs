@@ -1,6 +1,7 @@
 pub mod adblock;
 pub mod error;
 pub mod browser;
+pub mod capture;
 pub mod evidence;
 pub mod glomex;
 pub mod http_fetcher;
