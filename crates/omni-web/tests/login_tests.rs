@@ -31,14 +31,14 @@ fn build(configure: impl FnOnce(&mut AppConfig)) -> Result<App> {
     configure(&mut config);
 
     repo.create_user(
-        "it@station.gr",
+        "it@example.gr",
         PASSWORD,
         UserRole::Admin,
         "Administrator",
         None,
     )?;
     repo.create_user(
-        "reporter@station.gr",
+        "reporter@example.gr",
         PASSWORD,
         UserRole::User,
         "Reporter",
@@ -83,7 +83,7 @@ async fn login(app: &App, peer: &str, email: &str, password: &str) -> Result<(St
 #[tokio::test]
 async fn a_correct_password_issues_a_hardened_cookie() -> Result<()> {
     let app = build(|_| {})?;
-    let (status, cookie) = login(&app, "10.0.0.1:1234", "it@station.gr", PASSWORD).await?;
+    let (status, cookie) = login(&app, "10.0.0.1:1234", "it@example.gr", PASSWORD).await?;
     assert_eq!(status, StatusCode::OK);
 
     let cookie = cookie.expect("a session cookie must be set");
@@ -111,7 +111,7 @@ async fn an_unknown_account_and_a_wrong_password_are_indistinguishable() -> Resu
                 .header("content-type", "application/json")
                 .header("x-omni-request", "1")
                 .body(Body::from(
-                    json!({"email":"nobody@station.gr","password":"whatever"}).to_string(),
+                    json!({"email":"nobody@example.gr","password":"whatever"}).to_string(),
                 ))?,
         )
         .await?;
@@ -129,7 +129,7 @@ async fn an_unknown_account_and_a_wrong_password_are_indistinguishable() -> Resu
                 .header("content-type", "application/json")
                 .header("x-omni-request", "1")
                 .body(Body::from(
-                    json!({"email":"it@station.gr","password":"wrong"}).to_string(),
+                    json!({"email":"it@example.gr","password":"wrong"}).to_string(),
                 ))?,
         )
         .await?;
@@ -152,7 +152,7 @@ async fn repeated_failures_from_one_host_are_locked_out_with_retry_after() -> Re
     })?;
 
     for _ in 0..3 {
-        let (status, _) = login(&app, "10.0.0.9:1", "it@station.gr", "wrong").await?;
+        let (status, _) = login(&app, "10.0.0.9:1", "it@example.gr", "wrong").await?;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -169,7 +169,7 @@ async fn repeated_failures_from_one_host_are_locked_out_with_retry_after() -> Re
                 .header("content-type", "application/json")
                 .header("x-omni-request", "1")
                 .body(Body::from(
-                    json!({"email":"it@station.gr","password": PASSWORD}).to_string(),
+                    json!({"email":"it@example.gr","password": PASSWORD}).to_string(),
                 ))?,
         )
         .await?;
@@ -177,7 +177,7 @@ async fn repeated_failures_from_one_host_are_locked_out_with_retry_after() -> Re
     assert!(res.headers().get("retry-after").is_some());
 
     // A different workstation is unaffected.
-    let (status, _) = login(&app, "10.0.0.10:1", "it@station.gr", PASSWORD).await?;
+    let (status, _) = login(&app, "10.0.0.10:1", "it@example.gr", PASSWORD).await?;
     assert_eq!(status, StatusCode::OK);
     Ok(())
 }
@@ -185,8 +185,8 @@ async fn repeated_failures_from_one_host_are_locked_out_with_retry_after() -> Re
 #[tokio::test]
 async fn every_login_attempt_is_recorded() -> Result<()> {
     let app = build(|_| {})?;
-    login(&app, "10.0.0.5:1", "it@station.gr", "wrong").await?;
-    login(&app, "10.0.0.5:1", "it@station.gr", PASSWORD).await?;
+    login(&app, "10.0.0.5:1", "it@example.gr", "wrong").await?;
+    login(&app, "10.0.0.5:1", "it@example.gr", PASSWORD).await?;
 
     // Written straight to the table the audit trail reads from. The password
     // itself is never part of the row.
@@ -212,8 +212,8 @@ async fn session_lifetime_follows_the_role() -> Result<()> {
         c.security.session_hours_user = 12;
     })?;
 
-    let (_, admin_cookie) = login(&app, "10.0.0.1:1", "it@station.gr", PASSWORD).await?;
-    let (_, user_cookie) = login(&app, "10.0.0.2:1", "reporter@station.gr", PASSWORD).await?;
+    let (_, admin_cookie) = login(&app, "10.0.0.1:1", "it@example.gr", PASSWORD).await?;
+    let (_, user_cookie) = login(&app, "10.0.0.2:1", "reporter@example.gr", PASSWORD).await?;
 
     let max_age = |c: Option<String>| -> i64 {
         let c = c.unwrap();
@@ -235,7 +235,7 @@ async fn an_idle_session_stops_working_even_before_its_absolute_expiry() -> Resu
         c.security.session_idle_hours = 1;
     })?;
 
-    let user = app.repo.get_user_by_email("it@station.gr")?.unwrap();
+    let user = app.repo.get_user_by_email("it@example.gr")?.unwrap();
     let token = omni_core::auth::generate_session_token();
     // A 30-day absolute lifetime, so only the idle clock can end this.
     app.repo
@@ -281,8 +281,8 @@ async fn an_idle_session_stops_working_even_before_its_absolute_expiry() -> Resu
 async fn changing_a_password_ends_every_session_for_that_account() -> Result<()> {
     let app = build(|_| {})?;
 
-    let (_, cookie_a) = login(&app, "10.0.0.1:1", "reporter@station.gr", PASSWORD).await?;
-    let (_, cookie_b) = login(&app, "10.0.0.2:1", "reporter@station.gr", PASSWORD).await?;
+    let (_, cookie_a) = login(&app, "10.0.0.1:1", "reporter@example.gr", PASSWORD).await?;
+    let (_, cookie_b) = login(&app, "10.0.0.2:1", "reporter@example.gr", PASSWORD).await?;
     let token_a = session_token(cookie_a.unwrap());
     let token_b = session_token(cookie_b.unwrap());
 
@@ -329,7 +329,7 @@ async fn changing_a_password_ends_every_session_for_that_account() -> Result<()>
     let (status, _) = login(
         &app,
         "10.0.0.3:1",
-        "reporter@station.gr",
+        "reporter@example.gr",
         "a-brand-new-passphrase",
     )
     .await?;
@@ -340,7 +340,7 @@ async fn changing_a_password_ends_every_session_for_that_account() -> Result<()>
 #[tokio::test]
 async fn a_password_change_needs_the_current_password() -> Result<()> {
     let app = build(|_| {})?;
-    let (_, cookie) = login(&app, "10.0.0.1:1", "reporter@station.gr", PASSWORD).await?;
+    let (_, cookie) = login(&app, "10.0.0.1:1", "reporter@example.gr", PASSWORD).await?;
     let token = session_token(cookie.unwrap());
 
     let res = app
@@ -366,7 +366,7 @@ async fn a_password_change_needs_the_current_password() -> Result<()> {
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
     // The old password still works, so nothing was changed.
-    let (status, _) = login(&app, "10.0.0.4:1", "reporter@station.gr", PASSWORD).await?;
+    let (status, _) = login(&app, "10.0.0.4:1", "reporter@example.gr", PASSWORD).await?;
     assert_eq!(status, StatusCode::OK);
     Ok(())
 }
@@ -388,7 +388,7 @@ fn session_token(cookie: String) -> String {
 async fn the_secrets_api_never_returns_a_value() -> Result<()> {
     let dir = TempDir::new()?;
     let repo = Repository::new(dir.path().join("omni.db"))?;
-    let admin = repo.create_user("it@station.gr", PASSWORD, UserRole::Admin, "Admin", None)?;
+    let admin = repo.create_user("it@example.gr", PASSWORD, UserRole::Admin, "Admin", None)?;
     let token = omni_core::auth::generate_session_token();
     repo.create_session(admin, &token, 1)?;
 

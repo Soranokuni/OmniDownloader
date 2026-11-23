@@ -4,7 +4,7 @@
  */
 
 import { api, el, render, toast, fmtTime } from '/static/app.js?v=6';
-import { t } from '/static/admin-text.js?v=3';
+import { t } from '/static/admin-text.js?v=4';
 
 // The autonomy report (P11.0): the soak test's figure and why people were needed.
 // Each touch reason has its words under `admin.touch.<reason>`.

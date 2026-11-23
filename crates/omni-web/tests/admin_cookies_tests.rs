@@ -53,7 +53,7 @@ impl App {
     fn new(tester: Option<Arc<FakeTester>>) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
-        let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+        let id = repo.create_user("it@example.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
         let admin = omni_core::auth::generate_session_token();
         repo.create_session(id, &admin, 1)?;
         let health = HealthState::new();
@@ -124,7 +124,7 @@ async fn an_upload_is_stored_and_nothing_that_comes_back_holds_a_cookie_value() 
     assert!(!list.contains(VALUE) && !list.contains("auth_token") && !list.contains("ct0"), "the list shows contents: {list}");
     let l: Value = serde_json::from_str(&list)?;
     assert_eq!(l["jars"][0]["domain"], "x.com");
-    assert_eq!(l["jars"][0]["updated_by"], "it@station.gr");
+    assert_eq!(l["jars"][0]["updated_by"], "it@example.gr");
     assert_eq!(l["jars"][0]["cookie_count"], 2);
 
     let audit = app.audit().await?;

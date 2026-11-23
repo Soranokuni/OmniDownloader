@@ -33,8 +33,8 @@ fn build(ip_limit: u32, account_limit: u32) -> Result<App> {
     let mut config = AppConfig::default();
     config.security.login_rate_limit_per_5min = ip_limit;
     config.security.login_rate_limit_per_account_hour = account_limit;
-    repo.create_user("it@station.gr", PASSWORD, UserRole::Admin, "Administrator", None)?;
-    repo.create_user("reporter@station.gr", PASSWORD, UserRole::User, "Reporter", Some("PAPADAKI"))?;
+    repo.create_user("it@example.gr", PASSWORD, UserRole::Admin, "Administrator", None)?;
+    repo.create_user("reporter@example.gr", PASSWORD, UserRole::User, "Reporter", Some("PAPADAKI"))?;
     let state = AppState::new(repo.clone(), config, dir.path().join("config.json"));
     Ok(App {
         router: WebServer::build_router(state.clone()),
@@ -112,11 +112,11 @@ fn session_token(cookie: String) -> String {
 async fn a_flood_of_denied_attempts_writes_one_rate_limited_row() -> Result<()> {
     let app = build(3, 100)?;
     for _ in 0..3 {
-        let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@station.gr", "wrong").await?;
+        let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@example.gr", "wrong").await?;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
     }
     for _ in 0..50 {
-        let (s, _) = login(&app.router, "10.0.0.1:1", "Reporter@Station.gr", "wrong").await?;
+        let (s, _) = login(&app.router, "10.0.0.1:1", "Reporter@Example.gr", "wrong").await?;
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     }
     let rows = app.repo.recent_login_attempts(1000)?;
@@ -128,7 +128,7 @@ async fn a_flood_of_denied_attempts_writes_one_rate_limited_row() -> Result<()> 
 #[tokio::test]
 async fn a_huge_email_is_stored_truncated() -> Result<()> {
     let app = build(0, 0)?;
-    let huge = format!("{}@station.gr", "a".repeat(60 * 1024));
+    let huge = format!("{}@example.gr", "a".repeat(60 * 1024));
     // Larger than the body cap would be refused, so stay just under it.
     let (s, _) = login(&app.router, "10.0.0.1:1", &huge, "wrong").await?;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -144,7 +144,7 @@ async fn concurrent_wrong_logins_complete_and_the_runtime_keeps_answering() -> R
     for i in 0..20 {
         let router = app.router.clone();
         tasks.push(tokio::spawn(async move {
-            login(&router, &format!("10.0.1.{}:1", i + 1), "reporter@station.gr", "wrong").await
+            login(&router, &format!("10.0.1.{}:1", i + 1), "reporter@example.gr", "wrong").await
         }));
     }
     // While the Argon2 work drains, the health endpoint must keep answering. It is
@@ -227,7 +227,7 @@ async fn a_parallel_burst_reaches_password_verification_only_up_to_the_account_l
     for i in 0..50 {
         let router = app.router.clone();
         tasks.push(tokio::spawn(async move {
-            login(&router, &format!("10.0.2.{}:1", i + 1), "reporter@station.gr", "wrong").await
+            login(&router, &format!("10.0.2.{}:1", i + 1), "reporter@example.gr", "wrong").await
         }));
     }
     let mut limited = 0;
@@ -244,15 +244,15 @@ async fn a_parallel_burst_reaches_password_verification_only_up_to_the_account_l
 #[tokio::test]
 async fn an_unknown_or_deactivated_account_still_pays_for_a_verification() -> Result<()> {
     let app = build(0, 0)?;
-    let (s, _) = login(&app.router, "10.0.0.1:1", "nobody@station.gr", "wrong").await?;
+    let (s, _) = login(&app.router, "10.0.0.1:1", "nobody@example.gr", "wrong").await?;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     assert_eq!(app.state.password_checks.load(Ordering::SeqCst), 1);
 
     // The lookup does not return a deactivated account, so it takes the same
     // "unknown" path, dummy verification included.
-    let id = app.repo.get_user_by_email("reporter@station.gr")?.unwrap().id;
+    let id = app.repo.get_user_by_email("reporter@example.gr")?.unwrap().id;
     app.repo.set_user_active_status(id, false)?;
-    let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@station.gr", PASSWORD).await?;
+    let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@example.gr", PASSWORD).await?;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     assert_eq!(app.state.password_checks.load(Ordering::SeqCst), 2);
     Ok(())
@@ -262,11 +262,11 @@ async fn an_unknown_or_deactivated_account_still_pays_for_a_verification() -> Re
 async fn a_flood_with_a_different_email_each_time_still_writes_one_row() -> Result<()> {
     let app = build(3, 100)?;
     for i in 0..3 {
-        let (s, _) = login(&app.router, "10.0.0.9:1", &format!("a{i}@station.gr"), "wrong").await?;
+        let (s, _) = login(&app.router, "10.0.0.9:1", &format!("a{i}@example.gr"), "wrong").await?;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
     }
     for i in 0..50 {
-        let (s, _) = login(&app.router, "10.0.0.9:1", &format!("b{i}@station.gr"), "wrong").await?;
+        let (s, _) = login(&app.router, "10.0.0.9:1", &format!("b{i}@example.gr"), "wrong").await?;
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     }
     let rows = app.repo.recent_login_attempts(1000)?;
@@ -282,19 +282,19 @@ const LEGACY_HASH: &str =
 #[tokio::test]
 async fn a_legacy_hash_is_upgraded_on_a_successful_login_only() -> Result<()> {
     let app = build(0, 0)?;
-    let user = app.repo.get_user_by_email("reporter@station.gr")?.unwrap();
+    let user = app.repo.get_user_by_email("reporter@example.gr")?.unwrap();
     assert!(app.repo.upgrade_password_hash(user.id, &user.password_hash, LEGACY_HASH)?);
     assert!(omni_core::auth::needs_rehash(LEGACY_HASH));
 
     // A wrong password leaves the legacy hash alone.
-    let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@station.gr", "wrong").await?;
+    let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@example.gr", "wrong").await?;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    let stored = app.repo.get_user_by_email("reporter@station.gr")?.unwrap().password_hash;
+    let stored = app.repo.get_user_by_email("reporter@example.gr")?.unwrap().password_hash;
     assert_eq!(stored, LEGACY_HASH);
 
-    let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@station.gr", "legacy-pass-for-tests").await?;
+    let (s, _) = login(&app.router, "10.0.0.1:1", "reporter@example.gr", "legacy-pass-for-tests").await?;
     assert_eq!(s, StatusCode::OK);
-    let stored = app.repo.get_user_by_email("reporter@station.gr")?.unwrap().password_hash;
+    let stored = app.repo.get_user_by_email("reporter@example.gr")?.unwrap().password_hash;
     assert_ne!(stored, LEGACY_HASH);
     assert!(!omni_core::auth::needs_rehash(&stored), "got {stored}");
     assert!(omni_core::auth::verify_password("legacy-pass-for-tests", &stored));
@@ -304,7 +304,7 @@ async fn a_legacy_hash_is_upgraded_on_a_successful_login_only() -> Result<()> {
 #[tokio::test]
 async fn change_password_guesses_share_the_account_limit() -> Result<()> {
     let app = build(0, 3)?;
-    let (s, cookie) = login(&app.router, "10.0.0.1:1", "reporter@station.gr", PASSWORD).await?;
+    let (s, cookie) = login(&app.router, "10.0.0.1:1", "reporter@example.gr", PASSWORD).await?;
     assert_eq!(s, StatusCode::OK);
     let token = session_token(cookie.unwrap());
 
@@ -318,10 +318,10 @@ async fn change_password_guesses_share_the_account_limit() -> Result<()> {
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
 
     // Another account is unaffected.
-    let (s, _) = login(&app.router, "10.0.0.2:1", "it@station.gr", PASSWORD).await?;
+    let (s, _) = login(&app.router, "10.0.0.2:1", "it@example.gr", PASSWORD).await?;
     assert_eq!(s, StatusCode::OK);
     // And the password was not changed.
-    let (s, _) = login(&app.router, "10.0.0.3:1", "reporter@station.gr", "a-brand-new-passphrase").await?;
+    let (s, _) = login(&app.router, "10.0.0.3:1", "reporter@example.gr", "a-brand-new-passphrase").await?;
     assert_ne!(s, StatusCode::OK);
     Ok(())
 }

@@ -436,11 +436,11 @@ mod tests {
         let mut w = writer(sink.clone(), &["hunter2-mailbox-pass"]);
 
         // The shape an IMAP library actually logs on a failed login.
-        write!(w, "IMAP LOGIN ingest@station.gr hunter2-mailbox-pass -> NO").unwrap();
+        write!(w, "IMAP LOGIN ingest@example.gr hunter2-mailbox-pass -> NO").unwrap();
 
         let out = sink.text();
         assert!(!out.contains("hunter2-mailbox-pass"), "{out}");
-        assert_eq!(out, "IMAP LOGIN ingest@station.gr *** -> NO");
+        assert_eq!(out, "IMAP LOGIN ingest@example.gr *** -> NO");
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl App {
     fn new(runner: Option<Arc<FakeRunner>>) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
-        let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+        let id = repo.create_user("it@example.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
         let admin = omni_core::auth::generate_session_token();
         repo.create_session(id, &admin, 1)?;
         let mut state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));
@@ -373,7 +373,7 @@ fn attempt(repo: &Repository, n: u32, site: &str, mode: &str, outcome: &str, ago
 async fn the_shadow_summary_counts_fourteen_days_and_offers_hold_from_three_jobs() -> Result<()> {
     let dir = TempDir::new()?;
     let repo = Repository::new(dir.path().join("omni.db"))?;
-    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let id = repo.create_user("it@example.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
     let admin = omni_core::auth::generate_session_token();
     repo.create_session(id, &admin, 1)?;
     let state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));
@@ -411,7 +411,7 @@ async fn the_switch_to_hold_is_saved_live_and_audited_once() -> Result<()> {
     let dir = TempDir::new()?;
     let config_path = dir.path().join("config.json");
     let repo = Repository::new(dir.path().join("omni.db"))?;
-    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let id = repo.create_user("it@example.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
     let admin = omni_core::auth::generate_session_token();
     repo.create_session(id, &admin, 1)?;
     let workers = omni_core::config::LiveRepairMode::new(omni_core::config::RepairMode::Shadow);
@@ -426,7 +426,7 @@ async fn the_switch_to_hold_is_saved_live_and_audited_once() -> Result<()> {
     let (_, after) = app.send("GET", "/api/admin/repair/shadow", None).await?;
     assert_eq!((after["repair_mode"].as_str(), after["hold_offered"].as_bool()), (Some("hold"), Some(false)));
     let audited = |repo: &Repository| -> Result<usize> {
-        Ok(repo.get_recent_audit_logs(100)?.into_iter().filter(|l| l.message.contains("Repair mode switched from shadow to hold by it@station.gr")).count())
+        Ok(repo.get_recent_audit_logs(100)?.into_iter().filter(|l| l.message.contains("Repair mode switched from shadow to hold by it@example.gr")).count())
     };
     assert_eq!(audited(&repo)?, 1);
 
@@ -568,7 +568,7 @@ async fn the_import_hint_names_a_domain_the_import_accepts_and_a_barred_recipe_i
 async fn a_desk_stream_counts_while_open_and_the_reminder_reads_what_waits() -> Result<()> {
     let dir = TempDir::new()?;
     let repo = Repository::new(dir.path().join("omni.db"))?;
-    let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+    let id = repo.create_user("it@example.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
     let admin = omni_core::auth::generate_session_token();
     repo.create_session(id, &admin, 1)?;
     let desks = omni_core::held::DeskPresence::new();

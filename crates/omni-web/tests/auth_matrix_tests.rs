@@ -67,7 +67,7 @@ struct Tokens {
 
 impl Harness {
     fn new(with_admin: bool) -> Result<Self> {
-        Self::build(with_admin.then_some(("it@station.gr", "correct-horse-battery")))
+        Self::build(with_admin.then_some(("it@example.gr", "correct-horse-battery")))
     }
 
     /// The Admin caller is the first-run `admin` / `Admin` account (P2.14).
@@ -90,7 +90,7 @@ impl Harness {
         let mut tokens = Tokens::default();
 
         let user_id = repo.create_user(
-            "reporter@station.gr",
+            "reporter@example.gr",
             "correct-horse-battery",
             UserRole::User,
             "Reporter",
@@ -100,7 +100,7 @@ impl Harness {
         repo.create_session(user_id, &tokens.user, 1)?;
 
         let mcr_id = repo.create_user(
-            "desk@station.gr",
+            "desk@example.gr",
             "correct-horse-battery",
             UserRole::OpenMcr,
             "MCR Desk",

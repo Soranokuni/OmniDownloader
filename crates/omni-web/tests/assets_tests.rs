@@ -132,7 +132,7 @@ async fn a_hostile_job_url_is_returned_as_data_and_never_as_markup() -> Result<(
     let repo = Repository::new(dir.path().join("omni.db"))?;
     let token = omni_core::auth::generate_session_token();
     let mcr = repo.create_user(
-        "desk@station.gr",
+        "desk@example.gr",
         "correct-horse-battery",
         UserRole::OpenMcr,
         "MCR Desk",
@@ -1600,11 +1600,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v42_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v44_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=43"), "admin.html does not import admin.js?v=43");
-    assert!(!admin.contains("/static/admin.js?v=42"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=44"), "admin.html does not import admin.js?v=44");
+    assert!(!admin.contains("/static/admin.js?v=43"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -1729,7 +1729,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["13".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["14".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");
@@ -1990,6 +1990,15 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
     }
     let wizard = code("static/wizard.js");
     assert!(wizard.contains("t('admin.help.cidr')") && wizard.contains("t('admin.help.proxy')"), "the wizard does not explain CIDR and the proxy header");
+    // P13.10b: the People examples follow the language, and no page names a real-looking domain.
+    for id in ["g-name", "g-keywords", "pf-name", "pf-emails", "pf-aliases"] {
+        let at = html.find(&format!("id=\"{id}\"")).unwrap_or_else(|| panic!("{id} missing"));
+        let tag = &html[at..at + html[at..].find('>').unwrap()];
+        assert!(tag.contains("data-t-placeholder=") && !tag.contains(" placeholder="), "{id} keeps a fixed example");
+    }
+    for (name, src) in &assets {
+        assert!(!src.contains("station.gr") && !src.contains("radio.gr"), "{name} names a real-looking domain");
+    }
     // P13.6b: the Sites note names the buttons as they read, in each language.
     for words in [&el, &en] {
         for button in ["admin.sites.run_now", "admin.refresh"] {

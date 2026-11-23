@@ -121,7 +121,7 @@
           <label for="test-mail-client" style="margin-top:8px" data-t="admin.mail.client"></label>
           <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
           <label for="test-mail-user" style="margin-top:8px" data-t="admin.mail.mailbox"></label>
-          <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
+          <input type="text" id="test-mail-user" placeholder="ingest@example.gr">
           <label for="test-mail-secret" style="margin-top:8px" data-t="admin.mail.secret"></label>
           <input type="password" id="test-mail-secret" autocomplete="off">
           <label for="test-mail-expires" style="margin-top:8px" data-t="admin.mail.expires"></label>
@@ -333,7 +333,7 @@
           </div>
           <div>
             <label for="g-name" data-t="admin.col.name"></label>
-            <input type="text" id="g-name" required placeholder="Κεντρικό Δελτίο Ειδήσεων">
+            <input type="text" id="g-name" required data-t-placeholder="admin.groups.name_ph">
           </div>
         </div>
         <div class="grid-2">
@@ -348,7 +348,7 @@
           </div>
           <div>
             <label for="g-keywords" data-t="admin.groups.keywords"></label>
-            <input type="text" id="g-keywords" placeholder="ΔΕΛΤΙΟ, ΚΕΝΤΡΙΚΟ ΔΕΛΤΙΟ">
+            <input type="text" id="g-keywords" data-t-placeholder="admin.groups.keywords_ph">
           </div>
         </div>
         <div>
@@ -377,16 +377,16 @@
           </div>
           <div>
             <label for="pf-name" data-t="wizard.account.name"></label>
-            <input type="text" id="pf-name" required placeholder="Μαρία Παπαδάκη">
+            <input type="text" id="pf-name" required data-t-placeholder="admin.people.name_ph">
           </div>
         </div>
         <div>
           <label for="pf-emails" data-t="admin.people.emails"></label>
-          <input type="text" id="pf-emails" placeholder="m.papadaki@station.gr, papadaki@radio.gr" autocomplete="off" spellcheck="false">
+          <input type="text" id="pf-emails" data-t-placeholder="admin.people.emails_ph" autocomplete="off" spellcheck="false">
         </div>
         <div>
           <label for="pf-aliases" data-t="admin.people.aliases"></label>
-          <input type="text" id="pf-aliases" placeholder="ΠΑΠΑΔΑΚΗ, ΜΑΡΙΑ, ΜΑΙΡΗ">
+          <input type="text" id="pf-aliases" data-t-placeholder="admin.people.aliases_ph">
         </div>
         <div class="grid-2">
           <div>
@@ -724,6 +724,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=43"></script>
+<script type="module" src="/static/admin.js?v=44"></script>
 </body>
 </html>

@@ -1696,7 +1696,7 @@ mod tests {
         std::fs::write(
             &path,
             r#"{ "imap_server": "outlook.office365.com", "imap_port": 993,
-                 "email_address": "ingest@station.gr", "email_password": "legacy-secret-value" }"#,
+                 "email_address": "ingest@example.gr", "email_password": "legacy-secret-value" }"#,
         )
         .unwrap();
         let store = SecretStore::new(dir.path().join("secrets.bin"));

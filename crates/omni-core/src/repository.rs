@@ -8865,11 +8865,11 @@ mod tests {
         // Multi-byte characters: a byte cut at 254 would split one.
         let huge = "\u{3a9}".repeat(30_000); // 60 KB
         repo.record_login_attempt(Some(&huge), Some("10.0.0.1"), false, Some("unknown_account"))?;
-        repo.record_login_attempt(Some("Short@Station.GR"), None, false, None)?;
+        repo.record_login_attempt(Some("Short@Example.GR"), None, false, None)?;
         let rows = repo.recent_login_attempts(10)?;
         let long = rows.iter().find(|r| r.email.as_deref().is_some_and(|e| e.len() > 20)).unwrap();
         assert_eq!(long.email.as_deref().unwrap().chars().count(), 254);
-        assert!(rows.iter().any(|r| r.email.as_deref() == Some("short@station.gr")));
+        assert!(rows.iter().any(|r| r.email.as_deref() == Some("short@example.gr")));
         Ok(())
     }
 
@@ -9558,14 +9558,14 @@ mod tests {
         let repo = Repository::new(temp_db.path())?;
 
         // 1. User CRUD
-        let user_id = repo.create_user("journalist@station.gr", "hash123", UserRole::User, "Maria Papadaki", Some("PAPADAKI"))?;
+        let user_id = repo.create_user("journalist@example.gr", "hash123", UserRole::User, "Maria Papadaki", Some("PAPADAKI"))?;
         let user = repo.get_user_by_id(user_id)?.expect("User must exist");
-        assert_eq!(user.email, "journalist@station.gr");
+        assert_eq!(user.email, "journalist@example.gr");
         assert_eq!(user.journalist_surname.as_deref(), Some("PAPADAKI"));
 
         // 2. Journalist Mapping
-        repo.save_journalist("PAPADAKI", "Maria Papadaki", &["m.papadaki@station.gr".to_string()], 10)?;
-        let mapped_surname = repo.find_journalist_by_email("m.papadaki@station.gr")?;
+        repo.save_journalist("PAPADAKI", "Maria Papadaki", &["m.papadaki@example.gr".to_string()], 10)?;
+        let mapped_surname = repo.find_journalist_by_email("m.papadaki@example.gr")?;
         assert_eq!(mapped_surname.as_deref(), Some("PAPADAKI"));
 
         // 3. Queue Job Insertion & Atomic Leasing
@@ -9579,7 +9579,7 @@ mod tests {
             JobStatus::Pending,
             Some(user_id),
             Some("ΓΙΑ ΠΛΑΝΑ"),
-            Some("newsroom@station.gr"),
+            Some("newsroom@example.gr"),
         )?;
         assert!(job_id > 0);
 

@@ -10,8 +10,8 @@
  */
 
 import { api, el, render, toast, logout } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=13';
-import { t, mountLanguageSwitch } from '/static/admin-text.js?v=3';
+import { runWizard } from '/static/wizard.js?v=14';
+import { t, mountLanguageSwitch } from '/static/admin-text.js?v=4';
 
 // P13.6: the page's words in the chosen language (Greek by default) before
 // anything reads them, the search index included.
@@ -89,11 +89,11 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 
 // One URL per module; each is imported once, when its section is first opened.
 const MODULES = {
-  overview: () => import('/static/admin-overview.js?v=5'),
-  settings: () => import('/static/admin-settings.js?v=5'),
-  people: () => import('/static/admin-people.js?v=4'),
-  sites: () => import('/static/admin-sites.js?v=5'),
-  maintenance: () => import('/static/admin-maintenance.js?v=4'),
+  overview: () => import('/static/admin-overview.js?v=6'),
+  settings: () => import('/static/admin-settings.js?v=6'),
+  people: () => import('/static/admin-people.js?v=5'),
+  sites: () => import('/static/admin-sites.js?v=6'),
+  maintenance: () => import('/static/admin-maintenance.js?v=5'),
 };
 const SECTIONS = Object.keys(MODULES);
 const loaded = new Map();

@@ -393,10 +393,10 @@ mod tests {
     #[test]
     fn redaction_replaces_secret_values_wherever_they_appear() {
         let secrets = vec!["hunter2-hunter2".to_string(), "abc".to_string()];
-        let line = "IMAP LOGIN ingest@station.gr hunter2-hunter2 failed";
+        let line = "IMAP LOGIN ingest@example.gr hunter2-hunter2 failed";
         assert_eq!(
             redact(line, &secrets),
-            "IMAP LOGIN ingest@station.gr *** failed"
+            "IMAP LOGIN ingest@example.gr *** failed"
         );
 
         // A short value is skipped: redacting "abc" would black out ordinary

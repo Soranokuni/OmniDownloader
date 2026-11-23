@@ -40,7 +40,7 @@ fn build() -> Result<App> {
     let health = HealthState::new();
 
     let mcr = repo.create_user(
-        "desk@station.gr",
+        "desk@example.gr",
         "correct-horse-battery",
         UserRole::OpenMcr,
         "MCR Desk",
@@ -198,7 +198,7 @@ async fn public_health_gives_a_verdict_and_no_detail() -> Result<()> {
     );
     app.health.set(
         checks::MAIL,
-        Check::degraded("IMAP authentication failed for ingest@station.gr"),
+        Check::degraded("IMAP authentication failed for ingest@example.gr"),
     );
 
     // No session: this is what an external monitor sees.
@@ -216,7 +216,7 @@ async fn public_health_gives_a_verdict_and_no_detail() -> Result<()> {
     assert!(!raw.contains("ffmpeg"), "leaked which tool is missing: {raw}");
     assert!(!raw.contains("OmniDownloader"), "leaked a server path: {raw}");
     assert!(
-        !raw.contains("ingest@station.gr"),
+        !raw.contains("ingest@example.gr"),
         "leaked the station mailbox: {raw}"
     );
     Ok(())

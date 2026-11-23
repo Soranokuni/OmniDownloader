@@ -359,7 +359,7 @@ mod tests {
         );
         h.set(
             checks::MAIL,
-            Check::degraded("IMAP authentication failed for ingest@station.gr"),
+            Check::degraded("IMAP authentication failed for ingest@example.gr"),
         );
 
         let summary = serde_json::to_string(&h.summary()).unwrap();
@@ -367,7 +367,7 @@ mod tests {
         assert!(summary.contains("\"tools\":\"down\""), "{summary}");
         assert!(!summary.contains("ffmpeg.exe"), "{summary}");
         assert!(!summary.contains("OmniDownloader"), "{summary}");
-        assert!(!summary.contains("ingest@station.gr"), "{summary}");
+        assert!(!summary.contains("ingest@example.gr"), "{summary}");
     }
 
     #[test]

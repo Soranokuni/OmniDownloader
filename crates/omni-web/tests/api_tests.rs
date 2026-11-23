@@ -50,7 +50,7 @@ impl App {
         tweak(&mut config);
 
         let mcr_id = repo.create_user(
-            "desk@station.gr",
+            "desk@example.gr",
             "correct-horse-battery",
             UserRole::OpenMcr,
             "MCR Desk",
@@ -60,7 +60,7 @@ impl App {
         repo.create_session(mcr_id, &mcr_token, 1)?;
 
         let user_id = repo.create_user(
-            "reporter@station.gr",
+            "reporter@example.gr",
             "correct-horse-battery",
             UserRole::User,
             "Reporter",
@@ -70,7 +70,7 @@ impl App {
         repo.create_session(user_id, &user_token, 1)?;
 
         let admin_id = repo.create_user(
-            "it@station.gr",
+            "it@example.gr",
             "correct-horse-battery",
             UserRole::Admin,
             "Administrator",
@@ -293,7 +293,7 @@ async fn journalists_api_crud() -> Result<()> {
             Some(json!({
                 "surname": "PAPADOPOULOS",
                 "full_name": "Nikos Papadopoulos",
-                "emails": ["npapadopoulos@station.gr", "nikos.p@station.gr"],
+                "emails": ["npapadopoulos@example.gr", "nikos.p@example.gr"],
                 "priority": 15
             })),
         )
@@ -302,7 +302,7 @@ async fn journalists_api_crud() -> Result<()> {
 
     assert_eq!(
         app.repo
-            .find_journalist_by_email("npapadopoulos@station.gr")?
+            .find_journalist_by_email("npapadopoulos@example.gr")?
             .as_deref(),
         Some("PAPADOPOULOS")
     );
@@ -318,7 +318,7 @@ async fn journalists_api_crud() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert!(app
         .repo
-        .find_journalist_by_email("npapadopoulos@station.gr")?
+        .find_journalist_by_email("npapadopoulos@example.gr")?
         .is_none());
 
     Ok(())
@@ -388,7 +388,7 @@ async fn a_user_sees_only_their_own_jobs() -> Result<()> {
     let app = App::new()?;
     let reporter = app
         .repo
-        .get_user_by_email("reporter@station.gr")?
+        .get_user_by_email("reporter@example.gr")?
         .unwrap();
 
     app.repo.add_job(
