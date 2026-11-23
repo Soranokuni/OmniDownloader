@@ -53,7 +53,8 @@ pub async fn run(paths: &AppPaths, action: CookiesAction) -> Result<()> {
 /// [`run`] with the window's input and output given (tests).
 pub async fn run_with(paths: &AppPaths, action: CookiesAction, input: &mut dyn std::io::BufRead, screen: &mut dyn std::io::Write) -> Result<()> {
     let windowed = matches!(action, CookiesAction::SignIn { domain: None, .. });
-    let out = run_inner(paths, action).await.map_err(explain_access);
+    // The site list reads the same input: stdin is locked once, in `run` (P13.9c).
+    let out = run_inner(paths, action, input, screen).await.map_err(explain_access);
     if windowed {
         hold_window(&out, input, screen);
     }
@@ -71,7 +72,7 @@ pub fn hold_window(out: &Result<()>, input: &mut dyn std::io::BufRead, screen: &
     let _ = input.read_line(&mut line);
 }
 
-async fn run_inner(paths: &AppPaths, action: CookiesAction) -> Result<()> {
+async fn run_inner(paths: &AppPaths, action: CookiesAction, input: &mut dyn std::io::BufRead, screen: &mut dyn std::io::Write) -> Result<()> {
     let config = AppConfig::load_from_file(&paths.config).with_context(|| format!("Failed loading configuration from {:?}", paths.config))?;
     let repo = Repository::new(paths.resolve(&config.database_path))?.with_second_chance_window(&config.retry);
     match action {
@@ -79,11 +80,11 @@ async fn run_inner(paths: &AppPaths, action: CookiesAction) -> Result<()> {
         CookiesAction::SignIn { domain: Some(domain), browser } => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
         // From the Start menu (P13.9): choose a site; `run` keeps the window open.
         CookiesAction::SignIn { domain: None, browser } => {
-            let picked = pick_site(&mut std::io::stdin().lock(), &mut std::io::stdout())?;
+            let picked = pick_site(input, screen)?;
             match picked {
                 Some(domain) => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
                 None => {
-                    println!("Nothing was changed. / Δεν άλλαξε τίποτα.");
+                    writeln!(screen, "Nothing was changed. / Δεν άλλαξε τίποτα.")?;
                     Ok(())
                 }
             }
@@ -225,6 +226,28 @@ mod tests {
         let mut out = Vec::new();
         let got = pick_site(&mut answers.as_bytes(), &mut out);
         (got, String::from_utf8(out).unwrap())
+    }
+
+    /// P13.9c: with valid settings the site list reads the window's own
+    /// input (stdin is locked once, by `run`): the list is shown on the
+    /// window's screen, Enter alone stops, Enter again closes. Under a timeout,
+    /// so a second lock of the same input fails the test instead of hanging it.
+    #[tokio::test]
+    async fn the_site_list_reads_the_same_input_as_the_window() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::with_root(dir.path(), "config.json");
+        AppConfig::default().save_to_file(&paths.config).unwrap();
+        let mut screen = Vec::new();
+        let mut input = "\n\n".as_bytes();
+        let action = CookiesAction::SignIn { domain: None, browser: None };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(20), run_with(&paths, action, &mut input, &mut screen))
+            .await
+            .expect("the sign-in did not finish: the input is read twice");
+        assert!(out.is_ok(), "{out:?}");
+        let shown = String::from_utf8(screen).unwrap();
+        assert!(shown.contains("1. youtube.com"), "the list is not on the window's screen: {shown}");
+        assert!(shown.contains("Nothing was changed") && shown.contains("Press Enter"), "{shown}");
+        assert!(input.is_empty(), "both Enters were read from the window's input");
     }
 
     /// P13.9b: from the Start menu, an error before the site list (settings
