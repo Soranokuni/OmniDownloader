@@ -74,9 +74,10 @@ fn re(cell: &'static OnceLock<Regex>, pattern: &str) -> &'static Regex {
 }
 
 /// Whether `v` looks like a credential rather than a word or a status: at
-/// least 8 characters, not only digits, not only letters (P13.8c).
+/// least 8 characters and not only letters (P13.8c). Digits count: a status
+/// (`401`) is short, a numeric token is not (P13.8e).
 fn credential_like(v: &str) -> bool {
-    v.chars().count() >= 8 && !v.chars().all(|c| c.is_ascii_digit()) && !v.chars().all(char::is_alphabetic)
+    v.chars().count() >= 8 && !v.chars().all(char::is_alphabetic)
 }
 
 /// `text` with nothing secret left in it (see the module text).
@@ -115,11 +116,14 @@ pub fn scrub(text: &str, secrets: &[String]) -> String {
     // A quoted value ends at its closing quote, or at the end of its line when
     // the line was cut before it (P13.8d); never past the line. In escaped
     // JSON, `\\\"` is a quote inside the value, not its end.
-    let escaped = re(&ESCAPED, &key(r#"\\"(?:\\\\\\"|[^"\\\r\n]|\\[^"\r\n])*(?:\\"|$)"#));
+    // In escaped JSON a backslash inside the value is `\\\\` and a quote `\\\"`:
+    // both are taken whole, the backslash pair first (P13.8e).
+    let escaped = re(&ESCAPED, &key(r#"\\"(?:\\\\\\\\|\\\\\\"|[^"\\\r\n]|\\[^"\r\n])*(?:\\"|\\?$)"#));
     let text = escaped.replace_all(&text, "$1\\\"<removed>\\\"");
-    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\\r\n]|\\[^\r\n])*(?:"|$)"#));
+    // A line cut right after a backslash still ends the value (P13.8e).
+    let quoted2 = re(&QUOTED2, &key(r#""(?:[^"\\\r\n]|\\[^\r\n])*(?:"|\\?$)"#));
     let text = quoted2.replace_all(&text, "$1\"<removed>\"");
-    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\\r\n]|\\[^\r\n])*(?:'|$)"#));
+    let quoted1 = re(&QUOTED1, &key(r#"'(?:[^'\\\r\n]|\\[^\r\n])*(?:'|\\?$)"#));
     let text = quoted1.replace_all(&text, "$1'<removed>'");
     let array = re(&ARRAY, &key(r#"\[[^\]\r\n]*\]"#));
     let text = array.replace_all(&text, "$1[\"<removed>\"]");
@@ -130,7 +134,8 @@ pub fn scrub(text: &str, secrets: &[String]) -> String {
     // `null` is kept. After a token name only, a value that is not
     // credential-like (a status: `…/oauth2/v2.0/token: 401`) is kept too; a
     // password, secret, key or credential is always blanked, digits included (P13.8d).
-    let plain = re(&PLAIN, &key(r#"([^"'\s&;,\[\]{}]+)"#));
+    // Not starting with a backslash: `\"<removed>\"` of escaped JSON is not a value.
+    let plain = re(&PLAIN, &key(r#"([^"'\s&;,\[\]{}\\][^"'\s&;,\[\]{}]*)"#));
     let text = plain.replace_all(&text, |c: &regex::Captures| {
         let (lead, value) = (&c[1], &c[2]);
         let token_like = lead.trim_end_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace()).to_ascii_lowercase().trim_end_matches(['"', '\'', '\\']).ends_with("token");
@@ -526,6 +531,27 @@ mod tests {
         let out = scrub(cut, &[]);
         assert!(!out.contains("s3cr3t-tail") && out.ends_with("\r\nINFO \"x\": 1"), "{out:?}");
         assert!(!scrub("{'token': 'f1-planted-cut", &[]).contains("f1-planted"));
+    }
+
+    /// P13.8e: a value cut right after a backslash; an escaped-JSON value that
+    /// ends in an escaped backslash; a long numeric token.
+    #[test]
+    fn a_trailing_backslash_an_escaped_backslash_pair_and_a_numeric_token() {
+        let cut = "DEBUG {\"password\": \"g1-planted\\\nINFO next";
+        let out = scrub(cut, &[]);
+        assert!(!out.contains("g1-planted") && out.ends_with("\nINFO next"), "{out:?}");
+        let cut1 = "DEBUG {'secret': 'g2-planted\\\nINFO next";
+        assert!(!scrub(cut1, &[]).contains("g2-planted"));
+        let cut_esc = "DEBUG {\\\"token\\\":\\\"g3-planted-x\\\nINFO next";
+        assert!(!scrub(cut_esc, &[]).contains("g3-planted"), "{:?}", scrub(cut_esc, &[]));
+
+        // `\"abc\\\\\"` is abc followed by one backslash: the next key is not eaten.
+        let pair = r#"{\"password\":\"g4-planted\\\\\",\"user\":\"kept-name\"}"#;
+        let out = scrub(pair, &[]);
+        assert_eq!(out, r#"{\"password\":\"<removed>\",\"user\":\"kept-name\"}"#, "the next key is kept whole");
+
+        assert_eq!(scrub("refresh_token=48151623423", &[]), "refresh_token=<removed>");
+        assert_eq!(scrub("POST https://login.example/oauth2/v2.0/token: 401", &[]), "POST https://login.example/oauth2/v2.0/token: 401");
     }
 
     /// P13.8d: in escaped JSON a quote inside the value (`\\\"`) does not end it.
