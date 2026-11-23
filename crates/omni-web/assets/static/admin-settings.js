@@ -4,18 +4,21 @@
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=10';
+import { runWizard } from '/static/wizard.js?v=11';
 import { confirmDialog } from '/static/dialog.js?v=10';
+import { t } from '/static/admin-text.js?v=1';
 
 const setupState = await api('/api/admin/settings').catch(() => null);
+const MODES = ['beginner', 'intermediate', 'it'];
 
 // The Setup card: whether the wizard was finished, and a way to run it again.
 // The account step appears only for the first-run session, which never gets here.
 {
   const done = setupState && setupState.setup_completed;
+  const mode = done && MODES.includes(setupState.setup_mode) ? t(`wizard.mode.${setupState.setup_mode}`) : (done ? setupState.setup_mode : '');
   document.getElementById('setup-state').textContent = done
-    ? `Setup was completed in ${setupState.setup_mode} mode.`
-    : 'Setup not finished: the wizard was left before its last screen.';
+    ? t('admin.setup.done', { mode })
+    : t('admin.setup.unfinished');
   document.getElementById('setup-rerun').addEventListener('click', () => runWizard({ defaultAdmin: false }));
 
   // A new watchfolder that waits for the videos being made now (P13.2).
@@ -23,7 +26,7 @@ const setupState = await api('/api/admin/settings').catch(() => null);
   const pendingLine = document.getElementById('watchfolder-pending');
   if (pending) {
     pendingLine.hidden = false;
-    pendingLine.textContent = `New watchfolder pending: ${pending.path}. It is used as soon as the videos being made now have finished; until then files go to ${setupState.watchfolder_in_use || 'the current one'}.`;
+    pendingLine.textContent = t('admin.wf.pending', { path: pending.path, current: setupState.watchfolder_in_use || t('admin.wf.current') });
   }
 
   // «Επανεκκίνηση υπηρεσίας» (P13.2): asked in the page, then the panel waits
@@ -36,7 +39,7 @@ const setupState = await api('/api/admin/settings').catch(() => null);
     btn.addEventListener('click', async () => {
       if (warn.hidden) {
         warn.hidden = false;
-        btn.textContent = 'Επανεκκίνηση τώρα';
+        btn.textContent = t('admin.restart.now');
         btn.classList.add('btn-danger');
         return;
       }
@@ -50,7 +53,7 @@ const setupState = await api('/api/admin/settings').catch(() => null);
         return;
       }
       result.className = 'note';
-      result.textContent = 'Restarting… the page reloads when the service answers again.';
+      result.textContent = t('admin.restart.going');
       const started = Date.now();
       // Down first, then up again; give up after three minutes.
       let wentDown = false;
@@ -61,7 +64,7 @@ const setupState = await api('/api/admin/settings').catch(() => null);
         if (up && wentDown) { location.reload(); return; }
         if (Date.now() - started > 180000) {
           result.className = 'note bad';
-          result.textContent = 'The service has not answered for three minutes. Check it in Services, and the Event Log.';
+          result.textContent = t('admin.restart.silent');
           return;
         }
         setTimeout(poll, 2000);
@@ -75,12 +78,9 @@ const setupState = await api('/api/admin/settings').catch(() => null);
  * Credentials
  * ------------------------------------------------------------------ */
 
-const SECRET_LABEL = {
-  'graph.client_secret': 'Microsoft Graph client secret',
-  'llm.api_key': 'LLM provider API key',
-  'teams.webhook_url': 'Teams webhook URL',
-  'web.tls_password': 'TLS certificate passphrase',
-};
+// Each stored secret's name, by its key (`admin.secret.<key with _ for .>`).
+const SECRETS = ['graph.client_secret', 'llm.api_key', 'teams.webhook_url', 'web.tls_password'];
+const secretLabel = (key) => (SECRETS.includes(key) ? t(`admin.secret.${key.replace('.', '_')}`) : key);
 
 async function loadSecrets() {
   let status = {};
@@ -98,12 +98,12 @@ async function loadSecrets() {
     const input = el('input', {
       type: 'password',
       autocomplete: 'off',
-      placeholder: isSet ? '•••••••• (set)' : 'not set',
+      placeholder: isSet ? `•••••••• (${t('admin.secrets.set')})` : t('admin.secrets.unset'),
     });
     return el('div', { class: 'stack' },
       el('div', { class: 'row', style: 'justify-content:space-between' },
-        el('label', { style: 'margin:0' }, SECRET_LABEL[key] || key),
-        el('span', { class: isSet ? 'badge ok' : 'badge' }, isSet ? 'set' : 'not set'),
+        el('label', { style: 'margin:0' }, secretLabel(key)),
+        el('span', { class: isSet ? 'badge ok' : 'badge' }, isSet ? t('admin.secrets.set') : t('admin.secrets.unset')),
       ),
       el('div', { class: 'row' },
         el('div', { class: 'grow' }, input),
@@ -111,12 +111,12 @@ async function loadSecrets() {
           class: 'btn',
           type: 'button',
           onClick: () => saveSecret(key, input),
-        }, 'Save'),
+        }, t('admin.save')),
         isSet && el('button', {
           class: 'btn btn-danger',
           type: 'button',
           onClick: () => clearSecret(key),
-        }, 'Clear'),
+        }, t('admin.secrets.clear')),
       ),
     );
   }));
@@ -124,20 +124,20 @@ async function loadSecrets() {
 
 async function saveSecret(key, input) {
   const value = input.value;
-  if (!value) { toast('Enter a value first.', 'bad'); return; }
+  if (!value) { toast(t('admin.secrets.empty'), 'bad'); return; }
   try {
     await api('/api/secrets', { method: 'POST', body: { key, value } });
     input.value = '';
-    toast(`${SECRET_LABEL[key] || key} updated.`, 'ok');
+    toast(t('admin.secrets.updated', { name: secretLabel(key) }), 'ok');
     loadSecrets();
   } catch (e) { toast(e.message, 'bad'); }
 }
 
 async function clearSecret(key) {
-  if (!await confirmDialog(`Clear ${SECRET_LABEL[key] || key}? It cannot be recovered.`, { okLabel: 'Clear', danger: true })) return;
+  if (!await confirmDialog(t('admin.secrets.clear_ask', { name: secretLabel(key) }), { okLabel: t('admin.secrets.clear'), danger: true })) return;
   try {
     await api('/api/secrets', { method: 'POST', body: { key, value: '' } });
-    toast('Cleared.', 'ok');
+    toast(t('admin.secrets.cleared'), 'ok');
     loadSecrets();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -160,10 +160,10 @@ function showTest(message, ok) {
 // Presets only fill the base URL and how the key is sent; every field stays
 // editable, and "Custom" is any other OpenAI-compatible server.
 const LLM_PRESETS = [
-  ['lmstudio', 'LM Studio (this machine)', 'http://127.0.0.1:1234/v1', 'none'],
-  ['ollama', 'Ollama (this machine)', 'http://127.0.0.1:11434/v1', 'none'],
+  ['lmstudio', t('admin.llm.preset.lmstudio'), 'http://127.0.0.1:1234/v1', 'none'],
+  ['ollama', t('admin.llm.preset.ollama'), 'http://127.0.0.1:11434/v1', 'none'],
   ['geniex', 'Qualcomm GenieX (Snapdragon NPU)', 'http://127.0.0.1:18181/v1', 'none'],
-  ['llamacpp', 'llama.cpp / vLLM server', 'http://127.0.0.1:8000/v1', 'none'],
+  ['llamacpp', t('admin.llm.preset.llamacpp'), 'http://127.0.0.1:8000/v1', 'none'],
   ['openai', 'OpenAI', 'https://api.openai.com/v1', 'bearer'],
   ['azure', 'Azure OpenAI', 'https://YOUR-RESOURCE.openai.azure.com/openai/v1', 'api_key_header'],
   ['gemini', 'Google Gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', 'bearer'],
@@ -171,7 +171,7 @@ const LLM_PRESETS = [
   ['openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1', 'bearer'],
   ['mistral', 'Mistral', 'https://api.mistral.ai/v1', 'bearer'],
   ['groq', 'Groq', 'https://api.groq.com/openai/v1', 'bearer'],
-  ['custom', 'Custom (any OpenAI-compatible)', '', ''],
+  ['custom', t('admin.llm.preset.custom'), '', ''],
 ];
 
 const llm = (id) => document.getElementById(id);
@@ -240,21 +240,21 @@ async function loadLlm() {
   llm('llm-model').value = s.model || '';
   llm('llm-auth').value = s.auth || 'none';
   llm('llm-key').value = '';
-  llm('llm-key').placeholder = s.key_set ? '•••••••• (set; blank keeps it)' : 'not set';
+  llm('llm-key').placeholder = s.key_set ? `•••••••• (${t('admin.llm.key_kept')})` : t('admin.secrets.unset');
   llm('llm-clear-key').checked = false;
   llm('llm-timeout').value = s.timeout_secs;
   llm('llm-tokens').value = s.max_tokens;
   llm('llm-no-thinking').checked = !!s.disable_thinking;
   llm('llm-polish').checked = !!s.keyword_polish;
-  llm('llm-in-use').textContent = `In use: ${s.mode === 'off' ? 'off' : s.in_use}`;
+  llm('llm-in-use').textContent = t('admin.llm.in_use', { what: s.mode === 'off' ? t('admin.llm.off') : s.in_use });
   syncOnline();
 }
 
 async function llmCall(button, path, onOk) {
   button.disabled = true;
   const label = button.textContent;
-  button.textContent = 'Working…';
-  showLlm('Waiting for the server…', true);
+  button.textContent = t('admin.working');
+  showLlm(t('admin.llm.waiting'), true);
   try {
     onOk(await api(path, { method: 'POST', body: llmPayload() }));
   } catch (e) {
@@ -270,17 +270,19 @@ async function llmCall(button, path, onOk) {
 llm('llm-load-models').addEventListener('click', (event) => llmCall(event.currentTarget, '/api/admin/llm/models', (r) => {
   const models = r.models || [];
   render('llm-models', models.map((m) => el('option', { value: m })));
-  showLlm(models.length ? `${models.length} model(s): ${models.slice(0, 12).join(', ')}${models.length > 12 ? ', …' : ''}` : 'The server lists no models; type the model id.', models.length > 0);
+  showLlm(models.length
+    ? t('admin.llm.models', { n: models.length, list: `${models.slice(0, 12).join(', ')}${models.length > 12 ? ', …' : ''}` })
+    : t('admin.llm.no_models'), models.length > 0);
 }));
 
 llm('llm-test').addEventListener('click', (event) => llmCall(event.currentTarget, '/api/admin/llm/test', (r) => {
   const slow = r.seconds > Number(llm('llm-timeout').value) * 0.6;
-  showLlm(`Answered in ${r.seconds} s: ${JSON.stringify(r.answer)}` +
-    (slow ? '\nThat is close to the timeout; a real mail prompt is longer. Raise the timeout or use a faster machine.' : ''), true);
+  showLlm(t('admin.llm.answered', { seconds: r.seconds, answer: JSON.stringify(r.answer) }) +
+    (slow ? `\n${t('admin.llm.slow')}` : ''), true);
 }));
 
 llm('llm-save').addEventListener('click', (event) => llmCall(event.currentTarget, '/api/admin/llm', (r) => {
-  showLlm(`Saved. The next mail uses ${r.in_use}.`, true);
+  showLlm(t('admin.llm.saved', { what: r.in_use }), true);
   loadLlm();
   loadSecrets();
 }));
@@ -315,8 +317,8 @@ document.getElementById('save-mail-btn').addEventListener('click', async (event)
       },
     });
     showTest(res.restart_required
-      ? 'Saved. Restart the service to use these settings.'
-      : 'Saved. The next mail check uses these settings.', true);
+      ? t('admin.mail.saved_restart')
+      : t('admin.mail.saved'), true);
     loadMailbox();
   } catch (e) { showTest(e.message, false); }
   document.getElementById('test-mail-secret').value = '';
@@ -324,7 +326,7 @@ document.getElementById('save-mail-btn').addEventListener('click', async (event)
 });
 
 document.getElementById('test-mail-btn').addEventListener('click', async () => {
-  showTest('Testing…', true);
+  showTest(t('admin.testing'), true);
   try {
     const res = await api('/api/system/test-email', {
       method: 'POST',
@@ -335,7 +337,7 @@ document.getElementById('test-mail-btn').addEventListener('click', async () => {
         client_secret: document.getElementById('test-mail-secret').value,
       },
     });
-    showTest(res.detail || 'Mailbox readable.', true);
+    showTest(res.detail || t('admin.mail.readable'), true);
   } catch (e) { showTest(e.message, false); }
   // The secret is never left in the field after a test.
   document.getElementById('test-mail-secret').value = '';
@@ -357,7 +359,7 @@ function showWf(message, ok) {
 wf('wf-path').addEventListener('input', () => { wfTested = null; wf('wf-save').disabled = true; });
 wf('wf-test').addEventListener('click', async () => {
   const path = wf('wf-path').value;
-  showWf('Testing (up to 15 seconds)…', true);
+  showWf(t('admin.wf.testing'), true);
   try {
     const r = await api('/api/admin/settings/watchfolder/test', { method: 'POST', body: { path } });
     showWf(r.message, r.ok === true);
@@ -368,7 +370,7 @@ wf('wf-test').addEventListener('click', async () => {
 wf('wf-save').addEventListener('click', async () => {
   try {
     const r = await api('/api/admin/settings/watchfolder', { method: 'POST', body: { path: wfTested } });
-    showWf(r.message || (r.pending ? 'Saved; it is used once the videos being made now have finished.' : 'Saved and in use.'), true);
+    showWf(r.message || (r.pending ? t('admin.wf.saved_pending') : t('admin.saved_in_use')), true);
     wf('wf-save').disabled = true;
   } catch (e) { showWf(e.message, false); }
 });
@@ -406,7 +408,7 @@ wf('net-save').addEventListener('click', async () => {
     } });
     wf('net-certpw').value = '';
     out.className = 'note ok';
-    out.textContent = (r.restart_required ? 'Saved. The web port, TLS and host names apply after «Επανεκκίνηση υπηρεσίας» (Setup card).' : 'Saved and in use.')
+    out.textContent = (r.restart_required ? t('admin.net.saved_restart') : t('admin.saved_in_use'))
       + (r.warnings && r.warnings.length ? `\n${r.warnings.join('\n')}` : '');
   } catch (e) { out.className = 'note bad'; out.textContent = e.message; }
 });
@@ -449,8 +451,8 @@ wf('op-save').addEventListener('click', async () => {
     fillOperation(r.operation);
     out.className = 'note ok';
     out.textContent = r.restart_required
-      ? 'Saved. Repair mode, concurrency, the mail interval, pacing and the retry age apply after «Επανεκκίνηση υπηρεσίας» (Setup card); the late strip and the mailbox folders apply now.'
-      : 'Saved and in use.';
+      ? t('admin.op.saved_restart')
+      : t('admin.saved_in_use');
   } catch (e) { out.className = 'note bad'; out.textContent = e.message; }
 });
 
@@ -460,7 +462,7 @@ export function init() {
   loadLlm();
   if (setupState) {
     wf('wf-path').value = setupState.watchfolder_path || '';
-    wf('wf-in-use').textContent = setupState.watchfolder_in_use ? `In use now: ${setupState.watchfolder_in_use}` : '';
+    wf('wf-in-use').textContent = setupState.watchfolder_in_use ? t('admin.wf.in_use', { path: setupState.watchfolder_in_use }) : '';
     fillNetwork(setupState);
     if (setupState.operation) fillOperation(setupState.operation);
   }

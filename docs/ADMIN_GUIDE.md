@@ -767,8 +767,17 @@ section loads only when it is first opened. The search box at the top of the
 sidebar finds a setting by name (accents and case do not matter) and shows
 only the cards that match, in every section.
 
-- **Επισκόπηση**: Χρειάζεται τον διαχειριστή, Health, Autonomy, Repair in shadow.
-- **Ρυθμίσεις**: Setup, Watchfolder, Mailbox, Credentials, LLM assist, Network, TLS and archive, Λειτουργία.
+**Language.** The page and the setup wizard are in Greek. The **English** button
+at the top switches them to English, and **Ελληνικά** switches back; the choice is
+kept in that browser only (the MCR desk stays in Greek). The panel reloads on a
+switch; the wizard redraws the step that is open, so a value typed on it and not
+yet saved is filled again from the saved settings. Terms such as CIDR, the proxy
+header, recipes and canaries have a one-line explanation where they appear. So
+far the shell, Επισκόπηση, Ρυθμίσεις and the wizard are translated; Άνθρωποι,
+Ιστότοποι and Συντήρηση follow (their cards still show English text).
+
+- **Επισκόπηση**: Χρειάζεται τον διαχειριστή, Υγεία, Αυτονομία, Επιδιόρθωση σε σκιά.
+- **Ρυθμίσεις**: Εγκατάσταση, Watchfolder, Γραμματοκιβώτιο, Διαπιστευτήρια, Βοήθεια LLM, Δίκτυο, TLS και αρχείο, Λειτουργία.
 - **Άνθρωποι**: User accounts, Newsroom taxonomy (journalists and groups).
 - **Ιστότοποι**: Sites, Cookies, Recipes, Repair report, Test URL, Self-heal, Self-check.
 - **Συντήρηση**: Toolchain, Download engine, Database maintenance, Διαγνωστικό πακέτο, Scheduled maintenance, Benchmarks, Audit log, Recent mail.

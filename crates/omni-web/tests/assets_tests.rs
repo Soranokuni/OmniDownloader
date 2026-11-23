@@ -502,13 +502,18 @@ fn the_late_strip_is_loaded_every_cycle_and_reconciled_in_place() {
 /// The desk's dictionary (P12.7), `static/text.el.js`, as key -> text. Fails on a key given twice
 /// (a JS object keeps the last one silently).
 fn desk_dictionary(assets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let src = assets.get("static/text.el.js").expect("text.el.js shipped");
-    let body = src.split("export default {").nth(1).and_then(|s| s.split("\n};").next()).expect("text.el.js exports a dictionary");
+    dictionary(assets, "static/text.el.js")
+}
+
+/// A dictionary module (`export default { 'key': 'text', … }`, one entry per line) as key → raw text.
+fn dictionary(assets: &BTreeMap<String, String>, name: &str) -> BTreeMap<String, String> {
+    let src = assets.get(name).unwrap_or_else(|| panic!("{name} shipped"));
+    let body = src.split("export default {").nth(1).and_then(|s| s.split("\n};").next()).unwrap_or_else(|| panic!("{name} exports a dictionary"));
     let mut out = BTreeMap::new();
     for line in body.lines().map(str::trim).filter(|l| l.starts_with('\'')) {
         let key = line[1..].split('\'').next().expect("a key").to_string();
         let value = line.split_once("': '").map(|(_, v)| v.trim_end_matches(',').trim_end_matches('\'').to_string()).unwrap_or_else(|| panic!("no text for {key}"));
-        assert!(out.insert(key.clone(), value).is_none(), "text.el.js has `{key}` twice");
+        assert!(out.insert(key.clone(), value).is_none(), "{name} has `{key}` twice");
     }
     out
 }
@@ -1595,11 +1600,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v40_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v41_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=40"), "admin.html does not import admin.js?v=40");
-    assert!(!admin.contains("/static/admin.js?v=39"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=41"), "admin.html does not import admin.js?v=41");
+    assert!(!admin.contains("/static/admin.js?v=40"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -1619,7 +1624,10 @@ fn the_autonomy_card_is_on_the_overview_and_loads_the_report() {
     let overview = admin.find(r#"data-section="overview""#).expect("the Overview section");
     let next = admin[overview + 10..].find("data-section=").map(|i| overview + 10 + i).expect("the next section");
     assert!(admin[overview..next].contains(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not on the Overview");
-    assert!(admin.contains("A video later marked as wrong counts as touched."));
+    // P13.6: the words are in the admin dictionaries, by key.
+    let en = dictionary(&assets, "static/admin-text.en.js");
+    assert!(admin.contains(r#"data-t="admin.autonomy.intro""#));
+    assert!(en["admin.autonomy.intro"].contains("A video later marked as wrong counts as touched."));
     for id in ["autonomy-days", "autonomy-refresh", "autonomy-figures", "autonomy-tables"] {
         assert!(admin.contains(&format!(r#"id="{id}""#)), "{id} missing");
     }
@@ -1627,9 +1635,9 @@ fn the_autonomy_card_is_on_the_overview_and_loads_the_report() {
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
     let code = code.join("\n");
     assert!(code.contains("/api/admin/autonomy-report?days="), "the Overview does not load the autonomy report");
-    assert!(code.contains("Delivered untouched"));
-    assert!(code.contains("No finished jobs in this period yet."));
-    assert!(code.contains("Queued by MCR from an offer or a skipped link"));
+    assert!(code.contains("t('admin.autonomy.untouched'") && en["admin.autonomy.untouched"].starts_with("Delivered untouched"));
+    assert!(code.contains("t('admin.autonomy.empty')") && en["admin.autonomy.empty"] == "No finished jobs in this period yet.");
+    assert!(code.contains("'queued'") && en["admin.touch.queued"] == "Queued by MCR from an offer or a skipped link");
     assert!(!code.contains("innerHTML"));
 }
 
@@ -1642,7 +1650,9 @@ fn the_restart_button_asks_in_the_page_and_the_pending_watchfolder_is_shown() {
     for id in ["restart-box", "restart-warn", "restart-btn", "restart-result", "watchfolder-pending"] {
         assert!(html.contains(&format!(r#"id="{id}""#)), "{id} missing");
     }
-    assert!(html.contains("Επανεκκίνηση υπηρεσίας"));
+    // P13.6: the button's name is in the Greek dictionary, by key.
+    assert!(html.contains(r#"id="restart-btn" data-t="admin.restart.button""#));
+    assert_eq!(dictionary(&assets, "static/admin-text.el.js")["admin.restart.button"], "Επανεκκίνηση υπηρεσίας");
     let js = assets.get("static/admin-settings.js").expect("admin-settings.js shipped");
     let code: String = js.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
     // The restart block runs up to the next section heading of the raw file.
@@ -1698,8 +1708,15 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
     for banned in ["innerHTML", "outerHTML", "document.write", "insertAdjacentHTML", "http://", "https://", "service install --account"] {
         assert!(!code.contains(banned), "wizard.js contains {banned}");
     }
-    // P13.1f: the account is changed in place by Setup, not by re-registering the service.
-    assert!(code.contains("/change-account"), "the service-account hints do not point to Setup");
+    // P13.1f: the account is changed in place by Setup, not by re-registering the service
+    // (P13.6: the hints are in the dictionaries, in both languages).
+    for dict in ["static/admin-text.el.js", "static/admin-text.en.js"] {
+        let words = dictionary(&assets, dict);
+        for key in ["wizard.wf.denied", "wizard.net.account_help"] {
+            assert!(words[key].contains("/change-account"), "{dict} `{key}` does not point to Setup");
+            assert!(code.contains(&format!("t('{key}')")), "the wizard does not show `{key}`");
+        }
+    }
     assert!(code.contains("/api/setup/wizard/account"), "the account step is not wired");
     assert!(code.contains("/api/admin/settings/watchfolder/test"), "the watchfolder test is not wired");
     assert!(code.contains("/api/admin/settings/complete"), "Finish does not complete setup");
@@ -1712,7 +1729,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["10".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["11".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");
@@ -1735,10 +1752,13 @@ fn the_wizard_ends_with_a_test_download_and_mail_needs_a_passing_test() {
     assert!(code.contains("/api/admin/setup/test-download"), "the test download is not wired");
     assert!(code.contains("test_job_id: T.jobId") && code.contains("skip_test: true"), "Finish sends no proof");
     assert!(code.contains("valid: () => Boolean(T.status && T.status.delivered)"), "Finish is open before delivery");
-    assert!(code.contains("playout never reads"), "the watchfolder skip does not say where files go");
+    // P13.6: the words are in the dictionaries, by key.
+    let en = dictionary(&assets, "static/admin-text.en.js");
+    let el = dictionary(&assets, "static/admin-text.el.js");
+    assert!(code.contains("t('wizard.wf.skip_warn'") && en["wizard.wf.skip_warn"].contains("playout never reads"), "the watchfolder skip does not say where files go");
     // P13.4b: a failed status request retries instead of ending the test.
     assert!(code.contains("setTimeout(() => poll(gen), 3000)"), "a failed poll is not retried");
-    assert!(code.contains("Επανασύνδεση"), "a failed poll does not say it reconnects");
+    assert!(code.contains("t('wizard.testdl.reconnect'") && el["wizard.testdl.reconnect"].starts_with("Επανασύνδεση"), "a failed poll does not say it reconnects");
     // P13.4c: only a lost connection or a 5xx is retried; a 404/403 re-enables Start.
     assert!(code.contains("if (err.code === 'NETWORK' || err.status >= 500)"), "every failed poll is retried");
     for banned in ["confirm(", "prompt(", "alert("] {
@@ -1796,4 +1816,140 @@ fn the_admin_panel_is_five_sections_with_one_module_each_and_no_browser_dialogs(
     let maint = &assets["static/admin-maintenance.js"];
     assert!(!maint.contains("live(loadBenchmarks"), "the Benchmarks card still refetches on every event");
     assert!(maint.contains("if (going && sectionShown('maintenance'))"), "the Benchmarks card is not polled only while a run goes");
+}
+
+/// P13.6: the setup wizard and the admin panel's shell, Overview and Settings are Greek by default,
+/// with an English switch, through the desk's lookup (text.js). The two admin dictionaries hold the
+/// same keys with the same `{names}`; every key the pages ask for is in both; the converted modules
+/// and the converted part of admin.html keep no words of their own; the jargon (CIDR, proxy headers,
+/// recipes, canaries) has its one-line explanation; each new module has one URL.
+#[test]
+fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() {
+    let assets = all_assets();
+    let el = dictionary(&assets, "static/admin-text.el.js");
+    let en = dictionary(&assets, "static/admin-text.en.js");
+    let desk = desk_dictionary(&assets);
+    let greek = |s: &str| s.chars().any(|c| ('\u{0370}'..='\u{03FF}').contains(&c) || ('\u{1F00}'..='\u{1FFF}').contains(&c));
+    let code = |name: &str| -> String {
+        let src = assets.get(name).unwrap_or_else(|| panic!("{name} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+
+    // Same keys; English also has the desk dialog's words, which the admin pages use.
+    for key in el.keys() {
+        assert!(en.contains_key(key), "admin-text.en.js lacks `{key}`");
+    }
+    for key in en.keys() {
+        assert!(el.contains_key(key) || desk.contains_key(key), "admin-text.en.js has `{key}`, which no Greek dictionary has");
+    }
+    for key in ["dialog.cancel", "page.close"] {
+        assert!(en.contains_key(key), "the in-page dialog has no English `{key}`");
+    }
+    // English is English (the switch names Greek in Greek); the same names are filled in both.
+    for (key, text) in &en {
+        assert!(key == "lang.switch" || !greek(text), "English `{key}` has Greek: {text}");
+    }
+    let names = |s: &str| -> std::collections::BTreeSet<String> {
+        s.split('{').skip(1).filter_map(|p| p.split('}').next()).map(String::from).collect()
+    };
+    for (key, text) in &el {
+        assert_eq!(names(text), names(&en[key]), "`{key}` fills different names in Greek and English");
+    }
+
+    // Greek by default: text.js starts in Greek; the page says so; English is added, never forced.
+    let reg = code("static/admin-text.js");
+    assert!(reg.contains("addLanguage('el', { ...DESK, ...ADMIN_EL });") && reg.contains("addLanguage('en', ADMIN_EN);"));
+    assert!(!reg.contains("setLanguage('en')"), "the admin pages force English");
+    let html = &assets["admin.html"];
+    assert!(html.contains(r#"<html lang="el">"#) && html.contains(r#"id="lang-btn""#), "no Greek page or no switch");
+    assert!(code("static/admin.js").contains("mountLanguageSwitch();"), "the panel does not fill its words");
+    assert!(code("static/wizard.js").contains("onLanguageChange(() => show());"), "the switch does not redraw the wizard");
+    for m in ["admin-text.js", "admin-text.el.js", "admin-text.en.js", "text.js", "text.el.js"] {
+        let needle = format!("/static/{m}?v=");
+        let versions: std::collections::BTreeSet<String> = assets
+            .values()
+            .flat_map(|s| s.match_indices(needle.as_str()).map(|(i, _)| s[i + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(versions.len(), 1, "{m} is imported under {versions:?}");
+    }
+
+    // Every key asked for, in both languages: t('…') in the modules, data-t* in admin.html, and
+    // the keys the modules build from a name.
+    let modules = ["static/admin.js", "static/admin-overview.js", "static/admin-settings.js", "static/wizard.js", "static/admin-text.js"];
+    let mut asked: Vec<String> = Vec::new();
+    for m in modules {
+        let src = code(m);
+        for (i, _) in src.match_indices("t('") {
+            if src[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                continue;
+            }
+            asked.push(src[i + 3..].split('\'').next().unwrap().to_string());
+        }
+    }
+    for attr in ["data-t=\"", "data-t-aria-label=\"", "data-t-title=\"", "data-t-placeholder=\""] {
+        for (i, _) in html.match_indices(attr) {
+            asked.push(html[i + attr.len()..].split('"').next().unwrap().to_string());
+        }
+    }
+    for mode in ["beginner", "intermediate", "it"] {
+        asked.push(format!("wizard.mode.{mode}"));
+        asked.push(format!("wizard.mode.{mode}.about"));
+    }
+    for touch in ["retry", "override", "rename", "redownload", "manual_done", "approve", "reject", "next", "wrong_video", "cancel", "now", "discard", "queued"] {
+        asked.push(format!("admin.touch.{touch}"));
+    }
+    for state in ["ok", "degraded", "down"] {
+        asked.push(format!("admin.state.{state}"));
+    }
+    for section in ["overview", "settings", "people", "sites", "maintenance"] {
+        asked.push(format!("admin.nav.{section}"));
+    }
+    for secret in ["graph_client_secret", "llm_api_key", "teams_webhook_url", "web_tls_password"] {
+        asked.push(format!("admin.secret.{secret}"));
+    }
+    for mode in ["off", "shadow", "hold"] {
+        asked.push(format!("wizard.check.repair.{mode}"));
+    }
+    assert!(asked.len() > 300, "too few keys found ({}): the scan is broken", asked.len());
+    for key in &asked {
+        assert!(el.contains_key(key) || desk.contains_key(key), "`{key}` has no Greek");
+        assert!(en.contains_key(key), "`{key}` has no English");
+    }
+
+    // The converted modules keep no Greek of their own (comments aside)…
+    for m in ["static/admin.js", "static/admin-overview.js", "static/admin-settings.js", "static/wizard.js"] {
+        for line in code(m).lines() {
+            assert!(!greek(line), "{m} keeps Greek text of its own: {}", line.trim());
+        }
+    }
+    // …and admin.html's shell, Overview and Settings no text outside data-t.
+    let converted = &html[..html.find(r#"data-section="people""#).expect("the People section")];
+    let mut text = String::new();
+    let mut rest = converted;
+    while let Some(start) = rest.find('<') {
+        text.push_str(&rest[..start]);
+        text.push('\n');
+        let tail = &rest[start..];
+        let end = if tail.starts_with("<!--") {
+            tail.find("-->").map(|e| e + 3)
+        } else if tail.starts_with("<style") {
+            tail.find("</style>").map(|e| e + 8)
+        } else {
+            tail.find('>').map(|e| e + 1)
+        };
+        // The slice ends inside the People section's opening tag.
+        let Some(end) = end else { break };
+        rest = &tail[end..];
+    }
+    for word in text.lines().map(str::trim).filter(|w| !w.is_empty()) {
+        assert!(["OmniDownloader", "A"].contains(&word), "admin.html has a word of its own: {word:?}");
+    }
+
+    // Jargon, one line each, shown where the term is used.
+    for (key, term) in [("admin.help.cidr", "CIDR"), ("admin.help.proxy", "X-Forwarded-For"), ("admin.help.recipe", "recipe"), ("admin.help.canary", "canary")] {
+        assert!(el[key].contains(term) && en[key].to_lowercase().contains(&term.to_lowercase()), "`{key}` does not explain {term}");
+        assert!(html.contains(&format!("data-t=\"{key}\"")), "admin.html does not show `{key}`");
+    }
+    let wizard = code("static/wizard.js");
+    assert!(wizard.contains("t('admin.help.cidr')") && wizard.contains("t('admin.help.proxy')"), "the wizard does not explain CIDR and the proxy header");
 }

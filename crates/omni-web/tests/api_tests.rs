@@ -351,7 +351,8 @@ async fn html_pages_render_for_the_roles_that_may_see_them() -> Result<()> {
         ("/board", &app.mcr_token, "/static/board.js?v="),
         // Its words come from the dictionary since P12.10: the page's own script marks it.
         ("/user", &app.user_token, "/static/user.js?v="),
-        ("/admin", &app.admin_token, "Administration"),
+        // Its words come from the admin dictionaries since P13.6: the page's own script marks it.
+        ("/admin", &app.admin_token, "/static/admin.js?v="),
     ] {
         let res = app
             .router

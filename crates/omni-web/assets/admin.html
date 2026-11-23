@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="el">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniDownloader — Systems Administration</title>
+<title data-t="admin.page.title">OmniDownloader</title>
 <link rel="stylesheet" href="/static/app.css?v=12">
 <link rel="icon" href="data:,">
 <style>
@@ -16,6 +16,8 @@
 </style>
 </head>
 <body>
+<!-- P13.6: the words of the shell, the Overview and the Settings come from
+     admin-text.el.js / admin-text.en.js by key (data-t); Greek by default. -->
 
 <header class="topbar">
   <div class="topbar-inner">
@@ -23,271 +25,257 @@
       <div class="brand-mark" style="background:#fb7185;color:#1a0409">A</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p style="color:#fb7185">Systems Administration</p>
+        <p style="color:#fb7185" data-t="admin.page.tagline"></p>
       </div>
     </div>
     <div class="topbar-status">
-      <a class="btn" href="/mcr">MCR desk</a>
-      <button class="btn btn-danger" type="button" id="logout-btn">Sign out</button>
+      <button class="btn" type="button" id="lang-btn" lang="en"></button>
+      <a class="btn" href="/mcr" data-t="admin.page.desk"></a>
+      <button class="btn btn-danger" type="button" id="logout-btn" data-t="admin.page.logout"></button>
     </div>
   </div>
 </header>
 
 <main class="admin-layout">
 
-  <nav class="admin-nav card" aria-label="Sections">
-    <input type="search" id="admin-search" placeholder="Αναζήτηση ρύθμισης…" aria-label="Search the settings" autocomplete="off">
+  <nav class="admin-nav card" data-t-aria-label="admin.nav.label">
+    <input type="search" id="admin-search" data-t-placeholder="admin.search.placeholder" data-t-aria-label="admin.search.label" autocomplete="off">
     <p class="note" id="admin-search-note" role="status" style="margin:0"></p>
-    <a href="#overview" data-nav="overview">Επισκόπηση</a>
-    <a href="#settings" data-nav="settings">Ρυθμίσεις</a>
-    <a href="#people" data-nav="people">Άνθρωποι</a>
-    <a href="#sites" data-nav="sites">Ιστότοποι</a>
-    <a href="#maintenance" data-nav="maintenance">Συντήρηση</a>
+    <a href="#overview" data-nav="overview" data-t="admin.nav.overview"></a>
+    <a href="#settings" data-nav="settings" data-t="admin.nav.settings"></a>
+    <a href="#people" data-nav="people" data-t="admin.nav.people"></a>
+    <a href="#sites" data-nav="sites" data-t="admin.nav.sites"></a>
+    <a href="#maintenance" data-nav="maintenance" data-t="admin.nav.maintenance"></a>
   </nav>
 
   <div>
   <!-- Επισκόπηση -->
   <div class="admin-section" data-section="overview" hidden>
     <section class="card stack" id="needs">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Χρειάζεται τον διαχειριστή</h2>
-      <div id="needs-list" class="stack"><p class="note">Loading…</p></div>
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.needs.title"></h2>
+      <div id="needs-list" class="stack"><p class="note" data-t="admin.loading"></p></div>
     </section>
     <section class="card stack" id="health">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Health</h2>
-        <button class="btn" type="button" id="health-refresh">Refresh</button>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.health.title"></h2>
+        <button class="btn" type="button" id="health-refresh" data-t="admin.refresh"></button>
       </div>
-      <div id="health-list" class="stack"><p class="note">Loading…</p></div>
+      <div id="health-list" class="stack"><p class="note" data-t="admin.loading"></p></div>
     </section>
     <section class="card stack" id="autonomy">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Autonomy</h2>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.autonomy.title"></h2>
         <div class="row tight">
-          <select id="autonomy-days" aria-label="Period">
-            <option value="7">7 days</option>
-            <option value="14" selected>14 days</option>
-            <option value="30">30 days</option>
+          <select id="autonomy-days" data-t-aria-label="admin.autonomy.period">
+            <option value="7" data-t="admin.autonomy.days7"></option>
+            <option value="14" selected data-t="admin.autonomy.days14"></option>
+            <option value="30" data-t="admin.autonomy.days30"></option>
           </select>
-          <button class="btn" type="button" id="autonomy-refresh">Refresh</button>
+          <button class="btn" type="button" id="autonomy-refresh" data-t="admin.refresh"></button>
         </div>
       </div>
-      <p class="note">
-        How often a video reached air with nobody touching it. A job counts as touched when
-        a person retried, renamed, approved, rejected, cancelled, re-downloaded or discarded
-        it, put it into Dalet by hand, or queued it from an offered video or a skipped mail
-        link. A video later marked as wrong counts as touched.
-      </p>
-      <div id="autonomy-figures" class="stack"><p class="note">Loading…</p></div>
+      <p class="note" data-t="admin.autonomy.intro"></p>
+      <div id="autonomy-figures" class="stack"><p class="note" data-t="admin.loading"></p></div>
       <div id="autonomy-tables" class="stack"></div>
     </section>
     <section class="card stack" id="repair-shadow">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Repair in shadow</h2>
-      <p class="note">While repair runs in shadow it works out what it would have done for a failed video and records it, but changes nothing. What it would have done:</p>
-      <div id="shadow-body" class="stack"><p class="note">Loading…</p></div>
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.shadow.title"></h2>
+      <p class="note" data-t="admin.shadow.intro"></p>
+      <div id="shadow-body" class="stack"><p class="note" data-t="admin.loading"></p></div>
     </section>
   </div>
 
   <!-- Ρυθμίσεις -->
   <div class="admin-section" data-section="settings" hidden>
     <section class="card" id="setup-card">
-      <h2 class="card-title">Setup</h2>
-      <p class="note" id="setup-state" style="margin-bottom:10px">Checking…</p>
-      <button class="btn btn-block" type="button" id="setup-rerun">Run setup wizard again</button>
-      <p class="note" style="margin-top:8px">Walks through the administrator account (only while the first-run account exists), watchfolder, mail and, in the other modes, network, TLS and metrics.</p>
+      <h2 class="card-title" data-t="admin.setup.title"></h2>
+      <p class="note" id="setup-state" style="margin-bottom:10px" data-t="admin.setup.checking"></p>
+      <button class="btn btn-block" type="button" id="setup-rerun" data-t="admin.setup.rerun"></button>
+      <p class="note" style="margin-top:8px" data-t="admin.setup.about"></p>
       <p class="note warn" id="watchfolder-pending" hidden></p>
       <div id="restart-box" hidden style="margin-top:12px">
-        <p class="note">The watchfolder, the mailbox and the archive take effect without a restart. The web port, TLS, allowed host names and metrics on/off need one.</p>
-        <p class="note warn" id="restart-warn" hidden>While the service restarts (about a minute) nothing is downloaded and the panels do not answer. Videos being copied into the watchfolder finish first.</p>
-        <button class="btn btn-block" type="button" id="restart-btn">Επανεκκίνηση υπηρεσίας</button>
+        <p class="note" data-t="admin.restart.about"></p>
+        <p class="note warn" id="restart-warn" hidden data-t="admin.restart.warn"></p>
+        <button class="btn btn-block" type="button" id="restart-btn" data-t="admin.restart.button"></button>
         <p class="note" id="restart-result" role="status"></p>
       </div>
     </section>
-    <section class="card stack" id="watchfolder">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Watchfolder</h2>
-      <label for="wf-path">Watchfolder path (\\server\share, never a mapped drive letter)</label>
+    <section class="card stack" id="watchfolder" data-keywords="watchfolder φάκελος παράδοσης">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.wf.title"></h2>
+      <label for="wf-path" data-t="admin.wf.path"></label>
       <input type="text" id="wf-path" autocomplete="off" spellcheck="false">
       <p class="note" id="wf-in-use"></p>
       <div class="row">
-        <button class="btn" type="button" id="wf-test">Test</button>
-        <button class="btn btn-primary" type="button" id="wf-save" disabled>Save</button>
+        <button class="btn" type="button" id="wf-test" data-t="admin.test"></button>
+        <button class="btn btn-primary" type="button" id="wf-save" disabled data-t="admin.save"></button>
       </div>
-      <p class="note">Test creates the folder if it is missing and writes, renames and deletes a probe file as the service account. Save needs a passing test; the new folder is used between jobs.</p>
+      <p class="note" data-t="admin.wf.about"></p>
       <p id="wf-result" class="note" style="white-space:pre-line"></p>
     </section>
-    <section class="card">
-      <h2 class="card-title">Mailbox</h2>
+    <section class="card" data-keywords="mailbox graph entra tenant client secret">
+      <h2 class="card-title" data-t="admin.mail.title"></h2>
       <div>
         <div>
-          <label for="test-mail-tenant">Directory (tenant) ID</label>
+          <label for="test-mail-tenant" data-t="admin.mail.tenant"></label>
           <input type="text" id="test-mail-tenant" autocomplete="off" spellcheck="false">
-          <label for="test-mail-client" style="margin-top:8px">Application (client) ID</label>
+          <label for="test-mail-client" style="margin-top:8px" data-t="admin.mail.client"></label>
           <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
-          <label for="test-mail-user" style="margin-top:8px">Mailbox</label>
+          <label for="test-mail-user" style="margin-top:8px" data-t="admin.mail.mailbox"></label>
           <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
-          <label for="test-mail-secret" style="margin-top:8px">Client secret (blank: keep and test the stored one)</label>
+          <label for="test-mail-secret" style="margin-top:8px" data-t="admin.mail.secret"></label>
           <input type="password" id="test-mail-secret" autocomplete="off">
-          <label for="test-mail-expires" style="margin-top:8px">Client secret expires on</label>
+          <label for="test-mail-expires" style="margin-top:8px" data-t="admin.mail.expires"></label>
           <input type="date" id="test-mail-expires">
-          <p class="note" style="margin:4px 0 0">The "Expires" date Entra shows for this secret under Certificates &amp; secrets; the mail status turns amber 30 days before and red 7 days before.</p>
+          <p class="note" style="margin:4px 0 0" data-t="admin.mail.expires_help"></p>
           <div class="row" style="margin-top:10px">
-            <button class="btn" type="button" id="test-mail-btn">Test mailbox</button>
-            <button class="btn btn-primary" type="button" id="save-mail-btn">Save</button>
+            <button class="btn" type="button" id="test-mail-btn" data-t="admin.mail.test"></button>
+            <button class="btn btn-primary" type="button" id="save-mail-btn" data-t="admin.save"></button>
           </div>
-          <p class="note" style="margin:4px 0 0">Saved settings are used from the next mail check; no restart.</p>
+          <p class="note" style="margin:4px 0 0" data-t="admin.mail.saved_when"></p>
         </div>
       </div>
       <p id="test-result" class="note" style="margin-top:10px"></p>
     </section>
-    <section class="card">
-      <h2 class="card-title">Credentials</h2>
+    <section class="card" data-keywords="credentials secrets passwords">
+      <h2 class="card-title" data-t="admin.secrets.title"></h2>
       <div id="secrets-list" class="stack">
-        <p class="note">Loading…</p>
+        <p class="note" data-t="admin.loading"></p>
       </div>
-      <p class="note" style="margin-top:10px">
-        Stored encrypted on this machine. Values are never shown again once set,
-        here or anywhere else — replace one if it is lost.
-      </p>
+      <p class="note" style="margin-top:10px" data-t="admin.secrets.about"></p>
     </section>
-    <section class="card stack" id="llm">
+    <section class="card stack" id="llm" data-keywords="llm language model ai">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">LLM assist</h2>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.llm.title"></h2>
         <span id="llm-in-use" class="note mono"></span>
       </div>
-      <p class="note">
-        The parser decides every job. The model is asked only where the parser is
-        unsure (a journalist, a keyword, a group), and what it answers is checked
-        before use. Any OpenAI-compatible server works, on this machine or online.
-      </p>
+      <p class="note" data-t="admin.llm.about"></p>
       <div class="grid-2">
         <div>
-          <label for="llm-mode">Mode</label>
+          <label for="llm-mode" data-t="admin.llm.mode"></label>
           <select id="llm-mode">
-            <option value="assist">Assist (ask where the parser is unsure)</option>
-            <option value="off">Off (parser only)</option>
+            <option value="assist" data-t="admin.llm.mode.assist"></option>
+            <option value="off" data-t="admin.llm.mode.off"></option>
           </select>
         </div>
         <div>
-          <label for="llm-provider">Provider</label>
+          <label for="llm-provider" data-t="admin.llm.provider"></label>
           <select id="llm-provider"></select>
         </div>
       </div>
       <div>
-        <label for="llm-base">Base URL</label>
+        <label for="llm-base" data-t="admin.llm.base"></label>
         <input type="text" id="llm-base" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:1234/v1">
       </div>
-      <p id="llm-online" class="note warn" hidden>
-        Online provider: each assist call sends the subject, part of the mail
-        body, the roster surnames and the group names to this company. Email
-        addresses and phone numbers are replaced with placeholders first, and
-        the sender's address is never sent.
-      </p>
+      <p id="llm-online" class="note warn" hidden data-t="admin.llm.online"></p>
       <div class="grid-2">
         <div>
-          <label for="llm-auth">API key is sent as</label>
+          <label for="llm-auth" data-t="admin.llm.auth"></label>
           <select id="llm-auth">
-            <option value="none">No key (local server)</option>
-            <option value="bearer">Authorization: Bearer (most providers)</option>
-            <option value="api_key_header">api-key header (Azure OpenAI)</option>
+            <option value="none" data-t="admin.llm.auth.none"></option>
+            <option value="bearer" data-t="admin.llm.auth.bearer"></option>
+            <option value="api_key_header" data-t="admin.llm.auth.header"></option>
           </select>
         </div>
         <div>
-          <label for="llm-key">API key</label>
+          <label for="llm-key" data-t="admin.llm.key"></label>
           <input type="password" id="llm-key" autocomplete="off">
           <label class="row tight" style="margin:4px 0 0 0">
             <input type="checkbox" id="llm-clear-key" style="width:auto">
-            <span class="note">Remove the stored key</span>
+            <span class="note" data-t="admin.llm.clear_key"></span>
           </label>
         </div>
       </div>
       <div>
-        <label for="llm-model">Model</label>
+        <label for="llm-model" data-t="admin.llm.model"></label>
         <div class="row">
           <input type="text" id="llm-model" class="grow" list="llm-models" spellcheck="false" autocomplete="off" placeholder="google/gemma-4-e4b">
           <datalist id="llm-models"></datalist>
-          <button class="btn" type="button" id="llm-load-models">Load models</button>
+          <button class="btn" type="button" id="llm-load-models" data-t="admin.llm.load_models"></button>
         </div>
       </div>
       <div class="grid-2">
         <div>
-          <label for="llm-timeout">Timeout per call (seconds, 5–300)</label>
+          <label for="llm-timeout" data-t="admin.llm.timeout"></label>
           <input type="number" id="llm-timeout" min="5" max="300" value="30">
         </div>
         <div>
-          <label for="llm-tokens">Answer token limit (50–8000)</label>
+          <label for="llm-tokens" data-t="admin.llm.tokens"></label>
           <input type="number" id="llm-tokens" min="50" max="8000" value="400">
         </div>
       </div>
       <label class="row tight" style="margin:0">
         <input type="checkbox" id="llm-no-thinking" style="width:auto" checked>
-        <span>Disable thinking (reasoning models answer in seconds instead of minutes)</span>
+        <span data-t="admin.llm.no_thinking"></span>
       </label>
       <label class="row tight" style="margin:0">
         <input type="checkbox" id="llm-polish" style="width:auto">
-        <span>Let the LLM write every keyword (otherwise only where the parser cannot make one); one model call per mail</span>
+        <span data-t="admin.llm.polish"></span>
       </label>
       <div class="row">
-        <button class="btn" type="button" id="llm-test">Test</button>
-        <button class="btn btn-primary" type="button" id="llm-save">Save and apply</button>
+        <button class="btn" type="button" id="llm-test" data-t="admin.test"></button>
+        <button class="btn btn-primary" type="button" id="llm-save" data-t="admin.llm.save"></button>
       </div>
       <p id="llm-result" class="note" style="white-space:pre-line"></p>
     </section>
-    <section class="card stack" id="network" data-keywords="tls https certificate port proxy archive">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Network, TLS and archive</h2>
+    <section class="card stack" id="network" data-keywords="tls https certificate port proxy archive cidr">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.net.title"></h2>
       <div class="grid-2">
-        <div><label for="net-port">Web port</label><input type="number" id="net-port" min="1" max="65535"></div>
-        <div><label for="net-archive-days">Archive retention (days)</label><input type="number" id="net-archive-days" min="1" max="3650"></div>
+        <div><label for="net-port" data-t="admin.net.port"></label><input type="number" id="net-port" min="1" max="65535"></div>
+        <div><label for="net-archive-days" data-t="admin.net.archive_days"></label><input type="number" id="net-archive-days" min="1" max="3650"></div>
       </div>
-      <label class="row tight" style="margin:0"><input type="checkbox" id="net-archive" style="width:auto"><span>Keep delivered sources in the archive</span></label>
-      <label for="net-open">MCR open networks (one per line; empty: everyone signs in)</label>
+      <label class="row tight" style="margin:0"><input type="checkbox" id="net-archive" style="width:auto"><span data-t="admin.net.archive"></span></label>
+      <label for="net-open" data-t="admin.net.open"></label>
       <textarea id="net-open" rows="3" class="mono"></textarea>
+      <p class="note" style="margin:0" data-t="admin.help.cidr"></p>
       <div class="grid-2">
-        <div><label for="net-cert">TLS certificate (.pfx path; empty: plain HTTP)</label><input type="text" id="net-cert" autocomplete="off" spellcheck="false"></div>
-        <div><label for="net-certpw">Certificate passphrase (blank keeps the stored one)</label><input type="password" id="net-certpw" autocomplete="new-password"></div>
+        <div><label for="net-cert" data-t="admin.net.cert"></label><input type="text" id="net-cert" autocomplete="off" spellcheck="false"></div>
+        <div><label for="net-certpw" data-t="admin.net.certpw"></label><input type="password" id="net-certpw" autocomplete="new-password"></div>
       </div>
-      <label class="row tight" style="margin:0"><input type="checkbox" id="net-trust" style="width:auto"><span>Trust the X-Forwarded-For header from the proxies below</span></label>
-      <label for="net-proxies">Trusted proxies (one network per line)</label>
+      <label class="row tight" style="margin:0"><input type="checkbox" id="net-trust" style="width:auto"><span data-t="admin.net.trust"></span></label>
+      <p class="note" style="margin:0" data-t="admin.help.proxy"></p>
+      <label for="net-proxies" data-t="admin.net.proxies"></label>
       <textarea id="net-proxies" rows="2" class="mono"></textarea>
-      <label for="net-hosts">Allowed host names (one per line)</label>
+      <label for="net-hosts" data-t="admin.net.hosts"></label>
       <textarea id="net-hosts" rows="2" class="mono"></textarea>
-      <button class="btn btn-primary" type="button" id="net-save">Save</button>
+      <button class="btn btn-primary" type="button" id="net-save" data-t="admin.save"></button>
       <p id="net-result" class="note" style="white-space:pre-line"></p>
     </section>
 
     <section class="card stack" id="operation" data-keywords="repair shadow concurrency downloads encodes poll mail graph folders pacing retry late">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Λειτουργία</h2>
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.op.title"></h2>
       <div class="grid-2">
         <div>
-          <label for="op-repair">Repair mode (repair.mode)</label>
+          <label for="op-repair" data-t="admin.op.repair"></label>
           <select id="op-repair">
-            <option value="off">Off: a failed video goes to review with its reason</option>
-            <option value="shadow">Shadow: work out what repair would do, change nothing</option>
-            <option value="hold">Hold: a video repair found waits for approval by MCR</option>
+            <option value="off" data-t="admin.op.repair.off"></option>
+            <option value="shadow" data-t="admin.op.repair.shadow"></option>
+            <option value="hold" data-t="admin.op.repair.hold"></option>
           </select>
         </div>
-        <div><label for="op-poll">Mailbox check every (seconds, 10–3600)</label><input type="number" id="op-poll" min="10" max="3600"></div>
+        <div><label for="op-poll" data-t="admin.op.poll"></label><input type="number" id="op-poll" min="10" max="3600"></div>
       </div>
       <div class="grid-2">
-        <div><label for="op-downloads">Downloads at once (1–10)</label><input type="number" id="op-downloads" min="1" max="10"></div>
-        <div><label for="op-transcodes">Encodes at once (1–8)</label><input type="number" id="op-transcodes" min="1" max="8"></div>
+        <div><label for="op-downloads" data-t="admin.op.downloads"></label><input type="number" id="op-downloads" min="1" max="10"></div>
+        <div><label for="op-transcodes" data-t="admin.op.transcodes"></label><input type="number" id="op-transcodes" min="1" max="8"></div>
       </div>
-      <label class="row tight" style="margin:0"><input type="checkbox" id="op-write" style="width:auto"><span>Graph write access (Mail.ReadWrite): mark handled mail read and move it to the folders below</span></label>
+      <label class="row tight" style="margin:0"><input type="checkbox" id="op-write" style="width:auto"><span data-t="admin.op.write"></span></label>
       <div class="grid-2">
-        <div><label for="op-processed">Folder for handled mail</label><input type="text" id="op-processed" autocomplete="off"></div>
-        <div><label for="op-failed">Folder for failed mail</label><input type="text" id="op-failed" autocomplete="off"></div>
-      </div>
-      <div class="grid-2">
-        <div><label for="op-host">yt-dlp runs per platform at once (1–4)</label><input type="number" id="op-host" min="1" max="4"></div>
-        <div><label for="op-gap">Seconds between two starts on one platform (0–120)</label><input type="number" id="op-gap" min="0" max="120"></div>
+        <div><label for="op-processed" data-t="admin.op.processed"></label><input type="text" id="op-processed" autocomplete="off"></div>
+        <div><label for="op-failed" data-t="admin.op.failed"></label><input type="text" id="op-failed" autocomplete="off"></div>
       </div>
       <div class="grid-2">
-        <div><label for="op-age">No automatic retry after (minutes, 30–360)</label><input type="number" id="op-age" min="30" max="360"></div>
-        <div><label for="op-second">Second chance for jobs in review up to (minutes, 30–360)</label><input type="number" id="op-second" min="30" max="360"></div>
+        <div><label for="op-host" data-t="admin.op.host"></label><input type="number" id="op-host" min="1" max="4"></div>
+        <div><label for="op-gap" data-t="admin.op.gap"></label><input type="number" id="op-gap" min="0" max="120"></div>
       </div>
       <div class="grid-2">
-        <div><label for="op-late">Late on the desk after (minutes, 1–120)</label><input type="number" id="op-late" min="1" max="120"></div>
-        <div><label for="op-late-urgent">Urgent job late after (minutes, 1–120)</label><input type="number" id="op-late-urgent" min="1" max="120"></div>
+        <div><label for="op-age" data-t="admin.op.age"></label><input type="number" id="op-age" min="30" max="360"></div>
+        <div><label for="op-second" data-t="admin.op.second"></label><input type="number" id="op-second" min="30" max="360"></div>
       </div>
-      <button class="btn btn-primary" type="button" id="op-save">Save</button>
+      <div class="grid-2">
+        <div><label for="op-late" data-t="admin.op.late"></label><input type="number" id="op-late" min="1" max="120"></div>
+        <div><label for="op-late-urgent" data-t="admin.op.late_urgent"></label><input type="number" id="op-late-urgent" min="1" max="120"></div>
+      </div>
+      <button class="btn btn-primary" type="button" id="op-save" data-t="admin.save"></button>
       <p id="op-result" class="note" style="white-space:pre-line"></p>
     </section>
   </div>
@@ -445,12 +433,8 @@
         <h2 class="card-title" style="border:none;margin:0;padding:0">Sites</h2>
         <button class="btn" type="button" id="sites-refresh">Refresh</button>
       </div>
-      <p class="note">
-        A site turns degraded when its jobs start failing and broken when its recent
-        articles (the canaries) confirm it. «Run now» checks one site's canaries in the
-        background and, if the site is broken and repair is on, looks for a new way to
-        find its video. Press Refresh to see the result.
-      </p>
+      <p class="note" data-t="admin.help.canary"></p>
+      <p class="note" data-t="admin.sites.about"></p>
       <p id="sites-note" class="note"></p>
       <div class="card flush">
         <table>
@@ -509,13 +493,8 @@
           <button class="btn" type="button" id="recipes-export">Export recipes.json</button>
         </div>
       </div>
-      <p class="note">
-        A recipe is a short list of steps that finds the video on a page. The program ships
-        a few; the model writes others, and you can import more. A recipe suspended on a
-        site is not tried there until two canary checks in a row pass; a retired one never
-        comes back. An imported recipe is a candidate: the videos it finds still wait for
-        MCR's approval.
-      </p>
+      <p class="note" data-t="admin.help.recipe"></p>
+      <p class="note" data-t="admin.recipes.about"></p>
       <label class="row tight" style="margin:0">
         <input type="checkbox" id="recipes-retired" style="width:auto">
         <span>Show retired recipes</span>
@@ -796,6 +775,6 @@
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=40"></script>
+<script type="module" src="/static/admin.js?v=41"></script>
 </body>
 </html>

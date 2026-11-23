@@ -1,17 +1,18 @@
 /* Admin panel, «Επισκόπηση» (P13.5): health, what needs the administrator,
  * the autonomy report and the repair-shadow card. Loaded when the section
- * is first opened.
+ * is first opened. Words by key from admin-text.*.js (P13.6).
  */
 
 import { api, el, render, toast, fmtTime } from '/static/app.js?v=6';
+import { t } from '/static/admin-text.js?v=1';
 
 // The autonomy report (P11.0): the soak test's figure and why people were needed.
-const TOUCH_LABEL = {
-  retry: 'Retry', override: 'Retry with another link', rename: 'Rename', redownload: 'Download again',
-  manual_done: 'Put into Dalet by hand', approve: 'Approved a held video', reject: 'Rejected a held video',
-  next: 'Next choice', wrong_video: 'Wrong video', cancel: 'Cancel', now: 'Run now', discard: 'Discard',
-  queued: 'Queued by MCR from an offer or a skipped link',
-};
+// Each touch reason has its words under `admin.touch.<reason>`.
+const TOUCH_REASONS = [
+  'retry', 'override', 'rename', 'redownload', 'manual_done', 'approve', 'reject',
+  'next', 'wrong_video', 'cancel', 'now', 'discard', 'queued',
+];
+const touchLabel = (key) => (TOUCH_REASONS.includes(key) ? t(`admin.touch.${key}`) : key);
 
 const rate1 = (r) => (r === null || r === undefined ? '—' : `${(r * 100).toFixed(1)} %`);
 
@@ -22,12 +23,12 @@ function autonomyTable(title, head, rows) {
       el('thead', {}, el('tr', {}, head.map((h, i) => el('th', i > 0 ? { class: 'right' } : {}, h)))),
       el('tbody', {}, rows.length > 0
         ? rows
-        : el('tr', {}, el('td', { colspan: String(head.length), class: 'empty' }, 'None.'))))));
+        : el('tr', {}, el('td', { colspan: String(head.length), class: 'empty' }, t('admin.none')))))));
 }
 
-function splitLine(label, t) {
-  const aired = t.delivered + t.delivered_manual;
-  return `${label}: ${t.delivered_untouched} of ${aired} untouched (${t.ended} finished)`;
+function splitLine(label, x) {
+  const aired = x.delivered + x.delivered_manual;
+  return t('admin.autonomy.split', { label, untouched: x.delivered_untouched, aired, ended: x.ended });
 }
 
 async function loadAutonomy() {
@@ -39,30 +40,30 @@ async function loadAutonomy() {
     if (e.code !== 'UNAUTHENTICATED') toast(e.message, 'bad');
     return;
   }
-  const t = data.totals;
-  const waiting = el('p', {}, el('strong', {}, `Waiting for a person now: ${data.waiting_now}`));
-  if (t.ended === 0) {
-    render('autonomy-figures', el('p', { class: 'note' }, 'No finished jobs in this period yet.'), waiting);
+  const n = data.totals;
+  const waiting = el('p', {}, el('strong', {}, t('admin.autonomy.waiting', { n: data.waiting_now })));
+  if (n.ended === 0) {
+    render('autonomy-figures', el('p', { class: 'note' }, t('admin.autonomy.empty')), waiting);
     render('autonomy-tables');
     return;
   }
-  const aired = t.delivered + t.delivered_manual;
+  const aired = n.delivered + n.delivered_manual;
   render('autonomy-figures',
     el('p', { style: 'font-size:1.6rem;margin:0' }, el('strong', {},
-      `Delivered untouched: ${rate1(data.untouched_rate)} (${t.delivered_untouched} of ${aired} videos that reached air)`)),
-    el('p', { class: 'note' },
-      `Strict: ${rate1(data.strict_rate)} of all ${t.ended} finished jobs, counting ${t.cancelled} cancelled and ${t.discarded} discarded. ` +
-      `${t.delivered_manual} put into Dalet by hand.`),
-    el('p', { class: 'note' }, `${splitLine('From mail', data.from_mail)}. ${splitLine('Added on the desk or panel', data.manual)}.`),
+      t('admin.autonomy.untouched', { rate: rate1(data.untouched_rate), untouched: n.delivered_untouched, aired }))),
+    el('p', { class: 'note' }, t('admin.autonomy.strict', {
+      rate: rate1(data.strict_rate), ended: n.ended, cancelled: n.cancelled, discarded: n.discarded, manual: n.delivered_manual,
+    })),
+    el('p', { class: 'note' }, `${splitLine(t('admin.autonomy.from_mail'), data.from_mail)} ${splitLine(t('admin.autonomy.manual'), data.manual)}`),
     waiting);
   render('autonomy-tables',
-    autonomyTable('Why a person was needed', ['First error code', 'Jobs'],
+    autonomyTable(t('admin.autonomy.why'), [t('admin.autonomy.first_error'), t('admin.autonomy.jobs')],
       (data.by_first_error || []).map((c) => el('tr', {},
         el('td', { class: 'mono' }, c.key), el('td', { class: 'right' }, String(c.count))))),
-    autonomyTable('What the operator did', ['Action', 'Jobs'],
+    autonomyTable(t('admin.autonomy.did'), [t('admin.autonomy.action'), t('admin.autonomy.jobs')],
       (data.by_touch_reason || []).map((c) => el('tr', {},
-        el('td', { title: c.key }, TOUCH_LABEL[c.key] || c.key), el('td', { class: 'right' }, String(c.count))))),
-    autonomyTable('Sites', ['Site', 'Untouched', 'Total'],
+        el('td', { title: c.key }, touchLabel(c.key)), el('td', { class: 'right' }, String(c.count))))),
+    autonomyTable(t('admin.autonomy.sites'), [t('admin.autonomy.site'), t('admin.autonomy.site_untouched'), t('admin.autonomy.total')],
       (data.by_site || []).map((s) => el('tr', {},
         el('td', { class: 'mono' }, s.site),
         el('td', { class: 'right' }, String(s.delivered_untouched)),
@@ -77,7 +78,7 @@ document.getElementById('autonomy-days').addEventListener('change', loadAutonomy
  * ------------------------------------------------------------------ */
 
 const STATE_CLASS = { ok: 'ok', degraded: 'warn', down: 'bad' };
-const STATE_WORD = { ok: 'green', degraded: 'amber', down: 'red' };
+const stateWord = (state) => (STATE_CLASS[state] ? t(`admin.state.${state}`) : state);
 
 // Where each health line is fixed, for the «needs the administrator» list.
 const FIX_IN = {
@@ -87,9 +88,8 @@ const FIX_IN = {
   tools: 'maintenance', pinned_tools: 'maintenance', encoder: 'maintenance', deno: 'maintenance',
   disk: 'maintenance', queue: 'maintenance', workers: 'maintenance', lockdown: 'maintenance',
 };
-const SECTION_NAME = {
-  settings: 'Ρυθμίσεις', people: 'Άνθρωποι', sites: 'Ιστότοποι', maintenance: 'Συντήρηση', overview: 'Επισκόπηση',
-};
+const SECTIONS = ['settings', 'people', 'sites', 'maintenance', 'overview'];
+const sectionName = (section) => (SECTIONS.includes(section) ? t(`admin.nav.${section}`) : section);
 
 async function loadHealth() {
   let status;
@@ -102,30 +102,30 @@ async function loadHealth() {
   }
   const checks = Object.entries(status.checks || {});
   render('health-list', checks.length === 0
-    ? el('p', { class: 'note ok' }, 'Every check is green.')
+    ? el('p', { class: 'note ok' }, t('admin.health.green'))
     : checks.map(([name, c]) => el('div', { class: 'spec-row' },
       el('span', { class: 'mono' }, name),
-      el('span', {}, el('span', { class: `badge ${STATE_CLASS[c.state] || ''}`, style: 'margin-right:8px' }, STATE_WORD[c.state] || c.state),
+      el('span', {}, el('span', { class: `badge ${STATE_CLASS[c.state] || ''}`, style: 'margin-right:8px' }, stateWord(c.state)),
         c.detail || ''))));
 
   const needs = [];
   if (settings && settings.setup_completed === false) {
-    needs.push(['wizard', 'Setup is not finished: the wizard ends with a test download that reaches the watchfolder (or an explicit skip).']);
+    needs.push(['wizard', t('admin.needs.setup')]);
   }
   if (settings && settings.watchfolder_pending) {
-    needs.push(['settings', `A new watchfolder waits for the videos being made now: ${settings.watchfolder_pending.path}.`]);
+    needs.push(['settings', t('admin.needs.wf_pending', { path: settings.watchfolder_pending.path })]);
   }
   for (const [name, c] of checks) {
-    if (c.state !== 'ok') needs.push([FIX_IN[name] || 'overview', `${name}: ${c.detail || STATE_WORD[c.state]}`]);
+    if (c.state !== 'ok') needs.push([FIX_IN[name] || 'overview', `${name}: ${c.detail || stateWord(c.state)}`]);
   }
   render('needs-list', needs.length === 0
-    ? el('p', { class: 'note ok' }, 'Nothing needs the administrator now.')
+    ? el('p', { class: 'note ok' }, t('admin.needs.nothing'))
     : needs.map(([section, text]) => el('div', { class: 'row tight', style: 'justify-content:space-between' },
       el('span', {}, text),
       section === 'wizard'
         // Back into the wizard (P13.5b): the page shows it again while setup is unfinished.
-        ? el('button', { class: 'btn btn-primary', type: 'button', onclick: () => { sessionStorage.removeItem('omni.setup.leave'); location.reload(); } }, 'Continue the setup wizard')
-        : el('button', { class: 'btn', type: 'button', onclick: () => { location.hash = section; } }, SECTION_NAME[section] || section))));
+        ? el('button', { class: 'btn btn-primary', type: 'button', onclick: () => { sessionStorage.removeItem('omni.setup.leave'); location.reload(); } }, t('admin.needs.continue'))
+        : el('button', { class: 'btn', type: 'button', onclick: () => { location.hash = section; } }, sectionName(section)))));
 }
 
 /* ------------------------------------------------------------------ *
@@ -140,7 +140,7 @@ function shadowRows(value, prefix = '') {
   if (value === null || typeof value !== 'object') return [[prefix, String(value)]];
   return Object.entries(value).flatMap(([k, v]) => (v !== null && typeof v === 'object' && !Array.isArray(v)
     ? shadowRows(v, `${prefix}${k}.`)
-    : [[`${prefix}${k}`, Array.isArray(v) ? `${v.length} item(s)` : String(v)]]));
+    : [[`${prefix}${k}`, Array.isArray(v) ? t('admin.shadow.items', { n: v.length }) : String(v)]]));
 }
 
 async function loadShadow() {
@@ -149,9 +149,7 @@ async function loadShadow() {
     render('shadow-body', shadowRows(report).slice(0, 40).map(([k, v]) => el('div', { class: 'spec-row' },
       el('span', { class: 'mono' }, k), el('span', {}, v))));
   } catch (e) {
-    render('shadow-body', el('p', { class: 'note' }, e.status === 404
-      ? 'This version has no shadow report yet. The Repair report on «Ιστότοποι» counts shadow runs per site.'
-      : e.message));
+    render('shadow-body', el('p', { class: 'note' }, e.status === 404 ? t('admin.shadow.none') : e.message));
   }
 }
 

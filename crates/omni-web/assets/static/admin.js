@@ -10,7 +10,12 @@
  */
 
 import { api, el, render, toast, logout } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=10';
+import { runWizard } from '/static/wizard.js?v=11';
+import { t, mountLanguageSwitch } from '/static/admin-text.js?v=1';
+
+// P13.6: the page's words in the chosen language (Greek by default) before
+// anything reads them, the search index included.
+mountLanguageSwitch();
 
 /* ------------------------------------------------------------------ *
  * First-run account (P2.14) and the setup wizard (P7.12)
@@ -32,7 +37,7 @@ function showPasswordCard() {
       event.preventDefault();
       const fresh = document.getElementById('first-new').value;
       if (fresh !== document.getElementById('first-repeat').value) {
-        toast('The two new passwords differ.', 'bad');
+        toast(t('admin.pw.differ'), 'bad');
         return;
       }
       try {
@@ -44,18 +49,18 @@ function showPasswordCard() {
           },
         });
         // The server ended the session, so the only way on is to sign in again.
-        toast('Password changed. Sign in again…', 'ok');
+        toast(t('admin.pw.changed'), 'ok');
         setTimeout(() => { location.href = '/login'; }, 1200);
       } catch (e) { toast(e.message, 'bad'); }
     },
   },
-    field('first-current', 'Current password', 'current-password'),
-    field('first-new', 'New password (at least 12 characters)', 'new-password'),
-    field('first-repeat', 'Repeat the new password', 'new-password'),
-    el('button', { class: 'btn btn-primary', type: 'submit' }, 'Change password'));
+    field('first-current', t('admin.pw.current'), 'current-password'),
+    field('first-new', t('admin.pw.new'), 'new-password'),
+    field('first-repeat', t('admin.pw.repeat'), 'new-password'),
+    el('button', { class: 'btn btn-primary', type: 'submit' }, t('admin.pw.change')));
   render(document.querySelector('main'), el('section', { class: 'card' },
-    el('h2', { class: 'card-title' }, 'Change the default password'),
-    el('p', { class: 'note' }, 'Αλλάξτε πρώτα τον προεπιλεγμένο κωδικό. Nothing else is available until you do.'),
+    el('h2', { class: 'card-title' }, t('admin.pw.title')),
+    el('p', { class: 'note' }, t('admin.pw.first')),
     form));
 }
 
@@ -84,8 +89,8 @@ document.getElementById('logout-btn').addEventListener('click', logout);
 
 // One URL per module; each is imported once, when its section is first opened.
 const MODULES = {
-  overview: () => import('/static/admin-overview.js?v=2'),
-  settings: () => import('/static/admin-settings.js?v=2'),
+  overview: () => import('/static/admin-overview.js?v=3'),
+  settings: () => import('/static/admin-settings.js?v=3'),
   people: () => import('/static/admin-people.js?v=2'),
   sites: () => import('/static/admin-sites.js?v=3'),
   maintenance: () => import('/static/admin-maintenance.js?v=2'),
@@ -100,7 +105,7 @@ async function ensure(name) {
     loaded.set(name, ready);
     try { await ready; } catch (e) {
       loaded.delete(name);
-      toast(`This section could not be loaded: ${e.message}`, 'bad');
+      toast(t('admin.section.failed', { message: e.message }), 'bad');
     }
     return;
   }
@@ -158,7 +163,7 @@ search.addEventListener('input', () => {
     if (sections.has(s)) ensure(s);
   }
   for (const i of index) i.card.hidden = !hits.includes(i);
-  searchNote.textContent = hits.length ? `${hits.length} card(s)` : 'No setting by that name.';
+  searchNote.textContent = hits.length ? t('admin.search.hits', { n: hits.length }) : t('admin.search.none');
 });
 
 window.addEventListener('hashchange', () => { search.value = ''; searchNote.textContent = ''; route(); });
