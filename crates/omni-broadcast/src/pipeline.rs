@@ -1811,7 +1811,9 @@ impl BroadcastEngine {
         }
 
         let duration = held.duration.unwrap_or(0.0);
-        let report = match crate::verify::verify_mxf_with_clip(&self.ffprobe_path, &path, duration, Some(&slug)).await {
+        // A held video may have been encoded before the Rec.709 labels (P14.9b).
+        let labels = crate::verify::ColourLabels::TolerateUnset;
+        let report = match crate::verify::verify_mxf_with_clip_labels(&self.ffprobe_path, &path, duration, Some(&slug), labels).await {
             Ok(report) => report,
             Err(e) => {
                 let err_msg = format!("Compliance check could not run: {e}");

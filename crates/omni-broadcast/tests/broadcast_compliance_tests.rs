@@ -141,6 +141,29 @@ fn video_matches_sony_xdcam_hd422_pal_1080i50() {
     assert_flag(&args, "-color_range", "tv");
 }
 
+/// P14.9: the flags above do not label the frames, so the encoder wrote
+/// primaries and transfer as unspecified. Every branch must end with the
+/// label, after all pixel work, and the label must not set the matrix or
+/// range: that would skip FFmpeg's conversion to BT.709 and change the picture.
+#[test]
+fn every_branch_labels_its_frames_rec709_after_the_pixel_work() {
+    for scan in [ScanType::Progressive, ScanType::InterlacedTff, ScanType::InterlacedBff, ScanType::Unknown] {
+        for fps in [25.0, 29.97, 50.0, 59.94] {
+            let p = plan_for(&probe_of(video(1280, 720, fps, scan), Some(audio(2))));
+            let graph = filter_graph(&p.args);
+            let video_part = graph.split(';').next().unwrap();
+            assert!(
+                video_part.ends_with(",setparams=color_primaries=bt709:color_trc=bt709[v]"),
+                "branch {} does not end labelled Rec.709: {video_part}",
+                p.video_branch
+            );
+            assert_eq!(video_part.matches("setparams").count(), 1, "{video_part}");
+            assert!(!video_part.contains("colorspace="), "the matrix must stay FFmpeg's conversion: {video_part}");
+            assert!(!video_part.contains("range="), "the range must stay FFmpeg's conversion: {video_part}");
+        }
+    }
+}
+
 #[test]
 fn output_frame_rate_is_exactly_25_for_every_source_rate() {
     // 1080i50 PAL playout fed 29.97 or 50p is the most damaging mistake this
@@ -700,6 +723,8 @@ fn rewrap_targets_rdd9_op1a_at_25_fps() {
     assert_flag(&args, "-t", "rdd9");
     assert_flag(&args, "--tc-rate", "25");
     assert_flag(&args, "-o", "C:/temp/jobs/7/7_output.mxf");
+    // P14.9: the descriptor names the Rec.709 primaries (bmx omits them otherwise).
+    assert_flag(&args, "--color-prim", "bt709");
     assert_eq!(
         args.last().map(|s| s.as_str()),
         Some("C:/temp/jobs/7/7_transcode.mxf"),

@@ -62,6 +62,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -Arch x64 -ToolsD
   `--verify`, `/?`): an x64 package can be built on an ARM64 PC, where x64
   programs run under emulation, but an arm64 package has to be built on an
   ARM64 machine.
+- `omni-ingest.exe --version` and the first line of `OmniIngest-Setup.exe /?`
+  name the version and the commit the program was built from, for example
+  `omni-ingest 1.0.0 (abc1234)`; a build outside a git checkout says
+  `(unknown)`.
 
 ### 2.1 Installing with Setup
 
@@ -452,6 +456,9 @@ if you want.
 | bmxtranswrap | 1.6.0 (BBC bmx) | **pinned** by SHA-256; never upgraded on its own |
 | yt-dlp | latest stable | verified nightly update at 03:00, previous build kept for rollback |
 | Deno | latest | needed by yt-dlp for YouTube; kept current |
+
+Every delivered file is labelled BT.709 (colour primaries, transfer and
+matrix), both in the MPEG-2 video and in the MXF picture descriptor.
 
 **Admin → Toolchain** lists each tool with its state ("pinned build", "not
 the pinned build", "missing" or a version) and an **Install** / **Repair**

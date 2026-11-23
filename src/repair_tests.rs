@@ -1043,9 +1043,15 @@ fn page_with_picture() -> PageSnapshot {
     s
 }
 
+/// The card step's cap in tests that are not about the cap: ffmpeg runs below
+/// normal priority, and on a loaded machine the 45 s production cap ran out
+/// mid-comparison (P14.7). The cap itself has its own test.
+const TEST_CARD_CAP: Duration = Duration::from_secs(600);
+
 fn hold_rig(card_ffmpeg: Option<PathBuf>, body: Option<Vec<u8>>) -> Rig {
     let mut fake = Fake::new();
     fake.card_ffmpeg = card_ffmpeg;
+    fake.card_cap = Some(TEST_CARD_CAP);
     *fake.pics.body.lock().unwrap() = body;
     let r = rig_with(RepairMode::Hold, Duration::from_secs(60), fake);
     r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
@@ -1642,15 +1648,22 @@ async fn cancel_during_the_live_load_is_lost_and_writes_nothing() {
     let r = rig_with(RepairMode::Hold, Duration::from_secs(120), fake);
     let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
     let cancel = CancellationToken::new();
-    let c2 = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+    // Cancel once the live load has started (P14.7: a fixed 300 ms timer could
+    // fire before the ladder reached it on a loaded machine), and time from there.
+    let (c2, fake) = (cancel.clone(), r.fake.clone());
+    let cancelled_at = tokio::spawn(async move {
+        while fake.live_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         c2.cancel();
+        Instant::now()
     });
-    let t = Instant::now();
     let res = run(&r.ctx, &r.job, OWNER, PAGE, Some(blank()), &Prior::default(), &cancel).await;
+    let ended = Instant::now();
     assert!(matches!(res, LadderResult::Lost), "{res:?}");
-    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    assert!(cancel.is_cancelled(), "the ladder ended before the live load was cancelled");
+    let after_cancel = ended - cancelled_at.await.unwrap();
+    assert!(after_cancel < Duration::from_secs(3), "ended {after_cancel:?} after the cancel");
     assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 1);
     assert!(!has_event(&r, id));
     assert!(r.fake.downloads().is_empty());

@@ -34,10 +34,17 @@ async fn serve(app: Router) -> u16 {
     port
 }
 
-fn init_adblock() -> tempfile::TempDir {
+/// One browser at a time: fourteen Chromes in parallel missed a 12 s sniff
+/// deadline on a loaded machine (P14.3, the first run without bin/), and a CI
+/// runner has fewer cores than a desk machine.
+static ONE_BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The adblock lists, and this test's turn with the browser: hold both to the end.
+async fn init_adblock() -> (tempfile::TempDir, tokio::sync::MutexGuard<'static, ()>) {
+    let turn = ONE_BROWSER.lock().await;
     let dir = tempfile::tempdir().unwrap();
     UnifiedAdBlocker::init(dir.path().to_path_buf());
-    dir
+    (dir, turn)
 }
 
 const LONG_ID: &str = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
@@ -48,7 +55,7 @@ async fn amp_embeds_are_found_and_hostile_ids_are_ignored() {
         eprintln!("WARNING: skipping AMP sniffer test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let page = format!(
         r#"<!doctype html><html amp><head><meta charset="utf-8"><title>AMP</title></head><body>
 <amp-video width="640" height="360" src="/media/amp-clip.mp4"></amp-video>
@@ -119,7 +126,7 @@ async fn a_sourcepoint_dialog_in_another_sites_frame_is_accepted() {
         eprintln!("WARNING: skipping consent frame test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     // The dialog is served from a different site (localhost vs 127.0.0.1), as a CMP's is.
     let dialog = r#"<!doctype html><html><body><p>We value your privacy</p>
 <button title="Manage options">Manage</button>
@@ -147,7 +154,7 @@ async fn a_greek_accept_button_in_the_top_page_is_clicked() {
         eprintln!("WARNING: skipping Greek consent test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     // Mixed case and accents: the label must match with both normalised.
     let page = gated_page(
         r##"<div class="banner"><p>Χρησιμοποιούμε cookies</p><a href="#" onclick="return false">Ρυθμίσεις</a>
@@ -234,7 +241,7 @@ async fn a_same_site_canonical_is_followed_when_the_page_shows_nothing() {
         eprintln!("WARNING: skipping canonical test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let (port, _) = canonical_server().await;
 
     let media = StreamSniffer::extract_media_bundle(&format!("http://127.0.0.1:{port}/a"), 25)
@@ -253,7 +260,7 @@ async fn a_canonical_on_another_site_is_not_followed() {
         eprintln!("WARNING: skipping canonical test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let (port, hits) = canonical_server().await;
 
     let r = StreamSniffer::extract_media_bundle(&format!("http://127.0.0.1:{port}/c"), 14).await;
@@ -267,7 +274,7 @@ async fn a_canonical_equal_to_the_page_causes_no_second_visit() {
         eprintln!("WARNING: skipping canonical test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let (port, hits) = canonical_server().await;
 
     let r = StreamSniffer::extract_media_bundle(&format!("http://127.0.0.1:{port}/d"), 14).await;
@@ -281,7 +288,7 @@ async fn a_player_inside_a_scroller_that_loads_only_when_seen_is_found() {
         eprintln!("WARNING: skipping lazy scroll test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     // The player is far down a nested scroller: scrolling the window never
     // brings it into view, only scrolling the element itself does.
     let page = r#"<!doctype html><html><head><meta charset="utf-8"><title>Lazy</title></head><body>
@@ -318,7 +325,7 @@ async fn a_playlist_requested_during_load_is_seen() {
         eprintln!("WARNING: skipping early request test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let page = r#"<!doctype html><html><head><meta charset="utf-8"><title>Early</title></head><body>
 <p>Player</p>
 <script>new Image().src = '/v/master' + '.m3u8';</script></body></html>"#;
@@ -339,7 +346,7 @@ async fn a_canonical_that_is_the_site_root_is_not_followed() {
         eprintln!("WARNING: skipping canonical test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let (port, hits) = canonical_server().await;
 
     let r = StreamSniffer::extract_media_bundle(&format!("http://127.0.0.1:{port}/news/story"), 14).await;
@@ -356,7 +363,7 @@ async fn ordinary_links_and_buttons_with_consent_words_are_never_clicked() {
         eprintln!("WARNING: skipping consent safety test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let clicks = Arc::new(AtomicUsize::new(0));
     let c1 = clicks.clone();
     let c2 = clicks.clone();
@@ -403,7 +410,7 @@ async fn an_article_whose_path_contains_vast_still_loads() {
         eprintln!("WARNING: skipping blocked-path test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let app = Router::new().route("/news/vast-majority-of-voters", get(|| async { Html(CANONICAL_VIDEO) }));
     let port = serve(app).await;
 
@@ -421,7 +428,7 @@ async fn a_lazy_sentinel_far_down_the_page_is_reached_even_when_a_player_exists(
         eprintln!("WARNING: skipping stepped scroll test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let page = r#"<!doctype html><html><head><meta charset="utf-8"><title>Long</title></head><body>
 <div class="player-shell" style="height:40px">player</div>
 <div id="s" style="margin-top:2800px;height:60px">more</div><div style="height:1200px"></div>
@@ -450,7 +457,7 @@ async fn consent_labels_with_filler_words_are_clicked() {
         eprintln!("WARNING: skipping consent label test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     for label in ["Yes, I agree", "Accept and close", "ΑΠΟΔΟΧΗ ΟΛΩΝ ΤΩΝ COOKIES"] {
         let page = gated_page(&format!(
             r#"<div class="banner"><button onclick="window.postMessage('consent-accepted','*')">{label}</button></div>"#
@@ -471,7 +478,7 @@ async fn a_generic_accept_class_on_a_form_button_is_not_clicked() {
         eprintln!("WARNING: skipping form button test -- no Chrome/Edge installed");
         return;
     }
-    let _adblock = init_adblock();
+    let _adblock = init_adblock().await;
     let hits = Arc::new(AtomicUsize::new(0));
     let h = hits.clone();
     let app = Router::new()

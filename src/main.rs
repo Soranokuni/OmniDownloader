@@ -37,10 +37,17 @@ use selfcheck::UpdateVerdict;
 use worker::finish_held;
 use worker::{run_job, wait_for_deliveries, LEASE_REAP_INTERVAL, LEASE_SECS, SHUTDOWN_DELIVERY_BUDGET};
 
+// A panic in a job is caught and the job's lease released (P11.8); with
+// `panic = "abort"` it would end the whole service instead (P14.4).
+#[cfg(panic = "abort")]
+compile_error!("omni-ingest must be built with panic = \"unwind\" (see [profile.release] in Cargo.toml)");
+
 #[derive(Parser)]
 #[command(name = "omni-ingest")]
 #[command(author = "Alex Fountas")]
-#[command(version = "1.0.0")]
+// "omni-ingest 1.0.0 (abc1234)": the crate version and the commit (P14.4);
+// scripts\package.ps1 reads the version from this line.
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("OMNI_GIT_SHA"), ")"))]
 #[command(about = "Unified Broadcast-Grade Media Ingest Engine & Windows Service")]
 struct Cli {
     #[command(subcommand)]

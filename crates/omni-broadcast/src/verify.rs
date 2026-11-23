@@ -94,6 +94,18 @@ pub async fn verify_mxf(
     verify_mxf_with_clip(ffprobe, mxf, source_duration_secs, None).await
 }
 
+/// How the Rec.709 colour labels (primaries, transfer, matrix) are judged.
+/// A value other than bt709 fails in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColourLabels {
+    /// All three must read bt709 (P14.9b): every file this build encodes
+    /// carries them, in the bitstream and in the MXF descriptor.
+    Required,
+    /// An unset label passes. Only for a held video approved after an
+    /// upgrade: it may have been encoded by a build that did not write them.
+    TolerateUnset,
+}
+
 /// Verify, and additionally confirm the MXF material package name.
 ///
 /// bmxtranswrap's `--clip` sets the name Dalet shows as the asset title. A
@@ -105,6 +117,17 @@ pub async fn verify_mxf_with_clip(
     mxf: &Path,
     source_duration_secs: f64,
     expected_clip: Option<&str>,
+) -> Result<ComplianceReport> {
+    verify_mxf_with_clip_labels(ffprobe, mxf, source_duration_secs, expected_clip, ColourLabels::Required).await
+}
+
+/// [`verify_mxf_with_clip`] with the colour labels judged as `labels` says.
+pub async fn verify_mxf_with_clip_labels(
+    ffprobe: &Path,
+    mxf: &Path,
+    source_duration_secs: f64,
+    expected_clip: Option<&str>,
+    labels: ColourLabels,
 ) -> Result<ComplianceReport> {
     let mxf_arg = mxf.to_string_lossy().into_owned();
     let out = run_capture(
@@ -131,7 +154,7 @@ pub async fn verify_mxf_with_clip(
     }
 
     let size_bytes = tokio::fs::metadata(mxf).await.map(|m| m.len()).unwrap_or(0);
-    check_probe_json_with_clip(&out.stdout, size_bytes, source_duration_secs, expected_clip)
+    check_probe_json_with_clip_labels(&out.stdout, size_bytes, source_duration_secs, expected_clip, labels)
 }
 
 /// Apply the checks to ffprobe JSON. Separated so the gate can be tested
@@ -150,6 +173,17 @@ pub fn check_probe_json_with_clip(
     size_bytes: u64,
     source_duration_secs: f64,
     expected_clip: Option<&str>,
+) -> Result<ComplianceReport> {
+    check_probe_json_with_clip_labels(json, size_bytes, source_duration_secs, expected_clip, ColourLabels::Required)
+}
+
+/// [`check_probe_json_with_clip`] with the colour labels judged as `labels` says.
+pub fn check_probe_json_with_clip_labels(
+    json: &str,
+    size_bytes: u64,
+    source_duration_secs: f64,
+    expected_clip: Option<&str>,
+    labels: ColourLabels,
 ) -> Result<ComplianceReport> {
     let v: serde_json::Value =
         serde_json::from_str(json).context("ffprobe returned invalid JSON for the output MXF")?;
@@ -222,16 +256,12 @@ pub fn check_probe_json_with_clip(
             ("color_transfer", "color_transfer", "bt709"),
             ("color_space", "color_space", "bt709"),
         ] {
+            // ffprobe leaves a label out of the JSON when the file does not carry it.
             let actual = vs.get(key).and_then(|x| x.as_str()).unwrap_or("unset");
-            // Some ffprobe builds leave these unset on MXF even when the
-            // bitstream carries them. Unset is tolerated; a *different* value is
-            // not, because that one would actually shift the colours.
-            checks.push(Check::assert(
-                name,
-                expected,
-                actual,
-                actual == expected || actual == "unset",
-            ));
+            // Unset passes only on the held re-check (ColourLabels); a
+            // *different* value never does, because it would shift the colours.
+            let unset_ok = labels == ColourLabels::TolerateUnset && actual == "unset";
+            checks.push(Check::assert(name, expected, actual, actual == expected || unset_ok));
         }
 
         if let Some(br) = vs
@@ -492,21 +522,51 @@ mod tests {
         assert!(r.failures().iter().any(|c| c.name == "container"));
     }
 
+    /// The compliant fixture with one colour label left out, as ffprobe does when the file has none.
+    fn without(label: &str) -> String {
+        let json = compliant_json(92.0).replace(&format!(r#""{label}": "bt709","#), "");
+        assert!(!json.contains(&format!(r#""{label}""#)), "fixture still has {label}");
+        json
+    }
+
+    fn judged(json: &str, labels: ColourLabels) -> ComplianceReport {
+        check_probe_json_with_clip_labels(json, plausible_size(92.0), 92.0, None, labels).unwrap()
+    }
+
     #[test]
-    fn unset_colour_metadata_is_tolerated_but_wrong_metadata_is_not() {
-        // Some ffprobe builds leave these blank on MXF even when the bitstream
-        // carries them, so blank must not fail a good file...
+    fn an_unset_colour_label_fails_a_new_encode() {
+        // P14.9b: every file this build encodes carries all three labels.
+        for label in ["color_primaries", "color_transfer", "color_space"] {
+            let r = judged(&without(label), ColourLabels::Required);
+            assert!(!r.pass, "{label} unset passed: {}", r.summary());
+            let failed: Vec<_> = r.failures().iter().map(|c| (c.name.clone(), c.actual.clone())).collect();
+            assert_eq!(failed, vec![(label.to_string(), "unset".to_string())]);
+            // The default entry points are the strict ones.
+            assert!(!check_probe_json(&without(label), plausible_size(92.0), 92.0).unwrap().pass, "{label}");
+        }
+        assert!(judged(&compliant_json(92.0), ColourLabels::Required).pass);
+    }
+
+    #[test]
+    fn an_unset_colour_label_passes_the_held_recheck() {
+        // A held video encoded by the build before the labels, approved after the upgrade.
         let json = compliant_json(92.0)
             .replace(r#""color_primaries": "bt709","#, "")
             .replace(r#""color_transfer": "bt709","#, "")
             .replace(r#""color_space": "bt709","#, "");
-        assert!(check_probe_json(&json, plausible_size(92.0), 92.0).unwrap().pass);
+        let r = judged(&json, ColourLabels::TolerateUnset);
+        assert!(r.pass, "{}", r.summary());
+    }
 
-        // ...but Rec.601 primaries would actually shift the colours on air.
+    #[test]
+    fn a_different_colour_label_fails_in_both_modes() {
+        // Rec.601 primaries would actually shift the colours on air.
         let json = compliant_json(92.0).replace(r#""color_primaries": "bt709""#, r#""color_primaries": "smpte170m""#);
-        let r = check_probe_json(&json, plausible_size(92.0), 92.0).unwrap();
-        assert!(!r.pass);
-        assert!(r.failures().iter().any(|c| c.name == "color_primaries"));
+        for labels in [ColourLabels::Required, ColourLabels::TolerateUnset] {
+            let r = judged(&json, labels);
+            assert!(!r.pass, "{labels:?}");
+            assert!(r.failures().iter().any(|c| c.name == "color_primaries" && c.actual == "smpte170m"), "{labels:?}");
+        }
     }
 
     #[test]

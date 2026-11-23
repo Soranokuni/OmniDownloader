@@ -1,0 +1,74 @@
+# CI (P14.3): release build with warnings denied, the workspace tests, and the
+# dependency policy (deny.toml). The media tools in bin/ are not in git, so the
+# tests that need them skip with a visible WARNING line; the browser tests run
+# against the runner's own Chrome/Edge.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Applies to the workspace's own crates only: Cargo builds registry
+  # dependencies with --cap-lints allow, so their warnings cannot fail this.
+  # Set for the whole job so the build and the tests share one set of flags.
+  RUSTFLAGS: -D warnings
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  build-and-test:
+    name: Build and test (windows-latest, x64)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Release build (warnings are errors)
+        run: cargo build --release --workspace --locked
+
+      # --show-output: libtest hides a passing test's output, and a test that
+      # skipped for want of bin/ passes; its WARNING line must still be seen.
+      - name: Tests
+        shell: bash
+        run: cargo test --workspace --no-fail-fast --locked -- --show-output 2>&1 | tee test-output.log
+
+      - name: List the tests that skipped themselves
+        if: always()
+        shell: bash
+        run: |
+          grep -hoE "WARNING: (skip|bin/).*" test-output.log | sort | uniq -c | sort -rn > skipped.txt || true
+          total=$(awk '{s += $1} END {print s + 0}' skipped.txt)
+          echo "::warning title=Tests skipped::${total} tests skipped themselves (the media tools in bin/ are not in git); the list is in the job summary"
+          {
+            echo "### Tests that skipped themselves (${total})"
+            echo '```'
+            cat skipped.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deny:
+    name: Dependency policy (cargo deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # deny.toml restricts the graph to the Windows targets, so the check
+      # judges the Windows build even on this Linux runner.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

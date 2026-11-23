@@ -214,6 +214,56 @@ async fn a_held_file_changed_after_approval_is_not_delivered() {
     assert!(r.repo.get_job(job.id).unwrap().unwrap().file_path.is_none());
 }
 
+/// P14.9b: a video held by the build before the Rec.709 labels and approved
+/// after the upgrade still goes out. Made as that build made it: the MXF
+/// descriptor names no primaries, so ffprobe reports them unset. A new encode
+/// with the same gap fails the gate (verify's unit tests); the held re-check
+/// accepts it.
+#[tokio::test]
+async fn a_video_held_before_the_colour_labels_is_still_delivered_on_approval() {
+    let Some(r) = rig() else { return };
+    let bmx = bin("bmxtranswrap").expect("rig() checked it");
+    let ffprobe = bin("ffprobe").expect("rig() checked it");
+    let job = leased_job(&r).await;
+    let id = job.id;
+
+    // The previous build's output: encoded, then rewrapped without --color-prim.
+    let work = r.root.join("old_build");
+    let (intermediate, duration) = omni_broadcast::transcoder::Transcoder::new(&r.ffmpeg, &ffprobe)
+        .transcode(id, &r.root.join("attachments").join("1").join("source.mp4"), &work, |_| {})
+        .await
+        .expect("transcode");
+    let held_path = held_dir(&r, id).join(format!("{SLUG}.mxf"));
+    std::fs::create_dir_all(held_dir(&r, id)).unwrap();
+    let rewrapped = omni_core::process::run(
+        &bmx,
+        ["-t", "rdd9", "--tc-rate", "25", "-o", &held_path.to_string_lossy(), "--clip", SLUG, &intermediate.to_string_lossy()],
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .unwrap();
+    assert!(rewrapped.success, "{}", rewrapped.stderr_tail);
+    let unlabelled = omni_broadcast::verify::verify_mxf_with_clip(&ffprobe, &held_path, duration, Some(SLUG)).await.unwrap();
+    assert!(
+        unlabelled.failures().iter().map(|c| (c.name.as_str(), c.actual.as_str())).eq([("color_primaries", "unset")]),
+        "the stand-in must fail a new encode's gate on the primaries alone: {}",
+        unlabelled.summary()
+    );
+
+    let sha = omni_core::held::sha256_reader(std::fs::File::open(&held_path).unwrap()).unwrap();
+    let bytes = std::fs::metadata(&held_path).unwrap().len() as i64;
+    let expires = chrono::Utc::now() + chrono::Duration::hours(24);
+    assert!(r.repo.hold_output(id, "w1", &held_path.to_string_lossy(), bytes, &sha, Some(duration), expires).unwrap());
+    assert!(r.repo.finish(id, "w1", JobStatus::AwaitingApproval, None, None, None).unwrap());
+    assert!(r.repo.approve_held(id, &sha, "desk").unwrap());
+    let job = r.repo.lease_job("w2", 180).unwrap().expect("an approved job is leased again");
+    let held = r.repo.approved_held(id).unwrap().expect("approved row");
+
+    r.engine.deliver_held(&job, "w2", &held, None).await.expect("the approved video delivers");
+
+    assert_eq!(watchfolder_files(&r), vec![format!("{SLUG}.mxf")]);
+}
+
 #[tokio::test]
 async fn a_held_file_that_is_gone_is_not_delivered() {
     let Some(r) = rig() else { return };

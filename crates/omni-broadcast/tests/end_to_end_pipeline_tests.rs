@@ -517,6 +517,80 @@ async fn the_clip_name_reaches_the_mxf_and_the_gate_checks_it() {
     assert!(!wrong.pass, "a wrong material package name was accepted");
 }
 
+/// P14.9: the delivered file says it is Rec.709, primaries, transfer and
+/// matrix, both where ffprobe reads the MXF (stream) and in the MPEG-2
+/// bitstream itself (the decoded frames carry the sequence display
+/// extension's values). Before the fix the bitstream said 2/2/1. One source
+/// per video branch: progressive at 25 and 50, rate-converted 30, and an
+/// interlaced 25 TFF source on the pass-through branch.
+#[tokio::test]
+async fn the_delivered_file_is_labelled_rec709_on_every_branch() {
+    let Some((ffmpeg, ffprobe)) = toolchain() else {
+        return;
+    };
+    let Some(bmx) = tool("bmxtranswrap") else {
+        eprintln!("WARNING: skipping Rec.709 label test -- bmxtranswrap not found in bin/");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    for fps in ["25", "30", "50"] {
+        let src = dir.path().join(format!("p{fps}.mp4"));
+        assert!(make_source(&ffmpeg, &src, fps, 2, true).await, "source {fps}p");
+        sources.push(src);
+    }
+    let interlaced = dir.path().join("i25.mp4");
+    let made = omni_core::process::run(
+        &ffmpeg,
+        [
+            "-y", "-v", "error", "-f", "lavfi", "-i",
+            "testsrc2=size=1920x1080:rate=50:duration=2,tinterlace=mode=interleave_top,setfield=tff",
+            "-c:v", "libx264", "-flags", "+ildct+ilme", "-x264-params", "tff=1", "-pix_fmt", "yuv420p",
+            &interlaced.to_string_lossy(),
+        ],
+        omni_core::process::RunOpts::new(std::time::Duration::from_secs(120)),
+    )
+    .await
+    .expect("ffmpeg ran");
+    assert!(made.success, "interlaced source: {}", made.stderr_tail);
+    sources.push(interlaced);
+
+    for (n, src) in sources.iter().enumerate() {
+        let work = dir.path().join(format!("work{n}"));
+        let (intermediate, _) = Transcoder::new(&ffmpeg, &ffprobe)
+            .transcode_with_target(n as i64, src, &work, &LoudnessTarget { enabled: false, ..LoudnessTarget::default() }, |_| {})
+            .await
+            .expect("transcode");
+        let delivered = omni_broadcast::Rewrapper::new(&bmx)
+            .rewrap_with_clip(n as i64, &intermediate, &work, Some("1_MCR_LABEL"), None)
+            .await
+            .expect("rewrap");
+        for entries in ["stream=color_primaries,color_transfer,color_space", "frame=color_primaries,color_transfer,color_space"] {
+            let out = omni_core::process::run(
+                &ffprobe,
+                [
+                    "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1", "-show_entries", entries,
+                    "-of", "default=nw=1", &delivered.to_string_lossy(),
+                ],
+                omni_core::process::RunOpts {
+                    stdout: omni_core::process::StdoutMode::Capture,
+                    ..omni_core::process::RunOpts::new(std::time::Duration::from_secs(60))
+                },
+            )
+            .await
+            .expect("ffprobe ran");
+            for key in ["color_primaries", "color_transfer", "color_space"] {
+                assert!(
+                    out.stdout.lines().any(|l| l.trim() == format!("{key}=bt709")),
+                    "{} ({entries}): {key} is not bt709:\n{}",
+                    src.display(),
+                    out.stdout
+                );
+            }
+        }
+    }
+}
+
 /// P11.1: a tool that fails in transcode or rewrap leaves its stage's code on
 /// the error, which is what the worker classifies. Both used to read as
 /// PIPELINE_FAILED, "unexpected error", on the MCR card.
