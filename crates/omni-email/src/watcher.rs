@@ -598,6 +598,10 @@ impl EmailWatcher {
             // first. If the download fails they stay there, for MCR.
             let (status, method) = match job.tier {
                 Tier::Attachment => (JobStatus::ManualDownload, Some("attachment")),
+                // A locker share of one file that can be fetched directly (Dropbox,
+                // Google Drive, OneDrive, SharePoint) goes to the pipeline (P11.15a);
+                // the others wait for MCR as before.
+                Tier::Locker if omni_core::locker::direct_download(&job.url).is_some() => (JobStatus::Pending, Some("locker")),
                 Tier::Locker => (job.status, Some("locker")),
                 _ => (job.status, None),
             };

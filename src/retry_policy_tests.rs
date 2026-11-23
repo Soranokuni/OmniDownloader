@@ -544,3 +544,37 @@ fn every_review_site_writes_the_review_hint() {
     assert_eq!(src.matches("&review_hint(repo, job_id, code, ").count(), 3, "the three review sites");
     assert_eq!(src.matches("None, &omni_broadcast::errors::hint_for_job(").count(), 0, "a site writes the plain hint again");
 }
+
+/// P11.15a: a locker link a person must fetch (WeTransfer, a shared folder)
+/// goes to the MCR desk before anything is requested, with the vendor named;
+/// a share of one file fetched directly does not.
+#[tokio::test]
+async fn a_locker_a_person_must_fetch_goes_to_the_desk_and_a_direct_share_does_not() {
+    use omni_core::locker::{classify, Locker};
+    let r = rig();
+    for (n, url, vendor) in [(1, "https://we.tl/t-abc123", "WeTransfer"), (2, "https://www.dropbox.com/sh/folder1/AAB?dl=0", "Dropbox")] {
+        let id = r.repo.enqueue(&NewJob::new(url, &format!("{n}_ANNA_TEST"), "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+        let job = r.lease(id);
+        r.run_job(job).await;
+        let row = r.row(id);
+        assert_eq!((row.status, row.error_code.as_deref()), (JobStatus::ManualDownload, Some("MANUAL_DOWNLOAD")), "{url}");
+        assert!(row.error_message.as_deref().unwrap_or("").contains(vendor), "{url}: {:?}", row.error_message);
+    }
+    assert!(locker_manual_message(&classify("https://www.dropbox.com/s/abc/clip.mp4")).is_none(), "a direct share is not sent to the desk");
+    assert!(matches!(classify("https://www.dropbox.com/s/abc/clip.mp4"), Locker::Direct { .. }));
+    assert!(locker_manual_message(&classify("https://news.example/story")).is_none());
+}
+
+/// P11.15a: run_job fetches a direct share from its direct address, judged by
+/// the egress rule, before yt-dlp or the browser see the link.
+#[test]
+fn run_job_turns_a_direct_share_into_its_address_after_the_egress_check() {
+    let src = include_str!("worker.rs");
+    let run = &src[src.find("pub(crate) async fn run_job(").unwrap()..];
+    let at = |s: &str| run.find(s).unwrap_or_else(|| panic!("{s} missing"));
+    let vet = at("\n        match egress::vet_url(&orig_url, egress_allow).await {");
+    let direct = at("\n    let orig_url = match omni_core::locker::direct_download(&orig_url) {");
+    let direct_vet = direct + run[direct..].find("egress::vet_url(&direct, egress_allow)").expect("the direct address is vetted");
+    let page_scan = at("\n    let is_web = orig_url.starts_with(\"http://\")");
+    assert!(vet < direct && direct < direct_vet && direct_vet < page_scan);
+}

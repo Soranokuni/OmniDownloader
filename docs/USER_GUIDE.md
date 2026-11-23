@@ -372,7 +372,7 @@ The card always says why in Greek. The usual ones:
 | «Περιμένει τον φάκελο παράδοσης» | nothing to do: it is delivered when the watchfolder answers (§4.10). If it lasts, tell the administrator. |
 | «Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε…» | check Dalet first: there, «Το έβαλα στο Dalet»; not there, «Δοκιμή ξανά» (§4.10). |
 | Failed the broadcast check | the file was *not* delivered. Retry once; if it fails again, report it with the «Τεχνικές λεπτομέρειες». |
-| File locker (WeTransfer, Drive, Dropbox…) | not downloaded automatically yet: download by hand, then «Το έβαλα στο Dalet». |
+| File locker (WeTransfer, MyAirBridge, TransferNow, Filemail, MEGA, or a shared folder) | not downloaded automatically: download by hand, then «Το έβαλα στο Dalet». A link to one file on Dropbox, Google Drive, OneDrive or SharePoint is downloaded by itself like any video. |
 
 Nothing is ever overwritten in the Dalet watchfolder, and a file appears there
 only when it is complete.

@@ -12,7 +12,6 @@ use tracing::{error, info, warn};
 
 use omni_broadcast::errors::ErrorCode;
 use omni_broadcast::pipeline::BroadcastEngine;
-use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
 use omni_browser::evidence::{Evidence, EvidenceClass};
 use omni_browser::sniffer::StreamSniffer;
 use omni_core::config::RepairMode;
@@ -626,6 +625,20 @@ pub(crate) async fn run_approved_delivery(
     Ok(())
 }
 
+/// What the MCR desk is told about a file-locker link a person must fetch
+/// (P11.15a): a shared folder, or a locker with no direct address. `None` for
+/// a link that is not one, or a share of one file fetched directly.
+pub(crate) fn locker_manual_message(locker: &omni_core::locker::Locker) -> Option<String> {
+    use omni_core::locker::Locker;
+    match locker {
+        Locker::Folder { vendor } => {
+            Some(format!("Shared {vendor} folder link: open it and send the video's own link, or download the file and use 'Upload file' on this job."))
+        }
+        Locker::Manual { vendor } => Some(format!("File-locker link ({vendor}): download the file and use 'Upload file' on this job.")),
+        Locker::Direct { .. } | Locker::No => None,
+    }
+}
+
 /// Run one leased job through the pipeline.
 ///
 /// Extracted from the worker loop so the lease, the heartbeat and the permit are
@@ -647,26 +660,16 @@ pub(crate) async fn run_job(
     let job_id = job.id;
     let orig_url = job.url.clone();
 
-    // File lockers (WeTransfer and friends) are never handed to yt-dlp: the
-    // link is a landing page, not a media URL. Plan P8 may resolve them
-    // automatically; until then an operator fetches the file.
-    let locker_resolver = ComputerUseAgentPlaceholder::new(None, None);
-    if locker_resolver.can_handle(&orig_url) {
+    // File lockers are never handed to yt-dlp as they are: the link is a landing
+    // page, not a media URL. A share of one file the vendor serves directly
+    // (Dropbox, Google Drive, OneDrive, SharePoint) is fetched from its direct
+    // address below (P11.15a); a folder, and every other locker (WeTransfer and
+    // friends), goes to the MCR desk for a person to fetch.
+    let locker = omni_core::locker::classify(&orig_url);
+    if let Some(message) = locker_manual_message(&locker) {
         warn!("Job #{job_id} is a file-locker link; routing to the MCR desk.");
-        repo.record_event(
-            job_id,
-            "WARN",
-            Some(JobStage::Extract),
-            "File-locker link (WeTransfer/AirBridge/…); needs a manual download",
-        )?;
-        repo.finish(
-            job_id,
-            owner,
-            JobStatus::ManualDownload,
-            Some(ErrorCode::ManualDownload.as_str()),
-            Some("File-locker link: download the file and use 'Upload file' on this job."),
-            None,
-        )?;
+        repo.record_event(job_id, "WARN", Some(JobStage::Extract), &message)?;
+        repo.finish(job_id, owner, JobStatus::ManualDownload, Some(ErrorCode::ManualDownload.as_str()), Some(&message), None)?;
         return Ok(());
     }
 
@@ -795,6 +798,29 @@ pub(crate) async fn run_job(
         }
     } else {
         orig_url
+    };
+
+    // A locker share of one file (P11.15a): from here on the job fetches the
+    // vendor's direct address, judged by the same egress rule, and goes through
+    // the normal pipeline, transcoded and verified like any video. Not stored:
+    // the desk keeps showing the link that was sent, and a retry works it out
+    // again. The direct address carries the share's key; it is never logged.
+    let orig_url = match omni_core::locker::direct_download(&orig_url) {
+        Some(direct) => {
+            let direct = match egress::vet_url(&direct, egress_allow).await {
+                Ok(normal) => normal,
+                Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
+            };
+            let vendor = match &locker {
+                omni_core::locker::Locker::Direct { vendor, .. } => *vendor,
+                _ => "file-locker",
+            };
+            info!("Job #{job_id}: a {vendor} share of one file; downloading it from the direct address");
+            repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("{vendor} share: the file is downloaded directly"))?;
+            job.url = direct.clone();
+            direct
+        }
+        None => orig_url,
     };
 
     // A news page yt-dlp reads as several videos (an article with four

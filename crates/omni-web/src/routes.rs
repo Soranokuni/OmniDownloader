@@ -2725,7 +2725,8 @@ pub async fn api_mail_queue_link(
     let mut new = omni_core::models::NewJob::new(link.url.clone(), slug.clone(), journalist.clone());
     new.keyword = keyword;
     new.index_str = index.clone();
-    new.status = if locker { JobStatus::ManualDownload } else { JobStatus::Pending };
+    // A locker share of one file that can be fetched directly goes to the pipeline (P11.15a).
+    new.status = if locker && omni_core::locker::direct_download(&link.url).is_none() { JobStatus::ManualDownload } else { JobStatus::Pending };
     new.extraction_method = locker.then(|| "locker".to_string());
     new.email_message_id = Some(mail.internet_message_id.clone());
     new.email_source = mail.from_address.clone();

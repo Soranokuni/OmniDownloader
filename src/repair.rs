@@ -569,11 +569,11 @@ pub fn job_kind(job: &Job, url: &str) -> JobKind {
 
 /// [`job_kind`] from its facts: whether the job was marked a locker, and whether it is an article's sibling.
 pub fn kind_of(url: &str, marked_locker: bool, sibling: bool) -> JobKind {
-    use omni_browser::agent::{ComputerUseAgentPlaceholder, FileLockerResolver};
     if url.starts_with("attachment://") {
         return JobKind::Attachment;
     }
-    if marked_locker || ComputerUseAgentPlaceholder::new(None, None).can_handle(url) {
+    // Any file-locker link, direct or not (P11.15a): the ladder is for article pages.
+    if marked_locker || omni_core::locker::is_locker(url) {
         return JobKind::Locker;
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {

@@ -12,6 +12,7 @@ pub mod net;
 pub mod held;
 pub mod health;
 pub mod lockdown;
+pub mod locker;
 pub mod logging;
 pub mod maintenance;
 pub mod migrations;
