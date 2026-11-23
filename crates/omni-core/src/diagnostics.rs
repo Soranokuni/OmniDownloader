@@ -351,7 +351,7 @@ mod tests {
                 let mut f = z.by_index(i).unwrap();
                 let mut s = String::new();
                 f.read_to_string(&mut s).unwrap();
-                (f.name().to_string(), s)
+                (f.name().unwrap().to_string(), s)
             })
             .collect()
     }

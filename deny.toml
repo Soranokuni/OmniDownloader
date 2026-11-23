@@ -7,7 +7,12 @@ targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Each entry: why it does not apply here, and when it was decided (P14.3b).
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "2026-11-23: chrono is unmaintained, no fixed release exists; no known vulnerability. Revisit when a maintained successor or a fix appears." },
+    { id = "RUSTSEC-2025-0057", reason = "2026-11-23: fxhash is unmaintained (via inquire and selectors), no fixed release exists; it hashes in-memory keys only. Revisit with those crates' upgrades." },
+    { id = "RUSTSEC-2026-0459", reason = "2026-11-23: needs an attacker-written DB+WAL; our DB is written only by the service itself. Revisit with a rusqlite upgrade." },
+]
 
 [licenses]
 version = 2

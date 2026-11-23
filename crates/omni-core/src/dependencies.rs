@@ -898,7 +898,10 @@ fn extract_zip_into(bytes: &[u8], dest: &Path) -> Result<()> {
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(rel) = entry.enclosed_name() else {
-            anyhow::bail!("the yt-dlp download has an entry outside its folder: {}", entry.name());
+            anyhow::bail!(
+                "the yt-dlp download has an entry outside its folder: {}",
+                entry.name().map(|n| n.into_owned()).unwrap_or_default()
+            );
         };
         let out = dest.join(rel);
         if entry.is_dir() {
@@ -1947,7 +1950,8 @@ fn extract_pinned_members(zip_path: &Path, pin: &ToolPin, dest: &Path) -> Result
         let mut found: Option<usize> = None;
         for i in 0..archive.len() {
             let entry = archive.by_index(i)?;
-            if entry.is_dir() || !entry_matches(entry.name(), m.entry_suffix) {
+            // A name that does not decode is not the member being looked for.
+            if entry.is_dir() || !entry.name().is_ok_and(|n| entry_matches(&n, m.entry_suffix)) {
                 continue;
             }
             if found.is_some() {

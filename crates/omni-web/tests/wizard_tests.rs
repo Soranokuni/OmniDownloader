@@ -1087,7 +1087,7 @@ async fn the_diagnostics_package_downloads_with_no_stored_secret_in_it() -> Resu
     let mut all = String::new();
     for i in 0..z.len() {
         let mut f = z.by_index(i)?;
-        all.push_str(f.name());
+        all.push_str(&f.name()?);
         f.read_to_string(&mut all)?;
     }
     assert!(all.contains("logs/omni-ingest.2026-11-21.log") && all.contains("WARN Graph refused ***"), "{all}");

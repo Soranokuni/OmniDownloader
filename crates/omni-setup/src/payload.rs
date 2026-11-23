@@ -287,7 +287,8 @@ impl<F: Read + Seek> VerifiedPayload<F> {
         let mut plan = Vec::with_capacity(archive.len());
         for i in 0..archive.len() {
             let entry = archive.by_index(i).map_err(|e| PayloadError::Archive(e.to_string()))?;
-            let name = entry.name().to_string();
+            // A name that does not decode is refused like any other bad entry, before anything is written.
+            let name = entry.name().map_err(|e| PayloadError::Archive(e.to_string()))?.into_owned();
             let safe = entry.enclosed_name().and_then(|_| safe_entry_path(&name));
             match safe {
                 Some(rel) => plan.push((i, rel, entry.is_dir())),

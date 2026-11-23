@@ -21,7 +21,7 @@ tracing = "0.1"
 metrics = "0.24"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 regex = "1.10"
 tokio-util = "0.7"
 sha2 = "0.10"
