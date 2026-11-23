@@ -386,6 +386,21 @@ pub fn skip_pattern(raw: &str) -> Option<String> {
     })
 }
 
+/// A [`skip_pattern`] stored earlier, in the form [`skip_pattern`] gives
+/// today (P14.3c). The pattern is the `url` crate's reading of the address,
+/// and that reading changed with `url` 2.5.9, which percent-encodes `^` in a
+/// path (`/a^b` became `/a%5Eb`): a «Λάθος βίντεο» skip saved before the
+/// upgrade would no longer match the same video. Read back through the same
+/// parser, a stored pattern compares with today's. A pattern that does not
+/// parse is kept as stored.
+pub fn canonical_skip_pattern(stored: &str) -> String {
+    // Parse it with a scheme whose default port is not the one it names, so a
+    // port it kept stays (`:443` came from http, `:80` from https).
+    let authority = stored.split('/').next().unwrap_or(stored);
+    let scheme = if authority.ends_with(":80") { "https" } else { "http" };
+    skip_pattern(&format!("{scheme}://{stored}")).unwrap_or_else(|| stored.to_string())
+}
+
 /// Addresses `url` may have been before someone typed a word onto its end
 /// (plan P3.10): "…/arthro/-ΑΠΟΚΛΕΙΣΤΙΚΟ", "…-sismos-ΤΩΡΑ", "…-NEW".
 ///
@@ -472,6 +487,30 @@ mod tests {
         assert_eq!(skip_pattern("ftp://cdn.news.example/a.mp4"), None);
         assert_eq!(skip_pattern("attachment://x/1"), None);
         assert_eq!(skip_pattern("not a url"), None);
+    }
+
+    /// P14.3c: a skip saved before `url` 2.5.9 (with `^` as sent) reads back
+    /// as today's pattern of the same address; one saved after is unchanged.
+    #[test]
+    fn a_stored_skip_pattern_reads_back_in_todays_form() {
+        let today = skip_pattern("https://cdn.news.example/clips/a^b.mp4?token=1").unwrap();
+        assert_eq!(today, "cdn.news.example/clips/a%5Eb.mp4", "url 2.5.9 encodes ^ in a path");
+        assert_eq!(canonical_skip_pattern("cdn.news.example/clips/a^b.mp4"), today, "the form saved before the upgrade");
+        assert_eq!(canonical_skip_pattern(&today), today, "today's form is kept");
+        for kept in ["cdn.news.example/V/a.mp4", "cdn.news.example:8443/a.mp4", "cdn.news.example:443/a.mp4", "cdn.news.example:80/a.mp4", "cdn.news.example/κλιπ/a.mp4"] {
+            let stored = skip_pattern(&format!("http://{kept}")).or_else(|| skip_pattern(&format!("https://{kept}"))).unwrap();
+            assert_eq!(canonical_skip_pattern(&stored), stored, "{kept}");
+        }
+        assert_eq!(canonical_skip_pattern("not a pattern at all"), "not a pattern at all", "kept as stored");
+    }
+
+    /// P14.3c: `normalize` is string work and never goes through the `url`
+    /// crate, so the stored dedup keys did not change with `url` 2.5.9 (a `^`
+    /// stays as sent). If it ever does go through it, this fails, and
+    /// `NORMALIZE_VERSION` must be bumped so the stored keys are made again.
+    #[test]
+    fn normalize_does_not_follow_the_url_crates_encoding() {
+        assert_eq!(normalize("https://media.news.example/clips/a^b.mp4"), "https://media.news.example/clips/a^b.mp4");
     }
 
     #[test]

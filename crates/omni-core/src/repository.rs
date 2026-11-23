@@ -9753,11 +9753,16 @@ fn write_skip(tx: &rusqlite::Transaction<'_>, domain: &str, pattern: &str, now: 
     Ok(())
 }
 
-/// The still-valid skip patterns of `domain`.
+/// The still-valid skip patterns of `domain`, each in the form
+/// [`crate::urlnorm::skip_pattern`] gives today (P14.3c: one saved before the
+/// `url` 2.5.9 upgrade still matches the same video).
 fn skips_of(tx: &rusqlite::Connection, domain: &str, now: chrono::DateTime<Utc>) -> Result<Vec<String>> {
     let mut stmt = tx.prepare("SELECT pattern FROM repair_skips WHERE domain = ? AND until > ? ORDER BY pattern")?;
     let rows = stmt.query_map(params![domain, timestamps::format(now)], |r| r.get::<_, String>(0))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut skips: Vec<String> = rows.collect::<rusqlite::Result<Vec<_>>>()?.iter().map(|p| crate::urlnorm::canonical_skip_pattern(p)).collect();
+    skips.sort();
+    skips.dedup();
+    Ok(skips)
 }
 
 /// The places in `candidates_json` after `next_index` that may still be
