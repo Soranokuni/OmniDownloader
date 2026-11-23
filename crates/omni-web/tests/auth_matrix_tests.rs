@@ -286,6 +286,19 @@ const MATRIX: &[Row] = &[
             (Admin, Reached),
         ],
     ),
+    // The wall board (P12.13): the desk's access rule, read-only.
+    (
+        "GET",
+        "/board",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Loopback, Denied),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
     (
         "GET",
         "/api/jobs",
@@ -316,6 +329,30 @@ const MATRIX: &[Row] = &[
     (
         "POST",
         "/api/jobs/1/rename",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Denied),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    // The forms' live file-name preview (P12.11): read-only, for /user and the desk alike.
+    (
+        "GET",
+        "/api/slug-preview",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Reached),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    // The rename field's live file-name preview (P12.4): read-only, same gate as the rename.
+    (
+        "GET",
+        "/api/keyword-preview",
         &[
             (Anonymous, Denied),
             (Caller::User, Denied),

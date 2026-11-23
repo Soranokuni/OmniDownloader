@@ -469,7 +469,7 @@ async fn dev_hold(
     }
 
     let journalist = journalist.unwrap_or_else(|| "DEVTEST".to_string()).to_uppercase();
-    let slug = slug.unwrap_or_else(|| format!("1_{journalist}_DEVHOLD"));
+    let slug = slug.unwrap_or_else(|| omni_core::slug::compose("1", &journalist, "DEVHOLD"));
     // Unique, so the dedup window never folds two runs into one job.
     let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let mut new = omni_core::models::NewJob::new(format!("attachment://dev-hold/{nonce}"), slug, journalist);

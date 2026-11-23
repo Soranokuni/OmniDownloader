@@ -592,7 +592,7 @@ impl EmailWatcher {
 
         let mut out = Vec::new();
         for job in parsed.jobs() {
-            let slug = format!("{}_{}_{}", job.index_str, journalist, job.keyword);
+            let slug = omni_core::slug::compose(&job.index_str, journalist, &job.keyword);
             // Attachment jobs are parked as MANUAL_DOWNLOAD until their file
             // is on disk (`fetch_attachments`), so no worker can lease one
             // first. If the download fails they stay there, for MCR.

@@ -23,6 +23,7 @@ pub mod second_chance;
 pub mod secrets;
 pub mod site_health;
 pub mod site_videos;
+pub mod slug;
 pub mod taxonomy;
 pub mod selftest;
 pub mod timestamps;

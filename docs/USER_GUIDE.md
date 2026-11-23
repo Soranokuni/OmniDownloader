@@ -21,6 +21,18 @@ station's broadcast format (XDCAM HD422 1080i50 MXF, 8 audio tracks,
 name like `1A_PAPADAKI_FOTIA.mxf`. If anything is not right, the file is
 **not** delivered; the job waits on the MCR desk with the reason.
 
+**File names.** A delivered file is named `NUMBER_JOURNALIST_KEYWORD.mxf`,
+in capital Latin letters, digits and `_` only, and at most 60 characters
+before `.mxf`. Greek is written in Latin (Σεισμός → `SEISMOS`); any other
+sign, a dash or a space, becomes `_` (`PAPA-DAKI` → `PAPA_DAKI`,
+`fire in the hills` → `FIRE_IN_THE_HILLS`). A name that would be longer loses
+letters from the end of the keyword first, then of the journalist's name. The
+story number you type has at most 9 characters, so the A, B, C of a story's
+further videos always stay in their names. If
+a file of that name is already in the watchfolder, the new one is `…_2.mxf`;
+nothing is overwritten. Every form (adding a link, `/user`, renaming) shows
+the name the video will get while you type.
+
 You do not need to do anything for a normal mail. The desk is where you look
 when something needs a person.
 
@@ -83,7 +95,8 @@ The **«Αποστολή βίντεο»** (Send video) form:
 | «Σημείωση για το MCR (προαιρετικά)» | an optional note for MCR |
 | «Επείγον (μπαίνει πριν από τα άλλα)» | urgent: goes ahead of the queue |
 
-Press **«Αποστολή»** (Send). You will see one of:
+Under the list of links the page counts them («N από 20 συνδέσμους»); a list
+of more than 20 turns red and is not sent. Split it in two. Press **«Αποστολή»** (Send). You will see one of:
 
 - «Στάλθηκε στο MCR ως `<name>`.mxf» — queued under that file name.
 - «Στάλθηκαν N σύνδεσμοι στο MCR.» — several links queued.
@@ -92,8 +105,13 @@ Press **«Αποστολή»** (Send). You will see one of:
 ### 3.3 Following your submissions
 
 **«Οι αποστολές μου»** (My submissions) lists what you sent and its state.
-Press **«Ανανέωση»** to refresh. While a submission is still waiting
-(«Σε αναμονή»), you can withdraw it with **«Ακύρωση»** (Cancel).
+The list follows the system by itself; there is nothing to refresh. A bar
+shows the progress while the system works on a video; it is not shown while
+the video waits for MCR (a check, an approval, a file-locker link). The step
+reads, among others, «Ανάγνωση του βίντεο» (reading the downloaded video) and
+«Τελικός έλεγχος» (the final check before delivery). While a submission is still waiting
+(«Σε αναμονή»), you can withdraw it with **«Ακύρωση»** (Cancel); for 8 seconds
+**«Αναίρεση»** (Undo) keeps it.
 
 «Ειδοποίησέ με όταν ολοκληρωθεί ένα βίντεο μου» (notify me when a video of
 mine is done) saves your preference. Sending the notification email is not
@@ -105,9 +123,19 @@ switched on yet at every station; ask MCR.
 
 ### 4.1 The header
 
-- **«Ουρά: …»** — the queue's state at a glance.
-- **«Προδιαγραφές εκπομπής»** — the broadcast specification every delivered
-  file meets.
+- **The health pill** — «Όλα καλά» (all fine) in green, or «N προβλήματα» in
+  amber or red. Press it for every line of the system's health: what is wrong
+  and what to do, the free space of the Dalet watchfolder and of the temporary
+  folder, and the queue («N σε αναμονή · N σε εξέλιξη»). Escape or a click
+  elsewhere closes it.
+- **«🔔 Ήχος»** — the sound's settings: on or off, volume, which sounds,
+  the reminder (§4.7).
+- **«+ Προσθήκη συνδέσμου»** — at the end of the tab row: opens a panel on
+  the right to queue a link by hand (§4.6).
+- **«Βοήθεια»** — beside it, a small menu: **«Προδιαγραφές εκπομπής»** (the
+  broadcast specification every delivered file meets) and
+  **«Συντομεύσεις πληκτρολογίου»** (the keyboard shortcuts) and
+  **«Πίνακας τοίχου»** (the wall board, §4.11, in a new tab).
 - **«Διαχείριση»** — the admin page (administrators only).
 - **«Καθυστερούν»** — a strip above the tabs, only while some video is late
   (§4.9).
@@ -116,16 +144,24 @@ switched on yet at every station; ask MCR.
 
 | Tab | English | What is in it |
 |---|---|---|
-| **Email** | Email (opens first) | every mail and manually added link, newest first |
+| **«Εισερχόμενα»** | Inbox (opens first) | every mail and manually added link, newest first |
 | **«Σε εξέλιξη»** | In progress | jobs waiting or being processed |
 | **«Χρειάζονται έλεγχο»** | Need checking | jobs that stopped and need a person, plus videos waiting for approval |
 | **«Ολοκληρωμένα»** | Completed | delivered jobs |
-| **«Δημοσιογράφοι»** | Journalists | the roster: names, addresses, aliases, groups |
-| **«Προσθήκη συνδέσμου»** | Add link | queue a link by hand |
 
-The number on each tab is how many items are in it.
+The number on each tab is how many items are in it. The roster of
+journalists (names, addresses, aliases, groups) is kept on the administration
+page («Διαχείριση»), not on the desk.
 
-### 4.3 The Email tab
+**Keyboard.** **J** / **K** move to the next / previous card of the list on
+screen (the mails, the cards of «Χρειάζονται έλεγχο», the videos of
+«Σε εξέλιξη»); once a card has the focus, the arrow keys do the same.
+**Enter** opens the card («Περισσότερα», or a held video's history),
+**R** is «Δοκιμή ξανά», **A** is «Έγκριση → Dalet» (it still asks first),
+**/** jumps to the tab's search, **?** shows these shortcuts and **Esc**
+closes a window or a field. Nothing happens while you type in a field.
+
+### 4.3 The «Εισερχόμενα» tab (the mails)
 
 Filters along the top:
 
@@ -140,11 +176,31 @@ Filters along the top:
 Labels you may see on a mail:
 
 - «Χωρίς δημοσιογράφο» — the sender or name did not match anyone in the
-  roster; files are named with a placeholder. Add the person or an alias in
-  «Δημοσιογράφοι».
+  roster; files are named with a placeholder. Ask the administrator to add
+  the person or an alias.
+- **«Να το θυμάμαι για αυτή τη διεύθυνση»** — on an open mail whose
+  journalist you set, when the sender's address is not on the roster yet. It
+  asks first; after that, mails from that address go to that journalist by
+  themselves. If the address belongs to another journalist, the desk says so
+  and only the administrator can change it.
 - «Δεν βρέθηκε βίντεο» — no video found in the mail.
 - «Μόνο φωτογραφίες· τίποτα για λήψη» — only photos, nothing to download.
 - «Δεν διαβάστηκε» — the mail could not be read; open it to have it read again.
+
+A video's state has the same word, colour and mark everywhere: the desk's
+badges, the small tags beside the links in a mail's text, the summary line
+of a mail and the journalist's `/user` page. The key is shown above the
+mail text.
+
+| Mark | Colour | State |
+|---|---|---|
+| ✓ | green | «Παραδόθηκε» (also «Παραδόθηκε χειροκίνητα») |
+| ↻ | blue | «Σε εξέλιξη» |
+| ◷ | grey | «Σε αναμονή» |
+| ◉ | violet | «Για έγκριση» |
+| ! | amber | «Χρειάζεται έλεγχο», «Χειροκίνητη λήψη» |
+| ✕ | red | «Απέτυχε» |
+| ⊘ | grey, dashed outline | «Ακυρώθηκε» |
 
 **Opening a mail** shows the mail text and, under
 «Βίντεο από αυτό το email · N», one card per video. Below that:
@@ -175,7 +231,7 @@ While a video waits you may see:
 
 - «Σε αναμονή · Nο στη σειρά» — Nth in the queue.
 - «Νέα προσπάθεια σε …» — an automatic retry in so many seconds or minutes;
-  on the Email tab followed by «(έγιναν N από M)», tries made so far out of
+  on the «Εισερχόμενα» tab followed by «(έγιναν N από M)», tries made so far out of
   the most it will make (§4.10).
 - «Περιμένει τον φάκελο παράδοσης» — the video is ready and waits for the
   Dalet watchfolder to answer (§4.10).
@@ -195,7 +251,7 @@ does.
 | On the card | Meaning |
 |---|---|
 | «Σε αναμονή» | waiting in the queue |
-| «Σε επεξεργασία» | being processed |
+| «Σε εξέλιξη» | being processed |
 | «Παραδόθηκε» | delivered to Dalet |
 | «Παραδόθηκε χειροκίνητα» | you marked it as put into Dalet by hand |
 | «Χρειάζεται έλεγχο» | stopped; the card says why |
@@ -210,13 +266,47 @@ does.
 |---|---|
 | «Δοκιμή ξανά» | try again: back into the queue |
 | «Νέα λήψη» | download again; if the file is already in Dalet the new one is `…_2.mxf` (nothing is overwritten) |
-| «Μετονομασία…» | change the keyword, and so the file name |
-| «Ακύρωση» | cancel: it will not be sent to Dalet |
-| «Το έβαλα στο Dalet» | you put the video into Dalet yourself; the job is closed as done |
-| «Αφαίρεση» | remove the card from the lists (a delivered file is never touched) |
-| «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the Email tab) | use a link you pasted instead of the one found |
-| «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the Email tab the history shows under a selected card. |
+| «Μετονομασία…» | opens a field on the card: type the keyword (Greek or Latin) and it shows the file name it will get; Enter saves, Escape closes |
+| «Ακύρωση» | cancel at once: it will not be sent to Dalet. «Αναίρεση» for 8 seconds puts it back in the queue |
+| «Το έβαλα στο Dalet» | you put the video into Dalet yourself; the job is closed as done (asks first) |
+| «Αφαίρεση» | remove the card from the lists (a delivered file is never touched); «Αναίρεση» for 8 seconds brings it back |
+| «Χρήση αυτού του συνδέσμου» («Χρήση» after «Άλλος σύνδεσμος…» on the «Εισερχόμενα» tab) | use a link you pasted instead of the one found |
+| «Ιστορικό» | on a card in «Χρειάζονται έλεγχο»: the job's history, step by step, including «Αυτόματη επανάληψη» (§4.10). On the «Εισερχόμενα» tab the history shows under a selected card. |
 | «Τώρα» | in the «Καθυστερούν» strip: try now instead of waiting for the next retry (§4.9) |
+
+What can be taken back happens at once, with **«Αναίρεση»** (Undo) at the
+bottom left for 8 seconds: «Αφαίρεση», «Ακύρωση», «Απόκρυψη παλαιότερων από 3
+ημέρες» and «Αφαίρεση παραδοθέντων από τη λίστα». What sends a video to Dalet
+or closes a job for good asks first, in a window on the page: «Έγκριση → Dalet»,
+«Το έβαλα στο Dalet», «Λάθος βίντεο», «Επόμενη επιλογή» and «Νέα λήψη». The
+window starts on «Άκυρο»; Escape also closes it.
+
+**The «Χρειάζονται έλεγχο» tab is a work list.** It holds only what waits for
+you, grouped by what you have to do, not by date:
+
+| Group | What you do first |
+|---|---|
+| «Για έγκριση» | watch the video and approve it (§4.5) |
+| «Χρειάζεται σύνδεση (cookies)» | paste another link for the same video; if it happens often with that site, ask the administrator for cookies |
+| «Δεν βρέθηκε βίντεο» | paste the link of the video itself, or remove the card |
+| «Χειροκίνητη λήψη» | download the file by hand, put it into Dalet and press «Το έβαλα στο Dalet» |
+| «Άλλο» | usually «Δοκιμή ξανά»; the card says what to do |
+
+At the top of «Χρειάζεται σύνδεση (cookies)», a card per site says how many
+videos wait for a login there («3 βίντεο περιμένουν σύνδεση στο x.com»),
+why (the site's cookies are missing, expired, or no longer log in) and what
+to do: the administrator uploads new cookies in «Διαχείριση» → Cookies. The
+videos stay listed under it and are tried again by themselves once the
+cookies work; you do not need to press anything.
+
+Each card says in one sentence why the video waits, and shows one main
+action. Everything else («Δοκιμή ξανά», «Το έβαλα στο Dalet», «Μετονομασία…»,
+«Αφαίρεση», «Ιστορικό», another link) is under **«Περισσότερα»**. The error
+code and the tool's own message are under **«Τεχνικές λεπτομέρειες»**, for
+support. When a delivery was interrupted (`DELIVERY_UNCONFIRMED`) the main
+action is «Το έβαλα στο Dalet»: check Dalet first, so the video does not go
+in twice. A video the system will try again by itself is not in this list;
+it is on «Σε εξέλιξη».
 
 ### 4.5 Approvals
 
@@ -240,10 +330,12 @@ button never touches it. Pressing it twice does nothing more.
 
 ### 4.6 Adding a link by hand
 
-**«Προσθήκη συνδέσμου»**: the link, the journalist's surname, the keyword,
-the story number, and, for an article with several videos,
-«Από άρθρο: μόνο τα πρώτα … βίντεο» (only the first N videos). Tick
-**«Επείγον»** to put it first, then **«Προσθήκη στην ουρά»**.
+**«+ Προσθήκη συνδέσμου»** at the end of the tab row opens a panel on the
+right, beside the list you are working on: the link, the journalist's
+surname, the keyword, the story number, and, for an article with several
+videos, «Από άρθρο: μόνο τα πρώτα … βίντεο» (only the first N videos). Tick
+**«Επείγον»** to put it first, then **«Προσθήκη στην ουρά»**: the panel closes
+and «Σε εξέλιξη» opens. Esc or «✕» closes the panel without adding.
 
 ### 4.7 Sounds and pop-ups
 
@@ -253,6 +345,36 @@ a pop-up «✔ Email «…»» or «⚠ …». Click anywhere on the page once a
 opening it, or the browser keeps the sound muted. The desk also warns when the
 ingest service stops answering («Η υπηρεσία λήψης δεν απαντά») and when it is
 back.
+
+**«🔔 Ήχος»** in the header opens «Ρυθμίσεις ήχου»: sound on or off
+(«Ήχος ανοιχτός»), the volume («Ένταση»), and a switch with a «Δοκιμή»
+button for each of the four sounds: all the videos of a mail delivered
+(rising); something needs you, a review or a late video (falling); a problem
+with the system's health or the service (three low notes); a video waiting
+for «Έγκριση → Dalet» (two notes, up). **«Υπενθύμιση»** plays again every N
+minutes (10 unless you change it, 1 to 120) while a video has waited for you
+longer than N minutes, and says so in a message; a video you hid from the
+review list does not count. The settings belong to this computer and browser
+only: a wall screen can stay quiet while the operator's screen plays. The
+pop-up messages always appear, with or without sound.
+
+While a video waits for «Έγκριση → Dalet», the desk reminds you 15 minutes
+after the oldest was held, and then every 30 minutes: «N βίντεο περιμένουν
+έγκριση», with the sound «Ένα βίντεο περιμένει έγκριση». It follows the same
+settings: nothing with «Υπενθύμιση» off, no sound with that sound off. A held video's approval
+time runs only while a desk is open (the wall board does not count).
+
+A message about something that went wrong (red) stays until you close it with
+«✕»; at most three are shown, the oldest going first. Other messages leave by
+themselves after a few seconds.
+
+A health problem is told in three parts, in the banner above the tabs and in
+the health pill's panel: what happened, what it means for the videos
+(«Για τα βίντεο: …») and what to do («Τι κάνετε: …»), with who does it:
+**MCR** or **Διαχειριστής** (the administrator). A site that stopped giving
+video is named in a sentence, for example «Ο ιστότοπος example.gr δεν δίνει
+βίντεο από τις 14:21 (4 αποτυχίες στη σειρά).» The system's own technical text
+is only in the panel, under «Τεχνικές λεπτομέρειες», for support.
 
 ### 4.8 Keeping the lists tidy
 
@@ -278,7 +400,7 @@ Each row has the file name, «Επείγον» for an urgent video, the reason, 
 | «Περιμένει τον φάκελο παράδοσης» | the video is ready, but the Dalet watchfolder does not answer; it is delivered by itself when it does (§4.10) |
 | «Νέα προσπάθεια στις HH:MM · …» | an automatic retry at that time, followed by the reason in Greek |
 | «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» | the link is still a live broadcast; it is checked again at that time. Listed whatever its age. |
-| «Σε επεξεργασία · στο τρέχον βήμα εδώ και N′» | being processed, N minutes on its current step |
+| «Σε εξέλιξη · στο τρέχον βήμα εδώ και N′» | being processed, N minutes on its current step |
 | «Σε αναμονή στη σειρά» | waiting for its turn in the queue |
 
 **«Τώρα»** (now), on a retry or live-broadcast row, makes the system try at
@@ -354,6 +476,25 @@ rejects it, marks «Λάθος βίντεο» or queues one of its offered video
 waits for a person. It is also left alone when the same link is already in
 the queue or was delivered meanwhile, and when its video may already be in
 Dalet.
+
+### 4.11 The wall board (`/board`)
+
+`/board` is a page for a monitor on the control-room wall, in large type. It
+shows, and changes nothing:
+
+- **«Περιμένουν εσάς»** — three numbers: videos that need checking, videos
+  waiting for «Έγκριση → Dalet» (with the time of the oldest), and videos
+  running late. A number that is not zero is amber. A number the system
+  could not count is left blank, never shown as 0.
+- **«Σε εξέλιξη τώρα»** — every video being processed, with its step and its
+  progress, and how many wait in the queue.
+- **«Υγεία του συστήματος»** — «Όλα καλά», or each problem in the same words
+  as the desk.
+
+It refreshes every 5 seconds and shows the time. If the service stops
+answering, a red line says so. The same people who may open the desk may open
+the board; on the wall screen, sign in once with an MCR account or use a
+machine on the MCR network.
 
 ---
 
