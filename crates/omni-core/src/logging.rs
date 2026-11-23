@@ -75,6 +75,38 @@ impl Default for LogConfig {
 #[derive(Debug, Clone, Default)]
 pub struct Redactions {
     values: Arc<RwLock<Vec<String>>>,
+    /// Values a running job added for itself (P11.15a4: a file-locker share's
+    /// keys), oldest first, each with how many runs hold it. Removed when the
+    /// run's [`TemporaryRedaction`] drops; past [`TEMPORARY_CAP`] the oldest go,
+    /// never a value of `values` (start-up secrets, cookie values).
+    temporary: Arc<RwLock<std::collections::VecDeque<(String, usize)>>>,
+}
+
+/// The most temporary values held at once (P11.15a4): far more than the jobs
+/// that run together ever add; only a leak in a caller would reach it.
+pub const TEMPORARY_CAP: usize = 1000;
+
+/// Values one run keeps out of the log while it lives (see [`Redactions::add_temporary`]).
+#[derive(Debug)]
+pub struct TemporaryRedaction {
+    redactions: Redactions,
+    values: Vec<String>,
+}
+
+impl Drop for TemporaryRedaction {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.redactions.temporary.write() {
+            for v in &self.values {
+                if let Some(i) = t.iter().position(|(x, _)| x == v) {
+                    if t[i].1 > 1 {
+                        t[i].1 -= 1;
+                    } else {
+                        t.remove(i);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Redactions {
@@ -105,39 +137,55 @@ impl Redactions {
         }
     }
 
-    /// [`Self::extend`], but never past `cap` values in all (P11.15a3): a set
-    /// that grows with every job run must not grow without end.
-    pub fn extend_capped(&self, more: Vec<String>, cap: usize) {
-        if let Ok(mut guard) = self.values.write() {
+    /// Keep `more` out of the log while the returned guard lives (P11.15a4: a
+    /// file-locker share's keys for the length of its run). Never refused: past
+    /// [`TEMPORARY_CAP`] the oldest temporary values make room.
+    pub fn add_temporary(&self, more: Vec<String>) -> TemporaryRedaction {
+        let mut added = Vec::new();
+        if let Ok(mut t) = self.temporary.write() {
             for v in more.into_iter().filter(|v| v.len() >= 6) {
-                if guard.len() >= cap {
-                    break;
+                if added.contains(&v) {
+                    continue;
                 }
-                if !guard.contains(&v) {
-                    guard.push(v);
+                match t.iter_mut().find(|(x, _)| *x == v) {
+                    Some(held) => held.1 += 1,
+                    None => {
+                        while t.len() >= TEMPORARY_CAP {
+                            t.pop_front();
+                        }
+                        t.push_back((v.clone(), 1));
+                    }
                 }
+                added.push(v);
             }
         }
+        TemporaryRedaction { redactions: self.clone(), values: added }
     }
 
-    /// How many values are redacted.
+    /// How many values are redacted, temporary ones included.
     pub fn len(&self) -> usize {
-        self.values.read().map(|v| v.len()).unwrap_or(0)
+        self.values.read().map(|v| v.len()).unwrap_or(0) + self.temporary.read().map(|t| t.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.values.read().map(|v| v.is_empty()).unwrap_or(true)
+        self.len() == 0
     }
 
     /// Replace every known secret in `text` with `***`.
     pub fn apply(&self, text: &str) -> String {
-        let Ok(values) = self.values.read() else {
-            return text.to_string();
-        };
         let mut out = text.to_string();
-        for secret in values.iter() {
-            if out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), "***");
+        if let Ok(values) = self.values.read() {
+            for secret in values.iter() {
+                if out.contains(secret.as_str()) {
+                    out = out.replace(secret.as_str(), "***");
+                }
+            }
+        }
+        if let Ok(temporary) = self.temporary.read() {
+            for (secret, _) in temporary.iter() {
+                if out.contains(secret.as_str()) {
+                    out = out.replace(secret.as_str(), "***");
+                }
             }
         }
         out
@@ -318,6 +366,42 @@ pub fn init_console_only(filter: &str) {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// P11.15a4: a run's temporary values are never refused. Past the cap the
+    /// oldest temporary ones make room, never a start-up or cookie value; a run's
+    /// values go when its guard drops, unless another run still holds them.
+    #[test]
+    fn temporary_values_are_never_refused_and_go_with_their_run() {
+        let r = Redactions::new(vec!["startup-secret".into()]);
+        r.extend(vec!["cookie-secret".into()]);
+        let mut guards = Vec::new();
+        for i in 0..1100 {
+            guards.push(r.add_temporary(vec![format!("locker-part-{i:05}")]));
+        }
+        let newest = r.add_temporary(vec!["newest-share-key".into()]);
+        assert_eq!(r.apply("x newest-share-key y"), "x *** y", "a new value is still redacted past 1100");
+        assert_eq!(r.apply("startup-secret cookie-secret"), "*** ***", "permanent values are never evicted");
+        assert_eq!(r.apply("locker-part-01099"), "***");
+        assert_eq!(r.apply("locker-part-00000"), "locker-part-00000", "the oldest temporary value made room");
+        assert!(r.len() <= TEMPORARY_CAP + 2);
+
+        // Held by two runs: it stays until both are done.
+        let first = r.add_temporary(vec!["shared-share-key".into()]);
+        let second = r.add_temporary(vec!["shared-share-key".into()]);
+        drop(first);
+        assert_eq!(r.apply("shared-share-key"), "***");
+        drop(second);
+        assert_eq!(r.apply("shared-share-key"), "shared-share-key", "gone with its last run");
+        drop(newest);
+        assert_eq!(r.apply("newest-share-key"), "newest-share-key");
+        drop(guards);
+        assert_eq!(r.len(), 2, "only the permanent values are left");
+        assert!(!r.is_empty());
+        let empty = Redactions::default();
+        let held = empty.add_temporary(vec!["only-temporary".into()]);
+        assert!(!empty.is_empty(), "a writer must not skip redaction while a temporary value is held");
+        drop(held);
+    }
 
     /// Collects what a `RedactingWriter` actually emitted.
     #[derive(Clone, Default)]

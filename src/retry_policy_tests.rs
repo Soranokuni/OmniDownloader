@@ -585,10 +585,12 @@ fn run_job_turns_a_direct_share_into_its_address_after_the_egress_check() {
         "\n    let route = if locker_direct {\n        omni_broadcast::downloader::FirstAttempt::YtDlp",
         "\n            Err(e) => !locker_direct && classify_pipeline_error(e).should_sniff(&orig_url),",
         "\n                let ladder = if siblings_hold_the_rest || locker_direct {",
-        "\n        process_result = process_result.map_err(|e| scrub_locker_error(e, &sent_link));",
+        "\n        process_result = process_result.map_err(|e| scrub_locker_error(e, &locker_label));",
         "\n                let done_for_site = done && !locker_direct;",
         "\n            _size_guard = Some(engine.set_max_filesize(job_id, engine.locker_max_file_bytes()));",
-        "\n            repo.redact_in_logs(omni_core::locker::secret_parts(&direct));",
+        "\n            _redaction = repo.redact_in_logs(omni_core::locker::secret_parts(&direct));",
+        "\n            _link_guard = Some(engine.set_locker_link(job_id, &locker_label));",
+        "\n    let locker_label = omni_core::urlnorm::site_for_log(&sent_link);",
     ] {
         at(gate);
     }
@@ -671,13 +673,32 @@ async fn a_tools_error_about_a_direct_share_never_shows_its_addresses() {
     let job = r.lease(id);
     r.run_job(job).await;
 
+    // The engine logs exactly the text it writes as the job's ERROR event and its
+    // audit row (P11.15a4), so these cover its log lines too.
     let row = r.row(id);
     let mut texts: Vec<String> = r.repo.get_job_events(id, 500).unwrap().into_iter().map(|e| e.message).collect();
-    assert!(texts.iter().any(|t| t.contains("Unsupported URL")), "the fake's error reached the history: {texts:?}");
+    assert!(texts.iter().any(|t| t.contains("Unsupported URL: dropbox.com")), "the fake's error, its address named by the site: {texts:?}");
     texts.extend(r.repo.get_recent_audit_logs(200).unwrap().into_iter().map(|a| a.message));
     texts.extend(row.error_message.clone());
     for t in &texts {
         assert!(!t.contains(direct.as_str()) && !t.contains("SIGNEDTOKEN123") && !t.contains("dropboxusercontent"), "an address leaked: {t}");
+        // P11.15a4: not the sent link's key either: a share is named by its site.
+        assert!(!t.contains("rlkey") && !t.contains("abcdef123456") && !t.contains("x1y2z3w4v5"), "the share's key leaked: {t}");
     }
     assert_eq!(row.url, sent);
+}
+
+/// P11.15a4: two runs of one job overlap (a reaped lease and its new run): the
+/// first run's guards ending do not take the second run's values away.
+#[test]
+fn an_earlier_runs_guard_does_not_remove_a_later_runs_values() {
+    let r = rig();
+    let first_size = r.engine.set_max_filesize(7, 1 << 30);
+    let first_link = r.engine.set_locker_link(7, "first.example");
+    let second_size = r.engine.set_max_filesize(7, 2 << 30);
+    let second_link = r.engine.set_locker_link(7, "second.example");
+    drop((first_size, first_link));
+    assert_eq!(r.engine.job_locker_state(7), (Some(2 << 30), Some("second.example".to_string())), "the later run's values stay");
+    drop((second_size, second_link));
+    assert_eq!(r.engine.job_locker_state(7), (None, None));
 }

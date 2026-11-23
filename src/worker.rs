@@ -786,8 +786,11 @@ pub(crate) async fn run_job(
                     Ok(normal) => normal,
                     Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
                 };
-                info!("Job #{job_id}: {} -> {}", omni_core::cookies::host_and_path(&orig_url), omni_core::cookies::host_and_path(&fixed));
-                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed}"))?;
+                // A file-locker link is named by its site only: its query or path can carry the key (P11.15a4).
+                let shown = |u: &str| if omni_core::locker::is_locker(u) { omni_core::urlnorm::site_for_log(u) } else { omni_core::cookies::host_and_path(u) };
+                info!("Job #{job_id}: {} -> {}", shown(&orig_url), shown(&fixed));
+                let fixed_said = if omni_core::locker::is_locker(&fixed) { omni_core::urlnorm::site_for_log(&fixed) } else { fixed.clone() };
+                repo.record_event(job_id, "WARN", Some(JobStage::Extract), &format!("Link corrected, {why}: {fixed_said}"))?;
                 if let Err(e) = repo.set_leased_job_url(job_id, owner, &fixed) {
                     warn!("Job #{job_id}: could not store the corrected link: {e:#}");
                 }
@@ -814,9 +817,15 @@ pub(crate) async fn run_job(
     let mut locker_direct = false;
     let mut _size_guard: Option<omni_broadcast::pipeline::MaxFilesizeGuard> = None;
     let mut _link_guard: Option<omni_broadcast::pipeline::LockerLinkGuard> = None;
+    let mut _redaction: Option<omni_core::logging::TemporaryRedaction> = None;
+    // What a log line, an event or an audit row may say of a share: its site,
+    // never the sent link (its query or path can carry the key) nor the direct
+    // address (P11.15a4).
+    let locker_label = omni_core::urlnorm::site_for_log(&sent_link);
     let orig_url = match omni_core::locker::direct_download(&orig_url) {
         Some(direct) => {
-            repo.redact_in_logs(omni_core::locker::secret_parts(&direct));
+            // Held for the run, removed when it ends (P11.15a4).
+            _redaction = repo.redact_in_logs(omni_core::locker::secret_parts(&direct));
             let direct = match egress::vet_url(&direct, egress_allow).await {
                 Ok(normal) => normal,
                 Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
@@ -829,8 +838,8 @@ pub(crate) async fn run_job(
             repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("{vendor} share: the file is downloaded directly"))?;
             locker_direct = true;
             _size_guard = Some(engine.set_max_filesize(job_id, engine.locker_max_file_bytes()));
-            // The engine's own error lines say the sent link too (P11.15a3).
-            _link_guard = Some(engine.set_locker_link(job_id, &sent_link));
+            // The engine's own lines say the site too (P11.15a3, P11.15a4).
+            _link_guard = Some(engine.set_locker_link(job_id, &locker_label));
             job.url = direct.clone();
             direct
         }
@@ -971,7 +980,7 @@ pub(crate) async fn run_job(
 
     // A direct share's error text says the link that was sent, never the direct address (P11.15a2).
     if locker_direct {
-        process_result = process_result.map_err(|e| scrub_locker_error(e, &sent_link));
+        process_result = process_result.map_err(|e| scrub_locker_error(e, &locker_label));
     }
     if lost_lease(&process_result) {
         warn!("Job #{job_id}: no longer ours; nothing more to do");

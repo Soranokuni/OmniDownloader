@@ -22,8 +22,9 @@ use std::collections::BTreeMap;
 /// 1: the rules before P14.8. 2: P14.8 (YouTube playlist embeds, Facebook,
 /// Instagram and TikTok keys). 3: P11.15a2 (file-locker shares: Dropbox, Google Drive,
 /// OneDrive, SharePoint). 4: P11.15a3 (OneDrive personal shares by item id, Dropbox
-/// without the file name, Drive with its resourcekey).
-pub const NORMALIZE_VERSION: i64 = 4;
+/// without the file name). 5: P11.15a4 (Drive by its file id alone: the resource key is
+/// needed to download, not to tell two files apart).
+pub const NORMALIZE_VERSION: i64 = 5;
 
 /// Instagram path words that are pages, not shortcodes (P14.8b).
 const INSTAGRAM_PATH_WORDS: &[&str] = &["audio", "tagged", "saved", "explore", "stories", "accounts", "direct", "about", "legal"];
@@ -291,7 +292,7 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
         }
         "drive.google.com" => {
             // A file is its id: /file/d/{id}/view?usp=…, open?id=, uc?id=&export=…,
-            // and its `resourcekey` when the share has one (older shared files, P11.15a3).
+            // its `resourcekey` is needed to download, not to tell two files apart (P11.15a4).
             let id = match segs.as_slice() {
                 [f, d, id, ..] if f == "file" && d == "d" => Some(id.clone()),
                 [one] if one == "open" || one == "uc" => params.get("id").cloned(),
@@ -299,7 +300,7 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             };
             if let Some(id) = id.filter(|id| !id.is_empty()) {
                 *path = format!("/file/d/{id}");
-                params.retain(|k, _| k == "resourcekey");
+                params.clear();
             }
         }
         // A OneDrive short link, or a SharePoint share: the path is the share;
@@ -675,12 +676,14 @@ mod tests {
         ]);
         assert_eq!(dropbox_named, "https://www.dropbox.com/scl/fi/x1y2?rlkey=k9k9");
         assert_eq!(dropbox_old, "https://www.dropbox.com/s/abc123");
-        // P11.15a3: a Drive file's resourcekey is part of its identity.
+        // P11.15a4: a Drive file is its id, with or without a resource key.
         let drive_keyed = one(&[
             "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing&resourcekey=0-AbCdE",
             "https://drive.google.com/open?id=1AbC_dEf-GhIjKlMn&resourcekey=0-AbCdE",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?resourcekey=0-Other",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view",
         ]);
-        assert_eq!(drive_keyed, "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn?resourcekey=0-AbCdE");
+        assert_eq!(drive_keyed, drive);
 
         // Two different files stay two.
         assert_ne!(drive, normalize("https://drive.google.com/file/d/2ZzZ_other-file00/view"));
@@ -691,7 +694,7 @@ mod tests {
         assert_ne!(live, normalize("https://onedrive.live.com/?cid=ABC&resid=ABC%21124"));
         assert_ne!(live, normalize("https://onedrive.live.com/redir?resid=ABC!125"));
         assert_ne!(dropbox_named, normalize("https://www.dropbox.com/scl/fi/x1y3/clip.mov?rlkey=k9k9"));
-        assert_ne!(drive_keyed, normalize("https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?resourcekey=0-Other"));
+        assert_ne!(drive_keyed, normalize("https://drive.google.com/file/d/2ZzZ_other-file00/view?resourcekey=0-AbCdE"));
         for u in [&drive, &dropbox_old, &dropbox_new, &dropbox_named, &drive_keyed, &onedrive, &sharepoint, &live] {
             assert_eq!(normalize(u), *u, "idempotent: {u}");
         }

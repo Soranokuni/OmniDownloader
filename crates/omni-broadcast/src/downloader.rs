@@ -70,6 +70,9 @@ pub struct DownloadOpts<'a> {
     /// share (P11.15a2). yt-dlp skips a bigger one quietly, which ends as
     /// [`ErrorCode::ManualDownload`] with the limit named.
     pub max_filesize: Option<u64>,
+    /// What the log may say of the address instead of its host and path: the
+    /// site of a file-locker share, whose path carries its key (P11.15a4).
+    pub log_label: Option<&'a str>,
 }
 
 /// The format selection of a download (P11.6).
@@ -122,6 +125,7 @@ impl Default for DownloadOpts<'_> {
             ffmpeg: None,
             formats: FormatRoute::Usual,
             max_filesize: None,
+            log_label: None,
         }
     }
 }
@@ -154,6 +158,15 @@ pub const LIVE_FILTER: &str = "!is_live & live_status!=?is_upcoming";
 /// nothing, so this is only a secondary signal: see [`empty_download_is_live`].
 pub fn skipped_as_live(lines: &[String]) -> bool {
     lines.iter().any(|l| l.contains("does not pass filter") && l.contains(LIVE_FILTER))
+}
+
+/// What a download's log line says of `url` (P11.15a4): `label` when the caller
+/// gives one (a file-locker share's site), else the host and path, never the query.
+pub fn download_label(url: &str, label: Option<&str>) -> String {
+    match label {
+        Some(label) => label.to_string(),
+        None => omni_core::cookies::host_and_path(url),
+    }
 }
 
 /// The card's line for a file-locker share bigger than its limit of `bytes` (P11.15a2).
@@ -764,7 +777,7 @@ impl Downloader {
         let opts = self.own_tools(opts);
         let args = Self::build_args(url, output_dir, &opts);
 
-        info!("Job #{job_id}: downloading {}", omni_core::cookies::host_and_path(url));
+        info!("Job #{job_id}: downloading {}", download_label(url, opts.log_label));
 
         // yt-dlp prints the final path on stdout as well as progress lines, so
         // both are collected from the same stream.
@@ -2817,6 +2830,19 @@ mod platform_probe_tests {
             .unwrap_err();
         assert_eq!(tokio::time::Instant::now() - t0, RATE_LIMIT_COOL_DOWN);
         assert!(e.contains("could not run yt-dlp"), "{e}");
+    }
+
+    /// P11.15a4: a file-locker share's download is logged by its site, never by
+    /// a path that carries its key; any other by host and path, never the query.
+    #[test]
+    fn a_locker_downloads_log_line_names_its_site_only() {
+        let onedrive = omni_core::locker::direct_download("https://1drv.ms/v/s!AkExample123").unwrap();
+        let said = download_label(&onedrive, Some("1drv.ms"));
+        assert_eq!(said, "1drv.ms");
+        assert!(download_label(&onedrive, None).contains("u!"), "without the label the path would carry the token");
+        let sp = "https://station-my.sharepoint.com/:v:/g/personal/desk/EaBcDeFgHiJ?e=Xy1Zz9&download=1";
+        assert_eq!(download_label(sp, Some("sharepoint.com")), "sharepoint.com");
+        assert_eq!(download_label("https://news.example/v.mp4?sig=SECRET", None), "news.example/v.mp4");
     }
 
     /// P11.15a2: a file-locker share's download carries its size limit; any other does not.

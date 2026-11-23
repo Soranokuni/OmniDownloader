@@ -338,13 +338,6 @@ mod tests {
             assert!(parts.len() <= MAX_SECRET_PARTS && !parts.iter().any(|p| p == "download" || p == "1" || p == "t"), "{parts:?}");
         }
         assert!(secret_parts("https://news.example/story?long_value=abcdefghij").is_empty(), "not a share's address");
-
-        // The redactor's set is bounded.
-        let r = crate::logging::Redactions::default();
-        r.extend_capped((0..50).map(|i| format!("secret-{i:04}")).collect(), 10);
-        assert_eq!(r.len(), 10);
-        r.extend_capped(vec!["another-secret".to_string()], 10);
-        assert_eq!(r.len(), 10, "no more past the cap");
     }
 
     /// P11.15a3: an older shared Drive file keeps its resource key in the direct address.

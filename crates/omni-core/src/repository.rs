@@ -29,11 +29,6 @@ pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
 /// Rows per transaction when the keys are made again (P14.8b).
 pub const RENORMALIZE_BATCH: usize = 500;
 
-/// The most values the log redactor holds once file-locker keys are added to it
-/// (P11.15a3, [`Repository::redact_in_logs`]): the set grows with every share a
-/// job downloads, and must not grow without end.
-pub const MAX_LOG_REDACTIONS: usize = 1000;
-
 /// One page-evidence file of a failed job (plan P10.1).
 #[derive(Debug, Clone)]
 pub struct EvidenceRow {
@@ -940,12 +935,12 @@ impl Repository {
         self
     }
 
-    /// Keep `values` out of every log line from now on (P11.15a2: the keys of a
-    /// file-locker share's direct address). Nothing to do without a redactor.
-    pub fn redact_in_logs(&self, values: Vec<String>) {
-        if let Some(r) = &self.redactions {
-            r.extend_capped(values, MAX_LOG_REDACTIONS);
-        }
+    /// Keep `values` out of every log line while the returned guard lives
+    /// (P11.15a2, P11.15a4: the keys of a file-locker share's direct address,
+    /// for the length of its run). `None` without a redactor.
+    #[must_use = "the values are redacted only while the guard lives"]
+    pub fn redact_in_logs(&self, values: Vec<String>) -> Option<crate::logging::TemporaryRedaction> {
+        self.redactions.as_ref().map(|r| r.add_temporary(values))
     }
 
     /// The second-chance window (P11.5) from the `retry` config, read through

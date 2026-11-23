@@ -434,26 +434,42 @@ mod failure_text_tests {
 }
 
 /// Forgets a job's sent link when dropped (see [`BroadcastEngine::set_locker_link`]).
-pub struct LockerLinkGuard {
-    links: Arc<Mutex<HashMap<i64, String>>>,
-    job_id: i64,
-}
-
-impl Drop for LockerLinkGuard {
-    fn drop(&mut self) {
-        self.links.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.job_id);
-    }
-}
+pub type LockerLinkGuard = JobSlotGuard<String>;
 
 /// Forgets a job's download size limit when dropped (see [`BroadcastEngine::set_max_filesize`]).
-pub struct MaxFilesizeGuard {
-    sizes: Arc<Mutex<HashMap<i64, u64>>>,
-    job_id: i64,
+pub type MaxFilesizeGuard = JobSlotGuard<u64>;
+
+/// A per-job value the engine reads during a run (P11.15a4): each `set` takes a
+/// new generation, and its guard removes the entry only while it is still that
+/// generation, so a run that ends after another run of the same job started
+/// (a reaped lease, a retry) does not take the newer run's value away.
+type JobSlot<T> = Arc<Mutex<HashMap<i64, (u64, T)>>>;
+
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn set_slot<T>(slot: &JobSlot<T>, job_id: i64, value: T) -> JobSlotGuard<T> {
+    let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    slot.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, (generation, value));
+    JobSlotGuard { slot: slot.clone(), job_id, generation }
 }
 
-impl Drop for MaxFilesizeGuard {
+fn get_slot<T: Clone>(slot: &JobSlot<T>, job_id: i64) -> Option<T> {
+    slot.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).map(|(_, v)| v.clone())
+}
+
+/// Removes its run's entry from a [`JobSlot`] when dropped, if no later run replaced it.
+pub struct JobSlotGuard<T> {
+    slot: JobSlot<T>,
+    job_id: i64,
+    generation: u64,
+}
+
+impl<T> Drop for JobSlotGuard<T> {
     fn drop(&mut self) {
-        self.sizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.job_id);
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.get(&self.job_id).is_some_and(|(g, _)| *g == self.generation) {
+            slot.remove(&self.job_id);
+        }
     }
 }
 
@@ -506,10 +522,10 @@ pub struct BroadcastEngine {
     /// address, and every other argument of its download, are unchanged.
     login_sites: Arc<Mutex<HashMap<i64, String>>>,
     /// The largest file a job's download may bring, for the jobs that have one (P11.15a2).
-    max_filesizes: Arc<Mutex<HashMap<i64, u64>>>,
+    max_filesizes: JobSlot<u64>,
     /// The link that was sent, for the jobs that download a file-locker share's direct
     /// address (P11.15a3): every address in their error text says it instead.
-    locker_links: Arc<Mutex<HashMap<i64, String>>>,
+    locker_links: JobSlot<String>,
     /// `locker.max_file_gb` in bytes: the limit of a file-locker share's download (P11.15a2).
     locker_max_file_bytes: u64,
     /// The H.264 encoder previews use, found on first use (P10.6).
@@ -639,27 +655,37 @@ impl BroadcastEngine {
         self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).insert((job_id, owner.to_string()), permit);
     }
 
-    /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
     /// Limit job `job_id`'s downloads to `bytes` while the guard lives (P11.15a2):
     /// a file-locker share's direct download.
     pub fn set_max_filesize(&self, job_id: i64, bytes: u64) -> MaxFilesizeGuard {
-        self.max_filesizes.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, bytes);
-        MaxFilesizeGuard { sizes: self.max_filesizes.clone(), job_id }
+        set_slot(&self.max_filesizes, job_id, bytes)
     }
 
-    /// Job `job_id` downloads a file-locker share's direct address; `sent` is the
-    /// link it was sent as (P11.15a3). While the guard lives, every address in
-    /// the error text the engine writes (event, audit, log) is replaced by it.
-    pub fn set_locker_link(&self, job_id: i64, sent: &str) -> LockerLinkGuard {
-        self.locker_links.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, sent.to_string());
-        LockerLinkGuard { links: self.locker_links.clone(), job_id }
+    /// Job `job_id` downloads a file-locker share's direct address; `label` is
+    /// what may be said of it (its site, `urlnorm::site_for_log` of the sent link,
+    /// P11.15a4). While the guard lives, every address in the text the engine
+    /// writes for the job (event, audit, log) is replaced by it.
+    pub fn set_locker_link(&self, job_id: i64, label: &str) -> LockerLinkGuard {
+        set_slot(&self.locker_links, job_id, label.to_string())
+    }
+
+    /// What may be said of job `job_id`'s address (P11.15a4): its site, for a
+    /// file-locker share; `None` for any other job.
+    fn locker_label(&self, job_id: i64) -> Option<String> {
+        get_slot(&self.locker_links, job_id)
+    }
+
+    /// Job `job_id`'s download size limit and site label as the engine holds
+    /// them now (P11.15a4); for tests and diagnostics.
+    pub fn job_locker_state(&self, job_id: i64) -> (Option<u64>, Option<String>) {
+        (get_slot(&self.max_filesizes, job_id), self.locker_label(job_id))
     }
 
     /// `text` as the engine may write it for job `job_id`: unchanged, or for a
-    /// file-locker share with every address replaced by the sent link (P11.15a3).
+    /// file-locker share with every address replaced by its site (P11.15a3, P11.15a4).
     fn job_text(&self, job_id: i64, text: &str) -> String {
-        match self.locker_links.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id) {
-            Some(sent) => omni_core::locker::scrub_addresses(text, sent),
+        match self.locker_label(job_id) {
+            Some(label) => omni_core::locker::scrub_addresses(text, &label),
             None => text.to_string(),
         }
     }
@@ -675,6 +701,7 @@ impl BroadcastEngine {
         self.locker_max_file_bytes
     }
 
+    /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
     pub fn set_login_site(&self, job_id: i64, video_url: &str) -> LoginSiteGuard {
         self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, video_url.to_string());
         LoginSiteGuard { sites: self.login_sites.clone(), job_id }
@@ -1044,7 +1071,8 @@ impl BroadcastEngine {
         let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
         let jar_urls: Vec<&str> = std::iter::once(url).chain(login_site.as_deref()).collect();
         let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, job_temp, false);
-        let max_filesize = self.max_filesizes.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).copied();
+        let max_filesize = get_slot(&self.max_filesizes, job_id);
+        let log_label = self.locker_label(job_id);
         let downloaded = downloader
             .download(
                 job_id,
@@ -1059,6 +1087,7 @@ impl BroadcastEngine {
                     cancel: cancel.clone(),
                     formats,
                     max_filesize,
+                    log_label: log_label.as_deref(),
                     ..Default::default()
                 },
                 {
