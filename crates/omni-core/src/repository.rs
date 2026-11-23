@@ -935,6 +935,14 @@ impl Repository {
         self
     }
 
+    /// Keep `values` out of every log line from now on (P11.15a2: the keys of a
+    /// file-locker share's direct address). Nothing to do without a redactor.
+    pub fn redact_in_logs(&self, values: Vec<String>) {
+        if let Some(r) = &self.redactions {
+            r.extend(values);
+        }
+    }
+
     /// The second-chance window (P11.5) from the `retry` config, read through
     /// [`crate::second_chance::window_for`]: 30..=360 minutes, and never longer
     /// than `retry.max_age_mins`.

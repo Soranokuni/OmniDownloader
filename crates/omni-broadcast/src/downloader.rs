@@ -66,6 +66,10 @@ pub struct DownloadOpts<'a> {
     pub ffmpeg: Option<&'a Path>,
     /// Which formats to ask for: the usual ones, or the second route's (P11.6).
     pub formats: FormatRoute,
+    /// The largest file to download, in bytes (`--max-filesize`): a file-locker
+    /// share (P11.15a2). yt-dlp skips a bigger one quietly, which ends as
+    /// [`ErrorCode::ManualDownload`] with the limit named.
+    pub max_filesize: Option<u64>,
 }
 
 /// The format selection of a download (P11.6).
@@ -117,6 +121,7 @@ impl Default for DownloadOpts<'_> {
             js_runtime: None,
             ffmpeg: None,
             formats: FormatRoute::Usual,
+            max_filesize: None,
         }
     }
 }
@@ -149,6 +154,14 @@ pub const LIVE_FILTER: &str = "!is_live & live_status!=?is_upcoming";
 /// nothing, so this is only a secondary signal: see [`empty_download_is_live`].
 pub fn skipped_as_live(lines: &[String]) -> bool {
     lines.iter().any(|l| l.contains("does not pass filter") && l.contains(LIVE_FILTER))
+}
+
+/// The card's line for a file-locker share bigger than its limit of `bytes` (P11.15a2).
+pub fn too_big_el(bytes: u64) -> String {
+    format!(
+        "Το αρχείο είναι μεγαλύτερο από {} GB (όριο locker.max_file_gb) και δεν κατέβηκε αυτόματα. Κατεβάστε το με το χέρι και χρησιμοποιήστε «Μεταφόρτωση αρχείου» σε αυτή την εργασία.",
+        bytes >> 30
+    )
 }
 
 /// yt-dlp exited 0 and produced no file. Was that the live filter skipping a
@@ -684,6 +697,11 @@ impl Downloader {
                 .into_owned(),
         ]);
 
+        // A file-locker share's download is bounded (P11.15a2).
+        if let Some(bytes) = opts.max_filesize {
+            args.push("--max-filesize".into());
+            args.push(bytes.to_string());
+        }
         if opts.insecure_tls {
             args.push("--no-check-certificates".into());
         }
@@ -809,6 +827,12 @@ impl Downloader {
         warn!("Job #{job_id}: yt-dlp did not print a usable output path; scanning {output_dir:?}");
         if let Some(p) = find_downloaded_file(output_dir).await {
             return Ok(p);
+        }
+        // With a size limit (a file-locker share, P11.15a2) exit 0 and nothing written is
+        // yt-dlp skipping a bigger file (`--print` keeps its skip line quiet). Said before
+        // the live probe, which would ask the share's address again.
+        if let Some(bytes) = opts.max_filesize {
+            return Err(DownloadError { code: ErrorCode::ManualDownload, message: too_big_el(bytes) }.into());
         }
         // Exit 0 and nothing written is what the live filter leaves behind
         // (`--print` keeps its skip message quiet): ask yt-dlp whether the
@@ -2793,5 +2817,18 @@ mod platform_probe_tests {
             .unwrap_err();
         assert_eq!(tokio::time::Instant::now() - t0, RATE_LIMIT_COOL_DOWN);
         assert!(e.contains("could not run yt-dlp"), "{e}");
+    }
+
+    /// P11.15a2: a file-locker share's download carries its size limit; any other does not.
+    #[test]
+    fn a_locker_share_download_carries_its_size_limit() {
+        let dir = Path::new("C:/temp/jobs/7");
+        let limited = Downloader::build_args("https://www.dropbox.com/s/a/b.mp4?dl=1", dir, &DownloadOpts { max_filesize: Some(20 << 30), ..Default::default() });
+        let at = limited.iter().position(|a| a == "--max-filesize").expect("the limit is passed");
+        assert_eq!(limited[at + 1], (20u64 << 30).to_string());
+        let usual = Downloader::build_args("https://www.youtube.com/watch?v=abc", dir, &DownloadOpts::default());
+        assert!(!usual.iter().any(|a| a == "--max-filesize"), "{usual:?}");
+        let said = too_big_el(20 << 30);
+        assert!(said.contains("20 GB") && said.contains("locker.max_file_gb") && said.contains("«Μεταφόρτωση αρχείου»"), "{said}");
     }
 }

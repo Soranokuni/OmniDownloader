@@ -1339,6 +1339,8 @@ async fn run_daemon(
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
     .with_archive(Some(archive_settings.clone()))
+    // A file-locker share's download is bounded (P11.15a2).
+    .with_locker_max_file_bytes(config.locker.max_file_bytes())
     .with_watchfolder_state(watchfolder_state.clone())
     .with_retry_max_age(config.retry.max_age_mins)
     // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,

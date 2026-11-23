@@ -551,6 +551,8 @@ fn every_review_site_writes_the_review_hint() {
 #[tokio::test]
 async fn a_locker_a_person_must_fetch_goes_to_the_desk_and_a_direct_share_does_not() {
     use omni_core::locker::{classify, Locker};
+    // A broken guard here would reach the egress lookup: refused, so nothing leaves the machine (P11.15a2).
+    omni_core::net::refuse_lookups_for_tests();
     let r = rig();
     for (n, url, vendor) in [(1, "https://we.tl/t-abc123", "WeTransfer"), (2, "https://www.dropbox.com/sh/folder1/AAB?dl=0", "Dropbox")] {
         let id = r.repo.enqueue(&NewJob::new(url, &format!("{n}_ANNA_TEST"), "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
@@ -575,6 +577,65 @@ fn run_job_turns_a_direct_share_into_its_address_after_the_egress_check() {
     let vet = at("\n        match egress::vet_url(&orig_url, egress_allow).await {");
     let direct = at("\n    let orig_url = match omni_core::locker::direct_download(&orig_url) {");
     let direct_vet = direct + run[direct..].find("egress::vet_url(&direct, egress_allow)").expect("the direct address is vetted");
-    let page_scan = at("\n    let is_web = orig_url.starts_with(\"http://\")");
+    let page_scan = at("\n    let is_web = (orig_url.starts_with(\"http://\") || orig_url.starts_with(\"https://\")) && !locker_direct;");
     assert!(vet < direct && direct < direct_vet && direct_vet < page_scan);
+    // P11.15a2: a direct share is a download only. Its address is never opened as a
+    // page, no sniffer, no repair ladder, no site health, and its error is scrubbed.
+    for gate in [
+        "\n    let route = if locker_direct {\n        omni_broadcast::downloader::FirstAttempt::YtDlp",
+        "\n            Err(e) => !locker_direct && classify_pipeline_error(e).should_sniff(&orig_url),",
+        "\n                let ladder = if siblings_hold_the_rest || locker_direct {",
+        "\n        process_result = process_result.map_err(|e| scrub_locker_error(e, &sent_link));",
+        "\n                let done_for_site = done && !locker_direct;",
+        "\n            _size_guard = Some(engine.set_max_filesize(job_id, engine.locker_max_file_bytes()));",
+        "\n            repo.redact_in_logs(omni_core::locker::secret_parts(&direct));",
+    ] {
+        at(gate);
+    }
+}
+
+/// P11.15a2: a share of one file is a download only. After a run whose download
+/// fails, the row keeps the link that was sent, and neither its error nor any
+/// line of its history holds the direct address or the share's token. Nothing
+/// leaves the machine: lookups are refused and the rig has no yt-dlp.
+#[tokio::test]
+async fn a_direct_share_run_keeps_the_sent_link_and_never_shows_the_direct_address() {
+    omni_core::net::refuse_lookups_for_tests();
+    let r = rig();
+    let sent = "https://1drv.ms/v/s!AkExampleShare123";
+    let direct = omni_core::locker::direct_download(sent).unwrap();
+    let token = direct.split("shares/").nth(1).unwrap().split('/').next().unwrap().to_string();
+    let id = r.repo.enqueue(&NewJob::new(sent, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let job = r.lease(id);
+    r.run_job(job).await;
+    let row = r.row(id);
+    assert_eq!(row.url, sent, "the row keeps the sent link");
+    assert_ne!(row.status, JobStatus::ManualDownload, "a direct share is downloaded, not sent to the desk");
+    let mut texts: Vec<String> = r.repo.get_job_events(id, 500).unwrap().into_iter().map(|e| e.message).collect();
+    texts.extend(row.error_message.clone());
+    assert!(texts.iter().any(|t| t.contains("OneDrive share: the file is downloaded directly")), "{texts:?}");
+    for t in &texts {
+        assert!(!t.contains(&direct) && !t.contains(&token) && !t.contains("api.onedrive.com"), "the direct address leaked: {t}");
+    }
+    // No page scan, no browser: nothing of the web path ran.
+    assert!(!texts.iter().any(|t| t.contains("Sniffing") || t.contains("sniff")), "{texts:?}");
+}
+
+/// P11.15a2: a tool's error about a share's direct address names the sent link,
+/// keeps its code, and a lost lease is passed on untouched.
+#[test]
+fn a_direct_shares_error_is_scrubbed_and_keeps_its_code() {
+    let sent = "https://www.dropbox.com/scl/fi/x1y2/clip.mov?rlkey=k9k9&dl=0";
+    let direct = omni_core::locker::direct_download(sent).unwrap();
+    let raw = anyhow::anyhow!("ERROR: [generic] Unable to download {direct}: HTTP Error 403: Forbidden")
+        .context(format!("yt-dlp failed for {direct}"))
+        .context(ErrorCode::Http403.as_str());
+    let code = classify_pipeline_error(&raw);
+    let clean = scrub_locker_error(raw, sent);
+    assert_eq!(classify_pipeline_error(&clean), code);
+    let all = format!("{clean:#}");
+    assert!(!all.contains("dl=1") && all.contains(sent), "{all}");
+    assert!(!readable_cause(&clean).contains("dl=1"), "{}", readable_cause(&clean));
+    let lost = scrub_locker_error(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 1, stage: JobStage::Download }), sent);
+    assert!(lost.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some());
 }

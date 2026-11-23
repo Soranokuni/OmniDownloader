@@ -805,8 +805,17 @@ pub(crate) async fn run_job(
     // the normal pipeline, transcoded and verified like any video. Not stored:
     // the desk keeps showing the link that was sent, and a retry works it out
     // again. The direct address carries the share's key; it is never logged.
+    //
+    // P11.15a2: such a job is a download only, as an attachment is: no site API, no
+    // page scan, no browser, no page assessment, no repair ladder. Its size is
+    // bounded (`locker.max_file_gb`), the direct address's keys are kept out of the
+    // log, and every error text says the link that was sent instead of it.
+    let sent_link = orig_url.clone();
+    let mut locker_direct = false;
+    let mut _size_guard: Option<omni_broadcast::pipeline::MaxFilesizeGuard> = None;
     let orig_url = match omni_core::locker::direct_download(&orig_url) {
         Some(direct) => {
+            repo.redact_in_logs(omni_core::locker::secret_parts(&direct));
             let direct = match egress::vet_url(&direct, egress_allow).await {
                 Ok(normal) => normal,
                 Err(why) => return egress::end_job_internal_address(repo, job_id, owner, &why),
@@ -817,6 +826,8 @@ pub(crate) async fn run_job(
             };
             info!("Job #{job_id}: a {vendor} share of one file; downloading it from the direct address");
             repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("{vendor} share: the file is downloaded directly"))?;
+            locker_direct = true;
+            _size_guard = Some(engine.set_max_filesize(job_id, engine.locker_max_file_bytes()));
             job.url = direct.clone();
             direct
         }
@@ -827,7 +838,8 @@ pub(crate) async fn run_job(
     // Streamable embeds): this job takes the first, the others become
     // sibling jobs or offers, as when the sniffer finds them. Before, all
     // were downloaded into this job and one was delivered.
-    let is_web = orig_url.starts_with("http://") || orig_url.starts_with("https://");
+    // A file-locker share's direct address is a file, not a page (P11.15a2).
+    let is_web = (orig_url.starts_with("http://") || orig_url.starts_with("https://")) && !locker_direct;
     let mut page_referer: Option<String> = None;
     // How many videos yt-dlp's page scan named (P10.2).
     let mut scanned_videos = 0usize;
@@ -890,7 +902,11 @@ pub(crate) async fn run_job(
     // own pick waits as the fallback.
     // Where the page lands is judged by the egress rule too; an internal landing ends the job.
     let landed_refusal = std::sync::Mutex::new(None);
-    let route = omni_broadcast::downloader::first_attempt_resolved(
+    // A direct share is yt-dlp's download only: its address is not opened as a page (P11.15a2).
+    let route = if locker_direct {
+        omni_broadcast::downloader::FirstAttempt::YtDlp
+    } else {
+        omni_broadcast::downloader::first_attempt_resolved(
         page_referer.is_some(),
         is_platform,
         job.parent_job_id.is_some(),
@@ -909,7 +925,8 @@ pub(crate) async fn run_job(
             }
         },
     )
-    .await;
+    .await
+    };
     if let Some(why) = landed_refusal.into_inner().unwrap_or_else(|p| p.into_inner()) {
         return egress::end_job_internal_address(repo, job_id, owner, &why);
     }
@@ -949,6 +966,10 @@ pub(crate) async fn run_job(
         }
     };
 
+    // A direct share's error text says the link that was sent, never the direct address (P11.15a2).
+    if locker_direct {
+        process_result = process_result.map_err(|e| scrub_locker_error(e, &sent_link));
+    }
     if lost_lease(&process_result) {
         warn!("Job #{job_id}: no longer ours; nothing more to do");
         return Ok(());
@@ -976,7 +997,7 @@ pub(crate) async fn run_job(
     let mut sniff_referer: Option<String> = None;
     let sniff = sniff_first
         || match &process_result {
-            Err(e) => classify_pipeline_error(e).should_sniff(&orig_url),
+            Err(e) => !locker_direct && classify_pipeline_error(e).should_sniff(&orig_url),
             Ok(_) => false,
         };
     // The sniffer, taken first, found no usable video: yt-dlp's own pick is tried (P3.15).
@@ -1323,7 +1344,8 @@ pub(crate) async fn run_job(
             if done && !cancel.is_cancelled() {
                 // An article's sibling job holds a sniffed stream or post,
                 // not a page of the site: it says nothing about the site.
-                if job.parent_job_id.is_none() {
+                // Nor does a file-locker share (P11.15a2).
+                if job.parent_job_id.is_none() && !locker_direct {
                     note_site_outcome(repo, health, job_id, &orig_url, SiteOutcome::Success);
                 }
             }
@@ -1393,7 +1415,8 @@ pub(crate) async fn run_job(
                 // the repair ladder (P10.11a). Only here, only for a web page,
                 // only with repair on; a held video waits for MCR.
                 let tried = repair::Tried::of(&job, &orig_url, page_referer.as_deref(), &sniffed_streams, sniff_referer.as_deref());
-                let ladder = if siblings_hold_the_rest {
+                // Never for a file-locker share: its link is not a page (P11.15a2).
+                let ladder = if siblings_hold_the_rest || locker_direct {
                     None
                 } else {
                     repair::after_failure_with(repair, &job, owner, &orig_url, code, &snapshot, tried, furniture_urls.clone(), &cancel).await
@@ -1454,7 +1477,8 @@ pub(crate) async fn run_job(
 
                 // Nothing more is written for a job that is no longer ours.
                 if !cancel.is_cancelled() && still_ours(repo, job_id, owner) {
-                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, login_site.as_deref().unwrap_or(&job.url)))?;
+                    let hint_url = if locker_direct { sent_link.as_str() } else { login_site.as_deref().unwrap_or(&job.url) };
+                    repo.record_event(job_id, "ERROR", None, &review_hint(repo, job_id, code, hint_url))?;
                 }
                 // Only the job's owner writes evidence: a job MCR cancelled
                 // or the reaper gave away has no business leaving a file.
@@ -1476,8 +1500,10 @@ pub(crate) async fn run_job(
                 // A repair that ran out of time counts as the unresolved video it was.
                 let site_code = repair::site_code(code);
                 // A platform's extractor may have broken: an early yt-dlp update (P11.4d).
-                note_extraction_trouble(repo, canary, done, cancel.is_cancelled(), &orig_url, site_code.as_str());
-                if site_failure_counts(done, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
+                // A file-locker share says nothing about a site or a platform's extractor (P11.15a2).
+                let done_for_site = done && !locker_direct;
+                note_extraction_trouble(repo, canary, done_for_site, cancel.is_cancelled(), &orig_url, site_code.as_str());
+                if site_failure_counts(done_for_site, cancel.is_cancelled(), job.parent_job_id.is_some(), furniture_only_end(pick_refused, end, fallback_refused), site_code.as_str())
                 {
                     let noted = note_site_outcome(
                         repo,
@@ -2099,6 +2125,19 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
 /// Whether the engine stopped because this worker no longer holds the job
 /// (P1.14). Nothing more may be written for it: `finish` and `requeue_after`
 /// would refuse, but the events and sniffing would not.
+/// A file-locker share's failure, with every address in its text replaced by
+/// the link that was sent (P11.15a2): what the card, the history and the log
+/// show never holds the share's key or a signed download link. The code stays
+/// readable in the chain; a lost lease is passed on as it is (it names no address).
+pub(crate) fn scrub_locker_error(e: anyhow::Error, sent: &str) -> anyhow::Error {
+    if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some() {
+        return e;
+    }
+    let cause = omni_core::locker::scrub_addresses(&readable_cause(&e), sent);
+    let chain = omni_core::locker::scrub_addresses(&diagnostic_chain(&e), sent);
+    anyhow::anyhow!(cause).context(chain)
+}
+
 fn lost_lease<T>(result: &anyhow::Result<T>) -> bool {
     matches!(result, Err(e) if e.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some())
 }

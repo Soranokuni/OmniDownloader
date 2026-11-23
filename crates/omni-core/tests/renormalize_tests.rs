@@ -199,3 +199,33 @@ fn every_path_back_to_the_queue_writes_todays_key() -> Result<()> {
     assert_eq!(key_of(&dir, review), current, "second chance");
     Ok(())
 }
+
+/// P11.15a2: one Google Drive file sent in two forms is one job; a row stored
+/// with the old (v2) key is brought up by the pass and still blocks the second.
+#[test]
+fn one_drive_file_sent_in_two_forms_is_one_job_even_across_the_upgrade() -> Result<()> {
+    const VIEW: &str = "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing";
+    const OPEN: &str = "https://drive.google.com/open?id=1AbC_dEf-GhIjKlMn";
+    let dir = TempDir::new()?;
+    let first = {
+        let repo = Repository::new(dir.path().join("omni.db"))?;
+        let first = queue(&repo, VIEW, 1).job_id();
+        match queue(&repo, OPEN, 2) {
+            Enqueued::DuplicateActive { existing_id } => assert_eq!(existing_id, first),
+            other => panic!("the same file twice: {other:?}"),
+        }
+        first
+    };
+    // As P14.8 stored it (v2: the path and `usp` kept), before this version.
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("omni.db"))?;
+        conn.execute("UPDATE queue SET url_normalized = ? WHERE id = ?", params![VIEW, first])?;
+        conn.execute("UPDATE app_meta SET value = '2' WHERE key = 'url_normalize_version'", [])?;
+    }
+    let repo = Repository::new(dir.path().join("omni.db"))?;
+    match queue(&repo, OPEN, 3) {
+        Enqueued::DuplicateActive { existing_id } => assert_eq!(existing_id, first),
+        other => panic!("the row stored with the old key was missed: {other:?}"),
+    }
+    Ok(())
+}

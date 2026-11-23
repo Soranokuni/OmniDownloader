@@ -56,6 +56,8 @@ pub fn classify(url: &str) -> Locker {
     match site.as_str() {
         "dropbox.com" => dropbox(&parsed, &segs),
         "google.com" if host == "drive.google.com" => google_drive(&segs, param("id")),
+        // The short link's first segment is the item's kind: `f` a folder (P11.15a2), else a file.
+        "1drv.ms" if segs.first() == Some(&"f") => Locker::Folder { vendor: "OneDrive" },
         "1drv.ms" => Locker::Direct { vendor: "OneDrive", url: onedrive_share_content(url.trim()) },
         "live.com" if host == "onedrive.live.com" => {
             // A personal share opened in the browser: `?cid=…&resid=…` or `?redeem=…`.
@@ -84,6 +86,46 @@ pub fn direct_download(url: &str) -> Option<String> {
         Locker::Direct { url, .. } => Some(url),
         _ => None,
     }
+}
+
+/// The parts of a direct address that open the share (P11.15a2): every query
+/// value and every path segment of 10 characters or more (keys, ids, the
+/// shares API's `u!…` token). Given to the log redactor, so no log line shows
+/// them, whichever tool prints the address.
+pub fn secret_parts(direct: &str) -> Vec<String> {
+    let Ok(parsed) = reqwest::Url::parse(direct) else { return Vec::new() };
+    let mut out: Vec<String> = parsed.query_pairs().map(|(_, v)| v.into_owned()).filter(|v| v.len() >= 6).collect();
+    if let Some(segs) = parsed.path_segments() {
+        out.extend(segs.filter(|s| s.len() >= 10).map(str::to_string));
+    }
+    if let Some(q) = parsed.query() {
+        out.push(q.to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `text` with every web address in it replaced by `sent` (P11.15a2): a
+/// tool's error about a share's direct address (its key, a signed download
+/// link it was sent on to) says the link that was sent instead, on the card,
+/// in the job's history and in the log.
+pub fn scrub_addresses(text: &str, sent: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("http://").into_iter().chain(rest.find("https://")).min() {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let mut end = tail.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']')).unwrap_or(tail.len());
+        // A sentence's punctuation after the address is not part of it.
+        while end > 0 && tail[..end].ends_with([':', ',', '.', ';']) {
+            end -= 1;
+        }
+        out.push_str(sent);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn dropbox(parsed: &reqwest::Url, segs: &[&str]) -> Locker {
@@ -226,12 +268,33 @@ mod tests {
             format!("https://api.onedrive.com/v1.0/shares/u!{}/root/content", base64url(b"https://1drv.ms/v/s!AkExample123"))
         );
         assert!(direct("https://onedrive.live.com/?cid=ABC&resid=ABC%21123&authkey=x").starts_with("https://api.onedrive.com/v1.0/shares/u!"));
+        // P11.15a2: a shared folder's short link is not one file.
+        assert_eq!(classify("https://1drv.ms/f/s!AkFolder123"), Locker::Folder { vendor: "OneDrive" });
+        assert!(matches!(classify("https://1drv.ms/u/s!AkFile123"), Locker::Direct { .. }));
         assert_eq!(
             direct("https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Xy1"),
             "https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Xy1&download=1"
         );
         assert_eq!(classify("https://station.sharepoint.com/:f:/s/news/EaBcD"), Locker::Folder { vendor: "SharePoint" });
         assert_eq!(classify("https://station.sharepoint.com/sites/news/Shared%20Documents"), Locker::Manual { vendor: "SharePoint" });
+    }
+
+    /// P11.15a2: a tool's error text never keeps a direct address, and its keys go to the redactor.
+    #[test]
+    fn a_direct_address_is_scrubbed_from_text_and_its_keys_are_redacted() {
+        let sent = "https://www.dropbox.com/scl/fi/x1y2z3/clip.mov?rlkey=k9k9&dl=0";
+        let direct = direct(sent);
+        let text = format!("ERROR: [generic] Unable to download {direct}: HTTP Error 403 (from https://uc12.dl.dropboxusercontent.com/cd/0/get/SIGNED?x=1)");
+        let out = scrub_addresses(&text, sent);
+        assert!(!out.contains("dl=1") && !out.contains("SIGNED") && !out.contains("dropboxusercontent"), "{out}");
+        assert_eq!(out.matches(sent).count(), 2, "{out}");
+        assert!(out.starts_with("ERROR: [generic] Unable to download ") && out.contains(": HTTP Error 403 (from "));
+        assert_eq!(scrub_addresses("no address here", sent), "no address here");
+
+        // The keys a log line must not show: the rlkey, and the shares API's token.
+        assert!(secret_parts(&direct).iter().any(|p| p.contains("rlkey=k9k9")), "{:?}", secret_parts(&direct));
+        let one = direct_download("https://1drv.ms/v/s!AkExample123").unwrap();
+        assert!(secret_parts(&one).iter().any(|s| s.starts_with("u!") && one.contains(s.as_str())), "{:?}", secret_parts(&one));
     }
 
     #[test]

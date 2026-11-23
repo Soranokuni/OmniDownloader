@@ -363,10 +363,12 @@ fn a_live_release_still_waiting_for_its_verdict_is_verified_not_skipped() {
 #[test]
 fn the_worker_notes_extraction_trouble_after_finishing_a_job_it_will_not_retry() {
     let src = include_str!("worker.rs");
-    let call = "note_extraction_trouble(repo, canary, done, cancel.is_cancelled(), &orig_url, site_code.as_str());";
+    // `done`, but never for a file-locker share, which says nothing about a platform (P11.15a2).
+    let call = "note_extraction_trouble(repo, canary, done_for_site, cancel.is_cancelled(), &orig_url, site_code.as_str());";
     assert_eq!(src.matches(call).count(), 1, "the call in run_job");
     let at = src.find(call).unwrap();
     let before = &src[..at];
+    assert!(before.ends_with("let done_for_site = done && !locker_direct;\n                "), "done_for_site is `done` of a non-locker job");
     let branch = before.rfind("if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {").expect("the no-retry branch");
     let finish = before.rfind("let done = repo.finish(").expect("the job is finished first");
     assert!(branch < finish, "the finish belongs to the branch");

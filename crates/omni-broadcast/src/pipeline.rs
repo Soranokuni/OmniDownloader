@@ -433,6 +433,18 @@ mod failure_text_tests {
     }
 }
 
+/// Forgets a job's download size limit when dropped (see [`BroadcastEngine::set_max_filesize`]).
+pub struct MaxFilesizeGuard {
+    sizes: Arc<Mutex<HashMap<i64, u64>>>,
+    job_id: i64,
+}
+
+impl Drop for MaxFilesizeGuard {
+    fn drop(&mut self) {
+        self.sizes.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.job_id);
+    }
+}
+
 /// Forgets a job's extra login site when dropped (see [`BroadcastEngine::set_login_site`]).
 pub struct LoginSiteGuard {
     sites: Arc<Mutex<HashMap<i64, String>>>,
@@ -481,6 +493,10 @@ pub struct BroadcastEngine {
     /// job's yt-dlp runs also carry that site's cookie jar (P3.5). The job's own
     /// address, and every other argument of its download, are unchanged.
     login_sites: Arc<Mutex<HashMap<i64, String>>>,
+    /// The largest file a job's download may bring, for the jobs that have one (P11.15a2).
+    max_filesizes: Arc<Mutex<HashMap<i64, u64>>>,
+    /// `locker.max_file_gb` in bytes: the limit of a file-locker share's download (P11.15a2).
+    locker_max_file_bytes: u64,
     /// The H.264 encoder previews use, found on first use (P10.6).
     preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
     /// Where a delivered job's source goes instead of the bin (P1.7); `None`
@@ -609,6 +625,24 @@ impl BroadcastEngine {
     }
 
     /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
+    /// Limit job `job_id`'s downloads to `bytes` while the guard lives (P11.15a2):
+    /// a file-locker share's direct download.
+    pub fn set_max_filesize(&self, job_id: i64, bytes: u64) -> MaxFilesizeGuard {
+        self.max_filesizes.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, bytes);
+        MaxFilesizeGuard { sizes: self.max_filesizes.clone(), job_id }
+    }
+
+    /// `locker.max_file_gb` in bytes (P11.15a2).
+    pub fn with_locker_max_file_bytes(mut self, bytes: u64) -> Self {
+        self.locker_max_file_bytes = bytes.max(1);
+        self
+    }
+
+    /// The limit of a file-locker share's download, in bytes (P11.15a2).
+    pub fn locker_max_file_bytes(&self) -> u64 {
+        self.locker_max_file_bytes
+    }
+
     pub fn set_login_site(&self, job_id: i64, video_url: &str) -> LoginSiteGuard {
         self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, video_url.to_string());
         LoginSiteGuard { sites: self.login_sites.clone(), job_id }
@@ -659,6 +693,8 @@ impl BroadcastEngine {
             encoder_slots: Arc::new(Semaphore::new(DEFAULT_ENCODER_SLOTS)),
             download_slots: Arc::new(Mutex::new(HashMap::new())),
             login_sites: Arc::new(Mutex::new(HashMap::new())),
+            max_filesizes: Arc::new(Mutex::new(HashMap::new())),
+            locker_max_file_bytes: omni_core::config::LockerConfig::default().max_file_bytes(),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
             archive: None,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -973,6 +1009,7 @@ impl BroadcastEngine {
         let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
         let jar_urls: Vec<&str> = std::iter::once(url).chain(login_site.as_deref()).collect();
         let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, job_temp, false);
+        let max_filesize = self.max_filesizes.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).copied();
         let downloaded = downloader
             .download(
                 job_id,
@@ -986,6 +1023,7 @@ impl BroadcastEngine {
                     cookie_values: cookie_file.as_ref().map(|f| f.values()).unwrap_or(&[]),
                     cancel: cancel.clone(),
                     formats,
+                    max_filesize,
                     ..Default::default()
                 },
                 {

@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 /// again after it is still one job.
 ///
 /// 1: the rules before P14.8. 2: P14.8 (YouTube playlist embeds, Facebook,
-/// Instagram and TikTok keys).
-pub const NORMALIZE_VERSION: i64 = 2;
+/// Instagram and TikTok keys). 3: P11.15a2 (file-locker shares: Dropbox, Google Drive,
+/// OneDrive, SharePoint).
+pub const NORMALIZE_VERSION: i64 = 3;
 
 /// Instagram path words that are pages, not shortcodes (P14.8b).
 const INSTAGRAM_PATH_WORDS: &[&str] = &["audio", "tagged", "saved", "explore", "stories", "accounts", "direct", "about", "legal"];
@@ -191,6 +192,7 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             *host = "www.tiktok.com".into();
         }
         "m.vimeo.com" => *host = "vimeo.com".into(),
+        "dropbox.com" => *host = "www.dropbox.com".into(),
         _ => {
             // Generic mobile subdomain folding for news portals.
             if let Some(rest) = host.strip_prefix("m.") {
@@ -270,6 +272,39 @@ fn apply_host_rules(host: &mut String, path: &mut String, params: &mut BTreeMap<
             if let Some(id) = id {
                 *path = format!("/video/{id}");
                 params.clear();
+            }
+        }
+        // File-locker shares (P11.15a2): since P11.15a they download by
+        // themselves, so every form of one share must be one key, or the same
+        // file goes on air twice.
+        "www.dropbox.com" => {
+            // `dl`/`raw` only say how to serve it; `rlkey` is part of the share.
+            params.retain(|k, _| k == "rlkey");
+        }
+        "drive.google.com" => {
+            // A file is its id: /file/d/{id}/view?usp=…, open?id=, uc?id=&export=…
+            let id = match segs.as_slice() {
+                [f, d, id, ..] if f == "file" && d == "d" => Some(id.clone()),
+                [one] if one == "open" || one == "uc" => params.get("id").cloned(),
+                _ => None,
+            };
+            if let Some(id) = id.filter(|id| !id.is_empty()) {
+                *path = format!("/file/d/{id}");
+                params.clear();
+            }
+        }
+        // A OneDrive short link, or a SharePoint share: the path is the share;
+        // `e`, `usp`, `download` and the like only say how to show it.
+        "1drv.ms" => params.clear(),
+        h if h.ends_with(".sharepoint.com") && segs.first().is_some_and(|s| s.len() == 3 && s.starts_with(':') && s.ends_with(':')) => {
+            params.clear();
+        }
+        "onedrive.live.com" => {
+            // A personal share opened in the browser is its item id.
+            if params.contains_key("resid") {
+                params.retain(|k, _| k == "resid");
+            } else {
+                params.retain(|k, _| k == "redeem" || k == "id");
             }
         }
         _ => {}
@@ -573,6 +608,55 @@ mod tests {
         assert_ne!(normalize("https://www.tiktok.com/@a/video/1"), normalize("https://www.tiktok.com/@a/video/2"));
         // A Facebook page's video list is not one of its videos.
         assert_ne!(normalize("https://www.facebook.com/Page/videos"), normalize("https://www.facebook.com/watch?v=1"));
+    }
+
+    #[test]
+    fn every_form_of_one_locker_share_is_one_key_and_two_files_are_two() {
+        // P11.15a2: a share that downloads by itself, sent twice in two forms, is one job.
+        let one = |forms: &[&str]| {
+            let keys: Vec<String> = forms.iter().map(|u| normalize(u)).collect();
+            assert!(keys.windows(2).all(|w| w[0] == w[1]), "{forms:?} -> {keys:?}");
+            keys[0].clone()
+        };
+        let drive = one(&[
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=drive_link",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/",
+            "https://drive.google.com/open?id=1AbC_dEf-GhIjKlMn",
+            "https://drive.google.com/uc?id=1AbC_dEf-GhIjKlMn&export=download",
+        ]);
+        assert_eq!(drive, "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn");
+        let dropbox_old = one(&[
+            "https://www.dropbox.com/s/abc123/clip.mp4?dl=0",
+            "https://www.dropbox.com/s/abc123/clip.mp4?dl=1",
+            "https://dropbox.com/s/abc123/clip.mp4?raw=1",
+            "https://www.dropbox.com/s/abc123/clip.mp4",
+        ]);
+        let dropbox_new = one(&[
+            "https://www.dropbox.com/scl/fi/x1y2/clip.mov?rlkey=k9k9&dl=0",
+            "https://www.dropbox.com/scl/fi/x1y2/clip.mov?dl=1&rlkey=k9k9&st=abc",
+        ]);
+        assert!(dropbox_new.contains("rlkey=k9k9"), "the rlkey is part of the share: {dropbox_new}");
+        let onedrive = one(&["https://1drv.ms/v/s!AkExample123?e=Xy1", "https://1drv.ms/v/s!AkExample123"]);
+        let sharepoint = one(&[
+            "https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Xy1",
+            "https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Zz9&download=1",
+        ]);
+        let live = one(&[
+            "https://onedrive.live.com/?cid=ABC&resid=ABC%21123&authkey=x",
+            "https://onedrive.live.com/?resid=ABC%21123&cid=ABC&ithint=video",
+        ]);
+
+        // Two different files stay two.
+        assert_ne!(drive, normalize("https://drive.google.com/file/d/2ZzZ_other-file00/view"));
+        assert_ne!(dropbox_old, normalize("https://www.dropbox.com/s/def456/clip.mp4?dl=0"));
+        assert_ne!(dropbox_new, normalize("https://www.dropbox.com/scl/fi/x1y2/clip.mov?rlkey=other1"));
+        assert_ne!(onedrive, normalize("https://1drv.ms/v/s!AkOther456"));
+        assert_ne!(sharepoint, normalize("https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EfGhI?e=Xy1"));
+        assert_ne!(live, normalize("https://onedrive.live.com/?cid=ABC&resid=ABC%21124"));
+        for u in [&drive, &dropbox_old, &dropbox_new, &onedrive, &sharepoint, &live] {
+            assert_eq!(normalize(u), *u, "idempotent: {u}");
+        }
     }
 
     #[test]

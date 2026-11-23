@@ -631,6 +631,34 @@ impl Default for RepairConfig {
     }
 }
 
+/// File-locker links (`locker` in config.json, P11.15). Old files without the
+/// section load with these defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockerConfig {
+    /// The largest file a share's direct download may bring (P11.15a2), in GB
+    /// (read as at least 1): a bigger one is not downloaded and waits for
+    /// MCR, with its size named.
+    #[serde(default = "default_locker_max_file_gb")]
+    pub max_file_gb: u64,
+}
+
+fn default_locker_max_file_gb() -> u64 {
+    20
+}
+
+impl LockerConfig {
+    /// [`Self::max_file_gb`] in bytes, at least 1 GB.
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_gb.max(1).saturating_mul(1 << 30)
+    }
+}
+
+impl Default for LockerConfig {
+    fn default() -> Self {
+        Self { max_file_gb: default_locker_max_file_gb() }
+    }
+}
+
 /// Automatic retries of a failed job (`retry` in config.json, P11.3a). Old
 /// files without the section load with these defaults. Values are read
 /// where they are used, not checked at load.
@@ -956,6 +984,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub retry: RetryConfig,
 
+    /// File-locker links (P11.15).
+    #[serde(default)]
+    pub locker: LockerConfig,
+
     /// Event Log alerts (P11.14).
     #[serde(default)]
     pub alerts: AlertsConfig,
@@ -1081,6 +1113,7 @@ impl Default for AppConfig {
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             retry: RetryConfig::default(),
+            locker: LockerConfig::default(),
             alerts: AlertsConfig::default(),
             pacing: PacingConfig::default(),
             archive: ArchiveConfig::default(),
@@ -1330,6 +1363,18 @@ mod tests {
         assert_eq!(worker.get(), RepairMode::Hold);
         live.set(RepairMode::Off);
         assert_eq!(worker.get(), RepairMode::Off);
+    }
+
+    #[test]
+    fn the_locker_section_defaults_and_its_size_limit_is_at_least_a_gigabyte() {
+        // P11.15a2: an old file without the section gets 20 GB.
+        let old: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.locker.max_file_gb, 20);
+        assert_eq!(old.locker.max_file_bytes(), 20 << 30);
+        let set: AppConfig = serde_json::from_str(r#"{"locker":{"max_file_gb":5}}"#).unwrap();
+        assert_eq!(set.locker.max_file_bytes(), 5 << 30);
+        let zero: AppConfig = serde_json::from_str(r#"{"locker":{"max_file_gb":0}}"#).unwrap();
+        assert_eq!(zero.locker.max_file_bytes(), 1 << 30, "read as at least 1 GB");
     }
 
     #[test]
