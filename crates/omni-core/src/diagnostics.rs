@@ -134,8 +134,9 @@ pub fn scrub(text: &str, secrets: &[String]) -> String {
     // `null` is kept. After a token name only, a value that is not
     // credential-like (a status: `…/oauth2/v2.0/token: 401`) is kept too; a
     // password, secret, key or credential is always blanked, digits included (P13.8d).
-    // Not starting with a backslash: `\"<removed>\"` of escaped JSON is not a value.
-    let plain = re(&PLAIN, &key(r#"([^"'\s&;,\[\]{}\\][^"'\s&;,\[\]{}]*)"#));
+    // A backslash may start a value (`password=\Xy9…`) but not a backslash and a
+    // quote: `\"<removed>\"` of escaped JSON is not a value (P13.8f).
+    let plain = re(&PLAIN, &key(r#"((?:[^"'\s&;,\[\]{}\\]|\\[^"'\s&;,\[\]{}])[^"'\s&;,\[\]{}]*)"#));
     let text = plain.replace_all(&text, |c: &regex::Captures| {
         let (lead, value) = (&c[1], &c[2]);
         let token_like = lead.trim_end_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace()).to_ascii_lowercase().trim_end_matches(['"', '\'', '\\']).ends_with("token");
@@ -531,6 +532,16 @@ mod tests {
         let out = scrub(cut, &[]);
         assert!(!out.contains("s3cr3t-tail") && out.ends_with("\r\nINFO \"x\": 1"), "{out:?}");
         assert!(!scrub("{'token': 'f1-planted-cut", &[]).contains("f1-planted"));
+    }
+
+    /// P13.8f: an unquoted secret that starts with a backslash is blanked;
+    /// an escaped quote is still not taken for a value.
+    #[test]
+    fn an_unquoted_value_starting_with_a_backslash_is_blanked() {
+        assert_eq!(scrub(r"password=\Xy9kL2mn!", &[]), "password=<removed>");
+        assert_eq!(scrub(r"login secret: \\share\h1-planted next", &[]), "login secret: <removed> next");
+        let escaped = r#"{\"password\":\"h2-planted\",\"x\":1}"#;
+        assert_eq!(scrub(escaped, &[]), r#"{\"password\":\"<removed>\",\"x\":1}"#);
     }
 
     /// P13.8e: a value cut right after a backslash; an escaped-JSON value that
