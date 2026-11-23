@@ -813,6 +813,7 @@ pub(crate) async fn run_job(
     let sent_link = orig_url.clone();
     let mut locker_direct = false;
     let mut _size_guard: Option<omni_broadcast::pipeline::MaxFilesizeGuard> = None;
+    let mut _link_guard: Option<omni_broadcast::pipeline::LockerLinkGuard> = None;
     let orig_url = match omni_core::locker::direct_download(&orig_url) {
         Some(direct) => {
             repo.redact_in_logs(omni_core::locker::secret_parts(&direct));
@@ -828,6 +829,8 @@ pub(crate) async fn run_job(
             repo.record_event(job_id, "INFO", Some(JobStage::Extract), &format!("{vendor} share: the file is downloaded directly"))?;
             locker_direct = true;
             _size_guard = Some(engine.set_max_filesize(job_id, engine.locker_max_file_bytes()));
+            // The engine's own error lines say the sent link too (P11.15a3).
+            _link_guard = Some(engine.set_locker_link(job_id, &sent_link));
             job.url = direct.clone();
             direct
         }

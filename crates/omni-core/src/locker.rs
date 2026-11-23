@@ -55,7 +55,7 @@ pub fn classify(url: &str) -> Locker {
 
     match site.as_str() {
         "dropbox.com" => dropbox(&parsed, &segs),
-        "google.com" if host == "drive.google.com" => google_drive(&segs, param("id")),
+        "google.com" if host == "drive.google.com" => google_drive(&segs, param("id"), param("resourcekey")),
         // The short link's first segment is the item's kind: `f` a folder (P11.15a2), else a file.
         "1drv.ms" if segs.first() == Some(&"f") => Locker::Folder { vendor: "OneDrive" },
         "1drv.ms" => Locker::Direct { vendor: "OneDrive", url: onedrive_share_content(url.trim()) },
@@ -92,19 +92,47 @@ pub fn direct_download(url: &str) -> Option<String> {
 /// value and every path segment of 10 characters or more (keys, ids, the
 /// shares API's `u!…` token). Given to the log redactor, so no log line shows
 /// them, whichever tool prints the address.
+///
+/// Only the parts that open the share (P11.15a3), never a constant like
+/// `download`: Google Drive's file id and resource key, Dropbox's key or id and
+/// `rlkey`, the OneDrive shares API's `u!…` token, a SharePoint link's share
+/// token and its `e` code. At most [`MAX_SECRET_PARTS`], each of 6 characters
+/// or more, without repeats.
 pub fn secret_parts(direct: &str) -> Vec<String> {
     let Ok(parsed) = reqwest::Url::parse(direct) else { return Vec::new() };
-    let mut out: Vec<String> = parsed.query_pairs().map(|(_, v)| v.into_owned()).filter(|v| v.len() >= 6).collect();
-    if let Some(segs) = parsed.path_segments() {
-        out.extend(segs.filter(|s| s.len() >= 10).map(str::to_string));
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let segs: Vec<String> = parsed.path_segments().map(|s| s.map(str::to_string).collect()).unwrap_or_default();
+    let param = |name: &str| parsed.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
+    let mut out: Vec<String> = Vec::new();
+    match host.as_str() {
+        "drive.usercontent.google.com" => out.extend(param("id").into_iter().chain(param("resourcekey"))),
+        h if h == "dropbox.com" || h.ends_with(".dropbox.com") => {
+            match segs.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                ["s", key, ..] => out.push(key.to_string()),
+                ["scl", "fi", id, ..] => out.push(id.to_string()),
+                _ => {}
+            }
+            out.extend(param("rlkey"));
+        }
+        "api.onedrive.com" => out.extend(segs.iter().filter(|s| s.starts_with("u!")).cloned()),
+        h if h.ends_with(".sharepoint.com") => {
+            // `/:v:/g/personal/{user}/{token}`: the last segment is the share's token.
+            out.extend(segs.last().cloned());
+            out.extend(param("e"));
+        }
+        _ => {}
     }
-    if let Some(q) = parsed.query() {
-        out.push(q.to_string());
+    let mut kept: Vec<String> = Vec::new();
+    for part in out.into_iter().filter(|p| p.len() >= 6) {
+        if !kept.contains(&part) && kept.len() < MAX_SECRET_PARTS {
+            kept.push(part);
+        }
     }
-    out.sort();
-    out.dedup();
-    out
+    kept
 }
+
+/// The most parts [`secret_parts`] gives for one address.
+pub const MAX_SECRET_PARTS: usize = 4;
 
 /// `text` with every web address in it replaced by `sent` (P11.15a2): a
 /// tool's error about a share's direct address (its key, a signed download
@@ -156,7 +184,7 @@ fn dropbox(parsed: &reqwest::Url, segs: &[&str]) -> Locker {
     }
 }
 
-fn google_drive(segs: &[&str], id_param: Option<String>) -> Locker {
+fn google_drive(segs: &[&str], id_param: Option<String>, resource_key: Option<String>) -> Locker {
     let vendor = "Google Drive";
     let id = match segs {
         ["file", "d", id, ..] => Some(id.to_string()),
@@ -164,11 +192,16 @@ fn google_drive(segs: &[&str], id_param: Option<String>) -> Locker {
         ["drive", "folders", ..] | ["drive", "u", _, "folders", ..] => return Locker::Folder { vendor },
         _ => None,
     };
-    match id.filter(|id| id.len() >= 10 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
-        Some(id) => Locker::Direct {
-            vendor,
-            url: format!("https://drive.usercontent.google.com/download?id={id}&export=download&confirm=t"),
-        },
+    let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    match id.filter(|id| id.len() >= 10 && plain(id)) {
+        Some(id) => {
+            let mut url = format!("https://drive.usercontent.google.com/download?id={id}&export=download&confirm=t");
+            // An older shared file needs its resource key too (P11.15a3).
+            if let Some(key) = resource_key.filter(|k| !k.is_empty() && plain(k)) {
+                url.push_str(&format!("&resourcekey={key}"));
+            }
+            Locker::Direct { vendor, url }
+        }
         None => Locker::Manual { vendor },
     }
 }
@@ -291,10 +324,37 @@ mod tests {
         assert!(out.starts_with("ERROR: [generic] Unable to download ") && out.contains(": HTTP Error 403 (from "));
         assert_eq!(scrub_addresses("no address here", sent), "no address here");
 
-        // The keys a log line must not show: the rlkey, and the shares API's token.
-        assert!(secret_parts(&direct).iter().any(|p| p.contains("rlkey=k9k9")), "{:?}", secret_parts(&direct));
+        // P11.15a3: the keys a log line must not show, and nothing else (no `download`, no `1`).
+        let drive = direct_download("https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?resourcekey=0-AbCdEfGh").unwrap();
+        assert_eq!(secret_parts(&drive), vec!["1AbC_dEf-GhIjKlMn".to_string(), "0-AbCdEfGh".to_string()]);
+        let dropbox = direct_download("https://www.dropbox.com/scl/fi/x1y2z3w4v5/clip.mov?rlkey=abcdef123456&dl=0").unwrap();
+        assert_eq!(secret_parts(&dropbox), vec!["x1y2z3w4v5".to_string(), "abcdef123456".to_string()]);
         let one = direct_download("https://1drv.ms/v/s!AkExample123").unwrap();
-        assert!(secret_parts(&one).iter().any(|s| s.starts_with("u!") && one.contains(s.as_str())), "{:?}", secret_parts(&one));
+        let parts = secret_parts(&one);
+        assert!(parts.len() == 1 && parts[0].starts_with("u!") && one.contains(parts[0].as_str()), "{parts:?}");
+        let sp = direct_download("https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcDeFgHiJ?e=Xy1Zz9").unwrap();
+        assert_eq!(secret_parts(&sp), vec!["EaBcDeFgHiJ".to_string(), "Xy1Zz9".to_string()]);
+        for parts in [secret_parts(&drive), secret_parts(&dropbox), secret_parts(&sp)] {
+            assert!(parts.len() <= MAX_SECRET_PARTS && !parts.iter().any(|p| p == "download" || p == "1" || p == "t"), "{parts:?}");
+        }
+        assert!(secret_parts("https://news.example/story?long_value=abcdefghij").is_empty(), "not a share's address");
+
+        // The redactor's set is bounded.
+        let r = crate::logging::Redactions::default();
+        r.extend_capped((0..50).map(|i| format!("secret-{i:04}")).collect(), 10);
+        assert_eq!(r.len(), 10);
+        r.extend_capped(vec!["another-secret".to_string()], 10);
+        assert_eq!(r.len(), 10, "no more past the cap");
+    }
+
+    /// P11.15a3: an older shared Drive file keeps its resource key in the direct address.
+    #[test]
+    fn a_drive_files_resource_key_is_kept() {
+        assert_eq!(
+            direct("https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing&resourcekey=0-AbCdEfGh"),
+            "https://drive.usercontent.google.com/download?id=1AbC_dEf-GhIjKlMn&export=download&confirm=t&resourcekey=0-AbCdEfGh"
+        );
+        assert!(!direct("https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view").contains("resourcekey"));
     }
 
     #[test]

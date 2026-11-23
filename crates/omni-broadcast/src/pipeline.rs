@@ -433,6 +433,18 @@ mod failure_text_tests {
     }
 }
 
+/// Forgets a job's sent link when dropped (see [`BroadcastEngine::set_locker_link`]).
+pub struct LockerLinkGuard {
+    links: Arc<Mutex<HashMap<i64, String>>>,
+    job_id: i64,
+}
+
+impl Drop for LockerLinkGuard {
+    fn drop(&mut self) {
+        self.links.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.job_id);
+    }
+}
+
 /// Forgets a job's download size limit when dropped (see [`BroadcastEngine::set_max_filesize`]).
 pub struct MaxFilesizeGuard {
     sizes: Arc<Mutex<HashMap<i64, u64>>>,
@@ -495,6 +507,9 @@ pub struct BroadcastEngine {
     login_sites: Arc<Mutex<HashMap<i64, String>>>,
     /// The largest file a job's download may bring, for the jobs that have one (P11.15a2).
     max_filesizes: Arc<Mutex<HashMap<i64, u64>>>,
+    /// The link that was sent, for the jobs that download a file-locker share's direct
+    /// address (P11.15a3): every address in their error text says it instead.
+    locker_links: Arc<Mutex<HashMap<i64, String>>>,
     /// `locker.max_file_gb` in bytes: the limit of a file-locker share's download (P11.15a2).
     locker_max_file_bytes: u64,
     /// The H.264 encoder previews use, found on first use (P10.6).
@@ -632,6 +647,23 @@ impl BroadcastEngine {
         MaxFilesizeGuard { sizes: self.max_filesizes.clone(), job_id }
     }
 
+    /// Job `job_id` downloads a file-locker share's direct address; `sent` is the
+    /// link it was sent as (P11.15a3). While the guard lives, every address in
+    /// the error text the engine writes (event, audit, log) is replaced by it.
+    pub fn set_locker_link(&self, job_id: i64, sent: &str) -> LockerLinkGuard {
+        self.locker_links.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, sent.to_string());
+        LockerLinkGuard { links: self.locker_links.clone(), job_id }
+    }
+
+    /// `text` as the engine may write it for job `job_id`: unchanged, or for a
+    /// file-locker share with every address replaced by the sent link (P11.15a3).
+    fn job_text(&self, job_id: i64, text: &str) -> String {
+        match self.locker_links.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id) {
+            Some(sent) => omni_core::locker::scrub_addresses(text, sent),
+            None => text.to_string(),
+        }
+    }
+
     /// `locker.max_file_gb` in bytes (P11.15a2).
     pub fn with_locker_max_file_bytes(mut self, bytes: u64) -> Self {
         self.locker_max_file_bytes = bytes.max(1);
@@ -694,6 +726,7 @@ impl BroadcastEngine {
             download_slots: Arc::new(Mutex::new(HashMap::new())),
             login_sites: Arc::new(Mutex::new(HashMap::new())),
             max_filesizes: Arc::new(Mutex::new(HashMap::new())),
+            locker_links: Arc::new(Mutex::new(HashMap::new())),
             locker_max_file_bytes: omni_core::config::LockerConfig::default().max_file_bytes(),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
             archive: None,
@@ -977,6 +1010,8 @@ impl BroadcastEngine {
                 // does not have to re-read stderr to decide whether a retry could
                 // possibly help (plan P1.9).
                 let (code, err_msg) = download_failure_text(&e);
+                // A file-locker share's error says the sent link, never its direct or redirected address (P11.15a3).
+                let err_msg = self.job_text(job_id, &err_msg);
                 warn!("Job #{job_id}: {err_msg}");
                 let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Download), &err_msg);
                 let _ = self.repo.log_audit(
@@ -1099,7 +1134,7 @@ impl BroadcastEngine {
             Err(e) if e.downcast_ref::<LeaseLost>().is_some() => return Err(e),
             Err(_) if is_cancelled(&cancel) => return Err(self.lost(job_id, JobStage::Download, &job_temp).await),
             Err(e) => {
-                let why = format!("The second route did not help: {e:#}");
+                let why = self.job_text(job_id, &format!("The second route did not help: {e:#}"));
                 warn!("Job #{job_id}: {why}");
                 let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Download), &why);
                 WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;

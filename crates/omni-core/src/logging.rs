@@ -105,6 +105,26 @@ impl Redactions {
         }
     }
 
+    /// [`Self::extend`], but never past `cap` values in all (P11.15a3): a set
+    /// that grows with every job run must not grow without end.
+    pub fn extend_capped(&self, more: Vec<String>, cap: usize) {
+        if let Ok(mut guard) = self.values.write() {
+            for v in more.into_iter().filter(|v| v.len() >= 6) {
+                if guard.len() >= cap {
+                    break;
+                }
+                if !guard.contains(&v) {
+                    guard.push(v);
+                }
+            }
+        }
+    }
+
+    /// How many values are redacted.
+    pub fn len(&self) -> usize {
+        self.values.read().map(|v| v.len()).unwrap_or(0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.values.read().map(|v| v.is_empty()).unwrap_or(true)
     }

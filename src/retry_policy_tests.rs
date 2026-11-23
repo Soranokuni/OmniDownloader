@@ -639,3 +639,45 @@ fn a_direct_shares_error_is_scrubbed_and_keeps_its_code() {
     let lost = scrub_locker_error(anyhow::Error::new(omni_broadcast::pipeline::LeaseLost { job_id: 1, stage: JobStage::Download }), sent);
     assert!(lost.downcast_ref::<omni_broadcast::pipeline::LeaseLost>().is_some());
 }
+
+/// P11.15a3: a fake yt-dlp whose error names the share's direct address and the
+/// signed address it was sent on to. After the run, no line of the job's history,
+/// no audit row and not its `error_message` holds either: the engine scrubs its
+/// own lines, run_job the rest. Lookups are refused; nothing leaves the machine.
+#[tokio::test]
+async fn a_tools_error_about_a_direct_share_never_shows_its_addresses() {
+    omni_core::net::refuse_lookups_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let repo = Repository::new(root.join("omni.db")).unwrap();
+    let sent = "https://www.dropbox.com/scl/fi/x1y2z3w4v5/clip.mov?rlkey=abcdef123456&dl=0";
+    let direct = omni_core::locker::direct_download(sent).unwrap();
+    let signed = "https://uc12.dl.dropboxusercontent.com/cd/0/get/SIGNEDTOKEN123/file?dl=1";
+    let err = root.join("stderr.txt");
+    std::fs::write(&err, format!("ERROR: [generic] Unsupported URL: {direct}\r\nERROR: unable to download video data: HTTP Error 403: Forbidden (redirected to {signed})\r\n")).unwrap();
+    let shim = root.join("fake-yt-dlp.cmd");
+    std::fs::write(&shim, format!("@echo off\r\ntype \"{}\" 1>&2\r\nexit /b 1\r\n", err.display())).unwrap();
+    let engine = BroadcastEngine::new(
+        repo.clone(),
+        shim,
+        root.join("no-ffmpeg.exe"),
+        root.join("no-ffprobe.exe"),
+        root.join("no-bmx.exe"),
+        root.join("temp"),
+        root.join("watch"),
+    );
+    let r = Rig { _dir: dir, root, repo, engine: Arc::new(engine) };
+    let id = r.repo.enqueue(&NewJob::new(sent, "1_ANNA_TEST", "ANNA"), omni_core::repository::DEFAULT_DEDUP_WINDOW_HOURS).unwrap().job_id();
+    let job = r.lease(id);
+    r.run_job(job).await;
+
+    let row = r.row(id);
+    let mut texts: Vec<String> = r.repo.get_job_events(id, 500).unwrap().into_iter().map(|e| e.message).collect();
+    assert!(texts.iter().any(|t| t.contains("Unsupported URL")), "the fake's error reached the history: {texts:?}");
+    texts.extend(r.repo.get_recent_audit_logs(200).unwrap().into_iter().map(|a| a.message));
+    texts.extend(row.error_message.clone());
+    for t in &texts {
+        assert!(!t.contains(direct.as_str()) && !t.contains("SIGNEDTOKEN123") && !t.contains("dropboxusercontent"), "an address leaked: {t}");
+    }
+    assert_eq!(row.url, sent);
+}
