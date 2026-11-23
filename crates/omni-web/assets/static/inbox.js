@@ -17,20 +17,20 @@
  */
 
 import { api, el, render, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=9';
+import { toast } from '/static/toast.js?v=10';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=26';
-import { visible } from '/static/undo.js?v=10';
+} from '/static/desk.js?v=27';
+import { visible } from '/static/undo.js?v=11';
 import {
   STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
-} from '/static/status.js?v=9';
-import { whyText } from '/static/worklist.js?v=9';
-import { t, tn } from '/static/text.js?v=8';
-import { navCard } from '/static/keys.js?v=7';
-import { confirmDialog } from '/static/dialog.js?v=9';
+} from '/static/status.js?v=10';
+import { whyText } from '/static/worklist.js?v=10';
+import { t, tn } from '/static/text.js?v=9';
+import { navCard } from '/static/keys.js?v=8';
+import { confirmDialog } from '/static/dialog.js?v=10';
 
 /* ------------------------------------------------------------------ *
  * State

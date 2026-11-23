@@ -160,6 +160,12 @@ export default {
   'health.archive.down': 'Η φύλαξη των αρχικών αρχείων σταμάτησε.',
   'health.archive.means': 'Τα βίντεο παραδίδονται κανονικά· τα αρχικά τους δεν κρατιούνται.',
   'health.archive.todo': 'Ενημερώστε τον διαχειριστή.',
+  // Lane admin's config check (P13.4b): a key no setting reads, or a value read differently.
+  'health.config.name': 'Ρυθμίσεις (config.json)',
+  'health.config.degraded': 'Το config.json έχει κλειδί που δεν διαβάζεται ή τιμή έξω από τα όριά της.',
+  'health.config.down': 'Το config.json έχει κλειδί που δεν διαβάζεται ή τιμή έξω από τα όριά της.',
+  'health.config.means': 'Τα βίντεο συνεχίζουν· η ρύθμιση αυτή δεν ισχύει όπως γράφτηκε.',
+  'health.config.todo': 'Ενημερώστε τον διαχειριστή.',
   // Lane auto's scheduled-task check: amber while a task failed on its last run (the detail names them).
   'health.maintenance.name': 'Προγραμματισμένες εργασίες',
   'health.maintenance.degraded': 'Μια προγραμματισμένη εργασία συντήρησης απέτυχε στην τελευταία της εκτέλεση.',

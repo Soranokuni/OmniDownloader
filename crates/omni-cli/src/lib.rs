@@ -1,7 +1,7 @@
 pub mod install;
 
 use anyhow::{Context, Result};
-use inquire::{Confirm, CustomType, Password, Text};
+use inquire::Password;
 use omni_core::config::AppConfig;
 use omni_core::models::UserRole;
 use omni_core::paths::AppPaths;
@@ -147,6 +147,37 @@ pub enum AdminSubcommand {
     /// Deactivate (sign out, refuse sign-in) or reactivate an account. The
     /// last active administrator is never deactivated.
     SetActive { email: String, active: bool },
+    /// Create an administrator (P13.3): the way back in when no administrator
+    /// can sign in. Refused while an active one exists, unless `force`.
+    CreateAdmin { username: String, force: bool },
+}
+
+/// Create the administrator `username` with `password` (P13.3: no install is
+/// ever locked out). Refused while an active administrator exists unless
+/// `force`, for a login in use or the first-run `admin`, and for a password the
+/// panel would refuse. Writes an audit row naming the login, never the
+/// password. Returns the line to print.
+pub fn create_admin(repo: &Repository, username: &str, password: &str, force: bool) -> Result<String> {
+    let login = username.trim().to_lowercase();
+    if login.chars().count() < 3 || login.chars().count() > 64 || login.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        anyhow::bail!("The login must be 3 to 64 characters, without spaces.");
+    }
+    if login == omni_core::repository::DEFAULT_ADMIN_LOGIN {
+        anyhow::bail!("Choose a login other than \"admin\": that name is the first-run account.");
+    }
+    if repo.has_active_admin()? && !force {
+        anyhow::bail!(
+            "An active administrator already exists; sign in with it, or use `omni-ingest admin reset-password <login>`. \
+             Add --force to create another administrator anyway."
+        );
+    }
+    if repo.list_users()?.iter().any(|u| u.email.trim().eq_ignore_ascii_case(&login)) {
+        anyhow::bail!("The login `{login}` is already in use; see `omni-ingest admin list-users`.");
+    }
+    omni_core::auth::validate_password(password).map_err(anyhow::Error::msg)?;
+    repo.create_user(&login, password, UserRole::Admin, "Administrator", None)?;
+    let _ = repo.log_audit("WARN", "ADMIN", &format!("Administrator {login} created from the command line"));
+    Ok(format!("✓ Administrator {login} created. Sign in at /admin with it."))
 }
 
 pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<()> {
@@ -154,8 +185,18 @@ pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<(
         AdminSubcommand::ListUsers => {
             let users = repo.list_users()?;
             if users.is_empty() {
-                println!("\nNo accounts. Open /setup on this machine, or run `omni-ingest setup`.");
+                println!(
+                    "\nNo accounts. Start the service: a new installation gets the first-run account Admin / Admin, \
+                     which signs in at http://127.0.0.1:<port>/admin from this computer and opens the setup wizard. \
+                     If it does not appear, create an administrator with `omni-ingest admin create-admin <login>`."
+                );
                 return Ok(());
+            }
+            if !users.iter().any(|u| u.is_active && u.role == UserRole::Admin) {
+                println!(
+                    "\nNo active administrator. Reactivate one (`omni-ingest admin activate <login>`) \
+                     or create one (`omni-ingest admin create-admin <login>`)."
+                );
             }
             println!("\n{:<40} {:<10} {}", "Sign-in address", "Role", "Active");
             for u in users {
@@ -184,6 +225,22 @@ pub fn handle_admin_command(repo: &Repository, cmd: AdminSubcommand) -> Result<(
                 &format!("Account {} {} from the command line", user.email, if active { "reactivated" } else { "deactivated" }),
             );
             println!("✓ {} {}.", user.email, if active { "reactivated" } else { "deactivated and signed out" });
+        }
+        AdminSubcommand::CreateAdmin { username, force } => {
+            // Checked before the prompt, so nobody types a password for nothing.
+            if repo.has_active_admin()? && !force {
+                return create_admin(repo, &username, "", false).map(|_| ());
+            }
+            // Piped for scripts, masked and typed twice otherwise; never an argument.
+            let password = match read_piped_secret()? {
+                Some(piped) => piped,
+                None => Password::new(&format!("Password for {}:", username.trim()))
+                    .with_display_mode(inquire::PasswordDisplayMode::Masked)
+                    .with_custom_confirmation_message("Type it again:")
+                    .with_help_message("At least 12 characters")
+                    .prompt()?,
+            };
+            println!("{}", create_admin(repo, &username, &password, force)?);
         }
         AdminSubcommand::ResetPassword { email } => {
             let wanted = email.trim().to_lowercase();
@@ -291,204 +348,259 @@ fn ensure_known_key(key: &str) -> Result<()> {
     )
 }
 
-pub async fn run_setup_wizard(config_path_opt: Option<&str>) -> Result<()> {
-    println!();
-    println!("============================================================");
-    println!("   OMNIDOWNLOADER BROADCAST INGEST ENGINE - SETUP WIZARD    ");
-    println!("   Sony XDCAM HD422 PAL 1080i50 + RDD9 OP1a broadcast ingest   ");
-    println!("============================================================");
-    println!();
+/// `omni-ingest setup --answer <file>` (P13.3): apply an answer file (the admin
+/// page's «Download answer file», or one written for Setup's `/answer`) to this
+/// installation's `config.json`, through the same rules as Setup
+/// (`omni_core::answer_file`). The interactive setup is the wizard on /admin.
+///
+/// The settings the file does not name keep their values. `setup_completed`
+/// never changes and no secret is taken (a file naming one is refused). The
+/// previous file is kept as `config.json.prev`. Returns the lines to print.
+///
+/// The same rules as the installer and the panel (P13.3b): a watchfolder the
+/// service cannot use is refused with the installer's text; an online LLM
+/// endpoint must be `https://`, and when the endpoint names another provider
+/// the stored LLM key is removed, so it is never sent to the new host. While
+/// the service runs it is refused unless `force` (the daemon would write its
+/// own settings over the file on its next save).
+pub fn apply_answer_file(paths: &AppPaths, answer: &Path, force: bool) -> Result<Vec<String>> {
+    let running = omni_service::query_service_status().map(|s| s != "STOPPED").unwrap_or(false);
+    let store = SecretStore::new(paths.resolve("data/secrets.bin"));
+    apply_answer_file_with(paths, answer, &omni_core::paths::SystemDrives, &store, running, force)
+}
 
-    let target_config_path = config_path_opt.unwrap_or("config.json");
-    let mut config = if Path::new(target_config_path).exists() {
-        println!("Found existing config at '{}'. Loading defaults...", target_config_path);
-        AppConfig::load_from_file(target_config_path).unwrap_or_default()
+/// [`apply_answer_file`] with the drive lookups, the secret store and the
+/// service state given (tests).
+pub fn apply_answer_file_with(
+    paths: &AppPaths,
+    answer: &Path,
+    drives: &dyn omni_core::paths::DriveLookup,
+    store: &SecretStore,
+    service_running: bool,
+    force: bool,
+) -> Result<Vec<String>> {
+    if service_running && !force {
+        anyhow::bail!(
+            "The OmniIngest service is running: on its next settings save it would write its own settings over these. \
+             Stop it first (omni-ingest service stop), apply the file, then start it; or add --force."
+        );
+    }
+    let text = std::fs::read_to_string(answer)
+        .with_context(|| format!("Cannot read the answer file {}", answer.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("The answer file {} is not JSON", answer.display()))?;
+    let existing = paths.config.exists();
+    let base = if existing {
+        AppConfig::load_from_file(&paths.config)
+            .with_context(|| format!("Cannot read {}; fix it or move it aside first", paths.config.display()))?
     } else {
         AppConfig::default()
     };
+    let old_endpoint = base.llm.endpoint.clone();
+    let applied = omni_core::answer_file::apply(&doc, base)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("The answer file {} was not applied; nothing changed", answer.display()))?;
+    let not_applied = || format!("The answer file {} was not applied; nothing changed", answer.display());
+    install::check_config_watchfolder(paths, &applied.config, drives).with_context(not_applied)?;
+    let endpoint = applied.config.llm.endpoint.trim().to_string();
+    if !endpoint.is_empty() {
+        omni_email::llm::check_base_url(&endpoint)
+            .map_err(|why| anyhow::anyhow!("llm.endpoint ({endpoint}): {why}"))
+            .with_context(not_applied)?;
+    }
+    // A new provider does not inherit the old one's key (as the LLM card).
+    let same_base = |a: &str, b: &str| a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'));
+    let key_dropped = if !same_base(&endpoint, &old_endpoint) && store.get_lossy(secret_keys::LLM_API_KEY).is_some_and(|k| !k.is_empty()) {
+        store.remove(secret_keys::LLM_API_KEY).context("Cannot remove the LLM key of the previous provider; nothing changed")?;
+        true
+    } else {
+        false
+    };
+    if existing {
+        let prev = paths.config.with_extension("json.prev");
+        std::fs::copy(&paths.config, &prev)
+            .with_context(|| format!("Cannot keep the previous configuration as {}; nothing changed", prev.display()))?;
+    }
+    applied.config.save_to_file(&paths.config)?;
 
-    // 1. Web Port
-    config.web_port = CustomType::<u16>::new("Web Dashboard HTTP Port:")
-        .with_default(config.web_port)
-        .with_help_message("Port for MCR status watcher and Admin Panel (default 8080)")
-        .prompt()?;
+    let mut lines = vec![format!("✓ {} applied to {}.", answer.display(), paths.config.display())];
+    if service_running {
+        lines.push("! The service is running: restart it now, before anyone saves a setting in the admin panel.".into());
+    }
+    if existing {
+        lines.push(format!("  The previous configuration is kept as {}.", paths.config.with_extension("json.prev").display()));
+    }
+    if key_dropped {
+        lines.push("  The LLM key was removed: the answer file names another LLM provider. Enter its key on the LLM card.".into());
+    }
+    lines.extend(applied.notes.iter().map(|n| format!("  Note: {n}")));
+    lines.push("  Secrets are not in an answer file: enter the mailbox client secret (and an LLM key) in the setup wizard.".into());
+    lines.push("  Restart the service to use the new settings (omni-ingest service stop, then start).".into());
+    Ok(lines)
+}
 
-    // 2. Watchfolder
-    // A relative value in config.json means "under the install folder"; show it
-    // in full, because the wizard accepts only a full path.
-    let mut default_watch = config.resolve_path(&config.watchfolder_path).display().to_string();
-    loop {
-        let answer = Text::new("Broadcast ingest watchfolder (play-out destination):")
-            .with_default(&default_watch)
-            .with_help_message("Use the share's \\\\server\\share path, never a mapped drive letter")
-            .prompt()?;
-        match omni_core::paths::watchfolder_problem(&answer) {
-            None => {
-                config.watchfolder_path = answer.trim().to_string();
-                break;
-            }
-            Some(problem) => {
-                println!("{problem}");
-                default_watch = answer.trim().to_string();
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn install() -> (tempfile::TempDir, AppPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::with_root(dir.path(), "config.json");
+        (dir, paths)
+    }
+
+    fn answers(dir: &Path, doc: serde_json::Value) -> std::path::PathBuf {
+        let p = dir.join("omni-answers.json");
+        std::fs::write(&p, doc.to_string()).unwrap();
+        p
+    }
+
+    /// `Z:` is a mapped share; every other letter a local disk.
+    struct Drives;
+    impl omni_core::paths::DriveLookup for Drives {
+        fn drive_kind(&self, letter: char) -> omni_core::paths::DriveKind {
+            if letter == 'Z' { omni_core::paths::DriveKind::Remote } else { omni_core::paths::DriveKind::Other }
+        }
+        fn connection(&self, _letter: char) -> Option<String> {
+            Some(r"\\nas-test\ingest".into())
+        }
+        fn persistent_mapping(&self, _letter: char) -> Option<String> {
+            None
         }
     }
 
-    // 3. Temp dir
-    config.temp_path = Text::new("Temporary Working Directory:")
-        .with_default(&config.temp_path)
-        .with_help_message("Directory for transient downloads and intermediate transcodes")
-        .prompt()?;
+    fn store(paths: &AppPaths) -> SecretStore {
+        SecretStore::new(paths.resolve("data/secrets.bin"))
+    }
 
-    // 4. Email Ingest: the Office 365 mailbox through Microsoft Graph (P4.7).
-    let enable_email = Confirm::new("Enable email ingest from the Office 365 mailbox (Microsoft Graph)?")
-        .with_default(!config.graph.mailbox.trim().is_empty())
-        .prompt()?;
+    /// The service stopped, `Z:` mapped.
+    fn apply(paths: &AppPaths, file: &Path) -> Result<Vec<String>> {
+        apply_answer_file_with(paths, file, &Drives, &store(paths), false, false)
+    }
 
-    if enable_email {
-        config.graph.tenant_id = Text::new("Directory (tenant) ID:")
-            .with_default(&config.graph.tenant_id)
-            .with_help_message("From the app registration's Overview page in Entra ID")
-            .prompt()?;
+    #[test]
+    fn an_answer_file_is_applied_over_the_existing_config_which_is_kept() {
+        let (dir, paths) = install();
+        let mut before = AppConfig::default();
+        before.temp_path = "scratch-test".into();
+        before.setup_completed = true;
+        before.save_to_file(&paths.config).unwrap();
+        let file = answers(dir.path(), serde_json::json!({
+            "answer_file_version": 1,
+            "setup_completed": false,
+            "web_port": 8093,
+            "watchfolder_path": r"\\dalet-test\ingest",
+            "tls": { "cert_path": r"C:\certs\panel.pfx" },
+        }));
 
-        config.graph.client_id = Text::new("Application (client) ID:")
-            .with_default(&config.graph.client_id)
-            .prompt()?;
+        let lines = apply(&paths, &file).unwrap();
+        let after = AppConfig::load_from_file(&paths.config).unwrap();
+        assert_eq!((after.web_port, after.watchfolder_path.as_str()), (8093, r"\\dalet-test\ingest"));
+        assert_eq!(after.temp_path, "scratch-test", "what the file does not name is kept");
+        assert!(after.setup_completed, "the file never changes whether setup was finished");
+        assert_eq!(after.tls.cert_path, None, "TLS is never taken from an answer file");
+        assert!(lines.iter().any(|l| l.contains(omni_core::answer_file::TLS_NOTE)), "{lines:?}");
+        let prev = AppConfig::load_from_file(paths.config.with_extension("json.prev")).unwrap();
+        assert_eq!(prev.web_port, AppConfig::default().web_port);
+    }
 
-        config.graph.mailbox = Text::new("Ingest mailbox address:")
-            .with_default(&config.graph.mailbox)
-            .prompt()?;
+    const PASS: &str = "invented-passphrase-42";
 
-        let secret = Password::new("Client secret value:")
-            .without_confirmation()
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .with_help_message("Leave empty to keep the stored secret")
-            .prompt()?;
+    fn audit_text(repo: &Repository) -> String {
+        repo.get_recent_audit_logs(1000).unwrap().iter().map(|a| a.message.clone()).collect::<Vec<_>>().join("\n")
+    }
 
-        if !secret.is_empty() {
-            // Into the encrypted store, never config.json (plan P2.6).
-            // `config.graph.client_secret` is the runtime copy; `save_to_file`
-            // cannot serialise it.
-            let store = SecretStore::new(config.resolve_path("data/secrets.bin"));
-            store
-                .set(secret_keys::GRAPH_CLIENT_SECRET, &secret)
-                .context("Failed storing the Graph client secret")?;
-            config.graph.client_secret = secret;
-            println!("  Client secret stored encrypted in data/secrets.bin.");
+    #[test]
+    fn create_admin_gives_a_way_in_to_a_database_with_users_but_no_administrator() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        repo.create_user("reporter.test", "correct-horse-battery", UserRole::User, "Reporter", None).unwrap();
+        assert!(!repo.has_active_admin().unwrap());
+
+        // A weak password, the first-run login, a login in use: refused, nothing made.
+        assert!(create_admin(&repo, "station.it", "short", false).is_err());
+        assert!(create_admin(&repo, "admin", PASS, false).is_err());
+        assert!(create_admin(&repo, "Reporter.Test", PASS, false).is_err());
+        assert!(!repo.has_active_admin().unwrap());
+
+        let line = create_admin(&repo, " Station.IT ", PASS, false).unwrap();
+        let user = repo.get_user_by_email("station.it").unwrap().expect("created");
+        assert_eq!(user.role, UserRole::Admin);
+        assert!(user.is_active && omni_core::auth::verify_password(PASS, &user.password_hash));
+        let audit = audit_text(&repo);
+        assert!(audit.contains("Administrator station.it created from the command line"), "{audit}");
+        assert!(!line.contains(PASS) && !audit.contains(PASS), "the password is never written out");
+    }
+
+    #[test]
+    fn create_admin_is_refused_while_an_administrator_exists_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        repo.create_user("first.admin", PASS, UserRole::Admin, "First", None).unwrap();
+
+        let err = create_admin(&repo, "second.admin", PASS, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--force"), "{err:#}");
+        assert!(repo.get_user_by_email("second.admin").unwrap().is_none());
+
+        create_admin(&repo, "second.admin", PASS, true).unwrap();
+        assert!(repo.get_user_by_email("second.admin").unwrap().is_some());
+        assert!(!audit_text(&repo).contains(PASS));
+    }
+
+    #[test]
+    fn a_bad_answer_file_changes_nothing_and_names_the_key() {
+        let (dir, paths) = install();
+        AppConfig::default().save_to_file(&paths.config).unwrap();
+        let before = std::fs::read_to_string(&paths.config).unwrap();
+        for (doc, key) in [
+            (serde_json::json!({ "answer_file_version": 1, "graph": { "client_secret": "value-test-only" } }), "graph.client_secret"),
+            (serde_json::json!({ "answer_file_version": 1, "mcr_open_networks": ["newsroom-lan"] }), "mcr_open_networks"),
+            // P13.3b: the installer's watchfolder rules, with its text.
+            (serde_json::json!({ "answer_file_version": 1, "watchfolder_path": r"Z:\ingest" }), r"use \\nas-test\ingest\ingest instead"),
+            (serde_json::json!({ "answer_file_version": 1, "watchfolder_path": "" }), "No watchfolder was given"),
+            (serde_json::json!({ "answer_file_version": 1, "watchfolder_path": "D:x" }), "is a relative path"),
+            // P13.3b: the LLM card's rule for an online endpoint.
+            (serde_json::json!({ "answer_file_version": 1, "llm": { "endpoint": "http://llm.provider.example/v1" } }), "https://"),
+        ] {
+            let err = apply(&paths, &answers(dir.path(), doc)).unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
+            assert!(format!("{err:#}").contains("nothing changed"), "{err:#}");
         }
-
-        config.email_poll_interval_secs = CustomType::<u64>::new("Email Polling Interval (seconds):")
-            .with_default(config.email_poll_interval_secs)
-            .prompt()?;
+        assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), before);
+        assert!(!paths.config.with_extension("json.prev").exists());
     }
 
-    // 5. LLM Endpoint
-    let config_llm = Confirm::new("Configure Local LLM Ingest Parser (Ollama / vLLM / OpenAI API)?")
-        .with_default(true)
-        .prompt()?;
+    #[test]
+    fn a_new_llm_provider_in_an_answer_file_drops_the_stored_key_and_the_same_one_keeps_it() {
+        let (dir, paths) = install();
+        let mut base = AppConfig::default();
+        base.llm.endpoint = "https://llm-a.example/v1".into();
+        base.save_to_file(&paths.config).unwrap();
+        let key = secret_keys::LLM_API_KEY;
+        store(&paths).set(key, "sk-invented-test").unwrap();
+        let llm = |endpoint: &str| serde_json::json!({ "answer_file_version": 1, "llm": { "endpoint": endpoint } });
 
-    if config_llm {
-        config.ollama_endpoint = Text::new("LLM API Endpoint:")
-            .with_default(&config.ollama_endpoint)
-            .with_help_message("e.g. http://localhost:11434/v1 or http://127.0.0.1:8000/v1")
-            .prompt()?;
-
-        config.ollama_model = Text::new("LLM Model Name:")
-            .with_default(&config.ollama_model)
-            .with_help_message("e.g. llama3:latest, mistral, gpt-4o-mini")
-            .prompt()?;
+        // The same provider (case and a trailing slash aside): the key stays.
+        apply(&paths, &answers(dir.path(), llm("https://LLM-A.example/v1/"))).unwrap();
+        assert_eq!(store(&paths).get(key).unwrap().as_deref(), Some("sk-invented-test"));
+        // A local endpoint over http is allowed; it is another provider: the key goes.
+        let lines = apply(&paths, &answers(dir.path(), llm("http://127.0.0.1:1234/v1"))).unwrap();
+        assert_eq!(store(&paths).get(key).unwrap(), None, "never sent to the new host");
+        assert!(lines.iter().any(|l| l.contains("LLM key was removed")), "{lines:?}");
+        assert!(!lines.join("\n").contains("sk-invented-test"));
     }
 
-    // 6. Nightly yt-dlp auto-update
-    config.ytdl_auto_update_nightly = Confirm::new("Enable nightly automatic yt-dlp updates (at 03:00)?")
-        .with_default(config.ytdl_auto_update_nightly)
-        .prompt()?;
-
-    // 7. Save config
-    config.save_to_file(target_config_path)?;
-    println!("\n✓ Configuration saved to '{}'.", target_config_path);
-
-    // 8. Seed Admin user in SQLite
-    let db_path = config.resolve_path(&config.database_path);
-    if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    #[test]
+    fn while_the_service_runs_an_answer_file_is_refused_unless_forced() {
+        let (dir, paths) = install();
+        AppConfig::default().save_to_file(&paths.config).unwrap();
+        let before = std::fs::read_to_string(&paths.config).unwrap();
+        let file = answers(dir.path(), serde_json::json!({ "answer_file_version": 1, "web_port": 8095 }));
+        let err = apply_answer_file_with(&paths, &file, &Drives, &store(&paths), true, false).unwrap_err();
+        assert!(format!("{err:#}").contains("--force"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&paths.config).unwrap(), before);
+        let lines = apply_answer_file_with(&paths, &file, &Drives, &store(&paths), true, true).unwrap();
+        assert!(lines.iter().any(|l| l.contains("restart it now")), "{lines:?}");
+        assert_eq!(AppConfig::load_from_file(&paths.config).unwrap().web_port, 8095);
     }
-    let repo = Repository::new(&db_path)?;
-
-    let users = repo.list_users().unwrap_or_default();
-    let has_admin = users.iter().any(|u| u.role == UserRole::Admin);
-
-    if !has_admin {
-        println!("\nNo administrator account found in database. Let's create one now.");
-        let admin_email = Text::new("Admin Email:")
-            .with_default("admin@station.gr")
-            .prompt()?;
-
-        let admin_password = Password::new("Admin Password:")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .prompt()?;
-        // create_user hashes internally (repository.rs). Hashing here as well
-        // stored a hash *of the hash*, so the account the wizard created could
-        // never log in -- and the operator only found out at the login screen,
-        // after the wizard had reported success (defect W-05).
-        repo.create_user(
-            &admin_email,
-            &admin_password,
-            UserRole::Admin,
-            "System Administrator",
-            None,
-        )?;
-
-
-        println!("✓ Administrator user '{}' created.", admin_email);
-    }
-
-    // 9. Windows Service Installation Prompt
-    #[cfg(windows)]
-    {
-        let install_srv = Confirm::new("Install OmniDownloader as an automatic Windows Service now?")
-            .with_default(false)
-            .prompt()?;
-
-        if install_srv {
-            let current_exe = env::current_exe().context("Failed to get executable path")?;
-
-            // Ask for the account here rather than after the fact: a UNC
-            // watchfolder under LocalSystem produces a correct MXF and then
-            // fails to deliver it, which reads as a pipeline bug.
-            let account_name = Text::new(r"Service account (blank = NT SERVICE\OmniIngestService; LocalSystem to opt out):")
-                .with_default("")
-                .with_help_message(r"e.g. DOMAIN\svc_omni — needed when the watchfolder is a network share")
-                .prompt()?;
-            let account = resolve_service_account(
-                Some(account_name.as_str()),
-                Some(config.watchfolder_path.as_str()),
-            )?;
-
-            let previous = omni_service::installed_service_account();
-            if let Err(e) = install_service(&current_exe, account.as_ref()) {
-                println!("! Service installation returned notice: {}", e);
-                println!("  (You may need to run setup in an Administrator terminal to install services)");
-            } else {
-                let paths = AppPaths::discover(target_config_path);
-                install::apply_acls(&paths, &config, account.as_ref(), previous.as_deref(), &current_exe).await;
-                println!("✓ Windows Service 'OmniIngestService' installed successfully!");
-                print_privilege_checklist(account.as_ref(), Some(&config.watchfolder_path));
-                let start_now = Confirm::new("Start the Windows Service now?")
-                    .with_default(true)
-                    .prompt()?;
-                if start_now {
-                    if let Err(e) = start_service() {
-                        println!("! Service start returned notice: {}", e);
-                    } else {
-                        println!("✓ Windows Service started and running in background!");
-                    }
-                }
-            }
-        }
-    }
-
-    println!("\nSetup complete! You can start OmniDownloader in daemon mode with:");
-    println!("  omni-ingest run\n");
-    Ok(())
 }

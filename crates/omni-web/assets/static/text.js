@@ -1,6 +1,6 @@
 /* Every word the desk shows, looked up in one place (plan P12.7).
  *
- *   import { t, tn } from '/static/text.js?v=8';
+ *   import { t, tn } from '/static/text.js?v=9';
  *   t('undo.button')                       -> «Αναίρεση»
  *   t('desk.retry.done', { name })         -> «Το 1_X_Y.mxf μπήκε ξανά στην ουρά.»
  *   tn('summary.failed', 3)                -> «3 απέτυχαν» (keys `….one` / `….other`)
@@ -15,7 +15,7 @@
  * No framework and no build step: an object, a lookup, a switch.
  */
 
-import EL from '/static/text.el.js?v=8';
+import EL from '/static/text.el.js?v=9';
 
 const LANG_KEY = 'omni.lang';
 const dictionaries = { el: EL };

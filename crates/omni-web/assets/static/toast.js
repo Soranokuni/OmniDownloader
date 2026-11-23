@@ -11,7 +11,7 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=8';
+import { t } from '/static/text.js?v=9';
 
 export const MAX_ERRORS = 3;
 const PASSING_MS = 6000;

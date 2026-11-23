@@ -277,8 +277,9 @@ impl TlsConfig {
             // an operator who configured TLS and got HTTP would have no way to
             // tell, and the `Secure` cookie flag would be wrong either way.
             anyhow::bail!(
-                "web.tls.cert_path points at {resolved:?}, which does not exist. Refusing to \
-                 start rather than silently serving the panels over plaintext HTTP."
+                "`tls.cert_path` = {cert:?} points at {resolved:?}, which does not exist. Refusing to \
+                 start rather than silently serving the panels over plaintext HTTP. Fix: put the \
+                 .pfx file there, correct tls.cert_path, or remove it to serve plain HTTP."
             );
         }
         Ok(Some(resolved))
@@ -311,6 +312,12 @@ pub struct GraphConfig {
     /// records what was handled (plan P4.8).
     #[serde(default)]
     pub write_access: bool,
+    /// The day the client secret expires, as the administrator read it in Entra
+    /// (P11.11d): `Mail.Read` cannot read it. The `mail` health line turns amber
+    /// [`SECRET_WARN_DAYS`] days before and red [`SECRET_RED_DAYS`] days before.
+    /// Not a secret; absent when nobody entered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_expires: Option<chrono::NaiveDate>,
     /// Client secret — **runtime only**, loaded from the secret store
     /// (`graph.client_secret`). Never read from or written to config.json.
     #[serde(skip)]
@@ -334,10 +341,58 @@ impl Default for GraphConfig {
             processed_folder: default_processed_folder(),
             failed_folder: default_failed_folder(),
             write_access: false,
+            client_secret_expires: None,
             client_secret: String::new(),
         }
     }
 }
+
+/// Write `bytes` to `path` as a whole (P13.3b): into a temporary file in the
+/// same folder, flushed to disk, which then takes `path`'s place, so a crash or
+/// a full disk never leaves half a config.json. An existing file is replaced
+/// with `ReplaceFileW` on Windows, which keeps its permissions (the installer's
+/// grant on config.json); the temporary file is removed on any failure.
+pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.json".into());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // A file of the same name left by a crashed process with this process id.
+    let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    let done = written.and_then(|()| replace(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
+}
+
+#[cfg(windows)]
+fn replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return std::fs::rename(tmp, path);
+    }
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+    let wide = |p: &Path| p.as_os_str().to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (target, source) = (wide(path), wide(tmp));
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
+    unsafe { ReplaceFileW(PCWSTR(target.as_ptr()), PCWSTR(source.as_ptr()), PCWSTR::null(), REPLACE_FILE_FLAGS(0), None, None) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+}
+
+#[cfg(not(windows))]
+fn replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
+}
+
+/// Days before the Graph client secret expires that the `mail` health line turns amber.
+pub const SECRET_WARN_DAYS: i64 = 30;
+/// Days before it expires that the line turns red.
+pub const SECRET_RED_DAYS: i64 = 7;
 
 impl GraphConfig {
     /// Everything needed to log in is present, secret included.
@@ -396,11 +451,16 @@ pub enum LlmAuth {
     ApiKeyHeader,
 }
 
-/// The LLM assist. The server itself is `ollama_endpoint` + `ollama_model`
-/// (their names predate other providers; they hold any OpenAI-compatible
-/// base URL and model id). The key is `llm.api_key` in the secret store.
+/// The LLM assist. The server is `endpoint` (any OpenAI-compatible base URL)
+/// and `model`; until config v2 (P13.7) they were the top-level
+/// `ollama_endpoint` and `ollama_model`, which [`crate::config_v2::migrate_v1`] moves here. The
+/// key is `llm.api_key` in the secret store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
+    #[serde(default = "default_llm_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
     #[serde(default)]
     pub mode: LlmMode,
     #[serde(default = "default_llm_timeout")]
@@ -432,6 +492,29 @@ fn default_llm_provider() -> String {
     "custom".into()
 }
 
+fn default_llm_endpoint() -> String {
+    "http://localhost:11434/v1".to_string()
+}
+
+fn default_llm_model() -> String {
+    "google/gemma-4-e4b".to_string()
+}
+
+/// How the mailbox is read (config v2, P13.7). The mailbox itself and its app
+/// registration are `graph`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailConfig {
+    /// Seconds between two mailbox checks; read as at least 10. Until config
+    /// v2 the top-level `email_poll_interval_secs`.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self { poll_interval_secs: default_poll_interval() }
+    }
+}
 
 fn default_llm_timeout() -> u64 {
     30
@@ -444,6 +527,8 @@ fn default_llm_max_tokens() -> u32 {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            endpoint: default_llm_endpoint(),
+            model: default_llm_model(),
             mode: LlmMode::default(),
             timeout_secs: default_llm_timeout(),
             max_tokens: default_llm_max_tokens(),
@@ -850,24 +935,18 @@ pub struct AppConfig {
     #[serde(default = "default_concurrent_transcodes")]
     pub max_concurrent_transcodes: usize,
 
-    // Email ingest: the mailbox itself is `graph` below (plan P4.7).
+    // Email ingest: the mailbox itself is `graph` above (plan P4.7).
     /// Pre-Graph IMAP password, read so [`AppConfig::adopt_secrets`] can wipe
     /// it from an old config.json. IMAP is gone; the value is never stored,
     /// used or written back.
     #[serde(default, skip_serializing, rename = "email_password")]
     legacy_email_password: String,
 
-    #[serde(default = "default_poll_interval")]
-    pub email_poll_interval_secs: u64,
+    /// How often the mailbox is read (config v2, P13.7).
+    #[serde(default)]
+    pub mail: MailConfig,
 
-    // LLM configuration
-    #[serde(default = "default_ollama_endpoint")]
-    pub ollama_endpoint: String,
-
-    #[serde(default = "default_ollama_model")]
-    pub ollama_model: String,
-
-    /// LLM assist policy (plan P4.4). Endpoint and model stay above.
+    /// The LLM assist: server, model and policy (plan P4.4; config v2).
     ///
     /// There is deliberately no `system_prompt` any more (defect E-03): the
     /// deployed config.json overrode the tuned prompt with a one-liner and
@@ -905,6 +984,11 @@ pub struct AppConfig {
     /// "beginner", "intermediate" or "it": which wizard mode was last chosen.
     #[serde(default = "default_setup_mode")]
     pub setup_mode: String,
+
+    /// The link the wizard's last step, «Δοκιμαστική λήψη», runs through every
+    /// stage into the watchfolder (P13.4). Default: [`DEFAULT_SETUP_TEST_URL`].
+    #[serde(default = "default_setup_test_url")]
+    pub setup_test_url: String,
 
     // Update settings
     #[serde(default = "default_channel")]
@@ -963,12 +1047,6 @@ fn default_concurrent_transcodes() -> usize {
 fn default_poll_interval() -> u64 {
     20
 }
-fn default_ollama_endpoint() -> String {
-    "http://localhost:11434/v1".to_string()
-}
-fn default_ollama_model() -> String {
-    "google/gemma-4-e4b".to_string()
-}
 
 fn default_channel() -> String {
     "stable".to_string()
@@ -978,6 +1056,17 @@ fn default_setup_mode() -> String {
 }
 fn default_true() -> bool {
     true
+}
+
+/// The wizard's test link (P13.4): YouTube's first upload, "Me at the zoo",
+/// 19 seconds with sound, online unchanged since 2005. Short, so the test
+/// takes about a minute; YouTube, so it uses the same download path, pacing
+/// and JavaScript runtime as the newsroom's links. Change `setup_test_url`
+/// where YouTube is not reachable.
+pub const DEFAULT_SETUP_TEST_URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
+
+fn default_setup_test_url() -> String {
+    DEFAULT_SETUP_TEST_URL.to_string()
 }
 
 impl Default for AppConfig {
@@ -999,9 +1088,7 @@ impl Default for AppConfig {
             max_concurrent_downloads: default_concurrent_downloads(),
             max_concurrent_transcodes: default_concurrent_transcodes(),
             legacy_email_password: String::new(),
-            email_poll_interval_secs: default_poll_interval(),
-            ollama_endpoint: default_ollama_endpoint(),
-            ollama_model: default_ollama_model(),
+            mail: MailConfig::default(),
             llm: LlmConfig::default(),
             repair: RepairConfig::default(),
             retry: RetryConfig::default(),
@@ -1010,6 +1097,7 @@ impl Default for AppConfig {
             metrics: MetricsConfig::default(),
             setup_completed: false,
             setup_mode: default_setup_mode(),
+            setup_test_url: default_setup_test_url(),
             ytdl_channel: default_channel(),
             ytdl_auto_update_nightly: true,
             adblock_enabled: true,
@@ -1056,13 +1144,41 @@ fn warn_on_removed_auth_mode(raw: &str, path: &Path) {
 }
 
 impl AppConfig {
+    /// A brand-new installation (its database was just created, with the
+    /// first-run account) always starts with setup pending (P13.5b), whatever
+    /// config.json says: a hand-made or copied config.json without the key
+    /// reads as completed (the rule for upgrades), and must not skip the
+    /// wizard's test download. Returns whether it changed anything; the caller
+    /// saves. Setup becomes complete only through the wizard's Finish or Skip.
+    pub fn pending_setup_for_new_installation(&mut self, brand_new_database: bool) -> bool {
+        if brand_new_database && self.setup_completed {
+            self.setup_completed = false;
+            return true;
+        }
+        false
+    }
+
+    /// The daemon's start-up step (P13.5b): on a brand-new database, setup is
+    /// pending in memory and in config.json. The file is re-read and saved
+    /// with only that change: environment overrides in `self` are never
+    /// written (P4.9). Returns whether anything changed.
+    pub fn settle_new_installation(&mut self, path: &Path, brand_new_database: bool) -> Result<bool> {
+        if !self.pending_setup_for_new_installation(brand_new_database) {
+            return Ok(false);
+        }
+        let mut on_disk = AppConfig::load_from_file(path)?;
+        on_disk.setup_completed = false;
+        on_disk.save_to_file(path)?;
+        Ok(true)
+    }
+
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let p = path.as_ref();
         if p.exists() {
             let content = std::fs::read_to_string(p)
                 .with_context(|| format!("Failed reading config file at {:?}", p))?;
-            let config: AppConfig = serde_json::from_str(&content)
-                .with_context(|| format!("Failed parsing JSON from {:?}", p))?;
+            // v1 keys are read as v2; a bad value names its key, value and fix (P13.7).
+            let config = crate::config_v2::parse(&content, p)?;
             warn_on_removed_auth_mode(&content, p);
             Ok(config)
         } else {
@@ -1084,9 +1200,16 @@ impl AppConfig {
         }
         let json_str = serde_json::to_string_pretty(self)
             .context("Failed serializing AppConfig to JSON")?;
-        std::fs::write(p, json_str)
-            .with_context(|| format!("Failed writing config file {:?}", p))?;
-        Ok(())
+        match write_replacing(p, json_str.as_bytes()) {
+            Ok(()) => Ok(()),
+            // The service account may modify config.json but not create files next
+            // to it (the installer grants the file, not the install folder): there
+            // the file is rewritten in place, as before.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::fs::write(p, json_str).with_context(|| format!("Failed writing config file {:?}", p))
+            }
+            Err(e) => Err(e).with_context(|| format!("Failed writing config file {:?}", p)),
+        }
     }
 
     /// Move any plaintext secret out of config.json and load the real ones
@@ -1180,6 +1303,68 @@ mod tests {
     use super::*;
     use crate::secrets::{keys, SecretStore};
     use tempfile::TempDir;
+
+    /// P13.3b: config.json is written whole, through a file that takes its place;
+    /// nothing is left next to it, and a refused write leaves it as it was.
+    #[test]
+    fn config_json_is_replaced_whole_and_nothing_is_left_beside_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        let mut c = AppConfig::default();
+        c.save_to_file(&path).unwrap();
+        c.web_port = 8097;
+        c.save_to_file(&path).unwrap();
+        assert_eq!(AppConfig::load_from_file(&path).unwrap().web_port, 8097);
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["config.json"], "no temporary file is left");
+
+        // The temporary file cannot be made (its name is taken by a folder): the
+        // write fails, nothing is cut short, and config.json is as it was.
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::create_dir(dir.path().join(format!(".config.json.{}.tmp", std::process::id()))).unwrap();
+        assert!(write_replacing(&path, b"{ half").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// P13.5b: a config.json without the key reads as completed (an upgrade),
+    /// but on a brand-new installation setup is pending all the same.
+    #[test]
+    fn a_new_installation_starts_with_setup_pending_whatever_config_json_says() {
+        let mut copied: AppConfig = serde_json::from_str(r#"{ "web_port": 8085 }"#).unwrap();
+        assert!(copied.setup_completed, "the upgrade rule");
+        assert!(copied.pending_setup_for_new_installation(true));
+        assert!(!copied.setup_completed);
+        assert!(!copied.pending_setup_for_new_installation(true), "once");
+
+        let mut used: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!used.pending_setup_for_new_installation(false), "an installation in use keeps what it has");
+        assert!(used.setup_completed);
+    }
+
+    /// P13.5b/P13.8d: the start-up step as the daemon runs it: a fresh
+    /// database (the first-run account was just created) and a config.json
+    /// without the key end with setup pending, in memory and in the file, and
+    /// the environment's values are not written.
+    #[test]
+    fn the_start_up_step_leaves_a_fresh_installation_pending_in_the_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{ "web_port": 8086 }"#).unwrap();
+        let repo = crate::repository::Repository::new(dir.path().join("omni.db")).unwrap();
+        let brand_new = repo.ensure_default_admin().unwrap();
+        assert!(brand_new);
+        let mut config = AppConfig::load_from_file(&path).unwrap();
+        assert!(config.setup_completed, "no key: read as completed");
+        config.graph.mailbox = "from-env@station.example".into(); // an environment override
+        assert!(config.settle_new_installation(&path, brand_new).unwrap());
+        assert!(!config.setup_completed);
+        let on_disk = AppConfig::load_from_file(&path).unwrap();
+        assert!(!on_disk.setup_completed);
+        assert_eq!((on_disk.web_port, on_disk.graph.mailbox.as_str()), (8086, ""), "only the flag changed");
+        // The next start: the database is no longer new; nothing changes.
+        assert!(!repo.ensure_default_admin().unwrap());
+        assert!(!config.settle_new_installation(&path, false).unwrap());
+    }
 
     #[test]
     fn an_old_config_without_setup_keys_reads_as_completed() {

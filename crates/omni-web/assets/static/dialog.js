@@ -13,10 +13,18 @@
  *
  * infoDialog (P12.8) is the same window with one «Κλείσιμο», for something
  * to read, such as the keyboard shortcuts.
+ *
+ * The admin panel (P13.5) asks the same way, in two shorter forms built on
+ * the same window:
+ *
+ *   if (!(await confirmDialog('Delete X? …', { okLabel: 'Delete', danger: true }))) return;
+ *   const value = await promptDialog('New password for X:', { type: 'password', validate });
+ *
+ * promptDialog resolves the text, or null when cancelled.
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=8';
+import { t } from '/static/text.js?v=9';
 
 let openNow = false;
 let seq = 0;
@@ -78,8 +86,19 @@ function present(box, onAnswer) {
 /**
  * `body` is a string or an array of strings (one paragraph each). `danger`
  * colours the confirm button red. Resolves `true` only for the confirm button.
+ *
+ * The admin form: `confirmDialog(message, { okLabel, cancelLabel, danger })`,
+ * the message as the text and «okLabel?» as the title.
  */
-export function confirmDialog({ title, body, confirm, cancel = t('dialog.cancel'), danger = false }) {
+export function confirmDialog(what, options = {}) {
+  if (typeof what === 'string') {
+    const { okLabel = 'OK', cancelLabel = t('dialog.cancel'), danger = false } = options;
+    return confirmBox({ title: `${okLabel}?`, body: what, confirm: okLabel, cancel: cancelLabel, danger });
+  }
+  return confirmBox(what);
+}
+
+function confirmBox({ title, body, confirm, cancel = t('dialog.cancel'), danger = false }) {
   if (openNow) return Promise.resolve(false);
   openNow = true;
   return new Promise((resolve) => {
@@ -118,5 +137,34 @@ export function infoDialog({ title, content }) {
     const close = present(box, resolve);
     done.addEventListener('click', () => close(true));
     done.focus();
+  });
+}
+
+/**
+ * Ask for one value (the admin panel, P13.5). Resolves the text, or null for
+ * «Άκυρο», Escape or a click outside. `validate(value)` returns '' or the
+ * reason the value cannot be used; the action stays disabled while it says so.
+ */
+export function promptDialog(message, { okLabel = 'OK', cancelLabel = t('dialog.cancel'), type = 'text', value = '', placeholder = '', validate = () => '' } = {}) {
+  if (openNow) return Promise.resolve(null);
+  openNow = true;
+  return new Promise((resolve) => {
+    const id = ++seq;
+    const input = el('input', { type, value, placeholder: placeholder || null, id: `dlg-input-${id}`, autocomplete: type === 'password' ? 'new-password' : 'off' });
+    const why = el('p', { class: 'note bad dlg-text' });
+    const no = el('button', { class: 'btn', type: 'button' }, cancelLabel);
+    const yes = el('button', { class: 'btn btn-primary', type: 'submit' }, okLabel);
+    const check = () => { const m = validate(input.value); why.textContent = m || ''; yes.disabled = Boolean(m); };
+    const form = el('form', { class: 'stack' },
+      el('label', { for: `dlg-input-${id}`, class: 'dlg-text' }, message),
+      input, why,
+      el('div', { class: 'row dlg-actions' }, no, yes));
+    const box = el('div', { class: 'modal-body dlg', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': `dlg-input-${id}` }, form);
+    const close = present(box, (answer) => resolve(answer === false ? null : answer));
+    input.addEventListener('input', check);
+    no.addEventListener('click', () => close(false));
+    form.addEventListener('submit', (ev) => { ev.preventDefault(); if (!yes.disabled) close(input.value); });
+    check();
+    input.focus();
   });
 }

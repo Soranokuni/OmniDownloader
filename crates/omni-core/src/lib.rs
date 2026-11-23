@@ -3,6 +3,8 @@ pub mod benchmark;
 pub mod archive;
 pub mod busy;
 pub mod config;
+pub mod config_v2;
+pub mod diagnostics;
 pub mod events;
 pub mod extraction_trouble;
 pub mod fsutil;

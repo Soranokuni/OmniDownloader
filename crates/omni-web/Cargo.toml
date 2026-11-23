@@ -35,4 +35,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 metrics = "0.24"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 

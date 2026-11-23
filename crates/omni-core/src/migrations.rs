@@ -909,6 +909,20 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
         ALTER TABLE queue ADD COLUMN second_chances TEXT;
         "#,
     ),
+    (
+        45,
+        // A mail the watcher gave up on (FAILED) is read again automatically once, after the
+        // first good poll that follows a restart or a tool update (P11.11b). One row per mail
+        // that was given that chance, so it is never given twice; `cause` says what set it off,
+        // `person` for a mail a person asked to read again, which the system then leaves alone.
+        r#"
+        CREATE TABLE IF NOT EXISTS mail_auto_retries (
+            internet_message_id TEXT PRIMARY KEY,
+            requested_at        TEXT NOT NULL,
+            cause               TEXT NOT NULL
+        );
+        "#,
+    ),
 ];
 
 /// Pragmas that are per connection, so every pooled connection runs them from

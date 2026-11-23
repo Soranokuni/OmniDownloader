@@ -322,7 +322,9 @@ fn migration_31_upgrades_the_previous_schema_database_without_touching_its_rows(
     let path = dir.path().join("omni.db");
     {
         let conn = previous_database(&path);
-        assert_eq!(migrations::current_version(&conn)?, migrations::target_version() - 1);
+        // The migration before the last: versions may skip numbers (each lane has its own range).
+        let previous = migrations::MIGRATIONS[migrations::MIGRATIONS.len() - 2].0;
+        assert_eq!(migrations::current_version(&conn)?, previous);
         conn.execute("INSERT INTO queue (url, slug, status) VALUES ('https://a.example/v', 's', 'PENDING')", [])?;
         conn.execute("INSERT INTO audit_logs (level, category, message) VALUES ('INFO', 'T', 'm')", [])?;
         conn.execute("INSERT INTO processed_mail (internet_message_id, processed_at, outcome) VALUES ('id1', 'x', 'ok')", [])?;

@@ -133,6 +133,7 @@ pub async fn api_admin_tool_install(
                     message
                 };
                 let _ = task_state.repo.log_audit("INFO", "ADMIN", &format!("{who} installed {task_group}: {message}"));
+                task_state.tools_changed();
                 InstallResult { ok: true, message, needs_restart }
             }
             Err(e) => {

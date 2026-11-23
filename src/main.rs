@@ -71,8 +71,16 @@ enum Commands {
     Run,
     /// Run as Windows Service entry point (invoked by Windows SCM)
     RunService,
-    /// Run the interactive CLI setup wizard
-    Setup,
+    /// Apply an answer file (Admin → Setup → Download answer file) to this
+    /// installation's config.json. The interactive setup is the wizard on /admin.
+    Setup {
+        /// The answer file (omni-answers.json)
+        #[arg(long)]
+        answer: std::path::PathBuf,
+        /// Apply it although the service is running (it must then be restarted at once)
+        #[arg(long)]
+        force: bool,
+    },
     /// Install (or upgrade) from this release folder: copy to the install
     /// directory, register and start the Windows service, check it answers
     Install {
@@ -244,6 +252,14 @@ enum AdminAction {
     /// Set a new password for an account (prompted, never on the command
     /// line) and end all of its sessions
     ResetPassword { email: String },
+    /// Create an administrator when none can sign in (the password is prompted
+    /// twice, never on the command line). Refused while an active administrator
+    /// exists, unless --force
+    CreateAdmin {
+        username: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Sign an account out and refuse its sign-in until reactivated
     Deactivate { email: String },
     /// Let a deactivated account sign in again
@@ -284,6 +300,51 @@ enum ServiceAction {
     Start,
     Stop,
     Status,
+    /// Started by the service itself for the admin panel's restart (P13.2): wait
+    /// until the service has stopped, then start it again.
+    #[command(hide = true)]
+    RestartSelf,
+}
+
+/// The admin panel's service restart (P13.2): a detached `service restart-self`
+/// helper (the one process not started through `process::run`, see
+/// `omni_core::process::spawn_detached`), then a stop through the SCM, which
+/// runs the graceful stop of P2.15.
+struct ServiceRestart {
+    exe: PathBuf,
+}
+
+impl omni_web::admin_delivery::ServiceRestarter for ServiceRestart {
+    fn begin(&self) -> std::result::Result<(), String> {
+        omni_core::process::spawn_detached(&self.exe, &RESTART_SELF_ARGS).map(|_| ()).map_err(|e| format!("{e:#}"))
+    }
+    fn stop(&self) -> std::result::Result<(), String> {
+        omni_service::stop_service().map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// The helper's command line after the executable.
+const RESTART_SELF_ARGS: [&str; 2] = ["service", "restart-self"];
+
+/// How long `service restart-self` waits for the service to stop (P13.2). The
+/// stop waits for deliveries already copying (P2.15), which are short.
+const RESTART_SELF_WAIT: Duration = Duration::from_secs(180);
+
+/// `omni-ingest service restart-self` (P13.2): start the service again once it
+/// has stopped. A failure goes to the Event Log and the audit log, where an
+/// administrator looks when the panel does not come back.
+fn restart_self(paths: &AppPaths) -> Result<()> {
+    let Err(e) = omni_service::start_service_after_stop(RESTART_SELF_WAIT) else {
+        return Ok(());
+    };
+    let line = format!("The restart asked for in the admin panel did not start the service again: {e:#}. Start it with `omni-ingest service start` or in Services.");
+    omni_service::eventlog::report(omni_service::eventlog::EventLevel::Error, &line);
+    if let Ok(config) = AppConfig::load_from_file(&paths.config) {
+        if let Ok(repo) = Repository::new(paths.resolve(&config.database_path)) {
+            let _ = repo.log_audit("ERROR", "SYSTEM", &line);
+        }
+    }
+    Err(e)
 }
 
 /// Set up logging for whichever subcommand is running.
@@ -385,7 +446,7 @@ async fn mail_preview(
     };
 
     let assist = llm.then(|| {
-        omni_email::assist::Assist::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
+        omni_email::assist::Assist::new(&config.llm.endpoint, &config.llm.model, config.llm.clone())
     });
     for mail in &mails {
         let parsed = omni_email::assist::interpret(mail, &roster, &groups, &config.parser, assist.as_ref()).await;
@@ -842,12 +903,16 @@ async fn main() -> Result<()> {
                 rt.shutdown_timeout(Duration::from_secs(20));
             })?;
         }
-        Some(Commands::Setup) => {
-            omni_cli::run_setup_wizard(Some(&cli.config)).await?;
+        Some(Commands::Setup { answer, force }) => {
+            for line in omni_cli::apply_answer_file(&paths, &answer, force)? {
+                println!("{line}");
+            }
         }
         Some(Commands::Install { .. } | Commands::Uninstall { .. }) => unreachable!("handled before paths"),
+        Some(Commands::Service { action: ServiceAction::RestartSelf }) => restart_self(&paths)?,
         Some(Commands::Service { action }) => {
             let sub = match action {
+                ServiceAction::RestartSelf => unreachable!("handled above"),
                 ServiceAction::Install { account } => {
                     // The config gives the watchfolder (can the account reach
                     // it?) and the folders that need rights.
@@ -1031,6 +1096,7 @@ async fn main() -> Result<()> {
             let sub = match action {
                 AdminAction::ListUsers => omni_cli::AdminSubcommand::ListUsers,
                 AdminAction::ResetPassword { email } => omni_cli::AdminSubcommand::ResetPassword { email },
+                AdminAction::CreateAdmin { username, force } => omni_cli::AdminSubcommand::CreateAdmin { username, force },
                 AdminAction::Deactivate { email } => omni_cli::AdminSubcommand::SetActive { email, active: false },
                 AdminAction::Activate { email } => omni_cli::AdminSubcommand::SetActive { email, active: true },
             };
@@ -1086,8 +1152,38 @@ async fn run_daemon(
     info!("============================================================");
 
     let config_path = paths.config.clone();
+    // Config v2 (P13.7): the flat v1 keys move into their sections, once, with a
+    // copy of the old file (secrets blanked) kept beside it.
+    match omni_core::config_v2::upgrade_file(&config_path, &paths.data.join("backups").join("config")) {
+        Ok(Some(up)) => {
+            info!("config.json upgraded to the v2 layout; the old file is kept as {:?}", up.backup);
+            if up.backup.parent() != config_path.parent() {
+                info!("The folder of config.json does not accept new files from this account, so the copy is in {:?} instead", up.backup.parent().unwrap_or(&up.backup));
+            }
+            for m in &up.moved {
+                info!("config.json: {m}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!("config.json was not upgraded to the v2 layout ({e:#}); its v1 keys are still read"),
+    }
     let mut config = AppConfig::load_from_file(&config_path)
         .with_context(|| format!("Failed loading configuration from {:?}", config_path))?;
+    let fatal = omni_core::config_v2::fatal(&config);
+    if !fatal.is_empty() {
+        let lines: Vec<String> = fatal.iter().map(|p| p.to_string()).collect();
+        anyhow::bail!("config.json cannot be used: {}", lines.join(" "));
+    }
+    // What is ignored or read differently: logged now, and the `config` health line (P13.4b).
+    let mut config_notes: Vec<String> = Vec::new();
+    for p in omni_core::config_v2::problems(&config) {
+        warn!("config.json: {p}");
+        config_notes.push(p.to_string());
+    }
+    for u in omni_core::config_v2::unknown_keys_in_file(&config_path) {
+        warn!("config.json: {u}");
+        config_notes.push(u.to_string());
+    }
 
     // Secrets live in an encrypted store, not in config.json (plan P2.6).
     // If this deployment still has a plaintext mailbox password in the config,
@@ -1139,14 +1235,28 @@ async fn run_daemon(
     // A brand-new installation starts with Admin / Admin (owner's decision,
     // 2026-10-08). First, before anything writes to the audit log, which
     // is how a used database is told apart from a new one.
-    match repo.ensure_default_admin() {
-        Ok(true) => warn!(
-            "New installation: log in as Admin / Admin at http://127.0.0.1:{}/admin, create your own administrator and deactivate Admin.",
-            config.web_port
-        ),
+    let brand_new = match repo.ensure_default_admin() {
+        Ok(true) => {
+            warn!(
+                "New installation: log in as Admin / Admin at http://127.0.0.1:{}/admin, create your own administrator and deactivate Admin.",
+                config.web_port
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!("Could not create the first-run administrator: {e:#}");
+            false
+        }
+    };
+    // A new installation starts with setup pending, whatever config.json says (P13.5b).
+    let mut config = config;
+    match config.settle_new_installation(&config_path, brand_new) {
+        Ok(true) => info!("New installation: setup is pending until the wizard's test download is delivered or skipped"),
         Ok(false) => {}
-        Err(e) => warn!("Could not create the first-run administrator: {e:#}"),
+        Err(e) => warn!("Could not mark setup as pending in config.json ({e:#}); the wizard still opens for this run"),
     }
+    let config = config;
 
     // The generic recipes that ship with this build (P10.10). A failure here
     // costs the shipped recipes, never the daemon.
@@ -1166,8 +1276,9 @@ async fn run_daemon(
     }
     if !repo.has_active_admin().unwrap_or(true) {
         warn!(
-            "No administrator account exists. Open http://127.0.0.1:{}/setup from this machine, \
-             or run `omni-ingest setup`, to create one.",
+            "No active administrator account exists. See `omni-ingest admin list-users`, then \
+             `omni-ingest admin activate <login>` and `omni-ingest admin reset-password <login>` \
+             (or `omni-ingest admin create-admin <login>` when there is none), and sign in at http://127.0.0.1:{}/admin.",
             config.web_port
         );
     }
@@ -1331,6 +1442,8 @@ async fn run_daemon(
     // Whether the watchfolder answers (P11.2a): the start-up probe sets it, the
     // share watch and every delivery keep it current, the worker loop reads it.
     let watchfolder_state = omni_core::selftest::WatchfolderState::default();
+    // The watchfolder and the archive, which the admin panel swaps between jobs (P13.2).
+    let delivery_paths = omni_broadcast::pipeline::DeliveryPaths::new(watchfolder_path.clone(), Some(archive_settings.clone()));
     let broadcast_engine = Arc::new(BroadcastEngine::new(
         repo.clone(),
         ytdl_path.clone(),
@@ -1341,7 +1454,7 @@ async fn run_daemon(
         watchfolder_path.clone(),
     )
     .with_encoder_slots(config.max_concurrent_transcodes.clamp(1, 8))
-    .with_archive(Some(archive_settings.clone()))
+    .with_delivery_paths(delivery_paths.clone())
     .with_watchfolder_state(watchfolder_state.clone())
     .with_retry_max_age(config.retry.max_age_mins)
     // One pacer for every yt-dlp run of the daemon (P11.4): jobs, the repair ladder,
@@ -1352,6 +1465,14 @@ async fn run_daemon(
 
     // Live subsystem health, shared with the web panels (plan P6.2, W-09).
     let health = HealthState::new();
+    health.set(
+        omni_core::health::checks::CONFIG,
+        if config_notes.is_empty() {
+            omni_core::health::Check::ok("every key in config.json is read as written")
+        } else {
+            omni_core::health::Check::degraded(config_notes.join(" "))
+        },
+    );
 
     // Everything the self-test finds used to surface as a *job* failure,
     // attributed to whatever link happened to be at the front of the queue —
@@ -1447,6 +1568,9 @@ async fn run_daemon(
     // One LLM assist for the watcher, the admin panel and the health check;
     // the panel swaps it when the settings are saved (plan P4.22).
     let live_llm = omni_email::assist::LiveAssist::new(omni_email::assist::Assist::from_config(&config));
+    // The mailbox the watcher reads, which the admin panel swaps when the mail settings
+    // are saved (P11.11c); a tool update asks it to read the failed mail again (P11.11b).
+    let live_mail = omni_email::watcher::LiveMail::new(omni_email::watcher::MailSettings::graph(&config.graph));
     // Jobs a worker is still busy with: a retry from MCR waits for them.
     let busy_jobs = omni_core::busy::BusyJobs::new();
     // Site canaries (plan P10.4): shared by the nightly check, the workers'
@@ -1508,6 +1632,8 @@ async fn run_daemon(
         .with_secret_store(secret_store.clone())
         .with_health(health.clone())
         .with_llm(live_llm.clone())
+        .with_mail(live_mail.clone())
+        .with_delivery(omni_web::admin_delivery::LiveDelivery::new(delivery_paths.clone(), paths.clone()))
         .with_busy_jobs(busy_jobs.clone())
         .with_update_gate(update_gate.clone())
         .with_tool_dirs(bin_dir.clone(), tools_missing_at_start)
@@ -1518,6 +1644,13 @@ async fn run_daemon(
         .with_events(events.clone());
     if let Some(r) = &log_redactions {
         web_state = web_state.with_redactions(r.clone());
+    }
+    // «Επανεκκίνηση υπηρεσίας» (P13.2) only when this is the Windows service.
+    if service_shutdown_rx.is_some() {
+        match std::env::current_exe() {
+            Ok(exe) => web_state = web_state.with_restarter(Arc::new(ServiceRestart { exe })),
+            Err(e) => warn!("The admin panel's restart is off: this program's path is unknown ({e})"),
+        }
     }
     if let Some(handle) = metrics_handle {
         web_state = web_state.with_metrics(
@@ -1542,10 +1675,20 @@ async fn run_daemon(
     });
 
     // 2. Start Email Monitoring Watchdog
-    // The Office 365 mailbox through Microsoft Graph; see EmailWatcher::new.
-    if config.graph.is_configured() {
+    // The Office 365 mailbox through Microsoft Graph; see EmailWatcher::new. Started
+    // even with no mailbox configured: saving the mail settings in the admin panel
+    // swaps its source (P11.11c), and until then it reports "not configured".
+    {
+        if !config.graph.is_configured() {
+            info!("Email monitoring waits for the mailbox settings (tenant id, client id, mailbox and client secret).");
+            health.set(
+                omni_core::health::checks::MAIL,
+                omni_core::health::Check::disabled("Mailbox"),
+            );
+        }
         let email_watcher = Arc::new(
             EmailWatcher::new(config.clone(), repo.clone())
+                .with_live_mail(live_mail.clone())
                 .with_attachments_dir(temp_path.join("attachments"))
                 .with_health(health.clone())
                 .with_live_assist(live_llm.clone()),
@@ -1554,12 +1697,6 @@ async fn run_daemon(
         tokio::spawn(async move {
             email_watcher.start_polling_loop(email_rx).await;
         });
-    } else {
-        info!("Email monitoring disabled (the Graph mailbox is not configured: tenant id, client id, mailbox and client secret).");
-        health.set(
-            omni_core::health::checks::MAIL,
-            omni_core::health::Check::disabled("Mailbox"),
-        );
     }
 
     // 2b. LLM reachability.
@@ -1621,13 +1758,14 @@ async fn run_daemon(
             adblock_enabled: config.adblock_auto_update_nightly,
             gate: update_gate.clone(),
             retention_days: config.retention_days.max(1),
-            archive: Some(archive_settings.clone()),
+            archive: delivery_paths.clone(),
             mail_text_retention_days: config.mail_text_retention_days.max(1),
             health: health.clone(),
             canary: canary_env.clone(),
             evidence_days: config.repair.evidence_days.max(1),
             evidence_max_bytes: config.repair.evidence_max_mb.saturating_mul(1024 * 1024),
             early_ytdl: early_ytdl.clone(),
+            mail: live_mail.clone(),
         };
         let mut early_ytdl_rx = early_ytdl_rx;
 
@@ -1754,7 +1892,9 @@ async fn run_daemon(
     // look that does not answer in 15 s counts as not reachable; one still
     // hanging is not started twice.
     {
-        let (state, wf_health, wf) = (watchfolder_state.clone(), health.clone(), watchfolder_path.clone());
+        // The folder in use at each look: a watchfolder changed from the panel (P13.2) is
+        // the one watched from the next tick, and the old one is never looked at again.
+        let (state, wf_health, wf_paths) = (watchfolder_state.clone(), health.clone(), delivery_paths.clone());
         let mut watch_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             use omni_core::selftest::ShareCheck;
@@ -1765,6 +1905,7 @@ async fn run_daemon(
                 tokio::select! {
                     _ = watch_rx.recv() => break,
                     _ = tick.tick() => {
+                        let wf = wf_paths.watchfolder();
                         let (check, mut running) = match probe.take() {
                             Some((check, p)) if !p.is_finished() => (check, p),
                             _ => {
@@ -1821,10 +1962,11 @@ async fn run_daemon(
     let worker_gate = update_gate.clone();
     let worker_encoder_ok = encoder_ok.clone();
     let worker_health = health.clone();
-    let worker_watchfolder = watchfolder_path.clone();
+    // Read again for every lease: the panel may have changed them (P13.2).
+    let worker_delivery = delivery_paths.clone();
     let worker_watchfolder_state = watchfolder_state.clone();
     let worker_temp = temp_path.clone();
-    let worker_archive = archive_settings.clone();
+    let worker_archive_at_start = archive_settings.clone();
     // The LLM rung of the repair ladder (P10.12): both the switch and a model name,
     // never the mail model. Endpoint, key and auth are the `llm` section's.
     let repair_llm_cfg = repair::LlmCfg {
@@ -1839,7 +1981,7 @@ async fn run_daemon(
     let mut repair_env = repair::RealEnv::new(broadcast_engine.clone(), repair_ffprobe.clone(), ytdl_path.clone(), repair_ffmpeg.clone());
     if let (true, Some(model)) = (repair_llm_cfg.active(), repair_llm_cfg.model.as_deref()) {
         let client_cfg = omni_core::config::LlmConfig { timeout_secs: repair_llm_cfg.timeout.as_secs(), ..config.llm.clone() };
-        let client = omni_email::llm::LlmClient::from_settings(&config.ollama_endpoint, model, &client_cfg)
+        let client = omni_email::llm::LlmClient::from_settings(&config.llm.endpoint, model, &client_cfg)
             .with_reasoning_effort(config.repair.llm_reasoning_effort.clone());
         info!("Repair model rung on: model {model}, at most {} call(s) a day", repair_llm_cfg.max_calls_per_day);
         repair_env = repair_env.with_model(repair::LlmModel::new(client, config.repair.llm_max_tokens));
@@ -1910,6 +2052,9 @@ async fn run_daemon(
             // are the same, the oldest archived days go first (P1.7): a kept
             // source must never be the reason a newsroom job waits. Runs with
             // the archive switched off too, so old archives still give way.
+            let delivery_now = worker_delivery.current();
+            let worker_watchfolder = delivery_now.watchfolder;
+            let worker_archive = delivery_now.archive.unwrap_or_else(|| worker_archive_at_start.clone());
             if worker_archive.purges() {
                 let (a, temp) = (worker_archive.clone(), worker_temp.clone());
                 let low = (omni_core::selftest::LOW_DISK_GB * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -2394,6 +2539,7 @@ async fn nightly_deno_update(
     health: &HealthState,
     pacer: &omni_broadcast::pacing::HostPacer,
     ffmpeg: Option<&std::path::Path>,
+    mail: &omni_email::watcher::LiveMail,
 ) -> omni_core::scheduler::TaskOutcome {
     use omni_core::scheduler::TaskOutcome;
     let Some(installed) = dep_mgr.deno_version() else {
@@ -2456,6 +2602,7 @@ async fn nightly_deno_update(
                     let _ = repo.log_audit("INFO", "SYSTEM", &format!("Deno updated {installed} → {new_version}"));
                     // yt-dlp reads YouTube through Deno: a second chance for extraction failures (P11.5).
                     omni_core::second_chance::after_deno_update(repo, &new_version);
+                    mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
                     TaskOutcome::Ok
                 }
                 UpdateVerdict::RolledBack { broken } => {
@@ -2613,7 +2760,8 @@ struct MaintenanceContext {
     adblock_enabled: bool,
     gate: UpdateGate,
     retention_days: i64,
-    archive: Option<omni_core::archive::ArchiveSettings>,
+    /// The archive's settings now (P13.2: the panel changes them without a restart).
+    archive: omni_broadcast::pipeline::DeliveryPaths,
     mail_text_retention_days: i64,
     evidence_days: i64,
     evidence_max_bytes: u64,
@@ -2621,6 +2769,13 @@ struct MaintenanceContext {
     canary: Arc<canary::CanaryEnv>,
     /// The early yt-dlp update (P11.4d); the nightly run holds its running lock.
     early_ytdl: Arc<early_update::EarlyYtdlUpdate>,
+    /// The mail watcher's settings: a kept tool update asks it to read the failed mail again (P11.11b).
+    mail: omni_email::watcher::LiveMail,
+}
+
+/// A new yt-dlp build was kept: a tool update, for the failed mail's one more reading (P11.11b).
+fn ytdl_kept(run: &early_update::UpdateRun) -> bool {
+    run.reason == verdict_reason(&UpdateVerdict::Kept { checked: 0 })
 }
 
 /// The early yt-dlp update (P11.4d): the nightly task's own update, under the
@@ -2633,6 +2788,9 @@ async fn early_ytdl_update(repo: &Repository, ctx: &MaintenanceContext, drain: D
     })
     .await;
     selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
+    if ytdl_kept(&run) {
+        ctx.mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
+    }
     run
 }
 
@@ -2720,10 +2878,12 @@ async fn run_one_task(
             let (ytdl, deno) = canary::with_canary_lock(&ctx.canary, async {
                 let ffmpeg = ctx.canary.ffmpeg();
                 let ytdl = nightly_ytdl_update(&dep_mgr, &ctx.ytdl_channel, &ctx.gate, repo, &ctx.canary.pacer(), ffmpeg.as_deref(), early_update::NIGHTLY_DRAIN)
-                    .await
-                    .outcome;
-                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref()).await;
-                (ytdl, deno)
+                    .await;
+                if ytdl_kept(&ytdl) {
+                    ctx.mail.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
+                }
+                let deno = nightly_deno_update(&dep_mgr, &ctx.gate, repo, &ctx.health, &ctx.canary.pacer(), ffmpeg.as_deref(), &ctx.mail).await;
+                (ytdl.outcome, deno)
             })
             .await;
             selfcheck::refresh_health(repo, &ctx.health, &ctx.bin_dir);
@@ -2904,7 +3064,7 @@ async fn run_one_task(
             }
             // Delivered sources past their days (P1.7), by the date in the
             // directory name.
-            if let Some(a) = ctx.archive.clone().filter(|a| a.purges()) {
+            if let Some(a) = ctx.archive.current().archive.filter(|a| a.purges()) {
                 let today = chrono::Local::now().date_naive();
                 match tokio::task::spawn_blocking(move || omni_core::archive::purge_expired(&a.root, today, a.retention_days)).await {
                     Ok(n) if n > 0 => info!("Retention: removed {n} expired archive day(s)"),
@@ -3408,6 +3568,20 @@ mod tests {
         assert_eq!(ytdl_second_chance(&repo, &kept), 1);
         assert_eq!(repo.get_job(id).unwrap().unwrap().status, JobStatus::Pending);
         assert_eq!(repo.second_chances(id).unwrap(), vec!["ytdlp:0123456789abcdef".to_string()]);
+    }
+
+    /// P11.11b: only a kept yt-dlp build counts as the tool update that gives the
+    /// failed mail its one more reading.
+    #[test]
+    fn only_a_kept_ytdlp_build_is_a_tool_update_for_the_failed_mail() {
+        use omni_core::scheduler::TaskOutcome;
+        let run = |v: UpdateVerdict| early_update::UpdateRun::new(TaskOutcome::Ok, verdict_reason(&v));
+        assert!(ytdl_kept(&run(UpdateVerdict::Kept { checked: 3 })));
+        assert!(!ytdl_kept(&run(UpdateVerdict::RolledBack { broken: vec![] })));
+        assert!(!ytdl_kept(&run(UpdateVerdict::Postponed { why: "busy".into() })));
+        assert!(!ytdl_kept(&run(UpdateVerdict::Unverified { why: "x".into() })));
+        assert!(!ytdl_kept(&early_update::UpdateRun::drain_postponed()));
+        assert!(!ytdl_kept(&early_update::UpdateRun::new(TaskOutcome::Ok, "already the latest")));
     }
 
     /// P11.4 review round 1: the admin's cookie «Test» while the platform cools

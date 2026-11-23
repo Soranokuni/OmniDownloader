@@ -12,10 +12,11 @@
 //! Each change reports `restart_required`: true when the running daemon read the
 //! setting once at start-up and will use the saved value only after a restart.
 //! Live: `setup_*`, `security.mcr_open_networks`, `security.trust_proxy_header`,
-//! `security.trusted_proxies`, `metrics.allow_networks` (read per request).
-//! Restart: watchfolder (the worker pool, recovery and the disk checks captured
-//! the path), mail settings (the watcher is built at start), web port, TLS,
-//! `security.allowed_hosts`, `metrics.enabled`, archive.
+//! `security.trusted_proxies`, `metrics.allow_networks` (read per request), mail
+//! settings (the watcher's source is rebuilt, P11.11c), the watchfolder (between
+//! jobs, P13.2, `admin_delivery`) and the archive.
+//! Restart («Επανεκκίνηση υπηρεσίας»): web port, TLS, `security.allowed_hosts`,
+//! `metrics.enabled`: the listener reads them when it starts.
 
 use std::path::Path;
 use std::time::Duration;
@@ -285,13 +286,48 @@ fn settings_json(cfg: &AppConfig) -> serde_json::Value {
             "mailbox": cfg.graph.mailbox,
             // Whether, never what.
             "secret_set": !cfg.graph.client_secret.is_empty(),
+            "client_secret_expires": cfg.graph.client_secret_expires,
         },
-        "llm": { "mode": cfg.llm.mode, "provider": cfg.llm.provider, "endpoint": cfg.ollama_endpoint, "model": cfg.ollama_model },
+        "llm": { "mode": cfg.llm.mode, "provider": cfg.llm.provider, "endpoint": cfg.llm.endpoint, "model": cfg.llm.model },
     })
 }
 
 pub async fn api_admin_get_settings(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
-    Ok(Json(settings_json(&*state.config.read().await)))
+    let mut doc = settings_json(&*state.config.read().await);
+    // What the running daemon uses (P13.2): not part of the answer file.
+    if let Some(live) = &state.delivery {
+        doc["watchfolder_in_use"] = serde_json::json!(live.paths.watchfolder().to_string_lossy());
+        doc["watchfolder_pending"] = serde_json::json!(live.pending());
+    }
+    doc["restart_available"] = serde_json::json!(state.restarter.is_some());
+    // The wizard's last steps (P13.4): not part of the answer file.
+    {
+        let cfg = state.config.read().await;
+        doc["setup_test_url"] = serde_json::json!(cfg.setup_test_url);
+        doc["repair_mode"] = serde_json::json!(cfg.repair.mode);
+        // The Settings section's operation form (P13.5).
+        doc["operation"] = crate::admin_operation::operation_json(&cfg);
+    }
+    Ok(Json(doc))
+}
+
+/// Whether the configured archive and the watchfolder `resolved` contain one
+/// another: refused at save (P13.2), since the archive must never reach a file
+/// Dalet owns.
+fn archive_overlaps(state: &AppState, cfg: &AppConfig, resolved: &Path) -> bool {
+    match &state.delivery {
+        Some(live) => live.archive_for(&cfg.archive, resolved).conflict,
+        None => omni_core::archive::overlaps(&cfg.resolve_path(&cfg.archive.path), resolved),
+    }
+}
+
+/// The refusal for an archive that would overlap the watchfolder.
+fn archive_overlap_refusal(cfg: &AppConfig, resolved: &Path) -> ApiError {
+    ApiError::bad_request(format!(
+        "archive.path ({}) and the watchfolder ({}) would contain one another: the archive must never reach a file Dalet owns. Choose a watchfolder outside the archive, or move the archive (archive.path) first.",
+        cfg.resolve_path(&cfg.archive.path).display(),
+        resolved.display()
+    ))
 }
 
 /// The chosen settings as a file for an unattended install. No secret is in it:
@@ -300,6 +336,8 @@ pub async fn api_admin_answer_file(RequireAdmin(_): RequireAdmin, State(state): 
     let mut doc = settings_json(&*state.config.read().await);
     if let Some(graph) = doc.get_mut("graph").and_then(|g| g.as_object_mut()) {
         graph.remove("secret_set");
+        // Belongs to the secret, which is entered again on the new machine.
+        graph.remove("client_secret_expires");
     }
     doc["answer_file_version"] = serde_json::json!(1);
     let mut response = Json(doc).into_response();
@@ -368,12 +406,15 @@ fn probe_watchfolder_blocking(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The trimmed path as the rules of `/api/setup` read it: judged after it is
+/// The trimmed path as the watchfolder rules read it: judged after it is
 /// resolved against the install folder, so the default `watchfolder` passes.
 async fn judged_watchfolder(state: &AppState, raw: &str) -> Result<(String, std::path::PathBuf), String> {
     let watch = raw.trim().to_string();
     let resolved = if watch.is_empty() {
         std::path::PathBuf::new()
+    } else if let Some(live) = &state.delivery {
+        // Against the daemon's own install folder, as delivery resolves it.
+        live.install.resolve(&watch)
     } else {
         state.config.read().await.resolve_path(&watch)
     };
@@ -427,29 +468,55 @@ pub async fn api_admin_test_watchfolder(
     }))
 }
 
-/// Save only a path that passes the test just run again. Restart needed: the
-/// delivery path, crash recovery and disk checks hold the path they started with.
+/// Save only a path that passes the test just run again, and that no archive
+/// overlaps. In the daemon it is put into use between jobs (P13.2): at once
+/// when no job runs, else when they have finished (`pending`); finished videos
+/// waiting for the old folder go to review. Without a daemon to tell (tests),
+/// a restart is needed.
 pub async fn api_admin_save_watchfolder(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
     Json(payload): Json<WatchfolderPayload>,
 ) -> JsonResult {
     let watch = test_watchfolder(&state, &payload.path).await.map_err(ApiError::bad_request)?;
-    let restart = {
+    let (changed, resolved) = {
         let mut cfg = state.config.write().await;
+        let resolved = match &state.delivery {
+            Some(live) => live.install.resolve(&watch),
+            None => cfg.resolve_path(&watch),
+        };
+        if archive_overlaps(&state, &cfg, &resolved) {
+            return Err(archive_overlap_refusal(&cfg, &resolved));
+        }
         let changed = cfg.watchfolder_path != watch;
         let mut next = cfg.clone();
         next.watchfolder_path = watch.clone();
         next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
         *cfg = next;
-        changed
+        (changed, resolved)
     };
     let _ = state.repo.log_audit(
         "WARN",
         "ADMIN",
         &format!("Watchfolder set to {watch} by {} (settings)", admin.email),
     );
-    Ok(Json(serde_json::json!({ "status": "ok", "restart_required": restart })))
+    let applied = match (&state.delivery, changed) {
+        (_, false) => None,
+        (None, true) => return Ok(Json(serde_json::json!({ "status": "ok", "restart_required": true }))),
+        (Some(live), true) => Some(
+            crate::admin_delivery::apply_watchfolder(&state, live, resolved, watch.clone(), admin.email.clone()).await,
+        ),
+    };
+    Ok(Json(match applied {
+        Some(crate::admin_delivery::Applied::Pending) => serde_json::json!({
+            "status": "ok", "restart_required": false, "pending": true,
+            "message": "Saved. Videos are being made right now: the new watchfolder is used as soon as they have finished. Until then files go to the current one.",
+        }),
+        Some(crate::admin_delivery::Applied::Now { reviewed }) => serde_json::json!({
+            "status": "ok", "restart_required": false, "pending": false, "reviewed": reviewed,
+        }),
+        None => serde_json::json!({ "status": "ok", "restart_required": false, "pending": false }),
+    }))
 }
 
 // ==========================================
@@ -467,8 +534,28 @@ pub struct MailPayload {
     /// Blank keeps the stored secret.
     #[serde(default)]
     client_secret: Option<String>,
+    /// `YYYY-MM-DD`, the day the client secret expires (P11.11d). Absent keeps
+    /// the stored date; blank clears it.
+    #[serde(default)]
+    client_secret_expires: Option<String>,
 }
 
+/// The expiry date as typed: `Ok(None)` for blank.
+fn secret_expiry(raw: &str) -> Result<Option<chrono::NaiveDate>, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map(Some).map_err(|_| {
+        ApiError::bad_request(format!(
+            "graph.client_secret_expires: \"{}\" is not a date. Enter it as YYYY-MM-DD, as Entra shows it under Certificates & secrets.",
+            raw.chars().take(20).collect::<String>()
+        ))
+    })
+}
+
+/// Save the mailbox settings and, in the daemon, read with them from the next
+/// poll on (P11.11c): the watcher's source is rebuilt, no restart.
 pub async fn api_admin_save_mail(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
@@ -487,11 +574,15 @@ pub async fn api_admin_save_mail(
         return Err(ApiError::bad_request("The mailbox must be an email address."));
     }
     let secret = payload.client_secret.as_deref().map(str::trim).unwrap_or("");
+    let expires = payload.client_secret_expires.as_deref().map(secret_expiry).transpose()?;
     let mut cfg = state.config.write().await;
     let mut next = cfg.clone();
     next.graph.tenant_id = tenant;
     next.graph.client_id = client;
     next.graph.mailbox = mailbox;
+    if let Some(expires) = expires {
+        next.graph.client_secret_expires = expires;
+    }
     // The secret first: if it cannot be stored nothing changes. Never in config.json.
     if !secret.is_empty() {
         state
@@ -503,16 +594,23 @@ pub async fn api_admin_save_mail(
     let changed = next.graph.tenant_id != cfg.graph.tenant_id
         || next.graph.client_id != cfg.graph.client_id
         || next.graph.mailbox != cfg.graph.mailbox
+        || next.graph.client_secret_expires != cfg.graph.client_secret_expires
         || !secret.is_empty();
     next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
     let secret_set = !next.graph.client_secret.is_empty();
+    // Under the config lock, so two saves reach the watcher in the order they were saved.
+    let live = changed && state.apply_mail_settings(&next.graph);
     *cfg = next;
     drop(cfg);
-    let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Mail settings changed by {} (settings)", admin.email));
+    let _ = state.repo.log_audit(
+        "WARN",
+        "ADMIN",
+        &format!("Mail settings changed by {} (settings){}", admin.email, if live { "; in use from the next poll" } else { "" }),
+    );
     Ok(Json(serde_json::json!({
         "status": "ok",
         "secret_set": secret_set,
-        "restart_required": changed,
+        "restart_required": changed && !live,
     })))
 }
 
@@ -566,7 +664,9 @@ async fn check_pkcs12(path: std::path::PathBuf, password: String) -> Result<(), 
         let bytes = std::fs::read(&path).map_err(|e| format!("The TLS certificate {} cannot be read: {e}", path.display()))?;
         native_tls::Identity::from_pkcs12(&bytes, &password).map(|_| ()).map_err(|_| {
             format!(
-                "{} does not open as a PKCS#12 certificate with that passphrase. It must be a .pfx/.p12 file                  holding the certificate and its private key (not a .cer or .pem), and the passphrase must be right.                  Nothing was saved.",
+                "{} does not open as a PKCS#12 certificate with that passphrase. It must be a .pfx/.p12 file \
+                 holding the certificate and its private key (not a .cer or .pem), and the passphrase must be right. \
+                 Nothing was saved.",
                 path.display()
             )
         })
@@ -646,16 +746,26 @@ pub async fn api_admin_save_advanced(
     if let Some(list) = &p.mcr_open_networks {
         next.security.mcr_open_networks = clean_cidrs("MCR open networks", list)?;
     }
+    // The archive applies at once in the daemon (P13.2); without one, at the next start.
+    let live_archive = state.delivery.is_some();
     if let Some(on) = p.archive_enabled {
         next.archive.enabled = on;
-        restart |= on != cfg.archive.enabled;
+        restart |= on != cfg.archive.enabled && !live_archive;
     }
     if let Some(days) = p.archive_retention_days {
         if !(1..=3650).contains(&days) {
             return Err(ApiError::bad_request("Archive retention must be between 1 and 3650 days."));
         }
         next.archive.retention_days = days;
-        restart |= days != cfg.archive.retention_days;
+        restart |= days != cfg.archive.retention_days && !live_archive;
+    }
+    // An archive that would contain the watchfolder (or sit inside it) is refused.
+    let watchfolder_now = match &state.delivery {
+        Some(live) => live.paths.watchfolder(),
+        None => next.resolve_path(&next.watchfolder_path),
+    };
+    if next.archive.enabled && (p.archive_enabled.is_some() || p.archive_retention_days.is_some()) && archive_overlaps(&state, &next, &watchfolder_now) {
+        return Err(archive_overlap_refusal(&next, &watchfolder_now));
     }
     if let Some(cert) = &p.tls_cert_path {
         let cert = cert.trim();
@@ -702,6 +812,9 @@ pub async fn api_admin_save_advanced(
         restart = true;
     }
     next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
+    if let (Some(live), true) = (&state.delivery, p.archive_enabled.is_some() || p.archive_retention_days.is_some()) {
+        live.paths.set_archive(Some(live.archive_for(&next.archive, &watchfolder_now)));
+    }
     let saved_proxies = next.security.trusted_proxies.clone();
     *cfg = next;
     drop(cfg);
@@ -717,8 +830,16 @@ pub async fn api_admin_save_advanced(
 #[derive(Deserialize)]
 pub struct CompletePayload {
     mode: String,
+    /// The wizard's test download that reached the watchfolder (P13.4).
+    #[serde(default)]
+    test_job_id: Option<i64>,
+    /// The administrator skipped the test download on purpose.
+    #[serde(default)]
+    skip_test: bool,
 }
 
+/// Setup is complete only after a test download was delivered or was skipped
+/// on purpose (P13.4).
 pub async fn api_admin_complete_setup(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
@@ -728,6 +849,28 @@ pub async fn api_admin_complete_setup(
     if !MODES.contains(&mode.as_str()) {
         return Err(ApiError::bad_request("The mode must be beginner, intermediate or it."));
     }
+    let proof = match (p.test_job_id, p.skip_test) {
+        (Some(id), _) => {
+            let job = state.repo.get_job(id).map_err(internal_error("Could not read the job."))?;
+            match job.filter(crate::admin_wizard::proves_delivery) {
+                Some(job) => format!(
+                    "test download #{id} delivered as {}",
+                    job.file_path.as_deref().and_then(|f| Path::new(f).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ),
+                None => {
+                    return Err(ApiError::bad_request(format!(
+                        "Test download #{id} has not been delivered to the watchfolder. Wait for it, start it again, or skip it."
+                    )))
+                }
+            }
+        }
+        (None, true) => "test download skipped".to_string(),
+        (None, false) => {
+            return Err(ApiError::bad_request(
+                "Run «Δοκιμαστική λήψη» to the end, or skip it, before setup is complete.",
+            ))
+        }
+    };
     let mut cfg = state.config.write().await;
     let mut next = cfg.clone();
     next.setup_completed = true;
@@ -735,7 +878,7 @@ pub async fn api_admin_complete_setup(
     next.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
     *cfg = next;
     drop(cfg);
-    let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Setup wizard completed ({mode}) by {}", admin.email));
+    let _ = state.repo.log_audit("WARN", "ADMIN", &format!("Setup wizard completed ({mode}; {proof}) by {}", admin.email));
     Ok(Json(serde_json::json!({ "status": "ok", "restart_required": false })))
 }
 

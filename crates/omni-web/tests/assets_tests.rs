@@ -378,23 +378,23 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 26),
-        ("inbox.js", 33),
-        ("approval.js", 21),
-        ("notify.js", 21),
-        ("mcr.js", 59),
-        ("status.js", 9),
+        ("desk.js", 27),
+        ("inbox.js", 34),
+        ("approval.js", 22),
+        ("notify.js", 22),
+        ("mcr.js", 60),
+        ("status.js", 10),
         ("status.css", 11),
-        ("worklist.js", 9),
-        ("undo.js", 10),
-        ("dialog.js", 9),
-        ("keys.js", 7),
-        ("sound.js", 6),
-        ("board.js", 2),
-        ("user.js", 19),
-        ("toast.js", 9),
-        ("text.js", 8),
-        ("text.el.js", 8),
+        ("worklist.js", 10),
+        ("undo.js", 11),
+        ("dialog.js", 10),
+        ("keys.js", 8),
+        ("sound.js", 7),
+        ("board.js", 3),
+        ("user.js", 20),
+        ("toast.js", 10),
+        ("text.js", 9),
+        ("text.el.js", 9),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -1578,11 +1578,11 @@ fn the_desk_counts_itself_reminds_held_videos_and_names_the_login_sites() {
 }
 
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v19() {
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=19"), "user.html does not import user.js?v=19");
-    assert!(!page.contains("/static/user.js?v=18"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=20"), "user.html does not import user.js?v=20");
+    assert!(!page.contains("/static/user.js?v=19"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
@@ -1595,14 +1595,14 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v19() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v30_and_login_v6() {
+fn the_first_run_password_card_ships_with_admin_v40_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=30"), "admin.html does not import admin.js?v=30");
-    assert!(!admin.contains("/static/admin.js?v=29"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=40"), "admin.html does not import admin.js?v=40");
+    assert!(!admin.contains("/static/admin.js?v=39"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
-    assert!(login.contains("/static/login.js?v=6"), "login.html does not import login.js?v=6");
-    assert!(!login.contains("/static/login.js?v=5"), "login.html still imports the old login.js");
+    assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
+    assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
 
     let js = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(js.contains("password_change_required"), "admin.js ignores the first-run flag");
@@ -1610,27 +1610,82 @@ fn the_first_run_password_card_ships_with_admin_v30_and_login_v6() {
     assert!(login_js.contains("password_change_required"), "login.js ignores the first-run flag");
 }
 
-/// The Autonomy card (P11.0) opens the right-hand column and its loader asks
+/// The Autonomy card (P11.0) is on the Overview (P13.5) and its loader asks
 /// the admin endpoint, building nodes rather than writing HTML.
 #[test]
-fn the_autonomy_card_is_first_in_the_right_column_and_loads_the_report() {
+fn the_autonomy_card_is_on_the_overview_and_loads_the_report() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    let right = admin.find(r#"<div class="stack" style="grid-column:span 2">"#).expect("the right-hand column");
-    let first = admin[right..].find("<section").map(|i| right + i).expect("a card in it");
-    assert!(admin[first..].starts_with(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not first");
+    let overview = admin.find(r#"data-section="overview""#).expect("the Overview section");
+    let next = admin[overview + 10..].find("data-section=").map(|i| overview + 10 + i).expect("the next section");
+    assert!(admin[overview..next].contains(r#"<section class="card stack" id="autonomy">"#), "the Autonomy card is not on the Overview");
     assert!(admin.contains("A video later marked as wrong counts as touched."));
     for id in ["autonomy-days", "autonomy-refresh", "autonomy-figures", "autonomy-tables"] {
         assert!(admin.contains(&format!(r#"id="{id}""#)), "{id} missing");
     }
-    let js = assets.get("static/admin.js").expect("admin.js shipped");
+    let js = assets.get("static/admin-overview.js").expect("admin-overview.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
     let code = code.join("\n");
-    assert!(code.contains("/api/admin/autonomy-report?days="), "admin.js does not load the autonomy report");
+    assert!(code.contains("/api/admin/autonomy-report?days="), "the Overview does not load the autonomy report");
     assert!(code.contains("Delivered untouched"));
     assert!(code.contains("No finished jobs in this period yet."));
     assert!(code.contains("Queued by MCR from an offer or a skipped link"));
     assert!(!code.contains("innerHTML"));
+}
+
+/// P13.2: the restart button asks in the page (no browser dialog), calls the
+/// restart route through `api()`, and shows the pending watchfolder.
+#[test]
+fn the_restart_button_asks_in_the_page_and_the_pending_watchfolder_is_shown() {
+    let assets = all_assets();
+    let html = assets.get("admin.html").expect("admin.html shipped");
+    for id in ["restart-box", "restart-warn", "restart-btn", "restart-result", "watchfolder-pending"] {
+        assert!(html.contains(&format!(r#"id="{id}""#)), "{id} missing");
+    }
+    assert!(html.contains("Επανεκκίνηση υπηρεσίας"));
+    let js = assets.get("static/admin-settings.js").expect("admin-settings.js shipped");
+    let code: String = js.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    // The restart block runs up to the next section heading of the raw file.
+    let raw = &js[js.find("restart_available").expect("the restart block")..];
+    let raw = &raw[..raw.find("/* ----").expect("the next section")];
+    let block: String = raw.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    assert!(block.contains("api('/api/admin/restart-service'"), "the button calls the route");
+    assert!(block.contains("warn.hidden"), "the first click only asks");
+    assert!(!block.contains("confirm(") && !block.contains("innerHTML"));
+    assert!(code.contains("watchfolder_pending"));
+}
+
+/// P13.3: the wizard is the one setup path. No first-run page ships, and nothing
+/// points at one or at the endpoints it used.
+#[test]
+fn no_first_run_page_ships_and_nothing_points_at_it() {
+    let assets = all_assets();
+    assert!(!assets.contains_key("setup.html") && !assets.contains_key("static/setup.js"));
+    for (name, text) in &assets {
+        for gone in ["/setup\"", "/setup'", "<strong>/setup</strong>", "/api/setup/state", "'/api/setup'", "setup-hint"] {
+            assert!(!text.contains(gone), "{name} still mentions {gone}");
+        }
+    }
+}
+
+/// P11.11c/d: the wizard and the admin's Mailbox card both ask for the secret's
+/// expiry date, and the card saves the mailbox (used from the next poll).
+#[test]
+fn the_wizard_and_the_mailbox_card_ask_for_the_secret_expiry() {
+    let assets = all_assets();
+    let code = |name: &str| -> String {
+        let src = assets.get(name).unwrap_or_else(|| panic!("{name} shipped"));
+        src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n")
+    };
+    let wizard = code("static/wizard.js");
+    assert!(wizard.contains("client_secret_expires: expires.value"), "the wizard does not send the expiry");
+    let admin = code("static/admin-settings.js");
+    assert!(admin.contains("'/api/admin/settings/mail'"), "the Mailbox card does not save");
+    assert!(admin.contains("client_secret_expires: document.getElementById('test-mail-expires').value"));
+    assert!(!admin.contains("/api/setup/state"), "the Mailbox card must not read the first-run endpoint");
+    let html = assets.get("admin.html").expect("admin.html shipped");
+    assert!(html.contains(r#"<input type="date" id="test-mail-expires">"#));
+    assert!(html.contains(r#"id="save-mail-btn""#));
 }
 
 /// P7.12: the wizard is one module under one URL, built with el() only, and the
@@ -1657,9 +1712,88 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["4".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["10".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");
     assert!(page.contains("id=\"setup-rerun\""), "the Setup card is missing");
+}
+
+/// P13.4: the wizard ends with a delivered test video. Mail's Next needs a
+/// passing «Δοκιμή σύνδεσης»; journalists and tools steps are wired; Finish
+/// sends the test job or an explicit skip; no browser dialogs.
+#[test]
+fn the_wizard_ends_with_a_test_download_and_mail_needs_a_passing_test() {
+    let assets = all_assets();
+    let wizard = assets.get("static/wizard.js").expect("wizard.js shipped");
+    let code: String = wizard.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    assert!(code.contains("ids.push('check', 'testdl')"), "the test download is not the last step");
+    assert!(code.contains("valid: () => complete() && passed()"), "mail's Next does not need a passing test");
+    assert!(code.contains("copyable('Mail.Read')"), "the exact permission has no copy button");
+    assert!(code.contains("/api/admin/journalists/import"), "the journalists step is not wired");
+    assert!(code.contains("/api/admin/tools"), "the tools step is not wired");
+    assert!(code.contains("/api/admin/setup/test-download"), "the test download is not wired");
+    assert!(code.contains("test_job_id: T.jobId") && code.contains("skip_test: true"), "Finish sends no proof");
+    assert!(code.contains("valid: () => Boolean(T.status && T.status.delivered)"), "Finish is open before delivery");
+    assert!(code.contains("playout never reads"), "the watchfolder skip does not say where files go");
+    // P13.4b: a failed status request retries instead of ending the test.
+    assert!(code.contains("setTimeout(() => poll(gen), 3000)"), "a failed poll is not retried");
+    assert!(code.contains("Επανασύνδεση"), "a failed poll does not say it reconnects");
+    // P13.4c: only a lost connection or a 5xx is retried; a 404/403 re-enables Start.
+    assert!(code.contains("if (err.code === 'NETWORK' || err.status >= 500)"), "every failed poll is retried");
+    for banned in ["confirm(", "prompt(", "alert("] {
+        assert!(!code.contains(banned), "wizard.js uses {banned}");
+    }
+}
+
+/// P13.5: the admin panel is five hash-routed sections, each a module imported
+/// when first opened (one URL each); no browser dialog in any admin module;
+/// the Benchmarks card no longer refetches on every server event.
+#[test]
+fn the_admin_panel_is_five_sections_with_one_module_each_and_no_browser_dialogs() {
+    let assets = all_assets();
+    let html = assets.get("admin.html").expect("admin.html shipped");
+    let sections = ["overview", "settings", "people", "sites", "maintenance"];
+    for s in sections {
+        assert!(html.contains(&format!(r#"data-section="{s}""#)), "section {s} missing");
+        assert!(html.contains(&format!(r##"href="#{s}" data-nav="{s}""##)), "sidebar link {s} missing");
+    }
+    assert!(html.contains(r#"id="admin-search""#), "no search box");
+    for id in ["needs-list", "health-list", "shadow-body", "wf-path", "op-repair", "op-poll", "op-write", "op-gap", "op-age", "net-port"] {
+        assert!(html.contains(&format!(r#"id="{id}""#)), "{id} missing");
+    }
+
+    let shell = assets.get("static/admin.js").expect("admin.js shipped");
+    for s in sections {
+        let module = format!("static/admin-{s}.js");
+        assert!(assets.contains_key(&module), "{module} not shipped");
+        assert!(shell.contains(&format!("import('/static/admin-{s}.js?v=")), "{s} is not imported on demand");
+        let src = &assets[&module];
+        assert!(src.contains("export function init()"), "{module} has no init");
+    }
+    // One URL per module.
+    for m in ["admin-overview.js", "admin-settings.js", "admin-people.js", "admin-sites.js", "admin-maintenance.js", "admin-common.js", "dialog.js"] {
+        let needle = format!("/static/{m}?v=");
+        let versions: std::collections::BTreeSet<String> = assets
+            .values()
+            .flat_map(|s| s.match_indices(needle.as_str()).map(|(i, _)| s[i + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(versions.len(), 1, "{m} is imported under {versions:?}");
+    }
+
+    for (name, src) in assets.iter().filter(|(n, _)| n.starts_with("static/admin") || *n == "static/dialog.js") {
+        let code: String = src.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+        for banned in ["confirm(", "prompt(", "alert(", "innerHTML"] {
+            let hits = code.match_indices(banned).filter(|(i, _)| !code[..*i].ends_with("Dialog") && !code[..*i].ends_with('.')).count();
+            assert_eq!(hits, 0, "{name} uses {banned}");
+        }
+    }
+    // P13.9: the Cookies card names the Start-menu entry.
+    assert!(assets["static/admin-sites.js"].contains("«OmniIngest – Σύνδεση σε ιστότοπο»"), "the Cookies card does not point to the Start-menu entry");
+    // P13.5b: unfinished setup is listed with a way back into the wizard.
+    let overview = &assets["static/admin-overview.js"];
+    assert!(overview.contains("sessionStorage.removeItem('omni.setup.leave')"), "no way back into the wizard");
+    let maint = &assets["static/admin-maintenance.js"];
+    assert!(!maint.contains("live(loadBenchmarks"), "the Benchmarks card still refetches on every event");
+    assert!(maint.contains("if (going && sectionShown('maintenance'))"), "the Benchmarks card is not polled only while a run goes");
 }

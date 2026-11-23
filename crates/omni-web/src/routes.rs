@@ -21,7 +21,7 @@ use omni_core::repository::{DEFAULT_ADMIN_LOGIN, DEFAULT_ADMIN_PASSWORD};
 use crate::assets::EmbeddedFile;
 use crate::auth::{
     build_logout_cookie, build_session_cookie, client_ip, extract_session_token,
-    internal_error, is_loopback_client, LimiterIp, resolve_principal, ApiError, MaybePrincipal, Principal,
+    internal_error, LimiterIp, resolve_principal, ApiError, MaybePrincipal, Principal,
     RequireAdmin, RequireAdminAllowDefault, RequireMcr, RequireUser, RequireUserAllowDefault,
 };
 use crate::ratelimit::Decision;
@@ -87,37 +87,6 @@ pub async fn view_admin(principal: Option<RequireAdminAllowDefault>) -> Response
         Some(_) => EmbeddedFile("admin.html").into_response(),
         None => Redirect::temporary("/login").into_response(),
     }
-}
-
-/// The first-run page. Served only while no administrator exists, and only to a
-/// client on this machine (plan P2.4).
-///
-/// Once an admin exists the route is a 404, not a redirect: a redirect would
-/// confirm the page had once been there, and there is nothing at that address
-/// any more.
-pub async fn view_setup(State(state): State<AppState>, req: Request) -> Response {
-    let (parts, _) = req.into_parts();
-
-    if setup_window_open(&parts, &state).await {
-        EmbeddedFile("setup.html").into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "404 Not Found").into_response()
-    }
-}
-
-/// True while first-run configuration is permitted.
-async fn setup_window_open(parts: &axum::http::request::Parts, state: &AppState) -> bool {
-    // An existing admin may always reconfigure, from anywhere they can log in.
-    if let Some(p) = resolve_principal(parts, state).await {
-        // The first-run account is not an administrator until its password changes.
-        let locked = matches!(&p, Principal::User(u) if state.default_admin_locks(u));
-        if p.is_admin() && !locked {
-            return true;
-        }
-    }
-    // Otherwise: only before the first admin exists, and only from this box.
-    let no_admin = !state.repo.has_active_admin().unwrap_or(true);
-    no_admin && is_loopback_client(parts, state).await
 }
 
 // ==========================================
@@ -2034,6 +2003,7 @@ pub async fn api_admin_update_ytdl(
         "ADMIN",
         &format!("{} updated yt-dlp ({} channel)", admin.email, channel),
     );
+    state.tools_changed();
     Ok(Json(
         serde_json::json!({ "status": "ok", "path": path.to_string_lossy() }),
     ))
@@ -2271,6 +2241,8 @@ pub async fn api_secrets_set(
     if payload.key == omni_core::secrets::keys::GRAPH_CLIENT_SECRET {
         let mut cfg = state.config.write().await;
         cfg.graph.client_secret = payload.value.trim().to_string();
+        // And to the watcher, which reads with its own copy from the next check (P11.11c).
+        state.apply_mail_settings(&cfg.graph);
     }
 
     Ok(Json(serde_json::json!({ "status": "ok" })))
@@ -2330,7 +2302,7 @@ pub async fn api_system_status(
             cfg.watchfolder_path.clone(),
             cfg.temp_path.clone(),
             cfg.bin_dir.clone(),
-            cfg.ollama_model.clone(),
+            cfg.llm.model.clone(),
         )
     };
 
@@ -2681,8 +2653,24 @@ pub async fn api_get_mail_view(
     }
 
     let summary = omni_email::mail_view::MailParseSummary::stored(&mail);
+    let is_mail = query.kind.as_deref() != Some("manual");
+    // Whether «Να το θυμάμαι για αυτή τη διεύθυνση» has anything to remember (P11.11a).
+    let sender_on_roster = match mail.from_address.as_deref().filter(|a| is_mail && a.contains('@')) {
+        Some(a) => state.repo.find_journalist_by_email(a).map_err(internal_error("Could not read the roster."))?.is_some(),
+        None => true,
+    };
+    // The extra reading of a mail given up on (P11.11b): automatic once
+    // (`restart`, `tool update`) or asked by a person (`person`).
+    let read_again = if is_mail {
+        state.repo.mail_auto_retry(&mail.internet_message_id).ok().flatten()
+    } else {
+        None
+    };
     Ok(Json(serde_json::json!({
-        "kind": if query.kind.as_deref() == Some("manual") { "manual" } else { "mail" },
+        "kind": if is_mail { "mail" } else { "manual" },
+        "sender_on_roster": sender_on_roster,
+        "needs_person": is_mail && mail.outcome == "FAILED",
+        "read_again": read_again.map(|(at, cause)| serde_json::json!({ "at": at, "cause": cause })),
         "key": query.key,
         "subject": mail.subject,
         "from_name": mail.from_name,
@@ -2838,6 +2826,66 @@ pub async fn api_mail_reprocess(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+#[derive(Deserialize)]
+pub struct RememberSenderPayload {
+    /// The mail's Message-ID, as the mail view names it.
+    key: String,
+    /// The journalist MCR filed the mail under.
+    surname: String,
+}
+
+/// «Να το θυμάμαι για αυτή τη διεύθυνση» (P11.11a): add the sender of the mail
+/// `key` to the addresses of `surname`, so their next mail is filed under them.
+///
+/// Only the mail's own sender, never a typed address; never `MCR`, which is
+/// where unknown mail goes; and never an address already on someone, which
+/// would silently refile that person's mail. Jobs already made keep their names.
+pub async fn api_mail_remember_sender(
+    RequireMcr(principal): RequireMcr,
+    State(state): State<AppState>,
+    Json(payload): Json<RememberSenderPayload>,
+) -> JsonResult {
+    use omni_core::repository::AddressAdded;
+    let mail = state
+        .repo
+        .get_processed_mail(payload.key.trim())
+        .map_err(internal_error("Could not read the mail."))?
+        .ok_or_else(ApiError::not_found)?;
+    let address = mail.from_address.as_deref().unwrap_or("").trim().to_lowercase();
+    if address.is_empty() || !address.contains('@') {
+        return Err(ApiError::bad_request("Αυτό το email δεν έχει διεύθυνση αποστολέα για να τη θυμηθεί το σύστημα."));
+    }
+    let surname = payload.surname.trim().to_uppercase();
+    if surname.is_empty() || surname == "MCR" {
+        return Err(ApiError::bad_request("Επιλέξτε πρώτα τον δημοσιογράφο του email."));
+    }
+    let added = state
+        .repo
+        .add_journalist_email(&surname, &address)
+        .map_err(internal_error("Could not save the address."))?;
+    let already = match added {
+        AddressAdded::Added => false,
+        AddressAdded::AlreadyTheirs => true,
+        AddressAdded::TakenBy(other) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "ADDRESS_TAKEN",
+                format!("Η διεύθυνση {address} ανήκει ήδη στον/στην {other}. Αλλάξτε τη στη λίστα δημοσιογράφων, αν χρειάζεται."),
+            ))
+        }
+        AddressAdded::NoSuchJournalist => {
+            return Err(ApiError::bad_request("Αυτός ο δημοσιογράφος δεν υπάρχει στη λίστα."))
+        }
+        AddressAdded::Full => {
+            return Err(ApiError::bad_request("Αυτός ο δημοσιογράφος έχει ήδη 20 διευθύνσεις· αφαιρέστε μία στη λίστα δημοσιογράφων."))
+        }
+    };
+    if !already {
+        audit_action(&state, &principal, &format!("Journalist {surname}: the address of the email '{}' remembered", mail.subject.unwrap_or_default()));
+    }
+    Ok(Json(serde_json::json!({ "status": "ok", "surname": surname, "address": address, "already": already })))
+}
+
 // ==========================================
 // Handled mail and reprocess (plan P4.25)
 // ==========================================
@@ -2855,7 +2903,12 @@ pub async fn api_admin_mail_history(RequireAdmin(_): RequireAdmin, State(state):
         .into_iter()
         .map(|m| {
             let jobs = serde_json::from_str::<Vec<serde_json::Value>>(&m.jobs_json).map(|v| v.len()).unwrap_or(0);
+            // Read again once already, automatically or on request (P11.11b), and still
+            // failed: the system leaves it to a person.
+            let read_again = m.outcome == "FAILED"
+                && state.repo.mail_auto_retry(&m.internet_message_id).ok().flatten().is_some();
             serde_json::json!({
+                "read_again": read_again,
                 "internet_message_id": m.internet_message_id,
                 "subject": m.subject,
                 "from_address": m.from_address,
@@ -2951,12 +3004,15 @@ fn llm_settings(
         p.api_key.trim().to_string()
     } else if p.clear_key {
         String::new()
-    } else if same_base(&base, &saved.ollama_endpoint) {
+    } else if same_base(&base, &saved.llm.endpoint) {
         saved.llm.api_key.clone()
     } else {
         String::new()
     };
+    let model: String = p.model.trim().chars().take(200).collect();
     let cfg = omni_core::config::LlmConfig {
+        endpoint: base.clone(),
+        model: model.clone(),
         mode: p.mode,
         timeout_secs: p.timeout_secs.clamp(5, 300),
         max_tokens: p.max_tokens.clamp(50, 8000),
@@ -2969,7 +3025,7 @@ fn llm_settings(
         disable_thinking: p.disable_thinking,
         api_key: key,
     };
-    Ok((base, p.model.trim().chars().take(200).collect(), cfg))
+    Ok((base, model, cfg))
 }
 
 pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): State<AppState>) -> JsonResult {
@@ -2977,15 +3033,15 @@ pub async fn api_admin_get_llm(RequireAdmin(_): RequireAdmin, State(state): Stat
     Ok(Json(serde_json::json!({
         "mode": cfg.llm.mode,
         "provider": cfg.llm.provider,
-        "base_url": cfg.ollama_endpoint,
-        "model": cfg.ollama_model,
+        "base_url": cfg.llm.endpoint,
+        "model": cfg.llm.model,
         "auth": cfg.llm.auth,
         "timeout_secs": cfg.llm.timeout_secs,
         "max_tokens": cfg.llm.max_tokens,
         "disable_thinking": cfg.llm.disable_thinking,
         "keyword_polish": cfg.llm.keyword_polish,
         "key_set": !cfg.llm.api_key.is_empty(),
-        "online": !omni_email::llm::is_local_endpoint(&cfg.ollama_endpoint),
+        "online": !omni_email::llm::is_local_endpoint(&cfg.llm.endpoint),
         "in_use": state.llm.current().describe(),
     })))
 }
@@ -3007,12 +3063,10 @@ pub async fn api_admin_save_llm(
         state.secrets.set(key_key, payload.api_key.trim()).map_err(internal_error("Could not store the API key."))?;
     } else if payload.clear_key {
         state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
-    } else if !same_base(&base, &cfg.ollama_endpoint) && !cfg.llm.api_key.is_empty() {
+    } else if !same_base(&base, &cfg.llm.endpoint) && !cfg.llm.api_key.is_empty() {
         // A new provider does not inherit the old one's key.
         state.secrets.remove(key_key).map_err(internal_error("Could not clear the API key."))?;
     }
-    cfg.ollama_endpoint = base;
-    cfg.ollama_model = model;
     cfg.llm = llm;
     cfg.save_to_file(&state.config_path).map_err(internal_error("Could not save the configuration."))?;
     let assist = omni_email::assist::Assist::from_config(&cfg);
@@ -3076,186 +3130,6 @@ pub async fn api_admin_llm_models(
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(serde_json::json!({ "models": models })))
-}
-
-#[derive(Deserialize)]
-pub struct SetupPayload {
-    /// The Graph mailbox (plan P4.7). All blank: no email ingest.
-    #[serde(default)]
-    graph_tenant_id: String,
-    #[serde(default)]
-    graph_client_id: String,
-    #[serde(default)]
-    graph_mailbox: String,
-    /// Blank keeps the stored secret.
-    #[serde(default)]
-    graph_client_secret: String,
-    ollama_endpoint: String,
-    ollama_model: String,
-    watchfolder_path: String,
-    /// Only honoured while no administrator exists.
-    admin_email: Option<String>,
-    admin_password: Option<String>,
-    admin_full_name: Option<String>,
-}
-
-/// First-run configuration (plan P2.4).
-///
-/// Unauthenticated, this route let anyone on the newsroom LAN repoint
-/// `watchfolder_path`. Every hardening in Phases 0–1 then guaranteed a correct,
-/// atomically delivered MXF — into the attacker's directory.
-pub async fn api_setup(State(state): State<AppState>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    if !setup_window_open(&parts, &state).await {
-        // 404, matching the page: there is nothing here for this caller.
-        return ApiError::not_found().into_response();
-    }
-
-    let bytes = match axum::body::to_bytes(body, 256 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return ApiError::bad_request("Malformed request body.").into_response(),
-    };
-    let payload: SetupPayload = match serde_json::from_slice(&bytes) {
-        Ok(p) => p,
-        Err(_) => return ApiError::bad_request("Malformed request body.").into_response(),
-    };
-
-    // The same endpoint rule as the LLM card, before anything is created or saved.
-    // The card is optional: a blank endpoint is saved as before, unvalidated.
-    let llm_base = payload.ollama_endpoint.trim().to_string();
-    let llm_blank = llm_base.is_empty();
-    if !llm_blank {
-        if let Err(e) = omni_email::llm::check_base_url(&llm_base) {
-            return ApiError::bad_request(e).into_response();
-        }
-    }
-
-    // A mapped drive letter or a relative path: the service could not use it.
-    // The form pre-fills the config's own value, which may be the default relative
-    // "watchfolder" (under the install folder), so judge the resolved path.
-    let watch = payload.watchfolder_path.trim().to_string();
-    let judged = if watch.is_empty() {
-        String::new()
-    } else {
-        state.config.read().await.resolve_path(&watch).to_string_lossy().into_owned()
-    };
-    if let Some(problem) = omni_core::paths::watchfolder_problem(&judged) {
-        return ApiError::bad_request(problem).into_response();
-    }
-
-    // Create the first administrator, if this is that moment.
-    let needs_admin = !state.repo.has_active_admin().unwrap_or(true);
-    if needs_admin {
-        let (Some(email), Some(password)) =
-            (payload.admin_email.as_deref(), payload.admin_password.as_deref())
-        else {
-            return ApiError::bad_request(
-                "Create the administrator account to finish setup.",
-            )
-            .into_response();
-        };
-        if let Err(e) = validate_password(password) {
-            return ApiError::bad_request(e).into_response();
-        }
-        if !email.contains('@') {
-            return ApiError::bad_request("A valid email address is required.").into_response();
-        }
-        let (new_email, new_password, new_name) = (
-            email.trim().to_string(),
-            password.to_string(),
-            payload
-                .admin_full_name
-                .as_deref()
-                .unwrap_or("System Administrator")
-                .trim()
-                .to_string(),
-        );
-        if let Err(e) = state
-            .argon(move |s| {
-                s.repo
-                    .create_user(&new_email, &new_password, UserRole::Admin, &new_name, None)?;
-                let _ = s.repo.log_audit(
-                    "WARN",
-                    "ADMIN",
-                    &format!("First-run administrator {new_email} created"),
-                );
-                Ok::<_, anyhow::Error>(())
-            })
-            .await
-        {
-            tracing::error!(error = ?e, "First-run admin creation failed");
-            return ApiError::bad_request("Could not create the administrator account.")
-                .into_response();
-        }
-    }
-
-    {
-        let mut cfg = state.config.write().await;
-        cfg.graph.tenant_id = payload.graph_tenant_id.trim().to_string();
-        cfg.graph.client_id = payload.graph_client_id.trim().to_string();
-        cfg.graph.mailbox = payload.graph_mailbox.trim().to_string();
-        let secret = payload.graph_client_secret.trim();
-        if !secret.is_empty() {
-            // Into the encrypted store, never into config.json (plan P2.6).
-            // The runtime copy is what the mail watcher reads.
-            if let Err(e) = state
-                .secrets
-                .set(omni_core::secrets::keys::GRAPH_CLIENT_SECRET, secret)
-            {
-                tracing::error!(error = ?e, "Storing the Graph client secret failed");
-                return ApiError::internal("Could not store the Graph client secret.")
-                    .into_response();
-            }
-            cfg.graph.client_secret = secret.to_string();
-        }
-        if !llm_blank && !same_base(&llm_base, &cfg.ollama_endpoint) && !cfg.llm.api_key.is_empty() {
-            // A new provider does not inherit the old one's key (as the LLM card).
-            if let Err(e) = state.secrets.remove(omni_core::secrets::keys::LLM_API_KEY) {
-                tracing::error!(error = ?e, "Clearing the LLM API key failed");
-                return ApiError::internal("Could not clear the API key.").into_response();
-            }
-            cfg.llm.api_key.clear();
-        }
-        cfg.ollama_endpoint = if llm_blank { payload.ollama_endpoint } else { llm_base };
-        cfg.ollama_model = payload.ollama_model;
-        cfg.watchfolder_path = watch;
-        if let Err(e) = cfg.save_to_file(&state.config_path) {
-            tracing::error!(error = ?e, "Saving config failed");
-            return ApiError::internal("Could not save the configuration.").into_response();
-        }
-        state.llm.replace(omni_email::assist::Assist::from_config(&cfg));
-    }
-    let _ = state
-        .repo
-        .log_audit("WARN", "ADMIN", "Configuration changed via /setup");
-
-    Json(serde_json::json!({"status": "ok"})).into_response()
-}
-
-/// Whether the first-run page should still be offered in the UI.
-/// Public, because the login page links to it and must know.
-///
-/// To whoever may use the page (an admin, or loopback before the first admin)
-/// it also returns the current mailbox settings, so a reopened page does not
-/// blank them. Never a secret: only whether one is set.
-pub async fn api_setup_state(State(state): State<AppState>, req: Request) -> Json<serde_json::Value> {
-    let (parts, _) = req.into_parts();
-    let mut out = serde_json::json!({
-        "needs_admin": !state.repo.has_active_admin().unwrap_or(true)
-    });
-    if setup_window_open(&parts, &state).await {
-        let cfg = state.config.read().await;
-        out["graph"] = serde_json::json!({
-            "tenant_id": cfg.graph.tenant_id,
-            "client_id": cfg.graph.client_id,
-            "mailbox": cfg.graph.mailbox,
-            "secret_set": !cfg.graph.client_secret.is_empty(),
-        });
-        out["watchfolder_path"] = serde_json::json!(cfg.watchfolder_path);
-        out["ollama_endpoint"] = serde_json::json!(cfg.ollama_endpoint);
-        out["ollama_model"] = serde_json::json!(cfg.ollama_model);
-    }
-    Json(out)
 }
 
 // ==========================================

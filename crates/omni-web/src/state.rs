@@ -127,6 +127,22 @@ pub struct AppState {
     /// The LLM assist in use, shared with the mail watcher: saving LLM
     /// settings in the admin panel swaps it without a restart (plan P4.22).
     pub llm: omni_email::assist::LiveAssist,
+    /// The mail settings the watcher reads with: saving the mail settings swaps
+    /// them without a restart (P11.11c), and a tool update asks for the mail
+    /// given up on to be read again (P11.11b). `None` in tests that have none;
+    /// a save then says a restart is needed.
+    pub mail: Option<omni_email::watcher::LiveMail>,
+    /// The watchfolder and archive the daemon delivers with (P13.2): a save
+    /// swaps them between jobs. `None` in tests that have none; a save then
+    /// says a restart is needed.
+    pub delivery: Option<crate::admin_delivery::LiveDelivery>,
+    /// Carries out «Επανεκκίνηση υπηρεσίας» (P13.2); `None` outside the Windows service.
+    pub restarter: Option<Arc<dyn crate::admin_delivery::ServiceRestarter>>,
+    /// Set while a restart is under way (P13.2b): a second request starts no
+    /// second helper and no second stop.
+    pub restarting: Arc<std::sync::atomic::AtomicBool>,
+    /// One diagnostics package at a time (P13.8b); held until its file is written.
+    pub diagnostics_lock: Arc<tokio::sync::Mutex<()>>,
     /// Jobs a worker is still busy with; a retry waits until it has stopped
     /// (plan P7.20). Shared with the worker pool by the daemon.
     pub busy_jobs: omni_core::busy::BusyJobs,
@@ -214,6 +230,11 @@ impl AppState {
             health: omni_core::health::HealthState::new(),
             tls_enabled,
             llm,
+            mail: None,
+            delivery: None,
+            restarter: None,
+            restarting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            diagnostics_lock: Arc::new(tokio::sync::Mutex::new(())),
             busy_jobs: omni_core::busy::BusyJobs::new(),
             temp_dir: None,
             site_runner: None,
@@ -442,6 +463,44 @@ impl AppState {
     pub fn with_llm(mut self, llm: omni_email::assist::LiveAssist) -> Self {
         self.llm = llm;
         self
+    }
+
+    /// Share the daemon's delivery paths with the admin panel (P13.2).
+    pub fn with_delivery(mut self, delivery: crate::admin_delivery::LiveDelivery) -> Self {
+        self.delivery = Some(delivery);
+        self
+    }
+
+    /// The service restart behind «Επανεκκίνηση υπηρεσίας» (P13.2).
+    pub fn with_restarter(mut self, restarter: Arc<dyn crate::admin_delivery::ServiceRestarter>) -> Self {
+        self.restarter = Some(restarter);
+        self
+    }
+
+    /// Share the mail watcher's live settings with the admin panel.
+    pub fn with_mail(mut self, mail: omni_email::watcher::LiveMail) -> Self {
+        self.mail = Some(mail);
+        self
+    }
+
+    /// Use the mailbox `graph` names from the next poll on (P11.11c). `false`
+    /// when there is no running watcher to tell: the change waits for a restart.
+    pub fn apply_mail_settings(&self, graph: &omni_core::config::GraphConfig) -> bool {
+        match &self.mail {
+            Some(live) => {
+                live.replace(omni_email::watcher::MailSettings::graph(graph));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A tool was updated or installed: the mail given up on gets its one more
+    /// reading after the next good poll (P11.11b).
+    pub fn tools_changed(&self) {
+        if let Some(live) = &self.mail {
+            live.arm_failed_retry(omni_email::watcher::RETRY_AFTER_TOOL_UPDATE);
+        }
     }
 
     /// Point the state at the daemon's real secret store.

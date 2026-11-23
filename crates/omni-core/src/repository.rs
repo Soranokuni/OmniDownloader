@@ -61,6 +61,35 @@ pub const AUDIT_KEEP_DAYS: i64 = 365;
 pub const MAIL_KEEP_DAYS: i64 = 90;
 /// Rows removed per transaction by the scheduled retention, so a lease heartbeat never waits long.
 pub const RETENTION_BATCH: i64 = 5000;
+/// The `mail_auto_retries.cause` of a mail a person asked to read again (P11.11b).
+pub const MAIL_RETRY_BY_A_PERSON: &str = "person";
+/// How `mail_reprocess.requested_by` starts for the system's own re-read (P11.11b).
+const MAIL_RETRY_AUTOMATIC_PREFIX: &str = "automatic (";
+/// Addresses one journalist may have (the journalist card refuses more too).
+pub const MAX_JOURNALIST_EMAILS: usize = 20;
+
+/// What [`Repository::add_journalist_email`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressAdded {
+    Added,
+    /// The address was already this journalist's: nothing changed.
+    AlreadyTheirs,
+    /// The address is another journalist's (their surname): nothing changed.
+    TakenBy(String),
+    NoSuchJournalist,
+    /// The journalist already has [`MAX_JOURNALIST_EMAILS`] addresses.
+    Full,
+}
+
+/// What [`Repository::add_new_journalist`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewJournalist {
+    Added,
+    /// The surname is on the list already: nothing changed.
+    AlreadyListed,
+    /// `address` belongs to the journalist `surname`: nothing changed.
+    AddressTaken { address: String, surname: String },
+}
 
 /// The finished jobs retention may delete: terminal, past the cutoff (?1), not held (?2 = batch).
 pub const PURGE_JOB_IDS_SQL: &str = "SELECT id FROM queue
@@ -828,9 +857,9 @@ impl Repository {
         // credentials on a box that can repoint the playout watchfolder is not
         // a convenience, it is a back door, and nothing ever removed it.
         //
-        // First run is instead: `omni-ingest setup`, or `/setup` served to a
-        // loopback client while no admin exists. Once an admin exists, that
-        // window closes.
+        // First run is instead the daemon's `Admin` / `Admin` account on a brand-new
+        // database (`ensure_default_admin`), which signs in only from this machine
+        // and is replaced by the setup wizard (P13.3: there is no /setup page).
         let admin_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1",
             [],
@@ -838,9 +867,10 @@ impl Repository {
         )?;
         if admin_count == 0 {
             warn!(
-                "No administrator account exists. Run `omni-ingest setup`, or open /setup in a \
-                 browser ON THIS MACHINE, to create one. Until then the panels cannot be \
-                 administered."
+                "No active administrator account exists yet. A new installation gets the \
+                 first-run account when the service starts; otherwise reactivate one with \
+                 `omni-ingest admin activate <login>`, or create one with \
+                 `omni-ingest admin create-admin <login>`. Until then the panels cannot be administered."
             );
         }
 
@@ -1054,11 +1084,24 @@ impl Repository {
     /// Priority is raised to the journalist's default if that is higher
     /// (defect D-20 -- `journalists.default_priority` was never applied).
     pub fn enqueue(&self, job: &NewJob, dedup_window_hours: i64) -> Result<Enqueued> {
+        self.enqueue_with(job, dedup_window_hours, false)
+    }
+
+    /// [`Self::enqueue`] for a job the system makes again on its own from a mail
+    /// it re-reads automatically (P11.11b): a link delivered recently under *any*
+    /// journalist is a duplicate, as for a second chance. MCR may have queued the
+    /// failed mail's link by hand under the right name while the mail itself
+    /// went to the `MCR` placeholder; a second job would be a second MXF on air.
+    pub fn enqueue_automatic(&self, job: &NewJob, dedup_window_hours: i64) -> Result<Enqueued> {
+        self.enqueue_with(job, dedup_window_hours, true)
+    }
+
+    fn enqueue_with(&self, job: &NewJob, dedup_window_hours: i64, any_journalist_for_completed: bool) -> Result<Enqueued> {
         let normalized = crate::urlnorm::normalize(&job.url);
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        match Self::duplicate_of(&tx, &normalized, &job.journalist, dedup_window_hours, None, false)? {
+        match Self::duplicate_of(&tx, &normalized, &job.journalist, dedup_window_hours, None, any_journalist_for_completed)? {
             Some(Duplicate::Active(existing_id)) => {
                 tx.commit()?;
                 self.log_audit(
@@ -1472,6 +1515,54 @@ impl Repository {
             bus.job(id, JobStatus::RequiresReview.as_str(), None, None);
         }
         Ok(true)
+    }
+
+    /// The watchfolder is being changed (P13.2) with no job running: every
+    /// finished video still queued to wait for the old folder goes to review as
+    /// DELIVERY_UNCONFIRMED with `message`, as [`Self::review_waiting_delivery`]
+    /// does for one (event, audit row, the P10.16b note); its file, marker and
+    /// wait are kept, and nothing is delivered to the new folder on its own.
+    /// Returns the jobs moved.
+    pub fn review_parked_deliveries(&self, message: &str) -> Result<Vec<i64>> {
+        let mut conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM queue WHERE delivery_wait = 1 AND status = 'PENDING' ORDER BY id")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut moved = Vec::new();
+        for id in ids {
+            let n = tx.execute(
+                "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+                 error_code='DELIVERY_UNCONFIRMED', first_error_code = COALESCE(first_error_code, 'DELIVERY_UNCONFIRMED'),
+                 error_message=?, completed_at=?, updated_at=?
+                 WHERE id=? AND status='PENDING' AND delivery_wait = 1",
+                params![message, now, now, id],
+            )?;
+            if n != 1 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
+                params![id, now, message],
+            )?;
+            tx.execute(
+                "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+                params![format!("Job {id}: {message}"), now],
+            )?;
+            Self::close_waiting_auto_delivery(&tx, id, &now)?;
+            moved.push(id);
+        }
+        tx.commit()?;
+        for id in &moved {
+            count_finished(JobStatus::RequiresReview);
+            if let Some(bus) = &self.events {
+                bus.job(*id, JobStatus::RequiresReview.as_str(), None, None);
+            }
+        }
+        Ok(moved)
     }
 
     /// A waiting job leaves the wait without a proven delivery (P11.2b): to
@@ -3017,6 +3108,19 @@ impl Repository {
         Ok(list)
     }
 
+    /// The last `limit` jobs that ended without a delivery (FAILED, in
+    /// review, or waiting for a manual download), newest first: the
+    /// diagnostics package (P13.8).
+    pub fn recent_failed_jobs(&self, limit: usize) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM queue WHERE status IN ('FAILED','REQUIRES_REVIEW','MANUAL_DOWNLOAD')
+             ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::map_job_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn get_jobs_by_journalist(&self, journalist: &str) -> Result<Vec<Job>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT * FROM queue WHERE journalist = ? ORDER BY created_at DESC")?;
@@ -3907,10 +4011,8 @@ impl Repository {
 
     /// Whether any active administrator exists.
     ///
-    /// The `/setup` first-run window is open exactly while this is false, so it
-    /// is asked on every request to that route rather than cached: an admin
-    /// created through the CLI while the daemon runs must close the window
-    /// immediately, without a restart.
+    /// Asked, not cached: an account reactivated from the command line while the
+    /// daemon runs counts at once.
     pub fn has_active_admin(&self) -> Result<bool> {
         let conn = self.pool.get()?;
         let count: i64 = conn.query_row(
@@ -4763,6 +4865,79 @@ impl Repository {
         Ok(())
     }
 
+    /// Add `address` to the addresses of the journalist `surname` (P11.11a: MCR's «Να το
+    /// θυμάμαι για αυτή τη διεύθυνση»), so the next mail from it is filed under them. An
+    /// address already on someone else is never moved: the parser takes the first journalist
+    /// an address is on, and a silent move would refile their mail. Checked and written in
+    /// one transaction, so two desks cannot give one address to two people.
+    pub fn add_journalist_email(&self, surname: &str, address: &str) -> Result<AddressAdded> {
+        let address = address.trim().to_lowercase();
+        let surname = surname.trim().to_uppercase();
+        if address.is_empty() || !address.contains('@') {
+            anyhow::bail!("not an email address");
+        }
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT surname, emails FROM journalists ORDER BY surname")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut target: Option<Vec<String>> = None;
+        for (who, raw) in &rows {
+            let emails: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+            if emails.iter().any(|e| e.trim().to_lowercase() == address) {
+                return Ok(if *who == surname { AddressAdded::AlreadyTheirs } else { AddressAdded::TakenBy(who.clone()) });
+            }
+            if *who == surname {
+                target = Some(emails);
+            }
+        }
+        let Some(mut emails) = target else { return Ok(AddressAdded::NoSuchJournalist) };
+        if emails.len() >= MAX_JOURNALIST_EMAILS {
+            return Ok(AddressAdded::Full);
+        }
+        emails.push(address);
+        tx.execute(
+            "UPDATE journalists SET emails = ? WHERE surname = ?",
+            params![serde_json::to_string(&emails)?, surname],
+        )?;
+        tx.commit()?;
+        Ok(AddressAdded::Added)
+    }
+
+    /// Add a journalist who is not on the list (P13.4b, the wizard's import):
+    /// never changes one who is, and refuses an address that belongs to
+    /// someone else. The check and the insert are one transaction, so a save
+    /// on the desk between an import's preview and the import is kept.
+    pub fn add_new_journalist(&self, surname: &str, full_name: &str, emails: &[String]) -> Result<NewJournalist> {
+        let surname = surname.trim().to_uppercase();
+        let emails: Vec<String> = emails.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT surname, emails FROM journalists ORDER BY surname")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if rows.iter().any(|(who, _)| *who == surname) {
+            return Ok(NewJournalist::AlreadyListed);
+        }
+        for (who, raw) in &rows {
+            let theirs: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+            if let Some(address) = emails.iter().find(|e| theirs.iter().any(|t| t.trim().to_lowercase() == **e)) {
+                return Ok(NewJournalist::AddressTaken { address: address.clone(), surname: who.clone() });
+            }
+        }
+        let n = tx.execute(
+            "INSERT INTO journalists (surname, full_name, emails, default_priority) VALUES (?, ?, ?, 0)
+             ON CONFLICT(surname) DO NOTHING",
+            params![surname, full_name, serde_json::to_string(&emails)?],
+        )?;
+        tx.commit()?;
+        Ok(if n == 1 { NewJournalist::Added } else { NewJournalist::AlreadyListed })
+    }
+
     pub fn delete_journalist(&self, surname: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM journalists WHERE surname = ?", params![surname.to_uppercase()])?;
@@ -5268,6 +5443,12 @@ impl Repository {
             "#,
             params![m.internet_message_id, source, timestamps::now_string(), requested_by],
         )?;
+        // A mail a person asked to read again is theirs: the system never adds its own
+        // automatic reading after that (P11.11b).
+        conn.execute(
+            "INSERT OR IGNORE INTO mail_auto_retries (internet_message_id, requested_at, cause) VALUES (?, ?, ?)",
+            params![m.internet_message_id, timestamps::now_string(), MAIL_RETRY_BY_A_PERSON],
+        )?;
         Ok(m)
     }
 
@@ -5293,6 +5474,77 @@ impl Repository {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM mail_reprocess WHERE internet_message_id = ?", params![internet_message_id])?;
         Ok(())
+    }
+
+    /// Ask the watcher to read again, once, every mail it gave up on (FAILED) that was
+    /// received at or after `since` (P11.11b). A mail that already had its automatic chance,
+    /// one waiting for a reprocess a person asked for, and one with no mailbox id are left
+    /// alone. Returns the (Message-ID, subject) of each mail queued for its chance.
+    pub fn request_failed_mail_auto_retry(&self, since: DateTime<Utc>, cause: &str) -> Result<Vec<(String, Option<String>)>> {
+        let now = timestamps::now_string();
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let due: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT p.internet_message_id, p.source_id, p.subject FROM processed_mail p
+                WHERE p.outcome = 'FAILED'
+                  AND COALESCE(p.received_at, p.processed_at) >= ?1
+                  AND p.source_id IS NOT NULL AND TRIM(p.source_id) <> ''
+                  AND NOT EXISTS (SELECT 1 FROM mail_auto_retries a WHERE a.internet_message_id = p.internet_message_id)
+                  AND NOT EXISTS (SELECT 1 FROM mail_reprocess r WHERE r.internet_message_id = p.internet_message_id)
+                  -- A mail that made any job before it failed is left to a person: MCR may
+                  -- have cancelled, reviewed or finished those jobs, and a re-read would undo it.
+                  AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.email_message_id = p.internet_message_id)
+                ORDER BY COALESCE(p.received_at, p.processed_at)
+                "#,
+            )?;
+            let rows = stmt.query_map(params![timestamps::format(since)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (key, source, _) in &due {
+            tx.execute(
+                "INSERT INTO mail_auto_retries (internet_message_id, requested_at, cause) VALUES (?, ?, ?)",
+                params![key, now, cause],
+            )?;
+            tx.execute(
+                "INSERT INTO mail_reprocess (internet_message_id, source_id, requested_at, requested_by) VALUES (?, ?, ?, ?)",
+                params![key, source, now, format!("{MAIL_RETRY_AUTOMATIC_PREFIX}{cause})")],
+            )?;
+        }
+        // The chance of a mail long past every window is no longer needed.
+        tx.execute(
+            "DELETE FROM mail_auto_retries WHERE requested_at < ?",
+            params![timestamps::format(Utc::now() - Duration::days(MAIL_KEEP_DAYS))],
+        )?;
+        tx.commit()?;
+        Ok(due.into_iter().map(|(k, _, s)| (k, s)).collect())
+    }
+
+    /// Whether the pending reprocess of `internet_message_id` is the system's own
+    /// automatic re-read (P11.11b), not one a person asked for.
+    pub fn mail_reprocess_is_automatic(&self, internet_message_id: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let by: Option<Option<String>> = conn
+            .query_row(
+                "SELECT requested_by FROM mail_reprocess WHERE internet_message_id = ?",
+                params![internet_message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(by.flatten().is_some_and(|b| b.starts_with(MAIL_RETRY_AUTOMATIC_PREFIX)))
+    }
+
+    /// When and why the mail `internet_message_id` was read again automatically, if it was.
+    pub fn mail_auto_retry(&self, internet_message_id: &str) -> Result<Option<(Option<DateTime<Utc>>, String)>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(
+                "SELECT requested_at, cause FROM mail_auto_retries WHERE internet_message_id = ?",
+                params![internet_message_id],
+                |r| Ok((timestamps::parse_opt(r.get::<_, Option<String>>(0)?), r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// Forget that a mail was handled, so it is parsed as new. Only the
