@@ -120,14 +120,82 @@ mod os {
     }
 }
 
-/// Write the entry for `dir` into the Start menu; a line for setup.log when it could not.
-pub fn install(dir: &Path) -> Result<PathBuf, String> {
+/// Who an existing entry belongs to (P13.9b).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// No entry.
+    Absent,
+    /// It runs this installation's omni-ingest.exe.
+    Ours,
+    /// It runs another installation's; the target it names.
+    Other(PathBuf),
+    /// It could not be read; never touched.
+    Unreadable(String),
+}
+
+/// What [`install`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Placed {
+    Written(PathBuf),
+    /// An entry of another installation, or one that cannot be read, is kept.
+    Kept(Owner),
+}
+
+/// What [`remove`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Removed {
+    Removed(PathBuf),
+    /// No entry, or one that is not provably this installation's (kept).
+    Kept(Owner),
+}
+
+/// Whose is the entry at `path`. The target is the path stored in the entry,
+/// which stays readable after the program it names was deleted (uninstall
+/// removes the files first).
+#[cfg(windows)]
+fn owner(path: &Path, dir: &Path) -> Owner {
+    if !path.exists() {
+        return Owner::Absent;
+    }
+    match os::read(path) {
+        Ok((target, _, _)) if points_at(&target, dir) => Owner::Ours,
+        Ok((target, _, _)) => Owner::Other(target),
+        Err(e) => Owner::Unreadable(format!("{e:#}")),
+    }
+}
+
+/// [`install`] into `folder` (tests use a temporary folder).
+#[cfg(windows)]
+pub fn install_in(folder: &Path, dir: &Path) -> Result<Placed, String> {
+    let path = folder.join(SHORTCUT_FILE);
+    match owner(&path, dir) {
+        Owner::Absent | Owner::Ours => {
+            os::write(&path, &spec(dir)).map_err(|e| format!("{e:#}"))?;
+            Ok(Placed::Written(path))
+        }
+        kept => Ok(Placed::Kept(kept)),
+    }
+}
+
+/// [`remove`] from `folder` (tests use a temporary folder): only an entry
+/// that provably runs this installation.
+#[cfg(windows)]
+pub fn remove_in(folder: &Path, dir: &Path) -> Result<Removed, String> {
+    let path = folder.join(SHORTCUT_FILE);
+    match owner(&path, dir) {
+        Owner::Ours => {
+            std::fs::remove_file(&path).map_err(|e| format!("Cannot remove {}: {e}", path.display()))?;
+            Ok(Removed::Removed(path))
+        }
+        kept => Ok(Removed::Kept(kept)),
+    }
+}
+
+/// Write the entry for `dir` into the Start menu (all users).
+pub fn install(dir: &Path) -> Result<Placed, String> {
     #[cfg(windows)]
     {
-        let folder = os::programs_dir().map_err(|e| format!("{e:#}"))?;
-        let path = folder.join(SHORTCUT_FILE);
-        os::write(&path, &spec(dir)).map_err(|e| format!("{e:#}"))?;
-        Ok(path)
+        install_in(&os::programs_dir().map_err(|e| format!("{e:#}"))?, dir)
     }
     #[cfg(not(windows))]
     {
@@ -136,44 +204,43 @@ pub fn install(dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// What [`remove`] did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Removed {
-    Removed(PathBuf),
-    /// No entry.
-    Absent,
-    /// The entry points at another installation; kept.
-    Other(PathBuf),
-}
-
-/// Remove the entry when it points at the installation in `dir`.
+/// Remove the entry when it runs the installation in `dir`.
 pub fn remove(dir: &Path) -> Result<Removed, String> {
     #[cfg(windows)]
     {
-        let folder = os::programs_dir().map_err(|e| format!("{e:#}"))?;
-        remove_in(&folder, dir)
+        remove_in(&os::programs_dir().map_err(|e| format!("{e:#}"))?, dir)
     }
     #[cfg(not(windows))]
     {
         let _ = dir;
-        Ok(Removed::Absent)
+        Ok(Removed::Kept(Owner::Absent))
     }
 }
 
-/// [`remove`] for the entry in `folder` (tests use a temporary folder).
-#[cfg(windows)]
-pub fn remove_in(folder: &Path, dir: &Path) -> Result<Removed, String> {
-    let path = folder.join(SHORTCUT_FILE);
-    if !path.exists() {
-        return Ok(Removed::Absent);
+fn kept_line(owner: &Owner) -> Option<String> {
+    match owner {
+        Owner::Absent | Owner::Ours => None,
+        Owner::Other(target) => Some(format!("  The Start-menu sign-in entry runs {}; it is kept.", target.display())),
+        Owner::Unreadable(why) => Some(format!("! The Start-menu sign-in entry could not be read ({why}); it is kept.")),
     }
-    // An entry that cannot be read is ours by name: it is removed.
-    let target = os::read(&path).map(|(t, _, _)| t).unwrap_or_else(|_| dir.join("omni-ingest.exe"));
-    if !points_at(&target, dir) {
-        return Ok(Removed::Other(target));
+}
+
+/// The setup.log line for what [`install`] did.
+pub fn install_line(done: &Result<Placed, String>) -> String {
+    match done {
+        Ok(Placed::Written(path)) => format!("  Start menu: {}", path.display()),
+        Ok(Placed::Kept(owner)) => kept_line(owner).unwrap_or_default(),
+        Err(e) => format!("! The Start-menu entry for site sign-in was not written ({e}); run `omni-ingest cookies sign-in` from an Administrator prompt instead."),
     }
-    std::fs::remove_file(&path).map_err(|e| format!("Cannot remove {}: {e}", path.display()))?;
-    Ok(Removed::Removed(path))
+}
+
+/// The setup.log line for what [`remove`] did; none when nothing is worth saying.
+pub fn remove_line(done: &Result<Removed, String>) -> Option<String> {
+    match done {
+        Ok(Removed::Removed(_)) => None,
+        Ok(Removed::Kept(owner)) => kept_line(owner),
+        Err(e) => Some(format!("! The Start-menu sign-in entry was not removed ({e}).")),
+    }
 }
 
 #[cfg(windows)]
@@ -209,10 +276,43 @@ mod tests {
         assert_eq!((args.as_str(), runas), ("cookies sign-in", true));
 
         let other = tmp.path().join("other-install");
-        assert!(matches!(remove_in(tmp.path(), &other).unwrap(), Removed::Other(_)));
+        assert!(matches!(remove_in(tmp.path(), &other).unwrap(), Removed::Kept(Owner::Other(_))));
         assert!(path.exists(), "another installation's entry is kept");
+        // P13.9b: uninstall removes the files first; the stored target still names them.
+        std::fs::remove_dir_all(&ours).unwrap();
+        assert!(points_at(&read(&path).unwrap().0, &ours), "the target is read with the program gone");
         assert_eq!(remove_in(tmp.path(), &ours).unwrap(), Removed::Removed(path.clone()));
         assert!(!path.exists());
-        assert_eq!(remove_in(tmp.path(), &ours).unwrap(), Removed::Absent);
+        assert_eq!(remove_in(tmp.path(), &ours).unwrap(), Removed::Kept(Owner::Absent));
+    }
+
+    /// P13.9b: install keeps another installation's entry, and an entry that
+    /// cannot be read is never touched; both are logged.
+    #[cfg(windows)]
+    #[test]
+    fn another_installations_entry_and_an_unreadable_one_are_kept_and_logged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ours, other) = (tmp.path().join("ours"), tmp.path().join("other"));
+        let path = tmp.path().join(SHORTCUT_FILE);
+        write(&path, &spec(&other)).unwrap();
+
+        let placed = install_in(tmp.path(), &ours);
+        assert!(matches!(placed, Ok(Placed::Kept(Owner::Other(_)))), "{placed:?}");
+        assert!(points_at(&read(&path).unwrap().0, &other), "the other installation's entry is unchanged");
+        assert!(install_line(&placed).contains("it is kept"), "{}", install_line(&placed));
+
+        // Our own entry is rewritten in place.
+        std::fs::remove_file(&path).unwrap();
+        write(&path, &spec(&ours)).unwrap();
+        assert_eq!(install_in(tmp.path(), &ours).unwrap(), Placed::Written(path.clone()));
+
+        // Not a shortcut at all: never removed, never overwritten.
+        std::fs::write(&path, b"not a shortcut").unwrap();
+        let removed = remove_in(tmp.path(), &ours);
+        assert!(matches!(removed, Ok(Removed::Kept(Owner::Unreadable(_)))), "{removed:?}");
+        assert!(remove_line(&removed).unwrap().contains("could not be read"));
+        assert!(matches!(install_in(tmp.path(), &ours), Ok(Placed::Kept(Owner::Unreadable(_)))));
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a shortcut");
+        assert_eq!(remove_line(&Ok(Removed::Removed(path.clone()))), None);
     }
 }

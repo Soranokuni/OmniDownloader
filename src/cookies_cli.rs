@@ -45,7 +45,30 @@ pub fn explain_access(e: anyhow::Error) -> anyhow::Error {
 }
 
 pub async fn run(paths: &AppPaths, action: CookiesAction) -> Result<()> {
-    run_inner(paths, action).await.map_err(explain_access)
+    // From the Start menu (P13.9) the window closes with the process: whatever
+    // happens, from reading the settings on, it waits for Enter (P13.9b).
+    run_with(paths, action, &mut std::io::stdin().lock(), &mut std::io::stdout()).await
+}
+
+/// [`run`] with the window's input and output given (tests).
+pub async fn run_with(paths: &AppPaths, action: CookiesAction, input: &mut dyn std::io::BufRead, screen: &mut dyn std::io::Write) -> Result<()> {
+    let windowed = matches!(action, CookiesAction::SignIn { domain: None, .. });
+    let out = run_inner(paths, action).await.map_err(explain_access);
+    if windowed {
+        hold_window(&out, input, screen);
+    }
+    out
+}
+
+/// Show the error, if any, and wait for Enter before the window closes.
+pub fn hold_window(out: &Result<()>, input: &mut dyn std::io::BufRead, screen: &mut dyn std::io::Write) {
+    if let Err(e) = out {
+        let _ = writeln!(screen, "\n{e:#}");
+    }
+    let _ = writeln!(screen, "\nPress Enter to close this window. / Πατήστε Enter για να κλείσει το παράθυρο.");
+    let _ = screen.flush();
+    let mut line = String::new();
+    let _ = input.read_line(&mut line);
 }
 
 async fn run_inner(paths: &AppPaths, action: CookiesAction) -> Result<()> {
@@ -54,25 +77,16 @@ async fn run_inner(paths: &AppPaths, action: CookiesAction) -> Result<()> {
     match action {
         CookiesAction::List => list(&repo),
         CookiesAction::SignIn { domain: Some(domain), browser } => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
-        // From the Start menu (P13.9): choose a site, and keep the window open to read the result.
+        // From the Start menu (P13.9): choose a site; `run` keeps the window open.
         CookiesAction::SignIn { domain: None, browser } => {
-            let stdin = std::io::stdin();
-            let picked = pick_site(&mut stdin.lock(), &mut std::io::stdout());
-            let out = match picked {
-                Ok(Some(domain)) => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
-                Ok(None) => {
+            let picked = pick_site(&mut std::io::stdin().lock(), &mut std::io::stdout())?;
+            match picked {
+                Some(domain) => sign_in(paths, &config, &repo, &domain, browser.as_deref()).await,
+                None => {
                     println!("Nothing was changed. / Δεν άλλαξε τίποτα.");
                     Ok(())
                 }
-                Err(e) => Err(e),
-            };
-            if let Err(e) = &out {
-                println!("\n{:#}", explain_access(anyhow::anyhow!("{e:#}")));
             }
-            println!("\nPress Enter to close this window. / Πατήστε Enter για να κλείσει το παράθυρο.");
-            let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
-            out
         }
     }
 }
@@ -211,6 +225,26 @@ mod tests {
         let mut out = Vec::new();
         let got = pick_site(&mut answers.as_bytes(), &mut out);
         (got, String::from_utf8(out).unwrap())
+    }
+
+    /// P13.9b: from the Start menu, an error before the site list (settings
+    /// that cannot be read) is shown and the window waits for Enter.
+    #[tokio::test]
+    async fn an_error_before_the_list_keeps_the_window_open_with_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{ not json").unwrap();
+        let paths = AppPaths::with_root(dir.path(), "config.json");
+        let mut screen = Vec::new();
+        let out = run_with(&paths, CookiesAction::SignIn { domain: None, browser: None }, &mut "\n".as_bytes(), &mut screen).await;
+        assert!(out.is_err());
+        let shown = String::from_utf8(screen).unwrap();
+        assert!(shown.contains("not valid JSON") && shown.contains("Press Enter"), "{shown}");
+
+        // With a site named (a prompt the operator opened), nothing waits.
+        let mut screen = Vec::new();
+        let named = CookiesAction::SignIn { domain: Some("x.com".into()), browser: None };
+        assert!(run_with(&paths, named, &mut "".as_bytes(), &mut screen).await.is_err());
+        assert!(screen.is_empty());
     }
 
     /// P13.9: the Start-menu entry's site list.

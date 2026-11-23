@@ -256,9 +256,9 @@ pub fn after_install(report: &InstallReport, dir: &Path, verified: &mut Verified
     }
     write_apps_entry(dir, log);
     // P13.9: the Start-menu entry for signing a site in, without a terminal.
-    match crate::shortcut::install(dir) {
-        Ok(path) => log.say(&format!("  Start menu: {}", path.display())),
-        Err(e) => log.say(&format!("! The Start-menu entry for site sign-in was not written ({e}); run `omni-ingest cookies sign-in` from an Administrator prompt instead.")),
+    let line = crate::shortcut::install_line(&crate::shortcut::install(dir));
+    if !line.is_empty() {
+        log.say(&line);
     }
     match (report.kind, parse_admin_url(&report.admin_url)) {
         (InstallKind::Fresh, Some((tls, port))) => Done::OpenAdmin { tls, port },
@@ -542,12 +542,8 @@ pub async fn uninstall_execute(
         say(log, "  The Apps & Features entry belongs to another installation; it is kept.");
     }
     // P13.9: the Start-menu sign-in entry goes with the installation it points at.
-    match crate::shortcut::remove(root) {
-        Ok(crate::shortcut::Removed::Removed(_)) | Ok(crate::shortcut::Removed::Absent) => {}
-        Ok(crate::shortcut::Removed::Other(target)) => {
-            say(log, &format!("  The Start-menu sign-in entry runs {}; it is kept.", target.display()));
-        }
-        Err(e) => say(log, &format!("! The Start-menu sign-in entry was not removed ({e}).")),
+    if let Some(line) = crate::shortcut::remove_line(&crate::shortcut::remove(root)) {
+        say(log, &line);
     }
     if !remove_data && with_files {
         say(log, &format!("  The configuration, database and logs stay in {}.", root.display()));

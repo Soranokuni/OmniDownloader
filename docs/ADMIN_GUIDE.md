@@ -853,7 +853,7 @@ stored. The Cookies card shows this command ready to copy.
 the sites (1 youtube.com, 2 x.com, 3 facebook.com, 4 instagram.com, or type
 another site's domain; Enter alone stops) and then runs the same sign-in; the
 window stays open until you press Enter, so the result can be read. Uninstall
-removes the entry (one that points at another installation is kept).
+removes the entry. An entry that runs another installation, or one that cannot be read, is never replaced or removed; setup.log says so.
 
 `youtu.be` uses the `youtube.com` jar; `twitter.com` is stored as `x.com`.
 Every jar is re-tested nightly; the `cookies` health line warns 7 days before
