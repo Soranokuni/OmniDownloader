@@ -378,10 +378,13 @@ is only in the panel, under «Τεχνικές λεπτομέρειες», for s
 
 ### 4.8 Keeping the lists tidy
 
-- «Αφαίρεση παραδοθέντων από τη λίστα» (Completed tab) clears delivered jobs
-  from view.
-- In «Χρειάζονται έλεγχο», filter by journalist, or
-  «Απόκρυψη παλαιότερων από 3 ημέρες» (hide older than 3 days).
+- «Αφαίρεση παραδοθέντων από τη λίστα» («Σε εξέλιξη» tab) takes delivered
+  videos off that list; they stay in «Ολοκληρωμένα».
+- In «Χρειάζονται έλεγχο», filter by journalist, search for a file name, word
+  or link, or «Απόκρυψη παλαιότερων από 3 ημέρες» (hide older than 3 days);
+  hidden ones come back with «Εμφάνιση κρυμμένων (N)».
+- In «Ολοκληρωμένα», filter by journalist and by group («Χωρίς ομάδα» for
+  those without one), or search for a file name, word or link.
 
 ### 4.9 Late videos («Καθυστερούν»)
 
@@ -513,7 +516,7 @@ The card always says why in Greek. The usual ones:
 | «Περιμένει τον φάκελο παράδοσης» | nothing to do: it is delivered when the watchfolder answers (§4.10). If it lasts, tell the administrator. |
 | «Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε…» | check Dalet first: there, «Το έβαλα στο Dalet»; not there, «Δοκιμή ξανά» (§4.10). |
 | Failed the broadcast check | the file was *not* delivered. Retry once; if it fails again, report it with the «Τεχνικές λεπτομέρειες». |
-| File locker (WeTransfer, MyAirBridge, TransferNow, Filemail, MEGA, or a shared folder) | not downloaded automatically: download by hand, then «Το έβαλα στο Dalet». A link to one file on Dropbox, Google Drive, OneDrive or SharePoint is downloaded by itself like any video. |
+| File locker (WeTransfer, MyAirBridge, TransferNow, Filemail, MEGA, or a shared folder) | download by hand, then «Το έβαλα στο Dalet». If the administrator has switched on the browser capture, the system first tries the page once by itself; when that fails, the card names the service and why. A link to one file on Dropbox, Google Drive, OneDrive or SharePoint is downloaded by itself like any video, unless the administrator switched that off (the card then says so) or the file is over the size limit. |
 
 Nothing is ever overwritten in the Dalet watchfolder, and a file appears there
 only when it is complete.
