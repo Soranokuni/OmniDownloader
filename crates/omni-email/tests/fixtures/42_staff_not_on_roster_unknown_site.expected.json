@@ -1,0 +1,32 @@
+{
+  "ignored_urls": [],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.2,
+          "index_str": "1",
+          "keyword": "PARKO",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "other",
+          "url": "https://www.municipality.example/news/2026/11/egkainia-parkou"
+        }
+      ],
+      "keyword": "PARKO",
+      "title": "ΠΑΡΚΟ"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

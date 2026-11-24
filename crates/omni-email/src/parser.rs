@@ -200,6 +200,9 @@ pub mod warnings {
     /// [`LOCKER_NOTICE`]'s detail when the mail was the service's but no
     /// template recognised it, and it holds a link to files: MCR checks it.
     pub const LOCKER_NOTICE_FILE_LINK: &str = "UNRECOGNISED_WITH_FILE_LINK";
+    /// A mail from outside the newsroom linked to sites the parser does not
+    /// know; those links were not queued (P15.2). MCR may queue them by hand.
+    pub const OUTSIDER_UNKNOWN_SITES: &str = "OUTSIDER_UNKNOWN_SITES";
     pub const SECTION_WITHOUT_LINKS: &str = "SECTION_WITHOUT_LINKS";
     pub const DUPLICATE_SECTION_NUMBER: &str = "DUPLICATE_SECTION_NUMBER";
     pub const MARKER_WITHOUT_URL: &str = "MARKER_WITHOUT_URL";
@@ -1223,6 +1226,62 @@ fn percent_decoded(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Public mail providers: an address there says nothing about the newsroom,
+/// so their domains are never the station's own (P15.2). Exact registrable
+/// domains, and families under any suffix (`hotmail.co.uk`).
+const PUBLIC_MAIL_DOMAINS: &[&str] = &[
+    "gmail.com",
+    "googlemail.com",
+    "msn.com",
+    "ymail.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+    "otenet.gr",
+    "windowslive.com",
+];
+const PUBLIC_MAIL_FAMILIES: &[&str] = &["hotmail", "outlook", "live", "yahoo"];
+
+fn is_public_mail_domain(domain: &str) -> bool {
+    let site = omni_core::psl::registrable(domain);
+    PUBLIC_MAIL_DOMAINS.contains(&site.as_str())
+        || site.split('.').next().is_some_and(|first| PUBLIC_MAIL_FAMILIES.contains(&first))
+}
+
+/// The lowercased domain of a mail address, if it has one.
+fn mail_domain(address: &str) -> Option<String> {
+    let a = address.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase();
+    a.rsplit_once('@').map(|(_, d)| d.trim_end_matches('.').to_string()).filter(|d| !d.is_empty())
+}
+
+/// Whether a mail from `from` comes from outside the newsroom (P15.2): the
+/// address is on no roster entry, and its domain is neither one of the
+/// roster's own domains nor under one. The own domains are those of the
+/// roster's addresses, public mail providers left out; nothing is
+/// configured. A roster that yields no own domain (a fresh installation, a
+/// roster without addresses) makes nobody an outsider: unknown sites are
+/// tried, as before.
+pub fn is_outsider(from: &str, roster: &[Journalist]) -> bool {
+    let addr = from.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase();
+    if roster.iter().flat_map(|j| j.emails.iter()).any(|e| e.trim().eq_ignore_ascii_case(&addr)) {
+        return false;
+    }
+    let own: Vec<String> = roster
+        .iter()
+        .flat_map(|j| j.emails.iter())
+        .filter_map(|e| mail_domain(e))
+        .filter(|d| !is_public_mail_domain(d))
+        .collect();
+    if own.is_empty() {
+        return false;
+    }
+    let Some(domain) = mail_domain(&addr) else { return true };
+    !own.iter().any(|d| domain == *d || domain.ends_with(&format!(".{d}")))
+}
+
 /// Whether `url` is one of a transfer service's own pages rather than the
 /// link to the files (P15.1): its front page, help, legal or contact pages,
 /// mail images. Never a job.
@@ -1867,6 +1926,11 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     // A service mail no template recognised, yet with a link to files: still
     // no job, but MCR is told to look (P15.1).
     let mut unrecognised_file_link = false;
+    // A mail from outside the newsroom (P15.2): a link to a site the parser
+    // does not know is held for MCR instead of fetched. Staff mail keeps the
+    // owner's rule that such a site is tried (2026-10-05).
+    let outsider = is_outsider(&mail.from_address, roster);
+    let mut held_unknown = false;
 
     let urgent = {
         let s = translit(&mail.subject);
@@ -1971,6 +2035,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
         let any_marked = candidates.iter().any(|(_, t, m)| *m && !matches!(t, Tier::Locker | Tier::Image));
 
         let mut selected: Vec<(String, Tier, bool)> = Vec::new();
+        let mut held_in_section = false;
         for (u, tier, m) in candidates {
             let take = match tier {
                 Tier::Locker => true,
@@ -1984,14 +2049,23 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
             if tier == Tier::Image {
                 images += 1;
             }
-            if take {
+            // P15.2: an outsider's link to an unknown site that would have
+            // been tried (marked, called video, story-like) waits for MCR.
+            // Decided after the marker, so narrowing is as before.
+            let hold = take && outsider && tier == Tier::Other;
+            if hold {
+                held_in_section = true;
+                held_unknown = true;
+            }
+            if take && !hold {
                 selected.push((u, tier, m));
             } else {
                 ignored_urls.push(u);
             }
         }
 
-        if selected.is_empty() && s.header.is_some() {
+        // A section whose links were held is not «without links».
+        if selected.is_empty() && s.header.is_some() && !held_in_section {
             warnings.push(Warning::new(warnings::SECTION_WITHOUT_LINKS, Some(s.index.clone())));
         }
 
@@ -2142,6 +2216,9 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     if quiet {
         let detail = unrecognised_file_link.then(|| warnings::LOCKER_NOTICE_FILE_LINK.to_string());
         warnings.push(Warning::new(warnings::LOCKER_NOTICE, detail));
+    }
+    if held_unknown {
+        warnings.push(Warning::new(warnings::OUTSIDER_UNKNOWN_SITES, None));
     }
     let outcome = if job_count > 0 {
         Outcome::Jobs
@@ -2503,6 +2580,37 @@ mod tests {
         // P15.1: SwissTransfer and MyAirBridge's short links are lockers.
         assert_eq!(classify("https://www.swisstransfer.com/d/0a1b2c3d", &c), Tier::Locker);
         assert_eq!(classify("https://mab.to/t/AbC123/eu1", &c), Tier::Locker);
+    }
+
+    /// P15.2: who is outside the newsroom, from the roster alone.
+    #[test]
+    fn outsiders_are_told_apart_by_roster_address_and_own_domain() {
+        let person = |emails: &[&str]| Journalist {
+            id: 0,
+            surname: "X".into(),
+            full_name: String::new(),
+            emails: emails.iter().map(|s| s.to_string()).collect(),
+            default_priority: 0,
+            aliases: vec![],
+            groups: vec![],
+            created_at: None,
+        };
+        let roster = vec![person(&["a@example.gr"]), person(&["Someone@Gmail.com", "b@hotmail.co.uk"])];
+        assert!(!is_outsider("a@example.gr", &roster), "a roster address");
+        assert!(!is_outsider(" A@Example.GR ", &roster), "case and spaces");
+        assert!(!is_outsider("newperson@example.gr", &roster), "the roster's own domain");
+        assert!(!is_outsider("desk@news.example.gr", &roster), "a subdomain of an own domain");
+        assert!(!is_outsider("someone@gmail.com", &roster), "the roster's gmail address itself");
+        assert!(is_outsider("stranger@gmail.com", &roster), "a public provider is never an own domain");
+        assert!(is_outsider("stranger@hotmail.co.uk", &roster), "nor any hotmail");
+        assert!(is_outsider("press@municipality.example", &roster), "an unrelated domain");
+        assert!(is_outsider("x@notexample.gr", &roster), "a lookalike is not a subdomain");
+        assert!(is_outsider("not-an-address", &roster));
+        // No own domain to tell by (fresh installation): nobody is an outsider.
+        assert!(!is_outsider("a@example.gr", &[]), "an empty roster");
+        assert!(!is_outsider("press@municipality.example", &[person(&[])]), "a roster without addresses");
+        assert!(!is_outsider("press@municipality.example", &[person(&["x@gmail.com", "y@outlook.com"])]), "public addresses only");
+        assert!(is_public_mail_domain("mail.yahoo.gr") && is_public_mail_domain("outlook.com") && !is_public_mail_domain("example.gr"));
     }
 
     /// P15.1: a link that does something (unsubscribe, delete, report, sign

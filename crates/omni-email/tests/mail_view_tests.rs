@@ -286,6 +286,70 @@ fn action_links_and_transfer_service_pages_cannot_be_queued() {
     assert!(page.reason.contains("Σελίδα της υπηρεσίας μεταφοράς") && page.can_queue, "a person decides: {page:?}");
 }
 
+/// P15.2: an outsider's link to an unknown site says why it was held, MCR
+/// can queue it with one click, and the mail's notes say why nothing went.
+#[test]
+fn an_outsiders_unknown_site_is_held_and_can_be_queued_by_hand() {
+    let body = "Τα πλάνα: https://www.municipality.example/news/egkainia\nΚαι: https://www.youtube.com/watch?v=outsider001";
+    let mut m = mail("Εγκαίνια", body);
+    m.from_address = "press@municipality.example".into();
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &m);
+    let urls: Vec<&str> = jobs.iter().map(|j| j.url.as_str()).collect();
+    assert_eq!(urls, vec!["https://www.youtube.com/watch?v=outsider001"], "the video platform is still queued");
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let skip = view.links.iter().find(|l| l.url.contains("municipality")).unwrap().skip.clone().unwrap();
+    assert!(skip.reason.contains("εκτός σύνταξης") && skip.can_queue, "{skip:?}");
+    let note = view.notes.iter().find(|n| n.text.contains("εκτός σύνταξης")).expect("a note about the held links");
+    assert_eq!(note.level, NoteLevel::Info);
+
+    // Only the held link: no job, and the note replaces «no link found».
+    let mut only = mail("Εγκαίνια", "Τα πλάνα: https://www.municipality.example/news/egkainia");
+    only.from_address = "press@municipality.example".into();
+    only.internet_message_id = "<m2@example.gr>".into();
+    let (row, jobs) = ingest(&repo, &only);
+    assert!(jobs.is_empty());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    assert!(view.notes.iter().any(|n| n.text.contains("εκτός σύνταξης")), "{:?}", view.notes);
+    assert!(!view.notes.iter().any(|n| n.text.contains("Δεν βρέθηκε σύνδεσμος")), "{:?}", view.notes);
+
+    // The same link from a colleague is queued, as before.
+    let mut colleague = mail("Εγκαίνια", "Τα πλάνα: https://www.municipality.example/news/egkainia-2");
+    colleague.internet_message_id = "<m3@example.gr>".into();
+    let (row, jobs) = ingest(&repo, &colleague);
+    assert_eq!(jobs.len(), 1);
+    assert!(!build(&row, &jobs, &ParserConfig::default()).notes.iter().any(|n| n.text.contains("εκτός σύνταξης")));
+}
+
+/// P15.2: an outsider's marker still narrows as before (the other links say
+/// so), and a front page or profile keeps its own reason and no warning.
+#[test]
+fn an_outsiders_marker_narrows_as_before_and_non_stories_keep_their_reason() {
+    let fixture = |name: &str| {
+        let raw = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)).unwrap();
+        InboundMail::from_rfc822("fixture", &raw).unwrap()
+    };
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &fixture("44_outsider_marker_on_unknown_site.eml"));
+    assert!(jobs.is_empty());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let reason = |view: &mail_view::MailView, part: &str| view.links.iter().find(|l| l.url.contains(part)).unwrap().skip.clone().unwrap();
+    let held = reason(&view, "press-site");
+    assert!(held.reason.contains("εκτός σύνταξης") && held.can_queue, "{held:?}");
+    for part in ["youtube", "neakriti"] {
+        let skip = reason(&view, part);
+        assert!(skip.reason.contains("ΓΙΑ ΠΛΑΝΑ") && skip.can_queue, "{part}: {skip:?}");
+    }
+
+    let (row, jobs) = ingest(&repo, &fixture("45_outsider_front_page_and_profile_only.eml"));
+    let view = build(&row, &jobs, &ParserConfig::default());
+    for part in ["events.example", "facebook"] {
+        let skip = reason(&view, part);
+        assert!(skip.reason.contains("Δεν μοιάζει με σελίδα είδησης"), "{part}: {skip:?}");
+    }
+    assert!(!view.notes.iter().any(|n| n.text.contains("εκτός σύνταξης")), "{:?}", view.notes);
+}
+
 /// P15.1: a service mail no template recognised, with a link to files: no
 /// job, but a warning for MCR, and the link can be queued by hand.
 #[test]

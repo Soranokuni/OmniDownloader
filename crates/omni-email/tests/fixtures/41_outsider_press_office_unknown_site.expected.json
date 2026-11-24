@@ -1,0 +1,27 @@
+{
+  "ignored_urls": [
+    "https://www.municipality.example/news/2026/11/egkainia-parkou"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "NO_LINKS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "EGKAINIANEOU",
+      "title": "Εγκαίνια νέου πάρκου"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "OUTSIDER_UNKNOWN_SITES"
+    }
+  ]
+}

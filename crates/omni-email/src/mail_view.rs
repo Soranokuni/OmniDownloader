@@ -213,7 +213,9 @@ pub fn how_el(how: Resolution) -> &'static str {
 pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView {
     let subject = mail.subject.as_deref().unwrap_or("");
     let summary = MailParseSummary::stored(mail);
-    let notice = summary.as_ref().is_some_and(|s| s.warnings.iter().any(|w| w.code == warnings::LOCKER_NOTICE));
+    let warned = |code: &str| summary.as_ref().is_some_and(|s| s.warnings.iter().any(|w| w.code == code));
+    let notice = warned(warnings::LOCKER_NOTICE);
+    let outsider = warned(warnings::OUTSIDER_UNKNOWN_SITES);
     let queued: Vec<QueuedFromMail> = serde_json::from_str(&mail.jobs_json).unwrap_or_default();
     let by_id: HashMap<i64, &Job> = jobs.iter().map(|j| (j.id, j)).collect();
 
@@ -283,7 +285,7 @@ pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView
                 }
                 let id = format!("l{}", links.len() + 1);
                 let (ids, removed) = filed_under(&link_key(url));
-                let skip = ids.is_empty().then(|| skip_for(url, line.role, removed, notice, cfg));
+                let skip = ids.is_empty().then(|| skip_for(url, line.role, removed, notice, outsider, cfg));
                 links.push(LinkView { id: id.clone(), url: url.clone(), role: line.role, jobs: ids, skip });
                 segs.push(Segment::Link { l: id, t: line.text[range.clone()].to_string() });
                 at = range.end;
@@ -409,8 +411,9 @@ fn next_index<'a>(queued: &[QueuedFromMail], own: impl Iterator<Item = &'a Job>)
 }
 
 /// Why a link in the text became no job. `notice`: the mail is a transfer
-/// service's notice (P15.1).
-fn skip_for(url: &str, role: LineRole, removed: bool, notice: bool, cfg: &ParserConfig) -> Skip {
+/// service's notice (P15.1). `outsider`: the mail came from outside the
+/// newsroom and its links to unknown sites were held (P15.2).
+fn skip_for(url: &str, role: LineRole, removed: bool, notice: bool, outsider: bool, cfg: &ParserConfig) -> Skip {
     let skip = |reason: &str, can_queue: bool| Skip { reason: reason.to_string(), can_queue };
     if removed {
         return skip("Αφαιρέθηκε από το MCR.", true);
@@ -440,6 +443,9 @@ fn skip_for(url: &str, role: LineRole, removed: bool, notice: bool, cfg: &Parser
         }
         LineRole::Read if tier == Tier::Other && !parser::could_be_a_story(url) => {
             skip("Δεν μοιάζει με σελίδα είδησης: αρχική σελίδα, προφίλ, χάρτης ή φόρμα.", true)
+        }
+        LineRole::Read if outsider && tier == Tier::Other => {
+            skip("Σύνδεσμος σε άγνωστο site από αποστολέα εκτός σύνταξης: δεν ανοίγει αυτόματα.", true)
         }
         LineRole::Read => skip("Δεν επιλέχθηκε, π.χ. επειδή το «ΓΙΑ ΠΛΑΝΑ» έδειξε άλλους συνδέσμους.", true),
     }
@@ -496,6 +502,11 @@ fn notes(mail: &ProcessedMail, summary: Option<&MailParseSummary>) -> Vec<Note> 
                 "Μήνυμα υπηρεσίας μεταφοράς που δεν αναγνωρίστηκε, με σύνδεσμο αρχείου: ελέγξτε το και βάλτε το στην ουρά αν χρειάζεται."
                     .into(),
             ),
+            warnings::OUTSIDER_UNKNOWN_SITES => info(
+                "Το email ήρθε από αποστολέα εκτός σύνταξης: οι σύνδεσμοι σε άγνωστα sites δεν άνοιξαν αυτόματα. \
+                 Βάλτε στην ουρά όποιον χρειάζεται."
+                    .into(),
+            ),
             warnings::LOCKER_NOTICE => info(
                 "Ειδοποίηση υπηρεσίας μεταφοράς για αρχεία που στείλαμε εμείς ή μήνυμα της υπηρεσίας: δεν κατεβαίνει τίποτα.".into(),
             ),
@@ -517,8 +528,9 @@ fn notes(mail: &ProcessedMail, summary: Option<&MailParseSummary>) -> Vec<Note> 
     }
     match s.outcome {
         Outcome::PhotosOnly => out.push(info("Μόνο φωτογραφίες: δεν υπάρχει βίντεο για λήψη.".into())),
-        // A notice says why already (P15.1).
-        Outcome::NoLinks if s.warnings.iter().any(|w| w.code == warnings::LOCKER_NOTICE) => {}
+        // A notice, or the held links, say why already (P15.1, P15.2).
+        Outcome::NoLinks
+            if s.warnings.iter().any(|w| w.code == warnings::LOCKER_NOTICE || w.code == warnings::OUTSIDER_UNKNOWN_SITES) => {}
         Outcome::NoLinks => out.push(info("Δεν βρέθηκε σύνδεσμος ή συνημμένο βίντεο σε αυτό το email.".into())),
         Outcome::Jobs => {}
     }

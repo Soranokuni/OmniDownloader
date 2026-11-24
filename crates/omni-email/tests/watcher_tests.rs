@@ -686,6 +686,35 @@ async fn a_transfer_notice_queues_nothing_and_a_delivery_waits_for_mcr() {
     assert_eq!(jobs[0].extraction_method.as_deref(), Some("locker"));
 }
 
+/// P15.2: an outsider's link to an unknown site is not fetched; a colleague's
+/// (an address on the roster's domain) still is.
+#[tokio::test]
+async fn an_outsiders_unknown_site_is_held_and_a_colleagues_is_tried() {
+    use omni_email::eml::EmlSource;
+    use omni_email::watcher::Ingested;
+
+    let fixture = |name: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap();
+    let (_dir, repo) = repo();
+    let source = Arc::new(EmlSource::new([
+        ("outsider.eml".to_string(), fixture("41_outsider_press_office_unknown_site.eml")),
+        ("staff.eml".to_string(), fixture("42_staff_not_on_roster_unknown_site.eml")),
+    ]));
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+
+    let outsider = source.fetch_mail("outsider.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&outsider).await.unwrap(), Ingested::Processed);
+    assert!(repo.get_all_jobs().unwrap().is_empty(), "an outsider's unknown site is not fetched");
+    let row = repo.get_processed_mail("<fixture-41@example.gr>").unwrap().unwrap();
+    assert_eq!(row.outcome, "NO_LINKS");
+    assert!(row.parse_json.unwrap().contains("OUTSIDER_UNKNOWN_SITES"));
+
+    let staff = source.fetch_mail("staff.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&staff).await.unwrap(), Ingested::Processed);
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, JobStatus::Pending, "a colleague's unknown site is tried, as before");
+}
+
 /// P15.1 must not change a Dropbox share on `dl.dropbox.com`: as before, it is
 /// a direct share a worker fetches.
 #[tokio::test]
