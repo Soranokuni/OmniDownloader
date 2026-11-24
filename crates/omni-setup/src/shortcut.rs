@@ -35,10 +35,65 @@ pub fn spec(dir: &Path) -> ShortcutSpec {
 }
 
 /// Whether an entry whose target is `target` belongs to the installation in `dir`.
+/// Both are compared as [`comparable`] paths, so an 8.3 spelling of a folder
+/// (`C:\Users\RUNNER~1\…`) is the same folder as its long one, which is what
+/// an entry stores.
 pub fn points_at(target: &Path, dir: &Path) -> bool {
-    let a = target.to_string_lossy().to_lowercase();
-    let b = dir.join("omni-ingest.exe").to_string_lossy().to_lowercase();
-    a.trim_end_matches('\\') == b.trim_end_matches('\\')
+    comparable(target) == comparable(&dir.join("omni-ingest.exe"))
+}
+
+/// `path` in one spelling: 8.3 names expanded on its longest existing ancestor
+/// (the program's folder may already be deleted at uninstall), `\\?\` dropped,
+/// `/` as `\`, no trailing separator, lower case (Windows paths ignore case).
+fn comparable(path: &Path) -> String {
+    let text = long_form(path).to_string_lossy().replace('/', "\\");
+    let text = text.strip_prefix(r"\\?\UNC\").map(|rest| format!(r"\\{rest}")).unwrap_or(text);
+    let text = text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text);
+    text.trim_end_matches('\\').to_lowercase()
+}
+
+/// `path` with the 8.3 names of its longest existing ancestor expanded; the
+/// rest (not on disk) is kept as written. Unchanged when nothing exists or
+/// Windows cannot expand it.
+#[cfg(windows)]
+fn long_form(path: &Path) -> PathBuf {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+    let mut existing = path;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if existing.exists() {
+            let wide = HSTRING::from(existing.as_os_str());
+            let mut buf = vec![0u16; 1024];
+            // SAFETY: the buffer is ours and its length is passed with it.
+            let mut n = unsafe { GetLongPathNameW(&wide, Some(&mut buf)) } as usize;
+            if n >= buf.len() {
+                buf = vec![0u16; n + 1];
+                // SAFETY: as above, with the length Windows asked for.
+                n = unsafe { GetLongPathNameW(&wide, Some(&mut buf)) } as usize;
+            }
+            if n == 0 || n >= buf.len() {
+                return path.to_path_buf();
+            }
+            let mut out = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn long_form(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 #[cfg(windows)]
@@ -273,6 +328,9 @@ mod tests {
         write(&path, &spec(&ours)).unwrap();
         let (target, args, runas) = read(&path).unwrap();
         assert!(points_at(&target, &ours), "{}", target.display());
+        // CI: the temporary folder may be given in its 8.3 spelling (RUNNER~1).
+        let ours_short = short_form(&ours);
+        assert!(points_at(&target, &ours_short), "{} vs {}", target.display(), ours_short.display());
         assert_eq!((args.as_str(), runas), ("cookies sign-in", true));
 
         let other = tmp.path().join("other-install");
@@ -284,6 +342,48 @@ mod tests {
         assert_eq!(remove_in(tmp.path(), &ours).unwrap(), Removed::Removed(path.clone()));
         assert!(!path.exists());
         assert_eq!(remove_in(tmp.path(), &ours).unwrap(), Removed::Kept(Owner::Absent));
+    }
+
+    /// The 8.3 short form of an existing `path`, as Windows spells it.
+    #[cfg(windows)]
+    fn short_form(path: &Path) -> PathBuf {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide = HSTRING::from(path.as_os_str());
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: the buffer is ours and its length is passed with it.
+        let n = unsafe { GetShortPathNameW(&wide, Some(&mut buf)) } as usize;
+        assert!(n > 0 && n < buf.len(), "no short form for {}", path.display());
+        PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    }
+
+    /// CI (P13.10c): a temporary folder under an 8.3 profile name (`RUNNER~1`)
+    /// is the same folder as its long spelling, which an entry stores. An
+    /// uninstall given either spelling recognises its own entry, also after
+    /// the program's folder was deleted; a sibling installation never matches.
+    #[cfg(windows)]
+    #[test]
+    fn a_short_spelling_of_the_installation_folder_is_the_same_installation_and_a_sibling_is_not() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let long = tmp.path().join("Omni Ingest Long Folder");
+        let sibling = tmp.path().join("Omni Ingest Long Folder 2");
+        std::fs::create_dir_all(long.join("install")).unwrap();
+        std::fs::create_dir_all(sibling.join("install")).unwrap();
+        let short = short_form(&long);
+        if short.to_string_lossy().eq_ignore_ascii_case(&long.to_string_lossy()) {
+            eprintln!("WARNING: 8.3 names are disabled on this volume; the short-path test is skipped");
+            return;
+        }
+        let (ours_long, ours_short) = (long.join("install"), short.join("install"));
+        let sibling_short = short_form(&sibling).join("install");
+        assert!(points_at(&ours_long.join("omni-ingest.exe"), &ours_short), "{} vs {}", ours_long.display(), ours_short.display());
+        assert!(points_at(&ours_short.join("omni-ingest.exe"), &ours_long));
+        assert!(!points_at(&ours_long.join("omni-ingest.exe"), &sibling_short), "a sibling matched");
+        assert!(!points_at(&sibling.join("install").join("omni-ingest.exe"), &ours_short), "a sibling matched");
+        // Uninstall deletes the program's folder first: the existing ancestor is still expanded.
+        std::fs::remove_dir_all(&ours_long).unwrap();
+        assert!(points_at(&ours_long.join("omni-ingest.exe"), &ours_short), "the deleted folder's short spelling");
+        assert!(!points_at(&ours_long.join("omni-ingest.exe"), &sibling_short));
     }
 
     /// P13.9b: install keeps another installation's entry, and an entry that
