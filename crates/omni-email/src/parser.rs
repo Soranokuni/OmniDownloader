@@ -194,6 +194,12 @@ pub mod warnings {
     pub const JOURNALIST_AMBIGUOUS: &str = "JOURNALIST_AMBIGUOUS";
     pub const JOURNALIST_OVERRIDE_UNKNOWN: &str = "JOURNALIST_OVERRIDE_UNKNOWN";
     pub const PREAMBLE_URLS: &str = "PREAMBLE_URLS";
+    /// A transfer service's mail about files we sent, or other mail of the
+    /// service (P15.1): nothing in it is queued.
+    pub const LOCKER_NOTICE: &str = "LOCKER_NOTICE";
+    /// [`LOCKER_NOTICE`]'s detail when the mail was the service's but no
+    /// template recognised it, and it holds a link to files: MCR checks it.
+    pub const LOCKER_NOTICE_FILE_LINK: &str = "UNRECOGNISED_WITH_FILE_LINK";
     pub const SECTION_WITHOUT_LINKS: &str = "SECTION_WITHOUT_LINKS";
     pub const DUPLICATE_SECTION_NUMBER: &str = "DUPLICATE_SECTION_NUMBER";
     pub const MARKER_WITHOUT_URL: &str = "MARKER_WITHOUT_URL";
@@ -1144,11 +1150,93 @@ pub fn could_be_a_story(url: &str) -> bool {
     true
 }
 
+/// Path segments of a link that does something to an account or a
+/// subscription rather than show something (P15.1).
+const ACTION_SEGMENTS: &[&str] = &[
+    "unsubscribe",
+    "unsub",
+    "optout",
+    "opt-out",
+    "opt_out",
+    "delete",
+    "visitor-delete",
+    "abuse",
+    "preferences",
+    "email-preferences",
+    "manage-preferences",
+];
+const ACTION_QUERY_KEYS: &[&str] = &["delete-signature", "unsubscribe", "unsub", "optout"];
+const ACTION_HOSTS: &[&str] = &["myaccount.google.com"];
+
+/// Whether `url` is an action link (P15.1): unsubscribe, delete, report
+/// abuse, mail preferences, a Google account page. Opening one does
+/// something, so it is never a job, whatever its site. A sign-in page is not
+/// one: opening it changes nothing, and it may carry the story onward
+/// (`login/?next=…`). Whole path segments
+/// only (`/news/world-delete-12345` is a story), percent-decoded, without a
+/// page extension (`unsubscribe.php`); a query key such as
+/// `delete-signature`; `category=abuse`; Google's account hosts.
+pub fn is_action_link(url: &str) -> bool {
+    let Ok(u) = Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    if ACTION_HOSTS.contains(&host.as_str()) {
+        return true;
+    }
+    let action_segment = u.path_segments().into_iter().flatten().any(|s| {
+        let s = percent_decoded(s).to_lowercase();
+        let s = [".html", ".htm", ".php", ".aspx", ".asp", ".jsp"]
+            .iter()
+            .find_map(|e| s.strip_suffix(e))
+            .unwrap_or(s.as_str());
+        ACTION_SEGMENTS.contains(&s)
+    });
+    action_segment
+        || u.query_pairs().any(|(k, v)| {
+            let k = k.to_lowercase();
+            ACTION_QUERY_KEYS.contains(&k.as_str()) || (k == "category" && v.eq_ignore_ascii_case("abuse"))
+        })
+}
+
+/// `%xx` escapes decoded; an invalid escape is kept as written.
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether `url` is one of a transfer service's own pages rather than the
+/// link to the files (P15.1): its front page, help, legal or contact pages,
+/// mail images. Never a job.
+pub fn is_transfer_service_page(url: &str) -> bool {
+    omni_core::locker::is_transfer_service(url) && !omni_core::locker::is_share_link(url)
+}
+
 const LOCKER_DOMAINS: &[&str] = &[
     "wetransfer.com",
     "we.tl",
     "transfernow.net",
+    "swisstransfer.com",
     "myairbridge.com",
+    "mab.to",
     "filemail.com",
     "1drv.ms",
     "onedrive.live.com",
@@ -1771,6 +1859,15 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let journalist = resolve_journalist(mail, &body, &roster_ix, &mut warnings);
     let unresolved = journalist.how == Resolution::Unresolved;
 
+    // A transfer service's mail about files the desk sent, or its other mail
+    // (P15.1): every link is seen and none is queued.
+    let own: Vec<String> = roster.iter().filter(|j| j.surname == "MCR").flat_map(|j| j.emails.iter().cloned()).collect();
+    let notice = crate::locker_notice::notice_kind(mail, &own);
+    let quiet = notice.queues_nothing();
+    // A service mail no template recognised, yet with a link to files: still
+    // no job, but MCR is told to look (P15.1).
+    let mut unrecognised_file_link = false;
+
     let urgent = {
         let s = translit(&mail.subject);
         cfg.urgent_keywords.iter().any(|k| {
@@ -1824,6 +1921,8 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let mut sections = Vec::new();
     let mut section_sources: Vec<KeywordSource> = Vec::new();
     let mut inherited_from = KeywordSource::Fallback;
+    // One transfer sent under two links (MyAirBridge's short and alternate).
+    let mut seen_shares: HashSet<String> = HashSet::new();
 
     for (s, (title, section_kw, kw_source)) in raw.iter().zip(titles) {
         let marked = marked_urls(&s.lines, &mut warnings, &s.index);
@@ -1837,6 +1936,23 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 || (li > 0 && s.lines[li - 1].urls.is_empty() && RE_VIDEO_HINT.is_match(&s.lines[li - 1].latin));
             for u in &line.urls {
                 if !seen_urls.insert(urlnorm::normalize(u)) {
+                    continue;
+                }
+                // P15.1: never a job: anything in a notice, an action link
+                // (unsubscribe, delete, report abuse, sign in), a transfer
+                // service's own page, the same transfer a second time.
+                // The transfer's identity is taken only by a link that passed
+                // the other checks: a delete link first does not make the
+                // download link a repeat.
+                if quiet
+                    || is_action_link(u)
+                    || is_transfer_service_page(u)
+                    || omni_core::locker::share_identity(u).is_some_and(|id| !seen_shares.insert(id))
+                {
+                    unrecognised_file_link |= notice == crate::locker_notice::NoticeKind::ServiceMail
+                        && !is_action_link(u)
+                        && omni_core::locker::is_share_link(u);
+                    ignored_urls.push(u.clone());
                     continue;
                 }
                 if hinted {
@@ -1945,7 +2061,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     // P4.6: video attachments are assets of their own.
     let max_bytes = cfg.max_attachment_mb.saturating_mul(1024 * 1024);
     let mut att_jobs = Vec::new();
-    for a in &mail.attachments {
+    for a in mail.attachments.iter().filter(|_| !quiet) {
         if is_video_attachment(&a.content_type, &a.name) {
             if a.size > max_bytes {
                 warnings.push(Warning::new(warnings::ATTACHMENT_TOO_LARGE, Some(a.name.clone())));
@@ -2023,9 +2139,13 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     }
 
     let job_count: usize = sections.iter().map(|s| s.jobs.len()).sum();
+    if quiet {
+        let detail = unrecognised_file_link.then(|| warnings::LOCKER_NOTICE_FILE_LINK.to_string());
+        warnings.push(Warning::new(warnings::LOCKER_NOTICE, detail));
+    }
     let outcome = if job_count > 0 {
         Outcome::Jobs
-    } else if images > 0 {
+    } else if images > 0 && !quiet {
         Outcome::PhotosOnly
     } else {
         Outcome::NoLinks
@@ -2380,6 +2500,50 @@ mod tests {
         assert_eq!(classify("https://example.org/story", &c), Tier::Other);
         // Not fooled by a lookalike host.
         assert_eq!(classify("https://notyoutube.com/watch?v=x", &c), Tier::Other);
+        // P15.1: SwissTransfer and MyAirBridge's short links are lockers.
+        assert_eq!(classify("https://www.swisstransfer.com/d/0a1b2c3d", &c), Tier::Locker);
+        assert_eq!(classify("https://mab.to/t/AbC123/eu1", &c), Tier::Locker);
+    }
+
+    /// P15.1: a link that does something (unsubscribe, delete, report, sign
+    /// in) is never a job; a story whose slug has such a word is.
+    #[test]
+    fn action_links_are_recognised_by_whole_segments_and_query_keys() {
+        for url in [
+            "https://www.swisstransfer.com/transfers/0a1b2c3d-1111/delete?delete-signature=abc123",
+            "https://www.swisstransfer.com/transfers/0a1b2c3d-1111?delete-signature=abc123",
+            "https://myaccount.google.com/visitor-delete?atu=1",
+            "https://newsletter.us1.list-manage.com/unsubscribe?u=abc&id=def",
+            "https://www.transfernow.net/en/contact?category=ABUSE&subCat=REPORT&link=x",
+            "https://news.example.org/mail?unsubscribe=1",
+            "https://news.example.org/email-preferences",
+            "https://news.example.org/account/Unsubscribe.php?u=1",
+            "https://news.example.org/a/%75nsubscribe/1",
+        ] {
+            assert!(is_action_link(url), "{url} is an action link");
+        }
+        // Sign-in pages change nothing: they behave as before P15.1.
+        for url in [
+            "https://m.facebook.com/login/?next=https%3A%2F%2Fm.facebook.com%2Freel%2F123",
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd%2F1AbC_dEf-GhIjKlMn%2Fview",
+            "https://portal.example.org/user/login?next=/x",
+            "https://portal.example.org/Sign-In",
+            "https://portal.example.org/logout",
+            "https://portal.example.org/reset-password",
+        ] {
+            assert!(!is_action_link(url), "{url} is not an action link");
+        }
+        for url in [
+            "https://www.bbc.com/news/world-delete-12345",
+            "https://www.neakriti.gr/kriti/irakleio/2203079_report-ston-dromo",
+            "https://www.youtube.com/watch?v=abc123",
+            "https://youtu.be/abc123",
+            "https://www.example.gr/login-stories/123",
+            "https://www.example.gr/news/preferences-of-voters?category=politics",
+            "https://www.example.gr/story?id=5&delete=no-key-name",
+        ] {
+            assert!(!is_action_link(url), "{url} is a story");
+        }
     }
 
     #[test]

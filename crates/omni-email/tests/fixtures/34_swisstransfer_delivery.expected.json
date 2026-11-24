@@ -1,0 +1,34 @@
+{
+  "ignored_urls": [
+    "https://www.swisstransfer.com/en-gb/report/0a1b2c3d-3434-4444-5555-666677778834"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "1",
+          "keyword": "YOUHAVE",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://www.swisstransfer.com/d/0a1b2c3d-3434-4444-5555-666677778834"
+        }
+      ],
+      "keyword": "YOUHAVE",
+      "title": "You have received 2 files via SwissTransfer"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

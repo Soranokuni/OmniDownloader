@@ -1,0 +1,30 @@
+{
+  "ignored_urls": [
+    "https://www.transfernow.net/el",
+    "https://www.transfernow.net/dl/20261124Own32/Key32own",
+    "https://www.transfernow.net/el/support",
+    "https://www.transfernow.net/el/legal/terms"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "NO_LINKS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "ARCHEIOSAS",
+      "title": "Το αρχείο σας \"deltio_20h.mp4\" εστάλη σε k.paradeigma@studio.example"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "LOCKER_NOTICE"
+    }
+  ]
+}

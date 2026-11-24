@@ -1,0 +1,40 @@
+{
+  "ignored_urls": [
+    "https://www.transfernow.net/en",
+    "https://www.transfernow.net/en/about",
+    "https://www.transfernow.net/en/support",
+    "https://www.transfernow.net/en/legal/terms",
+    "https://www.transfernow.net/en/legal/privacy-gdpr",
+    "https://www.transfernow.net/en/contact?category=ABUSE&subCat=REPORT&link=20261124AbCdEf31",
+    "https://www.transfernow.net/api/mailer/subscriptions/recipient.html?email=master%40example.gr&token=f4k3t0k3n31"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "1",
+          "keyword": "PETROSPARADEIGMA",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://www.transfernow.net/dl/20261124AbCdEf31/XyZ31key"
+        }
+      ],
+      "keyword": "PETROSPARADEIGMA",
+      "title": "Petros Paradeigma has sent you \"plimmyra_chania.mp4\" via TransferNow"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+From: SwissTransfer <noreply@swisstransfer.com>
+To: master@example.gr
+Subject: Your transfer has been successfully completed
+Date: Tue, 24 Nov 2026 12:20:00 +0200
+Message-ID: <fixture-33@example.gr>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your transfer has been successfully completed
+
+Your files have been sent. They are available until 24 December 2026.
+
+Download link: https://www.swisstransfer.com/dl/0a1b2c3d-3333-4444-5555-666677778833
+
+Delete this transfer: https://www.swisstransfer.com/transfers/0a1b2c3d-3333-4444-5555-666677778833/delete?delete-signature=s1gn4tur3x33

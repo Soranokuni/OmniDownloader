@@ -213,6 +213,7 @@ pub fn how_el(how: Resolution) -> &'static str {
 pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView {
     let subject = mail.subject.as_deref().unwrap_or("");
     let summary = MailParseSummary::stored(mail);
+    let notice = summary.as_ref().is_some_and(|s| s.warnings.iter().any(|w| w.code == warnings::LOCKER_NOTICE));
     let queued: Vec<QueuedFromMail> = serde_json::from_str(&mail.jobs_json).unwrap_or_default();
     let by_id: HashMap<i64, &Job> = jobs.iter().map(|j| (j.id, j)).collect();
 
@@ -282,7 +283,7 @@ pub fn build(mail: &ProcessedMail, jobs: &[Job], cfg: &ParserConfig) -> MailView
                 }
                 let id = format!("l{}", links.len() + 1);
                 let (ids, removed) = filed_under(&link_key(url));
-                let skip = ids.is_empty().then(|| skip_for(url, line.role, removed, cfg));
+                let skip = ids.is_empty().then(|| skip_for(url, line.role, removed, notice, cfg));
                 links.push(LinkView { id: id.clone(), url: url.clone(), role: line.role, jobs: ids, skip });
                 segs.push(Segment::Link { l: id, t: line.text[range.clone()].to_string() });
                 at = range.end;
@@ -407,14 +408,21 @@ fn next_index<'a>(queued: &[QueuedFromMail], own: impl Iterator<Item = &'a Job>)
     (max + 1).to_string()
 }
 
-/// Why a link in the text became no job.
-fn skip_for(url: &str, role: LineRole, removed: bool, cfg: &ParserConfig) -> Skip {
+/// Why a link in the text became no job. `notice`: the mail is a transfer
+/// service's notice (P15.1).
+fn skip_for(url: &str, role: LineRole, removed: bool, notice: bool, cfg: &ParserConfig) -> Skip {
     let skip = |reason: &str, can_queue: bool| Skip { reason: reason.to_string(), can_queue };
     if removed {
         return skip("Αφαιρέθηκε από το MCR.", true);
     }
     if crate::decontaminate::is_mail_client_link(url) {
         return skip("Σύνδεσμος του προγράμματος email, όχι του αποστολέα.", false);
+    }
+    if parser::is_action_link(url) {
+        return skip("Σύνδεσμος ενέργειας (διαγραφή, απεγγραφή, λογαριασμός): δεν ανοίγει ποτέ.", false);
+    }
+    if parser::is_transfer_service_page(url) {
+        return skip("Σελίδα της υπηρεσίας μεταφοράς, όχι αρχείο.", true);
     }
     let tier = parser::classify(url, cfg);
     if tier == Tier::Image {
@@ -427,6 +435,9 @@ fn skip_for(url: &str, role: LineRole, removed: bool, cfg: &ParserConfig) -> Ski
         LineRole::Signature => skip("Στην υπογραφή, που το σύστημα δεν διαβάζει.", false),
         LineRole::Quoted => skip("Σε παλιότερο μήνυμα από κάτω, που το σύστημα δεν διαβάζει.", true),
         LineRole::Forwarded => skip("Στις κεφαλίδες του προωθημένου μηνύματος.", true),
+        LineRole::Read if notice => {
+            skip("Ειδοποίηση της υπηρεσίας μεταφοράς για αρχεία που στείλαμε εμείς ή μήνυμα της υπηρεσίας.", true)
+        }
         LineRole::Read if tier == Tier::Other && !parser::could_be_a_story(url) => {
             skip("Δεν μοιάζει με σελίδα είδησης: αρχική σελίδα, προφίλ, χάρτης ή φόρμα.", true)
         }
@@ -481,6 +492,13 @@ fn notes(mail: &ProcessedMail, summary: Option<&MailParseSummary>) -> Vec<Note> 
                 "Το email απευθύνεται σε «{detail}», που δεν είναι στη λίστα δημοσιογράφων. Αν είναι συνάδελφος, προσθέστε τον."
             )),
             warnings::PREAMBLE_URLS => info("Υπήρχαν σύνδεσμοι πριν από το πρώτο θέμα· μπήκαν στο θέμα 1.".into()),
+            warnings::LOCKER_NOTICE if w.detail.as_deref() == Some(warnings::LOCKER_NOTICE_FILE_LINK) => warn(
+                "Μήνυμα υπηρεσίας μεταφοράς που δεν αναγνωρίστηκε, με σύνδεσμο αρχείου: ελέγξτε το και βάλτε το στην ουρά αν χρειάζεται."
+                    .into(),
+            ),
+            warnings::LOCKER_NOTICE => info(
+                "Ειδοποίηση υπηρεσίας μεταφοράς για αρχεία που στείλαμε εμείς ή μήνυμα της υπηρεσίας: δεν κατεβαίνει τίποτα.".into(),
+            ),
             warnings::SECTION_WITHOUT_LINKS => warn(format!("Το θέμα {detail} δεν είχε σύνδεσμο ή βίντεο.")),
             warnings::DUPLICATE_SECTION_NUMBER => warn("Ο ίδιος αριθμός θέματος γράφτηκε δύο φορές.".into()),
             warnings::MARKER_WITHOUT_URL => warn(format!("Στο θέμα {detail} υπήρχε «ΓΙΑ ΠΛΑΝΑ:» χωρίς σύνδεσμο.")),
@@ -499,6 +517,8 @@ fn notes(mail: &ProcessedMail, summary: Option<&MailParseSummary>) -> Vec<Note> 
     }
     match s.outcome {
         Outcome::PhotosOnly => out.push(info("Μόνο φωτογραφίες: δεν υπάρχει βίντεο για λήψη.".into())),
+        // A notice says why already (P15.1).
+        Outcome::NoLinks if s.warnings.iter().any(|w| w.code == warnings::LOCKER_NOTICE) => {}
         Outcome::NoLinks => out.push(info("Δεν βρέθηκε σύνδεσμος ή συνημμένο βίντεο σε αυτό το email.".into())),
         Outcome::Jobs => {}
     }
