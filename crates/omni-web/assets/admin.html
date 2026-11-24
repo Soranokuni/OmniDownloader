@@ -1,13 +1,23 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="el">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniDownloader — Systems Administration</title>
+<title data-t="admin.page.title">OmniDownloader</title>
 <link rel="stylesheet" href="/static/app.css?v=12">
 <link rel="icon" href="data:,">
+<style>
+  .admin-layout { display:grid; grid-template-columns: 220px 1fr; gap:20px; align-items:start; }
+  .admin-nav { position:sticky; top:16px; display:flex; flex-direction:column; gap:6px; }
+  .admin-nav a { display:block; padding:8px 12px; border-radius:8px; text-decoration:none; color:inherit; }
+  .admin-nav a.active { background:rgba(251,113,133,0.15); font-weight:600; }
+  .admin-section { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  @media (max-width: 900px) { .admin-layout { grid-template-columns: 1fr; } .admin-nav { position:static; } }
+</style>
 </head>
 <body>
+<!-- P13.6: the words of the shell, the Overview and the Settings come from
+     admin-text.el.js / admin-text.en.js by key (data-t); Greek by default. -->
 
 <header class="topbar">
   <div class="topbar-inner">
@@ -15,308 +25,616 @@
       <div class="brand-mark" style="background:#fb7185;color:#1a0409">A</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p style="color:#fb7185">Systems Administration</p>
+        <p style="color:#fb7185" data-t="admin.page.tagline"></p>
       </div>
     </div>
     <div class="topbar-status">
-      <a class="btn" href="/mcr">MCR desk</a>
-      <button class="btn btn-danger" type="button" id="logout-btn">Sign out</button>
+      <button class="btn" type="button" id="lang-btn" lang="en"></button>
+      <a class="btn" href="/mcr" data-t="admin.page.desk"></a>
+      <button class="btn btn-danger" type="button" id="logout-btn" data-t="admin.page.logout"></button>
     </div>
   </div>
 </header>
 
-<main class="grid-3" style="align-items:start">
+<main class="admin-layout">
 
-  <div class="stack">
+  <nav class="admin-nav card" data-t-aria-label="admin.nav.label">
+    <input type="search" id="admin-search" data-t-placeholder="admin.search.placeholder" data-t-aria-label="admin.search.label" autocomplete="off">
+    <p class="note" id="admin-search-note" role="status" style="margin:0"></p>
+    <a href="#overview" data-nav="overview" data-t="admin.nav.overview"></a>
+    <a href="#settings" data-nav="settings" data-t="admin.nav.settings"></a>
+    <a href="#people" data-nav="people" data-t="admin.nav.people"></a>
+    <a href="#sites" data-nav="sites" data-t="admin.nav.sites"></a>
+    <a href="#maintenance" data-nav="maintenance" data-t="admin.nav.maintenance"></a>
+  </nav>
 
-    <section class="card" id="setup-card">
-      <h2 class="card-title">Setup</h2>
-      <p class="note" id="setup-state" style="margin-bottom:10px">Checking…</p>
-      <button class="btn btn-block" type="button" id="setup-rerun">Run setup wizard again</button>
-      <p class="note" style="margin-top:8px">Walks through the administrator account (only while the first-run account exists), watchfolder, mail and, in the other modes, network, TLS and metrics.</p>
+  <div>
+  <!-- Επισκόπηση -->
+  <div class="admin-section" data-section="overview" hidden>
+    <section class="card stack" id="needs">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.needs.title"></h2>
+      <div id="needs-list" class="stack"><p class="note" data-t="admin.loading"></p></div>
     </section>
-    <section class="card">
-      <h2 class="card-title">Download engine</h2>
-      <div class="spec-row"><span>Installed yt-dlp</span><span id="ytdl-installed" class="mono">checking…</span></div>
-      <div class="spec-row"><span>Latest release</span><span id="ytdl-remote" class="mono">checking…</span></div>
-      <p id="ytdl-note" class="note" style="margin:10px 0"></p>
-      <button class="btn btn-primary btn-block" type="button" id="ytdl-update">Update yt-dlp now</button>
-      <button class="btn btn-block" type="button" id="ytdl-rollback" style="margin-top:8px">
-        Roll back to the previous build
-      </button>
-      <p class="note" style="margin-top:8px">
-        Downloads are verified against the release checksum before anything is
-        replaced, and the previous build is kept.
-      </p>
-    </section>
-
-    <section class="card">
-      <h2 class="card-title">Toolchain</h2>
-      <div id="dependencies" class="stack">
-        <p class="note">Checking ffmpeg, ffprobe, bmxtranswrap…</p>
+    <section class="card stack" id="health">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.health.title"></h2>
+        <button class="btn" type="button" id="health-refresh" data-t="admin.refresh"></button>
       </div>
+      <div id="health-list" class="stack"><p class="note" data-t="admin.loading"></p></div>
     </section>
-
-    <section class="card">
-      <h2 class="card-title">Credentials</h2>
-      <div id="secrets-list" class="stack">
-        <p class="note">Loading…</p>
+    <section class="card stack" id="autonomy">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.autonomy.title"></h2>
+        <div class="row tight">
+          <select id="autonomy-days" data-t-aria-label="admin.autonomy.period">
+            <option value="7" data-t="admin.autonomy.days7"></option>
+            <option value="14" selected data-t="admin.autonomy.days14"></option>
+            <option value="30" data-t="admin.autonomy.days30"></option>
+          </select>
+          <button class="btn" type="button" id="autonomy-refresh" data-t="admin.refresh"></button>
+        </div>
       </div>
-      <p class="note" style="margin-top:10px">
-        Stored encrypted on this machine. Values are never shown again once set,
-        here or anywhere else — replace one if it is lost.
-      </p>
+      <p class="note" data-t="admin.autonomy.intro"></p>
+      <div id="autonomy-figures" class="stack"><p class="note" data-t="admin.loading"></p></div>
+      <div id="autonomy-tables" class="stack"></div>
     </section>
-
-    <section class="card">
-      <h2 class="card-title">Database maintenance</h2>
-      <label for="purge-days">Purge completed jobs older than</label>
-      <div class="row">
-        <select id="purge-days" class="grow">
-          <option value="7">7 days</option>
-          <option value="14" selected>14 days</option>
-          <option value="30">30 days</option>
-          <option value="90">90 days</option>
-        </select>
-        <button class="btn" type="button" id="purge-btn">Purge</button>
-      </div>
-      <button class="btn btn-block" type="button" id="vacuum-btn" style="margin-top:10px">
-        Vacuum and compact the database
-      </button>
+    <section class="card stack" id="repair-shadow">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.shadow.title"></h2>
+      <p class="note" data-t="admin.shadow.intro"></p>
+      <div id="shadow-body" class="stack"><p class="note" data-t="admin.loading"></p></div>
     </section>
   </div>
 
-  <div class="stack" style="grid-column:span 2">
-    <section class="card stack" id="autonomy">
+  <!-- Ρυθμίσεις -->
+  <div class="admin-section" data-section="settings" hidden>
+    <section class="card" id="setup-card">
+      <h2 class="card-title" data-t="admin.setup.title"></h2>
+      <p class="note" id="setup-state" style="margin-bottom:10px" data-t="admin.setup.checking"></p>
+      <button class="btn btn-block" type="button" id="setup-rerun" data-t="admin.setup.rerun"></button>
+      <p class="note" style="margin-top:8px" data-t="admin.setup.about"></p>
+      <p class="note warn" id="watchfolder-pending" hidden></p>
+      <div id="restart-box" hidden style="margin-top:12px">
+        <p class="note" data-t="admin.restart.about"></p>
+        <p class="note warn" id="restart-warn" hidden data-t="admin.restart.warn"></p>
+        <button class="btn btn-block" type="button" id="restart-btn" data-t="admin.restart.button"></button>
+        <p class="note" id="restart-result" role="status"></p>
+      </div>
+    </section>
+    <section class="card stack" id="watchfolder" data-keywords="watchfolder φάκελος παράδοσης">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.wf.title"></h2>
+      <label for="wf-path" data-t="admin.wf.path"></label>
+      <input type="text" id="wf-path" autocomplete="off" spellcheck="false">
+      <p class="note" id="wf-in-use"></p>
+      <div class="row">
+        <button class="btn" type="button" id="wf-test" data-t="admin.test"></button>
+        <button class="btn btn-primary" type="button" id="wf-save" disabled data-t="admin.save"></button>
+      </div>
+      <p class="note" data-t="admin.wf.about"></p>
+      <p id="wf-result" class="note" style="white-space:pre-line"></p>
+    </section>
+    <section class="card" data-keywords="mailbox graph entra tenant client secret">
+      <h2 class="card-title" data-t="admin.mail.title"></h2>
+      <div>
+        <div>
+          <label for="test-mail-tenant" data-t="admin.mail.tenant"></label>
+          <input type="text" id="test-mail-tenant" autocomplete="off" spellcheck="false">
+          <label for="test-mail-client" style="margin-top:8px" data-t="admin.mail.client"></label>
+          <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
+          <label for="test-mail-user" style="margin-top:8px" data-t="admin.mail.mailbox"></label>
+          <input type="text" id="test-mail-user" placeholder="ingest@example.gr">
+          <label for="test-mail-secret" style="margin-top:8px" data-t="admin.mail.secret"></label>
+          <input type="password" id="test-mail-secret" autocomplete="off">
+          <label for="test-mail-expires" style="margin-top:8px" data-t="admin.mail.expires"></label>
+          <input type="date" id="test-mail-expires">
+          <p class="note" style="margin:4px 0 0" data-t="admin.mail.expires_help"></p>
+          <div class="row" style="margin-top:10px">
+            <button class="btn" type="button" id="test-mail-btn" data-t="admin.mail.test"></button>
+            <button class="btn btn-primary" type="button" id="save-mail-btn" data-t="admin.save"></button>
+          </div>
+          <p class="note" style="margin:4px 0 0" data-t="admin.mail.saved_when"></p>
+        </div>
+      </div>
+      <p id="test-result" class="note" style="margin-top:10px"></p>
+    </section>
+    <section class="card" data-keywords="credentials secrets passwords">
+      <h2 class="card-title" data-t="admin.secrets.title"></h2>
+      <div id="secrets-list" class="stack">
+        <p class="note" data-t="admin.loading"></p>
+      </div>
+      <p class="note" style="margin-top:10px" data-t="admin.secrets.about"></p>
+    </section>
+    <section class="card stack" id="llm" data-keywords="llm language model ai">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Autonomy</h2>
-        <div class="row tight">
-          <select id="autonomy-days" aria-label="Period">
-            <option value="7">7 days</option>
-            <option value="14" selected>14 days</option>
-            <option value="30">30 days</option>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.llm.title"></h2>
+        <span id="llm-in-use" class="note mono"></span>
+      </div>
+      <p class="note" data-t="admin.llm.about"></p>
+      <div class="grid-2">
+        <div>
+          <label for="llm-mode" data-t="admin.llm.mode"></label>
+          <select id="llm-mode">
+            <option value="assist" data-t="admin.llm.mode.assist"></option>
+            <option value="off" data-t="admin.llm.mode.off"></option>
           </select>
-          <button class="btn" type="button" id="autonomy-refresh">Refresh</button>
+        </div>
+        <div>
+          <label for="llm-provider" data-t="admin.llm.provider"></label>
+          <select id="llm-provider"></select>
         </div>
       </div>
-      <p class="note">
-        How often a video reached air with nobody touching it. A job counts as touched when
-        a person retried, renamed, approved, rejected, cancelled, re-downloaded or discarded
-        it, put it into Dalet by hand, or queued it from an offered video or a skipped mail
-        link. A video later marked as wrong counts as touched.
-      </p>
-      <div id="autonomy-figures" class="stack"><p class="note">Loading…</p></div>
-      <div id="autonomy-tables" class="stack"></div>
+      <div>
+        <label for="llm-base" data-t="admin.llm.base"></label>
+        <input type="text" id="llm-base" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:1234/v1">
+      </div>
+      <p id="llm-online" class="note warn" hidden data-t="admin.llm.online"></p>
+      <div class="grid-2">
+        <div>
+          <label for="llm-auth" data-t="admin.llm.auth"></label>
+          <select id="llm-auth">
+            <option value="none" data-t="admin.llm.auth.none"></option>
+            <option value="bearer" data-t="admin.llm.auth.bearer"></option>
+            <option value="api_key_header" data-t="admin.llm.auth.header"></option>
+          </select>
+        </div>
+        <div>
+          <label for="llm-key" data-t="admin.llm.key"></label>
+          <input type="password" id="llm-key" autocomplete="off">
+          <label class="row tight" style="margin:4px 0 0 0">
+            <input type="checkbox" id="llm-clear-key" style="width:auto">
+            <span class="note" data-t="admin.llm.clear_key"></span>
+          </label>
+        </div>
+      </div>
+      <div>
+        <label for="llm-model" data-t="admin.llm.model"></label>
+        <div class="row">
+          <input type="text" id="llm-model" class="grow" list="llm-models" spellcheck="false" autocomplete="off" placeholder="google/gemma-4-e4b">
+          <datalist id="llm-models"></datalist>
+          <button class="btn" type="button" id="llm-load-models" data-t="admin.llm.load_models"></button>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div>
+          <label for="llm-timeout" data-t="admin.llm.timeout"></label>
+          <input type="number" id="llm-timeout" min="5" max="300" value="30">
+        </div>
+        <div>
+          <label for="llm-tokens" data-t="admin.llm.tokens"></label>
+          <input type="number" id="llm-tokens" min="50" max="8000" value="400">
+        </div>
+      </div>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="llm-no-thinking" style="width:auto" checked>
+        <span data-t="admin.llm.no_thinking"></span>
+      </label>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="llm-polish" style="width:auto">
+        <span data-t="admin.llm.polish"></span>
+      </label>
+      <div class="row">
+        <button class="btn" type="button" id="llm-test" data-t="admin.test"></button>
+        <button class="btn btn-primary" type="button" id="llm-save" data-t="admin.llm.save"></button>
+      </div>
+      <p id="llm-result" class="note" style="white-space:pre-line"></p>
+    </section>
+    <section class="card stack" id="network" data-keywords="tls https certificate port proxy archive cidr">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.net.title"></h2>
+      <div class="grid-2">
+        <div><label for="net-port" data-t="admin.net.port"></label><input type="number" id="net-port" min="1" max="65535"></div>
+        <div><label for="net-archive-days" data-t="admin.net.archive_days"></label><input type="number" id="net-archive-days" min="1" max="3650"></div>
+      </div>
+      <label class="row tight" style="margin:0"><input type="checkbox" id="net-archive" style="width:auto"><span data-t="admin.net.archive"></span></label>
+      <label for="net-open" data-t="admin.net.open"></label>
+      <textarea id="net-open" rows="3" class="mono"></textarea>
+      <p class="note" style="margin:0" data-t="admin.help.cidr"></p>
+      <div class="grid-2">
+        <div><label for="net-cert" data-t="admin.net.cert"></label><input type="text" id="net-cert" autocomplete="off" spellcheck="false"></div>
+        <div><label for="net-certpw" data-t="admin.net.certpw"></label><input type="password" id="net-certpw" autocomplete="new-password"></div>
+      </div>
+      <label class="row tight" style="margin:0"><input type="checkbox" id="net-trust" style="width:auto"><span data-t="admin.net.trust"></span></label>
+      <p class="note" style="margin:0" data-t="admin.help.proxy"></p>
+      <label for="net-proxies" data-t="admin.net.proxies"></label>
+      <textarea id="net-proxies" rows="2" class="mono"></textarea>
+      <label for="net-hosts" data-t="admin.net.hosts"></label>
+      <textarea id="net-hosts" rows="2" class="mono"></textarea>
+      <button class="btn btn-primary" type="button" id="net-save" data-t="admin.save"></button>
+      <p id="net-result" class="note" style="white-space:pre-line"></p>
     </section>
 
-    <section class="card stack" id="selfheal">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Self-heal</h2>
-      <p class="note">
-        When a news site's recent articles stop giving video, the system tries its known
-        ways of finding the video on those articles overnight (nothing is downloaded).
-        A way that works again is used for the next job, which still waits for MCR's
-        approval. The last 30 days:
-      </p>
+    <section class="card stack" id="operation" data-keywords="repair shadow concurrency downloads encodes poll mail graph folders pacing retry late">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.op.title"></h2>
+      <div class="grid-2">
+        <div>
+          <label for="op-repair" data-t="admin.op.repair"></label>
+          <select id="op-repair">
+            <option value="off" data-t="admin.op.repair.off"></option>
+            <option value="shadow" data-t="admin.op.repair.shadow"></option>
+            <option value="hold" data-t="admin.op.repair.hold"></option>
+          </select>
+        </div>
+        <div><label for="op-poll" data-t="admin.op.poll"></label><input type="number" id="op-poll" min="10" max="3600"></div>
+      </div>
+      <div class="grid-2">
+        <div><label for="op-downloads" data-t="admin.op.downloads"></label><input type="number" id="op-downloads" min="1" max="10"></div>
+        <div><label for="op-transcodes" data-t="admin.op.transcodes"></label><input type="number" id="op-transcodes" min="1" max="8"></div>
+      </div>
+      <label class="row tight" style="margin:0"><input type="checkbox" id="op-write" style="width:auto"><span data-t="admin.op.write"></span></label>
+      <div class="grid-2">
+        <div><label for="op-processed" data-t="admin.op.processed"></label><input type="text" id="op-processed" autocomplete="off"></div>
+        <div><label for="op-failed" data-t="admin.op.failed"></label><input type="text" id="op-failed" autocomplete="off"></div>
+      </div>
+      <div class="grid-2">
+        <div><label for="op-host" data-t="admin.op.host"></label><input type="number" id="op-host" min="1" max="4"></div>
+        <div><label for="op-gap" data-t="admin.op.gap"></label><input type="number" id="op-gap" min="0" max="120"></div>
+      </div>
+      <div class="grid-2">
+        <div><label for="op-age" data-t="admin.op.age"></label><input type="number" id="op-age" min="30" max="360"></div>
+        <div><label for="op-second" data-t="admin.op.second"></label><input type="number" id="op-second" min="30" max="360"></div>
+      </div>
+      <div class="grid-2">
+        <div><label for="op-late" data-t="admin.op.late"></label><input type="number" id="op-late" min="1" max="120"></div>
+        <div><label for="op-late-urgent" data-t="admin.op.late_urgent"></label><input type="number" id="op-late-urgent" min="1" max="120"></div>
+      </div>
+      <button class="btn btn-primary" type="button" id="op-save" data-t="admin.save"></button>
+      <p id="op-result" class="note" style="white-space:pre-line"></p>
+    </section>
+  </div>
+
+  <!-- Άνθρωποι -->
+  <div class="admin-section" data-section="people" hidden>
+    <section class="card" data-keywords="users accounts roles">
+      <div class="section-head" style="margin-bottom:12px">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.users.title"></h2>
+        <button class="btn btn-primary" type="button" id="add-user-btn" data-t="admin.users.create"></button>
+      </div>
       <div class="card flush">
         <table>
-          <thead><tr><th>Site</th><th>When</th><th>Result</th><th>Method</th><th class="right">Pages</th></tr></thead>
-          <tbody id="selfheal-body"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+          <thead>
+            <tr><th data-t="admin.col.email"></th><th data-t="admin.col.name"></th><th data-t="admin.col.role"></th><th data-t="admin.col.journalist"></th><th data-t="admin.col.status"></th><th class="right" data-t="admin.col.actions"></th></tr>
+          </thead>
+          <tbody id="users-body">
+            <tr><td colspan="6" class="empty" data-t="admin.loading"></td></tr>
+          </tbody>
         </table>
       </div>
     </section>
-    <section class="card stack" id="selfcheck">
+    <section class="card stack" id="taxonomy" data-keywords="taxonomy journalists groups roster">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Self-check</h2>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.taxonomy.title"></h2>
         <div class="row tight">
-          <button class="btn" type="button" id="selfcheck-refresh">Refresh</button>
-          <button class="btn btn-primary" type="button" id="selfcheck-run">Run the check now</button>
+          <button class="btn" type="button" id="taxonomy-export" data-t="admin.taxonomy.export"></button>
+          <button class="btn" type="button" id="taxonomy-import-btn" data-t="admin.taxonomy.import"></button>
+          <input type="file" id="taxonomy-file" accept="application/json,.json" hidden>
         </div>
       </div>
-      <p class="note">
-        Every morning at 05:15 the system checks that it can still find a video at each
-        link below, without downloading it, and that the browser it uses for news
-        articles works. When a link stops working, it shows here in red with the date it
-        started. A new yt-dlp is kept only if every link that worked before still works.
-        If one stops working, the previous yt-dlp is put back automatically.
-      </p>
-      <div id="selfcheck-summary" class="stack"></div>
+      <p class="note" data-t="admin.taxonomy.about"></p>
+      <label class="row tight" style="margin:0">
+        <input type="checkbox" id="taxonomy-replace" style="width:auto">
+        <span data-t="admin.taxonomy.replace_label"></span>
+      </label>
+      <p id="taxonomy-result" class="note" style="white-space:pre-line"></p>
+
+      <h3 class="card-title" style="font-size:0.95rem" data-t="admin.groups.title"></h3>
       <div class="card flush">
         <table>
-          <thead><tr><th>Link</th><th>Status</th><th>Last checked</th><th>What it found</th><th class="right"></th></tr></thead>
-          <tbody id="selfcheck-body"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+          <thead>
+            <tr><th data-t="admin.groups.col.code"></th><th data-t="admin.col.name"></th><th data-t="admin.groups.col.kind"></th><th data-t="admin.groups.col.keywords"></th><th data-t="admin.groups.col.description"></th><th class="right" data-t="admin.col.actions"></th></tr>
+          </thead>
+          <tbody id="groups-body">
+            <tr><td colspan="6" class="empty" data-t="admin.loading"></td></tr>
+          </tbody>
         </table>
       </div>
-      <form id="selfcheck-form" class="row">
-        <input type="text" id="selfcheck-label" placeholder="Name, e.g. Instagram reel" style="width:220px" required>
-        <input type="url" id="selfcheck-url" class="grow" placeholder="https://… a link that has a video" required>
-        <button class="btn" type="submit">Add link</button>
+      <form id="group-form" class="stack">
+        <div class="grid-2">
+          <div>
+            <label for="g-code" data-t="admin.groups.code"></label>
+            <input type="text" id="g-code" required maxlength="20" placeholder="NEWS" autocomplete="off">
+          </div>
+          <div>
+            <label for="g-name" data-t="admin.col.name"></label>
+            <input type="text" id="g-name" required data-t-placeholder="admin.groups.name_ph">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="g-kind" data-t="admin.groups.col.kind"></label>
+            <select id="g-kind">
+              <option value="news" data-t="admin.groups.kind.news"></option>
+              <option value="show" selected data-t="admin.groups.kind.show"></option>
+              <option value="desk" data-t="admin.groups.kind.desk"></option>
+              <option value="other" data-t="admin.groups.kind.other"></option>
+            </select>
+          </div>
+          <div>
+            <label for="g-keywords" data-t="admin.groups.keywords"></label>
+            <input type="text" id="g-keywords" data-t-placeholder="admin.groups.keywords_ph">
+          </div>
+        </div>
+        <div>
+          <label for="g-description" data-t="admin.groups.description"></label>
+          <textarea id="g-description" rows="2" maxlength="500"></textarea>
+        </div>
+        <button class="btn btn-primary" type="submit" data-t="admin.groups.save"></button>
       </form>
-      <p class="note">
-        Use links that will stay online (an official account's video, not a breaking-news
-        post that may be deleted). Keep at least one per kind of link the newsroom sends.
-      </p>
-    </section>
 
-    <section class="card stack" id="sites">
-      <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Sites</h2>
-        <button class="btn" type="button" id="sites-refresh">Refresh</button>
+      <h3 class="card-title" style="font-size:0.95rem" data-t="admin.people.title"></h3>
+      <div class="card flush" style="max-height:420px;overflow:auto">
+        <table>
+          <thead>
+            <tr><th data-t="admin.people.col.surname"></th><th data-t="admin.col.name"></th><th data-t="admin.people.col.addresses"></th><th data-t="admin.people.col.aliases"></th><th data-t="admin.groups.title"></th><th class="num" data-t="admin.people.col.prio"></th><th class="right"></th></tr>
+          </thead>
+          <tbody id="people-body">
+            <tr><td colspan="7" class="empty" data-t="admin.loading"></td></tr>
+          </tbody>
+        </table>
       </div>
-      <p class="note">
-        A site turns degraded when its jobs start failing and broken when its recent
-        articles (the canaries) confirm it. «Run now» checks one site's canaries in the
-        background and, if the site is broken and repair is on, looks for a new way to
-        find its video. Press Refresh to see the result.
-      </p>
+      <form id="person-form" class="stack">
+        <div class="grid-2">
+          <div>
+            <label for="pf-surname" data-t="admin.people.surname"></label>
+            <input type="text" id="pf-surname" required maxlength="40" placeholder="PAPADAKI" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="pf-name" data-t="wizard.account.name"></label>
+            <input type="text" id="pf-name" required data-t-placeholder="admin.people.name_ph">
+          </div>
+        </div>
+        <div>
+          <label for="pf-emails" data-t="admin.people.emails"></label>
+          <input type="text" id="pf-emails" data-t-placeholder="admin.people.emails_ph" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="pf-aliases" data-t="admin.people.aliases"></label>
+          <input type="text" id="pf-aliases" data-t-placeholder="admin.people.aliases_ph">
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="pf-groups" data-t="admin.people.groups"></label>
+            <input type="text" id="pf-groups" placeholder="NEWS" autocomplete="off" spellcheck="false">
+          </div>
+          <div>
+            <label for="pf-priority" data-t="admin.people.priority"></label>
+            <input type="number" id="pf-priority" value="0" min="-100" max="100">
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" type="submit" data-t="admin.people.save"></button>
+          <button class="btn" type="button" id="pf-clear" data-t="admin.people.new"></button>
+        </div>
+      </form>
+
+      <h3 class="card-title" style="font-size:0.95rem" data-t="admin.backups.title"></h3>
+      <div class="row" style="justify-content:space-between">
+        <p class="note" style="margin:0" data-t="admin.backups.about"></p>
+        <button class="btn" type="button" id="taxonomy-backup-now" data-t="admin.backups.now"></button>
+      </div>
+      <div class="card flush" style="max-height:260px;overflow:auto">
+        <table>
+          <thead><tr><th data-t="admin.backups.col.backup"></th><th class="num" data-t="admin.groups.title"></th><th class="num" data-t="admin.people.title"></th><th class="right"></th></tr></thead>
+          <tbody id="backups-body">
+            <tr><td colspan="4" class="empty" data-t="admin.loading"></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <!-- Ιστότοποι -->
+  <div class="admin-section" data-section="sites" hidden>
+    <section class="card stack" id="sites" data-keywords="sites canary">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.sites.title"></h2>
+        <button class="btn" type="button" id="sites-refresh" data-t="admin.refresh"></button>
+      </div>
+      <p class="note" data-t="admin.help.canary"></p>
+      <p class="note" data-t="admin.sites.about"></p>
       <p id="sites-note" class="note"></p>
       <div class="card flush">
         <table>
           <thead>
-            <tr><th>Site</th><th>State</th><th>Recent success</th><th>Last success</th><th>Last code</th><th>Model paused until</th><th>Canaries ok</th><th class="right"></th></tr>
+            <tr><th data-t="admin.col.site"></th><th data-t="admin.col.state"></th><th data-t="admin.sites.col.recent"></th><th data-t="admin.sites.col.last_ok"></th><th data-t="admin.sites.col.last_code"></th><th data-t="admin.sites.col.paused"></th><th data-t="admin.sites.col.canaries"></th><th class="right"></th></tr>
           </thead>
-          <tbody id="sites-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+          <tbody id="sites-body"><tr><td colspan="8" class="empty" data-t="admin.loading"></td></tr></tbody>
         </table>
       </div>
-      <div class="row"><button class="btn" type="button" id="sites-more" hidden>Show more</button></div>
+      <div class="row"><button class="btn" type="button" id="sites-more" hidden data-t="admin.more"></button></div>
     </section>
-
-    <section class="card stack" id="recipes">
+    <section class="card stack" id="cookies" data-keywords="cookies login sign in">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Recipes</h2>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.cookies.title"></h2>
+        <button class="btn" type="button" id="cookies-refresh" data-t="admin.refresh"></button>
+      </div>
+      <p class="note" data-t="admin.cookies.about"></p>
+      <div class="card flush">
+        <table>
+          <thead>
+            <tr>
+              <th data-t="admin.col.site"></th><th class="right" data-t="admin.cookies.title"></th><th data-t="admin.cookies.col.expiry"></th><th data-t="admin.cookies.col.uploaded"></th>
+              <th data-t="admin.cookies.col.last_test"></th><th data-t="admin.cookies.col.link"></th><th></th>
+            </tr>
+          </thead>
+          <tbody id="cookies-body"><tr><td colspan="7" class="empty" data-t="admin.loading"></td></tr></tbody>
+        </table>
+      </div>
+      <h3 class="card-title" style="font-size:0.95rem" data-t="admin.cookies.signin_title"></h3>
+      <div id="cookies-signin" class="stack"></div>
+      <h3 class="card-title" style="font-size:0.95rem" data-t="admin.cookies.upload_title"></h3>
+      <form id="cookies-form" class="stack">
         <div class="row tight">
-          <button class="btn" type="button" id="recipes-refresh">Refresh</button>
-          <button class="btn" type="button" id="recipes-export">Export recipes.json</button>
+          <input type="text" id="cookies-domain" class="grow" data-t-placeholder="admin.cookies.domain_ph" autocomplete="off" required>
+          <input type="file" id="cookies-file" accept=".txt,text/plain" hidden>
+          <button class="btn" type="button" id="cookies-pick" data-t="admin.cookies.pick"></button>
+          <button class="btn btn-primary" type="submit" id="cookies-upload" data-t="admin.cookies.upload"></button>
+        </div>
+        <p id="cookies-file-note" class="note"></p>
+      </form>
+      <p id="cookies-result" class="note" style="white-space:pre-line"></p>
+    </section>
+    <section class="card stack" id="recipes" data-keywords="recipes">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.recipes.title"></h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="recipes-refresh" data-t="admin.refresh"></button>
+          <button class="btn" type="button" id="recipes-export" data-t="admin.recipes.export"></button>
         </div>
       </div>
-      <p class="note">
-        A recipe is a short list of steps that finds the video on a page. The program ships
-        a few; the model writes others, and you can import more. A recipe suspended on a
-        site is not tried there until two canary checks in a row pass; a retired one never
-        comes back. An imported recipe is a candidate: the videos it finds still wait for
-        MCR's approval.
-      </p>
+      <p class="note" data-t="admin.help.recipe"></p>
+      <p class="note" data-t="admin.recipes.about"></p>
       <label class="row tight" style="margin:0">
         <input type="checkbox" id="recipes-retired" style="width:auto">
-        <span>Show retired recipes</span>
+        <span data-t="admin.recipes.show_retired"></span>
       </label>
       <div id="recipes-list" class="stack"></div>
-      <div class="row"><button class="btn" type="button" id="recipes-more" hidden>Show more</button></div>
-      <h3 class="card-title" style="font-size:0.95rem">Import recipes</h3>
-      <textarea id="recipes-import-text" rows="5" class="mono" placeholder='Paste the contents of a recipes.json file: {"recipes":[…]}'></textarea>
+      <div class="row"><button class="btn" type="button" id="recipes-more" hidden data-t="admin.more"></button></div>
+      <h3 class="card-title" style="font-size:0.95rem" data-t="admin.recipes.import_title"></h3>
+      <textarea id="recipes-import-text" rows="5" class="mono" data-t-placeholder="admin.recipes.import_ph"></textarea>
       <div class="row tight">
-        <button class="btn" type="button" id="recipes-import-btn">Import</button>
+        <button class="btn" type="button" id="recipes-import-btn" data-t="wizard.people.import"></button>
         <input type="file" id="recipes-import-file" accept="application/json,.json" hidden>
-        <button class="btn" type="button" id="recipes-import-pick">Choose a file…</button>
+        <button class="btn" type="button" id="recipes-import-pick" data-t="admin.recipes.pick"></button>
       </div>
       <p id="recipes-result" class="note" style="white-space:pre-line"></p>
     </section>
-
-    <section class="card stack" id="repair-report">
+    <section class="card stack" id="repair-report" data-keywords="repair report">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Repair report (30 days)</h2>
-        <button class="btn" type="button" id="report-refresh">Refresh</button>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.report.title"></h2>
+        <button class="btn" type="button" id="report-refresh" data-t="admin.refresh"></button>
       </div>
       <p id="report-note" class="note"></p>
       <div class="card flush">
         <table>
           <thead>
             <tr>
-              <th>Site</th><th class="right">Runs</th><th class="right">Next choices</th><th class="right">Found</th><th class="right">Held</th><th class="right">Auto-delivered</th>
-              <th class="right">Approved</th><th class="right">Wrong video</th><th class="right">Rejected, other</th><th class="right">Expired</th>
-              <th class="right">Page stated a length</th><th class="right">Picture matched</th><th class="right">Model calls</th>
-              <th class="right">Median time</th><th class="right">Self-heal found</th>
+              <th data-t="admin.col.site"></th><th class="right" data-t="admin.report.col.runs"></th><th class="right" data-t="admin.report.col.next"></th><th class="right" data-t="admin.report.col.found"></th><th class="right" data-t="admin.report.col.held"></th><th class="right" data-t="admin.report.col.auto"></th>
+              <th class="right" data-t="admin.report.col.approved"></th><th class="right" data-t="admin.touch.wrong_video"></th><th class="right" data-t="admin.report.col.rejected"></th><th class="right" data-t="admin.report.col.expired"></th>
+              <th class="right" data-t="admin.report.col.length"></th><th class="right" data-t="admin.report.col.picture"></th><th class="right" data-t="admin.report.col.model"></th>
+              <th class="right" data-t="admin.report.col.median"></th><th class="right" data-t="admin.report.col.heal"></th>
             </tr>
           </thead>
-          <tbody id="report-body"><tr><td colspan="15" class="empty">Loading…</td></tr></tbody>
+          <tbody id="report-body"><tr><td colspan="15" class="empty" data-t="admin.loading"></td></tr></tbody>
         </table>
       </div>
     </section>
-
-    <section class="card stack" id="test-url">
+    <section class="card stack" id="test-url" data-keywords="test url dry run">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Test URL</h2>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.tu.card_title"></h2>
       </div>
-      <p class="note">
-        Paste an article address to see what the program would do with it, without downloading,
-        queuing or delivering anything: first what yt-dlp and the page sniffer say, and when
-        both fail, what the repair ladder would try, with every candidate and its checks. It
-        takes up to three minutes, and one test runs at a time.
-      </p>
+      <p class="note" data-t="admin.tu.about"></p>
       <form id="test-url-form" class="row">
-        <input type="url" id="test-url-input" class="grow" placeholder="https://… an article page" required>
-        <button class="btn btn-primary" type="submit" id="test-url-run">Run</button>
+        <input type="url" id="test-url-input" class="grow" data-t-placeholder="admin.tu.url_ph" required>
+        <button class="btn btn-primary" type="submit" id="test-url-run" data-t="admin.tu.run"></button>
       </form>
       <label class="row tight" style="margin:0">
         <input type="checkbox" id="test-url-llm" style="width:auto">
-        <span id="test-url-llm-label">Use the model</span>
+        <span id="test-url-llm-label" data-t="admin.tu.use_model"></span>
       </label>
       <p id="test-url-progress" class="note"></p>
       <div id="test-url-result" class="stack"></div>
     </section>
-
-    <section class="card stack" id="cookies">
-      <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Cookies</h2>
-        <button class="btn" type="button" id="cookies-refresh">Refresh</button>
+    <section class="card stack" id="selfheal" data-keywords="self-heal selfheal">
+      <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.selfheal.title"></h2>
+      <p class="note" data-t="admin.selfheal.about"></p>
+      <div class="card flush">
+        <table>
+          <thead><tr><th data-t="admin.col.site"></th><th data-t="admin.selfheal.col.when"></th><th data-t="admin.bench.result"></th><th data-t="admin.selfheal.col.method"></th><th class="right" data-t="admin.selfheal.col.pages"></th></tr></thead>
+          <tbody id="selfheal-body"><tr><td colspan="5" class="empty" data-t="admin.loading"></td></tr></tbody>
+        </table>
       </div>
-      <p class="note">
-        Some sites (X, Facebook, Instagram) show a video only to a logged-in account. Export
-        the station account's cookies as a Netscape <span class="mono">cookies.txt</span> from a
-        browser that is logged in, and upload them here, one file per site. They are encrypted
-        on this machine and are never shown again. Only the lines of that site are kept. Use
-        «Test» with a public link of the site to check that they still log in; it is repeated
-        every night, and the Cookies health line turns amber when they are about to expire
-        or stop working.
-      </p>
+    </section>
+    <section class="card stack" id="selfcheck" data-keywords="self-check selfcheck yt-dlp">
+      <div class="section-head">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.selfcheck.title"></h2>
+        <div class="row tight">
+          <button class="btn" type="button" id="selfcheck-refresh" data-t="admin.refresh"></button>
+          <button class="btn btn-primary" type="button" id="selfcheck-run" data-t="admin.selfcheck.run"></button>
+        </div>
+      </div>
+      <p class="note" data-t="admin.selfcheck.about"></p>
+      <div id="selfcheck-summary" class="stack"></div>
+      <div class="card flush">
+        <table>
+          <thead><tr><th data-t="admin.selfcheck.col.link"></th><th data-t="admin.col.status"></th><th data-t="admin.selfcheck.col.checked"></th><th data-t="admin.selfcheck.col.found"></th><th class="right"></th></tr></thead>
+          <tbody id="selfcheck-body"><tr><td colspan="5" class="empty" data-t="admin.loading"></td></tr></tbody>
+        </table>
+      </div>
+      <form id="selfcheck-form" class="row">
+        <input type="text" id="selfcheck-label" data-t-placeholder="admin.selfcheck.label_ph" style="width:220px" required>
+        <input type="url" id="selfcheck-url" class="grow" data-t-placeholder="admin.selfcheck.url_ph" required>
+        <button class="btn" type="submit" data-t="admin.selfcheck.add"></button>
+      </form>
+      <p class="note" data-t="admin.selfcheck.advice"></p>
+    </section>
+  </div>
+
+  <!-- Συντήρηση -->
+  <div class="admin-section" data-section="maintenance" hidden>
+    <section class="card" data-keywords="toolchain ffmpeg ffprobe bmxtranswrap">
+      <h2 class="card-title" data-t="admin.tools.title"></h2>
+      <div id="dependencies" class="stack">
+        <p class="note" data-t="admin.tools.checking"></p>
+      </div>
+    </section>
+    <section class="card" data-keywords="yt-dlp download engine">
+      <h2 class="card-title" data-t="admin.ytdl.title"></h2>
+      <div class="spec-row"><span data-t="admin.ytdl.installed_label"></span><span id="ytdl-installed" class="mono" data-t="admin.setup.checking"></span></div>
+      <div class="spec-row"><span data-t="admin.ytdl.latest_label"></span><span id="ytdl-remote" class="mono" data-t="admin.setup.checking"></span></div>
+      <p id="ytdl-note" class="note" style="margin:10px 0"></p>
+      <button class="btn btn-primary btn-block" type="button" id="ytdl-update" data-t="admin.ytdl.update"></button>
+      <button class="btn btn-block" type="button" id="ytdl-rollback" style="margin-top:8px" data-t="admin.ytdl.rollback"></button>
+      <p class="note" style="margin-top:8px" data-t="admin.ytdl.about"></p>
+    </section>
+    <section class="card" data-keywords="database purge vacuum">
+      <h2 class="card-title" data-t="admin.db.title"></h2>
+      <label for="purge-days" data-t="admin.db.purge_label"></label>
+      <div class="row">
+        <select id="purge-days" class="grow">
+          <option value="7" data-t="admin.autonomy.days7"></option>
+          <option value="14" selected data-t="admin.autonomy.days14"></option>
+          <option value="30" data-t="admin.autonomy.days30"></option>
+          <option value="90" data-t="admin.db.days90"></option>
+        </select>
+        <button class="btn" type="button" id="purge-btn" data-t="admin.db.purge"></button>
+      </div>
+      <button class="btn btn-block" type="button" id="vacuum-btn" style="margin-top:10px" data-t="admin.db.vacuum"></button>
+    </section>
+    <section class="card" id="diagnostics" data-keywords="diagnostics support zip">
+      <h2 class="card-title" data-t="admin.diag.title"></h2>
+      <p class="note" data-t="admin.diag.about"></p>
+      <a class="btn btn-block" id="diagnostics-btn" href="/api/admin/diagnostics.zip" data-t="admin.diag.download"></a>
+    </section>
+    <section class="card" data-keywords="scheduled maintenance tasks">
+      <div class="section-head" style="margin-bottom:12px">
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.tasks.title"></h2>
+        <button class="btn" type="button" id="maintenance-refresh" data-t="admin.refresh"></button>
+      </div>
       <div class="card flush">
         <table>
           <thead>
-            <tr>
-              <th>Site</th><th class="right">Cookies</th><th>Earliest expiry</th><th>Uploaded</th>
-              <th>Last test</th><th>Test link</th><th></th>
-            </tr>
+            <tr><th data-t="admin.tasks.col.task"></th><th data-t="admin.tasks.col.next"></th><th data-t="admin.tasks.col.last"></th><th data-t="admin.bench.result"></th><th class="right" data-t="admin.col.actions"></th></tr>
           </thead>
-          <tbody id="cookies-body"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+          <tbody id="maintenance-body">
+            <tr><td colspan="5" class="empty" data-t="admin.loading"></td></tr>
+          </tbody>
         </table>
       </div>
-      <h3 class="card-title" style="font-size:0.95rem">Σύνδεση / Sign in</h3>
-      <div id="cookies-signin" class="stack"></div>
-      <h3 class="card-title" style="font-size:0.95rem">Upload cookies</h3>
-      <form id="cookies-form" class="stack">
-        <div class="row tight">
-          <input type="text" id="cookies-domain" class="grow" placeholder="Site, for example x.com" autocomplete="off" required>
-          <input type="file" id="cookies-file" accept=".txt,text/plain" hidden>
-          <button class="btn" type="button" id="cookies-pick">Choose cookies.txt…</button>
-          <button class="btn btn-primary" type="submit" id="cookies-upload">Upload</button>
-        </div>
-        <p id="cookies-file-note" class="note"></p>
-      </form>
-      <p id="cookies-result" class="note" style="white-space:pre-line"></p>
     </section>
-
-    <section class="card stack" id="benchmarks">
+    <section class="card stack" id="benchmarks" data-keywords="benchmarks corpus">
       <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Benchmarks</h2>
-        <button class="btn" type="button" id="bench-refresh">Refresh</button>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.bench.title"></h2>
+        <button class="btn" type="button" id="bench-refresh" data-t="admin.refresh"></button>
       </div>
-      <p class="note">
-        Runs the stored 65-link corpus through the same tools as a job and reports how many links
-        work, how long each step takes and how that differs from the last run of the same kind.
-        «Extraction only» looks for the video and downloads nothing. «Full» also downloads,
-        transcodes, rewraps and runs the compliance check, in a scratch folder: no job is
-        queued, nothing is delivered to the watchfolder or archived. A run is refused while a job
-        is running unless you tick the box, and only one run goes at a time.
-      </p>
+      <p class="note" data-t="admin.bench.about"></p>
       <form id="bench-form" class="stack">
         <div class="row tight">
           <select id="bench-mode">
-            <option value="extract">Extraction only</option>
-            <option value="full">Full (download, transcode, verify)</option>
+            <option value="extract" data-t="admin.bench.opt.extract"></option>
+            <option value="full" data-t="admin.bench.opt.full"></option>
           </select>
-          <input type="text" id="bench-targets" class="mono" value="1-65" placeholder="Targets: 1-65 or 1-5,9" autocomplete="off" aria-label="Targets">
-          <input type="number" id="bench-parallel" min="1" max="4" value="2" aria-label="Targets at once" title="Targets at once (1 to 4)">
-          <label class="row tight"><input type="checkbox" id="bench-force"> Run although a job is running</label>
-          <button class="btn btn-primary" type="submit" id="bench-start">Start</button>
+          <input type="text" id="bench-targets" class="mono" value="1-65" data-t-placeholder="admin.bench.targets_ph" autocomplete="off" data-t-aria-label="admin.bench.col.targets">
+          <input type="number" id="bench-parallel" min="1" max="4" value="2" data-t-aria-label="admin.bench.parallel" data-t-title="admin.bench.parallel_title">
+          <label class="row tight"><input type="checkbox" id="bench-force"> <span data-t="admin.bench.force"></span></label>
+          <button class="btn btn-primary" type="submit" id="bench-start" data-t="admin.bench.start"></button>
         </div>
       </form>
       <p id="bench-result" class="note"></p>
@@ -325,355 +643,87 @@
         <table>
           <thead>
             <tr>
-              <th>Run</th><th>Mode</th><th>State</th><th>Started</th><th class="right">Targets</th>
-              <th class="right">Extraction</th><th class="right">Delivery</th><th>Thresholds</th><th></th>
+              <th data-t="admin.bench.col.run"></th><th data-t="admin.bench.col.mode"></th><th data-t="admin.col.state"></th><th data-t="admin.bench.col.started"></th><th class="right" data-t="admin.bench.col.targets"></th>
+              <th class="right" data-t="admin.bench.col.extraction"></th><th class="right" data-t="admin.bench.col.delivery_pct"></th><th data-t="admin.bench.col.thresholds"></th><th></th>
             </tr>
           </thead>
-          <tbody id="bench-runs"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody>
+          <tbody id="bench-runs"><tr><td colspan="9" class="empty" data-t="admin.loading"></td></tr></tbody>
         </table>
       </div>
       <div id="bench-report" class="stack"></div>
     </section>
-
-    <section class="card">
+    <section class="card" data-keywords="audit log">
       <div class="section-head" style="margin-bottom:12px">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">User accounts</h2>
-        <button class="btn btn-primary" type="button" id="add-user-btn">Create user</button>
-      </div>
-      <div class="card flush">
-        <table>
-          <thead>
-            <tr><th>Email</th><th>Name</th><th>Role</th><th>Journalist</th><th>Status</th><th class="right">Actions</th></tr>
-          </thead>
-          <tbody id="users-body">
-            <tr><td colspan="6" class="empty">Loading users…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="section-head" style="margin-bottom:12px">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Recent mail</h2>
-        <button class="btn" type="button" id="mail-refresh">Refresh</button>
-      </div>
-      <p class="note" style="margin-bottom:10px">
-        What the daemon made of each mail. <b>Reprocess</b> reads a mail again on
-        the next poll (after a parser fix, or a journalist added to the roster);
-        jobs it already has are not queued twice.
-      </p>
-      <div class="card flush" style="max-height:360px;overflow:auto">
-        <table>
-          <thead><tr><th>Handled</th><th>Subject</th><th>From</th><th>Outcome</th><th class="num">Jobs</th><th class="right"></th></tr></thead>
-          <tbody id="mail-body">
-            <tr><td colspan="6" class="empty">Loading…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card stack" id="llm">
-      <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">LLM assist</h2>
-        <span id="llm-in-use" class="note mono"></span>
-      </div>
-      <p class="note">
-        The parser decides every job. The model is asked only where the parser is
-        unsure (a journalist, a keyword, a group), and what it answers is checked
-        before use. Any OpenAI-compatible server works, on this machine or online.
-      </p>
-      <div class="grid-2">
-        <div>
-          <label for="llm-mode">Mode</label>
-          <select id="llm-mode">
-            <option value="assist">Assist (ask where the parser is unsure)</option>
-            <option value="off">Off (parser only)</option>
-          </select>
-        </div>
-        <div>
-          <label for="llm-provider">Provider</label>
-          <select id="llm-provider"></select>
-        </div>
-      </div>
-      <div>
-        <label for="llm-base">Base URL</label>
-        <input type="text" id="llm-base" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:1234/v1">
-      </div>
-      <p id="llm-online" class="note warn" hidden>
-        Online provider: each assist call sends the subject, part of the mail
-        body, the roster surnames and the group names to this company. Email
-        addresses and phone numbers are replaced with placeholders first, and
-        the sender's address is never sent.
-      </p>
-      <div class="grid-2">
-        <div>
-          <label for="llm-auth">API key is sent as</label>
-          <select id="llm-auth">
-            <option value="none">No key (local server)</option>
-            <option value="bearer">Authorization: Bearer (most providers)</option>
-            <option value="api_key_header">api-key header (Azure OpenAI)</option>
-          </select>
-        </div>
-        <div>
-          <label for="llm-key">API key</label>
-          <input type="password" id="llm-key" autocomplete="off">
-          <label class="row tight" style="margin:4px 0 0 0">
-            <input type="checkbox" id="llm-clear-key" style="width:auto">
-            <span class="note">Remove the stored key</span>
-          </label>
-        </div>
-      </div>
-      <div>
-        <label for="llm-model">Model</label>
-        <div class="row">
-          <input type="text" id="llm-model" class="grow" list="llm-models" spellcheck="false" autocomplete="off" placeholder="google/gemma-4-e4b">
-          <datalist id="llm-models"></datalist>
-          <button class="btn" type="button" id="llm-load-models">Load models</button>
-        </div>
-      </div>
-      <div class="grid-2">
-        <div>
-          <label for="llm-timeout">Timeout per call (seconds, 5–300)</label>
-          <input type="number" id="llm-timeout" min="5" max="300" value="30">
-        </div>
-        <div>
-          <label for="llm-tokens">Answer token limit (50–8000)</label>
-          <input type="number" id="llm-tokens" min="50" max="8000" value="400">
-        </div>
-      </div>
-      <label class="row tight" style="margin:0">
-        <input type="checkbox" id="llm-no-thinking" style="width:auto" checked>
-        <span>Disable thinking (reasoning models answer in seconds instead of minutes)</span>
-      </label>
-      <label class="row tight" style="margin:0">
-        <input type="checkbox" id="llm-polish" style="width:auto">
-        <span>Let the LLM write every keyword (otherwise only where the parser cannot make one); one model call per mail</span>
-      </label>
-      <div class="row">
-        <button class="btn" type="button" id="llm-test">Test</button>
-        <button class="btn btn-primary" type="button" id="llm-save">Save and apply</button>
-      </div>
-      <p id="llm-result" class="note" style="white-space:pre-line"></p>
-    </section>
-
-    <section class="card stack" id="taxonomy">
-      <div class="section-head">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Newsroom taxonomy</h2>
-        <div class="row tight">
-          <button class="btn" type="button" id="taxonomy-export">Export taxonomy.json</button>
-          <button class="btn" type="button" id="taxonomy-import-btn">Import…</button>
-          <input type="file" id="taxonomy-file" accept="application/json,.json" hidden>
-        </div>
-      </div>
-      <p class="note">
-        Groups are the news desk, each show and each desk. A mail's group is
-        decided from its subject, from "για …" in the body, or from the
-        journalist's first group; the LLM chooses from this list only when
-        none of those decide. The group is a label on the job: it never
-        changes the file name or where the file is delivered.
-      </p>
-      <label class="row tight" style="margin:0">
-        <input type="checkbox" id="taxonomy-replace" style="width:auto">
-        <span>On import, also remove groups and people the file does not list</span>
-      </label>
-      <p id="taxonomy-result" class="note" style="white-space:pre-line"></p>
-
-      <h3 class="card-title" style="font-size:0.95rem">Groups</h3>
-      <div class="card flush">
-        <table>
-          <thead>
-            <tr><th>Code</th><th>Name</th><th>Kind</th><th>Keywords</th><th>Description</th><th class="right">Actions</th></tr>
-          </thead>
-          <tbody id="groups-body">
-            <tr><td colspan="6" class="empty">Loading groups…</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <form id="group-form" class="stack">
-        <div class="grid-2">
-          <div>
-            <label for="g-code">Code (A–Z, 0–9, _)</label>
-            <input type="text" id="g-code" required maxlength="20" placeholder="NEWS" autocomplete="off">
-          </div>
-          <div>
-            <label for="g-name">Name</label>
-            <input type="text" id="g-name" required placeholder="Κεντρικό Δελτίο Ειδήσεων">
-          </div>
-        </div>
-        <div class="grid-2">
-          <div>
-            <label for="g-kind">Kind</label>
-            <select id="g-kind">
-              <option value="news">News</option>
-              <option value="show" selected>Show</option>
-              <option value="desk">Desk</option>
-              <option value="other">Other</option>
-            </select>
-          </div>
-          <div>
-            <label for="g-keywords">Keywords that name it (comma-separated)</label>
-            <input type="text" id="g-keywords" placeholder="ΔΕΛΤΙΟ, ΚΕΝΤΡΙΚΟ ΔΕΛΤΙΟ">
-          </div>
-        </div>
-        <div>
-          <label for="g-description">Description (for people and the LLM)</label>
-          <textarea id="g-description" rows="2" maxlength="500"></textarea>
-        </div>
-        <button class="btn btn-primary" type="submit">Save group</button>
-      </form>
-
-      <h3 class="card-title" style="font-size:0.95rem">People</h3>
-      <div class="card flush" style="max-height:420px;overflow:auto">
-        <table>
-          <thead>
-            <tr><th>Surname (slug)</th><th>Name</th><th>Addresses</th><th>Other names</th><th>Groups</th><th class="num">Prio</th><th class="right"></th></tr>
-          </thead>
-          <tbody id="people-body">
-            <tr><td colspan="7" class="empty">Loading…</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <form id="person-form" class="stack">
-        <div class="grid-2">
-          <div>
-            <label for="pf-surname">Surname as it appears in file names (Latin)</label>
-            <input type="text" id="pf-surname" required maxlength="40" placeholder="PAPADAKI" autocomplete="off" spellcheck="false">
-          </div>
-          <div>
-            <label for="pf-name">Full name</label>
-            <input type="text" id="pf-name" required placeholder="Μαρία Παπαδάκη">
-          </div>
-        </div>
-        <div>
-          <label for="pf-emails">Addresses they send from (comma-separated)</label>
-          <input type="text" id="pf-emails" placeholder="m.papadaki@station.gr, papadaki@radio.gr" autocomplete="off" spellcheck="false">
-        </div>
-        <div>
-          <label for="pf-aliases">Other names the mail may use: Greek surname, first name, nickname (comma-separated)</label>
-          <input type="text" id="pf-aliases" placeholder="ΠΑΠΑΔΑΚΗ, ΜΑΡΙΑ, ΜΑΙΡΗ">
-        </div>
-        <div class="grid-2">
-          <div>
-            <label for="pf-groups">Groups, default first (comma-separated codes)</label>
-            <input type="text" id="pf-groups" placeholder="NEWS" autocomplete="off" spellcheck="false">
-          </div>
-          <div>
-            <label for="pf-priority">Queue priority (-100…100)</label>
-            <input type="number" id="pf-priority" value="0" min="-100" max="100">
-          </div>
-        </div>
-        <div class="row">
-          <button class="btn btn-primary" type="submit">Save person</button>
-          <button class="btn" type="button" id="pf-clear">New person</button>
-        </div>
-      </form>
-
-      <h3 class="card-title" style="font-size:0.95rem">Backups</h3>
-      <div class="row" style="justify-content:space-between">
-        <p class="note" style="margin:0">A backup is taken automatically before every import, restore and delete; the newest 30 are kept in data\backups\taxonomy.</p>
-        <button class="btn" type="button" id="taxonomy-backup-now">Back up now</button>
-      </div>
-      <div class="card flush" style="max-height:260px;overflow:auto">
-        <table>
-          <thead><tr><th>Backup</th><th class="num">Groups</th><th class="num">People</th><th class="right"></th></tr></thead>
-          <tbody id="backups-body">
-            <tr><td colspan="4" class="empty">Loading…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="section-head" style="margin-bottom:12px">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Audit log</h2>
-        <button class="btn" type="button" id="logs-refresh">Refresh</button>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.audit.title"></h2>
+        <button class="btn" type="button" id="logs-refresh" data-t="admin.refresh"></button>
       </div>
       <div class="card flush" style="max-height:320px;overflow:auto">
         <table>
-          <thead><tr><th>Time</th><th>Level</th><th>Area</th><th>Message</th></tr></thead>
+          <thead><tr><th data-t="admin.audit.col.time"></th><th data-t="admin.audit.col.level"></th><th data-t="admin.audit.col.area"></th><th data-t="admin.audit.col.message"></th></tr></thead>
           <tbody id="logs-body">
-            <tr><td colspan="4" class="empty">Loading audit log…</td></tr>
+            <tr><td colspan="4" class="empty" data-t="admin.loading"></td></tr>
           </tbody>
         </table>
       </div>
     </section>
-
-    <section class="card">
+    <section class="card" data-keywords="recent mail reprocess">
       <div class="section-head" style="margin-bottom:12px">
-        <h2 class="card-title" style="border:none;margin:0;padding:0">Scheduled maintenance</h2>
-        <button class="btn" type="button" id="maintenance-refresh">Refresh</button>
+        <h2 class="card-title" style="border:none;margin:0;padding:0" data-t="admin.mail_log.title"></h2>
+        <button class="btn" type="button" id="mail-refresh" data-t="admin.refresh"></button>
       </div>
-      <div class="card flush">
+      <p class="note" style="margin-bottom:10px" data-t="admin.mail_log.about"></p>
+      <div class="card flush" style="max-height:360px;overflow:auto">
         <table>
-          <thead>
-            <tr><th>Task</th><th>Next run</th><th>Last run</th><th>Result</th><th class="right">Actions</th></tr>
-          </thead>
-          <tbody id="maintenance-body">
-            <tr><td colspan="5" class="empty">Loading…</td></tr>
+          <thead><tr><th data-t="admin.mail_log.col.handled"></th><th data-t="admin.mail_log.col.subject"></th><th data-t="admin.mail_log.col.from"></th><th data-t="admin.mail_log.col.outcome"></th><th class="num" data-t="admin.autonomy.jobs"></th><th class="right"></th></tr></thead>
+          <tbody id="mail-body">
+            <tr><td colspan="6" class="empty" data-t="admin.loading"></td></tr>
           </tbody>
         </table>
       </div>
     </section>
-
-    <section class="card">
-      <h2 class="card-title">Mailbox test</h2>
-      <div>
-        <div>
-          <label for="test-mail-tenant">Directory (tenant) ID</label>
-          <input type="text" id="test-mail-tenant" autocomplete="off" spellcheck="false">
-          <label for="test-mail-client" style="margin-top:8px">Application (client) ID</label>
-          <input type="text" id="test-mail-client" autocomplete="off" spellcheck="false">
-          <label for="test-mail-user" style="margin-top:8px">Mailbox</label>
-          <input type="text" id="test-mail-user" placeholder="ingest@station.gr">
-          <label for="test-mail-secret" style="margin-top:8px">Client secret (blank: test the stored one)</label>
-          <input type="password" id="test-mail-secret" autocomplete="off">
-          <button class="btn btn-block" type="button" id="test-mail-btn" style="margin-top:10px">Test mailbox</button>
-        </div>
-      </div>
-      <p id="test-result" class="note" style="margin-top:10px"></p>
-    </section>
+  </div>
   </div>
 
 </main>
 
 <div class="modal" id="user-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="user-modal-title">
-    <h2 id="user-modal-title" class="card-title">Create a newsroom account</h2>
+    <h2 id="user-modal-title" class="card-title" data-t="admin.users.modal_title"></h2>
     <form id="create-user-form" class="stack">
       <div>
-        <label for="new-email">Work email</label>
+        <label for="new-email" data-t="admin.users.email"></label>
         <input type="email" id="new-email" required autocomplete="off">
       </div>
       <div>
-        <label for="new-name">Full name</label>
+        <label for="new-name" data-t="wizard.account.name"></label>
         <input type="text" id="new-name" required>
       </div>
       <div>
-        <label for="new-password">Initial password (at least 12 characters)</label>
+        <label for="new-password" data-t="admin.users.password"></label>
         <input type="password" id="new-password" required minlength="12" autocomplete="new-password">
       </div>
       <div class="grid-2">
         <div>
-          <label for="new-role">Role</label>
+          <label for="new-role" data-t="admin.col.role"></label>
           <select id="new-role">
-            <option value="user">Journalist — submits links</option>
-            <option value="open_mcr">MCR operator — runs the queue</option>
-            <option value="admin">Administrator — full access</option>
+            <option value="user" data-t="admin.users.role_opt.user"></option>
+            <option value="open_mcr" data-t="admin.users.role_opt.open_mcr"></option>
+            <option value="admin" data-t="admin.users.role_opt.admin"></option>
           </select>
         </div>
         <div>
-          <label for="new-journalist">Linked journalist surname</label>
-          <input type="text" id="new-journalist" placeholder="PAPADAKI (optional)">
+          <label for="new-journalist" data-t="admin.users.journalist"></label>
+          <input type="text" id="new-journalist" data-t-placeholder="admin.users.journalist_ph">
         </div>
       </div>
       <div class="row">
-        <button class="btn btn-primary grow" type="submit">Create account</button>
-        <button class="btn" type="button" id="user-modal-cancel">Cancel</button>
+        <button class="btn btn-primary grow" type="submit" data-t="admin.users.create_btn"></button>
+        <button class="btn" type="button" id="user-modal-cancel" data-t="dialog.cancel"></button>
       </div>
     </form>
   </div>
 </div>
 
-<script type="module" src="/static/admin.js?v=30"></script>
+<script type="module" src="/static/admin.js?v=44"></script>
 </body>
 </html>

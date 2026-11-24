@@ -188,10 +188,14 @@ try {
         throw (Cannot-Run $exe $_.Exception.Message)
     }
     $versionCode = $LASTEXITCODE
-    $version = (([string]($versionLine | Select-Object -First 1)) -split ' ')[-1].Trim()
-    if ($versionCode -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+') {
-        throw "omni-ingest.exe --version exited with $versionCode and printed '$versionLine'; expected a version such as 1.0.0"
+    # "omni-ingest 1.0.0 (abc1234)": the version, then the commit it was built from.
+    $first = ([string]($versionLine | Select-Object -First 1)).Trim()
+    if ($versionCode -ne 0 -or $first -notmatch '^omni-ingest (\d+\.\d+\.\d+\S*)( \((\S+)\))?$') {
+        throw "omni-ingest.exe --version exited with $versionCode and printed '$versionLine'; expected 'omni-ingest 1.0.0 (abc1234)'"
     }
+    $version = $Matches[1]
+    $commit = if ($Matches[3]) { $Matches[3] } else { 'unknown' }
+    Write-Host "omni-ingest.exe $version, commit $commit"
     $date = Get-Date -Format yyyyMMdd
     $name = "OmniIngest-$version-$date-$Arch"
     $stage = Join-Path $dist $name
@@ -285,7 +289,7 @@ try {
         $r = Invoke-Setup $setup @('/?')
         if ($r.Code -ne 0) { throw "OmniIngest-Setup.exe /? failed (exit $($r.Code)): $($r.Error)" }
         $first = ($r.Output -split "`r?`n")[0].Trim()
-        if ($first -match '^OmniIngest Setup (\S+)$') { $setupVersion = $Matches[1] }
+        if ($first -match '^OmniIngest Setup (\S+)( \((\S+)\))?$') { $setupVersion = $Matches[1] }
         else { throw "OmniIngest-Setup.exe /? does not start with its version: '$first'" }
         if ($setupVersion -ne $version) {
             throw "The Setup program is version $setupVersion but the packaged omni-ingest.exe is $version; bump both crates to the same version and build again."

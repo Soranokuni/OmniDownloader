@@ -4,6 +4,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -24,6 +25,9 @@ use crate::timestamps;
 /// A day covers the realistic case (the same story forwarded again during one
 /// news cycle) without blocking a genuine re-ingest the next day.
 pub const DEFAULT_DEDUP_WINDOW_HOURS: i64 = 24;
+
+/// Rows per transaction when the keys are made again (P14.8b).
+pub const RENORMALIZE_BATCH: usize = 500;
 
 /// One page-evidence file of a failed job (plan P10.1).
 #[derive(Debug, Clone)]
@@ -61,6 +65,35 @@ pub const AUDIT_KEEP_DAYS: i64 = 365;
 pub const MAIL_KEEP_DAYS: i64 = 90;
 /// Rows removed per transaction by the scheduled retention, so a lease heartbeat never waits long.
 pub const RETENTION_BATCH: i64 = 5000;
+/// The `mail_auto_retries.cause` of a mail a person asked to read again (P11.11b).
+pub const MAIL_RETRY_BY_A_PERSON: &str = "person";
+/// How `mail_reprocess.requested_by` starts for the system's own re-read (P11.11b).
+const MAIL_RETRY_AUTOMATIC_PREFIX: &str = "automatic (";
+/// Addresses one journalist may have (the journalist card refuses more too).
+pub const MAX_JOURNALIST_EMAILS: usize = 20;
+
+/// What [`Repository::add_journalist_email`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressAdded {
+    Added,
+    /// The address was already this journalist's: nothing changed.
+    AlreadyTheirs,
+    /// The address is another journalist's (their surname): nothing changed.
+    TakenBy(String),
+    NoSuchJournalist,
+    /// The journalist already has [`MAX_JOURNALIST_EMAILS`] addresses.
+    Full,
+}
+
+/// What [`Repository::add_new_journalist`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewJournalist {
+    Added,
+    /// The surname is on the list already: nothing changed.
+    AlreadyListed,
+    /// `address` belongs to the journalist `surname`: nothing changed.
+    AddressTaken { address: String, surname: String },
+}
 
 /// The finished jobs retention may delete: terminal, past the cutoff (?1), not held (?2 = batch).
 pub const PURGE_JOB_IDS_SQL: &str = "SELECT id FROM queue
@@ -748,6 +781,134 @@ enum Duplicate {
     Recent(i64),
 }
 
+/// What the repair ladder in shadow mode would have fixed (P11.9).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ShadowSummary {
+    /// Shadow runs of the ladder.
+    pub runs: i64,
+    /// Runs that verified a video they would have used.
+    pub would_fix: i64,
+    /// Jobs with at least one such run.
+    pub jobs: i64,
+    /// Per site, the most would-have-fixed first.
+    pub sites: Vec<ShadowSite>,
+    /// The latest would-have-fixed runs, newest first (at most 10).
+    pub latest: Vec<ShadowJob>,
+}
+
+/// One site's shadow runs (P11.9).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShadowSite {
+    /// The registrable domain; empty when the run recorded none.
+    pub domain: String,
+    pub runs: i64,
+    pub would_fix: i64,
+    pub jobs: i64,
+}
+
+/// A job the ladder would have fixed (P11.9).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ShadowJob {
+    pub job_id: i64,
+    pub slug: String,
+    pub domain: String,
+    pub at: Option<DateTime<Utc>>,
+    /// The job's status now (`REQUIRES_REVIEW`, `COMPLETED_MANUAL`, ...).
+    pub status: String,
+}
+
+/// A job in review behind a login wall (P11.12). The link is for grouping by
+/// site only and is never sent to a client.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoginWallJob {
+    pub id: i64,
+    pub slug: String,
+    pub url: String,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// What the desk's cards need beyond the job rows, for one page (P14.6,
+/// [`Repository::desk_extras`]).
+#[derive(Debug, Default)]
+pub struct DeskExtras {
+    /// Undecided held videos, by job.
+    pub held: HashMap<i64, HeldOutput>,
+    /// The latest attempt that ended held, of each job awaiting approval.
+    pub held_attempts: HashMap<i64, RepairAttempt>,
+    /// The latest attempt of each completed job.
+    pub attempts: HashMap<i64, RepairAttempt>,
+    /// Recipe origins, by recipe id.
+    pub origins: HashMap<i64, String>,
+    /// MCR approvals of a recipe on a site.
+    pub approvals: HashMap<(i64, String), i64>,
+}
+
+impl DeskExtras {
+    /// The approvals of `recipe_id` on `domain`, 0 when none are recorded.
+    pub fn approvals_of(&self, recipe_id: Option<i64>, domain: Option<&str>) -> i64 {
+        match (recipe_id, domain) {
+            (Some(id), Some(d)) => self.approvals.get(&(id, d.to_string())).copied().unwrap_or(0),
+            _ => 0,
+        }
+    }
+}
+
+/// The SQL functions every pooled connection has (P14.8c):
+/// `omni_normalize(url)` is [`crate::urlnorm::normalize`], so a statement that
+/// brings a row back to the queue writes its dedup key by today's rules in the
+/// same UPDATE (`url_normalized = omni_normalize(url)`). NULL stays NULL.
+fn register_sql_functions(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    c.create_scalar_function(
+        "omni_normalize",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|url| crate::urlnorm::normalize(&url))),
+    )
+}
+
+/// The columns [`attempt_from_row`] reads, in its order.
+const ATTEMPT_COLUMNS: &str = "id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
+    llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
+    held_url, mcr_decision, image_distance, image_frame_secs, image_host, expected_secs";
+
+fn attempt_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RepairAttempt> {
+    Ok(RepairAttempt {
+        id: r.get(0)?,
+        job_id: r.get(1)?,
+        started_at: timestamps::parse(&r.get::<_, String>(2)?),
+        finished_at: timestamps::parse_opt(r.get(3)?),
+        mode: r.get(4)?,
+        rung: r.get(5)?,
+        outcome: r.get(6)?,
+        recipe_hash: r.get(7)?,
+        recipe_id: r.get(8)?,
+        domain: r.get(9)?,
+        llm_calls: r.get(10)?,
+        tokens_in: r.get(11)?,
+        tokens_out: r.get(12)?,
+        candidates_json: r.get(13)?,
+        next_index: r.get(14)?,
+        duration_ms: r.get(15)?,
+        held_url: r.get(16)?,
+        mcr_decision: r.get(17)?,
+        image_distance: r.get(18)?,
+        image_frame_secs: r.get(19)?,
+        image_host: r.get(20)?,
+        expected_secs: r.get(21)?,
+    })
+}
+
+/// A job that waits for a person (P11.14), and since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingForPerson {
+    pub id: i64,
+    pub slug: String,
+    /// `REQUIRES_REVIEW`, `MANUAL_DOWNLOAD` or `AWAITING_APPROVAL`.
+    pub status: String,
+    pub since: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct Repository {
     pool: Arc<Pool<SqliteConnectionManager>>,
@@ -771,8 +932,10 @@ impl Repository {
                 .with_context(|| format!("Failed creating directory for DB {:?}", parent))?;
         }
 
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|c| c.execute_batch(migrations::PER_CONNECTION_PRAGMAS));
+        let manager = SqliteConnectionManager::file(path).with_init(|c| {
+            c.execute_batch(migrations::PER_CONNECTION_PRAGMAS)?;
+            register_sql_functions(c)
+        });
         let pool = Pool::builder()
             .max_size(16)
             .build(manager)
@@ -801,12 +964,71 @@ impl Repository {
         self
     }
 
+    /// Keep `values` out of every log line while the returned guard lives
+    /// (P11.15a2, P11.15a4: the keys of a file-locker share's direct address,
+    /// for the length of its run). `None` without a redactor.
+    #[must_use = "the values are redacted only while the guard lives"]
+    pub fn redact_in_logs(&self, values: Vec<String>) -> Option<crate::logging::TemporaryRedaction> {
+        self.redactions.as_ref().map(|r| r.add_temporary(values))
+    }
+
     /// The second-chance window (P11.5) from the `retry` config, read through
     /// [`crate::second_chance::window_for`]: 30..=360 minutes, and never longer
     /// than `retry.max_age_mins`.
     pub fn with_second_chance_window(mut self, retry: &crate::config::RetryConfig) -> Self {
         self.second_chance_window = crate::second_chance::window_for(retry);
         self
+    }
+
+    /// Bring the stored dedup keys (`queue.url_normalized`) up to
+    /// [`crate::urlnorm::NORMALIZE_VERSION`] (P14.8b, P14.8c). Does nothing when
+    /// the version stored in `app_meta` is current. Otherwise EVERY row gets
+    /// `normalize(url)` again, whatever its status and age: a finished row can be
+    /// brought back to the queue (re-download, retry), and its old key would let
+    /// the same link in twice. In batches of [`RENORMALIZE_BATCH`] rows by id,
+    /// each read and written in one transaction; a row whose `url` changed in
+    /// between is left to the statement that changed it (which writes its key,
+    /// `omni_normalize`). The version is stored last, so a stop half-way does
+    /// the rest at the next start. Returns how many keys changed.
+    pub fn renormalize_if_needed(conn: &mut rusqlite::Connection) -> Result<usize> {
+        let stored: Option<String> = conn
+            .query_row("SELECT value FROM app_meta WHERE key = 'url_normalize_version'", [], |r| r.get(0))
+            .optional()?;
+        let stored = stored.and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(1);
+        if stored == crate::urlnorm::NORMALIZE_VERSION {
+            return Ok(0);
+        }
+        let mut changed = 0;
+        let mut after: i64 = i64::MIN;
+        loop {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let batch: Vec<(i64, String, Option<String>)> = {
+                let mut stmt = tx.prepare("SELECT id, url, url_normalized FROM queue WHERE id > ? ORDER BY id LIMIT ?")?;
+                let rows = stmt.query_map(params![after, RENORMALIZE_BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let Some(last) = batch.last().map(|(id, _, _)| *id) else {
+                tx.commit()?;
+                break;
+            };
+            for (id, url, old) in &batch {
+                let key = crate::urlnorm::normalize(url);
+                if old.as_deref() != Some(key.as_str()) {
+                    changed += tx.execute("UPDATE queue SET url_normalized = ? WHERE id = ? AND url = ?", params![key, id, url])?;
+                }
+            }
+            tx.commit()?;
+            after = last;
+        }
+        conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES ('url_normalize_version', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![crate::urlnorm::NORMALIZE_VERSION.to_string()],
+        )?;
+        if changed > 0 {
+            info!("Dedup keys: {changed} brought up to normalization version {}", crate::urlnorm::NORMALIZE_VERSION);
+        }
+        Ok(changed)
     }
 
     /// The window the second-chance triggers use (P11.5).
@@ -820,6 +1042,10 @@ impl Repository {
         conn.execute_batch(migrations::DATABASE_PRAGMAS)?;
         migrations::apply(&mut conn, self.db_path.as_deref())
             .context("Schema migration failed; refusing to start against a half-migrated database")?;
+        // The dedup keys of the rows a duplicate check can still meet, made again
+        // when the normalization rules changed (P14.8b): a link sent before an
+        // upgrade and again after it must still be one job.
+        Self::renormalize_if_needed(&mut conn).context("Could not bring the stored dedup keys up to date")?;
 
         // No default admin is seeded (plan P2.4, defect W-04).
         //
@@ -828,9 +1054,9 @@ impl Repository {
         // credentials on a box that can repoint the playout watchfolder is not
         // a convenience, it is a back door, and nothing ever removed it.
         //
-        // First run is instead: `omni-ingest setup`, or `/setup` served to a
-        // loopback client while no admin exists. Once an admin exists, that
-        // window closes.
+        // First run is instead the daemon's `Admin` / `Admin` account on a brand-new
+        // database (`ensure_default_admin`), which signs in only from this machine
+        // and is replaced by the setup wizard (P13.3: there is no /setup page).
         let admin_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1",
             [],
@@ -838,9 +1064,10 @@ impl Repository {
         )?;
         if admin_count == 0 {
             warn!(
-                "No administrator account exists. Run `omni-ingest setup`, or open /setup in a \
-                 browser ON THIS MACHINE, to create one. Until then the panels cannot be \
-                 administered."
+                "No active administrator account exists yet. A new installation gets the \
+                 first-run account when the service starts; otherwise reactivate one with \
+                 `omni-ingest admin activate <login>`, or create one with \
+                 `omni-ingest admin create-admin <login>`. Until then the panels cannot be administered."
             );
         }
 
@@ -1054,17 +1281,30 @@ impl Repository {
     /// Priority is raised to the journalist's default if that is higher
     /// (defect D-20 -- `journalists.default_priority` was never applied).
     pub fn enqueue(&self, job: &NewJob, dedup_window_hours: i64) -> Result<Enqueued> {
+        self.enqueue_with(job, dedup_window_hours, false)
+    }
+
+    /// [`Self::enqueue`] for a job the system makes again on its own from a mail
+    /// it re-reads automatically (P11.11b): a link delivered recently under *any*
+    /// journalist is a duplicate, as for a second chance. MCR may have queued the
+    /// failed mail's link by hand under the right name while the mail itself
+    /// went to the `MCR` placeholder; a second job would be a second MXF on air.
+    pub fn enqueue_automatic(&self, job: &NewJob, dedup_window_hours: i64) -> Result<Enqueued> {
+        self.enqueue_with(job, dedup_window_hours, true)
+    }
+
+    fn enqueue_with(&self, job: &NewJob, dedup_window_hours: i64, any_journalist_for_completed: bool) -> Result<Enqueued> {
         let normalized = crate::urlnorm::normalize(&job.url);
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-        match Self::duplicate_of(&tx, &normalized, &job.journalist, dedup_window_hours, None, false)? {
+        match Self::duplicate_of(&tx, &normalized, &job.journalist, dedup_window_hours, None, any_journalist_for_completed)? {
             Some(Duplicate::Active(existing_id)) => {
                 tx.commit()?;
                 self.log_audit(
                     "INFO",
                     "QUEUE",
-                    &format!("Duplicate of active job #{existing_id} ignored: {}", job.url),
+                    &format!("Duplicate of active job #{existing_id} ignored ({})", crate::urlnorm::site_for_log(&job.url)),
                 )?;
                 return Ok(Enqueued::DuplicateActive { existing_id });
             }
@@ -1073,7 +1313,7 @@ impl Repository {
                 self.log_audit(
                     "INFO",
                     "QUEUE",
-                    &format!("Duplicate of recently completed job #{existing_id}: {}", job.url),
+                    &format!("Duplicate of recently completed job #{existing_id} ({})", crate::urlnorm::site_for_log(&job.url)),
                 )?;
                 return Ok(Enqueued::DuplicateRecent { existing_id });
             }
@@ -1266,6 +1506,18 @@ impl Repository {
         self.requeue(job_id, owner, backoff, error_code, error_message, None)
     }
 
+    /// Whether job `job_id` was ever re-queued with `error_code` (P11.7b): its
+    /// history has the line `requeue` writes, «{code}: retrying in …».
+    pub fn was_requeued_with(&self, job_id: i64, error_code: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let prefix = format!("{error_code}: retrying in ");
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM job_events WHERE job_id = ? AND substr(message, 1, ?) = ?)",
+            params![job_id, prefix.chars().count() as i64, prefix],
+            |r| r.get::<_, bool>(0),
+        )?)
+    }
+
     /// [`Self::requeue_after`] for a retry the policy decided (P11.3a): the
     /// attempt the lease spent stays spent, and `max_attempts` becomes the
     /// code's budget (first run plus its retries), so the desk's «έγιναν N
@@ -1296,7 +1548,7 @@ impl Repository {
         let now = timestamps::now_string();
         let not_before = timestamps::format(Utc::now() + backoff);
         let changed = conn.execute(
-            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+            "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
              lease_expires_at=NULL, not_before=?, error_code=?, first_error_code = COALESCE(first_error_code, ?),
              error_message=?, max_attempts = COALESCE(?, max_attempts),
              progress=0.0, delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
@@ -1371,7 +1623,7 @@ impl Repository {
             .optional()?
             .flatten();
         let changed = conn.execute(
-            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+            "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL, lease_expires_at=NULL,
              not_before=?, error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
              error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
              updated_at=?
@@ -1398,7 +1650,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let changed = conn.execute(
-            "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+            "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL, lease_expires_at=NULL,
              not_before=NULL, error_code=NULL, error_message=?, progress=0.0, speed='0 Mbps', eta='--:--',
              delivery_wait=0, ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
              delivering_to=NULL, delivering_bytes=NULL, delivering_recorded=NULL, updated_at=?
@@ -1472,6 +1724,54 @@ impl Repository {
             bus.job(id, JobStatus::RequiresReview.as_str(), None, None);
         }
         Ok(true)
+    }
+
+    /// The watchfolder is being changed (P13.2) with no job running: every
+    /// finished video still queued to wait for the old folder goes to review as
+    /// DELIVERY_UNCONFIRMED with `message`, as [`Self::review_waiting_delivery`]
+    /// does for one (event, audit row, the P10.16b note); its file, marker and
+    /// wait are kept, and nothing is delivered to the new folder on its own.
+    /// Returns the jobs moved.
+    pub fn review_parked_deliveries(&self, message: &str) -> Result<Vec<i64>> {
+        let mut conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM queue WHERE delivery_wait = 1 AND status = 'PENDING' ORDER BY id")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut moved = Vec::new();
+        for id in ids {
+            let n = tx.execute(
+                "UPDATE queue SET status='REQUIRES_REVIEW', lease_owner=NULL, lease_expires_at=NULL,
+                 error_code='DELIVERY_UNCONFIRMED', first_error_code = COALESCE(first_error_code, 'DELIVERY_UNCONFIRMED'),
+                 error_message=?, completed_at=?, updated_at=?
+                 WHERE id=? AND status='PENDING' AND delivery_wait = 1",
+                params![message, now, now, id],
+            )?;
+            if n != 1 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO job_events (job_id, at, stage, level, message) VALUES (?, ?, 'DELIVER', 'ERROR', ?)",
+                params![id, now, message],
+            )?;
+            tx.execute(
+                "INSERT INTO audit_logs (level, category, message, timestamp) VALUES ('WARN', 'DELIVERY', ?, ?)",
+                params![format!("Job {id}: {message}"), now],
+            )?;
+            Self::close_waiting_auto_delivery(&tx, id, &now)?;
+            moved.push(id);
+        }
+        tx.commit()?;
+        for id in &moved {
+            count_finished(JobStatus::RequiresReview);
+            if let Some(bus) = &self.events {
+                bus.job(*id, JobStatus::RequiresReview.as_str(), None, None);
+            }
+        }
+        Ok(moved)
     }
 
     /// A waiting job leaves the wait without a proven delivery (P11.2b): to
@@ -1804,6 +2104,30 @@ impl Repository {
         Ok(held.is_some())
     }
 
+    /// Take job `job_id`'s one second route through the pipeline (P11.6) for
+    /// the worker holding its lease. `false` when the job already took it or is
+    /// not `owner`'s running job: then nothing is written.
+    pub fn claim_second_route(&self, job_id: i64, owner: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let now = timestamps::now_string();
+        let n = conn.execute(
+            "UPDATE queue SET second_route_at = ?, updated_at = ?
+             WHERE id = ? AND lease_owner = ? AND status = 'RUNNING' AND second_route_at IS NULL",
+            params![now, now, job_id, owner],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// When job `job_id` took its second route (P11.6); `None` if it has not,
+    /// or the row is gone.
+    pub fn second_route_at(&self, job_id: i64) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.pool.get()?;
+        let at: Option<Option<String>> = conn
+            .query_row("SELECT second_route_at FROM queue WHERE id = ?", params![job_id], |r| r.get(0))
+            .optional()?;
+        Ok(at.flatten().as_deref().and_then(timestamps::parse))
+    }
+
     /// Move a leased job to the next stage and reset the stage clock.
     pub fn set_stage(&self, job_id: i64, owner: &str, stage: JobStage) -> Result<bool> {
         self.set_stage_at(job_id, owner, stage, Utc::now())
@@ -1877,7 +2201,7 @@ impl Repository {
         let Some(job) = self.get_job(job_id)? else {
             return Ok(None);
         };
-        let slug = format!("{}_{}_{}", job.index_str, job.journalist, keyword);
+        let slug = crate::slug::compose(&job.index_str, &job.journalist, keyword);
         let conn = self.pool.get()?;
         let changed = conn.execute(
             // A waiting job keeps its updated_at: it is the start of its wait (plan P7.19).
@@ -1975,41 +2299,78 @@ impl Repository {
     /// `extra` is fixed text from the two callers above, never a value.
     fn attempt_where(&self, job_id: i64, extra: &str) -> Result<Option<RepairAttempt>> {
         let conn = self.pool.get()?;
+        let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM repair_attempts WHERE job_id = ? {extra} ORDER BY id DESC LIMIT 1");
+        Ok(conn.query_row(&sql, params![job_id], attempt_from_row).optional()?)
+    }
+
+    /// The latest attempt (`held_only`: the latest that ended held) of each of
+    /// `job_ids`, in one query (P14.6: the desk's pages without one query per
+    /// job). Only the placeholders are formatted in; the ids are bound.
+    fn latest_attempts_of(conn: &rusqlite::Connection, job_ids: &[i64], held_only: bool) -> Result<HashMap<i64, RepairAttempt>> {
+        if job_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let marks = vec!["?"; job_ids.len()].join(",");
+        let held = if held_only { "AND outcome = 'held'" } else { "" };
         let sql = format!(
-            "SELECT id, job_id, started_at, finished_at, mode, rung, outcome, recipe_hash, recipe_id, domain,
-                    llm_calls, tokens_in, tokens_out, candidates_json, next_index, duration_ms,
-                    held_url, mcr_decision, image_distance, image_frame_secs, image_host, expected_secs
-             FROM repair_attempts WHERE job_id = ? {extra} ORDER BY id DESC LIMIT 1"
+            "SELECT {ATTEMPT_COLUMNS} FROM repair_attempts
+              WHERE id IN (SELECT MAX(id) FROM repair_attempts WHERE job_id IN ({marks}) {held} GROUP BY job_id)"
         );
-        let row = conn
-            .query_row(&sql, params![job_id], |r| {
-                Ok(RepairAttempt {
-                    id: r.get(0)?,
-                    job_id: r.get(1)?,
-                    started_at: timestamps::parse(&r.get::<_, String>(2)?),
-                    finished_at: timestamps::parse_opt(r.get(3)?),
-                    mode: r.get(4)?,
-                    rung: r.get(5)?,
-                    outcome: r.get(6)?,
-                    recipe_hash: r.get(7)?,
-                    recipe_id: r.get(8)?,
-                    domain: r.get(9)?,
-                    llm_calls: r.get(10)?,
-                    tokens_in: r.get(11)?,
-                    tokens_out: r.get(12)?,
-                    candidates_json: r.get(13)?,
-                    next_index: r.get(14)?,
-                    duration_ms: r.get(15)?,
-                    held_url: r.get(16)?,
-                    mcr_decision: r.get(17)?,
-                    image_distance: r.get(18)?,
-                    image_frame_secs: r.get(19)?,
-                    image_host: r.get(20)?,
-                    expected_secs: r.get(21)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(job_ids.iter()), attempt_from_row)?;
+        let mut out = HashMap::new();
+        for a in rows {
+            let a = a?;
+            out.insert(a.job_id, a);
+        }
+        Ok(out)
+    }
+
+    /// What the desk's cards need beyond the job rows (P14.6), for a whole page
+    /// in a handful of queries instead of several per job: the waiting held
+    /// video and latest held attempt of each job awaiting approval, the latest
+    /// attempt of each completed job, and the origin and site approvals of the
+    /// recipes those attempts name.
+    pub fn desk_extras(&self, jobs: &[&crate::models::Job]) -> Result<DeskExtras> {
+        let conn = self.pool.get()?;
+        let ids_of = |s: JobStatus| jobs.iter().filter(|j| j.status == s).map(|j| j.id).collect::<Vec<_>>();
+        let (waiting, completed) = (ids_of(JobStatus::AwaitingApproval), ids_of(JobStatus::Completed));
+        let mut extras = DeskExtras::default();
+        if !waiting.is_empty() {
+            let marks = vec!["?"; waiting.len()].join(",");
+            let mut stmt = conn.prepare(&format!("SELECT * FROM held_outputs WHERE job_id IN ({marks}) AND decision IS NULL"))?;
+            for h in stmt.query_map(rusqlite::params_from_iter(waiting.iter()), Self::held_from_row)? {
+                let h = h?;
+                extras.held.insert(h.job_id, h);
+            }
+        }
+        extras.held_attempts = Self::latest_attempts_of(&conn, &waiting, true)?;
+        extras.attempts = Self::latest_attempts_of(&conn, &completed, false)?;
+        let recipes: Vec<(i64, Option<String>)> = extras
+            .held_attempts
+            .values()
+            .chain(extras.attempts.values())
+            .filter_map(|a| a.recipe_id.map(|id| (id, a.domain.clone())))
+            .collect();
+        if !recipes.is_empty() {
+            let ids: Vec<i64> = recipes.iter().map(|(id, _)| *id).collect();
+            let marks = vec!["?"; ids.len()].join(",");
+            let mut stmt = conn.prepare(&format!("SELECT id, origin FROM recipes WHERE id IN ({marks})"))?;
+            for row in stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+                let (id, origin) = row?;
+                extras.origins.insert(id, origin);
+            }
+            let mut stmt = conn.prepare(&format!("SELECT recipe_id, domain, approvals FROM recipe_sites WHERE recipe_id IN ({marks})"))?;
+            for row in stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })? {
+                let (id, domain, n) = row?;
+                if recipes.iter().any(|(rid, d)| *rid == id && d.as_deref() == Some(domain.as_str())) {
+                    extras.approvals.insert((id, domain), n);
+                }
+            }
+        }
+        Ok(extras)
     }
 
     /// The article-picture evidence of a held attempt (P10.11b), written only
@@ -2396,7 +2757,7 @@ impl Repository {
             }
             if attempts < max_attempts {
                 tx.execute(
-                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
                      lease_expires_at=NULL, progress=0.0, updated_at=? WHERE id=?",
                     params![now, id],
                 )?;
@@ -2486,7 +2847,7 @@ impl Repository {
                 // it to review or delivers it twice. The attempt was given back when it parked.
                 requeued += 1;
                 tx.execute(
-                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
                      lease_expires_at=NULL, not_before=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
                      error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
                      updated_at=?
@@ -2512,7 +2873,7 @@ impl Repository {
                 warn!("Job #{id}: cannot tell whether {name} was delivered before the restart: {reason}");
                 requeued += 1;
                 tx.execute(
-                    "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL, lease_expires_at=NULL,
+                    "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL, lease_expires_at=NULL,
                      not_before=?, progress=0.0, speed='0 Mbps', eta='--:--', delivery_wait=1,
                      ready_path=NULL, ready_bytes=NULL, ready_sha256=NULL, ready_at=NULL,
                      error_code='DELIVERY_FAILED', first_error_code = COALESCE(first_error_code, 'DELIVERY_FAILED'),
@@ -2533,7 +2894,7 @@ impl Repository {
             }
             requeued += 1;
             tx.execute(
-                "UPDATE queue SET status='PENDING', stage='QUEUED', lease_owner=NULL,
+                "UPDATE queue SET status='PENDING', stage='QUEUED', url_normalized=omni_normalize(url), lease_owner=NULL,
                  lease_expires_at=NULL, progress=0.0, speed='0 Mbps', eta='--:--',
                  delivering_to=NULL, delivering_bytes=NULL, updated_at=?
                  WHERE id=?",
@@ -2810,12 +3171,14 @@ impl Repository {
         conn.execute(
             r#"
             UPDATE queue
-            SET status = ?,
-                error_message = COALESCE(?, error_message),
-                file_path = COALESCE(?, file_path),
-                duration_secs = COALESCE(?, duration_secs),
+            SET status = ?1,
+                -- Back to PENDING: the key of the link by today's rules (P14.8c).
+                url_normalized = CASE WHEN ?1 = 'PENDING' THEN omni_normalize(url) ELSE url_normalized END,
+                error_message = COALESCE(?2, error_message),
+                file_path = COALESCE(?3, file_path),
+                duration_secs = COALESCE(?4, duration_secs),
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            WHERE id = ?
+            WHERE id = ?5
             "#,
             params![status.as_str(), error_message, file_path, duration, id],
         )?;
@@ -3015,6 +3378,19 @@ impl Repository {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    /// The last `limit` jobs that ended without a delivery (FAILED, in
+    /// review, or waiting for a manual download), newest first: the
+    /// diagnostics package (P13.8).
+    pub fn recent_failed_jobs(&self, limit: usize) -> Result<Vec<Job>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM queue WHERE status IN ('FAILED','REQUIRES_REVIEW','MANUAL_DOWNLOAD')
+             ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::map_job_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub fn get_jobs_by_journalist(&self, journalist: &str) -> Result<Vec<Job>> {
@@ -3257,7 +3633,7 @@ impl Repository {
         let n = tx.execute(
             r#"
             UPDATE queue
-            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+            SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 file_path = NULL, delivered_at = NULL, completed_at = NULL, cleared_at = NULL,
@@ -3300,7 +3676,8 @@ impl Repository {
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, url = COALESCE(?, url),
-                url_normalized = COALESCE(?, url_normalized),
+                -- The key of the link it runs with, by today's rules (P14.8c).
+                url_normalized = COALESCE(?, omni_normalize(url)),
                 delivery_wait = 0, ready_path = NULL, ready_bytes = NULL, ready_sha256 = NULL, ready_at = NULL,
                 human_touched = 1, touch_reason = COALESCE(touch_reason, ?),
                 retry_from = ?, updated_at = ?
@@ -3455,7 +3832,7 @@ impl Repository {
             }
             let n = tx.execute(
                 "UPDATE queue
-                 SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+                 SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                      attempts = 0, not_before = NULL, lease_owner = NULL, lease_expires_at = NULL,
                      stage_started_at = NULL, completed_at = NULL,
                      second_chances = CASE WHEN second_chances IS NULL OR second_chances = '' THEN ?1
@@ -3726,6 +4103,125 @@ impl Repository {
         Ok(())
     }
 
+    /// Copy the live database into `dest` with SQLite's online backup API
+    /// (P11.13): one step, so the copy is one consistent snapshot, taken under
+    /// a read transaction that does not stop the workers writing (WAL). An
+    /// existing `dest` is replaced. Blocking: call it off the async threads.
+    pub fn backup_database(&self, dest: &Path) -> Result<()> {
+        self.backup_database_with(dest, &mut || {})
+    }
+
+    /// [`Self::backup_database`], running `during_copy` once the backup holds
+    /// its snapshot (a read transaction on the source) and before it copies:
+    /// whatever commits meanwhile is not in the copy, and is not held up.
+    pub fn backup_database_with(&self, dest: &Path, during_copy: &mut dyn FnMut()) -> Result<()> {
+        let conn = self.pool.get()?;
+        match std::fs::remove_file(dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("could not replace {dest:?}")),
+        }
+        let mut copy = rusqlite::Connection::open(dest).with_context(|| format!("could not create {dest:?}"))?;
+        // The snapshot: a read transaction the backup step then uses as its own.
+        conn.execute_batch("BEGIN DEFERRED").context("could not start the backup's read")?;
+        let snapshot = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+            .context("could not start the backup's read");
+        if let Err(e) = snapshot {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        during_copy();
+        let copied = Self::copy_pages(&conn, &mut copy);
+        let _ = conn.execute_batch("ROLLBACK");
+        copied?;
+        // The copy carries the live file's WAL flag: one self-contained file
+        // instead, so no `-wal`/`-shm` is left beside it (restoring it, the
+        // daemon turns WAL on again).
+        copy.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0))
+            .context("could not finish the backup file")?;
+        copy.close().map_err(|(_, e)| e).context("could not close the backup file")?;
+        Ok(())
+    }
+
+    /// Every page of `conn`'s database into `copy`, in one backup step.
+    fn copy_pages(conn: &rusqlite::Connection, copy: &mut rusqlite::Connection) -> Result<()> {
+        {
+            use rusqlite::backup::StepResult;
+            let backup = rusqlite::backup::Backup::new(conn, copy).context("could not start the backup")?;
+            // -1: every page in one step. Busy or locked: try again for up to a minute.
+            let mut waits = 0;
+            loop {
+                match backup.step(-1).context("the backup did not complete")? {
+                    StepResult::Done => break,
+                    StepResult::More => {}
+                    StepResult::Busy | StepResult::Locked if waits < 240 => {
+                        waits += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    other => anyhow::bail!("the backup could not get the database: {other:?}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Jobs waiting for a person (P11.14): in review, for a manual download, or
+    /// held for approval, not cleared from the desk, with when they started
+    /// waiting (held: when the video was held; otherwise when the job ended
+    /// there). A row whose time cannot be read is left out. All of them, the
+    /// longest waiting first: a cap would hide the newest, which are the ones
+    /// about to cross the alert's limit.
+    pub fn jobs_waiting_for_person(&self) -> Result<Vec<WaitingForPerson>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT q.id, q.slug, q.status,
+                    CASE WHEN q.status = 'AWAITING_APPROVAL' THEN COALESCE(h.created_at, q.updated_at)
+                         ELSE COALESCE(q.completed_at, q.updated_at) END AS since
+               FROM queue q
+               LEFT JOIN held_outputs h ON h.job_id = q.id
+              WHERE q.status IN ('REQUIRES_REVIEW', 'MANUAL_DOWNLOAD', 'AWAITING_APPROVAL')
+                AND q.cleared_at IS NULL
+              ORDER BY since ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, slug, status, since) = row?;
+            if let Some(since) = since.as_deref().and_then(timestamps::parse) {
+                out.push(WaitingForPerson { id, slug, status, since });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `PRAGMA quick_check` of the live database (P11.13): `["ok"]` when it
+    /// is sound, otherwise up to 20 lines naming the problems. Blocking.
+    pub fn quick_check(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        Self::quick_check_on(&conn)
+    }
+
+    /// `PRAGMA quick_check` of the database file at `path`, opened read-only
+    /// (a fresh backup is checked before it counts). Blocking.
+    pub fn quick_check_file(path: &Path) -> Result<Vec<String>> {
+        let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("could not open {path:?}"))?;
+        Self::quick_check_on(&conn)
+    }
+
+    fn quick_check_on(conn: &rusqlite::Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("PRAGMA quick_check(20)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn map_job_row(row: &rusqlite::Row) -> rusqlite::Result<Job> {
         let status_str: String = row.get("status")?;
         let stage_str: String = row.get("stage").unwrap_or_else(|_| "QUEUED".to_string());
@@ -3907,10 +4403,8 @@ impl Repository {
 
     /// Whether any active administrator exists.
     ///
-    /// The `/setup` first-run window is open exactly while this is false, so it
-    /// is asked on every request to that route rather than cached: an admin
-    /// created through the CLI while the daemon runs must close the window
-    /// immediately, without a restart.
+    /// Asked, not cached: an account reactivated from the command line while the
+    /// daemon runs counts at once.
     pub fn has_active_admin(&self) -> Result<bool> {
         let conn = self.pool.get()?;
         let count: i64 = conn.query_row(
@@ -4763,6 +5257,79 @@ impl Repository {
         Ok(())
     }
 
+    /// Add `address` to the addresses of the journalist `surname` (P11.11a: MCR's «Να το
+    /// θυμάμαι για αυτή τη διεύθυνση»), so the next mail from it is filed under them. An
+    /// address already on someone else is never moved: the parser takes the first journalist
+    /// an address is on, and a silent move would refile their mail. Checked and written in
+    /// one transaction, so two desks cannot give one address to two people.
+    pub fn add_journalist_email(&self, surname: &str, address: &str) -> Result<AddressAdded> {
+        let address = address.trim().to_lowercase();
+        let surname = surname.trim().to_uppercase();
+        if address.is_empty() || !address.contains('@') {
+            anyhow::bail!("not an email address");
+        }
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT surname, emails FROM journalists ORDER BY surname")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut target: Option<Vec<String>> = None;
+        for (who, raw) in &rows {
+            let emails: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+            if emails.iter().any(|e| e.trim().to_lowercase() == address) {
+                return Ok(if *who == surname { AddressAdded::AlreadyTheirs } else { AddressAdded::TakenBy(who.clone()) });
+            }
+            if *who == surname {
+                target = Some(emails);
+            }
+        }
+        let Some(mut emails) = target else { return Ok(AddressAdded::NoSuchJournalist) };
+        if emails.len() >= MAX_JOURNALIST_EMAILS {
+            return Ok(AddressAdded::Full);
+        }
+        emails.push(address);
+        tx.execute(
+            "UPDATE journalists SET emails = ? WHERE surname = ?",
+            params![serde_json::to_string(&emails)?, surname],
+        )?;
+        tx.commit()?;
+        Ok(AddressAdded::Added)
+    }
+
+    /// Add a journalist who is not on the list (P13.4b, the wizard's import):
+    /// never changes one who is, and refuses an address that belongs to
+    /// someone else. The check and the insert are one transaction, so a save
+    /// on the desk between an import's preview and the import is kept.
+    pub fn add_new_journalist(&self, surname: &str, full_name: &str, emails: &[String]) -> Result<NewJournalist> {
+        let surname = surname.trim().to_uppercase();
+        let emails: Vec<String> = emails.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT surname, emails FROM journalists ORDER BY surname")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if rows.iter().any(|(who, _)| *who == surname) {
+            return Ok(NewJournalist::AlreadyListed);
+        }
+        for (who, raw) in &rows {
+            let theirs: Vec<String> = serde_json::from_str(raw).unwrap_or_default();
+            if let Some(address) = emails.iter().find(|e| theirs.iter().any(|t| t.trim().to_lowercase() == **e)) {
+                return Ok(NewJournalist::AddressTaken { address: address.clone(), surname: who.clone() });
+            }
+        }
+        let n = tx.execute(
+            "INSERT INTO journalists (surname, full_name, emails, default_priority) VALUES (?, ?, ?, 0)
+             ON CONFLICT(surname) DO NOTHING",
+            params![surname, full_name, serde_json::to_string(&emails)?],
+        )?;
+        tx.commit()?;
+        Ok(if n == 1 { NewJournalist::Added } else { NewJournalist::AlreadyListed })
+    }
+
     pub fn delete_journalist(&self, surname: &str) -> Result<()> {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM journalists WHERE surname = ?", params![surname.to_uppercase()])?;
@@ -5059,7 +5626,7 @@ impl Repository {
         let conn = self.pool.get()?;
         let now = timestamps::now_string();
         let n = conn.execute(
-            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', updated_at = ?, cleared_at = NULL
+            "UPDATE queue SET source_path = ?, status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), updated_at = ?, cleared_at = NULL
              WHERE id = ? AND status = 'MANUAL_DOWNLOAD'",
             params![source_path, now, id],
         )?;
@@ -5268,6 +5835,12 @@ impl Repository {
             "#,
             params![m.internet_message_id, source, timestamps::now_string(), requested_by],
         )?;
+        // A mail a person asked to read again is theirs: the system never adds its own
+        // automatic reading after that (P11.11b).
+        conn.execute(
+            "INSERT OR IGNORE INTO mail_auto_retries (internet_message_id, requested_at, cause) VALUES (?, ?, ?)",
+            params![m.internet_message_id, timestamps::now_string(), MAIL_RETRY_BY_A_PERSON],
+        )?;
         Ok(m)
     }
 
@@ -5293,6 +5866,77 @@ impl Repository {
         let conn = self.pool.get()?;
         conn.execute("DELETE FROM mail_reprocess WHERE internet_message_id = ?", params![internet_message_id])?;
         Ok(())
+    }
+
+    /// Ask the watcher to read again, once, every mail it gave up on (FAILED) that was
+    /// received at or after `since` (P11.11b). A mail that already had its automatic chance,
+    /// one waiting for a reprocess a person asked for, and one with no mailbox id are left
+    /// alone. Returns the (Message-ID, subject) of each mail queued for its chance.
+    pub fn request_failed_mail_auto_retry(&self, since: DateTime<Utc>, cause: &str) -> Result<Vec<(String, Option<String>)>> {
+        let now = timestamps::now_string();
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let due: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT p.internet_message_id, p.source_id, p.subject FROM processed_mail p
+                WHERE p.outcome = 'FAILED'
+                  AND COALESCE(p.received_at, p.processed_at) >= ?1
+                  AND p.source_id IS NOT NULL AND TRIM(p.source_id) <> ''
+                  AND NOT EXISTS (SELECT 1 FROM mail_auto_retries a WHERE a.internet_message_id = p.internet_message_id)
+                  AND NOT EXISTS (SELECT 1 FROM mail_reprocess r WHERE r.internet_message_id = p.internet_message_id)
+                  -- A mail that made any job before it failed is left to a person: MCR may
+                  -- have cancelled, reviewed or finished those jobs, and a re-read would undo it.
+                  AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.email_message_id = p.internet_message_id)
+                ORDER BY COALESCE(p.received_at, p.processed_at)
+                "#,
+            )?;
+            let rows = stmt.query_map(params![timestamps::format(since)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (key, source, _) in &due {
+            tx.execute(
+                "INSERT INTO mail_auto_retries (internet_message_id, requested_at, cause) VALUES (?, ?, ?)",
+                params![key, now, cause],
+            )?;
+            tx.execute(
+                "INSERT INTO mail_reprocess (internet_message_id, source_id, requested_at, requested_by) VALUES (?, ?, ?, ?)",
+                params![key, source, now, format!("{MAIL_RETRY_AUTOMATIC_PREFIX}{cause})")],
+            )?;
+        }
+        // The chance of a mail long past every window is no longer needed.
+        tx.execute(
+            "DELETE FROM mail_auto_retries WHERE requested_at < ?",
+            params![timestamps::format(Utc::now() - Duration::days(MAIL_KEEP_DAYS))],
+        )?;
+        tx.commit()?;
+        Ok(due.into_iter().map(|(k, _, s)| (k, s)).collect())
+    }
+
+    /// Whether the pending reprocess of `internet_message_id` is the system's own
+    /// automatic re-read (P11.11b), not one a person asked for.
+    pub fn mail_reprocess_is_automatic(&self, internet_message_id: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let by: Option<Option<String>> = conn
+            .query_row(
+                "SELECT requested_by FROM mail_reprocess WHERE internet_message_id = ?",
+                params![internet_message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(by.flatten().is_some_and(|b| b.starts_with(MAIL_RETRY_AUTOMATIC_PREFIX)))
+    }
+
+    /// When and why the mail `internet_message_id` was read again automatically, if it was.
+    pub fn mail_auto_retry(&self, internet_message_id: &str) -> Result<Option<(Option<DateTime<Utc>>, String)>> {
+        let conn = self.pool.get()?;
+        Ok(conn
+            .query_row(
+                "SELECT requested_at, cause FROM mail_auto_retries WHERE internet_message_id = ?",
+                params![internet_message_id],
+                |r| Ok((timestamps::parse_opt(r.get::<_, Option<String>>(0)?), r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// Forget that a mail was handled, so it is parsed as new. Only the
@@ -5772,7 +6416,7 @@ impl Repository {
         let queued = tx.execute(
             r#"
             UPDATE queue
-            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+            SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
@@ -5907,7 +6551,7 @@ impl Repository {
         let queued = tx.execute(
             r#"
             UPDATE queue
-            SET status = 'PENDING', stage = 'QUEUED', progress = 0.0, speed = '0 Mbps', eta = '--:--',
+            SET status = 'PENDING', stage = 'QUEUED', url_normalized = omni_normalize(url), progress = 0.0, speed = '0 Mbps', eta = '--:--',
                 attempts = 0, error_message = NULL, error_code = NULL, not_before = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, stage_started_at = NULL,
                 completed_at = NULL, cleared_at = NULL, file_path = NULL, delivered_at = NULL,
@@ -6011,6 +6655,13 @@ impl Repository {
     /// of this job (the count behind «Επόμενη επιλογή (n)»).
     pub fn next_left(&self, job_id: i64, now: chrono::DateTime<Utc>) -> Result<usize> {
         let Some(hold) = self.latest_held_attempt(job_id)? else { return Ok(0) };
+        self.next_left_of(&hold, now)
+    }
+
+    /// [`Self::next_left`] for the job's latest held attempt `hold`, already
+    /// read (P14.6: the desk's page has it from [`Self::desk_extras`]).
+    pub fn next_left_of(&self, hold: &RepairAttempt, now: chrono::DateTime<Utc>) -> Result<usize> {
+        let job_id = hold.job_id;
         let Some(domain) = hold.domain.as_deref() else { return Ok(0) };
         let mut excluded = self.rejected_held_urls(job_id)?;
         excluded.extend(hold.held_url.clone());
@@ -6248,6 +6899,59 @@ impl Repository {
         Ok(rows)
     }
 
+    /// What the repair ladder in shadow mode would have fixed since `since`
+    /// (P11.9): its runs, the ones that verified a video it would have used,
+    /// per site, and the latest such jobs (at most 10). Sites only, never an
+    /// address.
+    pub fn shadow_summary(&self, since: chrono::DateTime<Utc>) -> Result<ShadowSummary> {
+        let conn = self.pool.get()?;
+        let since = timestamps::format(since);
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(domain, ''), COUNT(*), COALESCE(SUM(outcome = 'shadow_found'), 0),
+                    COUNT(DISTINCT CASE WHEN outcome = 'shadow_found' THEN job_id END)
+               FROM repair_attempts
+              WHERE mode = 'shadow' AND started_at >= ?
+              GROUP BY COALESCE(domain, '')
+              ORDER BY 3 DESC, 1",
+        )?;
+        let sites = stmt
+            .query_map(params![since], |r| {
+                Ok(ShadowSite { domain: r.get(0)?, runs: r.get(1)?, would_fix: r.get(2)?, jobs: r.get(3)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let jobs: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT job_id) FROM repair_attempts
+              WHERE mode = 'shadow' AND outcome = 'shadow_found' AND started_at >= ?",
+            params![since],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT a.job_id, q.slug, COALESCE(a.domain, ''), a.started_at, q.status
+               FROM repair_attempts a JOIN queue q ON q.id = a.job_id
+              WHERE a.mode = 'shadow' AND a.outcome = 'shadow_found' AND a.started_at >= ?
+              ORDER BY a.started_at DESC, a.id DESC
+              LIMIT 10",
+        )?;
+        let latest = stmt
+            .query_map(params![since], |r| {
+                Ok(ShadowJob {
+                    job_id: r.get(0)?,
+                    slug: r.get(1)?,
+                    domain: r.get(2)?,
+                    at: timestamps::parse_opt(r.get(3)?),
+                    status: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ShadowSummary {
+            runs: sites.iter().map(|s| s.runs).sum(),
+            would_fix: sites.iter().map(|s| s.would_fix).sum(),
+            jobs,
+            sites,
+            latest,
+        })
+    }
+
     /// What the repair ladder did per site since `since` (P10.15a). Attempts
     /// with no domain are one row, `(unknown)`. MCR's «next choice» rows are
     /// counted apart from the ladder's own runs. A rejection counts as «wrong
@@ -6418,6 +7122,76 @@ impl Repository {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Account the approval clocks of the videos waiting for MCR up to `now`
+    /// (P11.10). The time since a row was last accounted (`clock_at`, else
+    /// `created_at`) counts against its hold only when `watched` (an MCR desk
+    /// was connected over it) and it is no longer than `max_gap`; otherwise
+    /// (no desk, or a gap such as the daemon being stopped) `expires_at` moves
+    /// on by that time. Only undecided rows of AWAITING_APPROVAL jobs; a row
+    /// whose times cannot be read is left to the sweep. One immediate
+    /// transaction. Returns how many expiries moved.
+    pub fn account_held_clocks(&self, now: chrono::DateTime<Utc>, watched: bool, max_gap: Duration) -> Result<usize> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows: Vec<(i64, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT h.job_id, h.clock_at, h.created_at, h.expires_at
+                   FROM held_outputs h JOIN queue q ON q.id = h.job_id
+                  WHERE h.decision IS NULL AND q.status = 'AWAITING_APPROVAL'",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let stamp = timestamps::format(now);
+        let mut moved = 0;
+        for (job_id, clock_at, created_at, expires_at) in rows {
+            let since = timestamps::parse_opt(clock_at).or_else(|| timestamps::parse_opt(created_at));
+            let (Some(since), Some(expires_at)) = (since, timestamps::parse_opt(expires_at)) else {
+                continue;
+            };
+            let elapsed = now - since;
+            if elapsed <= Duration::zero() {
+                continue;
+            }
+            if watched && elapsed <= max_gap {
+                tx.execute(
+                    "UPDATE held_outputs SET clock_at = ? WHERE job_id = ? AND decision IS NULL",
+                    params![stamp, job_id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE held_outputs SET clock_at = ?, expires_at = ? WHERE job_id = ? AND decision IS NULL",
+                    params![stamp, timestamps::format(expires_at + elapsed), job_id],
+                )?;
+                moved += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// The videos waiting for MCR's approval (P11.10), for the desk's reminder:
+    /// how many, since when the oldest waits, and the soonest expiry.
+    pub fn held_waiting(&self) -> Result<HeldWaiting> {
+        let conn = self.pool.get()?;
+        let (count, oldest, soonest): (i64, Option<String>, Option<String>) = conn.query_row(
+            "SELECT COUNT(*), MIN(h.created_at), MIN(h.expires_at)
+               FROM held_outputs h JOIN queue q ON q.id = h.job_id
+              WHERE h.decision IS NULL AND q.status = 'AWAITING_APPROVAL'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(HeldWaiting { count, oldest_held_at: timestamps::parse_opt(oldest), soonest_expires_at: timestamps::parse_opt(soonest) })
+    }
+}
+
+/// The videos waiting for MCR's approval (P11.10).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct HeldWaiting {
+    pub count: i64,
+    pub oldest_held_at: Option<DateTime<Utc>>,
+    pub soonest_expires_at: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -7949,6 +8723,31 @@ impl Repository {
         Ok(conn.execute("DELETE FROM cookie_jars WHERE domain = ?", params![domain])? > 0)
     }
 
+    /// The jobs in review that failed on a login wall (`LOGIN_REQUIRED`, P11.12),
+    /// newest first: on the review tab (not tidied off it) and with nothing
+    /// delivered or on its way to the watchfolder. One query.
+    pub fn login_wall_jobs(&self) -> Result<Vec<LoginWallJob>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, slug, url, created_at FROM queue
+              WHERE status = 'REQUIRES_REVIEW' AND error_code = 'LOGIN_REQUIRED'
+                AND cleared_at IS NULL AND file_path IS NULL AND delivered_at IS NULL
+                AND delivering_to IS NULL AND delivery_wait = 0
+              ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![], |r| {
+                Ok(LoginWallJob {
+                    id: r.get(0)?,
+                    slug: r.get(1)?,
+                    url: r.get(2)?,
+                    created_at: timestamps::parse_opt(r.get::<_, Option<String>>(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The outcome of a test of the jar for `domain`, and the address it used.
     /// `detail` is already scrubbed (see [`crate::cookies::scrub_detail`]).
     pub fn record_cookie_test(
@@ -8066,11 +8865,11 @@ mod tests {
         // Multi-byte characters: a byte cut at 254 would split one.
         let huge = "\u{3a9}".repeat(30_000); // 60 KB
         repo.record_login_attempt(Some(&huge), Some("10.0.0.1"), false, Some("unknown_account"))?;
-        repo.record_login_attempt(Some("Short@Station.GR"), None, false, None)?;
+        repo.record_login_attempt(Some("Short@Example.GR"), None, false, None)?;
         let rows = repo.recent_login_attempts(10)?;
         let long = rows.iter().find(|r| r.email.as_deref().is_some_and(|e| e.len() > 20)).unwrap();
         assert_eq!(long.email.as_deref().unwrap().chars().count(), 254);
-        assert!(rows.iter().any(|r| r.email.as_deref() == Some("short@station.gr")));
+        assert!(rows.iter().any(|r| r.email.as_deref() == Some("short@example.gr")));
         Ok(())
     }
 
@@ -8759,14 +9558,14 @@ mod tests {
         let repo = Repository::new(temp_db.path())?;
 
         // 1. User CRUD
-        let user_id = repo.create_user("journalist@station.gr", "hash123", UserRole::User, "Maria Papadaki", Some("PAPADAKI"))?;
+        let user_id = repo.create_user("journalist@example.gr", "hash123", UserRole::User, "Maria Papadaki", Some("PAPADAKI"))?;
         let user = repo.get_user_by_id(user_id)?.expect("User must exist");
-        assert_eq!(user.email, "journalist@station.gr");
+        assert_eq!(user.email, "journalist@example.gr");
         assert_eq!(user.journalist_surname.as_deref(), Some("PAPADAKI"));
 
         // 2. Journalist Mapping
-        repo.save_journalist("PAPADAKI", "Maria Papadaki", &["m.papadaki@station.gr".to_string()], 10)?;
-        let mapped_surname = repo.find_journalist_by_email("m.papadaki@station.gr")?;
+        repo.save_journalist("PAPADAKI", "Maria Papadaki", &["m.papadaki@example.gr".to_string()], 10)?;
+        let mapped_surname = repo.find_journalist_by_email("m.papadaki@example.gr")?;
         assert_eq!(mapped_surname.as_deref(), Some("PAPADAKI"));
 
         // 3. Queue Job Insertion & Atomic Leasing
@@ -8780,7 +9579,7 @@ mod tests {
             JobStatus::Pending,
             Some(user_id),
             Some("ΓΙΑ ΠΛΑΝΑ"),
-            Some("newsroom@station.gr"),
+            Some("newsroom@example.gr"),
         )?;
         assert!(job_id > 0);
 
@@ -8954,11 +9753,16 @@ fn write_skip(tx: &rusqlite::Transaction<'_>, domain: &str, pattern: &str, now: 
     Ok(())
 }
 
-/// The still-valid skip patterns of `domain`.
+/// The still-valid skip patterns of `domain`, each in the form
+/// [`crate::urlnorm::skip_pattern`] gives today (P14.3c: one saved before the
+/// `url` 2.5.9 upgrade still matches the same video).
 fn skips_of(tx: &rusqlite::Connection, domain: &str, now: chrono::DateTime<Utc>) -> Result<Vec<String>> {
     let mut stmt = tx.prepare("SELECT pattern FROM repair_skips WHERE domain = ? AND until > ? ORDER BY pattern")?;
     let rows = stmt.query_map(params![domain, timestamps::format(now)], |r| r.get::<_, String>(0))?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut skips: Vec<String> = rows.collect::<rusqlite::Result<Vec<_>>>()?.iter().map(|p| crate::urlnorm::canonical_skip_pattern(p)).collect();
+    skips.sort();
+    skips.dedup();
+    Ok(skips)
 }
 
 /// The places in `candidates_json` after `next_index` that may still be

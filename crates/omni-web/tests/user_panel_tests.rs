@@ -140,11 +140,28 @@ async fn many_links_get_index_suffixes_and_one_bad_link_queues_nothing() -> Resu
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(p.job_count(), 3);
 
+    // P12.11b: a story number too long for its A/B/C to survive in the name queues nothing;
+    // at the longest allowed, the three names stay apart.
+    let typed = "9".repeat(omni_core::slug::MAX_TYPED_INDEX);
+    let three: Vec<String> = (1..=3).map(|n| format!("https://example.test/long/{n}")).collect();
+    let (status, _) = p
+        .send("POST", "/api/user/jobs", &p.ben, Some(json!({"urls": three, "keyword": "X", "index_str": format!("{typed}9")})))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(p.job_count(), 3, "a refused story number queued something");
+    let (status, json) = p
+        .send("POST", "/api/user/jobs", &p.ben, Some(json!({"urls": three, "keyword": "X", "index_str": typed})))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let names: std::collections::BTreeSet<&str> = json.as_array().unwrap().iter().map(|r| r["slug"].as_str().unwrap()).collect();
+    assert_eq!(names.len(), 3, "the videos of one story got the same name: {names:?}");
+
     // Exactly one of url / urls.
     let (status, _) = p
         .send("POST", "/api/user/jobs", &p.ben, Some(json!({"url": "https://example.test/a", "urls": ["https://example.test/b"], "keyword": "X"})))
         .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(p.job_count(), 6);
     Ok(())
 }
 
@@ -309,7 +326,8 @@ async fn a_roster_journalist_keeps_their_dash_in_the_identity_() -> Result<()> {
         .send("POST", "/api/user/jobs", &token, Some(json!({"url": "https://example.test/pd/1", "keyword": "fire-in-hills"})))
         .await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(r[0]["slug"], "1_PAPA-DAKI_FIRE-IN-HILLS");
+    // The file name follows the slug rule (P12.11: `-` becomes `_`); the identity below does not.
+    assert_eq!(r[0]["slug"], "1_PAPA_DAKI_FIRE_IN_HILLS");
     let job = p.repo.get_job(r[0]["job_id"].as_i64().unwrap())?.unwrap();
     // The identity still matches the roster, so the journalist's default
     // priority (7) is applied by enqueue.
@@ -364,8 +382,9 @@ async fn a_user_jobs_slug_is_built_from_its_stored_fields() -> Result<()> {
         assert_eq!(status, StatusCode::OK);
         for item in r.as_array().unwrap() {
             let job = p.repo.get_job(item["job_id"].as_i64().unwrap())?.unwrap();
-            // What article.rs `house_slug` compares against.
-            assert_eq!(job.slug, format!("{}_{}_{}", job.index_str, job.journalist, job.keyword));
+            // What article.rs `house_slug` compares against (P12.11).
+            assert_eq!(job.slug, omni_core::slug::compose(&job.index_str, &job.journalist, &job.keyword));
+            assert!(job.slug.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'), "{}", job.slug);
         }
     }
     Ok(())

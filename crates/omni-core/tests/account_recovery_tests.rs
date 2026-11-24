@@ -54,7 +54,7 @@ fn a_new_database_gets_admin_admin_once_and_never_again() {
     // A database that already has its own accounts (this PC's, upgraded).
     let dir2 = tempfile::tempdir().unwrap();
     let used = omni_core::repository::Repository::new(dir2.path().join("omni.db")).unwrap();
-    used.create_user("it@station.gr", "a-long-real-passphrase", omni_core::models::UserRole::Admin, "IT", None).unwrap();
+    used.create_user("it@example.gr", "a-long-real-passphrase", omni_core::models::UserRole::Admin, "IT", None).unwrap();
     assert!(!used.ensure_default_admin().unwrap());
     assert!(used.get_user_by_email("admin").unwrap().is_none());
 }

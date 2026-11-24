@@ -2,6 +2,7 @@
 name = "omni-web"
 version = "1.0.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 omni-core = { path = "../omni-core" }
@@ -34,4 +35,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 metrics = "0.24"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 

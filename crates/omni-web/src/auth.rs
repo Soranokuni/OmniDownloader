@@ -1,7 +1,7 @@
 //! Request authentication and the route access policy (plan P2.1, W-01/W-02).
 //!
 //! Before this module every route was reachable by anyone who could open a TCP
-//! connection to the port: `POST /api/setup` could repoint the watchfolder,
+//! connection to the port: `POST /api/setup` (removed in P13.3) could repoint the watchfolder,
 //! `POST /api/system/test-email` was a credential oracle for the ingest
 //! mailbox, and job override/retry/discard needed no session at all. The
 //! pipeline hardening in Phases 0–1 guaranteed that a correct MXF was delivered
@@ -103,7 +103,7 @@ pub fn client_ip(parts: &Parts, trusted_proxies: &CidrSet, trust_proxy_header: b
             Forwarded::Absent => {}
             // A loopback or unspecified address in the header is believed only from a proxy
             // on this box: from a LAN proxy range it would let any client in that range
-            // claim to be the server itself (default-admin login, /setup, open MCR).
+            // claim to be the server itself (default-admin login, open MCR).
             Forwarded::Client(ip) if (ip.is_loopback() || ip.is_unspecified()) && !peer.is_loopback() => return None,
             Forwarded::Client(ip) => return Some(ip),
             // A header the trusted proxy relayed but we cannot read: the peer is
@@ -301,22 +301,6 @@ pub async fn resolve_principal(parts: &Parts, state: &AppState) -> Option<Princi
     } else {
         None
     }
-}
-
-/// True when the request arrives from the machine the daemon runs on.
-///
-/// Used for the first-run `/setup` window (P2.4). Deliberately independent of
-/// `mcr_open_networks`: an operator who allowlists the whole newsroom subnet
-/// must not thereby hand first-run configuration to the whole newsroom.
-pub async fn is_loopback_client(parts: &Parts, state: &AppState) -> bool {
-    let (trusted, trust_header) = {
-        let cfg = state.config.read().await;
-        (
-            cfg.security.trusted_proxy_networks(),
-            cfg.security.trust_proxy_header,
-        )
-    };
-    matches!(client_ip(parts, &trusted, trust_header), Some(ip) if ip.is_loopback())
 }
 
 // ==========================================

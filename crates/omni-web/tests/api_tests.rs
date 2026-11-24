@@ -50,7 +50,7 @@ impl App {
         tweak(&mut config);
 
         let mcr_id = repo.create_user(
-            "desk@station.gr",
+            "desk@example.gr",
             "correct-horse-battery",
             UserRole::OpenMcr,
             "MCR Desk",
@@ -60,7 +60,7 @@ impl App {
         repo.create_session(mcr_id, &mcr_token, 1)?;
 
         let user_id = repo.create_user(
-            "reporter@station.gr",
+            "reporter@example.gr",
             "correct-horse-battery",
             UserRole::User,
             "Reporter",
@@ -70,7 +70,7 @@ impl App {
         repo.create_session(user_id, &user_token, 1)?;
 
         let admin_id = repo.create_user(
-            "it@station.gr",
+            "it@example.gr",
             "correct-horse-battery",
             UserRole::Admin,
             "Administrator",
@@ -293,7 +293,7 @@ async fn journalists_api_crud() -> Result<()> {
             Some(json!({
                 "surname": "PAPADOPOULOS",
                 "full_name": "Nikos Papadopoulos",
-                "emails": ["npapadopoulos@station.gr", "nikos.p@station.gr"],
+                "emails": ["npapadopoulos@example.gr", "nikos.p@example.gr"],
                 "priority": 15
             })),
         )
@@ -302,7 +302,7 @@ async fn journalists_api_crud() -> Result<()> {
 
     assert_eq!(
         app.repo
-            .find_journalist_by_email("npapadopoulos@station.gr")?
+            .find_journalist_by_email("npapadopoulos@example.gr")?
             .as_deref(),
         Some("PAPADOPOULOS")
     );
@@ -318,7 +318,7 @@ async fn journalists_api_crud() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert!(app
         .repo
-        .find_journalist_by_email("npapadopoulos@station.gr")?
+        .find_journalist_by_email("npapadopoulos@example.gr")?
         .is_none());
 
     Ok(())
@@ -347,8 +347,12 @@ async fn html_pages_render_for_the_roles_that_may_see_them() -> Result<()> {
 
     for (uri, token, needle) in [
         ("/mcr", &app.mcr_token, "MCR"),
-        ("/user", &app.user_token, "Οι αποστολές μου"),
-        ("/admin", &app.admin_token, "Administration"),
+        // The wall board (P12.13), marked by its own script.
+        ("/board", &app.mcr_token, "/static/board.js?v="),
+        // Its words come from the dictionary since P12.10: the page's own script marks it.
+        ("/user", &app.user_token, "/static/user.js?v="),
+        // Its words come from the admin dictionaries since P13.6: the page's own script marks it.
+        ("/admin", &app.admin_token, "/static/admin.js?v="),
     ] {
         let res = app
             .router
@@ -384,7 +388,7 @@ async fn a_user_sees_only_their_own_jobs() -> Result<()> {
     let app = App::new()?;
     let reporter = app
         .repo
-        .get_user_by_email("reporter@station.gr")?
+        .get_user_by_email("reporter@example.gr")?
         .unwrap();
 
     app.repo.add_job(
@@ -633,6 +637,27 @@ async fn a_skipped_link_can_be_queued_from_its_mail_once() -> Result<()> {
     Ok(())
 }
 
+/// P11.15a: from the mail view, a locker share of one file fetched directly
+/// is queued for the pipeline; a locker a person must fetch waits for MCR.
+#[tokio::test]
+async fn a_direct_locker_link_from_a_mail_is_queued_for_the_pipeline() -> Result<()> {
+    let app = App::new()?;
+    let body = "1. ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=api00000004\n\
+                Το βίντεο: https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing\n\
+                Και εδώ: https://we.tl/t-desk00001";
+    seed_mail(&app, "<m4@example.gr>", body, "https://www.youtube.com/watch?v=api00000004")?;
+    let send = |url: &str| json!({ "key": "<m4@example.gr>", "url": url });
+    let mut queued = Vec::new();
+    for url in ["https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing", "https://we.tl/t-desk00001"] {
+        let (status, body) = app.send("POST", "/api/mails/queue-link", &app.mcr_token, Some(send(url))).await?;
+        assert_eq!(status, StatusCode::OK, "{url}: {body}");
+        queued.push(app.repo.get_job(body["job_id"].as_i64().unwrap())?.unwrap());
+    }
+    assert_eq!((queued[0].status, queued[0].extraction_method.as_deref()), (JobStatus::Pending, Some("locker")));
+    assert_eq!((queued[1].status, queued[1].extraction_method.as_deref()), (JobStatus::ManualDownload, Some("locker")));
+    Ok(())
+}
+
 #[tokio::test]
 async fn only_a_mail_the_watcher_gave_up_on_can_be_read_again_from_the_desk() -> Result<()> {
     let app = App::new()?;
@@ -655,6 +680,58 @@ async fn only_a_mail_the_watcher_gave_up_on_can_be_read_again_from_the_desk() ->
     assert_eq!(status, StatusCode::OK, "{body}");
     let pending: Vec<String> = app.repo.pending_mail_reprocess()?.into_iter().map(|(k, _, _)| k).collect();
     assert_eq!(pending, vec!["<failed@example.gr>"]);
+    Ok(())
+}
+
+/// P11.11a: MCR filed a mail from an unknown sender under a journalist and asks the
+/// system to remember the address. The next mail from it is filed under them; an
+/// address that is someone else's is never moved.
+#[tokio::test]
+async fn mcr_remembers_an_unknown_sender_for_the_journalist_it_chose() -> Result<()> {
+    let app = App::new()?;
+    app.repo.save_journalist("GEORGIOU", "Eleni Georgiou", &["e.georgiou@example.gr".into()], 0)?;
+    app.repo.save_journalist("NIKOLAOU", "Giorgos Nikolaou", &[], 0)?;
+    let mail = |key: &str, from: &str| omni_core::models::ProcessedMail {
+        internet_message_id: key.into(),
+        source_id: Some("AAMk-x".into()),
+        outcome: "JOBS".into(),
+        from_address: Some(from.into()),
+        subject: Some("Πλάνα".into()),
+        ..Default::default()
+    };
+    app.repo.record_processed_mail(&mail("<new@example.gr>", "Freelance.Crew@Example.net"))?;
+    app.repo.record_processed_mail(&mail("<known@example.gr>", "e.georgiou@example.gr"))?;
+    let view = |key: &str| format!("/api/mails/view?key={}", q(key));
+    let ask = |key: &str, surname: &str| json!({ "key": key, "surname": surname });
+
+    let (_, v) = app.send("GET", &view("<new@example.gr>"), &app.mcr_token, None).await?;
+    assert_eq!(v["sender_on_roster"], false, "the desk offers the button: {v}");
+
+    // MCR is where unknown mail goes, never a journalist to remember.
+    let (status, _) = app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<new@example.gr>", "MCR"))).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<nope@example.gr>", "NIKOLAOU"))).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) =
+        app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<new@example.gr>", "nikolaou"))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["surname"].as_str(), body["already"].as_bool()), (Some("NIKOLAOU"), Some(false)));
+    assert_eq!(app.repo.find_journalist_by_email("freelance.crew@example.net")?.as_deref(), Some("NIKOLAOU"));
+    let (_, v) = app.send("GET", &view("<new@example.gr>"), &app.mcr_token, None).await?;
+    assert_eq!(v["sender_on_roster"], true);
+    // A second click changes nothing.
+    let (status, body) =
+        app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<new@example.gr>", "NIKOLAOU"))).await?;
+    assert_eq!((status, body["already"].as_bool()), (StatusCode::OK, Some(true)));
+
+    // GEORGIOU's address is not moved to NIKOLAOU.
+    let (status, body) =
+        app.send("POST", "/api/mails/remember-sender", &app.mcr_token, Some(ask("<known@example.gr>", "NIKOLAOU"))).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(app.repo.find_journalist_by_email("e.georgiou@example.gr")?.as_deref(), Some("GEORGIOU"));
+    let nikolaou = app.repo.list_journalists()?.into_iter().find(|j| j.surname == "NIKOLAOU").unwrap();
+    assert_eq!(nikolaou.emails, vec!["freelance.crew@example.net"]);
     Ok(())
 }
 
@@ -1530,9 +1607,82 @@ async fn the_mcr_form_keeps_the_journalist_identity_and_the_slug_matches_the_sto
     let job = app.repo.get_job(json["job_id"].as_i64().unwrap())?.unwrap();
     // The identity is what the roster knows, as at base.
     assert_eq!(job.journalist, "PAPA-DAKI");
+    // The stored fields keep the form's reading; the file name follows the slug rule (P12.11).
+    assert_eq!((job.index_str.as_str(), job.keyword.as_str()), ("2-B", "FIRE-IN-THE-HILLS"));
     // The invariant the article code (`house_slug`) relies on.
-    assert_eq!(job.slug, format!("{}_{}_{}", job.index_str, job.journalist, job.keyword));
-    assert_eq!(job.slug, "2-B_PAPA-DAKI_FIRE-IN-THE-HILLS");
+    assert_eq!(job.slug, omni_core::slug::compose(&job.index_str, &job.journalist, &job.keyword));
+    assert_eq!(job.slug, "2_B_PAPA_DAKI_FIRE_IN_THE_HILLS");
+    Ok(())
+}
+
+/// P12.11b: a typed story number is at most `MAX_TYPED_INDEX` characters, so the A/B/C of a
+/// story's further videos always survive in the file name. Longer is refused with a Greek
+/// message and nothing is queued; the forms do not let it be typed.
+#[tokio::test]
+async fn a_story_number_longer_than_a_file_name_keeps_is_refused() -> Result<()> {
+    use omni_core::slug::MAX_TYPED_INDEX;
+    let app = App::new()?;
+    let longest = "9".repeat(MAX_TYPED_INDEX);
+    let (status, ok) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({ "url": "https://example.test/idx/1", "keyword": "kw", "index_str": longest })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{ok}");
+    let (status, refused) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({ "url": "https://example.test/idx/2", "keyword": "kw", "index_str": format!("{longest}9") })))
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(refused.to_string().contains("έως 9 χαρακτήρες"), "{refused}");
+    assert!(!app.repo.get_all_jobs()?.iter().any(|j| j.url == "https://example.test/idx/2"), "a refused link was queued");
+
+    for page in ["mcr.html", "user.html"] {
+        let html = omni_web::assets::WebAssets::get(page).expect("page shipped");
+        let html = String::from_utf8_lossy(&html.data).to_string();
+        assert!(html.contains(&format!("required maxlength=\"{MAX_TYPED_INDEX}\"")), "{page}: the story number has no limit");
+    }
+    Ok(())
+}
+
+/// P12.11: the forms' live preview promises exactly the name the job then gets, Greek and
+/// signs included; for a rename it reads the keyword as the rename stores it.
+#[tokio::test]
+async fn the_file_name_preview_is_the_name_the_job_gets() -> Result<()> {
+    let app = App::new()?;
+    // Percent-encode every byte but letters and digits (Greek included).
+    let q = |s: &str| s.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect::<String>();
+    for (n, (index, journalist, keyword)) in [
+        ("2-B", "Papa-Daki", "fire in the hills"),
+        ("1", "Παπαδάκη", "Σεισμός Ηράκλειο"),
+        ("", "", ""),
+        ("3", "MCR", &*"K".repeat(90)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, preview) = app
+            .send(
+                "GET",
+                &format!("/api/slug-preview?index={}&journalist={}&keyword={}", q(index), q(journalist), q(keyword)),
+                &app.mcr_token,
+                None,
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        let (status, created) = app
+            .send(
+                "POST",
+                "/api/jobs",
+                &app.mcr_token,
+                Some(json!({ "url": format!("https://example.test/preview/{n}"), "keyword": keyword, "journalist": journalist, "index_str": index })),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(preview["slug"], created["slug"], "{index}/{journalist}/{keyword}");
+        assert!(preview["slug"].as_str().unwrap().len() <= omni_core::slug::MAX_LEN);
+    }
+    let (_, r) = app.send("GET", "/api/slug-preview?index=1&journalist=MCR&keyword=fire%20in&for=rename", &app.mcr_token, None).await?;
+    assert_eq!(r["slug"], "1_MCR_FIREIN", "a rename's keyword keeps letters and digits only");
+    let (_, r) = app.send("GET", "/api/slug-preview?index=1&journalist=MCR&keyword=x&for=rename", &app.mcr_token, None).await?;
+    assert!(r["slug"].is_null(), "a rename of one letter promises a name");
     Ok(())
 }
 
@@ -1838,5 +1988,48 @@ async fn the_late_limits_are_the_configured_ones() -> Result<()> {
 
     let (_, st) = app.send("GET", "/api/system/status", &app.mcr_token, None).await?;
     assert_eq!(st["queue"]["late"], 1, "{st}");
+    Ok(())
+}
+
+/// P12.4: the inline rename field's live preview names the file the rename then gives. Same
+/// keyword (Greek transliterated, upper case, letters and digits), and nothing under two of them.
+#[tokio::test]
+async fn the_keyword_preview_is_the_keyword_the_rename_stores() -> Result<()> {
+    let app = App::new()?;
+    let (status, created) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({ "url": "https://www.youtube.com/watch?v=preview1" })))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["job_id"].as_i64().unwrap();
+    // Percent-encode every byte that is not a plain letter or digit.
+    let encode = |s: &str| -> String {
+        s.bytes()
+            .map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") })
+            .collect()
+    };
+
+    for (typed, want) in [("σεισμός σητεία", Some("SEISMOSSITEIA")), ("Fire-Heraklion 2", Some("FIREHERAKLION2")), ("ά!", None)] {
+        let (status, preview) = app
+            .send("GET", &format!("/api/keyword-preview?text={}", encode(typed)), &app.mcr_token, None)
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["keyword"].as_str(), want, "preview of {typed:?}");
+        let (status, renamed) = app
+            .send("POST", &format!("/api/jobs/{id}/rename"), &app.mcr_token, Some(json!({ "keyword": typed })))
+            .await?;
+        match want {
+            Some(k) => {
+                assert_eq!(status, StatusCode::OK, "{renamed}");
+                assert_eq!(renamed["keyword"], k, "the rename stored another keyword than the preview showed");
+                assert!(renamed["slug"].as_str().unwrap().ends_with(&format!("_{k}")), "{renamed}");
+            }
+            None => assert_eq!(status, StatusCode::BAD_REQUEST, "{renamed}"),
+        }
+    }
+    // A long paste is cut, never refused.
+    let long = "a".repeat(5000);
+    let (status, preview) = app.send("GET", &format!("/api/keyword-preview?text={long}"), &app.mcr_token, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview["keyword"].as_str().map(str::len), Some(20));
     Ok(())
 }

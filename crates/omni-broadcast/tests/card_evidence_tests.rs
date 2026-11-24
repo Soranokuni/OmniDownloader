@@ -16,10 +16,18 @@ use omni_broadcast::preview::{ARTICLE_FILE, FRAME_FILE, VIDEO_FILE};
 use omni_broadcast::repair_gate::GateFacts;
 use omni_core::process::{self, RunOpts};
 
-fn ffmpeg_path() -> Option<PathBuf> {
+/// One test at a time: the card's own ffmpeg runs below normal priority with a
+/// fixed 20 s timeout per call, and the other tests' set-up encodes (normal
+/// priority) starved it past that on a loaded machine; the picture was then
+/// "not made" (P14.7b).
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `bin/ffmpeg.exe` and this test's turn (hold it to the end), or `None` with a
+/// visible warning when the tool is missing.
+async fn ffmpeg_path() -> Option<(PathBuf, tokio::sync::MutexGuard<'static, ()>)> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/ffmpeg.exe");
     if p.exists() {
-        Some(p)
+        Some((p, ONE_AT_A_TIME.lock().await))
     } else {
         eprintln!("WARNING: bin/ffmpeg.exe is missing; card evidence integration test skipped");
         None
@@ -96,9 +104,14 @@ impl ImageSource for Fake {
     }
 }
 
+/// The cap for the tests that are not about the cap: ffmpeg runs below normal
+/// priority, and on a loaded machine the 45 s production cap can run out
+/// mid-comparison (P14.7). The cap has its own tests below.
+const TEST_CAP: Duration = Duration::from_secs(600);
+
 async fn run(ffmpeg: &Path, dir: &Path, urls: &[&str], src: &Fake, secs: f64) -> ImageEvidence {
     let urls: Vec<String> = urls.iter().map(|s| s.to_string()).collect();
-    card_evidence_capped(ffmpeg, dir, &urls, &facts(), secs, src, CARD_CAP).await
+    card_evidence_capped(ffmpeg, dir, &urls, &facts(), secs, src, TEST_CAP).await
 }
 
 fn leftovers(dir: &Path) -> Vec<String> {
@@ -109,7 +122,7 @@ fn leftovers(dir: &Path) -> Vec<String> {
 
 #[tokio::test]
 async fn a_picture_that_is_a_frame_of_the_clip_matches_that_frame() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 12).await;
     let body = picture(&ffm, dir.path(), "mandelbrot", 6, "png").await;
@@ -128,7 +141,7 @@ async fn a_picture_that_is_a_frame_of_the_clip_matches_that_frame() {
 
 #[tokio::test]
 async fn an_unrelated_picture_is_no_match_but_is_still_kept_for_the_card() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 12).await;
     let body = picture(&ffm, dir.path(), "testsrc2", 3, "png").await;
@@ -141,7 +154,7 @@ async fn an_unrelated_picture_is_no_match_but_is_still_kept_for_the_card() {
 
 #[tokio::test]
 async fn a_svg_garbage_or_undecodable_body_leaves_no_picture_and_no_raw_file() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let bodies: Vec<Vec<u8>> = vec![
         b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\"/></svg>".to_vec(),
         b"#EXTM3U\n#EXT-X-VERSION:3\nfile:///C:/Windows/win.ini\n".to_vec(),
@@ -160,7 +173,7 @@ async fn a_svg_garbage_or_undecodable_body_leaves_no_picture_and_no_raw_file() {
 
 #[tokio::test]
 async fn a_host_the_page_never_used_or_a_private_one_is_refused_before_any_request() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 4).await;
     let body = picture(&ffm, dir.path(), "mandelbrot", 2, "png").await;
@@ -173,7 +186,7 @@ async fn a_host_the_page_never_used_or_a_private_one_is_refused_before_any_reque
 
 #[tokio::test]
 async fn no_preview_video_keeps_the_picture_with_no_distance() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     let body = picture(&ffm, dir.path(), "mandelbrot", 2, "png").await;
     let ev = run(&ffm, dir.path(), &[URL], &Fake::new(vec![Reply::Bytes(body)]), 4.0).await;
@@ -185,7 +198,7 @@ async fn no_preview_video_keeps_the_picture_with_no_distance() {
 
 #[tokio::test]
 async fn the_next_address_is_tried_only_after_a_failure_and_never_more_than_three() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 4).await;
     let good = picture(&ffm, dir.path(), "mandelbrot", 2, "png").await;
@@ -209,7 +222,7 @@ async fn the_next_address_is_tried_only_after_a_failure_and_never_more_than_thre
 
 #[tokio::test]
 async fn the_cap_ends_a_hanging_fetch_and_leaves_nothing_behind() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 4).await;
     // A leftover from an earlier hold must not survive either.
@@ -225,7 +238,7 @@ async fn the_cap_ends_a_hanging_fetch_and_leaves_nothing_behind() {
 
 #[tokio::test]
 async fn a_picture_declaring_an_enormous_canvas_is_refused_quickly() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 4).await;
     // 9000 x 9000 of one colour: a small file, 81 megapixels once decoded.
@@ -244,7 +257,7 @@ async fn a_picture_declaring_an_enormous_canvas_is_refused_quickly() {
 
 #[tokio::test]
 async fn a_flat_picture_is_kept_but_never_compared() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     // A black preview: every frame is flat too, so a naive comparison would call it a perfect match.
     ff(&ffm, &["-f", "lavfi", "-i", "color=c=black:size=640x360:rate=25", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", &dir.path().join(VIDEO_FILE).to_string_lossy()]).await;
@@ -259,7 +272,7 @@ async fn a_flat_picture_is_kept_but_never_compared() {
 /// A preview with a key frame every second: the match is found at the true second.
 #[tokio::test]
 async fn key_frames_give_the_true_time_not_the_nearest_fixed_sample() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     let src = "mandelbrot=size=640x360:rate=25";
     ff(
@@ -279,24 +292,27 @@ async fn key_frames_give_the_true_time_not_the_nearest_fixed_sample() {
 /// every other call is the real one.
 #[tokio::test]
 async fn when_the_comparison_runs_out_of_time_the_complete_picture_stays_without_a_distance() {
-    let Some(ffm) = ffmpeg_path() else { return };
+    let Some((ffm, _turn)) = ffmpeg_path().await else { return };
     let dir = tempfile::tempdir().unwrap();
     make_preview(&ffm, dir.path(), "mandelbrot", 4).await;
     let body = picture(&ffm, dir.path(), "mandelbrot", 2, "png").await;
     let shim = dir.path().join("ffshim.cmd");
     let real = std::fs::canonicalize(&ffm).unwrap();
     let real = real.to_string_lossy().replace("\\\\?\\", "").to_string();
-    std::fs::write(&shim, format!("@echo off\r\nfor %%a in (%*) do if \"%%a\"==\"-skip_frame\" ping -n 60 127.0.0.1 >nul\r\n\"{real}\" %*\r\n")).unwrap();
+    std::fs::write(&shim, format!("@echo off\r\nfor %%a in (%*) do if \"%%a\"==\"-skip_frame\" ping -n 600 127.0.0.1 >nul\r\n\"{real}\" %*\r\n")).unwrap();
     // The shim passes ordinary calls through untouched.
     let probe = process::run(&shim, ["-v", "error", "-y", "-i", &dir.path().join(VIDEO_FILE).to_string_lossy(), "-frames:v", "1", "-vf", "scale=64:-2", &dir.path().join("probe.jpg").to_string_lossy()], RunOpts::new(Duration::from_secs(30))).await.unwrap();
     assert!(probe.success && dir.path().join("probe.jpg").is_file(), "the shim must pass calls through: {} / {}", probe.stderr_tail, std::fs::read_to_string(&shim).unwrap());
     let urls = vec![URL.to_string()];
     let src = Fake::new(vec![Reply::Bytes(body)]);
     let started = Instant::now();
-    // 20 s: the picture phase must finish inside the cap even on a loaded
-    // machine (6 s failed during a full gate); the shim's comparison hangs 60 s.
-    let ev = card_evidence_capped(&shim, dir.path(), &urls, &facts(), 4.0, &src, Duration::from_secs(20)).await;
-    assert!(started.elapsed() < Duration::from_secs(40), "took {:?}", started.elapsed());
+    // The production cap: the picture phase must finish inside it even on a
+    // loaded machine (6 s failed in a full gate; 20 s left little room beside
+    // the workspace tests, P14.7); the shim's comparison hangs 10 minutes.
+    // Without the cap the key-frame run ends at its own timeout (68 s for a
+    // 4 s clip), so the bound stays below that.
+    let ev = card_evidence_capped(&shim, dir.path(), &urls, &facts(), 4.0, &src, CARD_CAP).await;
+    assert!(started.elapsed() < CARD_CAP + Duration::from_secs(15), "took {:?}", started.elapsed());
     assert_eq!(ev.host.as_deref(), Some("img.news.example"));
     assert_eq!((ev.distance, ev.frame_secs), (None, None));
     assert!(dir.path().join(ARTICLE_FILE).is_file(), "the finished picture is kept");

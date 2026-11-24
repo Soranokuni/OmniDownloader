@@ -33,6 +33,12 @@ pub fn build_args(source_mxf: &Path, output_mxf: &Path) -> Vec<String> {
         "25".into(),
         "-o".into(),
         output_mxf.to_string_lossy().into_owned(),
+        // The picture descriptor's primaries (P14.9). bmx writes the transfer
+        // and coding equations itself but leaves the primaries out, so the
+        // delivered file read "unknown" there although the bitstream says
+        // BT.709. A label only: the essence is copied byte for byte.
+        "--color-prim".into(),
+        "bt709".into(),
         source_mxf.to_string_lossy().into_owned(),
     ]
 }

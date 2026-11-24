@@ -28,6 +28,9 @@ use crate::ui::Ui;
 use crate::workdir::{create_secure_work_dir, WorkDir};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The short commit id this Setup was built from, "unknown" outside a
+/// checkout (set by build.rs, P14.4).
+pub const BUILD: &str = env!("OMNI_GIT_SHA");
 
 /// How a run ended: the process exit code, and the error to show (always,
 /// `/quiet` included).
@@ -255,6 +258,11 @@ pub fn after_install(report: &InstallReport, dir: &Path, verified: &mut Verified
         log.say(&format!("! {SETUP_EXE} was not copied to {} ({e:#}); keep this Setup to uninstall later.", dir.display()));
     }
     write_apps_entry(dir, log);
+    // P13.9: the Start-menu entry for signing a site in, without a terminal.
+    let line = crate::shortcut::install_line(&crate::shortcut::install(dir));
+    if !line.is_empty() {
+        log.say(&line);
+    }
     match (report.kind, parse_admin_url(&report.admin_url)) {
         (InstallKind::Fresh, Some((tls, port))) => Done::OpenAdmin { tls, port },
         _ => Done::Ok,
@@ -535,6 +543,10 @@ pub async fn uninstall_execute(
         }
     } else {
         say(log, "  The Apps & Features entry belongs to another installation; it is kept.");
+    }
+    // P13.9: the Start-menu sign-in entry goes with the installation it points at.
+    if let Some(line) = crate::shortcut::remove_line(&crate::shortcut::remove(root)) {
+        say(log, &line);
     }
     if !remove_data && with_files {
         say(log, &format!("  The configuration, database and logs stay in {}.", root.display()));

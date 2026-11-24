@@ -5,8 +5,13 @@
 //! The pages (P13.1c) are task dialogs, which exist only in common controls 6:
 //! the manifest names that assembly too. Per-monitor DPI awareness is set by
 //! an API call when the pages start, not here. Linker switches only.
+//! It also sets `OMNI_GIT_SHA`, the commit `/?` names on its first line (P14.4).
+
+include!("../../build_support/git_sha.rs");
 
 fn main() {
+    emit_git_sha();
+    println!("cargo:rerun-if-changed=../../build_support/git_sha.rs");
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     if msvc {
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");

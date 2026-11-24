@@ -285,3 +285,19 @@ fn the_latest_held_attempt_skips_later_attempts_that_did_not_hold() -> Result<()
     assert_eq!(repo.latest_held_attempt(id)?.unwrap().id, held, "the card describes the attempt that held");
     Ok(())
 }
+
+/// P14.6: the audit line of an ignored duplicate names the site and the job,
+/// never the address (whose path and query can carry a token).
+#[test]
+fn a_duplicates_audit_line_names_the_site_not_the_address() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let url = "https://www.news.example.gr/story-1?token=SECRET123";
+    let first = queue(&repo, url, 1).job_id();
+    assert!(matches!(queue(&repo, url, 2), Enqueued::DuplicateActive { .. }));
+    let audit: Vec<String> = repo.get_recent_audit_logs(20)?.into_iter().map(|a| a.message).collect();
+    let line = audit.iter().find(|m| m.starts_with("Duplicate of active job")).expect("the audit line");
+    assert!(line.contains(&format!("#{first}")) && line.contains("example.gr"), "{line}");
+    assert!(!line.contains("SECRET123") && !line.contains("story-1"), "{line}");
+    Ok(())
+}

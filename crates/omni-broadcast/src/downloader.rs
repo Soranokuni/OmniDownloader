@@ -64,6 +64,48 @@ pub struct DownloadOpts<'a> {
     /// The pinned ffmpeg for the merge (P11.4e). `download` fills it from
     /// the downloader when the caller leaves it empty.
     pub ffmpeg: Option<&'a Path>,
+    /// Which formats to ask for: the usual ones, or the second route's (P11.6).
+    pub formats: FormatRoute,
+    /// The largest file to download, in bytes (`--max-filesize`): a file-locker
+    /// share (P11.15a2). yt-dlp skips a bigger one quietly, which ends as
+    /// [`ErrorCode::ManualDownload`] with the limit named.
+    pub max_filesize: Option<u64>,
+    /// What the log may say of the address instead of its host and path: the
+    /// site of a file-locker share, whose path carries its key (P11.15a4).
+    pub log_label: Option<&'a str>,
+}
+
+/// The format selection of a download (P11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FormatRoute {
+    /// H.264/AAC merged into MP4 where offered, else the best up to the cap.
+    #[default]
+    Usual,
+    /// The second route after a source that failed probe, encode, wrap or the
+    /// gate: another video codec at the same cap, else a file the site serves
+    /// already merged as MP4 (no merge step of ours), both at least 720 lines
+    /// high so the second try is no big drop in picture; else as usual.
+    Second,
+}
+
+/// The lowest height the second route's own alternatives take (P11.6).
+pub const SECOND_ROUTE_MIN_HEIGHT: u32 = 720;
+
+/// The `-f` selector for `route`, every alternative capped at `h` but the last.
+pub fn format_selector(route: FormatRoute, h: u32) -> String {
+    match route {
+        FormatRoute::Usual => format!(
+            "bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
+             bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+        ),
+        FormatRoute::Second => {
+            let floor = SECOND_ROUTE_MIN_HEIGHT;
+            format!(
+                "bestvideo[height<={h}][height>={floor}][vcodec!^=avc1]+bestaudio/\
+                 best[height<={h}][height>={floor}][ext=mp4]/best[height<={h}]/best"
+            )
+        }
+    }
 }
 
 impl Default for DownloadOpts<'_> {
@@ -81,6 +123,9 @@ impl Default for DownloadOpts<'_> {
             cancel: None,
             js_runtime: None,
             ffmpeg: None,
+            formats: FormatRoute::Usual,
+            max_filesize: None,
+            log_label: None,
         }
     }
 }
@@ -113,6 +158,23 @@ pub const LIVE_FILTER: &str = "!is_live & live_status!=?is_upcoming";
 /// nothing, so this is only a secondary signal: see [`empty_download_is_live`].
 pub fn skipped_as_live(lines: &[String]) -> bool {
     lines.iter().any(|l| l.contains("does not pass filter") && l.contains(LIVE_FILTER))
+}
+
+/// What a download's log line says of `url` (P11.15a4): `label` when the caller
+/// gives one (a file-locker share's site), else the host and path, never the query.
+pub fn download_label(url: &str, label: Option<&str>) -> String {
+    match label {
+        Some(label) => label.to_string(),
+        None => omni_core::cookies::host_and_path(url),
+    }
+}
+
+/// The card's line for a file-locker share bigger than its limit of `bytes` (P11.15a2).
+pub fn too_big_el(bytes: u64) -> String {
+    format!(
+        "Το αρχείο είναι μεγαλύτερο από {} GB (όριο locker.max_file_gb) και δεν κατέβηκε αυτόματα. Κατεβάστε το με το χέρι και χρησιμοποιήστε «Μεταφόρτωση αρχείου» σε αυτή την εργασία.",
+        bytes >> 30
+    )
 }
 
 /// yt-dlp exited 0 and produced no file. Was that the live filter skipping a
@@ -589,10 +651,7 @@ impl Downloader {
             // since the output is 1080i50 either way. Prefer H.264/AAC so the
             // merge is a remux rather than a re-encode.
             "-f".into(),
-            format!(
-                "bestvideo[height<={h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
-                 bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
-            ),
+            format_selector(opts.formats, h),
             "--merge-output-format".into(),
             "mp4".into(),
             // A journalist's link often carries a playlist id; ingesting the
@@ -651,6 +710,11 @@ impl Downloader {
                 .into_owned(),
         ]);
 
+        // A file-locker share's download is bounded (P11.15a2).
+        if let Some(bytes) = opts.max_filesize {
+            args.push("--max-filesize".into());
+            args.push(bytes.to_string());
+        }
         if opts.insecure_tls {
             args.push("--no-check-certificates".into());
         }
@@ -713,7 +777,7 @@ impl Downloader {
         let opts = self.own_tools(opts);
         let args = Self::build_args(url, output_dir, &opts);
 
-        info!("Job #{job_id}: downloading {}", omni_core::cookies::host_and_path(url));
+        info!("Job #{job_id}: downloading {}", download_label(url, opts.log_label));
 
         // yt-dlp prints the final path on stdout as well as progress lines, so
         // both are collected from the same stream.
@@ -776,6 +840,12 @@ impl Downloader {
         warn!("Job #{job_id}: yt-dlp did not print a usable output path; scanning {output_dir:?}");
         if let Some(p) = find_downloaded_file(output_dir).await {
             return Ok(p);
+        }
+        // With a size limit (a file-locker share, P11.15a2) exit 0 and nothing written is
+        // yt-dlp skipping a bigger file (`--print` keeps its skip line quiet). Said before
+        // the live probe, which would ask the share's address again.
+        if let Some(bytes) = opts.max_filesize {
+            return Err(DownloadError { code: ErrorCode::ManualDownload, message: too_big_el(bytes) }.into());
         }
         // Exit 0 and nothing written is what the live filter leaves behind
         // (`--print` keeps its skip message quiet): ask yt-dlp whether the
@@ -1776,6 +1846,33 @@ mod tests {
         }
     }
 
+    /// P11.6: the second route asks for something else first (another codec,
+    /// then a file the site merged), capped like the usual one; every other
+    /// argument of the download is the same.
+    #[test]
+    fn the_second_route_asks_for_other_formats_and_changes_nothing_else() {
+        let usual = args_for(&DownloadOpts::default());
+        let second = args_for(&DownloadOpts { formats: FormatRoute::Second, ..Default::default() });
+        let f = |args: &[String]| args[args.iter().position(|a| a == "-f").unwrap() + 1].clone();
+        let selector = f(&second);
+        assert_ne!(selector, f(&usual));
+        let alts: Vec<&str> = selector.split('/').collect();
+        assert_eq!(
+            selector,
+            "bestvideo[height<=1080][height>=720][vcodec!^=avc1]+bestaudio/best[height<=1080][height>=720][ext=mp4]/best[height<=1080]/best"
+        );
+        assert_eq!(alts[0], "bestvideo[height<=1080][height>=720][vcodec!^=avc1]+bestaudio", "another codec first, 720 to 1080: {selector}");
+        assert_eq!(alts[1], "best[height<=1080][height>=720][ext=mp4]", "then a pre-merged MP4, 720 to 1080: {selector}");
+        for alt in &alts {
+            assert!(alt.contains("height<=1080") || *alt == "best", "fallback {alt:?} is not height-capped");
+        }
+        let without_f = |args: &[String]| {
+            let i = args.iter().position(|a| a == "-f").unwrap();
+            args.iter().enumerate().filter(|(n, _)| *n != i + 1).map(|(_, a)| a.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(without_f(&second), without_f(&usual));
+    }
+
     #[test]
     fn resilience_flags_are_present() {
         let args = args_for(&DownloadOpts::default());
@@ -2733,5 +2830,31 @@ mod platform_probe_tests {
             .unwrap_err();
         assert_eq!(tokio::time::Instant::now() - t0, RATE_LIMIT_COOL_DOWN);
         assert!(e.contains("could not run yt-dlp"), "{e}");
+    }
+
+    /// P11.15a4: a file-locker share's download is logged by its site, never by
+    /// a path that carries its key; any other by host and path, never the query.
+    #[test]
+    fn a_locker_downloads_log_line_names_its_site_only() {
+        let onedrive = omni_core::locker::direct_download("https://1drv.ms/v/s!AkExample123").unwrap();
+        let said = download_label(&onedrive, Some("1drv.ms"));
+        assert_eq!(said, "1drv.ms");
+        assert!(download_label(&onedrive, None).contains("u!"), "without the label the path would carry the token");
+        let sp = "https://station-my.sharepoint.com/:v:/g/personal/desk/EaBcDeFgHiJ?e=Xy1Zz9&download=1";
+        assert_eq!(download_label(sp, Some("sharepoint.com")), "sharepoint.com");
+        assert_eq!(download_label("https://news.example/v.mp4?sig=SECRET", None), "news.example/v.mp4");
+    }
+
+    /// P11.15a2: a file-locker share's download carries its size limit; any other does not.
+    #[test]
+    fn a_locker_share_download_carries_its_size_limit() {
+        let dir = Path::new("C:/temp/jobs/7");
+        let limited = Downloader::build_args("https://www.dropbox.com/s/a/b.mp4?dl=1", dir, &DownloadOpts { max_filesize: Some(20 << 30), ..Default::default() });
+        let at = limited.iter().position(|a| a == "--max-filesize").expect("the limit is passed");
+        assert_eq!(limited[at + 1], (20u64 << 30).to_string());
+        let usual = Downloader::build_args("https://www.youtube.com/watch?v=abc", dir, &DownloadOpts::default());
+        assert!(!usual.iter().any(|a| a == "--max-filesize"), "{usual:?}");
+        let said = too_big_el(20 << 30);
+        assert!(said.contains("20 GB") && said.contains("locker.max_file_gb") && said.contains("«Μεταφόρτωση αρχείου»"), "{said}");
     }
 }

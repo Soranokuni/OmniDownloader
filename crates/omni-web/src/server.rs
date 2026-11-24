@@ -9,6 +9,7 @@ use crate::admin_bench;
 use crate::admin_cookies;
 use crate::admin_settings;
 use crate::admin_sites;
+use crate::admin_wizard;
 use crate::admin_tools;
 use crate::assets::serve_static;
 use crate::middleware::{csrf_guard, host_guard, security_headers};
@@ -40,10 +41,8 @@ impl WebServer {
             .route("/metrics", get(crate::scrape::api_metrics))
             .route("/api/auth/login", post(api_login))
             .route("/api/auth/logout", post(api_logout))
-            .route("/api/setup/state", get(api_setup_state))
-            // ---- First run only (loopback, while no admin exists) ----
-            .route("/setup", get(view_setup))
-            .route("/api/setup", post(api_setup))
+            // There is no first-run page (P13.3): a new database gets the loopback-only
+            // first-run account, and the setup wizard on /admin is the one setup path.
             // ---- Logged in (any role) ----
             .route("/user", get(view_user))
             .route("/api/user/jobs", post(user_jobs::api_user_submit))
@@ -53,12 +52,16 @@ impl WebServer {
             .route("/api/auth/logout-all", post(api_logout_all))
             .route("/api/auth/password", post(api_change_password))
             .route("/api/jobs/mine", get(user_jobs::api_get_my_jobs))
+            // The file name a form will give (P12.11): /user, the desk, an allowlisted client.
+            .route("/api/slug-preview", get(api_slug_preview))
             // ---- MCR: admin, an MCR account, or an allowlisted client ----
             .route("/mcr", get(view_mcr))
+            .route("/board", get(view_board))
             .route("/api/jobs", get(api_get_jobs).post(api_create_job))
             .route("/api/jobs/:id", get(api_get_job))
             .route("/api/jobs/:id/override", post(api_override_job))
             .route("/api/jobs/:id/rename", post(api_rename_job))
+            .route("/api/keyword-preview", get(api_keyword_preview))
             .route("/api/jobs/:id/retry", post(api_retry_job))
             .route("/api/jobs/:id/now", post(api_run_now_job))
             .route("/api/jobs/:id/approve", post(api_approve_job))
@@ -85,6 +88,8 @@ impl WebServer {
             .route("/api/groups/:code", post(api_delete_group))
             .route("/api/journalists/:surname/groups", post(api_set_journalist_groups))
             .route("/api/system/status", get(api_system_status))
+            .route("/api/cookies/waiting", get(api_login_waits))
+            .route("/api/held/waiting", get(api_held_waiting))
             .route("/api/events", get(api_events))
             // The mail view (plan P7.8).
             .route("/api/mails", get(api_get_mails))
@@ -92,6 +97,7 @@ impl WebServer {
             .route("/api/mails/view", get(api_get_mail_view))
             .route("/api/mails/queue-link", post(api_mail_queue_link))
             .route("/api/mails/reprocess", post(api_mail_reprocess))
+            .route("/api/mails/remember-sender", post(api_mail_remember_sender))
             // ---- Admin ----
             .route("/admin", get(view_admin))
             .route(
@@ -112,6 +118,15 @@ impl WebServer {
             .route("/api/admin/settings/advanced", post(admin_settings::api_admin_save_advanced))
             .route("/api/admin/settings/complete", post(admin_settings::api_admin_complete_setup))
             .route("/api/admin/settings/answer-file", get(admin_settings::api_admin_answer_file))
+            // The wizard's last steps (P13.4).
+            .route("/api/admin/setup/test-download", post(admin_wizard::api_admin_start_test_download))
+            .route("/api/admin/setup/test-download/:id", get(admin_wizard::api_admin_test_download_status))
+            .route("/api/admin/journalists/import", post(admin_wizard::api_admin_import_journalists))
+            // The Settings section's operation form (P13.5).
+            .route("/api/admin/settings/operation", post(crate::admin_operation::api_admin_save_operation))
+            // The diagnostics package (P13.8).
+            .route("/api/admin/diagnostics.zip", get(crate::admin_diagnostics::api_admin_diagnostics))
+            .route("/api/admin/restart-service", post(crate::admin_delivery::api_admin_restart_service))
             .route("/api/admin/tools", get(admin_tools::api_admin_tools))
             .route("/api/admin/tools/:name/install", post(admin_tools::api_admin_tool_install))
             .route("/api/admin/update-ytdl", post(api_admin_update_ytdl))
@@ -139,6 +154,8 @@ impl WebServer {
             .route("/api/admin/recipes/:id/suspend", post(admin_sites::api_admin_recipe_suspend))
             .route("/api/admin/recipes/:id/retire", post(admin_sites::api_admin_recipe_retire))
             .route("/api/admin/repair-report", get(admin_sites::api_admin_repair_report))
+            .route("/api/admin/repair/shadow", get(admin_sites::api_admin_repair_shadow))
+            .route("/api/admin/repair/hold", post(admin_sites::api_admin_repair_hold))
             .route("/api/admin/autonomy-report", get(admin_sites::api_admin_autonomy_report))
             .route("/api/admin/test-url", get(admin_sites::api_admin_test_url_info).post(admin_sites::api_admin_test_url))
             .route("/api/admin/cookies", get(admin_cookies::api_admin_cookies).post(admin_cookies::api_admin_cookies_put))

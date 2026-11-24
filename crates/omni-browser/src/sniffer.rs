@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::adblock::UnifiedAdBlocker;
-use crate::agent::BrowserError;
+use crate::error::BrowserError;
 use crate::browser::HeadlessBrowserManager;
 use crate::evidence::{vast_candidate, vast_media_files, Diagnostic, NetworkEntry, NetworkLog, PageSnapshot, DIAG_JS, PAGE_FACTS_JS};
 use crate::glomex;

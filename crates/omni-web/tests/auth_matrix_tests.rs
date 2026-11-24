@@ -67,7 +67,7 @@ struct Tokens {
 
 impl Harness {
     fn new(with_admin: bool) -> Result<Self> {
-        Self::build(with_admin.then_some(("it@station.gr", "correct-horse-battery")))
+        Self::build(with_admin.then_some(("it@example.gr", "correct-horse-battery")))
     }
 
     /// The Admin caller is the first-run `admin` / `Admin` account (P2.14).
@@ -90,7 +90,7 @@ impl Harness {
         let mut tokens = Tokens::default();
 
         let user_id = repo.create_user(
-            "reporter@station.gr",
+            "reporter@example.gr",
             "correct-horse-battery",
             UserRole::User,
             "Reporter",
@@ -100,7 +100,7 @@ impl Harness {
         repo.create_session(user_id, &tokens.user, 1)?;
 
         let mcr_id = repo.create_user(
-            "desk@station.gr",
+            "desk@example.gr",
             "correct-horse-battery",
             UserRole::OpenMcr,
             "MCR Desk",
@@ -267,7 +267,6 @@ const MATRIX: &[Row] = &[
             (Admin, NotFound),
         ],
     ),
-    ("GET", "/api/setup/state", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/login", &[(Anonymous, Reached)]),
     ("POST", "/api/auth/logout", &[(Anonymous, Reached)]),
     // `/` always answers, but with a redirect that depends on the caller; it
@@ -277,6 +276,19 @@ const MATRIX: &[Row] = &[
     (
         "GET",
         "/mcr",
+        &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Loopback, Denied),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    // The wall board (P12.13): the desk's access rule, read-only.
+    (
+        "GET",
+        "/board",
         &[
             (Anonymous, Denied),
             (AllowlistedIp, Reached),
@@ -316,6 +328,30 @@ const MATRIX: &[Row] = &[
     (
         "POST",
         "/api/jobs/1/rename",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Denied),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    // The forms' live file-name preview (P12.11): read-only, for /user and the desk alike.
+    (
+        "GET",
+        "/api/slug-preview",
+        &[
+            (Anonymous, Denied),
+            (Caller::User, Reached),
+            (AllowlistedIp, Reached),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ],
+    ),
+    // The rename field's live file-name preview (P12.4): read-only, same gate as the rename.
+    (
+        "GET",
+        "/api/keyword-preview",
         &[
             (Anonymous, Denied),
             (Caller::User, Denied),
@@ -519,6 +555,22 @@ const MATRIX: &[Row] = &[
         "/api/system/status",
         &[(Anonymous, Denied), (AllowlistedIp, Reached), (Admin, Reached)],
     ),
+    // The desk's reminder of videos waiting for approval (P11.10): MCR, as the job list.
+    ("GET", "/api/held/waiting", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ]),
+    // The desk's «waiting for a login» card (P11.12): MCR, as the job list.
+    ("GET", "/api/cookies/waiting", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Reached),
+            (Caller::User, Denied),
+            (Mcr, Reached),
+            (Admin, Reached),
+        ]),
     (
         "GET",
         "/api/events",
@@ -569,6 +621,12 @@ const MATRIX: &[Row] = &[
         "POST",
         "/api/mails/reprocess",
         &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached)],
+    ),
+    // «Να το θυμάμαι για αυτή τη διεύθυνση» (P11.11a): the policy of the mail routes.
+    (
+        "POST",
+        "/api/mails/remember-sender",
+        &[(Anonymous, Denied), (Caller::User, Denied), (AllowlistedIp, Reached), (Mcr, Reached), (Admin, Reached)],
     ),
     // ---- Logged in ----
     (
@@ -640,6 +698,17 @@ const MATRIX: &[Row] = &[
     ("POST", "/api/admin/settings/mail", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("POST", "/api/admin/settings/advanced", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     ("POST", "/api/admin/settings/complete", &[(Anonymous, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // The wizard's last steps (P13.4): admin only. Job 1 is no test download: 404 for the admin.
+    ("POST", "/api/admin/setup/test-download", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    ("GET", "/api/admin/setup/test-download/1", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, ReachedNoFile)]),
+    ("POST", "/api/admin/journalists/import", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // The operation form (P13.5): admin only.
+    ("POST", "/api/admin/settings/operation", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // The diagnostics package (P13.8): admin only; it holds the logs.
+    ("GET", "/api/admin/diagnostics.zip", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
+    // «Επανεκκίνηση υπηρεσίας» (P13.2): admin only. The harness has no service, so the
+    // admin gets 409 NOT_A_SERVICE, which is reaching it.
+    ("POST", "/api/admin/restart-service", &[(Anonymous, Denied), (AllowlistedIp, Denied), (Caller::User, Denied), (Mcr, Denied), (Admin, Reached)]),
     // ---- Admin ----
     (
         "GET",
@@ -855,6 +924,21 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
+    // What the repair ladder in shadow would have fixed, and the switch to hold (P11.9): admin only.
+    ("GET", "/api/admin/repair/shadow", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
+    ("POST", "/api/admin/repair/hold", &[
+            (Anonymous, Denied),
+            (AllowlistedIp, Denied),
+            (Caller::User, Denied),
+            (Mcr, Denied),
+            (Admin, Reached),
+        ]),
     // The autonomy report (P11.0): admin only.
     ("GET", "/api/admin/autonomy-report", &[
             (Anonymous, Denied),
@@ -1006,8 +1090,8 @@ const MATRIX: &[Row] = &[
             (Mcr, Denied),
             (Admin, Reached),
         ]),
-    // ---- First-run only. With an admin present this is a 404 for everyone
-    //      who is not one, including a loopback client.
+    // ---- The first-run page and its endpoints are gone (P13.3): a 404 for
+    //      everyone, an administrator and a loopback client included.
     (
         "GET",
         "/setup",
@@ -1016,7 +1100,8 @@ const MATRIX: &[Row] = &[
             (Loopback, NotFound),
             (AllowlistedIp, NotFound),
             (Caller::User, NotFound),
-            (Admin, Reached),
+            (Mcr, NotFound),
+            (Admin, NotFound),
         ],
     ),
     (
@@ -1028,7 +1113,13 @@ const MATRIX: &[Row] = &[
             (AllowlistedIp, NotFound),
             (Caller::User, NotFound),
             (Mcr, NotFound),
+            (Admin, NotFound),
         ],
+    ),
+    (
+        "GET",
+        "/api/setup/state",
+        &[(Anonymous, NotFound), (Loopback, NotFound), (Admin, NotFound)],
     ),
     // ---- Static assets carry no data ----
     ("GET", "/static/app.css", &[(Anonymous, Reached)]),
@@ -1071,7 +1162,6 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
         ("POST", "/api/auth/logout-all"),
         ("POST", "/api/admin/users"),
         ("POST", "/api/setup/wizard/account"),
-        ("POST", "/api/setup/wizard/account"),
         ("GET", "/api/admin/users"),
     ];
 
@@ -1097,8 +1187,8 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
                     !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
                     "{route}: the default session must reach it, got {status}"
                 );
-            } else if *uri == "/api/setup" {
-                // Closed for this session, as for anyone once an admin exists.
+            } else if matches!(*uri, "/api/setup" | "/api/setup/state") {
+                // Removed (P13.3): nothing answers there, for anyone.
                 assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
             } else if uri.starts_with("/api/") {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
@@ -1106,7 +1196,7 @@ async fn a_default_admin_session_reaches_only_the_password_change_routes() -> Re
                 refused_api += 1;
             } else {
                 // Pages: the admin page is served (it shows the change form), the
-                // first-run page is closed, everything else bounces.
+                // removed first-run page is a 404, everything else bounces.
                 match *uri {
                     "/admin" => assert_eq!(status, StatusCode::OK, "{route}"),
                     "/setup" => assert_eq!(status, StatusCode::NOT_FOUND, "{route}"),
@@ -1190,7 +1280,7 @@ async fn w01_anonymous_callers_cannot_repoint_the_watchfolder() -> Result<()> {
         assert_eq!(
             res.status(),
             StatusCode::NOT_FOUND,
-            "{caller:?} must not reach /api/setup once an admin exists"
+            "{caller:?} must not reach /api/setup: the route is gone (P13.3)"
         );
     }
 
@@ -1199,61 +1289,31 @@ async fn w01_anonymous_callers_cannot_repoint_the_watchfolder() -> Result<()> {
     Ok(())
 }
 
+/// P13.3: a database with no administrator has no first-run page, not even from this
+/// machine. The way in is the first-run account the daemon creates on a new database,
+/// which signs in from this machine only; the wizard on /admin takes it from there.
 #[tokio::test]
-async fn the_first_run_window_is_loopback_only_and_closes_once_an_admin_exists() -> Result<()> {
+async fn a_new_database_has_no_setup_page_and_the_first_run_account_is_the_way_in() -> Result<()> {
     let h = Harness::new(false)?;
     assert!(!h.repo.has_active_admin()?);
+    for caller in [Loopback, AllowlistedIp, Anonymous] {
+        assert_eq!(h.request("GET", "/setup", caller).await, StatusCode::NOT_FOUND, "{caller:?}");
+        assert_eq!(h.request("POST", "/api/setup", caller).await, StatusCode::NOT_FOUND, "{caller:?}");
+    }
 
-    // A caller on the newsroom subnet cannot claim the first admin account,
-    // even though `mcr_open_networks` covers them: an allowlisted IP is a
-    // statement about a room, not an authorisation to administer the station.
-    assert_eq!(
-        h.request("GET", "/setup", AllowlistedIp).await,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        h.request("GET", "/setup", Anonymous).await,
-        StatusCode::NOT_FOUND
-    );
-    // From the machine itself, it is open.
-    assert_eq!(h.request("GET", "/setup", Loopback).await, StatusCode::OK);
-
-    // Claim it.
-    let payload = serde_json::json!({
-        "graph_tenant_id": "",
-        "graph_client_id": "",
-        "graph_mailbox": "ingest@station.gr",
-        "graph_client_secret": "",
-        "ollama_endpoint": "http://localhost:11434/v1",
-        "ollama_model": "gemma",
-        "watchfolder_path": "C:/watch",
-        "admin_email": "it@station.gr",
-        "admin_password": "correct-horse-battery",
-        "admin_full_name": "Administrator"
-    });
-    let res = h
-        .router
-        .clone()
-        .layer(MockConnectInfo(LOOPBACK.parse::<SocketAddr>().unwrap()))
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/setup")
-                .header("content-type", "application/json")
-                .header("x-omni-request", "1")
-                .header("host", "127.0.0.1:8080")
-                .header("origin", "http://127.0.0.1:8080")
-                .body(Body::from(payload.to_string()))?,
-        )
-        .await?;
-    assert_eq!(res.status(), StatusCode::OK);
-    assert!(h.repo.has_active_admin()?);
-
-    // The window is now shut, for loopback too.
-    assert_eq!(
-        h.request("GET", "/setup", Loopback).await,
-        StatusCode::NOT_FOUND
-    );
+    // What the daemon does at start on a database with no users and no history.
+    let dir = TempDir::new()?;
+    let fresh = Repository::new(dir.path().join("omni.db"))?;
+    assert!(fresh.ensure_default_admin()?, "a brand-new database gets the first-run account");
+    // ...which is how the harness below starts.
+    let h = Harness::with_default_admin()?;
+    let login = r#"{"email":"admin","password":"Admin"}"#;
+    let (status, body) = h.request_full("POST", "/api/auth/login", Loopback, login).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(r#""password_change_required":true"#), "{body}");
+    // From the newsroom network it is refused like a wrong password.
+    let (status, _) = h.request_full("POST", "/api/auth/login", AllowlistedIp, login).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
     Ok(())
 }
 

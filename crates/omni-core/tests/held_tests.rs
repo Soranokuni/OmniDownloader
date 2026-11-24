@@ -371,3 +371,191 @@ fn only_an_approved_hold_keeps_a_job_out_of_the_archive_stage_recovery() -> Resu
     assert_eq!(repo.get_job(approved)?.unwrap().status, JobStatus::Pending);
     Ok(())
 }
+
+fn expires(repo: &Repository, id: i64) -> chrono::DateTime<Utc> {
+    repo.get_held(id).unwrap().unwrap().expires_at.expect("an expiry")
+}
+
+/// Within a second: the stored times are milliseconds, `now` is finer.
+fn about(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
+    (a - b).num_milliseconds().abs() <= 1000
+}
+
+/// P11.10: a tick counts against the hold only when a desk was connected over
+/// it and it was no longer than the gap; otherwise the expiry moves on by it.
+/// A decided row is never touched.
+#[test]
+fn the_approval_clock_runs_only_while_a_desk_was_connected() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let id = held(&repo, 1);
+    let decided = held(&repo, 2);
+    assert!(repo.reject_held(decided, "not_usable", "no", "desk")?);
+    let (e0, d0) = (expires(&repo, id), repo.get_held(decided)?.unwrap().expires_at);
+    let now = Utc::now();
+    let gap = Duration::minutes(3);
+
+    assert_eq!(repo.account_held_clocks(now + Duration::minutes(1), true, gap)?, 0, "watched: the clock ran");
+    assert_eq!(expires(&repo, id), e0);
+
+    assert_eq!(repo.account_held_clocks(now + Duration::minutes(2), false, gap)?, 1, "no desk: the expiry moves");
+    assert!(about(expires(&repo, id), e0 + Duration::minutes(1)), "{} vs {}", expires(&repo, id), e0);
+
+    // The daemon was stopped for 10 hours: nobody saw it, whatever the desk says now.
+    assert_eq!(repo.account_held_clocks(now + Duration::minutes(2) + Duration::hours(10), true, gap)?, 1);
+    assert!(about(expires(&repo, id), e0 + Duration::minutes(1) + Duration::hours(10)));
+
+    assert_eq!(repo.get_held(decided)?.unwrap().expires_at, d0, "a decided row is left");
+    Ok(())
+}
+
+/// P11.10: a held video nobody's desk saw does not expire; once seen for the
+/// whole hold, it expires into review as before.
+#[test]
+fn an_unseen_held_video_does_not_expire_and_a_seen_one_ends_in_review() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let temp = dir.path().join("temp");
+    let id = held(&repo, 1);
+    let now = Utc::now();
+
+    // 30 hours with no desk: past the original 24 h, still waiting.
+    repo.account_held_clocks(now + Duration::hours(30), false, Duration::minutes(3))?;
+    let report = omni_core::held::sweep(&repo, &temp, now + Duration::hours(30))?;
+    assert!(report.expired.is_empty(), "{report:?}");
+    assert_eq!(repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+
+    // Then a desk watches it for the whole hold (one long tick, the gap allowing it).
+    let later = now + Duration::hours(30) + Duration::hours(24) + Duration::minutes(1);
+    assert_eq!(repo.account_held_clocks(later, true, Duration::hours(25))?, 0);
+    let report = omni_core::held::sweep(&repo, &temp, later)?;
+    assert_eq!(report.expired, vec![id]);
+    let job = repo.get_job(id)?.unwrap();
+    assert_eq!((job.status, job.error_code.as_deref()), (JobStatus::RequiresReview, Some("APPROVAL_EXPIRED")));
+    Ok(())
+}
+
+/// P11.10: the desk's reminder reads how many wait, the oldest and the soonest expiry.
+#[test]
+fn the_reminder_counts_the_videos_waiting_for_approval() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    assert_eq!(repo.held_waiting()?.count, 0);
+    let a = held(&repo, 1);
+    let b = held(&repo, 2);
+    assert!(repo.reject_held(b, "not_usable", "no", "desk")?);
+    held(&repo, 3);
+    let w = repo.held_waiting()?;
+    assert_eq!(w.count, 2);
+    assert_eq!(w.oldest_held_at, repo.get_held(a)?.unwrap().created_at);
+    assert_eq!(w.soonest_expires_at, Some(expires(&repo, a)));
+    Ok(())
+}
+
+/// P11.10b: when the clocks could not be accounted, the tick expires nothing
+/// (a video past its stored time stays waiting); the next good tick does.
+/// `reaper_tick` is what the daemon's reaper calls.
+#[test]
+fn a_tick_whose_clocks_failed_expires_nothing() -> Result<()> {
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let temp = dir.path().join("temp");
+    let id = held(&repo, 1);
+    let late = Utc::now() + Duration::hours(25);
+
+    let report = omni_core::held::sweep_after_clocks(&repo, &temp, late, Err(anyhow::anyhow!("database locked")))?;
+    assert!(report.expired.is_empty(), "{report:?}");
+    assert_eq!(repo.get_job(id)?.unwrap().status, JobStatus::AwaitingApproval);
+
+    // A good tick with a desk watching, over a gap it may count.
+    let desks = omni_core::held::DeskPresence::new();
+    let _desk = desks.connect();
+    let report = omni_core::held::reaper_tick(&repo, &temp, &desks, late, Duration::hours(26))?;
+    assert_eq!(report.expired, vec![id]);
+    Ok(())
+}
+
+/// P14.6: the desk's page reads its held and repair details in one batch, and
+/// gets what the per-job queries give: the waiting held video and the latest
+/// HELD attempt of a job awaiting approval (not a later attempt that did not
+/// hold), the latest attempt of a completed job, nothing for the others.
+#[test]
+fn the_desk_batch_gives_what_the_per_job_queries_give() -> Result<()> {
+    use omni_core::repository::AttemptEnd;
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let now = Utc::now();
+    let end = |outcome: &str| AttemptEnd { outcome: Some(outcome.into()), domain: Some("news.example".into()), ..Default::default() };
+
+    let waiting = held(&repo, 1);
+    let held_try = repo.start_attempt(waiting, "hold", now)?;
+    repo.finish_attempt(held_try, &end("held"), now)?;
+    let later = repo.start_attempt(waiting, "hold", now)?;
+    repo.finish_attempt(later, &end("next_failed"), now)?;
+
+    let done = queue(&repo, 2);
+    assert_eq!(repo.lease_job("w", 180)?.expect("leased").id, done);
+    let auto = repo.start_attempt(done, "hold", now)?;
+    repo.finish_attempt(auto, &end("auto_delivered"), now)?;
+    assert!(repo.finish(done, "w", JobStatus::Completed, None, None, None)?);
+    let plain = queue(&repo, 3);
+
+    let jobs: Vec<_> = [waiting, done, plain].iter().map(|id| repo.get_job(*id).unwrap().unwrap()).collect();
+    let extras = repo.desk_extras(&jobs.iter().collect::<Vec<_>>())?;
+    assert_eq!(extras.held.get(&waiting).map(|h| h.sha256.clone()), repo.waiting_held(waiting)?.map(|h| h.sha256));
+    assert_eq!(extras.held_attempts.get(&waiting).map(|a| a.id), Some(held_try), "the latest held one, not the later failed one");
+    assert_eq!(repo.latest_held_attempt(waiting)?.map(|a| a.id), Some(held_try));
+    assert_eq!(extras.attempts.get(&done).map(|a| a.id), repo.latest_attempt(done)?.map(|a| a.id));
+    assert_eq!(extras.attempts.get(&done).map(|a| a.id), Some(auto));
+    assert!(!extras.held.contains_key(&plain) && !extras.attempts.contains_key(&plain) && !extras.held_attempts.contains_key(&done));
+    assert!(repo.desk_extras(&[])?.held.is_empty(), "an empty page asks nothing");
+    Ok(())
+}
+
+/// P14.6b: the batch's recipe part. A held attempt found by a recipe that MCR
+/// approved on two sites gets the recipe's origin and only its own site's
+/// approvals, as the per-job `recipe_origin` and `recipe_site_approvals` give.
+#[test]
+fn the_desk_batch_gives_a_recipes_origin_and_its_own_sites_approvals() -> Result<()> {
+    use omni_core::recipe_score::{Event, InsertOutcome, NewRecipe, Origin, ScopeKind};
+    use omni_core::repository::AttemptEnd;
+    let dir = TempDir::new()?;
+    let repo = repo(&dir);
+    let now = Utc::now();
+    let recipe = NewRecipe {
+        scope_kind: ScopeKind::Site,
+        scope_key: "news.example".into(),
+        family: None,
+        recipe_json: "{}".into(),
+        hash: "h-desk-1".into(),
+        steps_hash: "s-desk-1".into(),
+        dsl_version: 1,
+        origin: Origin::Admin,
+    };
+    let rid = match repo.insert_recipe(&recipe, now)? {
+        InsertOutcome::Inserted(id) => id,
+        other => panic!("{other:?}"),
+    };
+    for _ in 0..2 {
+        repo.recipe_event(rid, "news.example", Event::Approval, now)?;
+    }
+    for _ in 0..3 {
+        repo.recipe_event(rid, "other.example", Event::Approval, now)?;
+    }
+
+    let waiting = held(&repo, 1);
+    let attempt = repo.start_attempt(waiting, "hold", now)?;
+    let end = AttemptEnd { outcome: Some("held".into()), domain: Some("news.example".into()), recipe_id: Some(rid), ..Default::default() };
+    repo.finish_attempt(attempt, &end, now)?;
+
+    let job = repo.get_job(waiting)?.unwrap();
+    let extras = repo.desk_extras(&[&job])?;
+    let a = extras.held_attempts.get(&waiting).expect("the held attempt");
+    assert_eq!(extras.origins.get(&rid).cloned(), repo.recipe_origin(rid)?);
+    assert!(extras.origins.contains_key(&rid));
+    let per_job = repo.recipe_site_approvals(rid, "news.example")?;
+    assert_eq!(per_job, 2);
+    assert_eq!(extras.approvals_of(a.recipe_id, a.domain.as_deref()), per_job, "its own site's approvals only");
+    assert_eq!(extras.approvals_of(Some(rid), Some("other.example")), 0, "another site's are not read for this page");
+    Ok(())
+}

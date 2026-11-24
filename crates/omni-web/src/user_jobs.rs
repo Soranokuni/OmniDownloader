@@ -72,7 +72,7 @@ pub async fn api_user_submit(
 
     let journalist = journalist_of(&user);
     let keyword = sanitize_token(&payload.keyword, "ASSET");
-    let base_index = sanitize_token(payload.index_str.as_deref().unwrap_or("1"), "1");
+    let base_index = crate::routes::typed_index(payload.index_str.as_deref())?;
     let notes = payload
         .notes
         .as_deref()
@@ -85,7 +85,7 @@ pub async fn api_user_submit(
     let mut failed = false;
     for (i, url) in urls.iter().enumerate() {
         let index = if multi { format!("{base_index}{}", index_suffix(i)) } else { base_index.clone() };
-        let slug = format!("{index}_{journalist}_{keyword}");
+        let slug = omni_core::slug::compose(&index, &journalist, &keyword);
         let mut new = NewJob::new(url.as_str(), slug.clone(), journalist.clone());
         new.keyword = keyword.clone();
         new.index_str = index;

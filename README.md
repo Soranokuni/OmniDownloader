@@ -251,7 +251,7 @@ cargo test --workspace
 ```
 
 The external tools are **not** in this repository. They live in `bin/`; a
-running daemon installs or repairs them from **Admin → Toolchain**, and
+running daemon installs or repairs them from **Admin → Maintenance → Toolchain**, and
 `scripts\package.ps1` copies them into a release:
 
 | Tool | Version | Source |
@@ -284,8 +284,9 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe run
 
 # first run: open http://127.0.0.1:8080/admin from this machine and sign in
-# as Admin / Admin (the setup wizard opens), or use the console wizard
-.\target\release\omni-ingest.exe setup
+# as Admin / Admin (the setup wizard opens); or apply an answer file exported
+# from another installation (the setup wizard's IT mode → Download answer file)
+.\target\release\omni-ingest.exe setup --answer omni-answers.json
 
 # what the daemon made of each mail; read one again on its next poll
 .\target\release\omni-ingest.exe mail-history
@@ -293,8 +294,8 @@ copy config.example.json config.json
 
 # locked out? list the accounts, or set a new password (prompted, not an argument)
 .\target\release\omni-ingest.exe admin list-users
-.\target\release\omni-ingest.exe admin reset-password admin@station.gr
-.\target\release\omni-ingest.exe admin deactivate old-admin@station.gr
+.\target\release\omni-ingest.exe admin reset-password admin@example.gr
+.\target\release\omni-ingest.exe admin deactivate old-admin@example.gr
 
 # credentials never go in config.json
 .\target\release\omni-ingest.exe secrets set graph.client_secret
@@ -318,15 +319,23 @@ copy config.example.json config.json
 .\target\release\omni-ingest.exe service start|stop|status|uninstall
 ```
 
-Panels: `/mcr` (operators), `/admin`, `/user`, `/login` on port 8080 by default.
+Panels: `/mcr` (operators), `/board` (a read-only wall screen for the control
+room), `/admin`, `/user`, `/login` on port 8080 by default. The desk and the
+journalist page are in Greek; the admin panel and its setup wizard are in Greek
+with an **English** switch.
 
-The MCR desk opens on **Email**: every mail (and every link added by hand), newest
-first, each with a bar of its videos' states. Opened, a mail shows its text with
-every link tagged by the file it became and coloured by how that file is doing,
-and its videos beside it; pointing at one lights up the other. A link the parser
-left out shows why, and can be queued from there. The text is kept for
-`mail_text_retention_days` (30) and then cleared; `/mcr#queue`, `#review` and
-`#completed` open the other lists directly.
+The MCR desk has four tabs and opens on **«Εισερχόμενα»**: every mail (and every
+link added by hand), newest first, each with a bar of its videos' states. Opened,
+a mail shows its text with every link tagged by the file it became and coloured
+by how that file is doing, and its videos beside it; pointing at one lights up
+the other. A link the parser left out shows why, and can be queued from there.
+The text is kept for `mail_text_retention_days` (30) and then cleared;
+`/mcr#queue`, `#review` and `#completed` open the other lists («Σε εξέλιξη»,
+«Χρειάζονται έλεγχο», «Ολοκληρωμένα») directly. A link is added by hand from
+**«+ Προσθήκη συνδέσμου»** (a side panel), the help menu has the broadcast
+specification, the keyboard shortcuts (J/K, Enter, R, A, /, ?) and the wall
+board, and each browser keeps its own sound settings, including a reminder
+while a video waits for a person. The User Guide has the details.
 
 A new installation runs the service as the virtual account
 `NT SERVICE\OmniIngestService` (no password), with Modify only on `data\`,
@@ -374,8 +383,9 @@ source; IMAP support has been removed.
    .\target\release\omni-ingest.exe secrets set graph.client_secret
    ```
 
-   Or use `/setup` in the browser, which stores the secret the same way, then
-   **Test mailbox** on `/admin`.
+   Or enter it in the setup wizard's Mail step, or the **Mailbox** card
+   (Admin → Settings), which store it the same way and use it from the next
+   mail check.
 
    For a console or development run you can instead set `OMNI_GRAPH_TENANT_ID`,
    `OMNI_GRAPH_CLIENT_ID`, `OMNI_GRAPH_MAILBOX` and `OMNI_GRAPH_CLIENT_SECRET`
@@ -392,8 +402,9 @@ was received no more than 72 hours before the last poll. On the very first
 poll the daemon looks back 24 hours.
 
 With `Mail.Read` alone the mailbox is left exactly as it is. A mail that could
-not be processed after three attempts is recorded as failed and appears in the
-admin log (`Gave up on email ...`), not in the mailbox.
+not be processed after three attempts is recorded as failed and appears on the
+desk («Εισερχόμενα», filter «Θέλουν προσοχή»), in **Admin → Maintenance →
+Recent mail** and in the audit log (`Gave up on email ...`), not in the mailbox.
 
 **Optional: mark and file mail in the mailbox.** Grant `Mail.ReadWrite`
 instead and set `"write_access": true` under `graph`: processed mail is then
@@ -407,7 +418,7 @@ The deterministic parser decides every job; the LLM is asked only where it
 is unsure (a journalist, a keyword, a group) and its answers are checked
 before use. With the LLM off, down or slow, the jobs are the same.
 
-Set it on **Admin → LLM assist**: pick a provider preset (LM Studio,
+Set it on **Admin → Settings → LLM assist**: pick a provider preset (LM Studio,
 Ollama, GenieX, llama.cpp/vLLM, OpenAI, Azure OpenAI, Google Gemini,
 Anthropic, OpenRouter, Mistral, Groq, or any OpenAI-compatible server),
 **Load models**, **Test**, then **Save and apply**; no restart. Keys are

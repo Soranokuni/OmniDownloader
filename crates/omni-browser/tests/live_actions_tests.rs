@@ -3,7 +3,7 @@
 //! Skipped with a visible warning when no browser is installed.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -43,7 +43,22 @@ const FROZEN: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>
 struct Hits {
     ticks: AtomicUsize,
     pwned: AtomicUsize,
+    /// When the browser first asked for `/page` or `/block`.
+    first: OnceLock<Instant>,
 }
+
+impl Hits {
+    /// Time since the browser first asked for the page: the browser's launch,
+    /// which a loaded machine stretches most, is not counted (P14.7b).
+    fn since_page_request(&self) -> Duration {
+        self.first.get().expect("the browser never asked for the page").elapsed()
+    }
+}
+
+/// One browser at a time: every run here waits a fixed 15 s settle and then
+/// answers within 3 s per action, which holds for one Chrome on a loaded
+/// machine, not for nine competing for the CPU beside a full gate (P14.7b).
+static ONE_BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn browser_installed() -> bool {
     [
@@ -56,20 +71,22 @@ fn browser_installed() -> bool {
     .any(|p| std::path::Path::new(p).exists())
 }
 
-/// Start the fixture server; `None` (with a warning printed) when there is no browser.
-async fn serve() -> Option<(String, Arc<Hits>)> {
+/// Start the fixture server; `None` (with a warning printed) when there is no
+/// browser. The guard is this test's turn with the browser: hold it to the end.
+async fn serve() -> Option<(String, Arc<Hits>, tokio::sync::MutexGuard<'static, ()>)> {
     if !browser_installed() {
         eprintln!("WARNING: skipping live action test -- no Chrome/Edge installed");
         return None;
     }
+    let turn = ONE_BROWSER.lock().await;
     let adblock = tempfile::tempdir().unwrap();
     UnifiedAdBlocker::init(adblock.path().to_path_buf());
     std::mem::forget(adblock);
 
     let hits = Arc::new(Hits::default());
     let app = Router::new()
-        .route("/page", get(|| async { Html(PAGE) }))
-        .route("/block", get(|| async { Html(FROZEN) }))
+        .route("/page", get(|State(h): State<Arc<Hits>>| async move { h.first.get_or_init(Instant::now); Html(PAGE) }))
+        .route("/block", get(|State(h): State<Arc<Hits>>| async move { h.first.get_or_init(Instant::now); Html(FROZEN) }))
         .route("/other", get(|| async { Html(OTHER) }))
         .route("/v/master.m3u8", get(|| async { "#EXTM3U\n" }))
         .route("/tick", get(|State(h): State<Arc<Hits>>| async move { h.ticks.fetch_add(1, Ordering::SeqCst); "" }))
@@ -78,7 +95,7 @@ async fn serve() -> Option<(String, Arc<Hits>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Some((format!("http://{addr}/page"), hits))
+    Some((format!("http://{addr}/page"), hits, turn))
 }
 
 fn has_stream(snap: &omni_browser::PageSnapshot) -> bool {
@@ -87,10 +104,9 @@ fn has_stream(snap: &omni_browser::PageSnapshot) -> bool {
 
 #[tokio::test]
 async fn a_click_that_starts_the_video_shows_it_in_the_network_and_the_run_is_complete() {
-    let Some((url, _)) = serve().await else { return };
-    let started = Instant::now();
+    let Some((url, hits, _turn)) = serve().await else { return };
     let (snap, diag) = StreamSniffer::diagnose_live(&url, 40, &[LiveAction::Click("#load".into())]).await;
-    eprintln!("live run with one click took {:?}", started.elapsed());
+    eprintln!("live run with one click took {:?} from the page request", hits.since_page_request());
     assert_eq!(diag.live_actions, vec!["clicked".to_string()]);
     assert!(has_stream(&snap), "network: {:?}", snap.network.iter().map(|n| &n.url).collect::<Vec<_>>());
     assert!(diag.complete);
@@ -99,7 +115,7 @@ async fn a_click_that_starts_the_video_shows_it_in_the_network_and_the_run_is_co
 #[tokio::test]
 async fn without_the_click_the_video_never_loads() {
     // the control for the test above: it must be the click that starts it
-    let Some((url, _)) = serve().await else { return };
+    let Some((url, _, _turn)) = serve().await else { return };
     let (snap, diag) = StreamSniffer::diagnose(&url, 40).await;
     assert!(!has_stream(&snap));
     assert!(diag.live_actions.is_empty());
@@ -108,7 +124,7 @@ async fn without_the_click_the_video_never_loads() {
 
 #[tokio::test]
 async fn a_click_on_a_missing_element_is_an_incomplete_run() {
-    let Some((url, _)) = serve().await else { return };
+    let Some((url, _, _turn)) = serve().await else { return };
     let (snap, diag) = StreamSniffer::diagnose_live(&url, 40, &[LiveAction::Click("#missing".into())]).await;
     assert_eq!(diag.live_actions, vec!["missing".to_string()]);
     assert!(!diag.complete);
@@ -118,7 +134,7 @@ async fn a_click_on_a_missing_element_is_an_incomplete_run() {
 
 #[tokio::test]
 async fn a_selector_is_data_and_never_becomes_script() {
-    let Some((url, hits)) = serve().await else { return };
+    let Some((url, hits, _turn)) = serve().await else { return };
     let actions = [
         LiveAction::Click("#x'); window.__pwned=1; ('".into()),
         LiveAction::ScrollTo("x\"]; window.__pwned=1; [\"".into()),
@@ -136,7 +152,7 @@ async fn a_selector_is_data_and_never_becomes_script() {
 
 #[tokio::test]
 async fn a_click_that_leaves_the_page_is_an_incomplete_run() {
-    let Some((url, _)) = serve().await else { return };
+    let Some((url, _, _turn)) = serve().await else { return };
     let (_snap, diag) = StreamSniffer::diagnose_live(&url, 40, &[LiveAction::Click("#go".into())]).await;
     assert_eq!(diag.live_actions, vec!["clicked".to_string()]);
     assert!(!diag.complete, "the page ended up somewhere else");
@@ -145,20 +161,19 @@ async fn a_click_that_leaves_the_page_is_an_incomplete_run() {
 
 #[tokio::test]
 async fn two_long_waits_stay_inside_the_cap_whatever_the_budget() {
-    let Some((url, _)) = serve().await else { return };
-    let started = Instant::now();
+    let Some((url, hits, _turn)) = serve().await else { return };
     let (_snap, diag) = StreamSniffer::diagnose_live(&url, 600, &[LiveAction::Wait(8000), LiveAction::Wait(8000)]).await;
-    let took = started.elapsed();
-    eprintln!("live run with two 8 s waits took {took:?}");
+    let took = hits.since_page_request();
+    eprintln!("live run with two 8 s waits took {took:?} from the page request");
     assert_eq!(diag.live_actions, vec!["waited".to_string(), "waited".to_string()]);
     assert!(diag.complete);
-    // 40 s cap for the run itself, plus closing the browser
+    // 40 s cap for the run itself (it starts before the page request), plus closing the browser
     assert!(took < Duration::from_secs(55), "took {took:?}");
 }
 
 #[tokio::test]
 async fn a_third_action_is_not_run_and_the_run_is_incomplete() {
-    let Some((url, _)) = serve().await else { return };
+    let Some((url, _, _turn)) = serve().await else { return };
     let actions = [LiveAction::Wait(1), LiveAction::Wait(1), LiveAction::Wait(1)];
     let (_snap, diag) = StreamSniffer::diagnose_live(&url, 40, &actions).await;
     assert_eq!(diag.live_actions, vec!["waited", "waited", "skipped"]);
@@ -167,12 +182,11 @@ async fn a_third_action_is_not_run_and_the_run_is_incomplete() {
 
 #[tokio::test]
 async fn a_frozen_page_is_cut_at_the_run_cap_whatever_the_budget() {
-    let Some((url, _)) = serve().await else { return };
+    let Some((url, hits, _turn)) = serve().await else { return };
     let url = url.replace("/page", "/block");
-    let started = Instant::now();
     let (_snap, diag) = StreamSniffer::diagnose_live(&url, 600, &[LiveAction::Click("#x".into())]).await;
-    let took = started.elapsed();
-    eprintln!("live run on a frozen page took {took:?}");
+    let took = hits.since_page_request();
+    eprintln!("live run on a frozen page took {took:?} from the page request");
     assert!(!diag.complete, "the page never answered the click");
     assert_eq!(classify_live_run(&[LiveAction::Click("#x".into())], &diag), LiveRun::Inconclusive);
     // the 40 s cap, plus closing a browser whose page is stuck
@@ -183,11 +197,10 @@ async fn a_frozen_page_is_cut_at_the_run_cap_whatever_the_budget() {
 
 #[tokio::test]
 async fn a_wait_longer_than_the_recipe_limit_is_clamped() {
-    let Some((url, _)) = serve().await else { return };
-    let started = Instant::now();
+    let Some((url, hits, _turn)) = serve().await else { return };
     let (_snap, diag) = StreamSniffer::diagnose_live(&url, 600, &[LiveAction::Wait(60_000)]).await;
-    let took = started.elapsed();
-    eprintln!("live run with a 60 s wait took {took:?}");
+    let took = hits.since_page_request();
+    eprintln!("live run with a 60 s wait took {took:?} from the page request");
     assert_eq!(diag.live_actions, vec!["waited".to_string()]);
     // Without the clamp this fails on the ["waited"] outcome above: the 40 s run cap would
     // cut an unclamped wait and leave no outcome. The time bound is only a sanity check.

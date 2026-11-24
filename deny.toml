@@ -1,0 +1,57 @@
+# cargo-deny policy (P14.3), checked in CI with `cargo deny check`.
+
+[graph]
+# The shipped build (x64) and the development machines (ARM64).
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Each entry: why it does not apply here, and when it was decided (P14.3b).
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "2026-11-23: chrono is unmaintained, no fixed release exists; no known vulnerability. Revisit when a maintained successor or a fix appears." },
+    { id = "RUSTSEC-2025-0057", reason = "2026-11-23: fxhash is unmaintained (via inquire and selectors), no fixed release exists; it hashes in-memory keys only. Revisit with those crates' upgrades." },
+    { id = "RUSTSEC-2026-0459", reason = "2026-11-23: needs an attacker-written DB+WAL; our DB is written only by the service itself. Revisit with a rusqlite upgrade." },
+]
+
+[licenses]
+version = 2
+# Permissive licences only, plus MPL-2.0 (file-level: the HTML parser's
+# selectors and cssparser), all of which allow shipping inside omni-ingest.exe.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Our own crates are `publish = false` and carry no licence field.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+# No C crypto: ring and aws-lc come in with rustls, openssl with native-tls'
+# non-Windows backend. TLS here is Windows SChannel.
+deny = [
+    { crate = "ring" },
+    { crate = "aws-lc-rs" },
+    { crate = "aws-lc-sys" },
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

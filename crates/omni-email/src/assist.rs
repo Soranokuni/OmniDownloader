@@ -111,7 +111,7 @@ impl Assist {
 
     /// The assist the configuration describes (plan P4.22).
     pub fn from_config(config: &AppConfig) -> Self {
-        Self::new(&config.ollama_endpoint, &config.ollama_model, config.llm.clone())
+        Self::new(&config.llm.endpoint, &config.llm.model, config.llm.clone())
     }
 
     pub fn client(&self) -> &LlmClient {

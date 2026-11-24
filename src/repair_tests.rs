@@ -360,7 +360,7 @@ struct Rig {
 }
 
 fn cfg(mode: RepairMode, budget: Duration) -> RepairCfg {
-    RepairCfg { mode, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default(), egress_allow: Default::default() }
+    RepairCfg { mode, live: None, budget, hold_hours: 24, held_max_bytes: 20 << 30, auto_deliver_after_approvals: 5, llm: LlmCfg::default(), egress_allow: Default::default() }
 }
 
 fn leased_job(repo: &Repository) -> Job {
@@ -436,6 +436,28 @@ async fn shadow_records_what_it_would_use_and_never_downloads() {
     assert_eq!(list[0]["url"], A);
     assert!(list[0]["checks"].as_array().unwrap().iter().any(|c| c["name"] == "probe" && c["ok"] == true));
     assert_eq!(r.repo.get_job(r.job.id).unwrap().unwrap().extraction_method, None, "shadow changes nothing on the job");
+}
+
+/// P11.9: the panel's switch to hold reaches the next run through the live
+/// mode, without a restart; a context with no live mode keeps its own.
+#[tokio::test]
+async fn the_live_mode_switched_to_hold_is_what_the_next_run_uses() {
+    let mut r = rig(RepairMode::Shadow);
+    let live = omni_core::config::LiveRepairMode::new(RepairMode::Shadow);
+    r.ctx.cfg.live = Some(live.clone());
+    assert_eq!(r.ctx.current().cfg.mode, RepairMode::Shadow);
+    live.set(RepairMode::Hold);
+    let run_ctx = r.ctx.current();
+    assert_eq!(run_ctx.cfg.mode, RepairMode::Hold);
+    r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
+    let res = run(&run_ctx, &r.job, OWNER, PAGE, Some(page(&next_data(A))), &Prior::default(), &CancellationToken::new()).await;
+    assert!(matches!(res, LadderResult::Held { .. }), "{res:?}");
+    assert_eq!(r.repo.latest_attempt(r.job.id).unwrap().unwrap().mode, "hold");
+    // A run that already started keeps the mode it read.
+    live.set(RepairMode::Off);
+    assert_eq!(run_ctx.cfg.mode, RepairMode::Hold);
+    r.ctx.cfg.live = None;
+    assert_eq!(r.ctx.current().cfg.mode, RepairMode::Shadow, "no live mode: the fixed one");
 }
 
 #[tokio::test]
@@ -1043,9 +1065,15 @@ fn page_with_picture() -> PageSnapshot {
     s
 }
 
+/// The card step's cap in tests that are not about the cap: ffmpeg runs below
+/// normal priority, and on a loaded machine the 45 s production cap ran out
+/// mid-comparison (P14.7). The cap itself has its own test.
+const TEST_CARD_CAP: Duration = Duration::from_secs(600);
+
 fn hold_rig(card_ffmpeg: Option<PathBuf>, body: Option<Vec<u8>>) -> Rig {
     let mut fake = Fake::new();
     fake.card_ffmpeg = card_ffmpeg;
+    fake.card_cap = Some(TEST_CARD_CAP);
     *fake.pics.body.lock().unwrap() = body;
     let r = rig_with(RepairMode::Hold, Duration::from_secs(60), fake);
     r.fake.script.lock().unwrap().push_back(Ok(RunOutcome::Held));
@@ -1642,15 +1670,22 @@ async fn cancel_during_the_live_load_is_lost_and_writes_nothing() {
     let r = rig_with(RepairMode::Hold, Duration::from_secs(120), fake);
     let id = add_live_recipe(&r, "site", "#load", "a[.]m3u8");
     let cancel = CancellationToken::new();
-    let c2 = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+    // Cancel once the live load has started (P14.7: a fixed 300 ms timer could
+    // fire before the ladder reached it on a loaded machine), and time from there.
+    let (c2, fake) = (cancel.clone(), r.fake.clone());
+    let cancelled_at = tokio::spawn(async move {
+        while fake.live_calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         c2.cancel();
+        Instant::now()
     });
-    let t = Instant::now();
     let res = run(&r.ctx, &r.job, OWNER, PAGE, Some(blank()), &Prior::default(), &cancel).await;
+    let ended = Instant::now();
     assert!(matches!(res, LadderResult::Lost), "{res:?}");
-    assert!(t.elapsed() < Duration::from_secs(3), "took {:?}", t.elapsed());
+    assert!(cancel.is_cancelled(), "the ladder ended before the live load was cancelled");
+    let after_cancel = ended - cancelled_at.await.unwrap();
+    assert!(after_cancel < Duration::from_secs(3), "ended {after_cancel:?} after the cancel");
     assert_eq!(r.fake.live_calls.load(Ordering::SeqCst), 1);
     assert!(!has_event(&r, id));
     assert!(r.fake.downloads().is_empty());
@@ -2064,6 +2099,28 @@ async fn a_pending_next_choice_is_not_run_unless_repair_mode_is_hold() {
         assert_eq!((job.status, job.error_message.as_deref()), (JobStatus::RequiresReview, Some("Η αυτόματη επισκευή είναι απενεργοποιημένη")), "{mode:?}");
         assert_eq!(n.repo.latest_attempt(n.job_id).unwrap().unwrap().outcome.as_deref(), Some("repair_off"));
     }
+}
+
+/// P11.9: `run_job` reads the mode the admin's switch set after the context was
+/// built: started in shadow, switched to hold, a pending next choice is held.
+#[tokio::test]
+async fn run_job_uses_the_live_mode_switched_after_the_context_was_built() {
+    let n = next_rig();
+    let env = NextEnv::new(vec![Ok(RunOutcome::Held)]);
+    let live = omni_core::config::LiveRepairMode::new(RepairMode::Shadow);
+    let mut c = cfg(RepairMode::Shadow, Duration::from_secs(5));
+    c.live = Some(live.clone());
+    let ctx = RepairCtx { repo: n.repo.clone(), cfg: c, env: env.clone() };
+    live.set(RepairMode::Hold);
+    let health = omni_core::health::HealthState::new();
+    let canary = Arc::new(crate::canary::CanaryEnv::new(n.repo.clone(), health.clone(), n.root.join("bin"), "stable".into()));
+    crate::worker::run_job(&n.repo, &n.engine, OWNER, n.lease(), CancellationToken::new(), &n.root.join("evidence"), &ctx, &health, &canary)
+        .await
+        .unwrap();
+    assert_eq!(env.downloads.lock().unwrap().len(), 1, "held in hold, not refused as in shadow");
+    let at = n.repo.latest_attempt(n.job_id).unwrap().unwrap();
+    assert_eq!((at.rung.as_deref(), at.outcome.as_deref()), (Some("next"), Some("held")));
+    assert_eq!(n.repo.get_job(n.job_id).unwrap().unwrap().status, JobStatus::AwaitingApproval);
 }
 
 #[path = "repair_dry_tests.rs"]

@@ -51,11 +51,112 @@ pub const MAIL_RECORD_MARGIN_DAYS: i64 = 7;
 /// database briefly locked, the disk full) gets this many polls to clear.
 pub const MAX_PROCESS_ATTEMPTS: u32 = 3;
 
+/// What the watcher reads the mailbox with: the source and the day its
+/// secret expires. Swapped as one when the administrator saves the mail
+/// settings (P11.11c).
+#[derive(Clone)]
+pub struct MailSettings {
+    pub source: Arc<dyn MailSource>,
+    pub secret_expires: Option<chrono::NaiveDate>,
+}
+
+impl MailSettings {
+    /// The Graph mailbox `graph` names.
+    pub fn graph(graph: &omni_core::config::GraphConfig) -> Self {
+        Self {
+            source: Arc::new(GraphMailSource::new(graph.clone())),
+            secret_expires: graph.client_secret_expires,
+        }
+    }
+}
+
+/// The mail settings in use, shared by the watcher and the admin panel
+/// (P11.11c), and the pending automatic re-read of the mail given up on
+/// (P11.11b). Cheap to clone.
+///
+/// A poll reads the settings once, at its start, and uses them to its end:
+/// a header listed in one mailbox is never fetched from another.
+#[derive(Clone)]
+pub struct LiveMail {
+    settings: Arc<tokio::sync::watch::Sender<MailSettings>>,
+    /// Why the mail given up on should be read again after the next good
+    /// poll: a restart, a tool update. `None`: nothing pending.
+    failed_retry: Arc<Mutex<Option<String>>>,
+}
+
+impl LiveMail {
+    pub fn new(settings: MailSettings) -> Self {
+        Self {
+            settings: Arc::new(tokio::sync::watch::Sender::new(settings)),
+            failed_retry: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn current(&self) -> MailSettings {
+        self.settings.borrow().clone()
+    }
+
+    /// Use `settings` from the next poll on; a waiting watcher polls at once.
+    pub fn replace(&self, settings: MailSettings) {
+        self.settings.send_replace(settings);
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<MailSettings> {
+        self.settings.subscribe()
+    }
+
+    /// Read the mail given up on again after the next good poll (P11.11b).
+    /// `cause` is what made it worth another try, for the audit log.
+    pub fn arm_failed_retry(&self, cause: &str) {
+        *self.failed_retry.lock().unwrap_or_else(|e| e.into_inner()) = Some(cause.to_string());
+    }
+
+    fn take_failed_retry(&self) -> Option<String> {
+        self.failed_retry.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// The cause recorded when the daemon has just started.
+pub const RETRY_AFTER_RESTART: &str = "restart";
+/// The cause recorded after a tool was updated or installed.
+pub const RETRY_AFTER_TOOL_UPDATE: &str = "tool update";
+
+/// The `mail` health line for a client secret that expires on `expires`, as of
+/// `today` (P11.11d): amber from `config::SECRET_WARN_DAYS` days before, red from
+/// `config::SECRET_RED_DAYS` days before and after. `None`: nothing to say.
+pub fn secret_expiry_check(expires: Option<chrono::NaiveDate>, today: chrono::NaiveDate) -> Option<Check> {
+    use omni_core::config::{SECRET_RED_DAYS, SECRET_WARN_DAYS};
+    let expires = expires?;
+    let left = (expires - today).num_days();
+    let fix = "create a new client secret in Microsoft Entra and enter it, with its expiry date, under Administration → Mail";
+    if left < 0 {
+        Some(Check::down(format!("the mailbox client secret expired on {expires}: {fix}")))
+    } else if left <= SECRET_RED_DAYS {
+        Some(Check::down(format!("the mailbox client secret expires on {expires} (in {left} day(s)): {fix}")))
+    } else if left <= SECRET_WARN_DAYS {
+        Some(Check::degraded(format!("the mailbox client secret expires on {expires} (in {left} days): {fix}")))
+    } else {
+        None
+    }
+}
+
+/// The detail of a failed poll when the client secret's date has passed: "expired
+/// on <date>" and the fix, instead of only the sign-in error. `None` otherwise.
+fn expired_secret_detail(expires: Option<chrono::NaiveDate>, today: chrono::NaiveDate) -> Option<String> {
+    expires
+        .filter(|e| *e < today)
+        .and_then(|e| secret_expiry_check(Some(e), today))
+        .and_then(|c| c.detail)
+}
+
 #[derive(Clone)]
 pub struct EmailWatcher {
     config: AppConfig,
     repo: Repository,
+    /// The source of this poll; [`Self::live`] holds the one in use.
     source: Arc<dyn MailSource>,
+    secret_expires: Option<chrono::NaiveDate>,
+    live: LiveMail,
     /// Where the poll result is reported (plan P6.2). `None` in tests and in
     /// any caller that does not care.
     health: Option<HealthState>,
@@ -123,15 +224,37 @@ impl EmailWatcher {
     pub fn with_source(config: AppConfig, repo: Repository, source: Arc<dyn MailSource>) -> Self {
         let attachments_dir = config.resolve_path(&config.temp_path).join("attachments");
         let assist = LiveAssist::new(Assist::from_config(&config));
+        let secret_expires = config.graph.client_secret_expires;
+        let live = LiveMail::new(MailSettings { source: source.clone(), secret_expires });
         Self {
             attachments_dir,
             assist,
             config,
             repo,
             source,
+            secret_expires,
+            live,
             health: None,
             attempts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Read the mailbox through `live`, which the admin panel can swap (P11.11c).
+    pub fn with_live_mail(mut self, live: LiveMail) -> Self {
+        let now = live.current();
+        self.source = now.source;
+        self.secret_expires = now.secret_expires;
+        self.live = live;
+        self
+    }
+
+    /// This watcher with the settings in use now, for one poll.
+    fn snapshot(&self) -> Self {
+        let now = self.live.current();
+        let mut w = self.clone();
+        w.source = now.source;
+        w.secret_expires = now.secret_expires;
+        w
     }
 
     /// Save attachments here instead of `{temp}/attachments`.
@@ -164,8 +287,12 @@ impl EmailWatcher {
     pub async fn start_polling_loop(self: Arc<Self>, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         info!("EmailWatcher: watching {}", self.source.describe());
 
-        let poll_interval = Duration::from_secs(self.config.email_poll_interval_secs.max(10));
+        let poll_interval = Duration::from_secs(self.config.mail.poll_interval_secs.clamp(10, 3600));
         let mut backoff = Backoff::default();
+        let mut settings_rx = self.live.subscribe();
+        // The mail given up on before this start gets its one more try (P11.11b).
+        self.live.arm_failed_retry(RETRY_AFTER_RESTART);
+        let mut idle = false;
 
         loop {
             let wait = backoff.next_wait(poll_interval);
@@ -174,16 +301,30 @@ impl EmailWatcher {
                     info!("EmailWatcher: Received shutdown signal. Exiting watchdog loop.");
                     break;
                 }
-                _ = tokio::time::sleep(wait) => {
-                    if !self.source.is_configured() {
-                        warn!("EmailWatcher: Credentials not configured. Sleeping...");
-                        self.report_health(Check::disabled("Mailbox"));
-                        continue;
+                // New settings from the admin panel (P11.11c): poll with them now, and a
+                // backoff earned by the old ones no longer applies.
+                changed = settings_rx.changed() => {
+                    if changed.is_err() {
+                        // The sender lives as long as `self.live`; this cannot happen.
+                        break;
                     }
-
-                    self.poll_and_report(&mut backoff, poll_interval).await;
+                    info!("EmailWatcher: mail settings changed; now watching {}", self.live.current().source.describe());
+                    backoff.succeeded();
                 }
+                _ = tokio::time::sleep(wait) => {}
             }
+            let poll = self.snapshot();
+            if !poll.source.is_configured() {
+                // Once, not every poll: a station may run without mail for good.
+                if !idle {
+                    warn!("EmailWatcher: the mailbox is not configured; waiting for its settings");
+                    idle = true;
+                }
+                poll.report_health(Check::disabled("Mailbox"));
+                continue;
+            }
+            idle = false;
+            poll.poll_and_report(&mut backoff, poll_interval).await;
         }
     }
 
@@ -197,7 +338,11 @@ impl EmailWatcher {
                 // exactly this (defect W-09). A short reason, not
                 // the whole chain: this string is shown to an
                 // operator, and it must not carry a credential.
-                if let Some(check) = backoff.failed(&e, Instant::now()) {
+                if let Some(mut check) = backoff.failed(&e, Instant::now()) {
+                    // A secret past its date is the likeliest cause, and the one with a known fix.
+                    if let Some(expired) = expired_secret_detail(self.secret_expires, chrono::Local::now().date_naive()) {
+                        check.detail = Some(expired);
+                    }
                     self.report_health(check.with_error(format!("{e:#}")));
                 }
             }
@@ -207,13 +352,42 @@ impl EmailWatcher {
                 if let Some(h) = &self.health {
                     h.note_mail_poll();
                 }
-                self.report_health(Check::ok(format!(
-                    "polling {} every {}s",
-                    self.source.describe(),
-                    poll_interval.as_secs()
-                )));
+                // A secret about to expire outranks "working" (P11.11d): the day it
+                // expires, mail stops with no other warning.
+                let today = chrono::Local::now().date_naive();
+                self.report_health(secret_expiry_check(self.secret_expires, today).unwrap_or_else(|| {
+                    Check::ok(format!("polling {} every {}s", self.source.describe(), poll_interval.as_secs()))
+                }));
+                if let Some(cause) = self.live.take_failed_retry() {
+                    if let Err(e) = self.request_failed_mail_retry(&cause) {
+                        // Kept for the next good poll: the database was busy, not the mail.
+                        warn!("EmailWatcher: could not ask for the failed mail to be read again: {e:#}");
+                        self.live.arm_failed_retry(&cause);
+                    }
+                }
             }
         }
+    }
+
+    /// Ask for one more reading of every mail given up on (FAILED) that is young
+    /// enough (P11.11b); the next poll reads them. Young enough is the window of
+    /// the jobs' automatic retries, `retry.max_age_mins`: nothing older is retried
+    /// without a person. Returns how many were asked for.
+    fn request_failed_mail_retry(&self, cause: &str) -> Result<usize> {
+        let window = chrono::Duration::minutes(self.config.retry.max_age_mins.clamp(30, 360));
+        let asked = self.repo.request_failed_mail_auto_retry(Utc::now() - window, cause)?;
+        for (key, subject) in &asked {
+            info!("EmailWatcher: {key} will be read again once ({cause})");
+            let _ = self.repo.log_audit(
+                "WARN",
+                "EMAIL",
+                &format!(
+                    "Email '{}' that could not be read is read again automatically once (after a {cause})",
+                    subject.as_deref().unwrap_or("")
+                ),
+            );
+        }
+        Ok(asked.len())
     }
 
     /// One poll (plan P4.8): list what changed since the checkpoint, fetch
@@ -256,9 +430,11 @@ impl EmailWatcher {
                     continue;
                 }
             };
+            // The system's own re-read (P11.11b) never delivers a link delivered under any name.
+            let automatic = self.repo.mail_reprocess_is_automatic(&key)?;
             let previous = self.repo.get_processed_mail(&key)?;
             self.repo.forget_processed_mail(&key)?;
-            match self.process_mail(&mail).await {
+            match self.process_mail_as(&mail, automatic).await {
                 Ok(_) => {
                     self.repo.finish_mail_reprocess(&key)?;
                     let now = self.repo.get_processed_mail(&key)?;
@@ -472,6 +648,12 @@ impl EmailWatcher {
     /// message for the next poll. A retry after a partial failure is safe: the
     /// jobs already created come back from `enqueue` as `DuplicateActive`.
     async fn process_mail(&self, mail: &InboundMail) -> Result<Handled> {
+        self.process_mail_as(mail, false).await
+    }
+
+    /// [`Self::process_mail`]; `automatic`: the system's own re-read of a mail it
+    /// gave up on, whose jobs are queued with [`Repository::enqueue_automatic`].
+    async fn process_mail_as(&self, mail: &InboundMail, automatic: bool) -> Result<Handled> {
         let key = mail_key(mail);
 
         // E-07: the server can show a message as unread again (a lost flag,
@@ -495,7 +677,7 @@ impl EmailWatcher {
             .find(|j| j.surname == parsed.journalist.surname)
             .map(|j| j.default_priority)
             .unwrap_or(0);
-        let mut records = self.enqueue_parsed(mail, &parsed, default_priority)?;
+        let mut records = self.enqueue_parsed(mail, &parsed, default_priority, automatic)?;
         self.fetch_attachments(mail, &mut records).await;
 
         info!(
@@ -580,7 +762,13 @@ impl EmailWatcher {
         }
     }
 
-    fn enqueue_parsed(&self, mail: &InboundMail, parsed: &ParsedEmail, default_priority: i32) -> Result<Vec<QueuedFromMail>> {
+    fn enqueue_parsed(
+        &self,
+        mail: &InboundMail,
+        parsed: &ParsedEmail,
+        default_priority: i32,
+        automatic: bool,
+    ) -> Result<Vec<QueuedFromMail>> {
         let journalist = &parsed.journalist.surname;
         let mut notes = format!("Email: {}", mail.subject);
         if !parsed.warnings.is_empty() {
@@ -592,12 +780,16 @@ impl EmailWatcher {
 
         let mut out = Vec::new();
         for job in parsed.jobs() {
-            let slug = format!("{}_{}_{}", job.index_str, journalist, job.keyword);
+            let slug = omni_core::slug::compose(&job.index_str, journalist, &job.keyword);
             // Attachment jobs are parked as MANUAL_DOWNLOAD until their file
             // is on disk (`fetch_attachments`), so no worker can lease one
             // first. If the download fails they stay there, for MCR.
             let (status, method) = match job.tier {
                 Tier::Attachment => (JobStatus::ManualDownload, Some("attachment")),
+                // A locker link a worker can take (P11.15a, P11.15b: a share of one file fetched
+                // directly, a locker page the browser opens, each while its switch is on) goes to
+                // the pipeline; the others wait for MCR as before.
+                Tier::Locker if omni_core::locker::queued_for_a_worker(&job.url, &self.config.locker) => (JobStatus::Pending, Some("locker")),
                 Tier::Locker => (job.status, Some("locker")),
                 _ => (job.status, None),
             };
@@ -619,14 +811,18 @@ impl EmailWatcher {
                 parent_job_id: None,
                 queued_by_operator: false,
             };
-            let result = self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?;
+            let result = if automatic {
+                self.repo.enqueue_automatic(&new, DEFAULT_DEDUP_WINDOW_HOURS)?
+            } else {
+                self.repo.enqueue(&new, DEFAULT_DEDUP_WINDOW_HOURS)?
+            };
             match &result {
                 Enqueued::Created { id } => info!("EmailWatcher: queued job #{id} {slug} ({})", status.as_str()),
                 Enqueued::DuplicateActive { existing_id } => {
-                    info!("EmailWatcher: {} already queued as job #{existing_id}", job.url)
+                    info!("EmailWatcher: a link on {} already queued as job #{existing_id}", omni_core::urlnorm::site_for_log(&job.url))
                 }
                 Enqueued::DuplicateRecent { existing_id } => {
-                    info!("EmailWatcher: {} delivered recently as job #{existing_id}", job.url)
+                    info!("EmailWatcher: a link on {} delivered recently as job #{existing_id}", omni_core::urlnorm::site_for_log(&job.url))
                 }
             }
             out.push(QueuedFromMail {
@@ -907,6 +1103,237 @@ mod tests {
         .await;
         // 2 h old: in; 5 days old: past the 72 h age; undated: still let in, as before.
         assert_eq!((r.too_old, r.fetched), (1, 2));
+    }
+
+    #[test]
+    fn the_secret_expiry_turns_the_mail_line_amber_at_thirty_days_and_red_at_seven() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
+        let state = |days: i64| secret_expiry_check(Some(today + chrono::Duration::days(days)), today).map(|c| c.state);
+        assert_eq!(secret_expiry_check(None, today).map(|c| c.state), None, "no date, nothing to say");
+        assert_eq!(state(31), None);
+        assert_eq!(state(30), Some(Health::Degraded));
+        assert_eq!(state(8), Some(Health::Degraded));
+        assert_eq!(state(7), Some(Health::Down));
+        assert_eq!(state(0), Some(Health::Down));
+        let expired = secret_expiry_check(Some(today - chrono::Duration::days(1)), today).unwrap();
+        assert_eq!(expired.state, Health::Down);
+        assert!(expired.detail.unwrap().contains("expired on 2026-11-18"));
+    }
+
+    /// A mailbox that names itself and counts its listings.
+    struct Named {
+        name: &'static str,
+        listed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSource for Named {
+        fn describe(&self) -> String {
+            self.name.into()
+        }
+        fn checkpoint_key(&self) -> String {
+            format!("named:{}", self.name)
+        }
+        fn is_configured(&self) -> bool {
+            true
+        }
+        async fn list_changed(&self, _: DateTime<Utc>, _: usize) -> Result<Vec<MailHeader>> {
+            self.listed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn fetch_mail(&self, id: &str) -> Result<InboundMail> {
+            anyhow::bail!("no mail {id}")
+        }
+        async fn mark_processed(&self, _: &str, _: MailOutcome) -> Result<()> {
+            Ok(())
+        }
+        async fn download_attachment(&self, _: &str, _: &str, _: &std::path::Path) -> Result<PathBuf> {
+            anyhow::bail!("none")
+        }
+        async fn reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> crate::source::MailHealth {
+            crate::source::MailHealth { ok: true, detail: self.name.into() }
+        }
+    }
+
+    fn named(name: &'static str) -> Arc<Named> {
+        Arc::new(Named { name, listed: std::sync::atomic::AtomicUsize::new(0) })
+    }
+
+    #[tokio::test]
+    async fn new_mail_settings_are_used_from_the_next_poll_and_a_poll_keeps_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let (old, new) = (named("old-box"), named("new-box"));
+        let live = LiveMail::new(MailSettings { source: old.clone(), secret_expires: None });
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo, named("unused")).with_live_mail(live.clone());
+
+        let running = watcher.snapshot();
+        live.replace(MailSettings { source: new.clone(), secret_expires: chrono::NaiveDate::from_ymd_opt(2030, 1, 1) });
+        // The poll that started before the save ends with the mailbox it started with.
+        running.poll_once().await.unwrap();
+        assert_eq!(running.source.describe(), "old-box");
+        assert_eq!(old.listed.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let next = watcher.snapshot();
+        next.poll_once().await.unwrap();
+        assert_eq!(next.source.describe(), "new-box");
+        assert_eq!(next.secret_expires, chrono::NaiveDate::from_ymd_opt(2030, 1, 1));
+        assert_eq!(new.listed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(old.listed.load(std::sync::atomic::Ordering::SeqCst), 1, "the old mailbox is not read again");
+    }
+
+    fn record_failed(repo: &Repository, key: &str, received_ago: chrono::Duration) {
+        repo.record_processed_mail(&ProcessedMail {
+            internet_message_id: key.into(),
+            source_id: Some(format!("id-{key}")),
+            outcome: MailOutcome::Failed.as_str().into(),
+            subject: Some("Πλάνα".into()),
+            received_at: Some(Utc::now() - received_ago),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_mail_is_asked_for_again_after_the_first_good_poll_and_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        record_failed(&repo, "<young@news.example>", chrono::Duration::minutes(20));
+        record_failed(&repo, "<old@news.example>", chrono::Duration::hours(3));
+        let source = Arc::new(ScriptedSource { fail: std::sync::atomic::AtomicBool::new(true) });
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), source.clone());
+        let pending = || repo.pending_mail_reprocess().unwrap().into_iter().map(|(k, _, _)| k).collect::<Vec<_>>();
+        let (mut backoff, every) = (Backoff::default(), Duration::from_secs(30));
+
+        watcher.live.arm_failed_retry(RETRY_AFTER_RESTART);
+        watcher.poll_and_report(&mut backoff, every).await;
+        assert!(pending().is_empty(), "a failed poll asks for nothing");
+
+        source.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        watcher.poll_and_report(&mut backoff, every).await;
+        // Older than retry.max_age_mins (2 h): left for a person.
+        assert_eq!(pending(), vec!["<young@news.example>"]);
+
+        // The reading fails again (this mailbox has no such mail) and gives up; a tool
+        // update later does not give it a second chance.
+        for _ in 0..MAX_PROCESS_ATTEMPTS {
+            watcher.poll_and_report(&mut backoff, every).await;
+        }
+        assert!(pending().is_empty());
+        assert_eq!(repo.get_processed_mail("<young@news.example>").unwrap().unwrap().outcome, "FAILED");
+        watcher.live.arm_failed_retry(RETRY_AFTER_TOOL_UPDATE);
+        watcher.poll_and_report(&mut backoff, every).await;
+        assert!(pending().is_empty(), "once per mail");
+    }
+
+    /// Lists nothing; fetching any id returns `mail`.
+    struct OneMail {
+        mail: InboundMail,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSource for OneMail {
+        fn describe(&self) -> String {
+            "one".into()
+        }
+        fn checkpoint_key(&self) -> String {
+            "one:test".into()
+        }
+        fn is_configured(&self) -> bool {
+            true
+        }
+        async fn list_changed(&self, _: DateTime<Utc>, _: usize) -> Result<Vec<MailHeader>> {
+            Ok(Vec::new())
+        }
+        async fn fetch_mail(&self, _: &str) -> Result<InboundMail> {
+            Ok(self.mail.clone())
+        }
+        async fn mark_processed(&self, _: &str, _: MailOutcome) -> Result<()> {
+            Ok(())
+        }
+        async fn download_attachment(&self, _: &str, _: &str, _: &std::path::Path) -> Result<PathBuf> {
+            anyhow::bail!("none")
+        }
+        async fn reply(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> crate::source::MailHealth {
+            crate::source::MailHealth { ok: true, detail: "one".into() }
+        }
+    }
+
+    /// Review round 2: MCR queued the failed mail's link by hand under the journalist and it
+    /// was delivered; the system's re-read (which files the mail under MCR) makes no second job.
+    #[tokio::test]
+    async fn an_automatic_re_read_does_not_deliver_a_link_mcr_already_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let url = "https://www.youtube.com/watch?v=handqueued01";
+        let key = "<retry@news.example>";
+        record_failed(&repo, key, chrono::Duration::minutes(20));
+        let id = repo.enqueue(&NewJob::new(url, "1_NIKOLAOU_LIMANI", "NIKOLAOU"), 24).unwrap().job_id();
+        assert!(repo.lease_job_by_id(id, "host:1:0", 180).unwrap());
+        assert!(repo.finish(id, "host:1:0", JobStatus::Completed, None, None, None).unwrap());
+
+        let mail = InboundMail {
+            id: format!("id-{key}"),
+            internet_message_id: key.into(),
+            from_address: "stranger@elsewhere.example".into(),
+            subject: "Πλάνα".into(),
+            received_at: Some(Utc::now()),
+            body_text: format!("1. ΛΙΜΑΝΙ\n{url}\n"),
+            ..Default::default()
+        };
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo.clone(), Arc::new(OneMail { mail }));
+        let (mut backoff, every) = (Backoff::default(), Duration::from_secs(30));
+        watcher.live.arm_failed_retry(RETRY_AFTER_RESTART);
+        watcher.poll_and_report(&mut backoff, every).await; // asks for the re-read
+        watcher.poll_and_report(&mut backoff, every).await; // re-reads it
+
+        let read = repo.get_processed_mail(key).unwrap().unwrap();
+        assert_ne!(read.outcome, "FAILED", "the mail was read again");
+        assert!(read.jobs_json.contains("duplicate_recent"), "{}", read.jobs_json);
+        assert_eq!(repo.get_all_jobs().unwrap().len(), 1, "no second job, so no second file");
+    }
+
+    #[tokio::test]
+    async fn a_failed_poll_with_an_expired_secret_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let health = HealthState::new();
+        let source = Arc::new(ScriptedSource { fail: std::sync::atomic::AtomicBool::new(true) });
+        let past = chrono::Local::now().date_naive() - chrono::Duration::days(2);
+        let live = LiveMail::new(MailSettings { source, secret_expires: Some(past) });
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo, named("unused"))
+            .with_live_mail(live)
+            .with_health(health.clone());
+        let mut backoff = Backoff::default();
+        for _ in 0..DEGRADED_AFTER_FAILURES {
+            watcher.poll_and_report(&mut backoff, Duration::from_secs(30)).await;
+        }
+        let check = health.all().into_iter().find(|(n, _)| n == omni_core::health::checks::MAIL).unwrap().1;
+        assert!(check.detail.as_deref().unwrap_or("").contains(&format!("expired on {past}")), "{check:?}");
+        assert!(check.last_error.is_some(), "the sign-in error is still kept");
+    }
+
+    #[tokio::test]
+    async fn a_good_poll_with_a_secret_about_to_expire_is_reported_red() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::new(dir.path().join("omni.db")).unwrap();
+        let health = HealthState::new();
+        let source = Arc::new(ScriptedSource { fail: std::sync::atomic::AtomicBool::new(false) });
+        let soon = chrono::Local::now().date_naive() + chrono::Duration::days(3);
+        let live = LiveMail::new(MailSettings { source, secret_expires: Some(soon) });
+        let watcher = EmailWatcher::with_source(AppConfig::default(), repo, named("unused"))
+            .with_live_mail(live)
+            .with_health(health.clone());
+        watcher.poll_and_report(&mut Backoff::default(), Duration::from_secs(30)).await;
+        let check = health.all().into_iter().find(|(n, _)| n == omni_core::health::checks::MAIL).unwrap().1;
+        assert_eq!(check.state, Health::Down, "{check:?}");
+        assert!(health.last_mail_poll().is_some(), "the poll itself worked");
     }
 
     #[test]

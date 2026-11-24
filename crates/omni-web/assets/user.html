@@ -3,25 +3,27 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OmniDownloader — Αποστολή βίντεο</title>
+<title data-t="user.page.title">OmniDownloader</title>
 <link rel="stylesheet" href="/static/app.css?v=12">
+<link rel="stylesheet" href="/static/status.css?v=11">
 <link rel="icon" href="data:,">
 </head>
 <body>
 
+<!-- Every word on this page comes from text.el.js by key (data-t, P12.10). -->
 <header class="topbar">
   <div class="topbar-inner">
     <div class="brand">
       <div class="brand-mark">O</div>
       <div>
         <h1>OmniDownloader</h1>
-        <p>Αποστολή βίντεο στο MCR</p>
+        <p data-t="user.page.tagline"></p>
       </div>
     </div>
     <div class="topbar-status">
-      <span id="user-display" class="status-item">Συνδεδεμένος</span>
-      <button class="btn" type="button" id="password-btn">Αλλαγή κωδικού</button>
-      <button class="btn" type="button" id="logout-btn">Αποσύνδεση</button>
+      <span id="user-display" class="status-item" data-t="user.page.signed_in"></span>
+      <button class="btn" type="button" id="password-btn" data-t="user.page.password"></button>
+      <button class="btn" type="button" id="logout-btn" data-t="page.logout"></button>
     </div>
   </div>
 </header>
@@ -29,40 +31,42 @@
 <main class="stack">
 
   <section class="card">
-    <h2 class="card-title">Αποστολή βίντεο</h2>
+    <h2 class="card-title" data-t="user.page.send_title"></h2>
     <form id="submit-form" class="stack">
       <div class="checkbox-row">
         <input type="checkbox" id="multi">
-        <label for="multi">Πολλοί σύνδεσμοι (ένας ανά γραμμή, έως 20)</label>
+        <label for="multi" data-t="user.page.multi"></label>
       </div>
       <div id="single-box">
-        <label for="url">Σύνδεσμος του βίντεο ή του άρθρου</label>
-        <input type="url" id="url" required
-               placeholder="https://www.youtube.com/watch?v=… ή άρθρο ειδησεογραφικού site">
+        <label for="url" data-t="user.page.url"></label>
+        <input type="url" id="url" required data-t-placeholder="user.page.url.placeholder">
       </div>
       <div id="multi-box" hidden>
-        <label for="urls">Σύνδεσμοι, ένας ανά γραμμή (παίρνουν διαδοχικά 1A, 1B, 1C… στο όνομα)</label>
-        <textarea id="urls" rows="6" placeholder="https://…&#10;https://…"></textarea>
+        <label for="urls" data-t="user.page.urls"></label>
+        <textarea id="urls" rows="6" placeholder="https://…&#10;https://…" aria-describedby="urls-count"></textarea>
+        <p class="note flat links-count" id="urls-count" aria-live="polite"></p>
       </div>
       <div class="grid-2">
         <div>
-          <label for="keyword">Λέξη-κλειδί του θέματος</label>
-          <input type="text" id="keyword" required placeholder="ΣΕΙΣΜΟΣ, ΚΙΝΗΤΟΠΟΙΗΣΗ, …">
+          <label for="keyword" data-t="user.page.keyword"></label>
+          <input type="text" id="keyword" required data-t-placeholder="user.page.keyword.placeholder">
         </div>
         <div>
-          <label for="index">Αριθμός θέματος στο δελτίο</label>
-          <input type="text" id="index" value="1" required>
+          <label for="index" data-t="user.page.index"></label>
+          <input type="text" id="index" value="1" required maxlength="9">
         </div>
       </div>
       <div>
-        <label for="notes">Σημείωση για το MCR (προαιρετικά)</label>
-        <input type="text" id="notes" placeholder="π.χ. μόνο το δεύτερο μισό του βίντεο">
+        <label for="notes" data-t="user.page.notes"></label>
+        <input type="text" id="notes" data-t-placeholder="user.page.notes.placeholder">
       </div>
       <div class="checkbox-row">
         <input type="checkbox" id="priority">
-        <label for="priority">Επείγον (μπαίνει πριν από τα άλλα)</label>
+        <label for="priority" data-t="add.urgent"></label>
       </div>
-      <button class="btn btn-primary btn-block" type="submit">Αποστολή</button>
+      <!-- The file name the video will get (P12.11), from the server's compose. -->
+      <p class="note flat mono" id="slug-preview" aria-live="polite"></p>
+      <button class="btn btn-primary btn-block" type="submit" data-t="user.page.send"></button>
       <div id="submit-result" class="stack"></div>
     </form>
   </section>
@@ -70,17 +74,17 @@
   <section class="card">
     <div class="checkbox-row">
       <input type="checkbox" id="notify">
-      <label for="notify">Ειδοποίησέ με όταν ολοκληρωθεί ένα βίντεο μου</label>
+      <label for="notify" data-t="user.page.notify"></label>
     </div>
   </section>
 
   <section class="stack">
+    <!-- The list follows the server by itself; no «Ανανέωση» button (P12.12). -->
     <div class="section-head">
-      <h2 class="card-title" style="border:none;margin:0;padding:0">Οι αποστολές μου</h2>
-      <button class="btn" type="button" id="refresh-btn">Ανανέωση</button>
+      <h2 class="card-title bare" data-t="user.page.mine"></h2>
     </div>
     <div id="my-jobs" class="stack">
-      <div class="card center">Φόρτωση…</div>
+      <div class="card center" data-t="loading"></div>
     </div>
   </section>
 
@@ -88,25 +92,25 @@
 
 <div class="modal" id="password-modal" hidden>
   <div class="modal-body" role="dialog" aria-modal="true" aria-labelledby="pw-title">
-    <h2 id="pw-title" class="card-title">Αλλαγή κωδικού</h2>
+    <h2 id="pw-title" class="card-title" data-t="user.page.password"></h2>
     <form id="password-form" class="stack">
       <div>
-        <label for="pw-current">Τρέχων κωδικός</label>
+        <label for="pw-current" data-t="user.page.pw_current"></label>
         <input type="password" id="pw-current" required autocomplete="current-password">
       </div>
       <div>
-        <label for="pw-new">Νέος κωδικός (τουλάχιστον 12 χαρακτήρες)</label>
+        <label for="pw-new" data-t="user.page.pw_new"></label>
         <input type="password" id="pw-new" required minlength="12" autocomplete="new-password">
       </div>
-      <p class="note">Με την αλλαγή του κωδικού αποσυνδέεστε από όλες τις συσκευές.</p>
+      <p class="note" data-t="user.page.pw_note"></p>
       <div class="row">
-        <button class="btn btn-primary grow" type="submit">Αλλαγή κωδικού</button>
-        <button class="btn" type="button" id="pw-cancel">Άκυρο</button>
+        <button class="btn btn-primary grow" type="submit" data-t="user.page.password"></button>
+        <button class="btn" type="button" id="pw-cancel" data-t="dialog.cancel"></button>
       </div>
     </form>
   </div>
 </div>
 
-<script type="module" src="/static/user.js?v=7"></script>
+<script type="module" src="/static/user.js?v=20"></script>
 </body>
 </html>

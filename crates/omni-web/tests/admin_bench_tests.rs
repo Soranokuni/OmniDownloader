@@ -52,7 +52,7 @@ impl App {
     fn new(starter: Option<Arc<FakeStarter>>) -> Result<Self> {
         let dir = TempDir::new()?;
         let repo = Repository::new(dir.path().join("omni.db"))?;
-        let id = repo.create_user("it@station.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
+        let id = repo.create_user("it@example.gr", "correct-horse-battery", UserRole::Admin, "Administrator", None)?;
         let admin = omni_core::auth::generate_session_token();
         repo.create_session(id, &admin, 1)?;
         let mut state = AppState::new(repo.clone(), AppConfig::default(), dir.path().join("config.json"));

@@ -4,142 +4,138 @@
  * emails have all their videos finished (/api/mails/settled). An email that
  * was still in progress at the last answer and is finished now gets:
  *
- *   - a short jingle: rising for "all delivered", a softer falling pair
- *     for "finished, but something needs MCR";
+ *   - a short sound: «delivered» when all went out, «person» when
+ *     something needs MCR;
  *   - a toast on the desk, and a browser notification when the browser
  *     allows one (it does only on https or on this machine itself);
  *   - the tab title marked until the desk is looked at again.
  *
- * The sound is synthesised with Web Audio: no file to ship or cache, and
- * nothing loaded from anywhere. Browsers start audio only after someone has
- * clicked the page, so the first click anywhere unlocks it; until then the
- * toast and title still say what happened.
+ * The status payload (watchStatus) adds the other news: a video that needs a
+ * person, one held for approval, one running late, a health check that got
+ * worse; and, while something has waited for a person longer than the
+ * reminder's minutes, the reminder, again every so many minutes (P12.9).
+ * The sounds, their switches and the volume are in sound.js.
  *
  * Only a change seen happening is announced: an email already finished
  * when the desk is opened stays quiet.
+ *
+ * Every word is in text.el.js (P12.7): `notify.*` and `health.*`.
  */
 
-import { api, el, toast } from '/static/app.js?v=6';
+import { api, el } from '/static/app.js?v=6';
+import { toast } from '/static/toast.js?v=10';
+import { t, tn, has } from '/static/text.js?v=9';
+import {
+  play, unlock, soundPrefs, soundLocked, onSoundChange, openSoundSettings,
+} from '/static/sound.js?v=7';
 
 const POLL_MS = 8000;
-const PREF_KEY = 'omni.mcr.chime';
 const BASE_TITLE = document.title;
 
-let ctx = null;
 let previous = null; // Map id -> settled, from the last answer
 let unseen = 0;
 let button = null;
 let onOpen = () => {};
 
-function soundOn() {
-  try {
-    return localStorage.getItem(PREF_KEY) !== 'off';
-  } catch {
-    return true;
-  }
-}
-
-function setSoundOn(on) {
-  try {
-    localStorage.setItem(PREF_KEY, on ? 'on' : 'off');
-  } catch { /* private mode: the choice lasts for this page only */ }
-}
-
-/** The AudioContext, created and resumed inside a user gesture. */
-function unlock() {
-  const Ctx = window.AudioContext || window.webkitAudioContext;
-  if (!Ctx) return;
-  if (!ctx) ctx = new Ctx();
-  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
-  paintButton();
-}
-
-/** One soft bell-like note: a sine with a quiet octave, quick attack, long tail. */
-function note(freq, at, length, gain) {
-  for (const [mult, level] of [[1, 1], [2, 0.18]]) {
-    const osc = ctx.createOscillator();
-    const amp = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.value = freq * mult;
-    amp.gain.setValueAtTime(0.0001, at);
-    amp.gain.exponentialRampToValueAtTime(gain * level, at + 0.015);
-    amp.gain.exponentialRampToValueAtTime(0.0001, at + length);
-    osc.connect(amp).connect(ctx.destination);
-    osc.start(at);
-    osc.stop(at + length + 0.05);
-  }
-}
-
-/** `ok`: C5 E5 G5 C6, rising. Otherwise G5 then E5, quieter. */
-function jingle(ok) {
-  if (!soundOn() || !ctx || ctx.state !== 'running') return false;
-  const t = ctx.currentTime + 0.03;
-  if (ok) {
-    [523.25, 659.25, 783.99].forEach((f, i) => note(f, t + i * 0.12, 0.5, 0.22));
-    note(1046.5, t + 0.36, 1.1, 0.25);
-  } else {
-    note(783.99, t, 0.45, 0.2);
-    note(659.25, t + 0.22, 0.9, 0.2);
-  }
-  return true;
-}
-
-/** Three short low notes, A4 A4 E4: unlike either jingle, and not a celebration. */
-function alarm() {
-  if (!soundOn() || !ctx || ctx.state !== 'running') return false;
-  const t = ctx.currentTime + 0.03;
-  [[440, 0], [440, 0.2], [329.63, 0.4]].forEach(([f, d]) => note(f, t + d, 0.3, 0.24));
-  return true;
-}
-
-/** Check name -> what the desk calls it and what MCR should do. */
-export const CHECK_INFO = {
-  mail: {
-    name: 'Email (εισερχόμενα)',
-    action: 'Τα νέα email δεν διαβάζονται· θέματα που στέλνονται τώρα δεν θα εμφανιστούν. Ενημερώστε τον διαχειριστή.',
-  },
-  encoder: {
-    name: 'Κωδικοποιητής',
-    action: 'Τα βίντεο δεν μετατρέπονται σε μορφή εκπομπής. Ενημερώστε τον διαχειριστή· χρειάζεται επανεκκίνηση της υπηρεσίας.',
-  },
-  tools: {
-    name: 'Εργαλεία',
-    action: 'Λείπει ή χάλασε εργαλείο λήψης/μετατροπής. Ενημερώστε τον διαχειριστή.',
-  },
-  watchfolder: {
-    name: 'Watchfolder',
-    action: 'Δεν γράφεται ο φάκελος του Dalet· τα έτοιμα βίντεο δεν παραδίδονται. Ελέγξτε τη σύνδεση με τον server του Dalet και ενημερώστε τον διαχειριστή.',
-  },
-  disk: {
-    name: 'Δίσκος',
-    action: 'Ο δίσκος γεμίζει· κάτω από 5 GB ελεύθερα οι λήψεις σταματούν. Ενημερώστε τον διαχειριστή.',
-  },
-  browser: {
-    name: 'Πρόγραμμα περιήγησης',
-    action: 'Ο ενσωματωμένος browser δεν ξεκινά· βίντεο μέσα σε άρθρα ειδησεογραφικών σελίδων μπορεί να αποτύχουν.',
-  },
-  selfcheck: {
-    name: 'Αυτοέλεγχος',
-    action: 'Κάποιοι δοκιμαστικοί σύνδεσμοι δεν κατεβαίνουν· ίσως ένας ιστότοπος άλλαξε. Ενημερώστε τον διαχειριστή αν επιμένει.',
-  },
-  deno: {
-    name: 'YouTube (Deno)',
-    action: 'Τα βίντεο από YouTube μπορεί να αποτυγχάνουν. Ενημερώστε τον διαχειριστή.',
-  },
-  queue: {
-    name: 'Ουρά',
-    action: 'Βίντεο περιμένουν ή τρέχουν ασυνήθιστα πολύ. Ελέγξτε την καρτέλα «Σε εξέλιξη».',
-  },
-  workers: {
-    name: 'Εκτέλεση εργασιών',
-    action: 'Κάποια εργασία σταμάτησε από εσωτερικό σφάλμα και μπήκε ξανά στην ουρά. Αν επαναληφθεί, ενημερώστε τον διαχειριστή.',
-  },
-  accounts: { name: 'Λογαριασμοί', action: '' },
-  sites: {
-    name: 'Ιστότοποι',
-    action: 'Κάποιος ιστότοπος δεν δίνει πια βίντεο· οι εργασίες από αυτόν ίσως χρειαστούν χειροκίνητη λήψη.',
-  },
+/**
+ * Every health check in plain words (P12.6, P12.7), one row per check name of
+ * `omni_core::health::checks`: who acts on it, 'mcr' or 'admin'. The texts
+ * are in text.el.js under `health.<name>.`:
+ *   name             what the desk calls it
+ *   degraded / down  what happened (by how bad it is)
+ *   means            what it means for the videos   (`means.down` if it differs)
+ *   todo             what to do                     (`todo.down` if it differs)
+ * The check's own detail (English, for support) goes under «Τεχνικές
+ * λεπτομέρειες» in the header's panel, never in the banner.
+ */
+export const CHECK_WHO = {
+  mail: 'admin',
+  llm: 'admin',
+  tools: 'admin',
+  pinned_tools: 'admin',
+  encoder: 'admin',
+  watchfolder: 'mcr',
+  disk: 'admin',
+  browser: 'admin',
+  selfcheck: 'admin',
+  deno: 'admin',
+  queue: 'mcr',
+  workers: 'admin',
+  accounts: 'admin',
+  sites: 'mcr',
+  cookies: 'admin',
+  lockdown: 'admin',
+  archive: 'admin',
+  maintenance: 'admin',
+  database: 'admin',
+  config: 'admin',
 };
+
+/** `CHECK_INFO[name].name`: what the desk calls a check, in the current language. */
+export const CHECK_INFO = Object.fromEntries(Object.keys(CHECK_WHO).map((name) => [name, {
+  get name() { return t(`health.${name}.name`); },
+  who: CHECK_WHO[name],
+}]));
+
+/** Who does what a line asks, as the badge says it. */
+export const WHO = {
+  get mcr() { return t('who.mcr'); },
+  get admin() { return t('who.admin'); },
+};
+
+/** The three texts of a check that is not OK; a check the desk does not know
+ *  yet still gets words of its own, never only its English detail. */
+export function checkTexts(name, check) {
+  const state = check && check.state === 'down' ? 'down' : 'degraded';
+  if (!CHECK_WHO[name]) {
+    return { name, happened: t('health.unknown.happened'), means: t('health.unknown.means'), todo: t('health.unknown.todo'), who: 'admin' };
+  }
+  const key = (part) => (has(`health.${name}.${part}.${state}`) ? `health.${name}.${part}.${state}` : `health.${name}.${part}`);
+  return {
+    name: t(`health.${name}.name`),
+    happened: t(`health.${name}.${state}`),
+    means: t(key('means')),
+    todo: t(key('todo')),
+    who: CHECK_WHO[name],
+  };
+}
+
+/** «14:21», or '' for a missing or unreadable time (never "now"). */
+function hhmm(at) {
+  const d = at ? new Date(at) : null;
+  if (!d || Number.isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString(t('locale'), { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+/** A site that stopped giving video, as one sentence (P12.6), from the status
+ *  payload's `sites` row: «Ο ιστότοπος x.gr δεν δίνει βίντεο από τις 14:21 (4 αποτυχίες στη σειρά).» */
+export function siteSentence(site) {
+  const at = hhmm(site.state_since);
+  const n = Number(site.consecutive_fail) || 0;
+  return t('site.sentence', {
+    domain: site.domain,
+    what: t(site.state === 'broken' ? 'site.broken' : 'site.degraded'),
+    since: at ? t('site.since', { at }) : '',
+    fails: n > 0 ? tn('site.fails', n) : '',
+  });
+}
+
+/** The checks that are not OK, as `[name, check]`, for the banner and the
+ *  header's pill. The LLM is left out: without it the parser still works,
+ *  and no video waits on it (its line is in the panel all the same). */
+export function healthProblems(checks) {
+  return Object.entries(checks || {}).filter(([name, c]) => c && c.state !== 'ok' && name !== 'llm');
+}
+
+/** The header's pill (P12.5): «Όλα καλά», or how many problems, in the
+ *  colour of the worst. */
+export function healthSummary(checks) {
+  const problems = healthProblems(checks);
+  const count = problems.length;
+  if (!count) return { count, tone: 'ok', text: t('health.pill.ok') };
+  const tone = problems.some(([, c]) => c.state === 'down') ? 'bad' : 'warn';
+  return { count, tone, text: tn('health.pill.problems', count) };
+}
 
 const SEVERITY = { ok: 0, degraded: 1, down: 2 };
 const SILENT_CHECKS = ['llm', 'accounts', 'sites'];
@@ -148,21 +144,26 @@ function sev(check) {
   return check ? (SEVERITY[check.state] ?? 0) : 0;
 }
 
-function needCount(q) {
-  return (q.review || 0) + (q.manual || 0) + (q.failed || 0) + (q.approval || 0);
+/** Waits for a person to fix or decide: review, file-locker links, failures
+ *  (a held video is its own news, with its own reminder). */
+function personCount(q) {
+  return (q.review || 0) + (q.manual || 0) + (q.failed || 0);
 }
 
 /**
  * Pure: what changed between two /api/system/status payloads. `prev` null
  * (first load) reports nothing, so what was already there is not alarmed.
+ * A video held for approval is its own news (`newlyHeld`, P12.9), with its
+ * own sound, not part of `needsPerson`.
  */
 export function diffStatus(prev, next) {
-  const out = { needsPerson: 0, newlyLate: 0, wentBad: [], recovered: [] };
+  const out = { needsPerson: 0, newlyHeld: 0, newlyLate: 0, wentBad: [], recovered: [] };
   if (!prev || !next) return out;
   // The server sends `queue: null` when it could not count; comparing with
   // that would announce the whole backlog as new on the next good answer.
   if (prev.queue && next.queue) {
-    out.needsPerson = Math.max(0, needCount(next.queue) - needCount(prev.queue));
+    out.needsPerson = Math.max(0, personCount(next.queue) - personCount(prev.queue));
+    out.newlyHeld = Math.max(0, (next.queue.approval || 0) - (prev.queue.approval || 0));
     // Late videos (P11.3b) are not "needs a person": they are still being tried.
     // Only a rise is news; a field an older server does not send counts nothing.
     if (typeof prev.queue.late === 'number' && typeof next.queue.late === 'number') {
@@ -207,56 +208,171 @@ export function watchStatus(data) {
   lastStatus = data;
   if (diff.needsPerson > 0) {
     const n = diff.needsPerson;
-    const text = n === 1 ? '1 βίντεο χρειάζεται έλεγχο' : `${n} βίντεο χρειάζονται έλεγχο`;
+    const text = tn('notify.needs', n);
     const covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
     lastBadNews = Date.now();
-    if (!covered) jingle(false);
+    if (!covered) play('person');
     toast(text, 'bad');
     plainNotification(text, 'omni-review');
     if (!covered) count(n, true);
   }
-  if (diff.newlyLate > 0) {
-    // The softer of the two jingles, once; no title count and no review alert.
-    jingle(false);
-    toast(diff.newlyLate === 1 ? 'Ένα βίντεο καθυστερεί' : `${diff.newlyLate} βίντεο καθυστερούν`, 'warn');
+  if (diff.newlyHeld > 0) {
+    const text = tn('notify.held', diff.newlyHeld);
+    play('held');
+    toast(text, 'warn');
+    plainNotification(text, 'omni-approval');
+    count(diff.newlyHeld, true);
   }
-  if (diff.wentBad.length) alarm();
+  if (diff.newlyLate > 0) {
+    // The «person» sound, once; no title count and no review alert.
+    play('person');
+    toast(tn('notify.late', diff.newlyLate), 'warn');
+  }
+  if (diff.wentBad.length) play('health');
   for (const bad of diff.wentBad) {
-    const info = CHECK_INFO[bad.name];
-    const text = `Πρόβλημα: ${info ? info.name : bad.name}${info?.action ? ` — ${info.action}` : ''}`;
+    const ct = checkTexts(bad.name, bad);
+    const text = t('notify.problem', { name: ct.name, happened: ct.happened, todo: ct.todo });
     toast(text, 'bad');
     plainNotification(text, `omni-health-${bad.name}`);
   }
   for (const name of diff.recovered) {
-    toast(`Αποκαταστάθηκε: ${CHECK_INFO[name]?.name || name}`, 'ok');
+    toast(t('notify.recovered', { name: CHECK_INFO[name]?.name || name }), 'ok');
   }
+  remind(data);
+}
+
+/* ------------------------------------------------------------------ *
+ * The reminder (P12.9): while something has waited for a person longer
+ * than `remindMins`, the «remind» sound and a message, again every
+ * `remindMins`. «Waited» is from the job's last change (updated_at), read
+ * from the review list once a minute at most, and only while the status
+ * says something waits. A video hidden from the review list («Απόκρυψη») is
+ * not in that list, so it does not remind. A held video has a reminder of
+ * its own (P12.14, below), so it is not counted here twice.
+ * ------------------------------------------------------------------ */
+
+const REMIND_CHECK_MS = 60000;
+let lastRemind = 0;
+let lastRemindCheck = 0;
+let reminding = false;
+
+/**
+ * Pure: whether the reminder is due. `oldestAt` is the time (ms) the longest
+ * waiting job last changed, or null; nothing known is never due.
+ */
+export function remindDue({ now, oldestAt, lastRemind: last, mins }) {
+  if (oldestAt === null || !Number.isFinite(oldestAt)) return false;
+  const span = mins * 60000;
+  return now - oldestAt >= span && (!last || now - last >= span);
+}
+
+/** The time (ms) of the longest wait, from the review list; null if none. */
+async function oldestWaitAt() {
+  const data = await api('/api/jobs?view=review&page=1&per_page=100');
+  let oldest = null;
+  for (const job of data.jobs || []) {
+    // A missing or unreadable time is skipped, never taken as "now".
+    const at = job.updated_at ? Date.parse(job.updated_at) : NaN;
+    if (Number.isFinite(at) && (oldest === null || at < oldest)) oldest = at;
+  }
+  return oldest;
+}
+
+async function remind(data) {
+  const p = soundPrefs();
+  const q = data && data.queue;
+  if (!q) return; // could not count: change nothing
+  if (personCount(q) === 0) { lastRemind = 0; return; } // nothing waits: the next wait starts afresh
+  if (!p.on || !p.remind || reminding) return;
+  const now = Date.now();
+  if (now - lastRemindCheck < REMIND_CHECK_MS) return;
+  lastRemindCheck = now;
+  reminding = true;
+  try {
+    const oldestAt = await oldestWaitAt();
+    if (!remindDue({ now: Date.now(), oldestAt, lastRemind, mins: p.remindMins })) return;
+    lastRemind = Date.now();
+    play('remind');
+    toast(tn('notify.remind', p.remindMins), 'warn');
+  } catch {
+    // The status line and the outage banner say when the server is gone.
+  } finally {
+    reminding = false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * The held videos' reminder (P11.10, P12.14): while a video waits for
+ * «Έγκριση → Dalet», a message and the «held video» sound 15 minutes after
+ * the oldest was held, then every `remind_every_mins` the server says (30).
+ * Read from `/api/held/waiting` once a minute. It follows the sound
+ * settings (P12.9): nothing at all with the reminder switched off; no sound
+ * with the «held video» sound off. A server without the route (404) gets no
+ * reminder and no error.
+ * ------------------------------------------------------------------ */
+
+const HELD_CHECK_MS = 60000;
+const HELD_FIRST_MINS = 15;
+let heldLast = 0;
+let heldGone = false;
+
+/**
+ * Pure: whether the held reminder is due at `now` (ms). `oldestAt` is when
+ * the oldest held video was held (ms), `last` when it last reminded (0:
+ * never). Due `firstMins` after `oldestAt`, then every `everyMins`; an
+ * unknown time is never due.
+ */
+export function heldReminderDue({ now, oldestAt, last, firstMins, everyMins }) {
+  if (oldestAt === null || !Number.isFinite(oldestAt) || !(everyMins > 0)) return false;
+  if (now - oldestAt < firstMins * 60000) return false;
+  return !last || now - last >= everyMins * 60000;
+}
+
+async function checkHeld() {
+  if (heldGone) return;
+  let held;
+  try {
+    held = await api('/api/held/waiting');
+  } catch (e) {
+    if (e.status === 404) heldGone = true; // an older server: no reminder, and no asking again
+    return;
+  }
+  if (!held || !(held.count > 0)) { heldLast = 0; return; } // none waits: the next wait starts afresh
+  const p = soundPrefs();
+  if (!p.on || !p.remind) return;
+  const oldestAt = held.oldest_held_at ? Date.parse(held.oldest_held_at) : NaN;
+  const everyMins = Number(held.remind_every_mins) || 30;
+  if (!heldReminderDue({ now: Date.now(), oldestAt, last: heldLast, firstMins: HELD_FIRST_MINS, everyMins })) return;
+  heldLast = Date.now();
+  play('held');
+  toast(tn('notify.held.waiting', held.count), 'warn');
 }
 
 /** The service stopped answering: sound once and say so outside the tab too. */
 export function serviceDown() {
-  alarm();
-  plainNotification('Η υπηρεσία λήψης δεν απαντά', 'omni-offline', () => {});
+  play('health');
+  plainNotification(t('service.down'), 'omni-offline', () => {});
 }
 
 /** The service answers again (same tag, so it replaces the outage notification). */
 export function serviceBack() {
-  plainNotification('Η υπηρεσία λήψης απαντά ξανά', 'omni-offline', () => {});
+  plainNotification(t('service.back'), 'omni-offline', () => {});
 }
 
 function describe(s) {
-  return s.ok
-    ? `${s.delivered}/${s.total} βίντεο παραδόθηκαν`
-    : `${s.delivered}/${s.total} παραδόθηκαν · τα υπόλοιπα θέλουν έλεγχο`;
+  return t(s.ok ? 'notify.mail.all' : 'notify.mail.some', { delivered: s.delivered, total: s.total });
 }
+
+const subjectOf = (s) => s.subject || t('mail.no_subject');
 
 function systemNotification(done) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
   const first = done[0];
   const allOk = done.every((s) => s.ok);
   const title = done.length === 1
-    ? (first.ok ? 'Ολοκληρώθηκε email' : 'Ολοκληρώθηκε email, θέλει έλεγχο')
-    : `Ολοκληρώθηκαν ${done.length} email${allOk ? '' : ' (κάποια θέλουν έλεγχο)'}`;
-  const body = done.slice(0, 3).map((s) => `«${s.subject || '(χωρίς θέμα)'}» — ${describe(s)}`).join('\n');
+    ? t(first.ok ? 'notify.mail.done' : 'notify.mail.done_check')
+    : t(allOk ? 'notify.mails.done' : 'notify.mails.done_check', { n: done.length });
+  const body = done.slice(0, 3).map((s) => t('notify.mail.line', { subject: subjectOf(s), what: describe(s) })).join('\n');
   try {
     const n = new Notification(title, { body, tag: `omni-${first.id}`, silent: true });
     n.onclick = () => {
@@ -287,11 +403,11 @@ function announce(done) {
     covered = Date.now() - lastBadNews <= SAME_NEWS_MS;
     lastBadNews = Date.now();
   }
-  if (!covered) jingle(allOk);
+  if (!covered) play(allOk ? 'delivered' : 'person');
   for (const s of done.slice(0, 3)) {
-    toast(`${s.ok ? '✔' : '⚠'} Email «${s.subject || '(χωρίς θέμα)'}»: ${describe(s)}`, s.ok ? 'ok' : 'bad');
+    toast(t('notify.mail.toast', { mark: s.ok ? '✔' : '⚠', subject: subjectOf(s), what: describe(s) }), s.ok ? 'ok' : 'bad');
   }
-  if (done.length > 3) toast(`Και ${done.length - 3} ακόμη email ολοκληρώθηκαν`, 'ok');
+  if (done.length > 3) toast(tn('notify.mails.more', done.length - 3), 'ok');
   systemNotification(done);
   if (!covered) count(done.length, !allOk);
 }
@@ -313,18 +429,17 @@ async function poll() {
 
 function paintButton() {
   if (!button) return;
-  const on = soundOn();
-  const locked = on && (!ctx || ctx.state !== 'running');
-  button.textContent = on ? (locked ? '🔔 Ήχος: πατήστε για ενεργοποίηση' : '🔔 Ήχος: ενεργός') : '🔕 Ήχος: σίγαση';
-  button.setAttribute('aria-pressed', String(on));
-  button.title = on
-    ? 'Μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email. Πατήστε για σίγαση.'
-    : 'Πατήστε για μελωδία και ειδοποίηση όταν τελειώνουν όλα τα βίντεο ενός email.';
+  const on = soundPrefs().on;
+  const locked = soundLocked();
+  // Short, so the header stays on one line at 1366 px (P12.5); the tooltip says the rest.
+  button.textContent = on ? (locked ? t('sound.locked') : t('sound.on')) : t('sound.off');
+  button.title = on ? t(locked ? 'sound.locked.title' : 'sound.on.title') : t('sound.off.title');
 }
 
 /**
- * Start watching. `host` gets the sound toggle; `open(id)` shows an entry
- * (`mail:<Message-ID>` or `manual:<job id>`) when a notification is clicked.
+ * Start watching. `host` gets the sound button, which opens the sound's
+ * settings (P12.9); `open(id)` shows an entry (`mail:<Message-ID>` or
+ * `manual:<job id>`) when a notification is clicked.
  */
 export function initNotify(host, open, openReview) {
   onOpen = open || onOpen;
@@ -334,27 +449,14 @@ export function initNotify(host, open, openReview) {
       class: 'btn',
       type: 'button',
       id: 'chime-btn',
-      onClick: () => {
-        const turningOn = !soundOn() || !ctx || ctx.state !== 'running';
-        setSoundOn(turningOn);
-        if (turningOn) {
-          unlock();
-          // Asked only from this click: browsers ignore an unprompted request.
-          if ('Notification' in window && Notification.permission === 'default') {
-            Notification.requestPermission().catch(() => {});
-          }
-          setTimeout(() => jingle(true), 60);
-        }
-        paintButton();
-      },
+      'aria-haspopup': 'dialog',
+      onClick: () => openSoundSettings(),
     });
     host.prepend(button);
   }
+  onSoundChange(paintButton);
   // The first click or key anywhere on the desk lets the browser play sound.
-  // Not a click on the toggle itself: unlocking first would make the toggle
-  // read "already on" and mute instead of enabling.
-  const gesture = (ev) => {
-    if (button && ev.target instanceof Node && button.contains(ev.target)) return;
+  const gesture = () => {
     unlock();
     document.removeEventListener('pointerdown', gesture, true);
     document.removeEventListener('keydown', gesture, true);
@@ -371,4 +473,5 @@ export function initNotify(host, open, openReview) {
   paintButton();
   poll();
   setInterval(poll, POLL_MS);
+  setInterval(checkHeld, HELD_CHECK_MS);
 }

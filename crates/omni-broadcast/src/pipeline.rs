@@ -13,7 +13,7 @@ use omni_core::repository::{HeldOutput, Repository};
 use crate::delivery::{DeliveryError, LeaseLostBeforeRename, WatchfolderDelivery};
 use omni_core::repository::MarkerCheck;
 use omni_core::selftest::WatchfolderState;
-use crate::downloader::{DownloadError, DownloadOpts, Downloader};
+use crate::downloader::{DownloadError, DownloadOpts, Downloader, FormatRoute};
 use crate::errors::ErrorCode;
 use crate::preview::{self, PreviewEncoder};
 use crate::rewrapper::Rewrapper;
@@ -165,6 +165,15 @@ fn unreachable_cause(e: &anyhow::Error) -> Option<String> {
         Some(DeliveryError::Unreachable(cause)) => Some(cause.clone()),
         _ => None,
     }
+}
+
+/// What a job's download is sent with besides its link: the sniffed page's
+/// referer, user agent and cookie header, when there are any.
+#[derive(Clone, Copy, Default)]
+struct SourceContext<'a> {
+    referer: Option<&'a str>,
+    user_agent: Option<&'a str>,
+    cookies: Option<&'a str>,
 }
 
 fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
@@ -424,6 +433,46 @@ mod failure_text_tests {
     }
 }
 
+/// Forgets a job's sent link when dropped (see [`BroadcastEngine::set_locker_link`]).
+pub type LockerLinkGuard = JobSlotGuard<String>;
+
+/// Forgets a job's download size limit when dropped (see [`BroadcastEngine::set_max_filesize`]).
+pub type MaxFilesizeGuard = JobSlotGuard<u64>;
+
+/// A per-job value the engine reads during a run (P11.15a4): each `set` takes a
+/// new generation, and its guard removes the entry only while it is still that
+/// generation, so a run that ends after another run of the same job started
+/// (a reaped lease, a retry) does not take the newer run's value away.
+type JobSlot<T> = Arc<Mutex<HashMap<i64, (u64, T)>>>;
+
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn set_slot<T>(slot: &JobSlot<T>, job_id: i64, value: T) -> JobSlotGuard<T> {
+    let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    slot.lock().unwrap_or_else(|p| p.into_inner()).insert(job_id, (generation, value));
+    JobSlotGuard { slot: slot.clone(), job_id, generation }
+}
+
+fn get_slot<T: Clone>(slot: &JobSlot<T>, job_id: i64) -> Option<T> {
+    slot.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).map(|(_, v)| v.clone())
+}
+
+/// Removes its run's entry from a [`JobSlot`] when dropped, if no later run replaced it.
+pub struct JobSlotGuard<T> {
+    slot: JobSlot<T>,
+    job_id: i64,
+    generation: u64,
+}
+
+impl<T> Drop for JobSlotGuard<T> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.get(&self.job_id).is_some_and(|(g, _)| *g == self.generation) {
+            slot.remove(&self.job_id);
+        }
+    }
+}
+
 /// Forgets a job's extra login site when dropped (see [`BroadcastEngine::set_login_site`]).
 pub struct LoginSiteGuard {
     sites: Arc<Mutex<HashMap<i64, String>>>,
@@ -450,6 +499,121 @@ impl Drop for DownloadSlotGuard {
     }
 }
 
+/// Where finished videos go and delivered sources are kept (P13.2): shared by
+/// the engine, the worker loop and the admin panel, and swapped by
+/// [`switch_watchfolder`] (between jobs, never under one) or
+/// [`DeliveryPaths::set_archive`]. Cheap to clone.
+#[derive(Clone)]
+pub struct DeliveryPaths(Arc<std::sync::RwLock<DeliveryTargets>>);
+
+#[derive(Clone, Debug)]
+pub struct DeliveryTargets {
+    pub watchfolder: PathBuf,
+    /// As configured, conflict and all; [`DeliveryPaths::archive_writing`] is
+    /// what the engine keeps sources in.
+    pub archive: Option<omni_core::archive::ArchiveSettings>,
+}
+
+impl DeliveryPaths {
+    pub fn new(watchfolder: PathBuf, archive: Option<omni_core::archive::ArchiveSettings>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(DeliveryTargets { watchfolder, archive })))
+    }
+
+    pub fn current(&self) -> DeliveryTargets {
+        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn watchfolder(&self) -> PathBuf {
+        self.current().watchfolder
+    }
+
+    /// The archive new sources go into: `None` when it is off or overlaps the watchfolder.
+    pub fn archive_writing(&self) -> Option<omni_core::archive::ArchiveSettings> {
+        self.current().archive.filter(|s| s.writes())
+    }
+
+    /// Archive settings take effect at once (P13.2): the next delivered job
+    /// uses them. No video is in the archive's way.
+    pub fn set_archive(&self, archive: Option<omni_core::archive::ArchiveSettings>) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).archive = archive;
+    }
+
+    /// Only through [`switch_watchfolder`], which holds the drained gate.
+    fn set_watchfolder(&self, watchfolder: PathBuf) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).watchfolder = watchfolder;
+    }
+}
+
+/// What [`switch_watchfolder`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchfolderSwitch {
+    /// The new folder is in use; these finished videos that waited for the old
+    /// one went to review as DELIVERY_UNCONFIRMED.
+    Switched { reviewed: Vec<i64> },
+    /// Jobs were still running after the drain: nothing changed.
+    Busy,
+    /// A newer save replaced this change (P13.2b): nothing changed.
+    Superseded,
+}
+
+/// The message on a video that waited for the old watchfolder (P13.2).
+pub fn waiting_video_review_message(old: &Path, new: &Path) -> String {
+    format!(
+        "The watchfolder was changed from {} to {} while this finished video waited for it; it is not delivered to the new one by itself. Check {} and Dalet, then deliver it with «Δοκιμή ξανά» if it is not there",
+        old.display(),
+        new.display(),
+        old.display()
+    )
+}
+
+/// Point delivery at `new` (P13.2), between jobs: the update gate stops new
+/// leases and waits up to `drain` for every running job to end (as a yt-dlp
+/// swap does). Then, with nothing running, the folder is swapped and every
+/// finished video still waiting for the old folder goes to review as
+/// DELIVERY_UNCONFIRMED: its rename may have landed there. If the drain times
+/// out nothing changes and [`WatchfolderSwitch::Busy`] is returned; the gate
+/// opens again either way. A zero `drain` is a passive check: it switches only
+/// when no job holds a pass at that moment, and holds no lease back.
+///
+/// `still_wanted` is asked before the drain and again after it, before
+/// anything is touched (P13.2b): a change a newer save replaced while it
+/// waited returns [`WatchfolderSwitch::Superseded`] and changes nothing.
+pub async fn switch_watchfolder(
+    gate: &omni_core::update_gate::UpdateGate,
+    paths: &DeliveryPaths,
+    repo: &Repository,
+    new: PathBuf,
+    drain: std::time::Duration,
+    still_wanted: impl Fn() -> bool,
+) -> Result<WatchfolderSwitch> {
+    if !still_wanted() {
+        return Ok(WatchfolderSwitch::Superseded);
+    }
+    let old = paths.watchfolder();
+    if same_folder(&old, &new) {
+        return Ok(WatchfolderSwitch::Switched { reviewed: Vec::new() });
+    }
+    // The passive check does not even raise the gate while a job runs: a zero
+    // timeout still lasts a timer tick (up to ~15 ms on Windows).
+    if drain.is_zero() && gate.active() > 0 {
+        return Ok(WatchfolderSwitch::Busy);
+    }
+    let Some(_swap) = gate.begin_swap(drain).await else {
+        return Ok(WatchfolderSwitch::Busy);
+    };
+    if !still_wanted() {
+        info!("The watchfolder change to {new:?} was replaced by a newer one while it waited; not applied");
+        return Ok(WatchfolderSwitch::Superseded);
+    }
+    let old = paths.watchfolder();
+    let reviewed = repo
+        .review_parked_deliveries(&waiting_video_review_message(&old, &new))
+        .context(ErrorCode::DeliveryFailed.as_str())?;
+    paths.set_watchfolder(new.clone());
+    info!("Watchfolder switched from {old:?} to {new:?}; {} waiting video(s) sent to review", reviewed.len());
+    Ok(WatchfolderSwitch::Switched { reviewed })
+}
+
 #[derive(Clone)]
 pub struct BroadcastEngine {
     repo: Repository,
@@ -458,7 +622,8 @@ pub struct BroadcastEngine {
     ffprobe_path: PathBuf,
     bmxtranswrap_path: PathBuf,
     temp_dir: PathBuf,
-    watchfolder_dir: PathBuf,
+    /// The watchfolder and the archive, swappable between jobs (P13.2).
+    delivery: DeliveryPaths,
     /// Encodes in progress (plan P1.13). Downloading is network-bound and
     /// encoding CPU-bound, so they are counted apart: a job finished
     /// downloading hands back its download slot and waits here, and the
@@ -472,11 +637,18 @@ pub struct BroadcastEngine {
     /// job's yt-dlp runs also carry that site's cookie jar (P3.5). The job's own
     /// address, and every other argument of its download, are unchanged.
     login_sites: Arc<Mutex<HashMap<i64, String>>>,
+    /// The largest file a job's download may bring, for the jobs that have one (P11.15a2).
+    max_filesizes: JobSlot<u64>,
+    /// The link that was sent, for the jobs that download a file-locker share's direct
+    /// address (P11.15a3): every address in their error text says it instead.
+    locker_links: JobSlot<String>,
+    /// `locker.max_file_gb` in bytes: the limit of a file-locker share's download (P11.15a2).
+    locker_max_file_bytes: u64,
+    /// What the worker does with file-locker links (P11.15): `locker.direct_shares`, and
+    /// the browser capture when `locker.browser_capture` is on.
+    locker: omni_core::locker::LockerSettings,
     /// The H.264 encoder previews use, found on first use (P10.6).
     preview_encoder: Arc<tokio::sync::OnceCell<PreviewEncoder>>,
-    /// Where a delivered job's source goes instead of the bin (P1.7); `None`
-    /// when the archive is switched off.
-    archive: Option<omni_core::archive::ArchiveSettings>,
     /// Set once the daemon is stopping (P2.15): no job enters DELIVER after
     /// it, so none starts a watchfolder copy the stop would cut.
     stopping: Arc<std::sync::atomic::AtomicBool>,
@@ -492,6 +664,10 @@ pub struct BroadcastEngine {
     /// Every yt-dlp run on a video platform waits here for its turn (P11.4);
     /// shared by clones, the repair ladder, the canaries and the self-check.
     pacer: crate::pacing::HostPacer,
+    /// Whether a source that failed probe, encode, wrap or the gate takes the
+    /// second route before review (P11.6, [`crate::second_route`]). Off unless
+    /// the daemon turns it on for its workers.
+    second_route: bool,
 }
 
 /// `retry.max_age_mins` when the daemon sets none: the owner's two hours.
@@ -575,11 +751,27 @@ impl BroadcastEngine {
         self.watchfolder_state.clone()
     }
 
-    /// Keep delivered sources as `settings` says (plan P1.7).
-    pub fn with_archive(mut self, settings: Option<omni_core::archive::ArchiveSettings>) -> Self {
-        // Only a usable archive is kept: off or overlapping the watchfolder means none.
-        self.archive = settings.filter(|s| s.writes());
+    /// Keep delivered sources as `settings` says (plan P1.7). Only a usable
+    /// archive is written: off or overlapping the watchfolder means none.
+    pub fn with_archive(self, settings: Option<omni_core::archive::ArchiveSettings>) -> Self {
+        self.delivery.set_archive(settings);
         self
+    }
+
+    /// The daemon's shared delivery paths (P13.2), which the admin panel swaps.
+    pub fn with_delivery_paths(mut self, paths: DeliveryPaths) -> Self {
+        self.delivery = paths;
+        self
+    }
+
+    /// The delivery paths this engine reads.
+    pub fn delivery_paths(&self) -> DeliveryPaths {
+        self.delivery.clone()
+    }
+
+    /// The watchfolder now. Read per use: it changes only while no job runs.
+    fn watchfolder_dir(&self) -> PathBuf {
+        self.delivery.watchfolder()
     }
 
     /// At most `n` encodes at once (at least one).
@@ -593,6 +785,75 @@ impl BroadcastEngine {
     /// [`Self::release_download_slot`] when the job ends before that.
     pub fn hold_download_slot(&self, job_id: i64, owner: &str, permit: OwnedSemaphorePermit) {
         self.download_slots.lock().unwrap_or_else(|p| p.into_inner()).insert((job_id, owner.to_string()), permit);
+    }
+
+    /// Limit job `job_id`'s downloads to `bytes` while the guard lives (P11.15a2):
+    /// a file-locker share's direct download.
+    pub fn set_max_filesize(&self, job_id: i64, bytes: u64) -> MaxFilesizeGuard {
+        set_slot(&self.max_filesizes, job_id, bytes)
+    }
+
+    /// Job `job_id` downloads a file-locker share's direct address; `label` is
+    /// what may be said of it (its site, `urlnorm::site_for_log` of the sent link,
+    /// P11.15a4). While the guard lives, every address in the text the engine
+    /// writes for the job (event, audit, log) is replaced by it.
+    pub fn set_locker_link(&self, job_id: i64, label: &str) -> LockerLinkGuard {
+        set_slot(&self.locker_links, job_id, label.to_string())
+    }
+
+    /// What may be said of job `job_id`'s address (P11.15a4): its site, for a
+    /// file-locker share; `None` for any other job.
+    fn locker_label(&self, job_id: i64) -> Option<String> {
+        get_slot(&self.locker_links, job_id)
+    }
+
+    /// Job `job_id`'s download size limit and site label as the engine holds
+    /// them now (P11.15a4); for tests and diagnostics.
+    pub fn job_locker_state(&self, job_id: i64) -> (Option<u64>, Option<String>) {
+        (get_slot(&self.max_filesizes, job_id), self.locker_label(job_id))
+    }
+
+    /// `text` as the engine may write it for job `job_id`: unchanged, or for a
+    /// file-locker share with every address replaced by its site (P11.15a3, P11.15a4).
+    fn job_text(&self, job_id: i64, text: &str) -> String {
+        match self.locker_label(job_id) {
+            Some(label) => omni_core::locker::scrub_addresses(text, &label),
+            None => text.to_string(),
+        }
+    }
+
+    /// `locker.max_file_gb` in bytes (P11.15a2).
+    pub fn with_locker_max_file_bytes(mut self, bytes: u64) -> Self {
+        self.locker_max_file_bytes = bytes.max(1);
+        self
+    }
+
+    /// The limit of a file-locker share's download, in bytes (P11.15a2).
+    pub fn locker_max_file_bytes(&self) -> u64 {
+        self.locker_max_file_bytes
+    }
+
+    /// Handle file-locker links as `settings` says (P11.15b).
+    pub fn with_locker(mut self, settings: omni_core::locker::LockerSettings) -> Self {
+        self.locker = settings;
+        self
+    }
+
+    /// The file-locker settings (P11.15b).
+    pub fn locker(&self) -> &omni_core::locker::LockerSettings {
+        &self.locker
+    }
+
+    /// Where a locker capture of job `job_id` keeps the page's file,
+    /// `temp/captures/{id}` (P11.15b2): outside the job's workspace, so a
+    /// failed run's clean-up does not take it and a retry finds it.
+    pub fn capture_dir(&self, job_id: i64) -> PathBuf {
+        omni_core::locker::capture_dir(&self.temp_dir, job_id)
+    }
+
+    /// Remove job `job_id`'s capture directory (the job no longer needs it).
+    pub fn discard_capture_dir(&self, job_id: i64) {
+        omni_core::locker::remove_capture_dir(&self.temp_dir, job_id);
     }
 
     /// Job `job_id` also needs the cookie jar of `video_url`'s site; forgotten when the guard drops.
@@ -642,18 +903,29 @@ impl BroadcastEngine {
             ffprobe_path,
             bmxtranswrap_path,
             temp_dir,
-            watchfolder_dir,
+            delivery: DeliveryPaths::new(watchfolder_dir, None),
             encoder_slots: Arc::new(Semaphore::new(DEFAULT_ENCODER_SLOTS)),
             download_slots: Arc::new(Mutex::new(HashMap::new())),
             login_sites: Arc::new(Mutex::new(HashMap::new())),
+            max_filesizes: Arc::new(Mutex::new(HashMap::new())),
+            locker_links: Arc::new(Mutex::new(HashMap::new())),
+            locker_max_file_bytes: omni_core::config::LockerConfig::default().max_file_bytes(),
+            locker: omni_core::locker::LockerSettings::default(),
             preview_encoder: Arc::new(tokio::sync::OnceCell::new()),
-            archive: None,
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             watchfolder_state: WatchfolderState::default(),
             waits: Arc::new(Mutex::new(HashMap::new())),
             retry_max_age: chrono::Duration::minutes(DEFAULT_RETRY_MAX_AGE_MINS),
             pacer: crate::pacing::HostPacer::default(),
+            second_route: false,
         }
+    }
+
+    /// Give a source that failed probe, encode, wrap or the gate its second
+    /// route before review (P11.6), once per job.
+    pub fn with_second_route(mut self, on: bool) -> Self {
+        self.second_route = on;
+        self
     }
 
     /// The daemon is stopping: a job reaching DELIVER from now on waits just before it
@@ -770,7 +1042,7 @@ impl BroadcastEngine {
         slug: &str,
         job_temp: &Path,
     ) -> Result<crate::delivery::Delivered> {
-        match WatchfolderDelivery::deliver_with(source, &self.watchfolder_dir, slug, |to, bytes| {
+        match WatchfolderDelivery::deliver_with(source, &self.watchfolder_dir(), slug, |to, bytes| {
             self.record_delivering(job_id, owner, to, bytes)
         })
         .await
@@ -895,44 +1167,21 @@ impl BroadcastEngine {
                 WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
                 return Err(anyhow::anyhow!(err_msg).context(ErrorCode::ManualDownload.as_str()));
             };
-            let _ = self.repo.record_event(
-                job_id,
-                "INFO",
-                Some(JobStage::Download),
-                "Source is the file attached to the email; nothing to download",
-            );
-            return self.finish_from_source(job, owner, source, job_temp, cancel, delivery).await;
+            // A file-locker page's file the browser already downloaded (P11.15b) takes this path too.
+            let said = if url == omni_core::locker::CAPTURE_URL {
+                "Source is the file the browser downloaded from the file-locker page; nothing more to download"
+            } else {
+                "Source is the file attached to the email; nothing to download"
+            };
+            let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Download), said);
+            let first = self.finish_from_source(job.clone(), owner, source, job_temp.clone(), cancel.clone(), delivery).await;
+            let context = SourceContext { referer, user_agent, cookies };
+            return self.or_second_route(first, job, owner, context, cancel, delivery, job_temp).await;
         }
 
         // 1. Download stage
-        let downloader = self.downloader_for(job_id, JobStage::Download);
-        let repo_clone = self.repo.clone();
-        // The site's cookie jar (P3.5), a file in this job's workspace for the
-        // length of the download only: the guard removes it on every way out.
-        let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
-        let jar_urls: Vec<&str> = std::iter::once(url.as_str()).chain(login_site.as_deref()).collect();
-        let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, &job_temp, false);
-        let raw_download_res = downloader
-            .download(
-                job_id,
-                &url,
-                &job_temp,
-                DownloadOpts {
-                    referer,
-                    user_agent,
-                    cookie_header: cookies,
-                    cookie_jar: cookie_file.as_ref().map(|f| f.path()),
-                    cookie_values: cookie_file.as_ref().map(|f| f.values()).unwrap_or(&[]),
-                    cancel: cancel.clone(),
-                    ..Default::default()
-                },
-                {
-                    let mut write = progress_writer(repo_clone, job_id);
-                    move |prog| write(prog.percent, &prog.speed, &prog.eta)
-                },
-            )
-            .await;
-        drop(cookie_file);
+        let raw_download_res =
+            self.download_source(job_id, &url, &job_temp, SourceContext { referer, user_agent, cookies }, &cancel, FormatRoute::Usual).await;
 
         let downloaded_file = match raw_download_res {
             Ok(path) => path,
@@ -944,6 +1193,8 @@ impl BroadcastEngine {
                 // does not have to re-read stderr to decide whether a retry could
                 // possibly help (plan P1.9).
                 let (code, err_msg) = download_failure_text(&e);
+                // A file-locker share's error says the sent link, never its direct or redirected address (P11.15a3).
+                let err_msg = self.job_text(job_id, &err_msg);
                 warn!("Job #{job_id}: {err_msg}");
                 let _ = self.repo.record_event(job_id, "ERROR", Some(JobStage::Download), &err_msg);
                 let _ = self.repo.log_audit(
@@ -956,7 +1207,181 @@ impl BroadcastEngine {
             }
         };
 
-        self.finish_from_source(job, owner, downloaded_file, job_temp, cancel, delivery).await
+        let first = self.finish_from_source(job.clone(), owner, downloaded_file, job_temp.clone(), cancel.clone(), delivery).await;
+        self.or_second_route(first, job, owner, SourceContext { referer, user_agent, cookies }, cancel, delivery, job_temp).await
+    }
+
+    /// Download job `job_id`'s link `url` into its workspace with `formats`.
+    /// The site's cookie jar (P3.5) is a file in the workspace for the length
+    /// of the download only: the guard removes it on every way out.
+    async fn download_source(
+        &self,
+        job_id: i64,
+        url: &str,
+        job_temp: &Path,
+        context: SourceContext<'_>,
+        cancel: &Option<CancellationToken>,
+        formats: FormatRoute,
+    ) -> Result<PathBuf> {
+        let downloader = self.downloader_for(job_id, JobStage::Download);
+        let login_site = self.login_sites.lock().unwrap_or_else(|p| p.into_inner()).get(&job_id).cloned();
+        let jar_urls: Vec<&str> = std::iter::once(url).chain(login_site.as_deref()).collect();
+        let cookie_file = crate::cookie_file::for_urls(&self.repo, &jar_urls, job_temp, false);
+        let max_filesize = get_slot(&self.max_filesizes, job_id);
+        let log_label = self.locker_label(job_id);
+        let downloaded = downloader
+            .download(
+                job_id,
+                url,
+                job_temp,
+                DownloadOpts {
+                    referer: context.referer,
+                    user_agent: context.user_agent,
+                    cookie_header: context.cookies,
+                    cookie_jar: cookie_file.as_ref().map(|f| f.path()),
+                    cookie_values: cookie_file.as_ref().map(|f| f.values()).unwrap_or(&[]),
+                    cancel: cancel.clone(),
+                    formats,
+                    max_filesize,
+                    log_label: log_label.as_deref(),
+                    ..Default::default()
+                },
+                {
+                    let mut write = progress_writer(self.repo.clone(), job_id);
+                    move |prog| write(prog.percent, &prog.speed, &prog.eta)
+                },
+            )
+            .await;
+        drop(cookie_file);
+        downloaded
+    }
+
+    /// The first route's result, or, for a source that could not be made into
+    /// a compliant file (PROBE_FAILED, TRANSCODE_FAILED, REWRAP_FAILED,
+    /// COMPLIANCE_FAILED), the second route's (P11.6, [`crate::second_route`]):
+    /// the link downloaded again with other formats (an attachment: its file
+    /// as it is), copied into a clean container, then the usual encode, wrap,
+    /// gate and delivery. Once per job, recorded on the row before anything
+    /// runs, so a restart or a retry does not take it again; with the engine's
+    /// second route off, or the job's taken, the first failure stands.
+    ///
+    /// When the second route fails at the download, the remux, or the same
+    /// kind of stage (its own source failure), the job ends with its first
+    /// failure; any other ending of the second run (delivered, held, waiting
+    /// for the watchfolder, a full disk, a lost lease) is the job's ending.
+    async fn or_second_route(
+        &self,
+        first: Result<RunOutcome>,
+        job: Job,
+        owner: &str,
+        context: SourceContext<'_>,
+        cancel: Option<CancellationToken>,
+        delivery: DeliveryMode,
+        job_temp: PathBuf,
+    ) -> Result<RunOutcome> {
+        let first_err = match first {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => e,
+        };
+        // A stopping daemon starts no new download or remux and does not use up the job's one
+        // second route; the first failure stands, as before the second route existed.
+        if !self.second_route || first_err.downcast_ref::<LeaseLost>().is_some() || is_cancelled(&cancel) || self.is_stopping() {
+            return Err(first_err);
+        }
+        let Some(code) = crate::second_route::applies(&first_err) else {
+            return Err(first_err);
+        };
+        let job_id = job.id;
+        match self.repo.claim_second_route(job_id, owner) {
+            Ok(true) => {}
+            Ok(false) if !self.repo.owns_lease(job_id, owner).unwrap_or(true) => {
+                return Err(self.lost(job_id, JobStage::Download, &job_temp).await);
+            }
+            // Taken already, by an earlier run of this job.
+            Ok(false) => return Err(first_err),
+            Err(e) => {
+                warn!("Job #{job_id}: could not record the second route, so it is not taken: {e:#}");
+                return Err(first_err);
+            }
+        }
+
+        let attachment = job.url.starts_with("attachment://");
+        let line = if attachment {
+            format!("{code}: second route: the attached file is copied into a clean container and made again")
+        } else {
+            format!("{code}: second route: downloading again with other formats, copied into a clean container and made again")
+        };
+        info!("Job #{job_id}: {line}");
+        let _ = self.repo.record_event(job_id, "INFO", Some(JobStage::Download), &line);
+
+        let source = match self.second_source(&job, owner, context, &cancel, &job_temp, attachment).await {
+            Ok(source) => source,
+            Err(e) if e.downcast_ref::<LeaseLost>().is_some() => return Err(e),
+            Err(_) if is_cancelled(&cancel) => return Err(self.lost(job_id, JobStage::Download, &job_temp).await),
+            Err(e) => {
+                let why = self.job_text(job_id, &format!("The second route did not help: {e:#}"));
+                warn!("Job #{job_id}: {why}");
+                let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Download), &why);
+                WatchfolderDelivery::cleanup_job_temp_files(&job_temp).await;
+                return Err(first_err);
+            }
+        };
+
+        match self.finish_from_source(job, owner, source, job_temp, cancel, delivery).await {
+            Ok(outcome) => {
+                let _ = self.repo.record_event(job_id, "INFO", None, "The second route made a compliant file");
+                Ok(outcome)
+            }
+            Err(e) if e.downcast_ref::<LeaseLost>().is_none() && crate::second_route::applies(&e).is_some() => {
+                let why = format!("The second route did not help either ({}); the first failure stands", crate::second_route::applies(&e).map_or("", |c| c.as_str()));
+                warn!("Job #{job_id}: {why}");
+                let _ = self.repo.record_event(job_id, "WARN", None, &why);
+                Err(first_err)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The second route's source in `job_temp` (P11.6): the link downloaded
+    /// again with the second route's formats (an attachment's file as it is),
+    /// copied into a clean container. A downloaded file is removed once
+    /// copied; an attachment is never touched.
+    async fn second_source(
+        &self,
+        job: &Job,
+        owner: &str,
+        context: SourceContext<'_>,
+        cancel: &Option<CancellationToken>,
+        job_temp: &Path,
+        attachment: bool,
+    ) -> Result<PathBuf> {
+        let job_id = job.id;
+        tokio::fs::create_dir_all(job_temp)
+            .await
+            .with_context(|| format!("Failed creating the workspace for job #{job_id} at {job_temp:?}"))
+            .context(ErrorCode::PipelineFailed.as_str())?;
+        let (source, downloaded) = if attachment {
+            let source = job.source_path.as_deref().map(PathBuf::from).filter(|p| p.is_file());
+            let source = source.context("the attached file is not on disk any more").context(ErrorCode::ManualDownload.as_str())?;
+            (source, false)
+        } else {
+            self.enter_stage(job_id, owner, JobStage::Download, job_temp).await?;
+            let path = self.download_source(job_id, &job.url, job_temp, context, cancel, FormatRoute::Second).await?;
+            (path, true)
+        };
+        let _ = self.repo.update_job_progress(job_id, 0.0, "Remuxing", "--:--");
+        let remuxed = crate::second_route::remux(&self.ffmpeg_path, &self.ffprobe_path, &source, job_temp, cancel.clone()).await?;
+        if downloaded {
+            let _ = tokio::fs::remove_file(&source).await;
+        }
+        let v = &remuxed.source.video;
+        let _ = self.repo.record_event(
+            job_id,
+            "INFO",
+            Some(JobStage::Download),
+            &format!("Second route source: {}x{} {}, {:.1} s, in a clean container", v.width, v.height, v.codec, remuxed.source.duration_secs),
+        );
+        Ok(remuxed.path)
     }
 
     /// Stages 2–6, from a source file on disk to the watchfolder.
@@ -1022,7 +1447,7 @@ impl BroadcastEngine {
         // the queue for 10 min, three times, and then to review (a clip that
         // needs more room than the volume has fails the same way every run).
         if let Ok(probe) = transcoder.probe_source(&downloaded_file).await {
-            if let Err(why) = room_for(probe.duration_secs, &job_temp, &self.watchfolder_dir) {
+            if let Err(why) = room_for(probe.duration_secs, &job_temp, &self.watchfolder_dir()) {
                 warn!("Job #{job_id}: {why}");
                 let _ = self.repo.record_event(job_id, "WARN", Some(JobStage::Transcode), &why);
                 drop(encoder);
@@ -1297,7 +1722,7 @@ impl BroadcastEngine {
     /// plus 64 MiB. Asked off the async threads, for at most 15 s; a volume
     /// that does not answer is not held against the delivery.
     async fn room_in_watchfolder(&self, job_id: i64, slug: &str, bytes: u64) -> Result<()> {
-        let wf = self.watchfolder_dir.clone();
+        let wf = self.watchfolder_dir();
         let asked = tokio::time::timeout(
             omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
             tokio::task::spawn_blocking(move || omni_core::selftest::disk_space(&wf).map(|(free, _)| free)),
@@ -1369,7 +1794,7 @@ impl BroadcastEngine {
         };
         let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
         let folder = Path::new(&path).parent().map(Path::to_path_buf).unwrap_or_default();
-        if !recorded && !same_folder(&folder, &self.watchfolder_dir) {
+        if !recorded && !same_folder(&folder, &self.watchfolder_dir()) {
             // An old folder may be a share that is gone for good: not asked, not waited for.
             return Err(self.needs_check(
                 job_id,
@@ -1400,7 +1825,7 @@ impl BroadcastEngine {
     /// began (`run_started`) and is not in use
     /// ([`crate::delivery::reclaim_own_staging`]). Off the async threads.
     async fn reclaim_own_staging(&self, job_id: i64, slug: &str, run_started: std::time::SystemTime) {
-        let (dir, name) = (self.watchfolder_dir.clone(), format!("{slug}.mxf"));
+        let (dir, name) = (self.watchfolder_dir(), format!("{slug}.mxf"));
         let ran = tokio::time::timeout(
             omni_core::selftest::WATCHFOLDER_PROBE_TIMEOUT,
             tokio::task::spawn_blocking(move || crate::delivery::reclaim_own_staging(&dir, &name, run_started)),
@@ -1811,7 +2236,9 @@ impl BroadcastEngine {
         }
 
         let duration = held.duration.unwrap_or(0.0);
-        let report = match crate::verify::verify_mxf_with_clip(&self.ffprobe_path, &path, duration, Some(&slug)).await {
+        // A held video may have been encoded before the Rec.709 labels (P14.9b).
+        let labels = crate::verify::ColourLabels::TolerateUnset;
+        let report = match crate::verify::verify_mxf_with_clip_labels(&self.ffprobe_path, &path, duration, Some(&slug), labels).await {
             Ok(report) => report,
             Err(e) => {
                 let err_msg = format!("Compliance check could not run: {e}");
@@ -1929,7 +2356,7 @@ impl BroadcastEngine {
     /// delivery: a failed archive is a warning and an `ARCHIVE_FAILED` event,
     /// and the cleanup runs regardless. On a lost lease nothing is written.
     pub async fn archive_then_clean(&self, job_id: i64, owner: &str, source: Option<&Path>, job_temp: &Path, delivered_filename: &str) {
-        if let (Some(settings), Some(source)) = (self.archive.clone(), source) {
+        if let (Some(settings), Some(source)) = (self.delivery.archive_writing(), source) {
             match self.repo.set_stage(job_id, owner, JobStage::Archive) {
                 Ok(true) => {
                     let outcome = match self.repo.get_job(job_id) {

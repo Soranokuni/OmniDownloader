@@ -633,8 +633,21 @@ pub async fn check_public(url: &str, allow: &CidrSet, timeout: std::time::Durati
     check_public_with(url, allow, timeout, system_lookup).await
 }
 
+/// Set by tests (P11.15a2): every [`system_lookup`] fails at once, without
+/// asking any resolver, so a test whose guard is broken still reaches no host
+/// name on the network. Never set by the daemon.
+static LOOKUPS_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For tests: refuse every [`system_lookup`] in this process from now on.
+pub fn refuse_lookups_for_tests() {
+    LOOKUPS_REFUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The system name lookup, as the resolver [`check_public_with`] takes.
 pub async fn system_lookup(host: String, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    if LOOKUPS_REFUSED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "name lookups are refused in tests"));
+    }
     Ok(tokio::net::lookup_host((host.as_str(), port)).await?.collect())
 }
 

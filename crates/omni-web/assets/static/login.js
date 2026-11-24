@@ -5,15 +5,6 @@ import { api, toast } from '/static/app.js?v=6';
 const errorLine = document.getElementById('error');
 const submitButton = document.getElementById('submit-btn');
 
-// The first-run hint is a fact about the deployment, not about any account, so
-// it is safe to show before anyone signs in -- and without it a fresh install
-// looks broken: there is no seeded administrator to sign in as any more.
-api('/api/setup/state')
-  .then((state) => {
-    document.getElementById('setup-hint').hidden = !state.needs_admin;
-  })
-  .catch(() => { /* not fatal; the hint simply stays hidden */ });
-
 document.getElementById('login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   errorLine.textContent = '';

@@ -2,6 +2,7 @@
 name = "omni-service"
 version = "1.0.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 omni-core = { path = "../omni-core" }
@@ -19,6 +20,8 @@ features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_System_Services",
     "Win32_System_EventLog",
     "Win32_System_Registry",
 ]

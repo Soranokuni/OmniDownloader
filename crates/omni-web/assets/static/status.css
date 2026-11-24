@@ -1,0 +1,392 @@
+/* The colours of status.js's tones (plan P12.1), one family per tone:
+ *   ok green · run blue · wait grey · approval violet · warn amber ·
+ *   bad red · off (cancelled) grey, dashed.
+ * app.css already colours ok, info, warn and bad; this adds what the one
+ * vocabulary needs on top: approval violet wherever it shows, a cancelled
+ * job that no longer looks like a waiting one, and the mark beside a colour.
+ * Loaded after app.css by the pages that show job statuses (/mcr, /user).
+ * Also holds the desk's work-list rules (P12.2), its undo strip, dialog and
+ * rename field (P12.4) and the control-room layout (P12.5) until all fold
+ * into app.css with its next version bump.
+ */
+
+.badge .mark { margin-right: 5px; font-weight: 700; }
+
+.badge.wait     { color: var(--text-dim); }
+.badge.run      { color: var(--info); background: rgba(96, 165, 250, 0.1);  border-color: rgba(96, 165, 250, 0.22); }
+.badge.approval { color: var(--busy); background: rgba(167, 139, 250, 0.1); border-color: rgba(167, 139, 250, 0.3); }
+.badge.off      { color: var(--text-dim); background: transparent; border-style: dashed; border-color: #3a4762; }
+
+.tag .mark { margin-right: 3px; }
+.tag.off  { background: transparent; color: var(--text-dim); border: 1px dashed #3a4762; }
+
+.seg.off { background: repeating-linear-gradient(135deg, #2a3346 0 2px, transparent 2px 5px); }
+
+.legend i {
+  width: auto; height: auto; min-width: 14px;
+  padding: 0 2px;
+  font-style: normal; font-size: 12px; font-weight: 800; line-height: 15px;
+  text-align: center;
+}
+.legend i.ok   { color: #03281a; }
+.legend i.run  { color: #061631; }
+.legend i.wait { color: var(--text-dim); }
+.legend i.warn { color: #241800; }
+.legend i.bad  { color: #2e0812; }
+.legend i.approval { background: var(--busy); color: #1a0f3a; }
+.legend i.off  { border: 1px dashed #3a4762; color: var(--text-dim); }
+.legend i.skip { min-width: 14px; }
+
+/* The review tab as a work list (plan P12.2, worklist.js): a heading per
+ * group, one sentence saying why, one primary action, the rest folded. */
+.wl-group {
+  margin: 18px 2px 4px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+#review-cards > .wl-group:first-child { margin-top: 4px; }
+.wl-why { margin: 0; font-size: 14px; font-weight: 600; color: var(--warn); line-height: 1.45; }
+.wl-override label { margin-bottom: 6px; }
+.wl-more > summary,
+.card .tech > summary { cursor: pointer; color: var(--text-dim); font-size: 13px; }
+.wl-more > .row,
+.wl-more > .wl-override { margin-top: 10px; }
+.card .tech p { margin: 6px 0 0; font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; }
+
+/* No native dialogs (plan P12.4): «Αναίρεση» at the bottom left (the
+ * other messages are at the bottom right), the in-page dialog, the inline
+ * rename field. */
+.undo-host {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(460px, calc(100vw - 32px));
+}
+.toast.undo { display: flex; align-items: center; gap: 12px; justify-content: space-between; }
+.toast.undo .btn { flex: 0 0 auto; }
+.dlg { max-width: 480px; }
+.dlg-title { margin: 0 0 10px; font-size: 17px; font-weight: 700; color: var(--text); }
+.dlg-text { margin: 0 0 10px; font-size: 14px; line-height: 1.5; color: var(--text-dim); }
+.dlg-actions { justify-content: flex-end; margin-top: 16px; }
+.rename-form { display: flex; flex-direction: column; gap: 6px; }
+.rename-form label { margin: 0; }
+.rename-preview { margin: 0; }
+
+/* ================================================================== *
+ * Layout for the control room (plan P12.5)
+ * ================================================================== */
+
+/* Type and contrast. Body text 15 px; nothing under 12 px; the faint grey
+ * is lighter so it reads at 4.5:1 on the page and on a card (app.css's
+ * #64718a was about 4:1). */
+:root { --text-faint: #7a879f; }
+body { font-size: 15px; }
+
+/* One page width on every tab: fluid, up to 1760 px. */
+.desk-page .topbar-inner,
+.desk-page main { max-width: 1760px; padding-left: 24px; padding-right: 24px; }
+
+/* The header: product, one health pill, sound, account. One line at 1366 px. */
+/* (app.css's sticky .topbar is the panel's anchor.) */
+.desk-page .topbar-status { flex-wrap: nowrap; white-space: nowrap; gap: 10px; font-size: 14px; }
+.brand p { font-size: 12px; }
+.health-pill {
+  appearance: none;
+  display: inline-flex; align-items: center; gap: 8px;
+  font: inherit; font-size: 14px; font-weight: 700;
+  color: var(--text);
+  background: #0e1220;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.health-pill:hover { background: #141a2b; }
+.health-pill[data-tone="ok"]   { border-color: rgba(52, 211, 153, 0.4); }
+.health-pill[data-tone="warn"] { border-color: rgba(251, 191, 36, 0.55); color: var(--warn); }
+.health-pill[data-tone="bad"]  { border-color: rgba(251, 113, 133, 0.6); color: var(--bad); }
+.sound-slot { display: inline-flex; }
+.health-panel {
+  position: absolute;
+  right: max(24px, calc((100vw - 1760px) / 2 + 24px));
+  top: 100%;
+  width: min(560px, calc(100vw - 48px));
+  max-height: calc(100vh - 90px);
+  overflow: auto;
+  background: #0b0e17;
+  border: 1px solid rgba(34, 211, 238, 0.24);
+  border-radius: 12px;
+  padding: 16px 18px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.6);
+  white-space: normal;
+  z-index: 50;
+}
+.hp-title { margin: 0 0 10px; font-size: 16px; }
+.hp-checks { list-style: none; margin: 0; padding: 0; }
+.hp-check {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  align-items: center;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+.hp-name { font-weight: 600; }
+.hp-state { color: var(--text-dim); font-size: 13px; }
+.hp-check.bad .hp-state { color: var(--warn); }
+.hp-action, .hp-detail { grid-column: 2 / 4; font-size: 13px; color: var(--text-dim); }
+.hp-detail { font-size: 12px; overflow-wrap: anywhere; }
+.hp-facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 12px 0 0; font-size: 14px; }
+.hp-facts dt { color: var(--text-dim); }
+.hp-facts dd { margin: 0; }
+.hp-note { margin: 12px 0 0; }
+
+/* Tabs. */
+.tablist { display: flex; gap: 4px; flex-wrap: wrap; }
+.tab { font-size: 15px; }
+.tab-end { margin-left: auto; }
+
+/* The lists use the width: two columns of cards on a wide monitor. A group
+ * heading spans the row. The approval cards (with their video) stay one per row. */
+@media (min-width: 1400px) {
+  #queue-cards, #review-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  #queue-cards > *, #review-cards > * { margin-top: 0; }
+  #queue-cards > .card.center, #review-cards > .card.center, #review-cards > .wl-group,
+  #review-cards > .cookie-waits { grid-column: 1 / -1; }
+}
+
+/* What used to be inline styles in the desk's JS and pages. */
+.note.flat, p.flat { margin: 0; }
+.spaced-top { margin-top: 10px; }
+.search-wide { width: 320px; max-width: 100%; }
+select.auto, input.auto { width: auto; }
+.inline-label { margin: 0; }
+.inline-label.spaced { margin-left: 12px; }
+.inline-check { margin: 0; gap: 6px; }
+.form-card { max-width: 680px; margin: 0 auto; }
+.form-intro { margin-bottom: 12px; }
+.modal-head { border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 12px; }
+.modal-title { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 0.07em; }
+.card-title.bare { border: none; margin: 0; padding: 0; }
+.step-time { margin-left: 6px; }
+.step-time.warn { color: var(--warn); }
+.gap-left { margin-left: 8px; }
+.card.pager { padding: 10px 14px; }
+.pager-page { padding: 0 8px; }
+.offer-row { border-top: 1px solid var(--line); padding-top: 10px; }
+.row.head-row { gap: 10px; align-items: flex-start; }
+.under-name { margin: 2px 0 0; }
+.url-cell { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.row-end { justify-content: flex-end; flex-wrap: nowrap; }
+strong.block { display: block; }
+.fchip .pip.run  { background: var(--info); }
+.fchip .pip.warn { background: var(--warn); }
+.fchip .pip.ok   { background: var(--ok); }
+.fchip .pip.none { background: #3a4762; }
+
+/* Health in plain Greek (plan P12.6): what happened, what it means for the
+ * videos, what to do and who does it; the tool's words folded away. */
+.banner-line { margin-top: 12px; }
+.hl-name { display: block; font-size: 15px; }
+.hl-happened, .hl-means, .hl-todo { margin: 3px 0 0; font-size: 14px; line-height: 1.45; }
+.hl-label { color: var(--text-dim); font-weight: 600; }
+.badge.who { margin-left: 4px; text-transform: none; letter-spacing: 0; }
+.badge.who.mcr   { color: var(--accent); border-color: rgba(34, 211, 238, 0.35); }
+.badge.who.admin { color: var(--busy); border-color: rgba(167, 139, 250, 0.35); }
+.hp-texts { grid-column: 2 / 4; }
+.hp-texts .hl-happened, .hp-texts .hl-means, .hp-texts .hl-todo { font-size: 13px; }
+.hp-tech { grid-column: 2 / 4; margin-top: 2px; }
+
+/* Messages: an error stays, with its «✕», until closed; at most three. */
+.desk-toasts { gap: 8px; }
+.toast-stack { display: flex; flex-direction: column; gap: 8px; }
+.toast.sticky { display: flex; align-items: flex-start; gap: 10px; }
+.toast.sticky .toast-text { flex: 1; }
+.toast-close {
+  appearance: none; flex: 0 0 auto;
+  background: none; border: 1px solid var(--line); border-radius: 6px;
+  color: var(--text-dim); font: inherit; font-size: 13px; line-height: 1;
+  padding: 4px 7px; cursor: pointer;
+}
+.toast-close:hover { color: var(--text); border-color: var(--text-dim); }
+
+/* Keyboard and accessibility (plan P12.8). One focus ring for every control
+ * and every card reached with J/K; real buttons where there were clickable
+ * spans and pictures, looking as before; less motion when asked for. */
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.lnk:focus-visible, .jcard .jc-name:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+[data-nav]:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+button.lnk {
+  display: inline;
+  font-family: var(--mono);
+  line-height: inherit;
+  text-align: left;
+  white-space: normal;
+  vertical-align: baseline;
+  margin: 0;
+}
+button.jc-name {
+  appearance: none; background: none; border: 0; padding: 0; margin: 0;
+  font-family: inherit; text-align: left; cursor: pointer;
+}
+.ap-pic, .ap-sheet-btn {
+  appearance: none; background: none; border: 0; padding: 0; margin: 0;
+  cursor: pointer; display: block; max-width: 100%;
+}
+.ap-pic.ap-zoom { cursor: zoom-in; }
+.ap-large { display: block; max-width: min(1200px, 90vw); max-height: 70vh; margin: 0 auto 8px; border-radius: 6px; }
+.dlg:has(.ap-large) { max-width: min(1240px, 94vw); }
+.keys-sheet { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0; font-size: 14px; }
+.keys-sheet dt { text-align: right; }
+.keys-sheet dd { margin: 0; color: var(--text-dim); }
+kbd {
+  font-family: var(--mono); font-size: 13px;
+  padding: 1px 7px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;
+  background: #0e1220; color: var(--text);
+}
+/* Only desk work in the tabs (plan P12.10): «+ Προσθήκη συνδέσμου» opens a
+ * side panel; «Βοήθεια» is a small menu; the specification is a dialog. */
+.tab-actions { display: flex; align-items: center; gap: 8px; }
+.menu-wrap { position: relative; }
+.menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 50;
+  min-width: 260px; padding: 6px; display: flex; flex-direction: column;
+  background: #0b0e17; border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.menu-item {
+  appearance: none; background: none; border: 0; border-radius: 6px;
+  padding: 9px 12px; text-align: left; font: inherit; font-size: 14px;
+  color: var(--text); cursor: pointer;
+}
+.menu-item:hover, .menu-item:focus-visible { background: rgba(34, 211, 238, 0.12); }
+a.menu-item { display: block; text-decoration: none; }
+/* The cookie sites at the top of their group (P12.14). */
+.cookie-waits { margin-bottom: 12px; }
+.cookie-wait .job-name { margin: 0 0 6px; }
+.side-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 55;
+  width: min(480px, 100vw); overflow-y: auto; padding: 20px;
+  background: #0b0e17; border-left: 1px solid rgba(34, 211, 238, 0.24);
+  box-shadow: -12px 0 30px rgba(0, 0, 0, 0.5);
+}
+.side-head { margin-bottom: 12px; }
+.spec-list { margin-bottom: 4px; }
+.spec-list .spec-row { font-size: 13px; }
+.remember-btn { margin-left: 10px; padding: 3px 10px; font-size: 13px; }
+
+/* The wall board (plan P12.13): read from across the room. Numbers are huge,
+ * labels large, colour always with a word; nothing to click. */
+.board-page { font-size: 22px; }
+.board-head {
+  display: flex; align-items: center; gap: 28px; padding: 18px 32px;
+  border-bottom: 1px solid var(--line); background: #0b0e17;
+}
+.board-brand { display: flex; align-items: center; gap: 14px; flex: 1; }
+.board-brand h1 { margin: 0; font-size: 30px; }
+.board-sub { color: var(--text-dim); font-weight: 600; margin-left: 10px; }
+.board-health {
+  display: inline-flex; align-items: center; gap: 12px; font-size: 28px; font-weight: 700;
+  padding: 8px 20px; border-radius: 999px; border: 2px solid var(--line);
+}
+.board-health .dot { width: 20px; height: 20px; }
+.board-health.ok { border-color: var(--ok); color: var(--ok); }
+.board-health.warn { border-color: var(--warn); color: var(--warn); }
+.board-health.bad { border-color: var(--bad); color: var(--bad); }
+.board-clock { font-size: 40px; font-weight: 700; color: var(--text); }
+.board-main { max-width: none; padding: 24px 32px; display: flex; flex-direction: column; gap: 28px; }
+.board-main h2 { margin: 0 0 14px; font-size: 26px; color: var(--text-dim); font-weight: 700; }
+.board-offline {
+  font-size: 34px; font-weight: 800; text-align: center; padding: 18px;
+  border: 3px solid var(--bad); border-radius: 14px; color: var(--bad);
+}
+.board-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.board-tile { border: 2px solid var(--line); border-radius: 16px; padding: 18px 24px; background: #12141d; }
+.board-tile.attention { border-color: var(--warn); }
+.board-number { font-size: 96px; font-weight: 800; line-height: 1.05; min-height: 1.05em; font-variant-numeric: tabular-nums; }
+.board-tile.attention .board-number { color: var(--warn); }
+.board-label { font-size: 26px; font-weight: 600; }
+.board-since { font-size: 20px; color: var(--text-dim); min-height: 1.3em; }
+.board-pending { font-size: 22px; font-weight: 600; margin-left: 12px; }
+.board-jobs { display: flex; flex-direction: column; gap: 12px; }
+.board-job {
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.4fr) minmax(0, 1fr) 4.5em;
+  align-items: center; gap: 18px; padding: 12px 18px; border: 1px solid var(--line); border-radius: 12px;
+}
+.board-job-name { font-size: 24px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.board-job-step { font-size: 22px; color: var(--text-dim); }
+.board-progress { height: 14px; }
+.board-job-pct { font-size: 24px; text-align: right; }
+.board-idle, .board-ok, .board-more { font-size: 24px; color: var(--text-dim); }
+.board-ok { color: var(--ok); font-weight: 700; }
+.board-problem { font-size: 24px; padding: 10px 16px; border-left: 6px solid var(--warn); margin-bottom: 8px; }
+.board-problem.bad { border-left-color: var(--bad); }
+.board-updated { font-size: 16px; }
+
+/* /user (P12.12): the count under the list of links, red over the limit. */
+.links-count { margin-top: 4px; }
+.links-count.bad { color: var(--bad); font-weight: 600; }
+
+/* The sound's settings window (plan P12.9). */
+.dlg:has(.snd-form) { max-width: 560px; }
+.snd-form { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+.snd-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.snd-row input[type="range"] { flex: 1; min-width: 160px; }
+.snd-check { display: inline-flex; align-items: center; gap: 8px; flex: 1; min-width: 220px; cursor: pointer; }
+.snd-check input { width: 18px; height: 18px; margin: 0; }
+.snd-value { min-width: 3.5em; text-align: right; font-family: var(--mono); }
+.snd-events { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px 10px; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.snd-events legend { padding: 0 6px; color: var(--text-dim); }
+.snd-mins { width: 5em; }
+.snd-mins-label { color: var(--text-dim); }
+.snd-test { padding: 4px 10px; font-size: 13px; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Nothing under 12 px: app.css's smaller sizes, raised on these pages. */
+thead th { font-size: 12px; }
+.badge { font-size: 12px; }
+.job-id { font-size: 12px; }
+.job-url { font-size: 12px; }
+.job-meta { font-size: 12.5px; }
+.reason { font-size: 12.5px; }
+.fchip .n { font-size: 12px; }
+.ib-day { font-size: 12px; }
+.mail-from .clip { font-size: 12px; }
+.new-pill { font-size: 12px; }
+.mail-sum { font-size: 12.5px; }
+.pane-title { font-size: 12px; }
+.legend { font-size: 12px; }
+.tag { font-size: 12px; }
+.jc-sub { font-size: 12.5px; }
+.jc-found { font-size: 12px; }
+.jc-hint .note { font-size: 12px; }
+.jc-override input { font-size: 12.5px; }
+.timeline li { font-size: 12.5px; }
+.tech { font-size: 12px; }
+.tech-log { font-size: 12px; }
+.rail-sep { font-size: 12px; }
+.skipcard .u { font-size: 12.5px; }
+.skipcard .why { font-size: 12.5px; }
+.mail-link { font-size: 12.5px; }
+@media (max-width: 760px) {
+  .avatar { font-size: 12px; }
+}

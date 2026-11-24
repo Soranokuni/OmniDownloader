@@ -579,7 +579,268 @@ impl DependencyManager {
             _ => {}
         }
     }
+
+    // ---- the pending-verdict marker of a verified update (P11.7b, P11.7c) ----
+    //
+    // One file in `bin/` per tool (`marker`), holding the hash of the build an
+    // update swapped in and has not judged yet. Shared by yt-dlp and Deno.
+
+    /// Before a verified update swaps the build with hash `sha256` in:
+    /// written and flushed, so a stop or crash before the verdict leaves it.
+    fn mark_verifying(&self, marker: &str, sha256: &str) -> Result<()> {
+        use std::io::Write;
+        let marker = self.bin_dir.join(marker);
+        let mut f = std::fs::File::create(&marker).with_context(|| format!("Failed writing {marker:?}"))?;
+        f.write_all(sha256.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    /// The verdict is recorded (whatever it was): nothing is left to verify.
+    /// An error when the marker is there and stays (P11.7b2): left behind a
+    /// kept build, it would have the next start roll that build back.
+    fn clear_verifying(&self, marker: &str) -> Result<()> {
+        let marker = self.bin_dir.join(marker);
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("Could not remove {marker:?}")),
+            _ => Ok(()),
+        }
+    }
+
+    /// The hash in the marker, if an update waits for its verdict.
+    fn verifying_sha256(&self, marker: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.bin_dir.join(marker)).ok()?;
+        Some(text.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    /// [`Self::clear_verifying`] where a failure is only worth a warning.
+    fn clear_verifying_or_warn(&self, marker: &str) {
+        if let Err(e) = self.clear_verifying(marker) {
+            tracing::warn!("{e:#}");
+        }
+    }
+
+    /// At start-up: an update the last run swapped in but stopped before
+    /// judging (a service stop or crash during its self-check) is unverified,
+    /// so the build that was live before it, which was, comes back; the next
+    /// update run tries the release again (it is not marked rejected). A
+    /// marker whose build is not live (the swap never happened, or was already
+    /// undone) is only removed. A failed rollback keeps the marker, so the
+    /// next start tries again and the next update run verifies the live build.
+    ///
+    /// With no live build (`state.live_exists` false: a swap cut between its
+    /// renames, P11.7b2), of the builds set aside (`state.aside`, each with its
+    /// hash) the first whose hash is known and is not the pending one goes back
+    /// live through `restore`. The pending (unverified) build is never restored
+    /// (P11.7b3). When none qualifies and another build is live anyway
+    /// (`state.other_live`: the legacy one-file yt-dlp), the marker only goes;
+    /// else it stays and the start says no verified build was left.
+    /// `live_sha256` names the live build, `rollback` puts the previous one back.
+    fn recover_unverified(
+        &self,
+        marker: &str,
+        state: impl FnOnce() -> SwapState,
+        restore: impl FnOnce(&Path) -> Result<()>,
+        live_sha256: impl FnOnce() -> Option<String>,
+        rollback: impl FnOnce() -> Result<()>,
+    ) -> UnverifiedUpdate {
+        if !self.bin_dir.join(marker).exists() {
+            return UnverifiedUpdate::None;
+        }
+        let Some(pending) = self.verifying_sha256(marker) else {
+            self.clear_verifying_or_warn(marker);
+            return UnverifiedUpdate::NotLive;
+        };
+        // Only now, with a marker: the state may hash files of ~100 MB (P11.7d).
+        let state = state();
+        if !state.live_exists {
+            let verified = state.aside.iter().find(|(_, sha)| sha.as_deref().is_some_and(|s| s != pending));
+            if let Some((from, _)) = verified {
+                if let Err(e) = restore(from) {
+                    return UnverifiedUpdate::RollbackFailed(format!("the previous build could not be moved back from {from:?}: {e:#}"));
+                }
+                self.clear_verifying_or_warn(marker);
+                return UnverifiedUpdate::SwapRepaired;
+            }
+            if state.other_live {
+                self.clear_verifying_or_warn(marker);
+                return UnverifiedUpdate::SetAside(pending);
+            }
+            return UnverifiedUpdate::RollbackFailed("no verified build was left to put back".into());
+        }
+        if live_sha256().as_deref() != Some(pending.as_str()) {
+            self.clear_verifying_or_warn(marker);
+            return UnverifiedUpdate::NotLive;
+        }
+        match rollback() {
+            Ok(()) => {
+                self.clear_verifying_or_warn(marker);
+                UnverifiedUpdate::RolledBack(pending)
+            }
+            Err(e) => UnverifiedUpdate::RollbackFailed(format!("{e:#}")),
+        }
+    }
+
+    /// [`Self::mark_verifying`] for yt-dlp (P11.7b).
+    pub fn mark_ytdl_verifying(&self, sha256: &str) -> Result<()> {
+        self.mark_verifying(YTDL_VERIFYING_MARKER, sha256)
+    }
+
+    /// [`Self::clear_verifying`] for yt-dlp.
+    pub fn clear_ytdl_verifying(&self) -> Result<()> {
+        self.clear_verifying(YTDL_VERIFYING_MARKER)
+    }
+
+    /// The hash in yt-dlp's pending-verdict marker (P11.7b2).
+    pub fn ytdl_verifying_sha256(&self) -> Option<String> {
+        self.verifying_sha256(YTDL_VERIFYING_MARKER)
+    }
+
+    /// [`Self::recover_unverified`] for yt-dlp (P11.7b, P11.7b2, P11.7b3). A
+    /// cut swap leaves no `yt-dlp/` and the two builds as `yt-dlp.prev/` and
+    /// `yt-dlp.staged/` (which is which depends on the rename that was cut);
+    /// each folder build names itself in its `.sha256`. The legacy one-file
+    /// exe, when present, is live whenever no folder build is.
+    pub fn recover_unverified_ytdl(&self) -> UnverifiedYtdl {
+        let live = self.ytdl_dir();
+        let folder_sha = |dir: PathBuf| {
+            let sha = dir
+                .join("yt-dlp.exe")
+                .is_file()
+                .then(|| std::fs::read_to_string(dir.join(SHA_MARKER)).ok())
+                .flatten()
+                .map(|s| s.trim().to_string());
+            (dir, sha)
+        };
+        let state = || {
+            let live_exists = live.exists();
+            SwapState {
+                live_exists,
+                // Read only when there is something to repair.
+                aside: if live_exists { Vec::new() } else { vec![folder_sha(self.ytdl_dir_previous()), folder_sha(self.ytdl_dir_staged())] },
+                other_live: self.ytdl_legacy().is_file(),
+            }
+        };
+        self.recover_unverified(
+            YTDL_VERIFYING_MARKER,
+            state,
+            |from| rename_patiently(from, &live).map_err(Into::into),
+            || self.ytdl_live_sha256(),
+            || self.rollback_ytdl().map(|_| ()),
+        )
+    }
+
+    /// After an apply that failed (P11.7b3): the marker goes only when a build
+    /// is still live, so a start-up repair can act on one that is not.
+    /// `Ok(true)` when it went.
+    fn clear_verifying_if_live(&self, marker: &str, live_exists: bool) -> Result<bool> {
+        if !live_exists {
+            return Ok(false);
+        }
+        self.clear_verifying(marker).map(|()| true)
+    }
+
+    /// [`Self::clear_verifying_if_live`] for yt-dlp: live is `yt-dlp/`.
+    pub fn clear_ytdl_verifying_if_live(&self) -> Result<bool> {
+        self.clear_verifying_if_live(YTDL_VERIFYING_MARKER, self.ytdl_dir().exists())
+    }
+
+    /// [`Self::clear_verifying_if_live`] for Deno: live is `deno.exe`.
+    pub fn clear_deno_verifying_if_live(&self) -> Result<bool> {
+        self.clear_verifying_if_live(DENO_VERIFYING_MARKER, self.deno_live().exists())
+    }
+
+    /// The hash that identifies the live Deno: its exe's own (P11.7c).
+    pub fn deno_live_sha256(&self) -> Option<String> {
+        std::fs::read(self.deno_live()).ok().map(|b| sha256_hex(&b))
+    }
+
+    /// The hash of the staged Deno, `None` when none is staged (P11.7c).
+    pub fn deno_staged_sha256(&self) -> Option<String> {
+        std::fs::read(self.deno_staged()).ok().map(|b| sha256_hex(&b))
+    }
+
+    /// [`Self::mark_verifying`] for Deno (P11.7c).
+    pub fn mark_deno_verifying(&self, sha256: &str) -> Result<()> {
+        self.mark_verifying(DENO_VERIFYING_MARKER, sha256)
+    }
+
+    /// [`Self::clear_verifying`] for Deno (P11.7c).
+    pub fn clear_deno_verifying(&self) -> Result<()> {
+        self.clear_verifying(DENO_VERIFYING_MARKER)
+    }
+
+    /// The hash in Deno's pending-verdict marker (P11.7c).
+    pub fn deno_verifying_sha256(&self) -> Option<String> {
+        self.verifying_sha256(DENO_VERIFYING_MARKER)
+    }
+
+    /// [`Self::recover_unverified`] for Deno (P11.7c): a cut swap left no
+    /// `deno.exe` and the old one as `deno.exe.prev`.
+    pub fn recover_unverified_deno(&self) -> UnverifiedUpdate {
+        let live = self.deno_live();
+        let file_sha = |path: PathBuf| {
+            let sha = std::fs::read(&path).ok().map(|b| sha256_hex(&b));
+            (path, sha)
+        };
+        let state = || {
+            let live_exists = live.exists();
+            SwapState {
+                live_exists,
+                // Hashed (about 100 MB each) only when there is something to repair (P11.7d).
+                aside: if live_exists { Vec::new() } else { vec![file_sha(self.deno_previous()), file_sha(self.deno_staged())] },
+                other_live: false,
+            }
+        };
+        self.recover_unverified(
+            DENO_VERIFYING_MARKER,
+            state,
+            |from| std::fs::rename(from, &live).map_err(Into::into),
+            || self.deno_live_sha256(),
+            || self.rollback_deno(),
+        )
+    }
 }
+
+/// What a start-up recovery sees of a tool's builds (P11.7b3).
+struct SwapState {
+    /// The live build is in place.
+    live_exists: bool,
+    /// The builds set aside (previous, staged), each with its hash if known.
+    aside: Vec<(PathBuf, Option<String>)>,
+    /// Another build is live when this one is not (the legacy one-file yt-dlp).
+    other_live: bool,
+}
+
+/// yt-dlp's name for [`UnverifiedUpdate`] (P11.7b).
+pub type UnverifiedYtdl = UnverifiedUpdate;
+
+/// What the start-up check for an unjudged update found and did (P11.7b, P11.7c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnverifiedUpdate {
+    /// No update was waiting for its verdict.
+    None,
+    /// One was, but its build is not live: the marker is removed.
+    NotLive,
+    /// The unverified build (this hash) was rolled back.
+    RolledBack(String),
+    /// The swap was cut between its renames: the build that was live before
+    /// it was moved back.
+    SwapRepaired,
+    /// The unverified build (this hash) is set aside and the legacy one-file
+    /// yt-dlp is live: only the marker went (P11.7b3).
+    SetAside(String),
+    /// The rollback failed: the unverified build stays live.
+    RollbackFailed(String),
+}
+
+/// In `bin/`: the hash of a yt-dlp build swapped in and not yet judged by its
+/// self-check (P11.7b). Removed with the verdict.
+pub const YTDL_VERIFYING_MARKER: &str = "yt-dlp.exe.verifying";
+
+/// In `bin/`: the hash of a Deno swapped in and not yet judged by its
+/// self-check (P11.7c). Removed with the verdict.
+pub const DENO_VERIFYING_MARKER: &str = "deno.exe.verifying";
 
 /// In `bin/`, next to `yt-dlp.exe.rejected`: the nights in a row the nightly
 /// yt-dlp update was postponed, and the local date of the last one (P11.4).
@@ -637,7 +898,10 @@ fn extract_zip_into(bytes: &[u8], dest: &Path) -> Result<()> {
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(rel) = entry.enclosed_name() else {
-            anyhow::bail!("the yt-dlp download has an entry outside its folder: {}", entry.name());
+            anyhow::bail!(
+                "the yt-dlp download has an entry outside its folder: {}",
+                entry.name().map(|n| n.into_owned()).unwrap_or_default()
+            );
         };
         let out = dest.join(rel);
         if entry.is_dir() {
@@ -1686,7 +1950,8 @@ fn extract_pinned_members(zip_path: &Path, pin: &ToolPin, dest: &Path) -> Result
         let mut found: Option<usize> = None;
         for i in 0..archive.len() {
             let entry = archive.by_index(i)?;
-            if entry.is_dir() || !entry_matches(entry.name(), m.entry_suffix) {
+            // A name that does not decode is not the member being looked for.
+            if entry.is_dir() || !entry.name().is_ok_and(|n| entry_matches(&n, m.entry_suffix)) {
                 continue;
             }
             if found.is_some() {
@@ -1860,6 +2125,232 @@ ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  yt-dlp_macos
         // ...and the rollback itself is reversible.
         mgr.rollback_ytdl().unwrap();
         assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"new build");
+    }
+
+    /// P11.7b: a build swapped in whose self-check was cut short (the service
+    /// stopped) is rolled back at the next start; the marker goes with it.
+    #[test]
+    fn a_swapped_build_with_no_verdict_is_rolled_back_at_start_up() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None);
+
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        mgr.apply_staged_ytdl().unwrap();
+        // ...the service stops here, before the verdict.
+
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::RolledBack("bbb".into()));
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("aaa"), "the build that was verified is back");
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+        assert!(!dir.path().join("yt-dlp.exe.rejected").exists(), "not rejected: the next run verifies it again");
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None, "once");
+    }
+
+    /// P11.7b: a verdict clears the marker; a marker whose build never went
+    /// live (stopped before the swap) is removed and nothing is rolled back.
+    #[test]
+    fn a_judged_or_never_swapped_build_is_left_live() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        mgr.apply_staged_ytdl().unwrap();
+        mgr.clear_ytdl_verifying().unwrap(); // the verdict: kept
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::None);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("bbb"));
+
+        mgr.mark_ytdl_verifying("ccc").unwrap(); // stopped before the swap
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::NotLive);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("bbb"));
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b2: a swap cut between its renames (no `yt-dlp/`, the old build in
+    /// `yt-dlp.prev/`) gets the old build back at start-up.
+    #[test]
+    fn a_swap_cut_between_its_renames_gets_the_previous_build_back() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        // The first rename of the swap, and the service stops.
+        std::fs::rename(mgr.ytdl_dir(), mgr.ytdl_dir_previous()).unwrap();
+        assert!(!mgr.ytdl_dir().exists());
+
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::SwapRepaired);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("aaa"));
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"old build");
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b3: a legacy-only install (one-file exe, no folder build before the
+    /// update). The verify's first swap set the NEW build aside as
+    /// `yt-dlp.prev/` and the one-file exe is live; a stop there must not put
+    /// the unverified build back live. It stays aside; only the marker goes.
+    #[test]
+    fn on_a_legacy_install_the_unverified_build_set_aside_is_never_restored() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        std::fs::write(mgr.ytdl_legacy(), b"one-file").unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        mgr.apply_staged_ytdl().unwrap();
+        // The self-check's look at the old build: the folder build steps aside.
+        mgr.rollback_ytdl().unwrap();
+        assert!(!mgr.ytdl_dir().exists());
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"one-file");
+
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::SetAside("bbb".into()));
+        assert!(!mgr.ytdl_dir().exists(), "the unverified build is not put back live");
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"one-file");
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b3: the self-check's swap back to the new build cut after its first
+    /// rename (no `yt-dlp/`, `prev` = the new build, `staged` = the old one):
+    /// the old, verified build goes back live, never the new one.
+    #[test]
+    fn a_swap_back_cut_restores_the_old_build_not_the_unverified_one() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        stage_folder(&mgr, b"new build", "bbb");
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        mgr.apply_staged_ytdl().unwrap();
+        mgr.rollback_ytdl().unwrap(); // the look at the old build: old live, new as prev
+        // The swap back starts: the old build steps aside as staged, and the service stops.
+        std::fs::rename(mgr.ytdl_dir(), mgr.ytdl_dir_staged()).unwrap();
+
+        assert_eq!(mgr.recover_unverified_ytdl(), UnverifiedYtdl::SwapRepaired);
+        assert_eq!(mgr.ytdl_live_sha256().as_deref(), Some("aaa"), "the verified build is live");
+        assert_eq!(std::fs::read(mgr.ytdl_live()).unwrap(), b"old build");
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b3: after a failed apply, the marker goes only while a build is live.
+    #[test]
+    fn a_failed_apply_keeps_the_marker_when_no_build_is_left_live() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        mgr.mark_ytdl_verifying("bbb").unwrap();
+        assert!(!mgr.ytdl_dir().exists());
+        assert!(!mgr.clear_ytdl_verifying_if_live().unwrap());
+        assert!(dir.path().join(YTDL_VERIFYING_MARKER).exists(), "kept for the start-up repair");
+        stage_folder(&mgr, b"old build", "aaa");
+        mgr.apply_staged_ytdl().unwrap();
+        assert!(mgr.clear_ytdl_verifying_if_live().unwrap());
+        assert!(!dir.path().join(YTDL_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7d: a start with no marker reads nothing of the builds (no file of
+    /// ~100 MB is hashed): the swap state is never asked for.
+    #[test]
+    fn a_start_without_a_marker_reads_no_build() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        let got = mgr.recover_unverified(
+            DENO_VERIFYING_MARKER,
+            || panic!("the swap state was read with no marker"),
+            |_| panic!("restore"),
+            || panic!("live hash"),
+            || panic!("rollback"),
+        );
+        assert_eq!(got, UnverifiedUpdate::None);
+    }
+
+    /// A Deno as `stage_deno` leaves it, staged (no process is run).
+    fn stage_deno_file(mgr: &DependencyManager, content: &[u8]) -> String {
+        std::fs::write(mgr.deno_staged(), content).unwrap();
+        sha256_hex(content)
+    }
+
+    /// P11.7c: a Deno swapped in whose self-check was cut short is rolled back
+    /// at the next start, not marked rejected; the marker goes with it.
+    #[test]
+    fn a_swapped_deno_with_no_verdict_is_rolled_back_at_start_up() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        assert_eq!(mgr.recover_unverified_deno(), UnverifiedUpdate::None);
+        std::fs::write(mgr.deno_live(), b"old deno").unwrap();
+        let new = stage_deno_file(&mgr, b"new deno");
+        assert_eq!(mgr.deno_staged_sha256().as_deref(), Some(new.as_str()));
+        mgr.mark_deno_verifying(&new).unwrap();
+        mgr.apply_staged_deno("9.9.9").unwrap();
+        // ...the service stops here, before the verdict.
+
+        assert_eq!(mgr.recover_unverified_deno(), UnverifiedUpdate::RolledBack(new));
+        assert_eq!(std::fs::read(mgr.deno_live()).unwrap(), b"old deno");
+        assert!(!dir.path().join(DENO_VERIFYING_MARKER).exists());
+        assert_eq!(mgr.recover_unverified_deno(), UnverifiedUpdate::None, "once");
+    }
+
+    /// P11.7c: a verdict clears the marker; a marker whose Deno never went live
+    /// is removed and nothing is rolled back.
+    #[test]
+    fn a_judged_or_never_swapped_deno_is_left_live() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        std::fs::write(mgr.deno_live(), b"old deno").unwrap();
+        let new = stage_deno_file(&mgr, b"new deno");
+        mgr.mark_deno_verifying(&new).unwrap();
+        mgr.apply_staged_deno("9.9.9").unwrap();
+        mgr.clear_deno_verifying().unwrap(); // the verdict: kept
+        assert_eq!(mgr.recover_unverified_deno(), UnverifiedUpdate::None);
+        assert_eq!(std::fs::read(mgr.deno_live()).unwrap(), b"new deno");
+
+        mgr.mark_deno_verifying(&sha256_hex(b"newer deno")).unwrap(); // stopped before the swap
+        assert_eq!(mgr.recover_unverified_deno(), UnverifiedUpdate::NotLive);
+        assert_eq!(std::fs::read(mgr.deno_live()).unwrap(), b"new deno");
+        assert!(!dir.path().join(DENO_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7c (with P11.7b2/b3): a Deno swap cut between its renames (no
+    /// `deno.exe`, the old one as `.prev`, the new one still staged) gets the
+    /// old one back, never the unverified one; with only the unverified one
+    /// aside, nothing is restored and the marker stays.
+    #[test]
+    fn a_deno_swap_cut_gets_the_old_deno_back_never_the_unverified_one() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        std::fs::write(mgr.deno_live(), b"old deno").unwrap();
+        let new = stage_deno_file(&mgr, b"new deno");
+        mgr.mark_deno_verifying(&new).unwrap();
+        std::fs::rename(mgr.deno_live(), mgr.deno_previous()).unwrap(); // the first rename only
+        assert_eq!(mgr.recover_unverified_deno(), UnverifiedUpdate::SwapRepaired);
+        assert_eq!(std::fs::read(mgr.deno_live()).unwrap(), b"old deno");
+        assert!(!dir.path().join(DENO_VERIFYING_MARKER).exists());
+
+        // Only the unverified Deno is aside: it is not put live.
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        let new = stage_deno_file(&mgr, b"new deno");
+        mgr.mark_deno_verifying(&new).unwrap();
+        assert!(matches!(mgr.recover_unverified_deno(), UnverifiedUpdate::RollbackFailed(_)));
+        assert!(!mgr.deno_live().exists());
+        assert!(dir.path().join(DENO_VERIFYING_MARKER).exists(), "kept for the next start");
+
+        // After a failed apply with no Deno live, the marker stays (P11.7b3).
+        assert!(!mgr.clear_deno_verifying_if_live().unwrap());
+        assert!(dir.path().join(DENO_VERIFYING_MARKER).exists());
+    }
+
+    /// P11.7b2: a marker that cannot be removed is an error the caller sees.
+    #[test]
+    fn a_verdict_marker_that_cannot_be_removed_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let mgr = DependencyManager::new(dir.path());
+        assert!(mgr.clear_ytdl_verifying().is_ok(), "no marker: nothing to do");
+        // A directory under the marker's name cannot be removed as a file.
+        std::fs::create_dir(dir.path().join(YTDL_VERIFYING_MARKER)).unwrap();
+        assert!(mgr.clear_ytdl_verifying().is_err());
     }
 
     #[test]

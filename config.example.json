@@ -39,7 +39,10 @@
   "max_concurrent_downloads": 2,
   "max_concurrent_transcodes": 2,
 
-  "email_poll_interval_secs": 30,
+  "mail": {
+    "_comment": "How often the mailbox (the graph section) is read, in seconds; at least 10. Config v2: an older file's email_poll_interval_secs moves here by itself.",
+    "poll_interval_secs": 30
+  },
 
   "graph": {
     "_comment": "Office 365 mailbox through Microsoft Graph. When tenant_id, client_id, mailbox and the client secret (`omni-ingest secrets set graph.client_secret`) are all set, the mailbox is polled; otherwise email ingest is off. The app needs Mail.Read only; write_access (with Mail.ReadWrite) also marks and files mail under the two folders. See README, 'Office 365 mailbox'.",
@@ -51,11 +54,10 @@
     "failed_folder": "Omni/Failed"
   },
 
-  "ollama_endpoint": "http://127.0.0.1:1234/v1",
-  "ollama_model": "google/gemma-4-e4b",
-
   "llm": {
-    "_comment": "The deterministic parser decides every job. In \"assist\" mode the model is asked only when the parser cannot name the journalist of a routed mail or make a keyword from a title, and what it proposes is checked against the roster and ^[A-Z0-9]{2,20}$. \"off\" never calls it. With the model down the jobs are identical.",
+    "_comment": "The deterministic parser decides every job. In \"assist\" mode the model is asked only when the parser cannot name the journalist of a routed mail or make a keyword from a title, and what it proposes is checked against the roster and ^[A-Z0-9]{2,20}$. \"off\" never calls it. With the model down the jobs are identical. endpoint is any OpenAI-compatible base URL (https for an online provider). Config v2: an older file's ollama_endpoint and ollama_model move here by themselves.",
+    "endpoint": "http://127.0.0.1:1234/v1",
+    "model": "google/gemma-4-e4b",
     "mode": "assist",
     "provider": "lmstudio",
     "auth": "none",

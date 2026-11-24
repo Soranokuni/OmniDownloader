@@ -186,6 +186,24 @@ fn wrong_video_revokes_the_trust_once_and_skips_the_address() -> Result<()> {
     Ok(())
 }
 
+/// P14.3c: a «Λάθος βίντεο» skip saved before the `url` 2.5.9 upgrade (a `^`
+/// in the path as sent) still bars the same video, whose pattern today has
+/// `%5E`; one saved today is read as it was saved.
+#[test]
+fn a_skip_saved_before_the_url_upgrade_still_bars_the_video() -> Result<()> {
+    let r = rig();
+    let until = omni_core::timestamps::format(Utc::now() + chrono::Duration::days(7));
+    r.raw().execute("INSERT INTO repair_skips (domain, pattern, until) VALUES (?, ?, ?)", params![DOMAIN, "cdn.news.example/clips/a^b.mp4", until])?;
+    r.raw().execute("INSERT INTO repair_skips (domain, pattern, until) VALUES (?, ?, ?)", params![DOMAIN, "cdn.news.example/clips/c%5Ed.mp4", until])?;
+    let skips = r.repo.repair_skip_patterns(DOMAIN, Utc::now())?;
+    let same = omni_core::urlnorm::skip_pattern("https://cdn.news.example/clips/a^b.mp4?token=9").unwrap();
+    assert!(skips.contains(&same), "{same} not in {skips:?}");
+    let today = omni_core::urlnorm::skip_pattern("https://cdn.news.example/clips/c^d.mp4").unwrap();
+    assert!(skips.contains(&today), "{today} not in {skips:?}");
+    assert_eq!(skips.len(), 2);
+    Ok(())
+}
+
 #[test]
 fn wrong_video_on_a_job_that_was_not_auto_delivered_changes_nothing() -> Result<()> {
     let r = rig();

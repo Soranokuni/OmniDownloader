@@ -1,259 +1,241 @@
 # ==============================================================================
-# OmniDownloader In-House Broadcast Robustness & Integrity Verification Suite
+# OmniDownloader in-house suite (P14.2)
+#
+# Runs a scratch daemon (its own root under $env:TEMP, its own config, database,
+# watchfolder and loopback port) and sends it one generated clip per case as a
+# mail attachment, the way a journalist would. Every delivered file is checked
+# with ffprobe against the on-air format. Then the daemon is killed by its PID
+# in the middle of an encode, started again, and the job must be delivered
+# exactly once.
+#
+# Never the live daemon: a binary under target\release is refused, and only
+# the PIDs this script started are ever stopped.
+#
+#   powershell -ExecutionPolicy Bypass -File .\scripts\in_house_test.ps1
+#   powershell -ExecutionPolicy Bypass -File .\scripts\in_house_test.ps1 -Binary C:\build\release\omni-ingest.exe
 # ==============================================================================
 param (
-    [string]$BinaryPath = "target\release\omni-ingest.exe",
+    # The build under test. Relative paths resolve against the repository root.
+    [string]$Binary = "target\gate\release\omni-ingest.exe",
+    # Where ffmpeg, ffprobe, bmxtranswrap and yt-dlp are copied from (read only).
     [string]$BinDir = "bin",
-    [int]$TestPort = 8089
+    # Minutes allowed for all the cases, and again for the kill-and-restart job.
+    [int]$TimeoutMinutes = 20,
+    # Keep the scratch root even when everything passed.
+    [switch]$Keep
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$RootDir = Split-Path -Parent $ScriptDir
-Set-Location $RootDir
+$RootDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Definition)
+
+function Resolve-FromRoot([string]$p) {
+    if ([System.IO.Path]::IsPathRooted($p)) { return [System.IO.Path]::GetFullPath($p) }
+    return [System.IO.Path]::GetFullPath((Join-Path $RootDir $p))
+}
+
+$Binary = Resolve-FromRoot $Binary
+$BinDir = Resolve-FromRoot $BinDir
+
+# ------------------------------------------------------------------------------
+# Refusals: the live daemon runs from target\release.
+# ------------------------------------------------------------------------------
+if ($Binary -match '\\target\\release\\omni-ingest\.exe$') {
+    Write-Host "REFUSED: $Binary is the live daemon's binary (target\release)." -ForegroundColor Red
+    Write-Host "Build the one under test elsewhere, e.g. cargo build --release --target-dir target/gate, and pass -Binary." -ForegroundColor Red
+    exit 2
+}
+if (-not (Test-Path -LiteralPath $Binary)) {
+    Write-Host "Binary not found: $Binary (cargo build --release --target-dir target/gate)" -ForegroundColor Red
+    exit 2
+}
+$running = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ($_.Path -ieq $Binary) }
+if ($running) {
+    Write-Host "REFUSED: $Binary is running now (PID $(@($running.Id) -join ', ')); test a copy that nothing runs." -ForegroundColor Red
+    exit 2
+}
+foreach ($tool in @("ffmpeg.exe", "ffprobe.exe", "bmxtranswrap.exe", "yt-dlp.exe")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $BinDir $tool))) {
+        Write-Host "Missing tool: $(Join-Path $BinDir $tool)" -ForegroundColor Red
+        exit 2
+    }
+}
+
+# ------------------------------------------------------------------------------
+# Scratch instance
+# ------------------------------------------------------------------------------
+$Scratch = Join-Path $env:TEMP ("omni-inhouse-" + (Get-Date -Format "yyyyMMdd-HHmmss") + "-" + $PID)
+$ScratchBin = Join-Path $Scratch "bin"
+$Watch = Join-Path $Scratch "watchfolder"
+$Cases = Join-Path $Scratch "cases"
+foreach ($d in @($Scratch, $ScratchBin, (Join-Path $Scratch "data"), $Watch, $Cases)) {
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+}
+# A copy, so nothing the daemon does (a yt-dlp update) can touch the real bin\.
+foreach ($tool in @("ffmpeg.exe", "ffprobe.exe", "bmxtranswrap.exe", "yt-dlp.exe")) {
+    Copy-Item -LiteralPath (Join-Path $BinDir $tool) -Destination $ScratchBin
+}
+$Ffmpeg = Join-Path $ScratchBin "ffmpeg.exe"
+$Ffprobe = Join-Path $ScratchBin "ffprobe.exe"
+
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$listener.Start()
+$Port = $listener.LocalEndpoint.Port
+$listener.Stop()
+$Base = "http://127.0.0.1:$Port"
+
+$ConfigPath = Join-Path $Scratch "config.json"
+$cfg = [ordered]@{
+    database_path               = "data/omni.db"
+    watchfolder_path            = $Watch
+    temp_path                   = "temp"
+    bin_dir                     = "bin"
+    web_port                    = $Port
+    web_host                    = "127.0.0.1"
+    max_concurrent_downloads    = 2
+    max_concurrent_transcodes   = 2
+    ytdl_auto_update_nightly    = $false
+    adblock_enabled             = $false
+    adblock_auto_update_nightly = $false
+    security                    = [ordered]@{ mcr_open_networks = @("127.0.0.1/32", "::1/128") }
+    llm                         = [ordered]@{ mode = "off" }
+    repair                      = [ordered]@{ mode = "off" }
+}
+# UTF-8 without a BOM: Windows PowerShell's "UTF8" writes one, and the JSON reader refuses it.
+$NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($ConfigPath, ($cfg | ConvertTo-Json -Depth 5), $NoBom)
+
+# An invented reporter, so the mails resolve to a journalist.
+$Sender = "reporter@inhouse.example"
+[System.IO.File]::WriteAllText((Join-Path $Scratch "data\journalists.seed.json"),
+    ('[{"surname":"INHOUSE","full_name":"In-house Test Reporter","emails":["' + $Sender + '"],"aliases":[],"default_priority":0}]'), $NoBom)
 
 Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "   OMNIDOWNLOADER IN-HOUSE ROBUSTNESS & INTEGRITY TEST SUITE         " -ForegroundColor Cyan
+Write-Host " OmniDownloader in-house suite" -ForegroundColor Cyan
 Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
-Write-Host "Root Directory: $RootDir" -ForegroundColor Gray
+Write-Host "Binary:  $Binary"
+Write-Host "Scratch: $Scratch"
+Write-Host "Web:     $Base"
 Write-Host ""
 
-$testsPassed = 0
-$testsFailed = 0
-
-function Assert-Step ($name, [scriptblock]$action) {
-    Write-Host "[TEST] $name... " -NoNewline
-    try {
-        & $action
-        Write-Host "PASSED" -ForegroundColor Green
-        $script:testsPassed++
-    } catch {
-        Write-Host "FAILED" -ForegroundColor Red
-        Write-Host "  Error: $_" -ForegroundColor DarkRed
-        $script:testsFailed++
-    }
+$results = New-Object System.Collections.ArrayList
+function Add-Result([string]$name, [bool]$ok, [string]$detail) {
+    [void]$results.Add([pscustomobject]@{ Name = $name; Ok = $ok; Detail = $detail })
+    if ($ok) { Write-Host "[PASS] $name" -ForegroundColor Green }
+    else { Write-Host "[FAIL] $name -- $detail" -ForegroundColor Red }
 }
 
-# ------------------------------------------------------------------------------
-# 1. Verify Compiled Release Binary
-# ------------------------------------------------------------------------------
-Assert-Step "Verify Production Release Binary" {
-    if (-not (Test-Path $BinaryPath)) {
-        throw "Binary not found at $BinaryPath. Run 'cargo build --release' first."
-    }
-    $verOutput = & $BinaryPath --version
-    if (-not ($verOutput -match "omni-ingest")) {
-        throw "Binary output did not contain 'omni-ingest': $verOutput"
-    }
-}
+. (Join-Path $PSScriptRoot "in_house_lib.ps1")
 
-# ------------------------------------------------------------------------------
-# 2. Verify Toolchain Binaries
-# ------------------------------------------------------------------------------
-$requiredTools = @("ffmpeg.exe", "ffprobe.exe", "bmxtranswrap.exe", "yt-dlp.exe")
-foreach ($tool in $requiredTools) {
-    Assert-Step "Verify Toolchain Binary: $tool" {
-        $path = Join-Path $BinDir $tool
-        if (-not (Test-Path $path)) {
-            throw "Missing tool: $path"
+$daemon = $null
+try {
+    # --------------------------------------------------------------------------
+    # The cases
+    # --------------------------------------------------------------------------
+    # Keys are letters only: the keyword (and so the file name) drops digits,
+    # and two cases with one keyword would be delivered as NAME and NAME_2.
+    $caseList = @(
+        @{ Key = "TWENTYFIVEP";  Name = "25p";      Vf = "testsrc2=size=1920x1080:rate=25";  Audio = "stereo"; Extra = @() },
+        @{ Key = "THIRTYP";      Name = "30p";      Vf = "testsrc2=size=1280x720:rate=30";   Audio = "stereo"; Extra = @() },
+        @{ Key = "TWENTYFIVEI";  Name = "25i";      Vf = "testsrc2=size=1920x1080:rate=50,tinterlace=mode=interleave_top,setfield=tff"; Audio = "stereo"; Extra = @("-flags", "+ildct+ilme", "-x264-params", "tff=1") },
+        @{ Key = "FIFTYP";       Name = "50p";      Vf = "testsrc2=size=1920x1080:rate=50";  Audio = "stereo"; Extra = @() },
+        @{ Key = "MONO";         Name = "mono";     Vf = "testsrc2=size=1920x1080:rate=25";  Audio = "mono";   Extra = @() },
+        @{ Key = "SURROUND";     Name = "5.1";      Vf = "testsrc2=size=1920x1080:rate=25";  Audio = "5.1";    Extra = @() },
+        @{ Key = "NOAUDIO";      Name = "no audio"; Vf = "testsrc2=size=1920x1080:rate=25";  Audio = "none";   Extra = @() }
+    )
+    $seconds = 6
+    $emls = @()
+    foreach ($c in $caseList) {
+        $clip = Join-Path $Cases ($c.Key.ToLower() + ".mp4")
+        New-Clip -Ffmpeg $Ffmpeg -Out $clip -Vf $c.Vf -Audio $c.Audio -Seconds $seconds -Extra $c.Extra
+        $emls += New-Eml -Dir $Cases -Clip $clip -Key $c.Key -Sender $Sender
+    }
+    # The long clip for kill-and-restart: long enough to be caught mid-encode.
+    $longClip = Join-Path $Cases "restart.mp4"
+    New-Clip -Ffmpeg $Ffmpeg -Out $longClip -Vf "testsrc2=size=1920x1080:rate=50" -Audio "stereo" -Seconds 120 -Extra @()
+    $longEml = New-Eml -Dir $Cases -Clip $longClip -Key "RESTART" -Sender $Sender
+
+    $daemon = Start-Daemon -Binary $Binary -Scratch $Scratch -Config $ConfigPath -Base $Base -Tag "1"
+
+    $ingest = Invoke-MailIngest -Binary $Binary -Scratch $Scratch -Config $ConfigPath -Emls $emls
+    Write-Host $ingest
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $jobs = Wait-Jobs -Base $Base -Count $caseList.Count -Deadline $deadline
+    for ($i = 0; $i -lt $caseList.Count; $i++) {
+        $c = $caseList[$i]
+        # The job's address names its mail, and the mail's Message-ID names the case.
+        $job = $jobs | Where-Object { $_.url -like ("attachment://inhouse-" + $c.Key + "-*") } | Select-Object -First 1
+        if (-not $job) { Add-Result "case $($c.Name)" $false "no job from mail $($c.Key)"; continue }
+        if ($job.status -ne "COMPLETED") {
+            Add-Result "case $($c.Name)" $false "job #$($job.id) ended $($job.status) $($job.error_code): $($job.error_message)"
+            continue
         }
-        $flag = if ($tool -match "ffmpeg|ffprobe") { "-version" } elseif ($tool -eq "yt-dlp.exe") { "--version" } else { "" }
-        if ($flag) {
-            $out = & $path $flag 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw "Tool $tool exited with code $LASTEXITCODE"
-            }
-        }
-    }
-}
-
-# ------------------------------------------------------------------------------
-# 3. Test Broadcast Transcoding & Dalet RDD9 OP1a Pipeline
-# ------------------------------------------------------------------------------
-Assert-Step "End-to-End Sony XDCAM HD422 PAL 1080i50 + EBU R48 Transcode & Rewrap" {
-    $tempDir = Join-Path $RootDir "temp\inhouse_test"
-    $watchDir = Join-Path $RootDir "temp\inhouse_watchfolder"
-    if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
-    if (Test-Path $watchDir) { Remove-Item $watchDir -Recurse -Force }
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    New-Item -ItemType Directory -Path $watchDir -Force | Out-Null
-
-    $ffmpeg = Join-Path $BinDir "ffmpeg.exe"
-    $ffprobe = Join-Path $BinDir "ffprobe.exe"
-    $bmxtranswrap = Join-Path $BinDir "bmxtranswrap.exe"
-
-    # Step A: Generate 2-second synthetic SMPTE color bars + 1kHz stereo tone at 50fps
-    $synthInput = Join-Path $tempDir "synth_input.mp4"
-    $pA = Start-Process -FilePath $ffmpeg -ArgumentList @(
-        "-y", "-f", "lavfi", "-i", "smptebars=size=1280x720:rate=50",
-        "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000",
-        "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", $synthInput
-    ) -NoNewWindow -Wait -PassThru
-    if ($pA.ExitCode -ne 0 -or -not (Test-Path $synthInput)) {
-        throw "Failed creating synthetic input file with FFmpeg (ExitCode: $($pA.ExitCode))"
+        $problems = Test-OnAir -Ffprobe $Ffprobe -File $job.file_path -Watch $Watch -SourceSeconds $seconds
+        Add-Result "case $($c.Name) (job #$($job.id), $(Split-Path -Leaf $job.file_path))" ($problems.Count -eq 0) ($problems -join "; ")
     }
 
-    # Step B: Transcode to Sony XDCAM HD422 PAL 1080i50 with EBU R48 8-channel discrete audio
-    $intermediateMxf = Join-Path $tempDir "intermediate.mxf"
-    $filterComplex = "[0:a:0]pan=mono|c0=c0[l];[0:a:0]pan=mono|c0=c1[r]"
-    
-    $pB = Start-Process -FilePath $ffmpeg -ArgumentList @(
-        "-y", "-threads", "0", "-i", $synthInput, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
-        "-filter_complex", $filterComplex,
-        "-map", "0:v", "-map", "[l]", "-map", "[r]",
-        "-map", "1:a", "-map", "1:a", "-map", "1:a", "-map", "1:a", "-map", "1:a", "-map", "1:a",
-        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,tinterlace=mode=interleave_top:flags=vlpf,format=yuv422p",
-        "-sws_flags", "bilinear",
-        "-c:v", "mpeg2video", "-b:v", "50M", "-minrate", "50M", "-maxrate", "50M", "-bufsize", "17825792",
-        "-profile:v", "0", "-level:v", "2", "-pix_fmt", "yuv422p",
-        "-g", "12", "-bf", "2", "-flags", "+ildct+ilme", "-top", "1",
-        "-r", "25", "-aspect", "16:9",
-        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-c:a", "pcm_s24le", "-ar", "48000", "-shortest",
-        $intermediateMxf
-    ) -NoNewWindow -Wait -PassThru
-
-
-    if ($pB.ExitCode -ne 0 -or -not (Test-Path $intermediateMxf)) {
-        throw "FFmpeg transcode to intermediate MXF failed (ExitCode: $($pB.ExitCode))"
-    }
-
-    # Step C: Rewrap with bmxtranswrap to SMPTE RDD9 OP1a
-    $rdd9Output = Join-Path $tempDir "final_rdd9.mxf"
-    $pC = Start-Process -FilePath $bmxtranswrap -ArgumentList @(
-        "-t", "rdd9", "--tc-rate", "25", "-o", $rdd9Output, $intermediateMxf
-    ) -NoNewWindow -Wait -PassThru
-
-    if ($pC.ExitCode -ne 0 -or -not (Test-Path $rdd9Output)) {
-        throw "bmxtranswrap rewrap to RDD9 failed (ExitCode: $($pC.ExitCode))"
-    }
-
-
-    # Step D: Inspect output with ffprobe and assert strict broadcast compliance
-    $probeJson = & $ffprobe -v quiet -print_format json -show_streams -show_format $rdd9Output | ConvertFrom-Json
-    
-    # Check Video Stream
-    $videoStream = $probeJson.streams | Where-Object { $_.codec_type -eq "video" }
-    if (-not $videoStream) { throw "No video stream found in MXF output" }
-    if ($videoStream.codec_name -ne "mpeg2video") { throw "Video codec is not mpeg2video: $($videoStream.codec_name)" }
-    if ($videoStream.width -ne 1920 -or $videoStream.height -ne 1080) { throw "Resolution is not 1920x1080: $($videoStream.width)x$($videoStream.height)" }
-    if ($videoStream.pix_fmt -ne "yuv422p") { throw "Pixel format is not yuv422p: $($videoStream.pix_fmt)" }
-
-    # Check Audio Streams (EBU R48: 8 discrete channels)
-    $audioStreams = $probeJson.streams | Where-Object { $_.codec_type -eq "audio" }
-    $totalAudioChannels = ($audioStreams | Measure-Object -Property channels -Sum).Sum
-    if ($totalAudioChannels -ne 8) {
-        throw "Expected 8 total discrete audio channels, got: $totalAudioChannels"
-    }
-
-    # Step E: Test Atomic Delivery to Watchfolder
-    $finalDelivery = Join-Path $watchDir "1_TEST_TOPIC.mxf"
-    $tempDelivery = Join-Path $watchDir ".1_TEST_TOPIC.mxf.tmp"
-    Copy-Item $rdd9Output $tempDelivery
-    Rename-Item $tempDelivery $finalDelivery
-    if (-not (Test-Path $finalDelivery)) {
-        throw "Atomic delivery failed: $finalDelivery does not exist"
-    }
-
-    # Cleanup test media
-    Remove-Item $tempDir -Recurse -Force
-    Remove-Item $watchDir -Recurse -Force
-}
-
-# ------------------------------------------------------------------------------
-# 4. Test Live Web Endpoints with Ephemeral Daemon Instance
-# ------------------------------------------------------------------------------
-Assert-Step "Live Daemon Startup & Web Health Check on Port $TestPort" {
-    $tempConfigPath = Join-Path $RootDir "temp\inhouse_config.json"
-    $tempDbPath = Join-Path $RootDir "temp\inhouse_test.db"
-    
-    $cfg = @{
-        database_path = "temp/inhouse_test.db"
-        watchfolder_path = "temp/inhouse_watchfolder"
-        temp_path = "temp/inhouse_work"
-        bin_dir = "bin"
-        web_port = $TestPort
-        web_host = "127.0.0.1"
-        auth_mode = "open_mcr"
-        max_concurrent_downloads = 2
-        max_concurrent_transcodes = 2
-        ytdl_auto_update_nightly = $false
-    }
-    $cfg | ConvertTo-Json | Set-Content -Path $tempConfigPath -Force
-
-    $daemonLog = Join-Path $RootDir "temp\inhouse_daemon.log"
-    $daemonErrLog = Join-Path $RootDir "temp\inhouse_daemon_err.log"
-    $daemonProcess = Start-Process -FilePath $BinaryPath `
-        -ArgumentList "run --config `"$tempConfigPath`"" `
-        -RedirectStandardOutput $daemonLog `
-        -RedirectStandardError $daemonErrLog `
-        -PassThru
-
-
-    try {
+    # --------------------------------------------------------------------------
+    # Kill and restart in the middle of an encode
+    # --------------------------------------------------------------------------
+    $before = @(Get-ChildItem -LiteralPath $Watch -Recurse -File).Count
+    $ingest = Invoke-MailIngest -Binary $Binary -Scratch $Scratch -Config $ConfigPath -Emls @($longEml)
+    Write-Host $ingest
+    $restartId = $caseList.Count + 1
+    $caught = Wait-Stage -Base $Base -Id $restartId -Stage "TRANSCODE" -Deadline (Get-Date).AddMinutes(5)
+    if (-not $caught) {
+        Add-Result "kill and restart" $false "job #$restartId never reached TRANSCODE while the daemon ran"
+    } else {
         Start-Sleep -Seconds 3
+        Stop-Process -Id $daemon.Id -Force
+        $daemon.WaitForExit(30000) | Out-Null
+        Write-Host "Killed the scratch daemon (PID $($daemon.Id)) during job #$restartId's encode."
+        $daemon = $null
+        Start-Sleep -Seconds 2
+        # The encoder dies with the daemon (job-object tree kill).
+        $orphans = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($ScratchBin, [System.StringComparison]::OrdinalIgnoreCase) })
+        foreach ($o in $orphans) { Stop-Process -Id $o.Id -Force -ErrorAction SilentlyContinue }
+        $early = @(Get-ChildItem -LiteralPath $Watch -Recurse -File).Count - $before
 
-
-        # Test /api/system/status
-        $statusResp = Invoke-RestMethod -Uri "http://127.0.0.1:$TestPort/api/system/status" -TimeoutSec 5
-        if ($statusResp.llm_status -ne "Ready") {
-            throw "System status reported unexpected LLM status: $($statusResp.llm_status)"
+        $daemon = Start-Daemon -Binary $Binary -Scratch $Scratch -Config $ConfigPath -Base $Base -Tag "2"
+        $done = Wait-Jobs -Base $Base -Count $restartId -Deadline (Get-Date).AddMinutes($TimeoutMinutes)
+        $job = $done | Where-Object { $_.id -eq $restartId }
+        $files = @(Get-ChildItem -LiteralPath $Watch -Recurse -File)
+        $mine = @($files | Where-Object { $_.BaseName -eq $job.slug -or $_.BaseName -like ($job.slug + "_*") })
+        $tmps = @($files | Where-Object { $_.Name -like "*.tmp" })
+        $extraJobs = Get-OmniJob -Base $Base -Id ($restartId + 1)
+        $problems = @()
+        if ($orphans.Count -gt 0) { $problems += "$($orphans.Count) encoder process(es) outlived the daemon" }
+        if ($early -ne 0) { $problems += "$early file(s) reached the watchfolder before the restart" }
+        if ($job.status -ne "COMPLETED") { $problems += "job ended $($job.status) $($job.error_code): $($job.error_message)" }
+        if ($mine.Count -ne 1) { $problems += "$($mine.Count) files for $($job.slug) in the watchfolder: $(($mine | ForEach-Object Name) -join ', ')" }
+        if ($tmps.Count -ne 0) { $problems += "left in the watchfolder: $(($tmps | ForEach-Object Name) -join ', ')" }
+        if ($extraJobs) { $problems += "a job #$($restartId + 1) exists" }
+        if ($job.status -eq "COMPLETED") {
+            $problems += Test-OnAir -Ffprobe $Ffprobe -File $job.file_path -Watch $Watch -SourceSeconds 120
         }
-
-        # Test /api/journalists (should be seeded)
-        $journalistsResp = Invoke-RestMethod -Uri "http://127.0.0.1:$TestPort/api/journalists" -TimeoutSec 5
-        if (-not ($journalistsResp.journalists.Count -ge 4)) {
-            throw "Expected at least 4 default seeded journalists, got: $($journalistsResp.journalists.Count)"
-        }
-
-        # Test Web Views
-        $mcrResp = Invoke-WebRequest -Uri "http://127.0.0.1:$TestPort/mcr" -UseBasicParsing -TimeoutSec 5
-        $loginResp = Invoke-WebRequest -Uri "http://127.0.0.1:$TestPort/login" -UseBasicParsing -TimeoutSec 5
-        if ($mcrResp.StatusCode -ne 200 -or $loginResp.StatusCode -ne 200) {
-            throw "Web views returned non-200 status: MCR=$($mcrResp.StatusCode), Login=$($loginResp.StatusCode)"
-        }
-
-        # Test POST /api/jobs
-        $newJob = @{
-            url = "https://www.youtube.com/watch?v=inhouse_test"
-            notes = "TEST_INGEST"
-            priority = 5
-        } | ConvertTo-Json
-
-        $jobResp = Invoke-RestMethod -Uri "http://127.0.0.1:$TestPort/api/jobs" `
-            -Method Post -Body $newJob -ContentType "application/json" -TimeoutSec 5
-
-        if ($jobResp.status -ne "ok") {
-            throw "Failed creating job via API: $($jobResp | ConvertTo-Json)"
-        }
-    } finally {
-        if ($daemonProcess -and -not $daemonProcess.HasExited) {
-            Stop-Process -Id $daemonProcess.Id -Force
-            Start-Sleep -Seconds 1
-        }
-        if (Test-Path $tempConfigPath) { Remove-Item $tempConfigPath -Force -ErrorAction SilentlyContinue }
-        if (Test-Path $tempDbPath) { Remove-Item $tempDbPath -Force -ErrorAction SilentlyContinue }
-        if (Test-Path "$tempDbPath-wal") { Remove-Item "$tempDbPath-wal" -Force -ErrorAction SilentlyContinue }
-        if (Test-Path "$tempDbPath-shm") { Remove-Item "$tempDbPath-shm" -Force -ErrorAction SilentlyContinue }
+        Add-Result "kill and restart (job #$restartId, delivered once)" ($problems.Count -eq 0) ($problems -join "; ")
+    }
+} catch {
+    Add-Result "suite" $false "$_"
+} finally {
+    if ($daemon -and -not $daemon.HasExited) {
+        Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
+        $daemon.WaitForExit(30000) | Out-Null
     }
 }
 
-
 # ------------------------------------------------------------------------------
-# Summary Report
+# Summary
 # ------------------------------------------------------------------------------
+$failed = @($results | Where-Object { -not $_.Ok }).Count
+$passed = @($results | Where-Object { $_.Ok }).Count
 Write-Host ""
-Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "                        VERIFICATION SUMMARY                          " -ForegroundColor Cyan
-Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "Total Passed: $testsPassed" -ForegroundColor Green
-Write-Host "Total Failed: $testsFailed" -ForegroundColor $(if ($testsFailed -eq 0) { "Green" } else { "Red" })
-
-if ($testsFailed -eq 0) {
-    Write-Host "`n✓ ALL ROBUSTNESS TESTS PASSED. The application is production ready!" -ForegroundColor Green
-    exit 0
+Write-Host "Passed: $passed  Failed: $failed"
+if ($failed -eq 0 -and -not $Keep) {
+    Start-Sleep -Seconds 2
+    Remove-Item -LiteralPath $Scratch -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $Scratch) { Write-Host "Could not remove all of $Scratch; delete it by hand." -ForegroundColor Yellow }
 } else {
-    Write-Host "`n✗ SOME TESTS FAILED. Please review the errors above." -ForegroundColor Red
-    exit 1
+    Write-Host "Scratch root kept for inspection: $Scratch (daemon log under logs\, stdout\stderr in daemon_*.log)"
 }
+if ($failed -eq 0) { exit 0 } else { exit 1 }

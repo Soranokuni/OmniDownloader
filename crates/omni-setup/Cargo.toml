@@ -2,6 +2,7 @@
 name = "omni-setup"
 version = "1.0.0"
 edition = "2021"
+publish = false
 description = "OmniIngest-Setup.exe: the release folder in one executable that installs, upgrades and removes OmniIngest"
 
 # Windows "installer detection" runs any unmanifested executable whose name
@@ -24,7 +25,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]

@@ -151,6 +151,19 @@ pub struct TaskStatus {
 pub fn default_tasks() -> Vec<TaskSpec> {
     vec![
         TaskSpec {
+            name: crate::maintenance::BACKUP_TASK,
+            description: "Back up the database into data\\backups (7 daily and 4 weekly copies kept)",
+            // Before the updates and the purge, so the copy holds the day as it was.
+            cadence: Cadence::DailyAt { hour: 2, minute: 30 },
+            jitter: Duration::ZERO,
+        },
+        TaskSpec {
+            name: crate::maintenance::CHECK_TASK,
+            description: "Check the database's integrity (PRAGMA quick_check)",
+            cadence: Cadence::EveryNDaysAt { days: 7, hour: 2, minute: 45 },
+            jitter: Duration::ZERO,
+        },
+        TaskSpec {
             name: "ytdl_update",
             description: "Check for a new yt-dlp, verify its checksum and stage it",
             cadence: Cadence::DailyAt { hour: 3, minute: 0 },

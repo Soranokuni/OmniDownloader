@@ -37,7 +37,7 @@ fn the_daemon_writes_a_rotating_log_that_never_contains_a_secret() {
     // The realistic shape: a library logging its own failed login, and a
     // subprocess's stderr passed through verbatim. Neither goes through a
     // field we control, which is why redaction sits at the writer.
-    tracing::warn!("IMAP LOGIN ingest@station.gr {SECRET} -> NO authentication failed");
+    tracing::warn!("IMAP LOGIN ingest@example.gr {SECRET} -> NO authentication failed");
     tracing::error!(
         stderr = %format!("yt-dlp: --password {SECRET} rejected"),
         "download failed"
@@ -89,7 +89,7 @@ fn the_daemon_writes_a_rotating_log_that_never_contains_a_secret() {
 
     // 3. The surrounding text survives, so the line is still diagnostic. A
     //    redactor that ate the whole line would be safe and useless.
-    assert!(contents.contains("IMAP LOGIN ingest@station.gr ***"), "{contents}");
+    assert!(contents.contains("IMAP LOGIN ingest@example.gr ***"), "{contents}");
     assert!(contents.contains("authentication failed"), "{contents}");
 
     // 4. The filter was applied.

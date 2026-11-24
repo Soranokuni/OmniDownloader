@@ -312,15 +312,12 @@ async fn a_default_session_can_sign_out_everywhere() -> Result<()> {
 }
 
 #[tokio::test]
-async fn setup_and_metrics_do_not_treat_the_default_session_as_an_admin() -> Result<()> {
+async fn metrics_does_not_treat_the_default_session_as_an_admin() -> Result<()> {
     let a = app(|c| c.metrics.enabled = true, true)?;
     let locked = default_session(&a).await;
     let normal = normal_session(&a).await;
     let outside = "192.0.2.77:51000";
 
-    // /setup is closed to it (404, as when closed) and open to a real admin.
-    assert_eq!(send(&a, "GET", "/setup", LOOPBACK, Some(&locked), None, None).await.status, StatusCode::NOT_FOUND);
-    assert_eq!(send(&a, "GET", "/setup", REMOTE, Some(&normal), None, None).await.status, StatusCode::OK);
     // /metrics: refused for it, served to a real admin.
     assert_eq!(send(&a, "GET", "/metrics", outside, Some(&locked), None, None).await.status, StatusCode::FORBIDDEN);
     assert_eq!(send(&a, "GET", "/metrics", outside, Some(&normal), None, None).await.status, StatusCode::OK);
@@ -394,53 +391,10 @@ async fn deactivating_the_default_account_lifts_the_flag() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- (C)
+// The `/api/setup` LLM-endpoint tests went with the route (P13.3); the LLM card keeps the
+// same rules and llm_settings_tests.rs covers them there.
 
-fn setup_body(endpoint: &str) -> Value {
-    json!({
-        "graph_tenant_id": "", "graph_client_id": "", "graph_mailbox": "",
-        "ollama_endpoint": endpoint, "ollama_model": "m", "watchfolder_path": "C:\\\\Playout\\\\Watch"
-    })
-}
-
-#[tokio::test]
-async fn setup_refuses_an_online_http_llm_endpoint() -> Result<()> {
-    let a = app(|_| {}, false)?;
-    let normal = normal_session(&a).await;
-    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(setup_body("http://evil.example/v1"))).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
-    assert_ne!(a.state.config.read().await.ollama_endpoint, "http://evil.example/v1");
-    Ok(())
-}
-
-#[tokio::test]
-async fn setup_drops_the_llm_key_when_the_base_changes_and_keeps_it_when_not() -> Result<()> {
-    let a = app(
-        |c| {
-            c.ollama_endpoint = "https://llm.newsroom.example/v1".to_string();
-            c.llm.api_key = "sk-invented".to_string();
-        },
-        false,
-    )?;
-    let key = omni_core::secrets::keys::LLM_API_KEY;
-    a.state.secrets.set(key, "sk-invented")?;
-    let normal = normal_session(&a).await;
-
-    // Same base (trailing slash and case aside): the key stays.
-    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(setup_body("https://LLM.newsroom.example/v1/"))).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(a.state.secrets.get(key)?.as_deref(), Some("sk-invented"));
-    assert_eq!(a.state.config.read().await.llm.api_key, "sk-invented");
-
-    // A new provider does not inherit it.
-    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(setup_body("https://other.newsroom.example/v1"))).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(a.state.secrets.get(key)?, None);
-    assert_eq!(a.state.config.read().await.llm.api_key, "");
-    Ok(())
-}
-
-// ---------------------------------------------------------------- stale flag, start-up, blank endpoint
+// ---------------------------------------------------------------- stale flag, start-up
 
 #[tokio::test]
 async fn a_stale_false_flag_is_corrected_by_the_default_login_itself() -> Result<()> {
@@ -490,17 +444,6 @@ async fn start_up_ends_default_account_sessions_only_while_the_password_is_live(
     a.repo.create_session(default_id, "kept-session", 1)?;
     assert_eq!(a.state.end_default_admin_sessions(), 0);
     assert!(a.repo.get_user_by_session_token("kept-session")?.is_some());
-    Ok(())
-}
-
-#[tokio::test]
-async fn setup_accepts_a_blank_llm_endpoint() -> Result<()> {
-    let a = app(|_| {}, false)?;
-    let normal = normal_session(&a).await;
-    for blank in ["", "   "] {
-        let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(setup_body(blank))).await;
-        assert_eq!(r.status, StatusCode::OK, "{blank:?}: {}", r.body);
-    }
     Ok(())
 }
 
@@ -576,30 +519,17 @@ async fn an_unreadable_forwarded_header_from_a_trusted_proxy_is_not_the_proxy_it
     Ok(())
 }
 
+/// Was a `/api/setup` test; the wizard's save keeps the rule (P13.3).
 #[tokio::test]
-async fn setup_refuses_an_empty_watchfolder_and_keeps_the_old_one() -> Result<()> {
+async fn the_wizard_refuses_an_empty_watchfolder_and_keeps_the_old_one() -> Result<()> {
     let a = app(|_| {}, false)?;
     let normal = normal_session(&a).await;
     let before = a.state.config.read().await.watchfolder_path.clone();
-    let mut body = setup_body("");
-    body["watchfolder_path"] = json!("   ");
-    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(body)).await;
+    let body = json!({ "path": "   " });
+    let r = send(&a, "POST", "/api/admin/settings/watchfolder", REMOTE, Some(&normal), None, Some(body)).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
     assert!(r.body.contains("No watchfolder was given"), "{}", r.body);
     assert_eq!(a.state.config.read().await.watchfolder_path, before);
-    Ok(())
-}
-
-#[tokio::test]
-async fn setup_accepts_the_default_relative_watchfolder_and_stores_it_trimmed() -> Result<()> {
-    let a = app(|_| {}, false)?;
-    let normal = normal_session(&a).await;
-    // The form pre-fills the config's own relative value: it must be accepted.
-    let mut body = setup_body("");
-    body["watchfolder_path"] = json!(" watchfolder ");
-    let r = send(&a, "POST", "/api/setup", REMOTE, Some(&normal), None, Some(body)).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert_eq!(a.state.config.read().await.watchfolder_path, "watchfolder");
     Ok(())
 }
 

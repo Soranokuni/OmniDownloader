@@ -338,12 +338,12 @@ pub fn plan_article_videos_facts(
     ArticlePlan { primary_index, siblings, offered }
 }
 
-/// The slug for a job at `index`, when the original followed the house
-/// `{index}_{JOURNALIST}_{KEYWORD}` pattern; `None` for a hand-set slug,
-/// which is left alone.
+/// The slug for a job at `index`, when the original is the house name of its
+/// stored fields ([`omni_core::slug::compose`], P12.11); `None` for a
+/// hand-set slug, which is left alone. Never read back out of the slug.
 pub fn house_slug(current_slug: &str, current_index: &str, journalist: &str, keyword: &str, index: &str) -> Option<String> {
-    (current_slug == format!("{current_index}_{journalist}_{keyword}"))
-        .then(|| format!("{index}_{journalist}_{keyword}"))
+    use omni_core::slug::compose;
+    (current_slug == compose(current_index, journalist, keyword)).then(|| compose(index, journalist, keyword))
 }
 
 /// The timeline line for one sibling. A retry of the article job plans the
@@ -424,7 +424,7 @@ pub fn queue_article_siblings(
     for (url, index) in &plan.siblings {
         let mut sibling = omni_core::models::NewJob::new(
             url.clone(),
-            format!("{index}_{}_{}", job.journalist, job.keyword),
+            omni_core::slug::compose(index, &job.journalist, &job.keyword),
             job.journalist.clone(),
         );
         sibling.keyword = job.keyword.clone();
@@ -908,5 +908,12 @@ mod tests {
     fn only_house_slugs_are_renamed() {
         assert_eq!(house_slug("1_MCR_ASDC", "1", "MCR", "ASDC", "1A").as_deref(), Some("1A_MCR_ASDC"));
         assert_eq!(house_slug("CUSTOM_NAME", "1", "MCR", "ASDC", "1A"), None);
+        // P12.11: the house name of a hyphenated identity is the composed one, never read back.
+        assert_eq!(
+            house_slug("1_PAPA_DAKI_FIRE_IN_HILLS", "1", "PAPA-DAKI", "FIRE-IN-HILLS", "1A").as_deref(),
+            Some("1A_PAPA_DAKI_FIRE_IN_HILLS")
+        );
+        // A job named before the rule (in flight at the upgrade) counts as hand-named.
+        assert_eq!(house_slug("1_PAPA-DAKI_FIRE-IN-HILLS", "1", "PAPA-DAKI", "FIRE-IN-HILLS", "1A"), None);
     }
 }

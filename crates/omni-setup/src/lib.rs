@@ -16,6 +16,7 @@ pub mod real;
 pub mod registry;
 pub mod removal;
 pub mod run;
+pub mod shortcut;
 pub mod texts;
 pub mod ui;
 pub mod workdir;

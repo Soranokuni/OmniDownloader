@@ -334,21 +334,21 @@ mod tests {
         for i in 0..10 {
             let addr = format!("10.0.{}.{}", i, i + 1);
             let addr = ip(&addr);
-            assert!(rl.check(addr, "target@station.gr").is_allowed());
-            rl.record_failure(addr, "target@station.gr");
+            assert!(rl.check(addr, "target@example.gr").is_allowed());
+            rl.record_failure(addr, "target@example.gr");
         }
-        assert!(!rl.check(ip("10.9.9.9"), "target@station.gr").is_allowed());
+        assert!(!rl.check(ip("10.9.9.9"), "target@example.gr").is_allowed());
         // Another account from the same fresh IP is still fine.
-        assert!(rl.check(ip("10.9.9.9"), "someone@station.gr").is_allowed());
+        assert!(rl.check(ip("10.9.9.9"), "someone@example.gr").is_allowed());
     }
 
     #[test]
     fn the_account_counter_is_case_insensitive() {
         let rl = LoginRateLimiter::new(100, 3);
         for _ in 0..3 {
-            rl.record_failure(ip("10.0.0.1"), "Admin@Station.GR");
+            rl.record_failure(ip("10.0.0.1"), "Admin@Example.GR");
         }
-        assert!(!rl.check(ip("10.0.0.2"), "admin@station.gr").is_allowed());
+        assert!(!rl.check(ip("10.0.0.2"), "admin@example.gr").is_allowed());
     }
 
     #[test]

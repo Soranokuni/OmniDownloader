@@ -62,6 +62,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -Arch x64 -ToolsD
   `--verify`, `/?`): an x64 package can be built on an ARM64 PC, where x64
   programs run under emulation, but an arm64 package has to be built on an
   ARM64 machine.
+- `omni-ingest.exe --version` and the first line of `OmniIngest-Setup.exe /?`
+  name the version and the commit the program was built from, for example
+  `omni-ingest 1.0.0 (abc1234)`; a build outside a git checkout says
+  `(unknown)`.
 
 ### 2.1 Installing with Setup
 
@@ -171,7 +175,7 @@ configure the network for MCR desks (§5.1) and optionally the LLM (§5.4).
 
 ### 2.1a The watchfolder and its share
 
-Use the share's `\\server\share` path, never a mapped drive letter: a mapping belongs to your Windows session and the service cannot see it. The installer, the setup page and the health page refuse a mapped letter. They show the exact path to use wherever the mapping can be resolved: an elevated installer cannot see your desktop's drives, so it reads the mapping your Windows account remembers; the service itself cannot, and then only says that the letter is not usable and asks for the `\\server\share` path.
+Use the share's `\\server\share` path, never a mapped drive letter: a mapping belongs to your Windows session and the service cannot see it. The installer, the setup wizard and the health page refuse a mapped letter. They show the exact path to use wherever the mapping can be resolved: an elevated installer cannot see your desktop's drives, so it reads the mapping your Windows account remembers; the service itself cannot, and then only says that the letter is not usable and asks for the `\\server\share` path.
 
 Share permissions:
 
@@ -188,33 +192,38 @@ The wizard has three modes, chosen on the first screen. They differ only in how 
 
 | Mode | Screens |
 |---|---|
-| Beginner | the essentials with safe defaults: administrator account, watchfolder, mail, check |
+| Beginner | the essentials with safe defaults: administrator account, watchfolder, mail, journalists, tools, check, test download |
 | Intermediate | Beginner plus network access, archive and the language model note (service account, MCR open networks, archive on/off and days, web port) |
 | IT / sysadmin | Intermediate plus TLS, reverse proxy, metrics and the answer file |
 
-Back and Next move between screens; Next stays disabled until the screen is valid. Every field shows its default and a one-line explanation.
+Back and Next move between screens; Next stays disabled until the screen is valid. Every field shows its default and a one-line explanation. The wizard is in Greek; the **English** button at the top switches it to English (§6). This guide quotes the English screens.
 
 1. **Welcome.** Pick the mode.
-2. **Administrator account** (only while the first-run account still works). Enter a full name, a login (at least 3 characters, no spaces, not `admin`) and a password (at least 12 characters, typed twice; the ticks turn green as the rules are met). On Next the new administrator is created, the first-run `admin` account is switched off and its sessions end, and this browser is signed in as the new administrator. If anything fails, the first-run account stays as it was and you can try again. A link on this screen offers the older route: keep `admin` and only change its password.
-3. **Watchfolder.** Enter the share's `\\server\share` path (placeholder `\\192.168.4.42\FileIngest`), never a mapped drive letter. **Test** runs in the daemon itself, as the account the service runs as: it creates the folder if it is missing, writes a probe file, renames it and deletes it, within 15 seconds. On "access denied" it names the account to grant **Modify** on the share and the folder. Next saves the path and is enabled only after a passing test; it starts filled with where the current setting resolves. When the test says access denied, the screen explains the cause (the service is not running as an account the share accepts) and how to run the service as a named account; on an installation made with Setup, do that with Apps & Features → OmniIngest → Modify (§2.2a). **Skip for now** changes nothing: files keep going to the current watchfolder (the local default folder next to the program on a new installation) until you set the share, and the warning says so. See 2.1a.
-4. **Mail (Microsoft 365).** Tenant ID, client ID, mailbox and client secret of the app registration (see 5.2). **Test connection** reads the mailbox. The secret goes to the encrypted store and is never shown again; leave it blank later to keep the stored one. **Skip for now** warns that no email is ingested until a mailbox is set.
-5. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the LLM card (5.4); a button leaves the wizard and opens it. A short note explains that a NAS or IP share needs the service to run as a named account (§2.2a).
-6. **TLS, reverse proxy and metrics** (IT only). The `.pfx` certificate path and passphrase, whether to trust the proxy header and from which networks, extra allowed host names, `/metrics` on/off and its networks, and **Download answer file**. A trusted-proxy range wider than /24 (IPv4) or /64 (IPv6) is flagged: every machine in it could speak for any client address. The certificate is opened with its passphrase before it is saved; a file that is not a PKCS#12 bundle, or a wrong passphrase, is refused, because it would stop the web listener at the next start.
-7. **Check and finish.** The daemon's current health lines, green, amber or red, each with its hint, and a notice if a restart is needed. **Finish** records `setup_completed` and the mode, and opens the normal panel.
+2. **Administrator account** (only while the first-run account still works). Enter a full name, a login (at least 3 characters, no spaces, not `admin`) and a password (at least 12 characters, typed twice; the ticks turn green as the rules are met). On Next the new administrator is created, the first-run `admin` account is switched off and its sessions end, and this browser is signed in as the new administrator. If anything fails, the first-run account stays as it was and you can try again. **Change the password instead** on this screen offers the older route: keep `admin` and only change its password.
+3. **Watchfolder.** Enter the share's `\\server\share` path (placeholder `\\192.168.4.42\FileIngest`), never a mapped drive letter. **Test** runs in the daemon itself, as the account the service runs as: it creates the folder if it is missing, writes a probe file, renames it and deletes it, within 15 seconds. On "access denied" it names the account to grant **Modify** on the share and the folder. Next saves the path and is enabled only after a passing test; it starts filled with where the current setting resolves. When the test says access denied, the screen explains the cause (the service is not running as an account the share accepts) and how to run the service as a named account; on an installation made with Setup, do that with Apps & Features → OmniIngest → Modify (§2.2a). **Skip for now** changes nothing (the first click says what that means and the button becomes **Skip anyway**): files keep going to the current watchfolder (the local default folder next to the program on a new installation, which playout never reads) until you set the share, and the warning says so. See 2.1a.
+4. **Mail (Microsoft 365).** Numbered instructions for the Entra app registration, with a **Copy** button for each value you type there: the name `OmniIngest`, the permission `Mail.Read` (Microsoft Graph, *application*, then "Grant admin consent"), and the `New-ApplicationAccessPolicy` command that limits the app to the ingest mailbox. Then tenant ID, client ID, mailbox, client secret and the day the secret expires (see 5.2). **Test connection** reads the mailbox; Next is enabled only after it passes for exactly the values on the screen (a changed tenant or client needs its secret typed again). The secret goes to the encrypted store and is never shown again. The expiry date is the "Expires" column Entra shows under Certificates & secrets: `Mail.Read` cannot read it, so it is asked here, and the `mail` health line turns amber 30 days before it and red 7 days before. **Skip for now** warns that no email is ingested until a mailbox is set: links are then added by hand on the desk.
+5. **Journalists.** Paste the list from Excel (surname, full name, email; more addresses in further columns or in one cell separated by `;`), or choose a CSV file (comma or semicolon; "CSV UTF-8" or Excel's plain "CSV"). **Preview** shows who would be added, who is already on the list (left exactly as they are) and every line that cannot be imported, with its number and the reason (no surname, not an email address, an address already belonging to someone, a repeated line, `MCR`). **Import** adds the new people after keeping a copy of the list in `data/backups/taxonomy`. Or press **Learn them as mail arrives**: mail from an unknown address is filed under MCR, and on the desk's «Εισερχόμενα» tab MCR picks the journalist once and remembers the sender («Να το θυμάμαι για αυτή τη διεύθυνση»).
+6. **Tools.** yt-dlp, ffmpeg, ffprobe, bmxtranswrap (and Deno) with their state and the pinned build, and **Install** / **Repair** for each that needs it (§3). Next is enabled when every tool is installed at the pinned build. **Skip for now** warns that every video fails at the stage that needs a missing tool and goes to review.
+7. **Network, archive and language model** (Intermediate and IT). Web port, MCR open networks (one CIDR per line; empty means a login for everyone), delivered-source archive on/off and its days. The language model is set on the **LLM assist** card (5.4); **Leave the wizard and open the LLM card** opens it. A short note explains that a NAS or IP share needs the service to run as a named account (§2.2a).
+8. **TLS, reverse proxy and metrics** (IT only). The `.pfx` certificate path and passphrase, whether to trust the proxy header and from which networks, extra allowed host names, `/metrics` on/off and its networks, and **Download answer file**. A trusted-proxy range wider than /24 (IPv4) or /64 (IPv6) is flagged: every machine in it could speak for any client address. The certificate is opened with its passphrase before it is saved; a file that is not a PKCS#12 bundle, or a wrong passphrase, is refused, because it would stop the web listener at the next start.
+9. **Check.** The daemon's current health lines, green, amber or red, each with its hint, a notice if a restart is needed, and the repair mode (`repair.mode`; a new installation runs it in `shadow`: it records what it would have done and changes nothing).
+10. **Test download.** A known-good link goes through every stage like any video: the screen shows the stages as they pass and the job's last lines, and ends with the file name in the watchfolder (`1_MCR_OMNIINGEST_TEST.mxf`, or `_2`, `_3`… if one is there already). Dalet imports it like any file: remove it there if you do not want to keep it. The link is `setup_test_url` in `config.json`, by default YouTube's first video ("Me at the zoo", 19 seconds, `https://www.youtube.com/watch?v=jNQXAC9IVRw`); change it on this screen if this computer cannot reach YouTube. If the test fails, the screen names the error; fix it (Back opens the earlier steps) and start it again with **Start the test download**. **Finish** is enabled only once the file is delivered; it records `setup_completed` and the mode and opens the normal panel. **Skip for now** finishes without the test: the first click says that nothing then proves a video reaches playout, and the button becomes **Skip and finish**. The audit log says which of the two it was. Setup is complete only this way: leaving the wizard earlier (**Open the admin panel**, even right after creating the administrator) leaves it unfinished, and the **Overview** lists it with **Continue the setup wizard**. A brand-new installation always starts with setup pending, even with a `config.json` copied from elsewhere.
 
 Which settings apply at once and which wait for a restart of the service:
 
 | Applies at once | Needs a restart |
 |---|---|
-| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks | watchfolder, mailbox settings, web port, TLS, allowed hosts, metrics on/off, archive |
+| `setup_completed` and mode, MCR open networks, trust proxy header, trusted proxies, metrics networks, mailbox settings (used from the next mail check), archive on/off and days, watchfolder (between videos, below) | web port, TLS, allowed hosts, metrics on/off |
 
-The wizard tells you after each save, and again on the last screen, when a restart is needed.
+The wizard tells you after each save, and again on the last screen, when a restart is needed. The **Setup** card then has **Restart the service**: the first click says what happens and the button becomes **Restart now**, the second restarts the service (the graceful stop: videos being copied into the watchfolder finish first), and the page reloads when the service answers again, usually within a minute. The button is there only when the program runs as the Windows service. Setup allows the service's own account to stop and start its service, and nothing else (for NetworkService and LocalService the right goes to the service's own SID, `NT SERVICE\OmniIngestService`, not to every service of that account); a second click while a restart is under way does nothing; a service registered by an older version gets this right at the next upgrade.
+
+**A new watchfolder** is never switched under a video. On save the queue stops taking new videos and waits for the running ones to finish (at most 10 minutes); then the new folder is used. If videos are still running after that, the save answers that the change is pending, the Setup card shows "New watchfolder pending", files keep going to the current folder, the queue runs normally, and every 30 seconds a check applies the change the moment no video is running. If you save another folder before it applies, only the latest one is used; the earlier one never is. Finished videos that were waiting for the old folder (because it did not answer) go to review as `DELIVERY_UNCONFIRMED`: they are never delivered to the new folder on their own, because an earlier copy may have reached the old one; check it and Dalet, then «Δοκιμή ξανά». From then on only the new folder is watched and written. A watchfolder inside the archive folder (or containing it) is refused.
 
 **Leaving early.** On every screen after the account step, **Open the admin panel** leaves the wizard for this browser session without completing setup; the Setup card then says "Setup not finished", and the wizard returns at the next sign-in.
 
 **Running it again.** The Admin page has a **Setup** card with **Run setup wizard again**. The account step is skipped when the first-run account no longer exists. The settings the wizard writes are also available on their own, to an administrator, at `GET /api/admin/settings` and the `POST /api/admin/settings/...` routes the screens use.
 
-**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation, and Setup reads it back for a new installation with `/answer` (§2.4).
+**The answer file.** `GET /api/admin/settings/answer-file` (the **Download answer file** button) returns the chosen settings as `omni-answers.json`: watchfolder, mode, ports, networks, archive, TLS path, proxy and metrics settings, the mailbox address and the LLM provider. It never contains a secret (not the mailbox client secret, the LLM key or the certificate passphrase); those are entered again on the new machine. It is the record of an installation, and Setup reads it back for a new installation with `/answer` (§2.4); on an installed machine, `omni-ingest setup --answer <file>` applies it to the existing `config.json` (§9). The wizard is the only interactive setup: there is no separate setup page.
 
 ### 2.1c What Setup refuses
 
@@ -453,12 +462,17 @@ if you want.
 | yt-dlp | latest stable | verified nightly update at 03:00, previous build kept for rollback |
 | Deno | latest | needed by yt-dlp for YouTube; kept current |
 
-**Admin → Toolchain** lists each tool with its state ("pinned build", "not
+Every delivered file is labelled BT.709 (colour primaries, transfer and
+matrix), both in the MPEG-2 video and in the MXF picture descriptor.
+
+**Admin → Maintenance → Toolchain** lists each tool with its state ("pinned build", "not
 the pinned build", "missing" or a version) and an **Install** / **Repair**
 button. Install downloads the exact pinned build and checks its checksum;
-jobs wait while the file is swapped. **Admin → Download engine** shows the
+jobs wait while the file is swapped. **Admin → Maintenance → Download engine** shows the
 installed and latest yt-dlp, with **Update yt-dlp now** and a rollback to
-the previous build.
+the previous build. If the service stops while the nightly update is still
+checking a new yt-dlp or Deno build, the next start puts the previous build back; the next
+update run checks the release again.
 
 The verified yt-dlp update also runs early when one platform (YouTube, X,
 Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) has 3 extraction
@@ -484,14 +498,14 @@ no ARM64 build: the x64 build is used on every host (emulated on ARM64). A
 start-up install runs only when a file is missing; it then installs that
 tool's whole pinned archive (ffmpeg and ffprobe together). If an x64 ffmpeg is already in
 `bin\` on an ARM64 host, the `pinned_tools` health line says so, and
-**Admin → Toolchain → Repair** replaces it with the native one.
+**Admin → Maintenance → Toolchain → Repair** replaces it with the native one.
 
 The encoder is pinned on purpose: the broadcast output was validated with
 that exact build. The service never uses an ffmpeg, ffprobe or bmxtranswrap
 found on the system PATH. If one is missing from `bin\` at start-up, the
 service downloads the pinned build (up to 3 minutes, smallest first). If that
 fails, the queue is held, the `pinned_tools` health line says which tool is
-missing, and **Admin → Toolchain → Install** followed by a service restart
+missing, and **Admin → Maintenance → Toolchain → Install** followed by a service restart
 fixes it.
 
 ---
@@ -505,6 +519,7 @@ directory.
 |---|---|
 | `config.json` | configuration (no secrets) |
 | `config.json.prev` | `config.json` as it was before the installer last rewrote it |
+| `config.json.v1.bak` | a first-version `config.json` as it was before the move to config v2 (§5), secrets blanked |
 | `omni-ingest.exe.prev` | the previous program, kept by an upgrade |
 | `OmniIngest-Setup.exe` | the copy of Setup that Apps & Features runs for Modify and Uninstall |
 | `setup.log` | what Setup did: each run that changed something, appended under a line with its date (UTC) |
@@ -547,6 +562,38 @@ right, and running the installer again restores it.
 Most settings are on the Admin page. The rest are in `config.json`; restart
 the service after editing it. `config.example.json` shows every key.
 
+**Config v2.** The first versions kept some settings at the top of the file.
+At its first start a newer version moves them into their sections by itself:
+`ollama_endpoint` and `ollama_model` become `llm.endpoint` and `llm.model`,
+`email_poll_interval_secs` becomes `mail.poll_interval_secs`, and the IMAP-era
+`imap_*` and `email_*` keys are removed (IMAP is no longer supported; the
+mailbox is the `graph` section). The old file is kept beside it as
+`config.json.v1.bak` (`config.json.v1.2.bak` and so on if that name is taken;
+a copy is never overwritten), with any password or secret in it blanked. If
+the service account may not create files in the installation folder, the copy
+goes to `data\backups\config\` instead, and the log says so. If the new file
+cannot be written and `config.json` is no longer as it was, the log names the
+copy that holds the previous settings. The
+service log lists each key it moved. If a key is in both places, the one in
+the section is kept.
+
+**A value that cannot be used.** The service names the key, the value and the
+fix, in the log and in the error when it refuses to start, for example
+``config.json: `web_port` = (text, 6 characters) cannot be read (expected
+u16). Fix: write a value like the default, 8080, or remove `web_port` to use
+the default.`` A wrong number or yes/no is shown as written; text written
+where a number or yes/no belongs is described by its length only (it may be
+a key pasted in the wrong place); the value of a password, secret, key,
+token, cookie or credential is `<removed>`; and a section, a list, a mode or
+a path in the wrong place is named without its value. It refuses to start with a value of the
+wrong kind, a `web_port` of 0 or an empty `watchfolder_path`. A value outside
+the range the service reads it in (concurrent downloads 1–10, concurrent
+encodes 1–8, `mail.poll_interval_secs` 10–3600, `retry.max_age_mins`
+30–360, `pacing.per_host_concurrency` 1–4, `pacing.min_gap_secs` 0–120) is
+logged at start with the value actually used. A key no setting reads (a typo
+such as `watchfoldr_path`) is ignored, and logged at start with the closest
+known key (`watchfolder_path`); both turn the `config` health line amber.
+
 ### 5.1 Network and sign-in (`security`)
 
 | Key | Default | Meaning |
@@ -569,15 +616,32 @@ For HTTPS set `tls.cert_path` to a `.pfx`; store its passphrase with
 | `tenant_id`, `client_id` | the Entra ID app registration |
 | `mailbox` | the ingest mailbox address |
 | `write_access` | `false` (default): the mailbox is never changed. `true` (needs `Mail.ReadWrite`): processed mail is marked read and moved to `processed_folder`, failed mail to `failed_folder` |
+| `client_secret_expires` | the day the client secret expires, `YYYY-MM-DD` (absent: not entered). The `mail` health line turns amber 30 days before and red 7 days before and after. Not a secret, and not in the answer file |
 
 The client secret goes into the secret store, never into `config.json`:
-**Admin → Credentials → Microsoft Graph client secret**, or
-`omni-ingest secrets set graph.client_secret`. Use **Admin → Mailbox test**
-to check access. Mail is polled every `email_poll_interval_secs` (30 s).
+**Admin → Settings → Mailbox** (with its expiry date), **Credentials →
+Microsoft Graph client secret**, or `omni-ingest secrets set graph.client_secret`.
+The **Mailbox** card tests access (**Test mailbox**) and saves the settings
+(**Save**); the daemon uses them
+from the next mail check, without a restart. Mail is polled every
+`mail.poll_interval_secs` seconds (default 20, at least 10).
 
 The deterministic parser handles every mail on its own. Mail from an address
 that matches nobody in the roster still gets processed; the files are named
 with a placeholder until you add the person (§6.3).
+
+**A mail that could not be read.** The watcher tries a mail three times, then
+records it as failed and leaves it for a person (the desk's «Εισερχόμενα» tab,
+filter «Θέλουν προσοχή»). Once, automatically, it reads such a mail again: after the
+first good mail check that follows a restart of the service or a tool update
+(yt-dlp or Deno kept after the nightly check, or a tool installed or updated
+from the Admin page). Only mail received within `retry.max_age_mins` (2 hours)
+gets this chance, never a mail that made any video before it failed, and a
+link already delivered in the last 24 hours, under any journalist, is not
+queued again by it. Nor is it given to a mail a person already asked to read again
+(**Reprocess** here, or «Να διαβαστεί ξανά» on the desk). If it fails again it
+stays failed, marked **needs a person** in **Recent mail**, and is not tried
+again on its own.
 
 ### 5.3 Processing
 
@@ -591,15 +655,31 @@ with a placeholder until you add the person (§6.3).
 | `retry.max_age_mins` | 120 | no automatic retry for a job older than this, counted from when it was queued or from MCR's last «Δοκιμή ξανά» (read as 30 to 360); see §10 |
 | `retry.late_after_mins`, `retry.late_after_urgent_mins` | 10, 5 | minutes after which a job that is waiting or running (not yet delivered) counts as late, ordinary and urgent, counted like `retry.max_age_mins` (read as 1 to 120). A late job is listed in the desk's «Καθυστερούν» strip with its reason, and the desk sounds once; a live stream waiting for its next check is listed whatever its age. See the User Guide, §4.9 |
 | `retry.second_chance_window_mins` | 120 | a job waiting in review goes back to the queue on its own when what it failed on is fixed: a new yt-dlp or Deno kept after the nightly self-check (jobs that failed to find or read the video), a cookie jar uploaded, signed in or tested good (that site's jobs that needed a login or were rate-limited), a news site that works again (that site's jobs that failed to find the video). Once per cause, at most once for a site and three times in all, never a job a person acted on («Δοκιμή ξανά», cancel, «Το έβαλα στο Dalet», reject, wrong video, an offered video queued…), never a job whose link is already queued or was delivered again meanwhile, and only while the job is younger than this, counted like `retry.max_age_mins` (read as 30 to 360, and never longer than `retry.max_age_mins`). The job's history says «Αυτόματη επανάληψη» and why |
+| `locker.max_file_gb` | 20 | the largest file a one-file share on Dropbox, Google Drive, OneDrive or SharePoint may bring when it downloads by itself (read as at least 1). A bigger one is not downloaded: the job waits for MCR (`MANUAL_DOWNLOAD`) and its card names the limit |
+| `locker.direct_shares` | true | a one-file share on Dropbox, Google Drive, OneDrive or SharePoint downloads by itself through its direct address. `false`: every such link waits for MCR (`MANUAL_DOWNLOAD`) and its card says direct downloads are switched off |
+| `locker.browser_capture` | false | `true`: a file-locker page that needs a person (WeTransfer and similar, or a share without a direct address) is opened once in the headless browser, which presses its «Download» / «I agree» buttons and keeps the one file it downloads (at most 15 minutes and `locker.max_file_gb`; every connection the browser opens, from the page, a popup, a worker or a WebSocket, passes the outbound rule of `security.egress_allow_networks` first and goes only to the address the rule checked, on port 80 or 443 (or the link's own), and a name that does not resolve is refused; WebRTC sends nothing; the file is kept in `temp\captures\{job}` until the job ends, so a retry uses it again). If that fails for any reason the job waits for MCR (`MANUAL_DOWNLOAD`) once, its card naming the service and why; it is never tried again by itself. `false`: such links wait for MCR straight away, as before |
 | `pacing.per_host_concurrency` | 1 | yt-dlp runs starting at one video platform (YouTube, X, Facebook, Instagram, TikTok, Vimeo, Dailymotion, Streamable) at a time, so a mail with many links does not trip the platform's bot check (read as 1 to 4). A download gives its turn back as soon as the video starts transferring, so downloads still overlap; a probe keeps it until it ends. A job waiting for its turn keeps its download slot; a wait over 2 s is written to its history |
 | `pacing.min_gap_secs` | 8 | seconds between two starts on one platform, plus up to 4 s at random (read as 0 to 120; 0 switches the gap off). After a platform refuses a run as a rate limit (`RATE_LIMITED`), nothing new starts there for 2 minutes |
 | `parser.urgent_keywords` | ΕΚΤΑΚΤΟ, BREAKING, URGENT | mail that jumps the queue |
 | `parser.max_attachment_mb` | 2048 | largest attachment taken |
 | `adblock_*` | on | blocklists for the page reader, updated nightly |
+| `alerts.waiting_for_person_mins` | 15 | a video waiting for a person (in review, for a manual download, or held for approval) longer than this is written to the Windows Event Log once (read as 1 to 1440) |
+
+The service writes to the Windows **Application** log (source `OmniIngestService`)
+when nobody has the panel open, once when a condition starts and once when it
+ends, never repeatedly: a health line turning red (Error, event id 3000; back
+to normal: Information, 1000), videos waiting for a person past
+`alerts.waiting_for_person_mins` (Warning, 2000; one entry naming them), and
+the mailbox not answering for 10 minutes (Error, 3000; answering again:
+Information, 1000). A health line's change is written once it has held for 3
+minutes, so a line flapping at a threshold writes nothing. E-mail addresses and
+known secrets are masked in these entries. After a restart a condition that
+still holds is written once more. A console run (`omni-ingest.exe run`) writes these lines to its log
+file only.
 
 ### 5.4 LLM assist (optional)
 
-**Admin → LLM assist.** The parser decides every job; the model is only
+**Admin → Settings → LLM assist.** The parser decides every job; the model is only
 asked where the parser is unsure (who the mail is for, a keyword). Pick a
 provider (LM Studio, Ollama, OpenAI, Azure OpenAI, Gemini, Anthropic,
 OpenRouter, Mistral, Groq or any OpenAI-compatible server), **Load models**,
@@ -614,13 +694,13 @@ evidence and try saved recipes, a live page load and (optionally) a model.
 
 | `repair.mode` | Effect |
 |---|---|
-| `off` (default) | behaves exactly as without repair |
-| `shadow` | records what repair *would* do; **Admin → Repair report** shows it. Run this for a week or two first. |
-| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24); the one exception is a trusted recipe (below) |
+| `off` | behaves exactly as without repair (the value of a config.json written before this version that names no mode) |
+| `shadow` (default of a new installation) | records what repair *would* do; **Admin → Sites → Repair report (30 days)** shows it. Run this for a week or two first. Once it would have fixed at least 3 jobs in the last 14 days, the **Repair in shadow** card on the **Overview** offers **Switch repair to hold**, one click (saved to config.json, used from the next job, no restart; written to the audit log) |
+| `hold` | repair runs; a video it finds waits for MCR approval and is deleted if not approved within `hold_hours` (24) of an MCR desk being open (time with no desk open, or the service stopped, does not count; the desk reminds every 30 minutes while a video waits); the one exception is a trusted recipe (below) |
 
 Optional model rung: `repair.llm_enabled = true` with an explicit
 `repair.llm_model`; at most `llm_max_calls_per_day` (15) calls. Make one
-call by hand first with **Admin → Test URL** and **Use the model**.
+call by hand first with **Admin → Sites → Test URL** and **Use the model**.
 
 **Trusted recipes deliver on their own.** `repair.auto_deliver_after_approvals`
 (default **5**, `0` = never) lets a recipe that MCR approved that many times
@@ -634,8 +714,7 @@ suspends the recipe there, and its videos wait for MCR again. A rejection is
 remembered permanently per recipe steps and site: it survives deleting the job,
 the 90-day retention purge, and the recipe's promotion to a player recipe. MCR's «Επόμενη
 επιλογή» is always held, whatever the trust. The delivery is the
-normal atomic one; the job log says «Παραδόθηκε χωρίς έγκριση» and **Admin →
-Repair report** counts them per site (*Auto-delivered*). Trust is checked when
+normal atomic one; the job log says «Παραδόθηκε χωρίς έγκριση» and the **Repair report (30 days)** counts them per site (column *Auto-delivered*). Trust is checked when
 the repair starts: a job of the same recipe that is already downloading when
 MCR rejects another one still goes to Dalet, so check the next few minutes of
 deliveries from that site after a rejection. Set `0` to go back to
@@ -644,7 +723,7 @@ deliveries from that site after a rejection. Set `0` to go back to
 ### 5.6 Secrets
 
 Secrets live only in `data\secrets.bin` (DPAPI). Manage them in
-**Admin → Credentials** or with the CLI:
+**Admin → Settings → Credentials** or with the CLI:
 
 | Key | What |
 |---|---|
@@ -700,31 +779,64 @@ Prometheus handles as a counter reset.
 
 ## 6. The Admin page
 
+The page has five sections in a sidebar on the left; the address ends in the
+section's name (`/admin#settings`), so a bookmark opens it directly, and each
+section loads only when it is first opened. The search box at the top of the
+sidebar finds a setting by name (accents and case do not matter) and shows
+only the cards that match, in every section.
+
+**Language.** The page and the setup wizard are in Greek. The **English** button
+at the top switches them to English, and **Ελληνικά** switches back; the choice is
+kept in that browser only (the MCR desk stays in Greek). The panel reloads on a
+switch; the wizard redraws the step that is open, so a value typed on it and not
+yet saved is filled again from the saved settings. Terms such as CIDR, the proxy
+header, recipes and canaries have a one-line explanation where they appear. What a
+tool or the server reports in its own words (an error detail, a task's
+description, an audit message) is shown as it comes. This guide quotes the
+panel's English labels, with the Greek name of each section beside it; the
+Greek guide quotes the Greek labels.
+
+- **Overview** (Επισκόπηση): Needs the administrator, Health, Autonomy, Repair in shadow.
+- **Settings** (Ρυθμίσεις): Setup, Watchfolder, Mailbox, Credentials, LLM assist, Network, TLS and archive, Operation.
+- **People** (Άνθρωποι): User accounts, Newsroom taxonomy (groups, people and backups).
+- **Sites** (Ιστότοποι): Sites, Cookies, Recipes, Repair report (30 days), Test URL, Self-heal, Self-check.
+- **Maintenance** (Συντήρηση): Toolchain, Download engine, Database maintenance, Diagnostic bundle, Scheduled maintenance, Benchmarks, Audit log, Recent mail.
+
+Every action that removes or replaces something asks in the page first; the
+action button names what it does.
+
 | Card | Use |
 |---|---|
-| **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b) |
+| **Needs the administrator** | what needs the administrator now: unfinished setup (with **Continue the setup wizard**), a pending watchfolder, every amber or red health line, each with a button to the section that fixes it |
+| **Health** | every health line (§8) with its detail |
+| **Repair in shadow** | what the repair ladder would have done while `repair.mode` is `shadow`: runs and jobs it would have fixed, by site, and the latest such jobs; **Switch repair to hold** once it is offered (§5.5) |
+| **Watchfolder** | test and save the watchfolder (the same rules as the wizard); used between jobs |
+| **Network, TLS and archive** | web port, MCR open networks, TLS certificate and passphrase, trusted proxies, allowed host names, archive on/off and days |
+| **Operation** | repair mode, downloads and encodes at once, how often the mailbox is read, Graph write access and its two folders, yt-dlp pacing, the retry, second-chance and late-strip windows. A value outside its range is refused with its name and range. The late strip and the Graph settings apply at once; the rest after **Restart the service** |
+| **Setup** | whether the setup wizard was finished; **Run setup wizard again** (§2.1b); a pending watchfolder; **Restart the service** |
 | **Download engine** | yt-dlp version, update now, roll back |
 | **Toolchain** | install or repair ffmpeg, ffprobe, bmxtranswrap, yt-dlp, Deno |
 | **Credentials** | set or clear the secrets above |
 | **Database maintenance** | purge completed jobs older than 7–90 days; vacuum |
+| **Diagnostic bundle** | **Download the diagnostic bundle**: one zip for support: the service log of the last 7 days (at most 8 MB per day and 40 MB in all, the newest first), `config.json`, the health checks, the tool versions and the last 50 failed jobs with their history. Known secret values are written as `***`; web addresses lose user name, password and query (`?…`); cookie and authorization headers and `omni_session` are `<removed>`; secret-named settings are `<removed>`. Tokens that look like plain words (only letters, or under 8 characters) after a `…token` name or `Bearer` may remain. The encrypted secret store, cookie jars, the database and sessions are never in it. The zip is also kept in `temp\diagnostics` (the newest three); making one is in the audit log. One is made at a time: a second click meanwhile, or any error, shows a short page saying so with a link back |
 | **Autonomy** | how often a video reached air with nobody touching it, and why a person was needed (below) |
 | **Self-heal** | the last 30 days of overnight retries on news sites that stopped giving video (nothing is downloaded) |
-| **Self-check** | the daily check links ("a link that has a video" per site); add, remove, run now |
-| **Sites** | per-site health: recent success, last error, canary checks, **Run now** |
-| **Recipes** | learned extraction recipes: export / import `recipes.json`, suspend, retire |
+| **Self-check** | the daily check links ("a link that has a video" per site); **Add link**, remove, **Run the check now** |
+| **Sites** | per-site health (healthy, degraded, broken): recent success, last error, canary checks, **Run now** |
+| **Recipes** | learned extraction recipes: **Export recipes.json** / import, **Suspend**, **Retire for good** |
 | **Repair report (30 days)** | what the repair route did or would have done |
-| **Test URL** | run a page through extraction and the repair ladder without queueing anything |
+| **Test URL** | run a page through extraction and the repair ladder without queueing anything (**Run**) |
 | **Cookies** | per-site login cookies (§6.1) |
-| **Benchmarks** | run the 65-link corpus, extraction only or full pipeline |
-| **User accounts** | create users, set role, link to a journalist, reset password, deactivate |
-| **Recent mail** | handled mail, reprocess one |
+| **Benchmarks** | run the 65-link corpus, "Extraction only" or "Full" |
+| **User accounts** | **Create user**, set role, link to a journalist, **Reset password**, **Deactivate** |
+| **Recent mail** | handled mail, **Reprocess** one; **needs a person** on a failed mail already read again automatically (§5.2) |
 | **LLM assist** | §5.4 |
 | **Newsroom taxonomy** | groups and people (roster), import/export, backups (§6.3) |
 | **Audit log** | who did what |
-| **Scheduled maintenance** | the nightly tasks (§7), run one now |
-| **Mailbox test** | check Graph access with given or stored credentials |
+| **Scheduled maintenance** | the nightly tasks (§7), run one now with **Run now** |
+| **Mailbox** | check Graph access with given or stored credentials; save the mailbox, a new client secret and its expiry date (used from the next mail check) |
 
-**Autonomy report.** The first card on the right. *Delivered untouched* is the
+**Autonomy report.** On the **Overview**. *Delivered untouched* is the
 share of the videos that reached air (delivered to the watchfolder, or put into
 Dalet by hand) that nobody touched: no retry, rename, approval or rejection,
 next choice, cancel, re-download, "wrong video", "run now", discard or manual
@@ -759,7 +871,7 @@ station account**, never a personal one.
 2. Export `cookies.txt` with a cookies.txt browser extension.
 3. Close the private window **without signing out** (signing out cancels the
    cookies).
-4. **Admin → Cookies**: type the site (`x.com`, `youtube.com`, …),
+4. **Admin → Sites → Cookies**: type the site (`x.com`, `youtube.com`, …),
    **Choose cookies.txt…**, **Upload**, then **Test** with a known link.
 
 **From the command line** (no file to handle): on the server's desktop, in an
@@ -772,9 +884,18 @@ omni-ingest cookies sign-in youtube.com
 opens Edge on its own profile; sign in, close the window, and the cookies are
 stored. The Cookies card shows this command ready to copy.
 
+**From the Start menu** (no prompt at all): Setup adds **Start → «OmniIngest –
+Σύνδεση σε ιστότοπο»** for all users. It asks for administrator rights, lists
+the sites (1 youtube.com, 2 x.com, 3 facebook.com, 4 instagram.com, or type
+another site's domain; Enter alone stops) and then runs the same sign-in; the
+window stays open until you press Enter, so the result can be read. Uninstall
+removes the entry. An entry that runs another installation, or one that cannot be read, is never replaced or removed; setup.log says so.
+
 `youtu.be` uses the `youtube.com` jar; `twitter.com` is stored as `x.com`.
-Every jar is re-tested nightly; the `cookies` health line warns 7 days before
-they expire.
+Every jar is re-tested nightly; the `cookies` health line is computed again
+every day and warns 7 days before they expire. While jobs in review wait for a
+site's login (no jar, an expired one, or one that failed its test), the MCR
+desk counts them per site.
 
 YouTube cookies are optional: most YouTube links work without them. Add them
 only if LOGIN_REQUIRED keeps coming back.
@@ -787,7 +908,7 @@ only if LOGIN_REQUIRED keeps coming back.
 | MCR operator — runs the queue (`open_mcr`) | `/mcr` |
 | Administrator — full access (`admin`) | everything |
 
-### 6.3 The roster (Newsroom taxonomy)
+### 6.3 The roster («Newsroom taxonomy»)
 
 Each person has a Latin surname (used in file names), full name, email
 addresses, aliases (Greek spellings, nicknames, cases) and groups. The parser
@@ -802,12 +923,24 @@ before every delete or import.
 
 | Task | When (local time) | What |
 |---|---|---|
+| `db_backup` | daily 02:30 | back up the database while the service runs into `data\backups\omni-YYYY-MM-DD.db`; the copy is checked before it counts; the 7 newest and one for each of the 4 weeks before them are kept |
+| `db_check` | every 7 days, 02:45 | integrity check of the database (`PRAGMA quick_check`) |
 | `ytdl_update` | daily 03:00 | check, verify and stage a new yt-dlp; also run early when a platform starts failing, noted `early: …` (§3) |
 | `adblock_update` | daily 03:30 | refresh blocklists |
 | `retention` | daily 04:00 | delete expired archive copies, orphaned temp, old login records, old mail text, and the old database records below |
 | `selfcheck` | daily 05:15 | browser check and per-site check links |
 | `cookie_test` | daily 05:30 | test each cookie jar |
 | `vacuum` | every 30 days, 04:30 | compact the database |
+
+A task that fails on its last run turns the **maintenance** health line amber
+and names it; its next good run clears it. The **database** line shows the
+last integrity check and the last backup; it turns red if the check finds the
+database damaged. Then stop the service, move `data\omni.db` together with
+`omni.db-wal` and `omni.db-shm` (if present) to another folder, copy the newest
+`omni-YYYY-MM-DD.db` from `data\backups\` (never a `.tmp`: that is a copy that
+was not finished or failed its check) to `data\omni.db`, and start the service
+again. The backups hold the whole database, accounts and sessions included:
+they stay in `data\`, which only the service and administrators can read.
 
 What the `retention` task keeps in the database, and for how long (fixed, not configurable):
 
@@ -829,10 +962,10 @@ Green = ok, amber = degraded, red = down.
 
 | Line | Amber / red means |
 |---|---|
-| `mail` | the mailbox cannot be read |
+| `mail` | the mailbox cannot be read; or the client secret expires within 30 days (amber) or 7 days, or has expired (red): make a new one in Entra and enter it with its date under **Admin → Settings → Mailbox** |
 | `llm` | the LLM endpoint does not answer (amber; jobs are unaffected) |
 | `tools` | a tool is missing (red) |
-| `pinned_tools` | a tool is missing or not the pinned build: **Admin → Toolchain → Install / Repair**, then restart the service if it was missing |
+| `pinned_tools` | a tool is missing or not the pinned build: **Admin → Maintenance → Toolchain → Install / Repair**, then restart the service if it was missing |
 | `encoder` | the encoder self-test failed |
 | `watchfolder` | the watchfolder is not writable (red) |
 | `browser` | Edge/Chrome failed its test page (amber); **red "sandboxed launch failed"**: the browser does not start at all. It always runs with Chromium's sandbox, which is never turned off: check the service account and the browser install |
@@ -845,6 +978,9 @@ Green = ok, amber = degraded, red = down.
 | `cookies` | a jar failed its test or expires within 7 days |
 | `lockdown` | the `data` and `temp` folders are not restricted to SYSTEM, Administrators and the service account |
 | `archive` | the archive disk is low |
+| `config` | `config.json` has a key no setting reads (amber; usually a typo, named with the closest known key, e.g. `watchfoldr_path` → `watchfolder_path`), or a value outside the range the service reads it in (§5). Correct the file and restart the service |
+| `maintenance` | a scheduled task failed on its last run (amber), named in the line; its next good run clears it (§7) |
+| `database` | shown once the weekly integrity check has run, with the last backup; amber when the check could not run, red when it finds the database damaged: restore the newest backup (§7) |
 | `workers` | a job run hit an internal error in the last 24 hours (amber). Before delivery the job goes back to the queue once (after 30 s), then to review; during delivery it is never queued again: it is finished as delivered when its file is in the watchfolder, otherwise it goes to review with `DELIVERY_UNCONFIRMED`. If it repeats, send `logs\` to support |
 
 ---
@@ -858,12 +994,13 @@ Run from the install folder (elevated on an installed service).
 | `omni-ingest run [--config <file>]` | run in a console window instead of as a service |
 | `omni-ingest install …` / `uninstall` | what `Install.cmd` / `Uninstall.cmd` call (§2.5) |
 | `omni-ingest service install\|start\|stop\|status\|uninstall` | the Windows service |
-| `omni-ingest setup` | interactive setup wizard |
+| `omni-ingest setup --answer <file> [--force]` | apply an answer file (§2.1b) to this installation's `config.json`, by Setup's and the panel's rules (a watchfolder the service cannot use and an online `http://` LLM endpoint are refused; another LLM provider removes the stored LLM key); the old file is kept as `config.json.prev`. Refused while the service runs, unless `--force` (then restart it at once). No secrets; restart the service afterwards. The interactive setup is the wizard on `/admin` |
 | `omni-ingest admin list-users` | list accounts |
 | `omni-ingest admin reset-password <email>` | new password (prompted), signs the user out |
 | `omni-ingest admin activate\|deactivate <email>` | enable / disable an account |
+| `omni-ingest admin create-admin <username> [--force]` | create an administrator when none can sign in (password prompted twice, never shown or logged); refused while an active administrator exists unless `--force` |
 | `omni-ingest secrets list\|set <key>\|clear <key>` | the secret store (values prompted, never shown) |
-| `omni-ingest cookies sign-in <domain> [--browser edge\|chrome]` | sign in once and store the site's cookies |
+| `omni-ingest cookies sign-in [<domain>] [--browser edge\|chrome]` | sign in once and store the site's cookies; without a domain, a list of sites to choose from (what the Start-menu entry runs) |
 | `omni-ingest cookies list` | the cookie jars (no contents) |
 | `omni-ingest mail-preview [--last 10] [--hours 72] [--eml <file>] [--llm]` | what the parser would do; changes nothing |
 | `omni-ingest mail-ingest --eml <file>…` | queue saved `.eml` files as if they had arrived |
@@ -914,6 +1051,19 @@ good), or with `NO_STREAM_FOUND`, `VIDEO_UNRESOLVED`, `HTTP_403` or
 may go back to the queue on its own: the second chance of §5.3
 (`retry.second_chance_window_mins`).
 
+A job that fails with `PROBE_FAILED`, `TRANSCODE_FAILED`, `REWRAP_FAILED` or
+`COMPLIANCE_FAILED` first takes a second route, once per job and without anyone
+acting: a link is downloaded again with other formats (another video codec, or
+a file the site serves already merged as MP4, either at least 720 lines high),
+an attached file is taken as it is, and the file is copied into a clean
+container (fresh timestamps) before the usual encode, wrap and compliance
+check. The job's history says «second route», the new source's size, and how
+it ended. If it does not help, the job goes to review with its first code. A
+file is never shortened to fit: one whose own index lists more frames than it
+holds (a download cut part way), or whose copy is shorter than the file says
+(a clock that jumps), goes to review. A daemon that is stopping does not take
+the second route.
+
 | Code | Auto | Meaning / action |
 |---|---|---|
 | `NETWORK` | yes | network problem |
@@ -922,7 +1072,7 @@ may go back to the queue on its own: the second chance of §5.3
 | `EXTRACT_TIMEOUT`, `DOWNLOAD_TIMEOUT` | yes | download timed out |
 | `DELIVERY_FAILED`, `DELIVER_TIMEOUT` | yes | could not write to the watchfolder: check the share and the service account's rights |
 | `LOW_DISK` | yes | free disk space |
-| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after it was queued (within the same 2-hour age limit), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
+| `LIVE_STREAM` | yes | still live, or a premiere not yet started: checked again 10, 30, 60 and 120 minutes after the first try found it live (the checks stop at the age limit, `retry.max_age_mins`, counted from when it was queued), then review. While it waits it is in the late strip as «Ζωντανή μετάδοση· επόμενος έλεγχος HH:MM» |
 | `LOGIN_REQUIRED` | no | the site wants a login: add cookies (§6.1) |
 | `GEO_BLOCKED` | no | not available from Greece |
 | `PRIVATE_OR_REMOVED` | no | ask for another link |
@@ -932,14 +1082,14 @@ may go back to the queue on its own: the second chance of §5.3
 | `VIDEO_UNRESOLVED` | no | a video is there but was not fetched; download by hand |
 | `DRM_PROTECTED` | no | copy-protected; get the file from the source |
 | `SOURCE_TOO_LONG` | no | over the duration limit |
-| `MANUAL_DOWNLOAD` | no | file-transfer link (WeTransfer etc.): download by hand, mark done |
+| `MANUAL_DOWNLOAD` | no | file-transfer link a person must fetch (WeTransfer, MyAirBridge, TransferNow, Filemail, MEGA, or a shared folder): download by hand, mark done. One-file shares on Dropbox, Google Drive, OneDrive and SharePoint are downloaded directly, no account needed |
 | `PROBE_FAILED` | no | the downloaded file is unreadable, or is not an accepted video container. Accepted: MP4/MOV/3GP, MKV/WebM, MPEG-TS, MPEG-PS, AVI, WMV, FLV, MXF, DV, GXF, Ogg, raw H.264/HEVC/MPEG video and still images. Playlists (HLS, DASH, concat) and scripts (AviSynth, VapourSynth) are always refused |
 | `TRANSCODE_FAILED`, `TRANSCODE_TIMEOUT` | no | encoding failed; report if it repeats |
 | `REWRAP_FAILED`, `REWRAP_TIMEOUT` | no | MXF wrapping failed; report if it repeats |
 | `COMPLIANCE_FAILED` | no | the result is not to broadcast spec: **not delivered** |
 | `LEASE_EXPIRED` | no | interrupted repeatedly (crash or restart) |
 | `REJECTED_BY_MCR` | no | MCR rejected a repaired video |
-| `APPROVAL_EXPIRED` | no | not approved within 24 h; the held file was deleted |
+| `APPROVAL_EXPIRED` | no | not approved within 24 h of an MCR desk being open; the held file was deleted |
 | `HELD_FILE_CHANGED` | no | the held file changed: not delivered |
 | `REPAIR_EXHAUSTED` | no | repair ran out of time or attempts |
 | `NON_PUBLIC_ADDRESS` | no | the link, or a stream behind it, is an internal address: not downloaded (see `egress_allow_networks`) |
@@ -953,7 +1103,8 @@ may go back to the queue on its own: the second chance of §5.3
 | Symptom | Check |
 |---|---|
 | Panel does not open | service running (`omni-ingest service status`), firewall, port |
-| Nothing arrives from mail | `mail` health line; **Mailbox test**; the client secret has not expired in Entra ID |
+| No administrator can sign in | on the server, in an elevated terminal: `omni-ingest admin list-users`, then `admin reset-password` or `admin activate`; if there is no administrator account at all, `omni-ingest admin create-admin <username>` |
+| Nothing arrives from mail | `mail` health line; **Admin → Settings → Mailbox → Test mailbox**; the client secret has not expired in Entra ID |
 | YouTube LOGIN_REQUIRED | update yt-dlp (**Download engine**); if it persists, add `youtube.com` cookies |
 | X / Instagram posts fail | upload that site's cookies and **Test** |
 | Wrong video from a news site | **Test URL** on the article; report the article link |

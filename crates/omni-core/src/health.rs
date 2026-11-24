@@ -156,6 +156,12 @@ pub mod checks {
     pub const ARCHIVE: &str = "archive";
     /// Job runs that hit an internal error (a panic) in the last 24 h (P11.8).
     pub const WORKERS: &str = "workers";
+    /// config.json has keys no setting reads, or values read differently (P13.4b).
+    pub const CONFIG: &str = "config";
+    /// A scheduled maintenance task failed on its last run (P11.13).
+    pub const MAINTENANCE: &str = "maintenance";
+    /// The weekly integrity check of `omni.db` and the last backup (P11.13).
+    pub const DATABASE: &str = "database";
 }
 
 impl Default for HealthState {
@@ -353,7 +359,7 @@ mod tests {
         );
         h.set(
             checks::MAIL,
-            Check::degraded("IMAP authentication failed for ingest@station.gr"),
+            Check::degraded("IMAP authentication failed for ingest@example.gr"),
         );
 
         let summary = serde_json::to_string(&h.summary()).unwrap();
@@ -361,7 +367,7 @@ mod tests {
         assert!(summary.contains("\"tools\":\"down\""), "{summary}");
         assert!(!summary.contains("ffmpeg.exe"), "{summary}");
         assert!(!summary.contains("OmniDownloader"), "{summary}");
-        assert!(!summary.contains("ingest@station.gr"), "{summary}");
+        assert!(!summary.contains("ingest@example.gr"), "{summary}");
     }
 
     #[test]
