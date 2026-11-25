@@ -4,7 +4,11 @@
 //!
 //! * other **video-platform** posts (X, YouTube, Facebook, …) are queued
 //!   automatically as sibling jobs — `1A`, `1B`, `1C` — up to
-//!   [`MAX_AUTO_SIBLINGS`];
+//!   [`MAX_AUTO_SIBLINGS`] (5) in all, or up to
+//!   [`MAX_AUTO_SIBLINGS_IN_ARTICLE`] (10) when the page confirms the posts
+//!   sit inside the article's own content (owner 2026-11-25): posts of
+//!   unknown placement stop once 5 siblings are queued, confirmed ones go on
+//!   to 10, in page order;
 //! * anything else (raw streams from the page itself, and platform posts
 //!   beyond the cap) is **offered** to MCR on the job, one click to queue.
 //!
@@ -28,6 +32,11 @@ use crate::downloader::is_video_platform;
 /// More than this and the article is a listicle: the rest are offered, not
 /// all poured into Dalet.
 pub const MAX_AUTO_SIBLINGS: usize = 5;
+
+/// The cap for platform posts the page confirms are inside the article
+/// (`VideoFacts::in_article == Some(true)`, owner 2026-11-25): an article
+/// that embeds nine videos in its body gets all nine.
+pub const MAX_AUTO_SIBLINGS_IN_ARTICLE: usize = 10;
 
 /// At most this many offers are kept on a job.
 pub const MAX_OFFERED: usize = 10;
@@ -144,7 +153,9 @@ pub struct Probed {
 /// Ask `probe` about each video that would be queued as a sibling, and note
 /// the answers in `facts`. A sibling the answer holds back is replaced by the
 /// next one in line, which is asked in turn, so the probes are at most
-/// [`MAX_AUTO_SIBLINGS`] plus the videos held. An unknown answer (`None`)
+/// [`MAX_AUTO_SIBLINGS_IN_ARTICLE`] (only [`MAX_AUTO_SIBLINGS`] when no post
+/// is confirmed inside the article) plus the videos held, and never more than
+/// the page's videos. An unknown answer (`None`)
 /// leaves the video queued. Not asked at all when the journalist gave a count
 /// (they chose those videos).
 pub async fn probe_siblings<F, Fut>(
@@ -313,9 +324,13 @@ pub fn plan_article_videos_facts(
     let mut overflow = Vec::new();
     let mut held = Vec::new();
     for u in platform {
-        if facts_of(&u).hold_reason().is_some() {
+        let f = facts_of(&u);
+        // Unknown placement fills the default cap; a post the page confirms
+        // is inside the article may go on to the larger one.
+        let cap = if f.in_article == Some(true) { MAX_AUTO_SIBLINGS_IN_ARTICLE } else { MAX_AUTO_SIBLINGS };
+        if f.hold_reason().is_some() {
             held.push(u);
-        } else if siblings.len() < MAX_AUTO_SIBLINGS {
+        } else if siblings.len() < cap {
             siblings.push((u, name(next)));
             next += 1;
         } else {
@@ -664,6 +679,7 @@ mod tests {
 
     #[test]
     fn a_listicle_is_capped_and_the_rest_offered() {
+        // No placement facts (unknown placement): the default cap of 5 holds.
         let many: Vec<String> = (1..=9).map(|i| format!("https://x.com/i/status/{i}")).collect();
         let p = plan_article_videos(ARTICLE, &many[0], &many, "1");
         assert_eq!(p.siblings.len(), MAX_AUTO_SIBLINGS);
@@ -841,12 +857,136 @@ mod tests {
             async move { Some(answer) }
         })
         .await;
-        // 5 siblings at first (2..=6); #2 is long, so #7 is promoted and asked: 6 probes.
+        // Unknown placement, so the cap of 5: 5 siblings at first (2..=6);
+        // #2 is long, so #7 is promoted and asked: 6 probes.
         assert_eq!(asked.borrow().len(), MAX_AUTO_SIBLINGS + 1, "{:?}", asked.borrow());
         assert!(asked.borrow().contains(&urls[6]));
         assert!(!asked.borrow().contains(&urls[7]), "#8 stays an overflow offer, unasked");
         let p = plan_article_videos_facts(ARTICLE, &urls[0], &urls, "1", None, &f);
         assert!(p.siblings.iter().all(|(u, _)| *u != long) && p.siblings.len() == MAX_AUTO_SIBLINGS, "{p:?}");
+    }
+
+    fn posts(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("https://x.com/i/status/{i}")).collect()
+    }
+
+    const INSIDE: VideoFacts = VideoFacts { in_article: Some(true), contextual: false, link: false, duration_secs: None, live: false };
+
+    fn all_inside(urls: &[String]) -> Facts {
+        urls.iter().map(|u| (facts_key(u), INSIDE)).collect()
+    }
+
+    /// iefimerida, live replay 2026-11-25: nine videos in the article's body;
+    /// the cap of 5 left three Instagram reels only offered.
+    #[test]
+    fn nine_videos_inside_the_article_are_all_queued() {
+        let v = posts(9);
+        let p = plan_article_videos_facts(ARTICLE, &v[0], &v, "1", None, &all_inside(&v));
+        let queued: Vec<&str> = p.siblings.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(queued, v[1..].iter().map(String::as_str).collect::<Vec<_>>(), "{p:?}");
+        assert_eq!(p.siblings.last().unwrap().1, "1I");
+        assert_eq!(p.primary_index, "1A");
+        assert!(p.offered.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn videos_inside_the_article_are_capped_at_ten() {
+        let v = posts(15);
+        let p = plan_article_videos_facts(ARTICLE, &v[0], &v, "1", None, &all_inside(&v));
+        assert_eq!(p.siblings.len(), MAX_AUTO_SIBLINGS_IN_ARTICLE);
+        assert_eq!(p.siblings.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(), v[1..=10].to_vec());
+        let offered: Vec<&str> = p.offered.iter().map(|o| o.url.as_str()).collect();
+        assert_eq!(offered, v[11..].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(p.offered[0].index_str, "1L");
+    }
+
+    #[test]
+    fn unknown_placement_keeps_the_cap_of_five() {
+        let v = posts(9);
+        let unknown: Facts = v.iter().map(|u| (facts_key(u), VideoFacts::default())).collect();
+        let p = plan_article_videos_facts(ARTICLE, &v[0], &v, "1", None, &unknown);
+        assert_eq!(p.siblings.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(), v[1..=5].to_vec());
+        assert_eq!(p.offered.iter().map(|o| o.url.clone()).collect::<Vec<_>>(), v[6..].to_vec());
+    }
+
+    #[test]
+    fn unknown_placement_stops_at_five_confirmed_go_on_to_ten() {
+        let v = posts(9);
+        // After the primary: [in, None, in, None, None, None, in, in].
+        let placement = [Some(true), None, Some(true), None, None, None, Some(true), Some(true)];
+        let f: Facts = v[1..]
+            .iter()
+            .zip(placement)
+            .map(|(u, in_article)| (facts_key(u), VideoFacts { in_article, ..Default::default() }))
+            .collect();
+        let p = plan_article_videos_facts(ARTICLE, &v[0], &v, "1", None, &f);
+        let queued: Vec<(&str, &str)> = p.siblings.iter().map(|(u, i)| (u.as_str(), i.as_str())).collect();
+        assert_eq!(
+            queued,
+            vec![
+                (v[1].as_str(), "1B"),
+                (v[2].as_str(), "1C"),
+                (v[3].as_str(), "1D"),
+                (v[4].as_str(), "1E"),
+                (v[5].as_str(), "1F"),
+                (v[7].as_str(), "1G"),
+                (v[8].as_str(), "1H"),
+            ],
+            "{p:?}"
+        );
+        // The sixth unknown one came after 5 siblings: offered.
+        assert_eq!(p.offered, vec![Offered { url: v[6].clone(), index_str: "1I".into(), queued_job_id: None }]);
+    }
+
+    #[test]
+    fn a_held_video_is_offered_even_with_room_under_the_larger_cap() {
+        let v = posts(6);
+        let mut f = all_inside(&v);
+        f.insert(facts_key(&v[1]), VideoFacts { in_article: Some(false), ..Default::default() });
+        f.insert(facts_key(&v[2]), VideoFacts { contextual: true, ..INSIDE });
+        f.insert(facts_key(&v[3]), VideoFacts { live: true, ..INSIDE });
+        f.insert(facts_key(&v[4]), VideoFacts { duration_secs: Some(601.0), ..INSIDE });
+        let p = plan_article_videos_facts(ARTICLE, &v[0], &v, "1", None, &f);
+        assert_eq!(p.siblings, vec![(v[5].clone(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered.iter().map(|o| o.url.clone()).collect::<Vec<_>>(), v[1..=4].to_vec());
+    }
+
+    #[test]
+    fn a_raw_stream_inside_the_article_is_still_offered() {
+        let raw = "https://cdn.portal.gr/video/master.m3u8";
+        let f = facts(&[(raw, INSIDE), (X2, INSIDE)]);
+        let p = plan_with(&f, &[X1, raw, X2]);
+        assert_eq!(p.siblings, vec![(X2.to_string(), "1B".to_string())], "{p:?}");
+        assert_eq!(p.offered, vec![Offered { url: raw.into(), index_str: "1C".into(), queued_job_id: None }]);
+    }
+
+    #[tokio::test]
+    async fn probes_inside_the_article_are_at_most_ten_plus_the_held() {
+        let v = posts(15);
+        let mut f = all_inside(&v);
+        let n = std::cell::Cell::new(0);
+        probe_siblings(ARTICLE, &v[0], &v, "1", None, &mut f, |_| {
+            n.set(n.get() + 1);
+            async { Some(Probed { duration_secs: Some(30.0), live: false }) }
+        })
+        .await;
+        assert_eq!(n.get(), MAX_AUTO_SIBLINGS_IN_ARTICLE);
+
+        // One long video among them: it is held, the 11th steps in and is asked too.
+        let long = v[3].clone();
+        let mut f = all_inside(&v);
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        probe_siblings(ARTICLE, &v[0], &v, "1", None, &mut f, |u| {
+            asked.borrow_mut().push(u.clone());
+            let d = if u == long { 4200.0 } else { 30.0 };
+            async move { Some(Probed { duration_secs: Some(d), live: false }) }
+        })
+        .await;
+        assert_eq!(asked.borrow().len(), MAX_AUTO_SIBLINGS_IN_ARTICLE + 1, "{:?}", asked.borrow());
+        assert!(asked.borrow().contains(&v[11]) && !asked.borrow().contains(&v[12]), "{:?}", asked.borrow());
+        let p = plan_article_videos_facts(ARTICLE, &v[0], &v, "1", None, &f);
+        assert_eq!(p.siblings.len(), MAX_AUTO_SIBLINGS_IN_ARTICLE);
+        assert!(p.siblings.iter().all(|(u, _)| *u != long), "{p:?}");
     }
 
     #[tokio::test]

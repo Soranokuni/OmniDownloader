@@ -2124,7 +2124,8 @@ async fn save_page_evidence(
 /// (P3.14): where on the page each sat and whether it was a contextual
 /// playlist (from the sniffer; nothing for yt-dlp's own page scan), and the
 /// length of each one that would be queued, asked of yt-dlp without
-/// downloading. At most `MAX_AUTO_SIBLINGS` probes plus one for each sibling
+/// downloading. At most `MAX_AUTO_SIBLINGS_IN_ARTICLE` probes (`MAX_AUTO_SIBLINGS`
+/// when no post is confirmed inside the article) plus one for each sibling
 /// held back (its replacement is asked too), 15 s each, one after another. A length that cannot be had stays unknown and plans as before
 /// (queued). Nothing is probed when the journalist asked for a count: they
 /// chose those videos.
