@@ -17,7 +17,7 @@
          links, the saved sample mails, and a daily canary mail when a source
          for canary links exists. Every mail of a day is sent from one invented
          journalist (day index mod 14). Due mails are replayed with
-         `omni-ingest mail-ingest`, at most 3 per pass, oldest first;
+         `omni-ingest mail-ingest`, at most -MaxPerPass per pass, oldest first;
       4. checks every new *.mxf in the test watchfolder with ffprobe against
          the broadcast format, appends the verdict to <Root>\soak_log.csv, and
          deletes checked files older than one hour from that folder;
@@ -30,6 +30,23 @@
     drift from the benchmark's. Write the journalist roster with -WriteSeed
     BEFORE the soak instance first opens its database: the roster is read only
     when the journalists table is empty.
+
+    Replay mode (-ReplayDir) replaces steps 1-3: a folder of saved .eml files
+    is fed in the order and spacing of manifest.csv, sped up by -Speed, so a
+    real newsroom week can be lived through on a test machine. The first real
+    pass starts the replay clock (stored in soak_state.json with the folder,
+    the speed and the files sent). A mail is due once its offset from the first
+    manifest date, divided by -Speed, has passed on the replay clock. Each pass
+    sends the due mails oldest first, at most -MaxPerPass, records each one as
+    sent as soon as mail-ingest has queued it, and stops at the first failure
+    (that mail is retried next pass). After its 3rd failed attempt a mail is
+    given up (listed apart from the sent ones) and the pass goes on with the
+    next due mail. -Days does not apply: once every manifest row is sent or
+    given up, passes only do steps 4-5 and log "replay complete". Steps 4-5,
+    the lock and the free-space rule are the same as in the link soak.
+
+    The replay folder may hold REAL mail: it is refused inside any git
+    repository, like the root, and nothing is ever written into it.
 
 .PARAMETER Root
     The soak root, for example D:\OmniSoak. It must exist, lie outside any git
@@ -64,6 +81,28 @@
 .PARAMETER CorpusSource
     The source file that holds the benchmark corpus (default
     crates\omni-core\src\benchmark.rs next to this script's repository).
+
+.PARAMETER ReplayDir
+    Replay mode: a folder outside any git repository holding *.eml files and
+    manifest.csv with the header "file,date_utc" (file: a bare file name in
+    that folder; date_utc: yyyy-MM-ddTHH:mm:ssZ). Rows may be in any order;
+    they are sent by date, then file name. Cannot be combined with
+    -LinksPerDay, -SampleDir or -CorpusSource. A later pass with another
+    folder is refused, so two corpora never mix in one root.
+
+.PARAMETER Speed
+    Replay mode: newsroom seconds per real second (default 7: a week in a
+    day). Over 0 and at most 1440. A later pass with another speed is refused.
+
+.PARAMETER MaxPerPass
+    Most mails sent in one pass (default 3, 1 to 500). Bounds the catch-up
+    after missed passes.
+
+.EXAMPLE
+    .\soak_feed.ps1 -Root D:\OmniSoak -LinksPerDay 10
+
+.EXAMPLE
+    .\soak_feed.ps1 -Root C:\OmniReplay -ReplayDir C:\OmniReplay\mail -Speed 7 -MaxPerPass 40
 #>
 
 [CmdletBinding()]
@@ -77,14 +116,16 @@ param(
     [switch]$WriteSeed,
     [string]$SampleDir = '',
     [string]$CorpusSource = '',
-    [int]$LinksPerDay = 0
+    [int]$LinksPerDay = 0,
+    [string]$ReplayDir = '',
+    [double]$Speed = 7.0,
+    [int]$MaxPerPass = 3
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $MinFreeGB = 20
-$MaxMailsPerPass = 3
 $IngestTimeoutMs = 5 * 60 * 1000
 $ProbeTimeoutMs = 2 * 60 * 1000
 $MaxAttempts = 3
@@ -434,10 +475,28 @@ function New-MailText {
 
 # --------------------------------------------------------------------------- state
 
+function Resolve-StateFile {
+    param([string]$Path, [switch]$Recover)
+    # Save-TextAtomic's Move-Item can die between dropping the old file and renaming
+    # the new one (Windows PowerShell 5.1): the complete .tmp is then the state.
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { return $Path }
+    $tmp = $Path + '.tmp'
+    if (-not (Test-Path -LiteralPath $tmp -PathType Leaf)) { return $null }
+    if (-not $Recover) { return $tmp }
+    if ($DryRun) {
+        Write-Log "state file missing; read from $tmp (an interrupted save)"
+        return $tmp
+    }
+    Move-Item -LiteralPath $tmp -Destination $Path
+    Write-Log "state file missing; recovered it from $tmp (an interrupted save)"
+    return $Path
+}
+
 function Read-State {
     param([string]$Path, [datetime]$Today)
-    if (Test-Path -LiteralPath $Path) {
-        $s = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $src = Resolve-StateFile -Path $Path -Recover
+    if ($src) {
+        $s = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
         # The start date is kept as yyyyMMdd text: PowerShell 7 would turn an
         # ISO date string into a DateTime on load.
         return [pscustomobject]@{ start = [string](Get-Prop $s 'start'); entries = @(Get-Prop $s 'entries') }
@@ -456,6 +515,130 @@ function Test-EntryDone {
         if ($e.id -eq $Id) { return ([bool]$e.ok -or [int]$e.attempts -ge $MaxAttempts) }
     }
     return $false
+}
+
+function Get-IngestVerdict {
+    param($Result)
+    # mail-ingest exits 0 on "not queued" too, so stdout decides; exit 0 alone is not success.
+    $v = [pscustomobject]@{ Ok = $false; Jobs = 0; Note = '' }
+    if ($Result.TimedOut) {
+        $v.Note = 'timed out'
+    } elseif ($Result.ExitCode -ne 0) {
+        $v.Note = "exit $($Result.ExitCode)"
+    } elseif ($Result.Out -match 'not queued') {
+        $v.Note = 'not queued'
+    } elseif ($Result.Out -match '(\d+) job\(s\)') {
+        $v.Ok = $true; $v.Jobs = [int]$Matches[1]
+    } elseif ($Result.Out -match 'already handled') {
+        $v.Ok = $true
+    } else {
+        $v.Note = 'unrecognised output'
+    }
+    return $v
+}
+
+# --------------------------------------------------------------------------- replay
+
+$ReplayStampFormat = "yyyyMMdd'T'HHmmss'Z'"
+$ManifestDateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+
+function Format-Utc {
+    param([datetime]$Moment)
+    return $Moment.ToString($ManifestDateFormat, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertFrom-UtcText {
+    param([string]$Text, [string]$Format)
+    $dt = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    if ([datetime]::TryParseExact($Text, $Format, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$dt)) { return $dt }
+    return $null
+}
+
+function Assert-OutsideRepo {
+    param([string]$Path, [string]$What)
+    $d = $Path
+    while ($d) {
+        if (Test-Path -LiteralPath (Join-Path $d '.git')) { Stop-Refused "'$d' holds .git; $What must be outside any repository" }
+        $parent = Split-Path -Parent $d
+        if ((-not $parent) -or ($parent -eq $d)) { break }
+        $d = $parent
+    }
+}
+
+function Read-ReplayManifest {
+    param([string]$Dir)
+    # Every problem is a refusal: a half-valid manifest would replay a different week.
+    $path = Join-Path $Dir 'manifest.csv'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Stop-Refused "'$path' is missing" }
+    $lines = @([System.IO.File]::ReadAllLines($path, [System.Text.Encoding]::UTF8))
+    if (($lines.Count -eq 0) -or (($lines[0] -replace '"', '').Trim() -ine 'file,date_utc')) { Stop-Refused "'$path' does not start with the header file,date_utc" }
+    $rows = New-Object System.Collections.Generic.List[object]
+    $names = @{}
+    $badChars = [System.IO.Path]::GetInvalidFileNameChars()
+    foreach ($r in @(Import-Csv -LiteralPath $path -Encoding UTF8)) {
+        $file = [string](Get-Prop $r 'file')
+        $date = [string](Get-Prop $r 'date_utc')
+        if (($file -eq '') -or $file.Contains('..') -or ($file.IndexOfAny([char[]]@('\', '/')) -ge 0) -or ($file.IndexOfAny($badChars) -ge 0)) {
+            Stop-Refused "manifest row '$file' is not a bare file name"
+        }
+        if ($names.ContainsKey($file)) { Stop-Refused "manifest lists '$file' twice" }
+        $names[$file] = $true
+        $full = Join-Path $Dir $file
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { Stop-Refused "manifest row '$file' has no file in '$Dir'" }
+        $dt = ConvertFrom-UtcText -Text $date.Trim() -Format $ManifestDateFormat
+        if ($null -eq $dt) { Stop-Refused "manifest row '$file' has date_utc '$date', expected yyyy-MM-ddTHH:mm:ssZ" }
+        $rows.Add([pscustomobject]@{ File = $file; Path = $full; Date = $dt })
+    }
+    if ($rows.Count -eq 0) { Stop-Refused "'$path' lists no mail" }
+    return , @($rows.ToArray() | Sort-Object -Property Date, File)
+}
+
+function Read-StateObject {
+    param([string]$Path)
+    # Used by the refusals only; a state file that does not parse is the pass's error, not a refusal.
+    $src = Resolve-StateFile -Path $Path
+    if (-not $src) { return $null }
+    try { return (Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Assert-StateFitsMode {
+    param($Raw)
+    if ($null -eq $Raw) { return }
+    $isReplay = $null -ne (Get-Prop $Raw 'replay_dir')
+    if (-not $ReplayDirFull) {
+        if ($isReplay) { Stop-Refused "soak_state.json in '$RootFull' belongs to a replay; pass -ReplayDir or use another root" }
+        return
+    }
+    if (-not $isReplay) { Stop-Refused "soak_state.json in '$RootFull' belongs to a link soak; use another root for a replay" }
+    $dir = [string](Get-Prop $Raw 'replay_dir')
+    if (-not [string]::Equals($dir.TrimEnd('\'), $ReplayDirFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Stop-Refused "this root replays '$dir'; -ReplayDir '$ReplayDirFull' would mix two corpora"
+    }
+    $was = [double](Get-Prop $Raw 'speed')
+    if ([math]::Abs($was - $Speed) -gt (1e-9 * [math]::Max(1.0, $Speed))) {
+        Stop-Refused ("this root replays at -Speed {0}; -Speed {1} would change the clock" -f $was.ToString([System.Globalization.CultureInfo]::InvariantCulture), $Speed.ToString([System.Globalization.CultureInfo]::InvariantCulture))
+    }
+}
+
+function Read-ReplayState {
+    param([string]$Path)
+    $src = Resolve-StateFile -Path $Path -Recover
+    if ($src) {
+        $s = Get-Content -LiteralPath $src -Raw -Encoding UTF8 | ConvertFrom-Json
+        # The start is kept as basic ISO text (no dashes): PowerShell 7 would turn
+        # an extended ISO string into a DateTime on load.
+        return [pscustomobject]@{
+            replay_dir = [string](Get-Prop $s 'replay_dir'); speed = [double](Get-Prop $s 'speed')
+            replay_start_utc = [string](Get-Prop $s 'replay_start_utc')
+            sent = @(@(Get-Prop $s 'sent') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            given_up = @(@(Get-Prop $s 'given_up') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            failed_attempts = @(@(Get-Prop $s 'failed_attempts') | Where-Object { $_ } | ForEach-Object {
+                [pscustomobject]@{ file = [string](Get-Prop $_ 'file'); attempts = [int](Get-Prop $_ 'attempts') }
+            })
+        }
+    }
+    return [pscustomobject]@{ replay_dir = $ReplayDirFull; speed = $Speed; replay_start_utc = ''; sent = @(); given_up = @(); failed_attempts = @() }
 }
 
 # --------------------------------------------------------------------------- delivered files
@@ -538,13 +721,20 @@ $RootFull = (Resolve-Path -LiteralPath $Root).ProviderPath.TrimEnd('\')
 if ($RootFull.StartsWith('\\')) { Stop-Refused "-Root '$RootFull' is a network path; the soak root must be on a local drive" }
 $RootSep = Get-DirWithSeparator $RootFull
 
-$dir = $RootFull
-while ($dir) {
-    # A repository above the root would put the soak's database and mail next to real work.
-    if (Test-Path -LiteralPath (Join-Path $dir '.git')) { Stop-Refused "'$dir' holds .git; the soak root must be outside any repository" }
-    $parent = Split-Path -Parent $dir
-    if ((-not $parent) -or ($parent -eq $dir)) { break }
-    $dir = $parent
+# A repository above the root would put the soak's database and mail next to real work.
+Assert-OutsideRepo -Path $RootFull -What 'the soak root'
+
+if (-not (($Speed -gt 0) -and ($Speed -le 1440))) { Stop-Refused "-Speed $Speed is not over 0 and at most 1440" }
+if (($MaxPerPass -lt 1) -or ($MaxPerPass -gt 500)) { Stop-Refused "-MaxPerPass $MaxPerPass is not 1 to 500" }
+$ReplayDirFull = ''
+if ($PSBoundParameters.ContainsKey('ReplayDir')) {
+    foreach ($other in @('LinksPerDay', 'SampleDir', 'CorpusSource')) {
+        if ($PSBoundParameters.ContainsKey($other)) { Stop-Refused "-ReplayDir cannot be combined with -$other" }
+    }
+    if ((-not $ReplayDir) -or (-not (Test-Path -LiteralPath $ReplayDir -PathType Container))) { Stop-Refused "-ReplayDir '$ReplayDir' does not exist or is not a folder" }
+    $ReplayDirFull = (Resolve-Path -LiteralPath $ReplayDir).ProviderPath.TrimEnd('\')
+    # It may hold real mail: never next to a repository that could commit it.
+    Assert-OutsideRepo -Path $ReplayDirFull -What 'the replay folder'
 }
 
 $ConfigPath = Join-Path $RootFull 'config.json'
@@ -582,6 +772,23 @@ if (Test-Path -LiteralPath $WatchFull) {
     }
 }
 
+# mail-ingest writes into this database: it must be the soak's own, never a live one.
+# Resolved as the daemon does with --root: relative to the root, default data/omni.db.
+$db = Get-Prop $config 'database_path'
+if ($null -eq $db) { $db = 'data/omni.db' }
+if (($db -isnot [string]) -or ($db.Trim() -eq '')) { Stop-Refused 'config.json has a blank or non-text database_path' }
+if ($db.StartsWith('\\') -or $db.StartsWith('//')) { Stop-Refused "database_path '$db' is a network path" }
+if ($db -match '^[A-Za-z]:[\\/]') {
+    $DbFull = [System.IO.Path]::GetFullPath($db)
+} elseif ([System.IO.Path]::IsPathRooted($db)) {
+    Stop-Refused "database_path '$db' is rooted but has no drive"
+} else {
+    $DbFull = [System.IO.Path]::GetFullPath((Join-Path $RootFull $db))
+}
+if (-not $DbFull.StartsWith($RootSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Stop-Refused "database '$DbFull' is not inside the soak root '$RootFull'"
+}
+
 if (-not $Binary) { $Binary = Join-Path $RootFull 'omni-ingest.exe' }
 if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) { Stop-Refused "binary '$Binary' is missing" }
 $BinaryFull = (Resolve-Path -LiteralPath $Binary).ProviderPath
@@ -590,6 +797,8 @@ if ($BinaryFull -like '*\target\release\*') { Stop-Refused "binary '$BinaryFull'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $SampleDir) { $SampleDir = Join-Path $RepoRoot 'temp\dev\mails' }
 if (-not $CorpusSource) { $CorpusSource = Join-Path $RepoRoot 'crates\omni-core\src\benchmark.rs' }
+$Manifest = @()
+if ($ReplayDirFull) { $Manifest = Read-ReplayManifest $ReplayDirFull }
 
 # =========================================================================== seed
 
@@ -621,6 +830,9 @@ $CsvPath = Join-Path $RootFull 'soak_log.csv'
 $script:LogPath = Join-Path $RootFull 'soak_feed.log'
 $LockPath = Join-Path $RootFull 'soak_feed.lock'
 
+# Refused before the lock is taken, so a refusal writes nothing; checked again under the lock.
+Assert-StateFitsMode (Read-StateObject $StatePath)
+
 $lock = $null
 if (-not $DryRun) {
     # Passes can overlap when a mail-ingest is slow; the OS drops the lock if we die.
@@ -634,124 +846,207 @@ if (-not $DryRun) {
 
 try {
     $now = Get-Date
-    $state = Read-State -Path $StatePath -Today $now.Date
-    $startDate = [datetime]::ParseExact($state.start, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
-    $dayIndex = [int][math]::Round(($now.Date - $startDate.Date).TotalDays)
     $freeGB = Get-FreeGB $RootFull
     $sent = 0; $sendFailed = 0; $due = 0; $later = 0
     $checked = 0; $failedChecks = 0; $pruned = 0
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
 
-    if (-not (Test-Path -LiteralPath $SeedPath)) {
-        Write-Log "warning: $SeedPath is missing; mail is attributed to MCR unless the database already has the soak journalists"
-    }
-
-    # ---- steps 1-3: plan and send
-    $canSend = $true
-    $planned = @()
-    if ($dayIndex -lt 0) {
-        Write-Log "start date $($state.start) is in the future; nothing is sent"
-        $canSend = $false
-    } elseif ($dayIndex -ge $Days) {
-        Write-Log "soak window over (day $dayIndex of $Days); nothing is sent"
-        $canSend = $false
-    } elseif (($freeGB -lt 0) -or ($freeGB -lt $MinFreeGB)) {
-        Write-Log "free space on the soak drive is $freeGB GB (under $MinFreeGB GB or unknown); nothing is sent this pass"
-        $canSend = $false
-    }
-
-    if (($dayIndex -ge 0) -and ($dayIndex -lt $Days)) {
-        if (-not (Test-Path -LiteralPath $CorpusSource -PathType Leaf)) { throw "corpus source '$CorpusSource' not found" }
-        $corpus = Read-Corpus $CorpusSource
-        if ($corpus.Count -eq 0) { throw "no corpus links found in '$CorpusSource'" }
-        $samples = @()
-        if (Test-Path -LiteralPath $SampleDir -PathType Container) {
-            $samples = @(Get-ChildItem -LiteralPath $SampleDir -Filter '*.eml' -File | Sort-Object -Property Name | ForEach-Object { $_.FullName })
-        } else {
-            Write-Log 'no sample mail folder; sample mails skipped'
+    if ($ReplayDirFull) {
+        # ---- steps 1-3, replay mode: the manifest's own order and spacing, sped up
+        Assert-StateFitsMode (Read-StateObject $StatePath)
+        $rstate = Read-ReplayState -Path $StatePath
+        $nowUtc = $now.ToUniversalTime()
+        if ((-not $DryRun) -and (-not $rstate.replay_start_utc)) {
+            # The first real pass starts the clock; saved at once so a crash cannot restart it.
+            $rstate.replay_start_utc = $nowUtc.ToString($ReplayStampFormat, $inv)
+            Save-State -Path $StatePath -State $rstate
+            Write-Log ("replay of {0} mails from {1} started at speed {2}" -f $Manifest.Count, $ReplayDirFull, $Speed.ToString($inv))
         }
-        $canaryPath = Join-Path $RootFull 'soak_canary_links.txt'
-        $canaryLinks = Get-CanaryLinks -Path $canaryPath
-        $planned = Get-DayPlan -Day $dayIndex -Corpus $corpus -SampleFiles $samples -CanaryLinks $canaryLinks -LinksPerDay $LinksPerDay
-        $journalist = Get-SoakJournalist (($dayIndex % $JournalistCount) + 1)
-        $nowMinute = $now.Hour * 60 + $now.Minute
+        $elapsed = 0.0
+        if ($rstate.replay_start_utc) {
+            $startUtc = ConvertFrom-UtcText -Text $rstate.replay_start_utc -Format $ReplayStampFormat
+            if ($null -eq $startUtc) { throw "soak_state.json has replay_start_utc '$($rstate.replay_start_utc)', expected yyyyMMddTHHmmssZ" }
+            $elapsed = [math]::Max(0.0, ($nowUtc - $startUtc).TotalSeconds)
+        }
+        $firstUtc = $Manifest[0].Date
+        $lastUtc = $Manifest[$Manifest.Count - 1].Date
+        $clock = Format-Utc ($firstUtc.AddSeconds($elapsed * $Speed))
+        $sentSet = @{}
+        foreach ($n in $rstate.sent) { $sentSet[$n] = $true }
+        # Given up = done, like the link soak's $MaxAttempts rule: one bad file cannot stall the replay.
+        $doneSet = @{}
+        foreach ($n in @($rstate.sent) + @($rstate.given_up)) { $doneSet[$n] = $true }
+        $dueRows = @($Manifest | Where-Object { (-not $doneSet.ContainsKey($_.File)) -and ((($_.Date - $firstUtc).TotalSeconds / $Speed) -le $elapsed) })
+        $sentTotal = @($Manifest | Where-Object { $sentSet.ContainsKey($_.File) }).Count
+        $givenUp = @($Manifest | Where-Object { $doneSet.ContainsKey($_.File) -and (-not $sentSet.ContainsKey($_.File)) }).Count
+        $due = $dueRows.Count
 
         if ($DryRun) {
-            $xf = @($corpus | Where-Object { $_.ExpectedFail }).Count
-            $effective = $corpus.Count
-            if (($LinksPerDay -gt 0) -and ($LinksPerDay -lt $corpus.Count)) { $effective = $LinksPerDay }
-            $xf = @($planned | ForEach-Object { $_.Links } | Where-Object { $_.ExpectedFail }).Count
-            $canarySource = 'no canary links file'
-            if (@($canaryLinks).Count -gt 0) { $canarySource = "canary links from $canaryPath" }
-            Write-Host ("plan day {0}: {1} mails, {2} corpus links per day (LinksPerDay {3}; corpus {4}), {5} expected to fail, journalist {6}; {7}" -f $dayIndex, $planned.Count, $effective, $LinksPerDay, $corpus.Count, $xf, $journalist.Surname, $canarySource)
-            foreach ($e in $planned) {
-                $xfe = @($e.Links | Where-Object { $_.ExpectedFail }).Count
-                Write-Host ("  {0}  {1,-8} {2,-9} links={3} expected_fail={4}" -f (Format-Minute $e.Minute), $e.Kind, $e.Id, @($e.Links).Count, $xfe)
+            $span = $lastUtc - $firstUtc
+            $real = [System.TimeSpan]::FromSeconds([math]::Ceiling($span.TotalSeconds / $Speed))
+            Write-Host ("replay {0}: {1} mails, first {2}, last {3}; newsroom span {4} (d.hh:mm:ss), real duration {5} at speed {6}" -f $ReplayDirFull, $Manifest.Count, (Format-Utc $firstUtc), (Format-Utc $lastUtc), $span.ToString('c'), $real.ToString('c'), $Speed.ToString($inv))
+            if ($rstate.replay_start_utc) {
+                Write-Host ("replay started {0}; {1} of {2} sent, {3} given up; newsroom clock {4}" -f $rstate.replay_start_utc, $sentTotal, $Manifest.Count, $givenUp, $clock)
+            } else {
+                Write-Host 'replay not started; the first real pass starts its clock'
             }
+            Write-Host ("{0} due now and unsent (at most {1} per pass)" -f $due, $MaxPerPass)
         }
 
-        $dueEntries = @($planned | Where-Object { ($_.Minute -le $nowMinute) -and (-not (Test-EntryDone $state.entries $_.Id)) })
-        $later = @($planned | Where-Object { ($_.Minute -gt $nowMinute) -and (-not (Test-EntryDone $state.entries $_.Id)) }).Count
-        $due = $dueEntries.Count
-
-        if ($canSend) {
-            $batch = @($dueEntries | Select-Object -First $MaxMailsPerPass)
+        if (($sentTotal + $givenUp) -ge $Manifest.Count) {
+            Write-Log ("replay complete: all {0} manifest mails are sent ({1}) or given up ({2}); only delivered files are checked" -f $Manifest.Count, $sentTotal, $givenUp)
+        } elseif (($freeGB -lt 0) -or ($freeGB -lt $MinFreeGB)) {
+            Write-Log "free space on the soak drive is $freeGB GB (under $MinFreeGB GB or unknown); nothing is sent this pass"
+        } else {
+            $batch = @($dueRows | Select-Object -First $MaxPerPass)
             if ($DryRun) {
-                foreach ($e in $batch) { Write-Host ("would send {0} ({1}, planned {2}) as {3}" -f $e.Id, $e.Kind, (Format-Minute $e.Minute), $journalist.Email) }
+                foreach ($row in @($batch | Select-Object -First 10)) { Write-Host ("would send {0} (newsroom {1})" -f $row.File, (Format-Utc $row.Date)) }
+                if ($batch.Count -gt 10) { Write-Host ("... and {0} more" -f ($batch.Count - 10)) }
                 if ($batch.Count -eq 0) { Write-Host 'would send nothing this pass' }
             } else {
-                $mailDir = Join-Path (Join-Path $RootFull 'soak_mail') ('day{0:D2}' -f $dayIndex)
-                [void](New-Item -ItemType Directory -Force -Path $mailDir)
-                foreach ($e in $batch) {
-                    $emlPath = Join-Path $mailDir ($e.Id + '.eml')
-                    if (-not (Test-Path -LiteralPath $emlPath)) {
-                        # A retry reuses the file, so its Message-ID is the same and ingest stays idempotent.
-                        $text = New-MailText -Entry $e -Journalist $journalist -Moment (Get-Date)
-                        [System.IO.File]::WriteAllText($emlPath, $text, $(if ($e.Kind -eq 'sample') { $Latin1 } else { $Utf8NoBom }))
-                    }
-                    $args1 = '--root "{0}" --config "{1}" mail-ingest --eml "{2}"' -f $RootFull, $ConfigPath, $emlPath
+                # mail-ingest's answers are kept in the root, never in the replay folder.
+                $outDir = Join-Path (Join-Path $RootFull 'soak_mail') 'replay'
+                [void](New-Item -ItemType Directory -Force -Path $outDir)
+                foreach ($row in $batch) {
+                    $args1 = '--root "{0}" --config "{1}" mail-ingest --eml "{2}"' -f $RootFull, $ConfigPath, $row.Path
                     $r = Invoke-Tool -FilePath $BinaryFull -Arguments $args1 -TimeoutMs $IngestTimeoutMs
-                    $jobs = 0
-                    $ok = $false
-                    $note = ''
-                    if ($r.TimedOut) {
-                        $note = 'timed out'
-                    } elseif ($r.ExitCode -ne 0) {
-                        $note = "exit $($r.ExitCode)"
-                    } elseif ($r.Out -match 'not queued') {
-                        $note = 'not queued'
-                    } elseif ($r.Out -match '(\d+) job\(s\)') {
-                        $ok = $true; $jobs = [int]$Matches[1]
-                    } elseif ($r.Out -match 'already handled') {
-                        $ok = $true
-                    } else {
-                        $note = 'unrecognised output'
-                    }
-                    [System.IO.File]::WriteAllText(($emlPath + '.out.txt'), ($r.Out + $r.Err), $Utf8NoBom)
-
-                    $prev = $null
-                    foreach ($x in $state.entries) { if ($x.id -eq $e.Id) { $prev = $x } }
-                    $attempts = 1
-                    if ($null -ne $prev) { $attempts = [int]$prev.attempts + 1 }
-                    $record = [pscustomobject]@{
-                        id = $e.Id; day = $dayIndex; kind = $e.Kind; planned = (Format-Minute $e.Minute)
-                        links = @($e.Links).Count; expected_fail = @($e.Links | Where-Object { $_.ExpectedFail }).Count
-                        attempts = $attempts; ok = $ok; exit = $r.ExitCode; jobs = $jobs
-                        at = (Get-Date).ToString('s')
-                    }
-                    $state.entries = @(@($state.entries | Where-Object { $_.id -ne $e.Id }) + $record)
-                    Save-State -Path $StatePath -State $state
-                    if ($ok) {
-                        $sent++
-                        Write-Log ("sent {0} ({1} links, {2} jobs) as {3}" -f $e.Id, @($e.Links).Count, $jobs, $journalist.Surname)
-                    } else {
+                    $v = Get-IngestVerdict $r
+                    [System.IO.File]::WriteAllText((Join-Path $outDir ($row.File + '.out.txt')), ($r.Out + $r.Err), $Utf8NoBom)
+                    if (-not $v.Ok) {
                         $sendFailed++
-                        Write-Log ("send of {0} failed ({1}); attempt {2} of {3}" -f $e.Id, $note, $attempts, $MaxAttempts)
+                        $attempts = 1
+                        foreach ($x in $rstate.failed_attempts) { if ($x.file -eq $row.File) { $attempts = $x.attempts + 1 } }
+                        $rstate.failed_attempts = @(@($rstate.failed_attempts | Where-Object { $_.file -ne $row.File }) + [pscustomobject]@{ file = $row.File; attempts = $attempts })
+                        if ($attempts -ge $MaxAttempts) {
+                            # Given up, so the next due mail is tried in this same pass.
+                            $rstate.given_up = @(@($rstate.given_up) + $row.File)
+                            Save-State -Path $StatePath -State $rstate
+                            $givenUp++; $due--
+                            Write-Log ("replay gave up {0} after {1} attempts ({2})" -f $row.File, $attempts, $v.Note)
+                            continue
+                        }
+                        Save-State -Path $StatePath -State $rstate
+                        # Order matters in a replay: stop here; this mail goes first next pass.
+                        Write-Log ("replay send of {0} failed ({1}); attempt {2} of {3}, retried next pass" -f $row.File, $v.Note, $attempts, $MaxAttempts)
+                        break
                     }
+                    # Saved after every mail: a crash mid-pass loses none, and a resend after a
+                    # crash before this save is answered "already handled" by mail-ingest.
+                    $rstate.sent = @(@($rstate.sent) + $row.File)
+                    Save-State -Path $StatePath -State $rstate
+                    $sent++; $sentTotal++
+                    Write-Log ("replay sent {0} (newsroom {1}, {2} jobs)" -f $row.File, (Format-Utc $row.Date), $v.Jobs)
                 }
                 $due = $due - $sent
             }
         }
-        if ((-not $DryRun) -and (-not (Test-Path -LiteralPath $StatePath))) { Save-State -Path $StatePath -State $state }
+    } else {
+        # Again under the lock: a replay pass may have created the state since the first check.
+        Assert-StateFitsMode (Read-StateObject $StatePath)
+        $state = Read-State -Path $StatePath -Today $now.Date
+        $startDate = [datetime]::ParseExact($state.start, 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
+        $dayIndex = [int][math]::Round(($now.Date - $startDate.Date).TotalDays)
+
+        if (-not (Test-Path -LiteralPath $SeedPath)) {
+            Write-Log "warning: $SeedPath is missing; mail is attributed to MCR unless the database already has the soak journalists"
+        }
+
+        # ---- steps 1-3: plan and send
+        $canSend = $true
+        $planned = @()
+        if ($dayIndex -lt 0) {
+            Write-Log "start date $($state.start) is in the future; nothing is sent"
+            $canSend = $false
+        } elseif ($dayIndex -ge $Days) {
+            Write-Log "soak window over (day $dayIndex of $Days); nothing is sent"
+            $canSend = $false
+        } elseif (($freeGB -lt 0) -or ($freeGB -lt $MinFreeGB)) {
+            Write-Log "free space on the soak drive is $freeGB GB (under $MinFreeGB GB or unknown); nothing is sent this pass"
+            $canSend = $false
+        }
+
+        if (($dayIndex -ge 0) -and ($dayIndex -lt $Days)) {
+            if (-not (Test-Path -LiteralPath $CorpusSource -PathType Leaf)) { throw "corpus source '$CorpusSource' not found" }
+            $corpus = Read-Corpus $CorpusSource
+            if ($corpus.Count -eq 0) { throw "no corpus links found in '$CorpusSource'" }
+            $samples = @()
+            if (Test-Path -LiteralPath $SampleDir -PathType Container) {
+                $samples = @(Get-ChildItem -LiteralPath $SampleDir -Filter '*.eml' -File | Sort-Object -Property Name | ForEach-Object { $_.FullName })
+            } else {
+                Write-Log 'no sample mail folder; sample mails skipped'
+            }
+            $canaryPath = Join-Path $RootFull 'soak_canary_links.txt'
+            $canaryLinks = Get-CanaryLinks -Path $canaryPath
+            $planned = Get-DayPlan -Day $dayIndex -Corpus $corpus -SampleFiles $samples -CanaryLinks $canaryLinks -LinksPerDay $LinksPerDay
+            $journalist = Get-SoakJournalist (($dayIndex % $JournalistCount) + 1)
+            $nowMinute = $now.Hour * 60 + $now.Minute
+
+            if ($DryRun) {
+                $xf = @($corpus | Where-Object { $_.ExpectedFail }).Count
+                $effective = $corpus.Count
+                if (($LinksPerDay -gt 0) -and ($LinksPerDay -lt $corpus.Count)) { $effective = $LinksPerDay }
+                $xf = @($planned | ForEach-Object { $_.Links } | Where-Object { $_.ExpectedFail }).Count
+                $canarySource = 'no canary links file'
+                if (@($canaryLinks).Count -gt 0) { $canarySource = "canary links from $canaryPath" }
+                Write-Host ("plan day {0}: {1} mails, {2} corpus links per day (LinksPerDay {3}; corpus {4}), {5} expected to fail, journalist {6}; {7}" -f $dayIndex, $planned.Count, $effective, $LinksPerDay, $corpus.Count, $xf, $journalist.Surname, $canarySource)
+                foreach ($e in $planned) {
+                    $xfe = @($e.Links | Where-Object { $_.ExpectedFail }).Count
+                    Write-Host ("  {0}  {1,-8} {2,-9} links={3} expected_fail={4}" -f (Format-Minute $e.Minute), $e.Kind, $e.Id, @($e.Links).Count, $xfe)
+                }
+            }
+
+            $dueEntries = @($planned | Where-Object { ($_.Minute -le $nowMinute) -and (-not (Test-EntryDone $state.entries $_.Id)) })
+            $later = @($planned | Where-Object { ($_.Minute -gt $nowMinute) -and (-not (Test-EntryDone $state.entries $_.Id)) }).Count
+            $due = $dueEntries.Count
+
+            if ($canSend) {
+                $batch = @($dueEntries | Select-Object -First $MaxPerPass)
+                if ($DryRun) {
+                    foreach ($e in $batch) { Write-Host ("would send {0} ({1}, planned {2}) as {3}" -f $e.Id, $e.Kind, (Format-Minute $e.Minute), $journalist.Email) }
+                    if ($batch.Count -eq 0) { Write-Host 'would send nothing this pass' }
+                } else {
+                    $mailDir = Join-Path (Join-Path $RootFull 'soak_mail') ('day{0:D2}' -f $dayIndex)
+                    [void](New-Item -ItemType Directory -Force -Path $mailDir)
+                    foreach ($e in $batch) {
+                        $emlPath = Join-Path $mailDir ($e.Id + '.eml')
+                        if (-not (Test-Path -LiteralPath $emlPath)) {
+                            # A retry reuses the file, so its Message-ID is the same and ingest stays idempotent.
+                            $text = New-MailText -Entry $e -Journalist $journalist -Moment (Get-Date)
+                            [System.IO.File]::WriteAllText($emlPath, $text, $(if ($e.Kind -eq 'sample') { $Latin1 } else { $Utf8NoBom }))
+                        }
+                        $args1 = '--root "{0}" --config "{1}" mail-ingest --eml "{2}"' -f $RootFull, $ConfigPath, $emlPath
+                        $r = Invoke-Tool -FilePath $BinaryFull -Arguments $args1 -TimeoutMs $IngestTimeoutMs
+                        $v = Get-IngestVerdict $r
+                        $jobs = $v.Jobs
+                        $ok = $v.Ok
+                        $note = $v.Note
+                        [System.IO.File]::WriteAllText(($emlPath + '.out.txt'), ($r.Out + $r.Err), $Utf8NoBom)
+
+                        $prev = $null
+                        foreach ($x in $state.entries) { if ($x.id -eq $e.Id) { $prev = $x } }
+                        $attempts = 1
+                        if ($null -ne $prev) { $attempts = [int]$prev.attempts + 1 }
+                        $record = [pscustomobject]@{
+                            id = $e.Id; day = $dayIndex; kind = $e.Kind; planned = (Format-Minute $e.Minute)
+                            links = @($e.Links).Count; expected_fail = @($e.Links | Where-Object { $_.ExpectedFail }).Count
+                            attempts = $attempts; ok = $ok; exit = $r.ExitCode; jobs = $jobs
+                            at = (Get-Date).ToString('s')
+                        }
+                        $state.entries = @(@($state.entries | Where-Object { $_.id -ne $e.Id }) + $record)
+                        Save-State -Path $StatePath -State $state
+                        if ($ok) {
+                            $sent++
+                            Write-Log ("sent {0} ({1} links, {2} jobs) as {3}" -f $e.Id, @($e.Links).Count, $jobs, $journalist.Surname)
+                        } else {
+                            $sendFailed++
+                            Write-Log ("send of {0} failed ({1}); attempt {2} of {3}" -f $e.Id, $note, $attempts, $MaxAttempts)
+                        }
+                    }
+                    $due = $due - $sent
+                }
+            }
+            if ((-not $DryRun) -and (-not (Test-Path -LiteralPath $StatePath))) { Save-State -Path $StatePath -State $state }
+        }
     }
 
     # ---- step 4: delivered files
@@ -799,7 +1094,11 @@ try {
     }
 
     # ---- step 5: summary
-    $summary = 'pass day={0} sent={1} send_failed={2} pending={3} later={4} checked={5} failed={6} pruned={7} free_gb={8}' -f $dayIndex, $sent, $sendFailed, $due, $later, $checked, $failedChecks, $pruned, $freeGB.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    if ($ReplayDirFull) {
+        $summary = 'pass replay sent={0} sent_total={1}/{2} given_up={3} backlog={4} send_failed={5} newsroom_clock={6} checked={7} failed={8} pruned={9} free_gb={10}' -f $sent, $sentTotal, $Manifest.Count, $givenUp, $due, $sendFailed, $clock, $checked, $failedChecks, $pruned, $freeGB.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    } else {
+        $summary = 'pass day={0} sent={1} send_failed={2} pending={3} later={4} checked={5} failed={6} pruned={7} free_gb={8}' -f $dayIndex, $sent, $sendFailed, $due, $later, $checked, $failedChecks, $pruned, $freeGB.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
     if ($DryRun) { Write-Host "dry run: $summary (nothing written)" } else { Write-Log $summary }
     exit 0
 } catch {
