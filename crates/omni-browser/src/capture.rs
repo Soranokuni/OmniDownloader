@@ -62,6 +62,24 @@ const CLICK_EVERY: Duration = Duration::from_secs(3);
 /// How long one name lookup of the egress rule may take.
 const LOOKUP: Duration = Duration::from_secs(5);
 
+/// How long closing the capture's page may take.
+const PAGE_CLOSE: Duration = Duration::from_secs(5);
+
+/// How far past the budget the capture may run when a DevTools command does
+/// not answer: a step in flight at the deadline (a lookup, at most
+/// [`LOOKUP`]) and closing the page. Past it the capture is dropped (P15.7).
+const RUN_OVERRUN: Duration = Duration::from_secs(12);
+
+/// How long the browser's own shutdown may take; past it Chrome is killed.
+const SHUTDOWN: Duration = Duration::from_secs(10);
+
+/// How long killing Chrome may take, after a shutdown that did not end.
+const KILL: Duration = Duration::from_secs(3);
+
+/// A capture ends within its budget plus this, whatever the browser does
+/// (or does not) answer (P15.7): [`RUN_OVERRUN`] + [`SHUTDOWN`] + [`KILL`].
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
+
 /// The browser predicts, prefetches and preconnects nothing: a preconnect
 /// opens a connection no request (and so no egress check) goes with. WebRTC
 /// sends no UDP the proxy does not carry, which is none (P11.15b3): STUN and
@@ -129,6 +147,8 @@ impl LockerCapture for BrowserCapture {
 /// `dir/files/`. `resolve` is the egress rule's resolver. On any failure
 /// nothing is left in `dir` and the error says why, in a few words, naming a
 /// site at most, never an address. Dropping the future kills the browser.
+/// It returns within the budget plus [`SHUTDOWN_GRACE`], whatever the browser
+/// does (after a launch chromiumoxide bounds itself).
 pub async fn capture_with<R, Fut>(url: &str, dir: &Path, options: &CaptureOptions, resolve: R) -> Result<PathBuf, String>
 where
     R: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
@@ -168,8 +188,25 @@ where
             return Err(format!("the browser did not start: {e:#}"));
         }
     };
-    let result = run(&session.browser, url, &files, options, deadline, resolve, &mut proxy).await;
-    session.shutdown().await;
+    // A DevTools command that never answers must not hold the capture (P15.7):
+    // past the deadline and its overrun the run is dropped, and the browser is
+    // shut down within its own bound or killed.
+    let seen = Mutex::new(Seen::default());
+    let result = until(
+        tokio::time::Instant::from_std(deadline + RUN_OVERRUN),
+        run(&session.browser, url, &files, options, deadline, resolve, &mut proxy, &seen),
+        || {
+            warn!("Locker capture: the browser stopped answering ({})", site_for_log(url));
+            Err(seen.lock().map(|s| s.reason_at_deadline()).unwrap_or_else(|_| "no download started".to_string()))
+        },
+    )
+    .await;
+    if !bounded(SHUTDOWN, session.shutdown()).await {
+        warn!("Locker capture: the browser did not close in time; killing it");
+        let _ = tokio::time::timeout(KILL, session.browser.kill()).await;
+    }
+    // Dropping the session kills Chrome if it still runs (kill on drop).
+    drop(session);
     drop(proxy);
     let _ = std::fs::remove_dir_all(&profile);
     match result {
@@ -177,6 +214,45 @@ where
         Err(why) => {
             let _ = std::fs::remove_dir_all(&files);
             Err(why)
+        }
+    }
+}
+
+/// Run `work` until `deadline`; past it, `work` is dropped and `late` answers.
+async fn until<T>(deadline: tokio::time::Instant, work: impl std::future::Future<Output = T>, late: impl FnOnce() -> T) -> T {
+    match tokio::time::timeout_at(deadline, work).await {
+        Ok(v) => v,
+        Err(_) => late(),
+    }
+}
+
+/// Await `step` for at most `grace`. False when it did not end in time (it is
+/// dropped then).
+async fn bounded(grace: Duration, step: impl std::future::Future<Output = ()>) -> bool {
+    tokio::time::timeout(grace, step).await.is_ok()
+}
+
+/// What a capture saw, readable after its run was dropped at the deadline.
+#[derive(Debug, Default)]
+struct Seen {
+    /// A download of ours began.
+    began: bool,
+    /// The first address a request of the page (`Fetch`) was refused.
+    refused_by_page: Option<String>,
+    /// The first connection only the proxy saw and refused (a WebSocket, a
+    /// preconnect, the browser's own traffic).
+    refused_by_proxy: Option<String>,
+}
+
+impl Seen {
+    /// The reason when the budget ran out.
+    fn reason_at_deadline(&self) -> String {
+        if self.began {
+            return "the download did not finish in time".to_string();
+        }
+        match self.refused_by_page.as_ref().or(self.refused_by_proxy.as_ref()) {
+            Some(site) => format!("no download started; the page asked for an address that is not allowed ({site})"),
+            None => "no download started".to_string(),
         }
     }
 }
@@ -251,6 +327,7 @@ async fn run<R, Fut>(
     deadline: Instant,
     resolve: R,
     proxy: &mut proxy::EgressProxy,
+    seen: &Mutex<Seen>,
 ) -> Result<PathBuf, String>
 where
     R: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
@@ -286,18 +363,14 @@ where
     let mut unwatched: Vec<TargetId> = Vec::new();
 
     let refused = Mutex::new(HashSet::<String>::new());
-    // What was refused, for the reason: a request of the page (`Fetch`) first,
-    // else a connection only the proxy saw (a WebSocket, a preconnect, the
-    // browser's own traffic).
-    let mut refused_any: Option<String> = None;
-    let mut refused_by_proxy: Option<String> = None;
-    // The navigation runs on its own: the requests it makes are answered below.
-    let navigation = {
+    // The navigation runs on its own: the requests it makes are answered
+    // below. It ends with the run, also when the run is dropped (P15.7).
+    let navigation = AbortOnDrop({
         let (page, url) = (page.clone(), url.to_string());
         tokio::spawn(async move {
             let _ = page.goto(url).await;
         })
-    };
+    });
 
     let result = async {
         let mut ours: Option<(String, String)> = None;
@@ -307,10 +380,7 @@ where
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
             if Instant::now() >= deadline {
-                return Err(match &ours {
-                    Some(_) => "the download did not finish in time".to_string(),
-                    None => "no download started".to_string(),
-                });
+                return Err(seen.lock().map(|s| s.reason_at_deadline()).unwrap_or_else(|_| "no download started".to_string()));
             }
             tokio::select! {
                 // A download's start before its progress (P11.15b2): a progress
@@ -328,6 +398,9 @@ where
                     }
                     info!("Locker capture: a download began ({})", site_for_log(&ev.url));
                     ours = Some((ev.guid.clone(), ev.suggested_filename.clone()));
+                    if let Ok(mut s) = seen.lock() {
+                        s.began = true;
+                    }
                 }
                 Some(ev) = progress.next() => {
                     let Some((guid, name)) = ours.clone() else { continue };
@@ -353,7 +426,9 @@ where
                 }
                 // A connection the proxy refused (a WebSocket, a preconnect, …).
                 Some(site) = proxy.refused.recv() => {
-                    refused_by_proxy.get_or_insert(site);
+                    if let Ok(mut s) = seen.lock() {
+                        s.refused_by_proxy.get_or_insert(site);
+                    }
                 }
                 Some(ev) = challenged.next() => {
                     let challenge = &ev.auth_challenge;
@@ -375,7 +450,9 @@ where
                     if allowed(&ev.request.url, &options.allow, resolve.clone(), &refused).await {
                         let _ = browser.execute(ContinueRequestParams::new(id)).await;
                     } else {
-                        refused_any.get_or_insert_with(|| site_for_log(&ev.request.url));
+                        if let Ok(mut s) = seen.lock() {
+                            s.refused_by_page.get_or_insert_with(|| site_for_log(&ev.request.url));
+                        }
                         let _ = browser.execute(FailRequestParams::new(id, ErrorReason::BlockedByClient)).await;
                     }
                 }
@@ -411,14 +488,17 @@ where
         }
     }
     .await;
-    navigation.abort();
-    let _ = page.close().await;
-    match result {
-        Err(why) if why == "no download started" => match refused_any.or(refused_by_proxy) {
-            Some(site) => Err(format!("no download started; the page asked for an address that is not allowed ({site})")),
-            None => Err(why),
-        },
-        other => other,
+    drop(navigation);
+    let _ = tokio::time::timeout(PAGE_CLOSE, page.close()).await;
+    result
+}
+
+/// A spawned task that is aborted when this is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -513,6 +593,61 @@ mod tests {
         assert!(allowed("https://files.example/a", &none_allowed(), resolve.clone(), &refused).await);
         assert!(allowed("https://files.example/b", &none_allowed(), resolve, &refused).await);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "nothing is cached as allowed");
+    }
+
+    /// P15.7: a run that never ends (a DevTools command that never answers)
+    /// is dropped at its deadline and answered by `late`. Paused time: instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_never_ends_is_dropped_at_its_deadline() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(900);
+        let work = std::future::pending::<Result<PathBuf, String>>();
+        let got = tokio::time::timeout_at(deadline + Duration::from_secs(60), until(deadline, work, || Err("late".to_string())))
+            .await
+            .expect("the run must end at its deadline, not hang");
+        assert_eq!(got, Err("late".to_string()));
+        assert_eq!(start.elapsed(), Duration::from_secs(900), "ended exactly at the deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_ends_in_time_keeps_its_result() {
+        let start = tokio::time::Instant::now();
+        let work = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok::<_, String>(PathBuf::from("capture.mp4"))
+        };
+        let got = until(start + Duration::from_secs(900), work, || Err("late".to_string())).await;
+        assert_eq!(got, Ok(PathBuf::from("capture.mp4")));
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    /// P15.7: a shutdown that never ends is given up after its grace.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_that_never_ends_is_given_up_after_its_grace() {
+        let start = tokio::time::Instant::now();
+        let ended = tokio::time::timeout(Duration::from_secs(60), bounded(SHUTDOWN, std::future::pending::<()>()))
+            .await
+            .expect("the shutdown must be given up, not hang");
+        assert!(!ended);
+        assert_eq!(start.elapsed(), SHUTDOWN);
+        assert!(bounded(SHUTDOWN, async {}).await, "a shutdown that ends is waited for");
+    }
+
+    #[test]
+    fn the_grace_covers_every_bounded_step() {
+        assert!(SHUTDOWN_GRACE >= RUN_OVERRUN + SHUTDOWN + KILL);
+        assert!(RUN_OVERRUN >= LOOKUP + PAGE_CLOSE);
+    }
+
+    #[test]
+    fn the_reason_at_the_deadline_says_what_was_seen() {
+        assert_eq!(Seen::default().reason_at_deadline(), "no download started");
+        let began = Seen { began: true, refused_by_page: Some("a.example".into()), ..Seen::default() };
+        assert_eq!(began.reason_at_deadline(), "the download did not finish in time");
+        let both = Seen { began: false, refused_by_page: Some("page.example".into()), refused_by_proxy: Some("proxy.example".into()) };
+        assert_eq!(both.reason_at_deadline(), "no download started; the page asked for an address that is not allowed (page.example)");
+        let proxy = Seen { refused_by_proxy: Some("proxy.example".into()), ..Seen::default() };
+        assert_eq!(proxy.reason_at_deadline(), "no download started; the page asked for an address that is not allowed (proxy.example)");
     }
 
     #[tokio::test]

@@ -1,0 +1,30 @@
+{
+  "ignored_urls": [
+    "https://backgrounds.wetransfer.net/fixture36.png",
+    "https://wetransfer.com/downloads/a1b2c3d4e5f636/f6a7b8c9d036/1a2b36",
+    "https://wetransfer.com/plans",
+    "https://about.wetransfer.com/legal/terms"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "NO_LINKS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "DELTIO14H",
+      "title": "deltio_14h.mp4 has been downloaded"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "LOCKER_NOTICE"
+    }
+  ]
+}

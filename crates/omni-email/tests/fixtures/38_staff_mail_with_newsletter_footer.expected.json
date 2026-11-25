@@ -1,0 +1,31 @@
+{
+  "ignored_urls": [
+    "https://newsletter.us1.list-manage.com/unsubscribe?u=fx38&id=ab38",
+    "https://news.example.org/email-preferences?u=fx38"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "GEORGIOU"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "KAIROS",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture3801"
+        }
+      ],
+      "keyword": "KAIROS",
+      "title": "ΚΑΙΡΟΣ"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

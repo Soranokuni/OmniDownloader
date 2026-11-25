@@ -235,7 +235,15 @@ async fn capture(path: &str, budget_secs: u64, max_bytes: u64) -> (Result<std::p
 async fn capture_url(url: &str, budget_secs: u64, max_bytes: u64, hits: Arc<AtomicUsize>) -> (Result<std::path::PathBuf, String>, Vec<String>, usize, tempfile::TempDir) {
     let job = tempfile::tempdir().unwrap();
     let dir = job.path().join("capture");
-    let got = capture_with(url, &dir, &options(budget_secs, max_bytes), resolve).await;
+    // P15.7: a capture that stalls fails here in about a minute rather than
+    // holding the whole test run (and CI) until its job limit.
+    let limit = Duration::from_secs(budget_secs + 60);
+    let got = tokio::time::timeout(limit, capture_with(url, &dir, &options(budget_secs, max_bytes), resolve))
+        .await
+        .unwrap_or_else(|_| {
+            let test = std::thread::current().name().unwrap_or("a capture test").to_string();
+            panic!("{test}: the capture of {url} did not end within {limit:?}");
+        });
     let left = left(&dir);
     // A connection the page opened late still counts.
     tokio::time::sleep(Duration::from_millis(300)).await;

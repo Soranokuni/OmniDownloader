@@ -654,6 +654,80 @@ async fn a_saved_mail_is_queued_like_one_from_the_mailbox_and_only_once() {
     assert_eq!(repo.get_all_jobs().unwrap().len(), 2);
 }
 
+/// P15.1: a transfer service's notice about a file we sent queues nothing and
+/// is recorded as a mail without links; a delivery to us queues its share link
+/// for MCR, never for a worker, under the default switches.
+#[tokio::test]
+async fn a_transfer_notice_queues_nothing_and_a_delivery_waits_for_mcr() {
+    use omni_email::eml::EmlSource;
+    use omni_email::watcher::Ingested;
+
+    let fixture = |name: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap();
+    let (_dir, repo) = repo();
+    let source = Arc::new(EmlSource::new([
+        ("own.eml".to_string(), fixture("32_transfernow_own_file_sent.eml")),
+        ("delivery.eml".to_string(), fixture("34_swisstransfer_delivery.eml")),
+    ]));
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+
+    let own = source.fetch_mail("own.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&own).await.unwrap(), Ingested::Processed);
+    assert!(repo.get_all_jobs().unwrap().is_empty(), "a notice about our own file queues nothing");
+    let row = repo.get_processed_mail("<fixture-32@example.gr>").unwrap().unwrap();
+    assert_eq!(row.outcome, "NO_LINKS");
+    assert!(row.parse_json.unwrap().contains("LOCKER_NOTICE"));
+
+    let delivery = source.fetch_mail("delivery.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&delivery).await.unwrap(), Ingested::Processed);
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1, "only the share link: {:?}", jobs.iter().map(|j| &j.url).collect::<Vec<_>>());
+    assert!(jobs[0].url.starts_with("https://www.swisstransfer.com/d/"));
+    assert_eq!(jobs[0].status, JobStatus::ManualDownload, "a SwissTransfer page waits for MCR");
+    assert_eq!(jobs[0].extraction_method.as_deref(), Some("locker"));
+}
+
+/// P15.2: an outsider's link to an unknown site is not fetched; a colleague's
+/// (an address on the roster's domain) still is.
+#[tokio::test]
+async fn an_outsiders_unknown_site_is_held_and_a_colleagues_is_tried() {
+    use omni_email::eml::EmlSource;
+    use omni_email::watcher::Ingested;
+
+    let fixture = |name: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap();
+    let (_dir, repo) = repo();
+    let source = Arc::new(EmlSource::new([
+        ("outsider.eml".to_string(), fixture("41_outsider_press_office_unknown_site.eml")),
+        ("staff.eml".to_string(), fixture("42_staff_not_on_roster_unknown_site.eml")),
+    ]));
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+
+    let outsider = source.fetch_mail("outsider.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&outsider).await.unwrap(), Ingested::Processed);
+    assert!(repo.get_all_jobs().unwrap().is_empty(), "an outsider's unknown site is not fetched");
+    let row = repo.get_processed_mail("<fixture-41@example.gr>").unwrap().unwrap();
+    assert_eq!(row.outcome, "NO_LINKS");
+    assert!(row.parse_json.unwrap().contains("OUTSIDER_UNKNOWN_SITES"));
+
+    let staff = source.fetch_mail("staff.eml").await.unwrap();
+    assert_eq!(watcher.ingest(&staff).await.unwrap(), Ingested::Processed);
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, JobStatus::Pending, "a colleague's unknown site is tried, as before");
+}
+
+/// P15.1 must not change a Dropbox share on `dl.dropbox.com`: as before, it is
+/// a direct share a worker fetches.
+#[tokio::test]
+async fn a_dl_dropbox_share_is_still_a_direct_locker_job() {
+    let (_dir, repo) = repo();
+    let source = FakeSource::with(vec![mail("m1", "ΘΕΜΑΤΑ", "1. ΚΑΥΣΩΝΑΣ\nhttps://dl.dropbox.com/s/abc123/kafsonas.mp4")]);
+    let watcher = EmailWatcher::with_source(test_config(), repo.clone(), source.clone());
+    assert_eq!(watcher.poll_once().await.unwrap().processed, 1);
+    let jobs = repo.get_all_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!((jobs[0].status, jobs[0].extraction_method.as_deref()), (JobStatus::Pending, Some("locker")));
+}
+
 /// P11.15b: the `locker` switches decide which locker links a worker takes:
 /// with `direct_shares` off a share waits for MCR; with `browser_capture` on a
 /// WeTransfer page is queued for the browser; a folder always waits.

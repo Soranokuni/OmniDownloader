@@ -1,0 +1,39 @@
+{
+  "ignored_urls": [
+    "https://click.inspire.example.com/email/click?user=fx40&target=board",
+    "https://promo.casino-lucky.example/r/fx40?campaign=autumn",
+    "https://blog.browser-news.example/2026/11/new-release"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.75,
+          "index_str": "1",
+          "keyword": "IDEASYOU",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=fixture4001"
+        }
+      ],
+      "keyword": "IDEASYOU",
+      "title": "Ideas you might love"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "OUTSIDER_UNKNOWN_SITES"
+    }
+  ]
+}

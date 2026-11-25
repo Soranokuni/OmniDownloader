@@ -1,0 +1,36 @@
+{
+  "ignored_urls": [
+    "https://www.myairbridge.com/transfer/Mab35AbCdE/eu1/",
+    "https://www.myairbridge.com/transfer/Mab35AbCdE/eu1/delete",
+    "https://info.myairbridge.com/en/help"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.8,
+          "index_str": "1",
+          "keyword": "PYRKAGIASFAKIA",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://mab.to/t/Mab35AbCdE/eu1"
+        }
+      ],
+      "keyword": "PYRKAGIASFAKIA",
+      "title": "☁ ΠΥΡΚΑΓΙΑ ΣΤΑ ΣΦΑΚΙΑ"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

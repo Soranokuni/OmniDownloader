@@ -103,7 +103,9 @@ const MANUAL: &[(&str, &str)] = &[
     ("wetransfer.com", "WeTransfer"),
     ("we.tl", "WeTransfer"),
     ("myairbridge.com", "MyAirBridge"),
+    ("mab.to", "MyAirBridge"),
     ("transfernow.net", "TransferNow"),
+    ("swisstransfer.com", "SwissTransfer"),
     ("filemail.com", "Filemail"),
     ("mega.nz", "MEGA"),
     ("mega.io", "MEGA"),
@@ -145,6 +147,111 @@ pub fn classify(url: &str) -> Locker {
 /// Whether `url` is any file-locker link (direct, folder or manual).
 pub fn is_locker(url: &str) -> bool {
     classify(url) != Locker::No
+}
+
+/// Whether `url` is on a file-transfer service's own sites (P15.1): the
+/// lockers and their mail and asset hosts (`about.wetransfer.com`,
+/// `backgrounds.wetransfer.net`, `cdn.transfernow.net`, …). MEGA is not one:
+/// its links stay as [`classify`] has them.
+pub fn is_transfer_service(url: &str) -> bool {
+    let Some((_, host)) = web(url) else { return false };
+    match crate::psl::registrable(&host).as_str() {
+        "wetransfer.com" | "wetransfer.net" | "we.tl" | "transfernow.net" | "swisstransfer.com" | "myairbridge.com" | "mab.to"
+        | "filemail.com" | "dropbox.com" | "sharepoint.com" | "1drv.ms" => true,
+        "google.com" => host == "drive.google.com",
+        "live.com" => host == "onedrive.live.com",
+        _ => false,
+    }
+}
+
+/// Whether `url` is the link a transfer service sends for the files
+/// themselves (P15.1), as opposed to its front page, help, legal, contact,
+/// account or mail-preference pages:
+///
+/// * WeTransfer `wetransfer.com/downloads/…` (any subdomain), `we.tl/{x}`;
+/// * TransferNow `/dl/{id}…`, also after a two-letter language segment;
+/// * SwissTransfer `/d/{id}` or `/dl/{id}`;
+/// * MyAirBridge `mab.to/t/{id}…`, `myairbridge.com/transfer/{id}/…` and the
+///   older `#!/folder/…` / `#!/link/…` pages;
+/// * Filemail `/d/{id}`;
+/// * Dropbox (any subdomain, `dl.dropbox.com` too): a shared file or folder
+///   as [`classify`] reads it, or a Dropbox Transfer `/t/{id}`;
+/// * Google Drive: a shared file or folder (`/file/d/{id}`, `open?id=`,
+///   `uc?id=`, `/drive/folders/…`);
+/// * OneDrive: any `1drv.ms` short link, a `onedrive.live.com` share;
+/// * SharePoint: an «anyone» link (`/:v:/…`, `/:f:/…`), a page that names the
+///   item (`id=`, `share=`, `docid=`), or a media file's own address.
+///
+/// Pure: from the link alone.
+pub fn is_share_link(url: &str) -> bool {
+    let Some((parsed, host)) = web(url) else { return false };
+    let site = crate::psl::registrable(&host);
+    let segs: Vec<&str> = parsed.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let lower: Vec<String> = segs.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let seg = |i: usize| lower.get(i).map(String::as_str);
+    // `/{kind}/{id}`, also after a two-letter language segment (`/en/dl/{id}`).
+    let kind_then_id = |kinds: &[&str]| {
+        let language = |s: &str| s.len() == 2 && s.bytes().all(|b| b.is_ascii_alphabetic()) && !kinds.contains(&s);
+        let start = usize::from(seg(0).is_some_and(language));
+        seg(start).is_some_and(|k| kinds.contains(&k)) && seg(start + 1).is_some()
+    };
+    let param = |name: &str| parsed.query_pairs().any(|(k, v)| k.eq_ignore_ascii_case(name) && !v.is_empty());
+    let shared = || matches!(classify(url), Locker::Direct { .. } | Locker::Folder { .. });
+    match site.as_str() {
+        "wetransfer.com" => seg(0) == Some("downloads") && seg(1).is_some(),
+        "we.tl" => seg(0).is_some(),
+        "transfernow.net" => kind_then_id(&["dl"]),
+        "swisstransfer.com" => kind_then_id(&["d", "dl"]),
+        "mab.to" => seg(0) == Some("t") && seg(1).is_some(),
+        "myairbridge.com" => {
+            let fragment = parsed.fragment().unwrap_or("").to_ascii_lowercase();
+            kind_then_id(&["transfer"]) || fragment.contains("/folder/") || fragment.contains("/link/")
+        }
+        "filemail.com" => seg(0) == Some("d") && seg(1).is_some(),
+        // Any subdomain (`dl.dropbox.com/s/…`): the path's shape decides.
+        "dropbox.com" => shared() || (seg(0) == Some("t") && seg(1).is_some()),
+        "google.com" if host == "drive.google.com" => {
+            shared()
+                || (seg(0) == Some("file") && seg(1) == Some("d") && seg(2).is_some())
+                || (matches!(seg(0), Some("open" | "uc")) && segs.len() == 1 && param("id"))
+        }
+        "1drv.ms" => seg(0).is_some(),
+        "live.com" if host == "onedrive.live.com" => shared(),
+        "sharepoint.com" => {
+            const MEDIA: &[&str] = &[".mp4", ".mov", ".mxf", ".avi", ".mkv", ".m4v", ".mts", ".wav", ".mp3", ".zip"];
+            shared()
+                || param("id")
+                || param("share")
+                || param("docid")
+                || lower.last().is_some_and(|l| MEDIA.iter().any(|e| l.ends_with(e)))
+        }
+        _ => false,
+    }
+}
+
+/// One name for the links of one transfer that a service sends twice in a
+/// mail (P15.1): MyAirBridge's `mab.to/t/{id}/…` and its «alternate link»
+/// `myairbridge.com/transfer/{id}/…` are the same files.
+pub fn share_identity(url: &str) -> Option<String> {
+    let (parsed, host) = web(url)?;
+    let segs: Vec<&str> = parsed.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let id = match (crate::psl::registrable(&host).as_str(), segs.as_slice()) {
+        ("mab.to", [t, id, ..]) if t.eq_ignore_ascii_case("t") => *id,
+        ("myairbridge.com", [t, id, ..]) if t.eq_ignore_ascii_case("transfer") => *id,
+        ("myairbridge.com", [_, t, id, ..]) if t.eq_ignore_ascii_case("transfer") => *id,
+        _ => return None,
+    };
+    Some(format!("MyAirBridge/{id}"))
+}
+
+/// `url` parsed, when it is a web address, with its lowercased host.
+fn web(url: &str) -> Option<(reqwest::Url, String)> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some((parsed, host))
 }
 
 /// The direct address of `url`'s one file, when it has one.
@@ -531,5 +638,97 @@ mod tests {
         }
         assert!(is_locker("https://we.tl/t-abc") && !is_locker("https://news.example/story"));
         assert_eq!(direct_download("https://we.tl/t-abc"), None);
+    }
+
+    /// P15.1: SwissTransfer and MyAirBridge's short host are lockers a person fetches.
+    #[test]
+    fn swisstransfer_and_mab_to_are_manual_lockers() {
+        assert_eq!(classify("https://www.swisstransfer.com/d/0a1b2c3d-1111-2222-3333-444455556666"), Locker::Manual { vendor: "SwissTransfer" });
+        assert_eq!(classify("https://mab.to/t/AbCdEf123/eu1"), Locker::Manual { vendor: "MyAirBridge" });
+    }
+
+    /// P15.1: on a transfer service only the link to the files is a share; its
+    /// own pages (front, help, legal, contact, account, mail preferences,
+    /// images) are not.
+    #[test]
+    fn only_a_transfer_services_file_link_is_a_share() {
+        for url in [
+            "https://wetransfer.com/downloads/a1b2c3d4e5/f6a7b8c9d0/1a2b3c?utm_source=x",
+            "https://newsdesk.wetransfer.com/downloads/a1b2c3d4e5/f6a7b8c9d0",
+            "https://we.tl/t-AbCdEf1234",
+            "https://www.transfernow.net/dl/20261124AbCdEf/XyZ12345",
+            "https://www.transfernow.net/en/dl/20261124AbCdEf/XyZ12345",
+            "https://www.transfernow.net/el/dl/20261124AbCdEf",
+            "https://www.swisstransfer.com/d/0a1b2c3d-1111-2222-3333-444455556666",
+            "https://www.swisstransfer.com/dl/0a1b2c3d-1111-2222-3333-444455556666",
+            "https://mab.to/t/AbCdEf123/eu1",
+            "https://www.myairbridge.com/transfer/AbCdEf123/eu1/",
+            "https://www.myairbridge.com/en/#!/folder/AbCdEf123",
+            "https://www.filemail.com/d/abcdefghijklmno",
+            "https://www.dropbox.com/s/abc123/clip.mp4?dl=0",
+            "https://www.dropbox.com/scl/fi/x1y2z3/clip.mov?rlkey=k9k9&dl=0",
+            "https://www.dropbox.com/scl/fo/abc/xyz?rlkey=1",
+            "https://www.dropbox.com/t/AbCdEf123456",
+            "https://dl.dropbox.com/s/abc123/clip.mp4",
+            "https://dl.dropbox.com/scl/fi/x1y2z3/clip.mov?rlkey=k9k9",
+            "https://drive.google.com/file/d/1AbC_dEf-GhIjKlMn/view?usp=sharing",
+            "https://drive.google.com/file/d/short/view",
+            "https://drive.google.com/open?id=1AbC_dEf-GhIjKlMn",
+            "https://drive.google.com/drive/folders/1AbCdEfGhIj",
+            "https://1drv.ms/v/s!AkExample123",
+            "https://onedrive.live.com/?cid=ABC&resid=ABC%21123&authkey=x",
+            "https://station-my.sharepoint.com/:v:/g/personal/desk_station_example/EaBcD?e=Xy1",
+            "https://station.sharepoint.com/sites/news/Shared%20Documents/Forms/AllItems.aspx?id=%2Fsites%2Fnews%2Fclip.mp4",
+        ] {
+            assert!(is_share_link(url), "{url} is a share");
+            assert!(is_transfer_service(url), "{url} is on a transfer service");
+        }
+        for url in [
+            "https://www.transfernow.net/en",
+            "https://www.transfernow.net/en/about",
+            "https://www.transfernow.net/en/support",
+            "https://www.transfernow.net/en/legal/terms",
+            "https://www.transfernow.net/en/legal/privacy-gdpr",
+            "https://www.transfernow.net/en/contact?category=ABUSE&subCat=REPORT&link=https%3A%2F%2Fwww.transfernow.net%2Fdl%2Fx",
+            "https://www.transfernow.net/api/mailer/subscriptions/recipient.html?email=a%40example.gr&token=t0k3n",
+            "https://cdn.transfernow.net/mail/logo.png",
+            "https://about.wetransfer.com/terms",
+            "https://wetransfer.com/",
+            "https://wetransfer.com/downloads",
+            "https://backgrounds.wetransfer.net/x.png",
+            "https://info.myairbridge.com/en/help",
+            "https://www.myairbridge.com/en/",
+            "https://www.dropbox.com/account/plan",
+            "https://www.dropbox.com/plans",
+            "https://www.dropbox.com/home",
+            "https://help.dropbox.com/share/create-and-view-links",
+            "https://em-s.dropbox.com/l/abc?x=1",
+            "https://www.swisstransfer.com/transfers/0a1b2c3d-1111-2222-3333-444455556666/delete?delete-signature=abc",
+            "https://www.swisstransfer.com/en-gb/report",
+            "https://www.filemail.com/pricing",
+            "https://drive.google.com/drive/my-drive",
+            "https://onedrive.live.com/about/en-us/",
+            "https://station.sharepoint.com/sites/news",
+        ] {
+            assert!(!is_share_link(url), "{url} is not a share");
+            assert!(is_transfer_service(url), "{url} is on a transfer service");
+        }
+        // As at HEAD: a `dl.dropbox.com` share is still fetched directly, and
+        // `dropboxusercontent.com` is not a locker at all.
+        assert!(matches!(classify("https://dl.dropbox.com/s/abc123/clip.mp4"), Locker::Direct { vendor: "Dropbox", .. }));
+        assert_eq!(classify("https://dl.dropboxusercontent.com/s/abc123/clip.mp4"), Locker::No);
+        for url in ["https://dl.dropboxusercontent.com/s/abc123/clip.mp4", "https://www.youtube.com/watch?v=abc", "https://mega.nz/file/abc#key", "https://outlook.live.com/mail", "https://www.google.com/maps", "attachment://clip.mp4"] {
+            assert!(!is_transfer_service(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_myairbridge_transfer_has_one_identity_under_both_its_links() {
+        let short = share_identity("https://mab.to/t/AbCdEf123/eu1");
+        assert_eq!(short.as_deref(), Some("MyAirBridge/AbCdEf123"));
+        assert_eq!(share_identity("https://www.myairbridge.com/transfer/AbCdEf123/eu1/"), short);
+        assert_eq!(share_identity("https://www.myairbridge.com/en/transfer/AbCdEf123/eu1/"), short);
+        assert_ne!(share_identity("https://mab.to/t/Other99/eu1"), short);
+        assert_eq!(share_identity("https://we.tl/t-AbCdEf123"), None);
     }
 }

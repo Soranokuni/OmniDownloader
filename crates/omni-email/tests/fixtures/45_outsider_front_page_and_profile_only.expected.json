@@ -1,0 +1,25 @@
+{
+  "ignored_urls": [
+    "https://www.events.example/",
+    "https://www.facebook.com/EventsExample"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "NO_LINKS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "EKDILOSEISEVDOMADAS",
+      "title": "Οι εκδηλώσεις της εβδομάδας"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    }
+  ]
+}

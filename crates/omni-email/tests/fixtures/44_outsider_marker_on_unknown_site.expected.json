@@ -1,0 +1,29 @@
+{
+  "ignored_urls": [
+    "https://www.press-site.example/video/123",
+    "https://www.neakriti.gr/article/kriti/1300044/episkepsi-ypourgou",
+    "https://www.youtube.com/watch?v=fixture4401"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "NO_LINKS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "EPISKEPSIYPOURGOU",
+      "title": "Επίσκεψη υπουργού"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "OUTSIDER_UNKNOWN_SITES"
+    }
+  ]
+}

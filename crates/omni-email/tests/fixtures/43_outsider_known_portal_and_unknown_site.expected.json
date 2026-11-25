@@ -1,0 +1,37 @@
+{
+  "ignored_urls": [
+    "https://www.unknown-blog.example/seismos-video"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.6,
+          "index_str": "1",
+          "keyword": "SEISMOSKRITI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier2",
+          "url": "https://www.neakriti.gr/article/kriti/1300043/seismos-irakleio"
+        }
+      ],
+      "keyword": "SEISMOSKRITI",
+      "title": "Σεισμός στην Κρήτη"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "OUTSIDER_UNKNOWN_SITES"
+    }
+  ]
+}

@@ -194,6 +194,15 @@ pub mod warnings {
     pub const JOURNALIST_AMBIGUOUS: &str = "JOURNALIST_AMBIGUOUS";
     pub const JOURNALIST_OVERRIDE_UNKNOWN: &str = "JOURNALIST_OVERRIDE_UNKNOWN";
     pub const PREAMBLE_URLS: &str = "PREAMBLE_URLS";
+    /// A transfer service's mail about files we sent, or other mail of the
+    /// service (P15.1): nothing in it is queued.
+    pub const LOCKER_NOTICE: &str = "LOCKER_NOTICE";
+    /// [`LOCKER_NOTICE`]'s detail when the mail was the service's but no
+    /// template recognised it, and it holds a link to files: MCR checks it.
+    pub const LOCKER_NOTICE_FILE_LINK: &str = "UNRECOGNISED_WITH_FILE_LINK";
+    /// A mail from outside the newsroom linked to sites the parser does not
+    /// know; those links were not queued (P15.2). MCR may queue them by hand.
+    pub const OUTSIDER_UNKNOWN_SITES: &str = "OUTSIDER_UNKNOWN_SITES";
     pub const SECTION_WITHOUT_LINKS: &str = "SECTION_WITHOUT_LINKS";
     pub const DUPLICATE_SECTION_NUMBER: &str = "DUPLICATE_SECTION_NUMBER";
     pub const MARKER_WITHOUT_URL: &str = "MARKER_WITHOUT_URL";
@@ -1144,11 +1153,149 @@ pub fn could_be_a_story(url: &str) -> bool {
     true
 }
 
+/// Path segments of a link that does something to an account or a
+/// subscription rather than show something (P15.1).
+const ACTION_SEGMENTS: &[&str] = &[
+    "unsubscribe",
+    "unsub",
+    "optout",
+    "opt-out",
+    "opt_out",
+    "delete",
+    "visitor-delete",
+    "abuse",
+    "preferences",
+    "email-preferences",
+    "manage-preferences",
+];
+const ACTION_QUERY_KEYS: &[&str] = &["delete-signature", "unsubscribe", "unsub", "optout"];
+const ACTION_HOSTS: &[&str] = &["myaccount.google.com"];
+
+/// Whether `url` is an action link (P15.1): unsubscribe, delete, report
+/// abuse, mail preferences, a Google account page. Opening one does
+/// something, so it is never a job, whatever its site. A sign-in page is not
+/// one: opening it changes nothing, and it may carry the story onward
+/// (`login/?next=…`). Whole path segments
+/// only (`/news/world-delete-12345` is a story), percent-decoded, without a
+/// page extension (`unsubscribe.php`); a query key such as
+/// `delete-signature`; `category=abuse`; Google's account hosts.
+pub fn is_action_link(url: &str) -> bool {
+    let Ok(u) = Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    if ACTION_HOSTS.contains(&host.as_str()) {
+        return true;
+    }
+    let action_segment = u.path_segments().into_iter().flatten().any(|s| {
+        let s = percent_decoded(s).to_lowercase();
+        let s = [".html", ".htm", ".php", ".aspx", ".asp", ".jsp"]
+            .iter()
+            .find_map(|e| s.strip_suffix(e))
+            .unwrap_or(s.as_str());
+        ACTION_SEGMENTS.contains(&s)
+    });
+    action_segment
+        || u.query_pairs().any(|(k, v)| {
+            let k = k.to_lowercase();
+            ACTION_QUERY_KEYS.contains(&k.as_str()) || (k == "category" && v.eq_ignore_ascii_case("abuse"))
+        })
+}
+
+/// `%xx` escapes decoded; an invalid escape is kept as written.
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).copied().and_then(hex), b.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Public mail providers: an address there says nothing about the newsroom,
+/// so their domains are never the station's own (P15.2). Exact registrable
+/// domains, and families under any suffix (`hotmail.co.uk`).
+const PUBLIC_MAIL_DOMAINS: &[&str] = &[
+    "gmail.com",
+    "googlemail.com",
+    "msn.com",
+    "ymail.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+    "otenet.gr",
+    "windowslive.com",
+];
+const PUBLIC_MAIL_FAMILIES: &[&str] = &["hotmail", "outlook", "live", "yahoo"];
+
+fn is_public_mail_domain(domain: &str) -> bool {
+    let site = omni_core::psl::registrable(domain);
+    PUBLIC_MAIL_DOMAINS.contains(&site.as_str())
+        || site.split('.').next().is_some_and(|first| PUBLIC_MAIL_FAMILIES.contains(&first))
+}
+
+/// The lowercased domain of a mail address, if it has one.
+fn mail_domain(address: &str) -> Option<String> {
+    let a = address.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase();
+    a.rsplit_once('@').map(|(_, d)| d.trim_end_matches('.').to_string()).filter(|d| !d.is_empty())
+}
+
+/// Whether a mail from `from` comes from outside the newsroom (P15.2): the
+/// address is on no roster entry, and its domain is neither one of the
+/// roster's own domains nor under one. The own domains are those of the
+/// roster's addresses, public mail providers left out; nothing is
+/// configured. A roster that yields no own domain (a fresh installation, a
+/// roster without addresses) makes nobody an outsider: unknown sites are
+/// tried, as before.
+pub fn is_outsider(from: &str, roster: &[Journalist]) -> bool {
+    let addr = from.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase();
+    if roster.iter().flat_map(|j| j.emails.iter()).any(|e| e.trim().eq_ignore_ascii_case(&addr)) {
+        return false;
+    }
+    let own: Vec<String> = roster
+        .iter()
+        .flat_map(|j| j.emails.iter())
+        .filter_map(|e| mail_domain(e))
+        .filter(|d| !is_public_mail_domain(d))
+        .collect();
+    if own.is_empty() {
+        return false;
+    }
+    let Some(domain) = mail_domain(&addr) else { return true };
+    !own.iter().any(|d| domain == *d || domain.ends_with(&format!(".{d}")))
+}
+
+/// Whether `url` is one of a transfer service's own pages rather than the
+/// link to the files (P15.1): its front page, help, legal or contact pages,
+/// mail images. Never a job.
+pub fn is_transfer_service_page(url: &str) -> bool {
+    omni_core::locker::is_transfer_service(url) && !omni_core::locker::is_share_link(url)
+}
+
 const LOCKER_DOMAINS: &[&str] = &[
     "wetransfer.com",
     "we.tl",
     "transfernow.net",
+    "swisstransfer.com",
     "myairbridge.com",
+    "mab.to",
     "filemail.com",
     "1drv.ms",
     "onedrive.live.com",
@@ -1771,6 +1918,20 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let journalist = resolve_journalist(mail, &body, &roster_ix, &mut warnings);
     let unresolved = journalist.how == Resolution::Unresolved;
 
+    // A transfer service's mail about files the desk sent, or its other mail
+    // (P15.1): every link is seen and none is queued.
+    let own: Vec<String> = roster.iter().filter(|j| j.surname == "MCR").flat_map(|j| j.emails.iter().cloned()).collect();
+    let notice = crate::locker_notice::notice_kind(mail, &own);
+    let quiet = notice.queues_nothing();
+    // A service mail no template recognised, yet with a link to files: still
+    // no job, but MCR is told to look (P15.1).
+    let mut unrecognised_file_link = false;
+    // A mail from outside the newsroom (P15.2): a link to a site the parser
+    // does not know is held for MCR instead of fetched. Staff mail keeps the
+    // owner's rule that such a site is tried (2026-10-05).
+    let outsider = is_outsider(&mail.from_address, roster);
+    let mut held_unknown = false;
+
     let urgent = {
         let s = translit(&mail.subject);
         cfg.urgent_keywords.iter().any(|k| {
@@ -1824,6 +1985,8 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let mut sections = Vec::new();
     let mut section_sources: Vec<KeywordSource> = Vec::new();
     let mut inherited_from = KeywordSource::Fallback;
+    // One transfer sent under two links (MyAirBridge's short and alternate).
+    let mut seen_shares: HashSet<String> = HashSet::new();
 
     for (s, (title, section_kw, kw_source)) in raw.iter().zip(titles) {
         let marked = marked_urls(&s.lines, &mut warnings, &s.index);
@@ -1837,6 +2000,23 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 || (li > 0 && s.lines[li - 1].urls.is_empty() && RE_VIDEO_HINT.is_match(&s.lines[li - 1].latin));
             for u in &line.urls {
                 if !seen_urls.insert(urlnorm::normalize(u)) {
+                    continue;
+                }
+                // P15.1: never a job: anything in a notice, an action link
+                // (unsubscribe, delete, report abuse, sign in), a transfer
+                // service's own page, the same transfer a second time.
+                // The transfer's identity is taken only by a link that passed
+                // the other checks: a delete link first does not make the
+                // download link a repeat.
+                if quiet
+                    || is_action_link(u)
+                    || is_transfer_service_page(u)
+                    || omni_core::locker::share_identity(u).is_some_and(|id| !seen_shares.insert(id))
+                {
+                    unrecognised_file_link |= notice == crate::locker_notice::NoticeKind::ServiceMail
+                        && !is_action_link(u)
+                        && omni_core::locker::is_share_link(u);
+                    ignored_urls.push(u.clone());
                     continue;
                 }
                 if hinted {
@@ -1855,6 +2035,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
         let any_marked = candidates.iter().any(|(_, t, m)| *m && !matches!(t, Tier::Locker | Tier::Image));
 
         let mut selected: Vec<(String, Tier, bool)> = Vec::new();
+        let mut held_in_section = false;
         for (u, tier, m) in candidates {
             let take = match tier {
                 Tier::Locker => true,
@@ -1868,14 +2049,23 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
             if tier == Tier::Image {
                 images += 1;
             }
-            if take {
+            // P15.2: an outsider's link to an unknown site that would have
+            // been tried (marked, called video, story-like) waits for MCR.
+            // Decided after the marker, so narrowing is as before.
+            let hold = take && outsider && tier == Tier::Other;
+            if hold {
+                held_in_section = true;
+                held_unknown = true;
+            }
+            if take && !hold {
                 selected.push((u, tier, m));
             } else {
                 ignored_urls.push(u);
             }
         }
 
-        if selected.is_empty() && s.header.is_some() {
+        // A section whose links were held is not «without links».
+        if selected.is_empty() && s.header.is_some() && !held_in_section {
             warnings.push(Warning::new(warnings::SECTION_WITHOUT_LINKS, Some(s.index.clone())));
         }
 
@@ -1945,7 +2135,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     // P4.6: video attachments are assets of their own.
     let max_bytes = cfg.max_attachment_mb.saturating_mul(1024 * 1024);
     let mut att_jobs = Vec::new();
-    for a in &mail.attachments {
+    for a in mail.attachments.iter().filter(|_| !quiet) {
         if is_video_attachment(&a.content_type, &a.name) {
             if a.size > max_bytes {
                 warnings.push(Warning::new(warnings::ATTACHMENT_TOO_LARGE, Some(a.name.clone())));
@@ -2023,9 +2213,16 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     }
 
     let job_count: usize = sections.iter().map(|s| s.jobs.len()).sum();
+    if quiet {
+        let detail = unrecognised_file_link.then(|| warnings::LOCKER_NOTICE_FILE_LINK.to_string());
+        warnings.push(Warning::new(warnings::LOCKER_NOTICE, detail));
+    }
+    if held_unknown {
+        warnings.push(Warning::new(warnings::OUTSIDER_UNKNOWN_SITES, None));
+    }
     let outcome = if job_count > 0 {
         Outcome::Jobs
-    } else if images > 0 {
+    } else if images > 0 && !quiet {
         Outcome::PhotosOnly
     } else {
         Outcome::NoLinks
@@ -2380,6 +2577,81 @@ mod tests {
         assert_eq!(classify("https://example.org/story", &c), Tier::Other);
         // Not fooled by a lookalike host.
         assert_eq!(classify("https://notyoutube.com/watch?v=x", &c), Tier::Other);
+        // P15.1: SwissTransfer and MyAirBridge's short links are lockers.
+        assert_eq!(classify("https://www.swisstransfer.com/d/0a1b2c3d", &c), Tier::Locker);
+        assert_eq!(classify("https://mab.to/t/AbC123/eu1", &c), Tier::Locker);
+    }
+
+    /// P15.2: who is outside the newsroom, from the roster alone.
+    #[test]
+    fn outsiders_are_told_apart_by_roster_address_and_own_domain() {
+        let person = |emails: &[&str]| Journalist {
+            id: 0,
+            surname: "X".into(),
+            full_name: String::new(),
+            emails: emails.iter().map(|s| s.to_string()).collect(),
+            default_priority: 0,
+            aliases: vec![],
+            groups: vec![],
+            created_at: None,
+        };
+        let roster = vec![person(&["a@example.gr"]), person(&["Someone@Gmail.com", "b@hotmail.co.uk"])];
+        assert!(!is_outsider("a@example.gr", &roster), "a roster address");
+        assert!(!is_outsider(" A@Example.GR ", &roster), "case and spaces");
+        assert!(!is_outsider("newperson@example.gr", &roster), "the roster's own domain");
+        assert!(!is_outsider("desk@news.example.gr", &roster), "a subdomain of an own domain");
+        assert!(!is_outsider("someone@gmail.com", &roster), "the roster's gmail address itself");
+        assert!(is_outsider("stranger@gmail.com", &roster), "a public provider is never an own domain");
+        assert!(is_outsider("stranger@hotmail.co.uk", &roster), "nor any hotmail");
+        assert!(is_outsider("press@municipality.example", &roster), "an unrelated domain");
+        assert!(is_outsider("x@notexample.gr", &roster), "a lookalike is not a subdomain");
+        assert!(is_outsider("not-an-address", &roster));
+        // No own domain to tell by (fresh installation): nobody is an outsider.
+        assert!(!is_outsider("a@example.gr", &[]), "an empty roster");
+        assert!(!is_outsider("press@municipality.example", &[person(&[])]), "a roster without addresses");
+        assert!(!is_outsider("press@municipality.example", &[person(&["x@gmail.com", "y@outlook.com"])]), "public addresses only");
+        assert!(is_public_mail_domain("mail.yahoo.gr") && is_public_mail_domain("outlook.com") && !is_public_mail_domain("example.gr"));
+    }
+
+    /// P15.1: a link that does something (unsubscribe, delete, report, sign
+    /// in) is never a job; a story whose slug has such a word is.
+    #[test]
+    fn action_links_are_recognised_by_whole_segments_and_query_keys() {
+        for url in [
+            "https://www.swisstransfer.com/transfers/0a1b2c3d-1111/delete?delete-signature=abc123",
+            "https://www.swisstransfer.com/transfers/0a1b2c3d-1111?delete-signature=abc123",
+            "https://myaccount.google.com/visitor-delete?atu=1",
+            "https://newsletter.us1.list-manage.com/unsubscribe?u=abc&id=def",
+            "https://www.transfernow.net/en/contact?category=ABUSE&subCat=REPORT&link=x",
+            "https://news.example.org/mail?unsubscribe=1",
+            "https://news.example.org/email-preferences",
+            "https://news.example.org/account/Unsubscribe.php?u=1",
+            "https://news.example.org/a/%75nsubscribe/1",
+        ] {
+            assert!(is_action_link(url), "{url} is an action link");
+        }
+        // Sign-in pages change nothing: they behave as before P15.1.
+        for url in [
+            "https://m.facebook.com/login/?next=https%3A%2F%2Fm.facebook.com%2Freel%2F123",
+            "https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fdrive.google.com%2Ffile%2Fd%2F1AbC_dEf-GhIjKlMn%2Fview",
+            "https://portal.example.org/user/login?next=/x",
+            "https://portal.example.org/Sign-In",
+            "https://portal.example.org/logout",
+            "https://portal.example.org/reset-password",
+        ] {
+            assert!(!is_action_link(url), "{url} is not an action link");
+        }
+        for url in [
+            "https://www.bbc.com/news/world-delete-12345",
+            "https://www.neakriti.gr/kriti/irakleio/2203079_report-ston-dromo",
+            "https://www.youtube.com/watch?v=abc123",
+            "https://youtu.be/abc123",
+            "https://www.example.gr/login-stories/123",
+            "https://www.example.gr/news/preferences-of-voters?category=politics",
+            "https://www.example.gr/story?id=5&delete=no-key-name",
+        ] {
+            assert!(!is_action_link(url), "{url} is a story");
+        }
     }
 
     #[test]

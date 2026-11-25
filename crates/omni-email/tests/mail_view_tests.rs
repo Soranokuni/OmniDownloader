@@ -263,6 +263,135 @@ fn skipped_links_say_why_and_photos_cannot_be_queued() {
     assert!(view.links.iter().find(|l| l.url.contains("video000001")).unwrap().skip.is_none());
 }
 
+/// P15.1: an action link and a transfer service's own page say why they are
+/// no job, and MCR is not offered them.
+#[test]
+fn action_links_and_transfer_service_pages_cannot_be_queued() {
+    let body = "1. ΚΑΙΡΟΣ\nhttps://www.youtube.com/watch?v=action00001\nhttps://we.tl/t-Action0001\n\
+                Όροι: https://www.transfernow.net/en/legal/terms\n\
+                Απεγγραφή: https://newsletter.us1.list-manage.com/unsubscribe?u=ab&id=cd\n\
+                Αναφορά: https://www.transfernow.net/en/contact?category=ABUSE&subCat=REPORT\n\
+                Διαγραφή: https://www.swisstransfer.com/transfers/0a1b2c3d/delete?delete-signature=x1";
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &mail("ΘΕΜΑΤΑ", body));
+    let urls: Vec<&str> = jobs.iter().map(|j| j.url.as_str()).collect();
+    assert_eq!(urls, vec!["https://www.youtube.com/watch?v=action00001", "https://we.tl/t-Action0001"]);
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let reason = |part: &str| view.links.iter().find(|l| l.url.contains(part)).unwrap().skip.clone().unwrap();
+    for part in ["list-manage", "category=ABUSE", "delete-signature"] {
+        let skip = reason(part);
+        assert!(skip.reason.contains("Σύνδεσμος ενέργειας") && !skip.can_queue, "{part}: {skip:?}");
+    }
+    let page = reason("legal/terms");
+    assert!(page.reason.contains("Σελίδα της υπηρεσίας μεταφοράς") && page.can_queue, "a person decides: {page:?}");
+}
+
+/// P15.2: an outsider's link to an unknown site says why it was held, MCR
+/// can queue it with one click, and the mail's notes say why nothing went.
+#[test]
+fn an_outsiders_unknown_site_is_held_and_can_be_queued_by_hand() {
+    let body = "Τα πλάνα: https://www.municipality.example/news/egkainia\nΚαι: https://www.youtube.com/watch?v=outsider001";
+    let mut m = mail("Εγκαίνια", body);
+    m.from_address = "press@municipality.example".into();
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &m);
+    let urls: Vec<&str> = jobs.iter().map(|j| j.url.as_str()).collect();
+    assert_eq!(urls, vec!["https://www.youtube.com/watch?v=outsider001"], "the video platform is still queued");
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let skip = view.links.iter().find(|l| l.url.contains("municipality")).unwrap().skip.clone().unwrap();
+    assert!(skip.reason.contains("εκτός σύνταξης") && skip.can_queue, "{skip:?}");
+    let note = view.notes.iter().find(|n| n.text.contains("εκτός σύνταξης")).expect("a note about the held links");
+    assert_eq!(note.level, NoteLevel::Info);
+
+    // Only the held link: no job, and the note replaces «no link found».
+    let mut only = mail("Εγκαίνια", "Τα πλάνα: https://www.municipality.example/news/egkainia");
+    only.from_address = "press@municipality.example".into();
+    only.internet_message_id = "<m2@example.gr>".into();
+    let (row, jobs) = ingest(&repo, &only);
+    assert!(jobs.is_empty());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    assert!(view.notes.iter().any(|n| n.text.contains("εκτός σύνταξης")), "{:?}", view.notes);
+    assert!(!view.notes.iter().any(|n| n.text.contains("Δεν βρέθηκε σύνδεσμος")), "{:?}", view.notes);
+
+    // The same link from a colleague is queued, as before.
+    let mut colleague = mail("Εγκαίνια", "Τα πλάνα: https://www.municipality.example/news/egkainia-2");
+    colleague.internet_message_id = "<m3@example.gr>".into();
+    let (row, jobs) = ingest(&repo, &colleague);
+    assert_eq!(jobs.len(), 1);
+    assert!(!build(&row, &jobs, &ParserConfig::default()).notes.iter().any(|n| n.text.contains("εκτός σύνταξης")));
+}
+
+/// P15.2: an outsider's marker still narrows as before (the other links say
+/// so), and a front page or profile keeps its own reason and no warning.
+#[test]
+fn an_outsiders_marker_narrows_as_before_and_non_stories_keep_their_reason() {
+    let fixture = |name: &str| {
+        let raw = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)).unwrap();
+        InboundMail::from_rfc822("fixture", &raw).unwrap()
+    };
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &fixture("44_outsider_marker_on_unknown_site.eml"));
+    assert!(jobs.is_empty());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let reason = |view: &mail_view::MailView, part: &str| view.links.iter().find(|l| l.url.contains(part)).unwrap().skip.clone().unwrap();
+    let held = reason(&view, "press-site");
+    assert!(held.reason.contains("εκτός σύνταξης") && held.can_queue, "{held:?}");
+    for part in ["youtube", "neakriti"] {
+        let skip = reason(&view, part);
+        assert!(skip.reason.contains("ΓΙΑ ΠΛΑΝΑ") && skip.can_queue, "{part}: {skip:?}");
+    }
+
+    let (row, jobs) = ingest(&repo, &fixture("45_outsider_front_page_and_profile_only.eml"));
+    let view = build(&row, &jobs, &ParserConfig::default());
+    for part in ["events.example", "facebook"] {
+        let skip = reason(&view, part);
+        assert!(skip.reason.contains("Δεν μοιάζει με σελίδα είδησης"), "{part}: {skip:?}");
+    }
+    assert!(!view.notes.iter().any(|n| n.text.contains("εκτός σύνταξης")), "{:?}", view.notes);
+}
+
+/// P15.1: a service mail no template recognised, with a link to files: no
+/// job, but a warning for MCR, and the link can be queued by hand.
+#[test]
+fn an_unrecognised_service_mail_with_a_file_link_asks_mcr_to_check() {
+    let mut m = mail("WeTransfer", "Something about your account.\nhttps://wetransfer.com/downloads/unkn0wn1/abc/def\nhttps://wetransfer.com/plans");
+    m.from_address = "noreply@wetransfer.com".into();
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &m);
+    assert!(jobs.is_empty());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let warn = view.notes.iter().find(|n| n.text.contains("δεν αναγνωρίστηκε")).expect("a note about the file link");
+    assert_eq!(warn.level, NoteLevel::Warn);
+    let link = view.links.iter().find(|l| l.url.contains("/downloads/")).unwrap().skip.clone().unwrap();
+    assert!(link.can_queue, "{link:?}");
+
+    // Without a file link it is the plain, informational note.
+    let mut plain = mail("WeTransfer", "Something about your account.\nhttps://wetransfer.com/plans");
+    plain.from_address = "noreply@wetransfer.com".into();
+    plain.internet_message_id = "<m2@example.gr>".into();
+    let (row, jobs) = ingest(&repo, &plain);
+    let view = build(&row, &jobs, &ParserConfig::default());
+    assert!(!view.notes.iter().any(|n| n.text.contains("δεν αναγνωρίστηκε")), "{:?}", view.notes);
+    let note = view.notes.iter().find(|n| n.text.contains("Ειδοποίηση υπηρεσίας μεταφοράς")).unwrap();
+    assert_eq!(note.level, NoteLevel::Info);
+}
+
+/// P15.1: a transfer service's notice about our own file says so, once.
+#[test]
+fn a_transfer_notice_says_why_nothing_was_queued() {
+    let mut m = mail("x.mp4 has been downloaded", "x.mp4 has been downloaded by a@studio.example\nhttps://wetransfer.com/downloads/n0t1c3/abc/def");
+    m.from_address = "noreply@wetransfer.com".into();
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &m);
+    assert!(jobs.is_empty());
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let notes: Vec<&str> = view.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(notes.iter().any(|n| n.contains("Ειδοποίηση υπηρεσίας μεταφοράς")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("Δεν βρέθηκε σύνδεσμος")), "{notes:?}");
+    let skip = view.links[0].skip.clone().unwrap();
+    assert!(skip.reason.contains("Ειδοποίηση της υπηρεσίας μεταφοράς"), "{skip:?}");
+}
+
 #[test]
 fn videos_found_in_an_article_are_filed_under_its_link() {
     let body = "1. ΗΘΟΠΟΙΟΣ\nhttps://www.iefimerida.gr/zoi/ithopoios-podilato";

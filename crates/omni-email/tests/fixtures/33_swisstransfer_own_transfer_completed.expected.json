@@ -1,0 +1,28 @@
+{
+  "ignored_urls": [
+    "https://www.swisstransfer.com/dl/0a1b2c3d-3333-4444-5555-666677778833",
+    "https://www.swisstransfer.com/transfers/0a1b2c3d-3333-4444-5555-666677778833/delete?delete-signature=s1gn4tur3x33"
+  ],
+  "journalist": {
+    "how": "unresolved",
+    "surname": "MCR"
+  },
+  "outcome": "NO_LINKS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [],
+      "keyword": "YOURTRANSFER",
+      "title": "Your transfer has been successfully completed"
+    }
+  ],
+  "urgent": false,
+  "warnings": [
+    {
+      "code": "JOURNALIST_UNRESOLVED"
+    },
+    {
+      "code": "LOCKER_NOTICE"
+    }
+  ]
+}
