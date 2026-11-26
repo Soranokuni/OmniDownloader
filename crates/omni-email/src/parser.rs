@@ -1306,6 +1306,67 @@ const LOCKER_DOMAINS: &[&str] = &[
 
 const IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic"];
 
+/// Servers that only serve photos, with addresses that carry no extension
+/// (P15.5): `(host, path prefix)`. The host matches itself and its
+/// subdomains. Two more are rules in [`is_image_server`]: Google's image
+/// thumbnails (`encrypted-tbnN.gstatic.com`, and `*.gstatic.com/images`
+/// with `q=tbn:…`), and an address whose `format=` or `fm=` names an image
+/// type ([`IMAGE_FORMATS`]). Never a host that also serves video
+/// (`video.twimg.com`, `*.googlevideo.com`, `*.fbcdn.net`).
+const IMAGE_SERVERS: &[(&str, &str)] = &[
+    ("images.openai.com", "/"),
+    ("i.pinimg.com", "/"),
+    ("pbs.twimg.com", "/media/"),
+    ("lh3.googleusercontent.com", "/"),
+    ("lh4.googleusercontent.com", "/"),
+    ("lh5.googleusercontent.com", "/"),
+    ("lh6.googleusercontent.com", "/"),
+    ("braze-images.com", "/"),
+];
+
+/// The `format=` / `fm=` values that say the address is a photo.
+const IMAGE_FORMATS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "avif"];
+
+/// A Google Photos video stream on an `lhN.googleusercontent.com` host: its
+/// address ends in `=dv` or `=m<digits>` (P15.5). Never a photo.
+fn is_google_photos_video(host: &str, path: &str) -> bool {
+    host.ends_with(".googleusercontent.com")
+        && path.rsplit_once('=').is_some_and(|(_, tail)| {
+            tail == "dv" || tail.strip_prefix('m').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// Whether the address's path ends in an image file's extension: a photo
+/// for certain, unlike one matched only by its server ([`is_image_server`]).
+pub fn has_image_extension(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| {
+        let path = u.path().to_ascii_lowercase();
+        IMAGE_EXTENSIONS.iter().any(|e| path.ends_with(e))
+    })
+}
+
+/// A photo by its server or its query, though its path has no image extension (P15.5).
+fn is_image_server(parsed: &Url, host: &str, path: &str) -> bool {
+    if is_google_photos_video(host, path) {
+        return false;
+    }
+    if IMAGE_SERVERS.iter().any(|(h, prefix)| host_matches(host, h) && path.starts_with(prefix)) {
+        return true;
+    }
+    if host_matches(host, "gstatic.com") {
+        let label = host.strip_suffix(".gstatic.com").unwrap_or("");
+        let tbn = label.strip_prefix("encrypted-tbn").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let thumbnail = path == "/images"
+            && parsed.query_pairs().any(|(k, v)| k == "q" && v.to_ascii_lowercase().starts_with("tbn:"));
+        if tbn || thumbnail {
+            return true;
+        }
+    }
+    parsed
+        .query_pairs()
+        .any(|(k, v)| (k == "format" || k == "fm") && IMAGE_FORMATS.contains(&v.to_ascii_lowercase().as_str()))
+}
+
 pub fn classify(url: &str, cfg: &ParserConfig) -> Tier {
     let Ok(parsed) = Url::parse(url) else {
         return Tier::Other;
@@ -1336,7 +1397,7 @@ pub fn classify(url: &str, cfg: &ParserConfig) -> Tier {
         return Tier::Tier1;
     }
 
-    if IMAGE_EXTENSIONS.iter().any(|e| path.ends_with(e)) {
+    if has_image_extension(url) || is_image_server(&parsed, &host, &path) {
         return Tier::Image;
     }
     if cfg
@@ -2553,6 +2614,60 @@ mod tests {
         assert_eq!(cut("https://www.star.gr/tv/clip-VIDEO"), None, "English words end real paths");
         assert_eq!(cut("https://site.gr/a/MYBINTEO"), None, "a Latin word needs a separator");
         assert_eq!(cut("https://site.gr/-ΒΙΝΤΕΟ"), None, "nothing but the front page would be left");
+    }
+
+    /// P15.5: photo links without an image extension (a mail replay sent four
+    /// of them to review) are photos by their server or their query; a video
+    /// host, a lookalike and an article about images are not.
+    #[test]
+    fn known_image_servers_are_photos_without_an_extension() {
+        let c = ParserConfig { tier2_domains: vec!["example-news.gr".into()], ..ParserConfig::default() };
+        for url in [
+            "https://images.openai.com/static-rsc-4/AbC_dEf-123?purpose=fullsize",
+            "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQabc&s=10",
+            "https://encrypted-tbn3.gstatic.com/images?q=tbn:ANd9GcQabc",
+            "https://t0.gstatic.com/images?q=tbn:ANd9GcQabc",
+            "https://i.pinimg.com/originals/ab/cd/ef/abcdef",
+            "https://pbs.twimg.com/media/GabcDEF?format=jpg&name=large",
+            "https://pbs.twimg.com/media/GabcDEF",
+            "https://lh3.googleusercontent.com/abc=w1200-h630-p-k-no-nu",
+            "https://lh6.googleusercontent.com/proxy/abc",
+            "https://braze-images.com/appboy/communication/assets/image_assets/images/abc",
+            "https://cdn.example.org/asset/123?fm=webp&w=800",
+            "https://cdn.example.org/asset/123?format=AVIF",
+            "https://www.example-news.gr/resizer/abc?format=jpeg",
+        ] {
+            assert_eq!(classify(url, &c), Tier::Image, "{url}");
+        }
+        for (url, want) in [
+            ("https://video.twimg.com/ext_tw_video/1/pu/vid/1280x720/abc.mp4", Tier::Other),
+            ("https://pbs.twimg.com/ext_tw_video_thumb/1/pu/abc", Tier::Other),
+            ("https://rr3---sn-abc.googlevideo.com/videoplayback?expire=1&mime=video%2Fmp4", Tier::Other),
+            ("https://video.fbcdn.net/v/t42.1790-2/abc.mp4?_nc_cat=1", Tier::Other),
+            ("https://scontent.xx.fbcdn.net/v/t39.25447-2/abc?format=mp4", Tier::Other),
+            ("https://www.youtube.com/watch?v=abcdefghijk", Tier::Tier1),
+            ("https://lh3.googleusercontent.com.evil.example/abc", Tier::Other),
+            ("https://lh7.googleusercontent.com/abc", Tier::Other),
+            // Google Photos video streams on the same hosts.
+            ("https://lh3.googleusercontent.com/pw/AbCdEf123=dv", Tier::Other),
+            ("https://lh5.googleusercontent.com/pw/AbCdEf123=m18", Tier::Other),
+            ("https://lh6.googleusercontent.com/AbCdEf123=m37", Tier::Other),
+            ("https://lh4.googleusercontent.com/pw/AbCdEf123=m22?format=jpg", Tier::Other),
+            ("https://notimages.openai.com.example/x", Tier::Other),
+            ("https://encrypted-tbnx.gstatic.com/images?q=x", Tier::Other),
+            ("https://www.gstatic.com/images/branding/logo", Tier::Other),
+            ("https://fonts.gstatic.com/s/roboto/v1/font", Tier::Other),
+            // Q2: an X post's photo address stays a post; it may carry a video too.
+            ("https://x.com/someone/status/1234567890/photo/1", Tier::Tier1),
+            ("https://www.example-news.gr/news/images-of-the-storm-video", Tier::Tier2),
+            ("https://www.example-news.gr/images/2026/storm?format=video", Tier::Tier2),
+        ] {
+            assert_eq!(classify(url, &c), want, "{url}");
+        }
+        // Only an extension makes a photo certain; a server match can be queued by hand.
+        assert!(has_image_extension("https://www.example.org/press/photo1.JPG"));
+        assert!(!has_image_extension("https://images.openai.com/static-rsc-4/abc"));
+        assert!(!has_image_extension("not a url.jpg"));
     }
 
     #[test]

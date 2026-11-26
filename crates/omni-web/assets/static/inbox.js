@@ -17,20 +17,20 @@
  */
 
 import { api, el, render, fmtTime, fmtDuration, safeHref, icon } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=10';
+import { toast } from '/static/toast.js?v=11';
 import {
   STAGE_TEXT, STAGE_ORDER, clock, timelineNode, limitNote, fileName, deliveredName,
   waitLine, stepTimeNode, stepIsLong, pager, retryJob, overrideJob, discardJob, cancelJob, redownloadJob, markDoneJob, queueOffer, canRename,
   renameForm, renameOpen, autoDeliveredNode,
-} from '/static/desk.js?v=27';
-import { visible } from '/static/undo.js?v=11';
+} from '/static/desk.js?v=28';
+import { visible } from '/static/undo.js?v=12';
 import {
-  STATUS, statusInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
-} from '/static/status.js?v=10';
-import { whyText } from '/static/worklist.js?v=10';
-import { t, tn } from '/static/text.js?v=9';
-import { navCard } from '/static/keys.js?v=8';
-import { confirmDialog } from '/static/dialog.js?v=10';
+  STATUS, jobInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
+} from '/static/status.js?v=11';
+import { whyText } from '/static/worklist.js?v=11';
+import { t, tn } from '/static/text.js?v=10';
+import { navCard } from '/static/keys.js?v=9';
+import { confirmDialog } from '/static/dialog.js?v=11';
 
 /* ------------------------------------------------------------------ *
  * State
@@ -88,7 +88,7 @@ function shortStatus(j) {
     const stage = SHORT_STAGES.includes(j.stage) ? t(`stage_short.${j.stage}`) : STATUS.RUNNING.phrase;
     return `${stage} ${pct(j)}%`;
   }
-  return statusInfo(j.status).phrase;
+  return jobInfo(j).phrase;
 }
 
 const pct = (j) => Math.max(0, Math.min(100, Math.round(Number(j.progress) || 0)));
@@ -107,7 +107,7 @@ function summary(e) {
   if (!js.length) {
     return [t(e.outcome === 'PHOTOS_ONLY' ? 'mail.photos_only' : 'mail.no_video')];
   }
-  const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0, approval: 0, off: 0 };
+  const c = { ok: 0, run: 0, wait: 0, warn: 0, bad: 0, approval: 0, off: 0, photo: 0 };
   for (const j of js) c[tone(j)] += 1;
   const head = el('b', {}, tn('mail.videos', js.length));
   if (c.ok === js.length) return [head, tn('mail.sum.all_done', js.length)];
@@ -121,6 +121,7 @@ function summary(e) {
   }
   if (c.wait) parts.push(`${c.wait} ${STATUS.PENDING.phrase}`);
   if (c.off) parts.push(tn('mail.sum.cancelled', c.off));
+  if (c.photo) parts.push(tn('mail.sum.photo', c.photo));
   if (c.ok) parts.push(tn('mail.sum.done', c.ok));
   return [head, ' · ', parts.join(' · ')];
 }
@@ -864,7 +865,7 @@ function subLine(j) {
       left = [el('span', { class: 'st' }, t('mail.job.manual'))];
       break;
     case 'CANCELLED':
-      left = [STATUS.CANCELLED.label];
+      left = [jobInfo(j).label];
       break;
     case 'AWAITING_APPROVAL':
       // To the review tab, with this video's card in view (mcr.js listens).

@@ -1294,7 +1294,7 @@ impl StreamSniffer {
                 Ok(Err(e)) => warn!("StreamSniffer: page facts could not be read: {}", e),
                 Err(_) => warn!("StreamSniffer: page facts read timed out"),
             }
-            Err(BrowserError::NoStreamFound(log_addr(target_url)).into())
+            Err(nothing_found(&snapshot.network, log_addr(target_url)).into())
         }
     }
 
@@ -1636,9 +1636,99 @@ fn final_candidates(
     (list, meta)
 }
 
+/// The page's own document as answered: the first document request that has
+/// a response, in the frame of the first document request (a redirect keeps
+/// the frame; an iframe's document has another).
+fn main_document(network: &[NetworkEntry]) -> Option<&NetworkEntry> {
+    let is_doc = |e: &&NetworkEntry| e.resource_type.as_deref() == Some("Document");
+    let first = network.iter().find(is_doc)?;
+    network
+        .iter()
+        .filter(is_doc)
+        .filter(|e| e.frame_id == first.frame_id)
+        .find(|e| e.mime.is_some())
+}
+
+/// What a run that found no stream reports (P15.5): a page that is itself an
+/// image, answered 2xx, is a photo; everything else is a page without a
+/// video. An expired or hotlink-blocked video often answers 403/404 with an
+/// image: that is not a photo, and the original error must stand.
+fn nothing_found(network: &[NetworkEntry], addr: String) -> BrowserError {
+    let photo = main_document(network).is_some_and(|e| {
+        e.status.is_some_and(|s| (200..300).contains(&s))
+            && e.mime.as_deref().is_some_and(|m| m.trim().get(..6).is_some_and(|p| p.eq_ignore_ascii_case("image/")))
+    });
+    if photo {
+        BrowserError::IsPhoto(addr)
+    } else {
+        BrowserError::NoStreamFound(addr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc(url: &str, mime: Option<&str>, frame: &str, kind: &str) -> NetworkEntry {
+        NetworkEntry {
+            url: url.to_string(),
+            method: Some("GET".into()),
+            status: mime.map(|_| 200),
+            mime: mime.map(str::to_string),
+            resource_type: Some(kind.to_string()),
+            frame_id: Some(frame.to_string()),
+        }
+    }
+
+    fn is_photo(network: &[NetworkEntry]) -> bool {
+        matches!(nothing_found(network, "https://x.example/p".into()), BrowserError::IsPhoto(_))
+    }
+
+    /// P15.5: a run that found nothing on a link the browser opened as an
+    /// image says it is a photo; on anything else it stays NO_STREAM_FOUND.
+    #[test]
+    fn nothing_found_on_an_image_document_is_a_photo() {
+        let main = "F1";
+        for mime in ["image/jpeg", "image/webp", "IMAGE/PNG", "image/avif"] {
+            let net = [doc("https://images.example/static/a", Some(mime), main, "Document")];
+            assert!(is_photo(&net), "{mime}");
+        }
+        // A redirect: the first hop has no response of its own, the second is the image.
+        let net = [
+            doc("https://t.example/r", None, main, "Document"),
+            doc("https://img.example/a", Some("image/jpeg"), main, "Document"),
+        ];
+        assert!(is_photo(&net));
+        assert!(matches!(nothing_found(&net, "a".into()), BrowserError::IsPhoto(a) if a == "a"));
+
+        // A page, an unknown answer, or nothing seen at all: no video, as before.
+        for net in [
+            vec![doc("https://news.example/a", Some("text/html"), main, "Document")],
+            vec![doc("https://news.example/a", None, main, "Document")],
+            vec![doc("https://news.example/a", Some(""), main, "Document")],
+            vec![],
+        ] {
+            assert!(!is_photo(&net), "{net:?}");
+            assert!(matches!(nothing_found(&net, "a".into()), BrowserError::NoStreamFound(_)));
+        }
+        // An expired or hotlink-blocked video answering with an error image is not a photo:
+        // the original error stands. Nor is an image with no status seen.
+        for (status, mime) in [(Some(403), "image/png"), (Some(404), "image/jpeg"), (Some(500), "image/gif"), (None, "image/jpeg")] {
+            let mut e = doc("https://cdn.example/v/abc", Some(mime), main, "Document");
+            e.status = status;
+            assert!(!is_photo(&[e]), "{status:?} {mime}");
+        }
+        let mut ok = doc("https://img.example/a", Some("image/jpeg"), main, "Document");
+        ok.status = Some(203);
+        assert!(is_photo(&[ok]), "any 2xx");
+        // An article full of pictures, or with an iframe that is an image, is still an article.
+        let net = [
+            doc("https://news.example/a", Some("text/html"), main, "Document"),
+            doc("https://news.example/pic.jpg", Some("image/jpeg"), main, "Image"),
+            doc("https://ads.example/banner", Some("image/gif"), "F2", "Document"),
+        ];
+        assert!(!is_photo(&net));
+    }
 
     /// A real launch failure cannot be forced here (the browser paths are fixed), so this keeps the
     /// context the self-test's red `browser` line reads (P2.13) on the launch inside `self_test`.

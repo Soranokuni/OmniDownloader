@@ -1,7 +1,7 @@
 /* Helpers shared by the admin panel's section modules (P13.5). */
 
 import { el, toast } from '/static/app.js?v=6';
-import { t } from '/static/admin-text.js?v=4';
+import { t } from '/static/admin-text.js?v=5';
 
 /** Put `text` on the clipboard; plain HTTP on the LAN has no clipboard API. */
 export function copyText(text, button) {

@@ -13,9 +13,9 @@
  */
 
 import { api, el, render } from '/static/app.js?v=6';
-import { stageLine, fileName } from '/static/desk.js?v=27';
-import { healthProblems, healthSummary, checkTexts } from '/static/notify.js?v=22';
-import { t, tn, applyText } from '/static/text.js?v=9';
+import { stageLine, fileName } from '/static/desk.js?v=28';
+import { healthProblems, healthSummary, checkTexts } from '/static/notify.js?v=23';
+import { t, tn, applyText } from '/static/text.js?v=10';
 
 applyText();
 

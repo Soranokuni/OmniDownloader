@@ -1,6 +1,6 @@
 /* The colours of status.js's tones (plan P12.1), one family per tone:
  *   ok green · run blue · wait grey · approval violet · warn amber ·
- *   bad red · off (cancelled) grey, dashed.
+ *   bad red · off (cancelled) grey, dashed · photo (P15.5) steel blue-grey.
  * app.css already colours ok, info, warn and bad; this adds what the one
  * vocabulary needs on top: approval violet wherever it shows, a cancelled
  * job that no longer looks like a waiting one, and the mark beside a colour.
@@ -10,17 +10,24 @@
  * into app.css with its next version bump.
  */
 
+/* A photo link (P15.5): calm, neither a waiting grey nor the running blue. */
+:root { --photo: #7fa7bf; }
+
 .badge .mark { margin-right: 5px; font-weight: 700; }
 
 .badge.wait     { color: var(--text-dim); }
 .badge.run      { color: var(--info); background: rgba(96, 165, 250, 0.1);  border-color: rgba(96, 165, 250, 0.22); }
 .badge.approval { color: var(--busy); background: rgba(167, 139, 250, 0.1); border-color: rgba(167, 139, 250, 0.3); }
 .badge.off      { color: var(--text-dim); background: transparent; border-style: dashed; border-color: #3a4762; }
+.badge.photo    { color: var(--photo); background: rgba(127, 167, 191, 0.1); border-color: rgba(127, 167, 191, 0.4); }
 
 .tag .mark { margin-right: 3px; }
 .tag.off  { background: transparent; color: var(--text-dim); border: 1px dashed #3a4762; }
+.tag.photo { background: var(--photo); color: #0a1a24; }
 
 .seg.off { background: repeating-linear-gradient(135deg, #2a3346 0 2px, transparent 2px 5px); }
+.seg.photo { background: var(--photo); }
+.dot.photo { background: var(--photo); }
 
 .legend i {
   width: auto; height: auto; min-width: 14px;
@@ -35,6 +42,7 @@
 .legend i.bad  { color: #2e0812; }
 .legend i.approval { background: var(--busy); color: #1a0f3a; }
 .legend i.off  { border: 1px dashed #3a4762; color: var(--text-dim); }
+.legend i.photo { background: var(--photo); color: #0a1a24; }
 .legend i.skip { min-width: 14px; }
 
 /* The review tab as a work list (plan P12.2, worklist.js): a heading per

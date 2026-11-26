@@ -13,7 +13,7 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=9';
+import { t } from '/static/text.js?v=10';
 
 /** The colour families and their marks (a text glyph: no sprite needed, so a
  *  tag keeps it at any size). The badge classes are the tone names. */
@@ -25,6 +25,7 @@ export const TONES = {
   warn: { mark: '!' },
   bad: { mark: '✕' },
   off: { mark: '⊘' },
+  photo: { mark: '▣' },
 };
 
 /** The tone of every status the server sends (`JobStatus::as_str`). */
@@ -64,14 +65,30 @@ export const STATUS = Object.fromEntries(Object.entries(STATUS_TONE).map(([s, to
  *  needing a look rather than hide it. */
 const UNKNOWN = row('UNKNOWN', 'warn');
 
+/** A link that turned out to be a photo (P15.5): the worker closed it as
+ *  CANCELLED with IS_PHOTO. Not a status of its own on the server, but its
+ *  own words and its own calm colour here, and never something to look at. */
+const PHOTO = row('PHOTO', 'photo');
+
+/** Whether a job is a photo link the worker closed. */
+export function isPhoto(job) {
+  return !!job && job.status === 'CANCELLED' && job.error_code === 'IS_PHOTO';
+}
+
 /** The row for a status string. */
 export function statusInfo(status) {
   return STATUS[status] || UNKNOWN;
 }
 
+/** The row for a job: its status's, or the photo's. Every badge, tag and
+ *  colour of a job goes through here, so the photo override is in one place. */
+export function jobInfo(job) {
+  return isPhoto(job) ? PHOTO : statusInfo(job && job.status);
+}
+
 /** The colour family of a job's state. */
 export function tone(job) {
-  return statusInfo(job && job.status).tone;
+  return jobInfo(job).tone;
 }
 
 /** The glyph of a tone, aria-hidden: the word beside it is what is read. */
@@ -84,14 +101,14 @@ export function markNode(name) {
  * text: 'label' (the desk), 'short' (the rail) or 'user' (/user).
  */
 export function statusBadge(job, form = 'label') {
-  const info = statusInfo(job && job.status);
+  const info = jobInfo(job);
   return el('span', { class: `badge ${info.tone}` }, markNode(info.tone), info[form] || info.label);
 }
 
 /** A small coloured tag, such as a file's «1B» beside its link, with its
  *  mark, and the status word as its tooltip and accessible name. */
 export function statusTag(job, text, title) {
-  const info = statusInfo(job && job.status);
+  const info = jobInfo(job);
   const name = title || `${text}: ${info.label}`;
   return el('span', { class: `tag ${info.tone}`, title: name, 'aria-label': name }, markNode(info.tone), text);
 }

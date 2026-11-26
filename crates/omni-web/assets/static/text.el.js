@@ -51,6 +51,11 @@ export default {
   'status.UNKNOWN.short': 'Έλεγχος',
   'status.UNKNOWN.phrase': 'χρειάζεται έλεγχο',
   'status.UNKNOWN.user': 'Το εξετάζει το MCR',
+  // A photo link the worker closed (CANCELLED with IS_PHOTO, P15.5): not a status of the server.
+  'status.PHOTO.label': 'Φωτογραφία',
+  'status.PHOTO.short': 'Φωτογραφία',
+  'status.PHOTO.phrase': 'φωτογραφία, όχι βίντεο',
+  'status.PHOTO.user': 'Φωτογραφία, όχι βίντεο',
   // The legend under a mail's text, one word per colour.
   'tone.ok': 'παραδόθηκε',
   'tone.run': 'σε εξέλιξη',
@@ -59,6 +64,7 @@ export default {
   'tone.warn': 'χρειάζεται έλεγχο',
   'tone.bad': 'απέτυχε',
   'tone.off': 'ακυρώθηκε',
+  'tone.photo': 'φωτογραφία',
   'tone.skip': 'δεν κατέβηκε',
 
   // ---- The «needs you» list (worklist.js) ----
@@ -465,6 +471,8 @@ export default {
   'mail.sum.check.other': '{n} θέλουν έλεγχο',
   'mail.sum.cancelled.one': '1 ακυρώθηκε',
   'mail.sum.cancelled.other': '{n} ακυρώθηκαν',
+  'mail.sum.photo.one': '1 φωτογραφία, όχι βίντεο',
+  'mail.sum.photo.other': '{n} φωτογραφίες, όχι βίντεο',
   'mail.sum.done.one': '1 παραδόθηκε',
   'mail.sum.done.other': '{n} παραδόθηκαν',
   'mail.unread_count': 'Νέα που δεν έχετε ανοίξει ακόμη',
