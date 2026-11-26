@@ -83,6 +83,10 @@ fn respond(path: &str, canary: u16, udp: u16) -> Response {
         // A popup, and a link that opens a tab, to the canary.
         "/popup" => page(&format!("<button onclick=\"window.open('{refused}/file')\">Download</button>")),
         "/tab" => page(&format!("<a href=\"{refused}/file\" target=\"_blank\">Download</a>")),
+        // A button that waits, inside its own press, for its request to the canary.
+        "/sync" => page(&format!(
+            "<button onclick=\"var x=new XMLHttpRequest();x.open('GET','{refused}/file',false);try{{x.send();}}catch(e){{}}\">Download</button>"
+        )),
         // Ways around a page's own requests: a WebSocket, a worker, and hints.
         "/socket" => page(&format!("<script>try {{ new WebSocket('ws://127.0.0.2:{canary}/socket'); }} catch (e) {{}}</script>")),
         "/worker" => page(&format!(
@@ -345,6 +349,23 @@ async fn a_download_link_that_opens_a_tab_is_still_gated() {
     let (got, left, hits, _job) = capture("/tab", 10, 1 << 20).await;
     let why = got.unwrap_err();
     assert!(why.contains("not allowed (127.0.0.2)"), "{why}");
+    assert_eq!(hits, 0, "nothing reached the canary");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A request of the page is answered while the capture waits on something
+/// else: here the press itself, which does not return until its own request
+/// to the canary is decided (a synchronous request). Were the gate to wait
+/// for the press, neither would ever end and the refusal would go unseen
+/// (PR #29's CI: a tab's request went unanswered past the deadline).
+#[tokio::test]
+async fn a_request_is_gated_while_the_press_that_made_it_is_still_running() {
+    need_browser!();
+    let _turn = ONE_BROWSER.lock().await;
+    let started = std::time::Instant::now();
+    let (got, left, hits, _job) = capture("/sync", 10, 1 << 20).await;
+    let why = got.unwrap_err();
+    assert!(why.contains("not allowed (127.0.0.2)"), "the press's own request is refused and named, after {:?}: {why}", started.elapsed());
     assert_eq!(hits, 0, "nothing reached the canary");
     assert!(left.is_empty(), "{left:?}");
 }
