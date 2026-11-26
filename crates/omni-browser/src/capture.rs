@@ -409,10 +409,12 @@ where
                         let _ = browser.execute(FailRequestParams::new(id, ErrorReason::BlockedByClient)).await;
                     }
                 }
-                // Both streams ended (the browser is gone): the loop ends the run.
-                else => return std::future::pending::<std::convert::Infallible>().await,
+                else => break,
             }
         }
+        // Both streams ended (the browser is gone): the gate waits for ever
+        // and the loop below ends the run.
+        std::future::pending::<Result<PathBuf, String>>().await
     };
 
     let events = async {
@@ -507,7 +509,7 @@ where
     let result = tokio::select! {
         biased;
         result = events => result,
-        never = gate => match never {},
+        parked = gate => parked,
     };
     drop(navigation);
     let _ = tokio::time::timeout(PAGE_CLOSE, page.close()).await;
