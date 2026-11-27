@@ -76,8 +76,9 @@ const SHUTDOWN: Duration = Duration::from_secs(10);
 /// How long killing Chrome may take, after a shutdown that did not end.
 const KILL: Duration = Duration::from_secs(3);
 
-/// A capture ends within its budget plus this, whatever the browser does
-/// (or does not) answer (P15.7): [`RUN_OVERRUN`] + [`SHUTDOWN`] + [`KILL`].
+/// A capture ends within its budget plus the browser's launch bound plus
+/// this, whatever the browser does (or does not) answer (P15.7, P15.14):
+/// [`RUN_OVERRUN`] + [`SHUTDOWN`] + [`KILL`].
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
 
 /// The browser predicts, prefetches and preconnects nothing: a preconnect
@@ -147,8 +148,12 @@ impl LockerCapture for BrowserCapture {
 /// `dir/files/`. `resolve` is the egress rule's resolver. On any failure
 /// nothing is left in `dir` and the error says why, in a few words, naming a
 /// site at most, never an address. Dropping the future kills the browser.
-/// It returns within the budget plus [`SHUTDOWN_GRACE`], whatever the browser
-/// does (after a launch chromiumoxide bounds itself).
+/// It returns within the budget plus [`LAUNCH`] plus [`SHUTDOWN_GRACE`],
+/// whatever the browser does (P15.14): the launch is bounded by [`LAUNCH`],
+/// the run ends at the budget plus [`RUN_OVERRUN`] counted from the start,
+/// and the shutdown takes at most [`SHUTDOWN`] + [`KILL`].
+///
+/// [`LAUNCH`]: crate::browser::LAUNCH
 pub async fn capture_with<R, Fut>(url: &str, dir: &Path, options: &CaptureOptions, resolve: R) -> Result<PathBuf, String>
 where
     R: Fn(String, u16) -> Fut + Clone + Send + Sync + 'static,
