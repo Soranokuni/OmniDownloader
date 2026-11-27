@@ -893,7 +893,7 @@ static RE_BARE_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"(?i)\b(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be|youtube-nocookie\.com|instagram\.com|facebook\.com"#,
         r#"|fb\.watch|tiktok\.com|x\.com|twitter\.com|vimeo\.com|dailymotion\.com|dai\.ly"#,
-        r#"|wetransfer\.com|we\.tl|transfernow\.net|myairbridge\.com|filemail\.com|fex\.net|1drv\.ms"#,
+        r#"|wetransfer\.com|we\.tl|transfernow\.net|myairbridge\.com|filemail\.com|fex\.net|kdrive\.infomaniak\.com|1drv\.ms"#,
         r#"|onedrive\.live\.com|drive\.google\.com|dropbox\.com)/[^\s<>"'«»\[\]{}|\\^`]+"#
     ))
     .unwrap()
@@ -3730,6 +3730,15 @@ https://youtu.be/sent-on";
         assert_eq!((jobs[0].tier, jobs[0].status), (Tier::Locker, JobStatus::ManualDownload), "{p:?}");
         assert!(!p.warnings.iter().any(|w| w.code == warnings::OUTSIDER_UNKNOWN_SITES), "{:?}", p.warnings);
         assert_eq!(classify("https://fex.net/s/abc1d2e", &ParserConfig::default()), Tier::Locker);
+    }
+
+    /// P15.11 round 2: a kDrive share typed without `https://` is a link,
+    /// and a locker for MCR.
+    #[test]
+    fn a_bare_kdrive_share_is_found() {
+        let found: Vec<String> = find_urls("Τα πλάνα: kdrive.infomaniak.com/app/share/123456/ab12cd34-ef56 ευχαριστώ").into_iter().map(|(_, u)| u).collect();
+        assert_eq!(found, ["https://kdrive.infomaniak.com/app/share/123456/ab12cd34-ef56"]);
+        assert_eq!(classify(&found[0], &ParserConfig::default()), Tier::Locker);
     }
 
     /// P15.11: a SwissTransfer delivery a colleague forwards carries

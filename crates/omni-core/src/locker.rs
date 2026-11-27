@@ -112,6 +112,12 @@ const MANUAL: &[(&str, &str)] = &[
     ("mega.io", "MEGA"),
 ];
 
+/// Infomaniak's own pages in SwissTransfer mail (the apex, and these
+/// subdomains): never jobs. Its other hosts (the video players) stay links.
+const INFOMANIAK_SERVICE_HOSTS: &[&str] = &[
+    "infomaniak.com", "www", "news", "manager", "login", "shop", "support", "faq", "welcome", "kdrive", "swisstransfer",
+];
+
 /// [`Locker`] of `url`, from its parsed host and path.
 pub fn classify(url: &str) -> Locker {
     let Ok(parsed) = reqwest::Url::parse(url.trim()) else { return Locker::No };
@@ -164,8 +170,9 @@ pub fn is_transfer_service(url: &str) -> bool {
         "wetransfer.com" | "wetransfer.net" | "we.tl" | "transfernow.net" | "swisstransfer.com" | "myairbridge.com" | "mab.to"
         | "filemail.com" | "dropbox.com" | "sharepoint.com" | "1drv.ms" | "fex.net" => true,
         // SwissTransfer's operator: its ads, footer and account pages ride
-        // along in a forwarded SwissTransfer mail (P15.11).
-        "infomaniak.com" => true,
+        // along in a forwarded SwissTransfer mail (P15.11). Only those hosts:
+        // its video players (`player.vod2…`, `vod…`, `player…`) are media.
+        "infomaniak.com" => INFOMANIAK_SERVICE_HOSTS.iter().any(|h| host == *h || host.strip_suffix(".infomaniak.com") == Some(*h)),
         "google.com" => host == "drive.google.com",
         "live.com" => host == "onedrive.live.com",
         _ => false,
@@ -679,6 +686,16 @@ mod tests {
             "https://kdrive.infomaniak.com/app/drive/123",
         ] {
             assert!(is_transfer_service(url) && !is_share_link(url), "{url}");
+        }
+        assert!(is_transfer_service("https://infomaniak.com/en"));
+        // Its video players are media, not the service's pages (round 2).
+        for url in [
+            "https://player.vod2.infomaniak.com/embed/1abcd2efgh",
+            "https://vod.infomaniak.com/redirect/station_vod/clip-2026.mp4",
+            "https://player.infomaniak.com/?channel=12345",
+        ] {
+            assert!(!is_transfer_service(url), "{url}");
+            assert_eq!(classify(url), Locker::No, "{url}");
         }
         assert_eq!(classify("https://www.infomaniak.com/en/hosting"), Locker::No);
         assert!(!is_transfer_service("https://infomaniak.com.evil.example/app/share/1/x"));

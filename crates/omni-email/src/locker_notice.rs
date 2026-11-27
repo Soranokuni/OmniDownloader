@@ -341,6 +341,12 @@ mod tests {
             kind("noreply@wetransfer.com", "Petros Example sent you files (from p.example@studio.example)", "Download link"),
             delivery(Some("p.example@studio.example"))
         );
+        // A real delivery cue with an outbound word beside it stays a delivery:
+        // only an address alone gives way to the outbound word.
+        assert_eq!(
+            kind("noreply@wetransfer.com", "p.example@studio.example sent you files — expires in 7 days", "Download link"),
+            delivery(Some("p.example@studio.example"))
+        );
     }
 
     #[test]
