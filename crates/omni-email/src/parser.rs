@@ -56,6 +56,9 @@ pub enum Resolution {
     Subject,
     /// The sender address is on the roster.
     Sender,
+    /// A transfer service's delivery names the sender, and the name is a
+    /// roster surname or full name (P15.8).
+    LockerSender,
     /// The mail came from the MCR desk (or an address not on the roster)
     /// passing on a journalist's mail: the forwarded `From:`/`Από:` line in
     /// the body names someone on the roster.
@@ -237,6 +240,34 @@ fn tokens(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty())
 }
 
+/// Each word of `s` with the word after it, when only spaces stand between
+/// them: «ΜΑΡΙΑ - ΚΑΙΡΟΣ» is two things, «ΜΑΡΙΑ ΚΑΙΡΟΣ» may be one name (P15.8).
+fn tokens_with_next(s: &str) -> Vec<(&str, Option<&str>)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(b)) => {
+                spans.push((b, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(b) = start {
+        spans.push((b, s.len()));
+    }
+    spans
+        .iter()
+        .enumerate()
+        .map(|(i, &(b, e))| {
+            let next = spans.get(i + 1).filter(|&&(nb, _)| s[e..nb].chars().all(char::is_whitespace)).map(|&(nb, ne)| &s[nb..ne]);
+            (&s[b..e], next)
+        })
+        .collect()
+}
+
 enum Lookup {
     One(String),
     /// Several people answer to it (sorted surnames).
@@ -244,9 +275,82 @@ enum Lookup {
     None,
 }
 
+fn pick(mut people: Vec<String>) -> Lookup {
+    people.sort();
+    people.dedup();
+    match people.len() {
+        0 => Lookup::None,
+        1 => Lookup::One(people.remove(0)),
+        _ => Lookup::Ambiguous(people),
+    }
+}
+
+/// Endings of Greek surnames (and of the Slavic ones guests bring), in
+/// ELOT 743 Latin: ΚΟΥΝΑΛΑΚΗΣ, ΣΚΟΥΛΑΚΗ, ΘΕΟΦΙΛΟΥ, ΠΕΤΡΩΦ.
+const SURNAME_ENDINGS: &[&str] =
+    &["IS", "AS", "OS", "ES", "OU", "AKI", "IDI", "IDOU", "OPOULOU", "OF", "OV", "EV", "AKIS"];
+
+/// A word that could be a surname after a first name: four letters or more,
+/// not a word the subject uses for something else, and a surname's ending
+/// («ΛΑΙΒ», «ΧΑΝΙΑ», «ΤΕΛΕΥΤΑΙΟ» have none) or a surname on the roster
+/// (`on_roster`) (P15.8).
+fn looks_like_surname(word: &str, on_roster: impl Fn(&str) -> bool) -> bool {
+    let k = latin_key(word);
+    word.chars().all(char::is_alphabetic)
+        && k.len() >= 4
+        && ![STOPWORDS, NOT_A_NAME, ARTICLES, TOPIC_WORDS].iter().any(|list| list.contains(&k.as_str()))
+        && !is_generic_keyword(&k)
+        && (SURNAME_ENDINGS.iter().any(|e| k.ends_with(e)) || on_roster(&k))
+}
+
+/// Whether `a` becomes `b` with at most one letter added, dropped or
+/// changed: «ΚΟΚΙΝΑΚΗ» for ΚΟΚΚΙΝΑΚΗ.
+fn one_edit(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let (short, long) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let same_start = short.iter().zip(long.iter()).take_while(|(x, y)| x == y).count();
+    let skip = if short.len() == long.len() { 1 } else { 0 };
+    short[(same_start + skip).min(short.len())..] == long[(same_start + 1).min(long.len())..]
+}
+
+/// Whether `word` is surname `key` as written in a subject: the same, its
+/// genitive / nominative form, or either with one letter wrong (P15.8).
+fn same_surname(key: &str, word: &str) -> bool {
+    let bare = |s: &str| s.strip_suffix('S').unwrap_or(s).to_string();
+    key == word
+        || inflected(key, word)
+        || (word.len() >= 4 && [(key.to_string(), word.to_string()), (bare(key), bare(word))].iter().any(|(k, w)| one_edit(k, w)))
+}
+
+/// Genitive / nominative forms of one name: ΑΝΝΑ ↔ ΑΝΝΑΣ, ΠΑΠΑΔΑΚΗΣ ↔ ΠΑΠΑΔΑΚΗ.
+fn inflected(a: &str, b: &str) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    short.len() >= 4 && long.len() - short.len() <= 2 && long.starts_with(short)
+}
+
+/// What a roster key is of its journalist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    /// The surname, or the word of the full name that is the surname.
+    Surname,
+    /// An alias that is not one of the first names.
+    Alias,
+    /// A word of the full name other than the surname, or a one-word alias
+    /// equal to one (P15.8): «ΓΙΑΝΝΗΣ» alone names whoever is called that.
+    FirstName,
+}
+
+struct Key {
+    key: String,
+    surname: String,
+    kind: KeyKind,
+}
+
 struct Roster<'a> {
-    /// (latin key, surname)
-    keys: Vec<(String, String)>,
+    keys: Vec<Key>,
     journalists: &'a [Journalist],
 }
 
@@ -254,54 +358,127 @@ impl<'a> Roster<'a> {
     fn new(journalists: &'a [Journalist]) -> Self {
         let mut keys = Vec::new();
         for j in journalists {
-            let mut add = |raw: &str| {
-                let k = latin_key(raw);
+            let surname = latin_key(&j.surname);
+            let mut add = |k: String, kind: KeyKind| {
                 if !k.is_empty() {
-                    keys.push((k, j.surname.clone()));
+                    keys.push(Key { key: k, surname: j.surname.clone(), kind });
                 }
             };
-            add(&j.surname);
-            for a in &j.aliases {
-                add(a);
-            }
+            add(surname.clone(), KeyKind::Surname);
             // First names from the full name. Two staff sharing a first name
             // is handled by the ambiguity rule, not by leaving them out.
+            let mut first_names = Vec::new();
             for t in tokens(&j.full_name) {
-                add(t);
+                let k = latin_key(t);
+                if k == surname || inflected(&k, &surname) {
+                    add(k, KeyKind::Surname);
+                } else {
+                    first_names.push(k.clone());
+                    add(k, KeyKind::FirstName);
+                }
+            }
+            for a in &j.aliases {
+                let k = latin_key(a);
+                let one_word = tokens(a).count() == 1;
+                // «ΚΩΣΤΑ» for "Kostas" is the first name too.
+                let first = first_names.iter().any(|f| *f == k || inflected(f, &k));
+                let kind = if one_word && first { KeyKind::FirstName } else { KeyKind::Alias };
+                add(k, kind);
             }
         }
         Self { keys, journalists }
     }
 
-    fn lookup(&self, token: &str) -> Lookup {
+    /// The people `token` names, each with whether it names them only by a
+    /// first name: the exact keys, else the genitive / nominative forms.
+    fn candidates(&self, token: &str) -> Vec<(String, bool)> {
         let tok = latin_key(token);
         if tok.len() < 3 {
-            return Lookup::None;
+            return Vec::new();
         }
-        let pick = |set: HashSet<&String>| match set.len() {
-            0 => None,
-            1 => Some(Lookup::One(set.into_iter().next().unwrap().clone())),
-            _ => {
-                let mut all: Vec<String> = set.into_iter().cloned().collect();
-                all.sort();
-                Some(Lookup::Ambiguous(all))
+        let collect = |matches: &dyn Fn(&Key) -> bool| {
+            let mut found: Vec<(String, bool)> = Vec::new();
+            for k in self.keys.iter().filter(|k| matches(k)) {
+                let first = k.kind == KeyKind::FirstName;
+                match found.iter_mut().find(|(s, _)| *s == k.surname) {
+                    Some((_, only_first)) => *only_first &= first,
+                    None => found.push((k.surname.clone(), first)),
+                }
             }
+            found.sort();
+            found
         };
-        let exact: HashSet<&String> = self.keys.iter().filter(|(k, _)| *k == tok).map(|(_, s)| s).collect();
-        if let Some(l) = pick(exact) {
-            return l;
+        let exact = collect(&|k| k.key == tok);
+        if !exact.is_empty() {
+            return exact;
         }
-        // Genitive / nominative forms: ΑΝΝΑ ↔ ΑΝΝΑΣ, ΠΑΠΑΔΑΚΗΣ ↔ ΠΑΠΑΔΑΚΗ.
-        let prefix: HashSet<&String> = self
+        collect(&|k| inflected(&k.key, &tok))
+    }
+
+    fn lookup(&self, token: &str) -> Lookup {
+        pick(self.candidates(token).into_iter().map(|(s, _)| s).collect())
+    }
+
+    /// [`Self::lookup`] of a subject word, given the word after it (P15.8).
+    /// A first name followed by someone else's surname («ΓΙΑΝΝΗΣ ΚΟΥΝΑΛΑΚΗΣ»)
+    /// is not the person whose first name it is. `next` is the word after
+    /// it only when nothing but spaces stands between them.
+    fn lookup_before(&self, token: &str, next: Option<&str>) -> Lookup {
+        let on_roster = |w: &str| self.keys.iter().any(|k| k.kind == KeyKind::Surname && k.key == w);
+        let next = next.filter(|n| looks_like_surname(n, on_roster)).map(latin_key);
+        // Their own name after it, even misspelt by a letter («ΦΩΤΕΙΝΗ ΚΟΚΙΝΑΚΗ»).
+        let theirs = |surname: &str, n: &str| {
+            self.keys.iter().filter(|k| k.surname == surname).any(|k| match k.kind {
+                KeyKind::Surname => same_surname(&k.key, n),
+                _ => k.key == n || inflected(&k.key, n),
+            })
+        };
+        let people = self
+            .candidates(token)
+            .into_iter()
+            .filter(|(surname, only_first)| match &next {
+                Some(n) if *only_first => theirs(surname, n),
+                _ => true,
+            })
+            .map(|(s, _)| s)
+            .collect();
+        pick(people)
+    }
+
+    /// The one person a display name a transfer service shows («Nikos
+    /// Example has sent you…») is, by surname written exactly (the name is
+    /// nominative: «Manolis» is not the surname ΜΑΝΩΛΗ): a first name alone
+    /// is never enough (P15.8). Two people of that surname: the one whose
+    /// full name it is. A first name on the roster that is not theirs
+    /// («Giannis Vardakis» for Nikos Vardakis) is someone else.
+    fn by_full_or_surname(&self, name: &str) -> Option<String> {
+        let words: Vec<String> = tokens(name).map(latin_key).filter(|k| k.len() >= 3).collect();
+        let mut found: Vec<String> = self
             .keys
             .iter()
-            .filter(|(k, _)| {
-                let (short, long) = if k.len() <= tok.len() { (k, &tok) } else { (&tok, k) };
-                short.len() >= 4 && long.len() - short.len() <= 2 && long.starts_with(short.as_str())
-            })
-            .map(|(_, s)| s)
+            .filter(|k| k.kind == KeyKind::Surname && words.contains(&k.key))
+            .map(|k| k.surname.clone())
             .collect();
-        pick(prefix).unwrap_or(Lookup::None)
+        found.sort();
+        found.dedup();
+        // ANTONIOS for ΑΝΤΩΝΗΣ, ΓΙΩΡΓΟ for ΓΙΩΡΓΟΣ.
+        let near = |a: &str, b: &str| a == b || inflected(a, b) || (a.len() >= 4 && b.len() >= 4 && one_edit(a, b));
+        let first_names: Vec<&Key> = self.keys.iter().filter(|k| k.kind == KeyKind::FirstName).collect();
+        found.retain(|s| {
+            let own_surname = |w: &str| self.keys.iter().any(|k| k.surname == *s && k.kind == KeyKind::Surname && k.key == w);
+            let own_first = |w: &str| first_names.iter().any(|k| k.surname == *s && near(&k.key, w));
+            let someone_elses = |w: &str| first_names.iter().any(|k| near(&k.key, w)) && !own_first(w);
+            !words.iter().any(|w| !own_surname(w) && someone_elses(w))
+        });
+        if found.len() > 1 {
+            found.retain(|s| {
+                self.journalists
+                    .iter()
+                    .filter(|j| j.surname == *s)
+                    .any(|j| tokens(&j.full_name).map(latin_key).all(|t| words.contains(&t)))
+            });
+        }
+        (found.len() == 1).then(|| found.remove(0))
     }
 
     fn by_sender(&self, address: &str) -> Option<String> {
@@ -413,10 +590,19 @@ fn is_forward(subject: &str) -> bool {
         .any(|p| s.starts_with(p))
 }
 
+/// Who a transfer service's delivery says sent the files (P15.8).
+struct DeliverySender {
+    /// The address the notice names (`NoticeKind::Delivery`'s sender).
+    address: Option<String>,
+    /// The display name before «has sent you» / «σας έστειλε».
+    name: Option<String>,
+}
+
 fn resolve_journalist(
     mail: &InboundMail,
     body: &str,
     roster: &Roster,
+    locker_sender: Option<&DeliverySender>,
     warnings: &mut Vec<Warning>,
 ) -> ResolvedJournalist {
     let mut ambiguous = false;
@@ -469,11 +655,21 @@ fn resolve_journalist(
     let subject = subject_without_prefixes(&translit(&mail.subject));
     let mut unknown_recipient: Option<String> = None;
     if let Some(c) = RE_SUBJECT_NAME.captures(&subject) {
-        for t in tokens(&c[2]) {
-            match roster.lookup(t) {
+        let words = tokens_with_next(&c[2]);
+        // The sender, when the subject's name could be them: a mail is rarely
+        // for a namesake of the one who sent it (P15.8).
+        let sender = roster.by_sender(&mail.from_address).filter(|s| s != "MCR");
+        for (t, next) in words {
+            match roster.lookup_before(t, next) {
                 Lookup::One(s) => {
                     return ResolvedJournalist {
                         surname: s,
+                        how: Resolution::Subject,
+                    }
+                }
+                Lookup::Ambiguous(all) if sender.as_ref().is_some_and(|s| all.contains(s)) => {
+                    return ResolvedJournalist {
+                        surname: sender.clone().unwrap_or_default(),
                         how: Resolution::Subject,
                     }
                 }
@@ -507,9 +703,23 @@ fn resolve_journalist(
         }
     };
 
+    // b2. A transfer service's delivery names who sent the files: that
+    // person (P15.8). By the address it names, which is exact; else by the
+    // display name («Nikos Example has sent you…»), by surname.
+    let by_locker = locker_sender.and_then(|d| {
+        let by_address = d.address.as_deref().and_then(|a| roster.by_sender(a)).filter(|s| s != "MCR");
+        by_address.or_else(|| d.name.as_deref().and_then(|n| roster.by_full_or_surname(n)).filter(|s| s != "MCR"))
+    });
+    if let Some(s) = by_locker {
+        return ResolvedJournalist {
+            surname: s,
+            how: Resolution::LockerSender,
+        };
+    }
+
     // c. Sender address. The MCR desk is never the journalist: it passes on
     // what a journalist sent it (owner, 2026-10-05).
-    if let Some(s) = roster.by_sender(&mail.from_address).filter(|s| s != "MCR") {
+    if let Some(s)= roster.by_sender(&mail.from_address).filter(|s| s != "MCR") {
         return ResolvedJournalist {
             surname: s,
             how: Resolution::Sender,
@@ -694,6 +904,16 @@ const NOT_A_NAME: &[&str] = &[
     // "ΓΙΑ ΣΗΜΕΡΙΝΟ ΚΑΛΕΣΜΕΝΟ": a day or a role, not who the mail is for.
     "SIMERINO", "SIMERINI", "SIMERINA", "SIMERINOU", "AVRIANO", "AVRIANI", "AVRIANA", "KALESMENO", "KALESMENI",
     "KALESMENOUS",
+];
+
+/// Topics that follow a first name in a subject («ΓΙΑ ΓΙΑΝΝΗ ΣΕΙΣΜΟΣ») and
+/// end like a surname, in Latin (P15.8). Only [`looks_like_surname`] reads
+/// them: after «ΓΙΑ» alone they are still the subject's keyword.
+const TOPIC_WORDS: &[&str] = &[
+    "KAIROS", "AGIOS", "AGIA", "AGIOU", "AGIAS", "SEISMOS", "SEISMOU", "EKLOGES", "AGROTES", "AGROTON", "DIMOS",
+    "DIMOU", "PLIMMYRES", "PLIMMYRA", "ASTYNOMIA", "ASTYNOMIAS", "FOTIA", "FOTIES", "PYRKAGIA", "PYRKAGIES",
+    "PYROSVESTIKI", "PYROSVESTIKIS", "NOSOKOMEIO", "NOSOKOMEIOU", "TROCHAIO", "KAKOKAIRIA", "KYVERNISI", "VOULI",
+    "LIMANI", "AERODROMIO", "SCHOLEIO", "PANEPISTIMIO", "MATS", "AGONAS", "AGONES",
 ];
 
 /// Greek articles and prepositions-with-article, in ELOT 743 Latin: after
@@ -1975,15 +2195,21 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     // 1. Cleanup.
     let body = cleaned_body(mail);
 
-    // 2. Journalist.
-    let journalist = resolve_journalist(mail, &body, &roster_ix, &mut warnings);
-    let unresolved = journalist.how == Resolution::Unresolved;
-
     // A transfer service's mail about files the desk sent, or its other mail
     // (P15.1): every link is seen and none is queued.
     let own: Vec<String> = roster.iter().filter(|j| j.surname == "MCR").flat_map(|j| j.emails.iter().cloned()).collect();
     let notice = crate::locker_notice::notice_kind(mail, &own);
     let quiet = notice.queues_nothing();
+
+    // 2. Journalist.
+    let locker_sender = match &notice {
+        crate::locker_notice::NoticeKind::Delivery { sender } => {
+            Some(DeliverySender { address: sender.clone(), name: crate::locker_notice::sender_name(mail) })
+        }
+        _ => None,
+    };
+    let journalist = resolve_journalist(mail, &body, &roster_ix, locker_sender.as_ref(), &mut warnings);
+    let unresolved = journalist.how == Resolution::Unresolved;
     // A service mail no template recognised, yet with a link to files: still
     // no job, but MCR is told to look (P15.1).
     let mut unrecognised_file_link = false;
@@ -2379,6 +2605,193 @@ mod tests {
         // the answer; the journalist who forwarded it is.
         let m = mail("VIRAL ΓΙΑ ΑΝΝΑ", "flow@example.gr", &body.replace("Κοιν.: Άννα Γεωργίου; ", "Κοιν.: "));
         assert_eq!(resolved(&m, &desk_roster()), ("NIKOLAOU".into(), Resolution::Forwarded));
+    }
+
+    /// P15.8: two staff called Aria, one Giannis, and the desk. Invented.
+    fn namesake_roster() -> Vec<Journalist> {
+        let j = |surname: &str, full: &str, email: &str| Journalist {
+            id: 0,
+            surname: surname.into(),
+            full_name: full.into(),
+            emails: vec![email.into()],
+            default_priority: 0,
+            aliases: vec![],
+            groups: vec![],
+            created_at: None,
+        };
+        vec![
+            j("MCR", "Master Control Room", "master@example.gr"),
+            j("DRAKAKIS", "Γιάννης Δρακάκης", "g.drakakis@example.gr"),
+            j("LEFAKI", "Άρια Λεφάκη", "a.lefaki@example.gr"),
+            j("MPOURNAKI", "Άρια Μπουρνάκη", "a.mpournaki@example.gr"),
+            j("VARDAKIS", "Nikos Vardakis", "n.vardakis@example.gr"),
+            j("VARDAKI", "Eleni Vardaki", "e.vardaki@example.gr"),
+            j("KOKKINAKI", "Φωτεινή Κοκκινάκη", "f.kokkinaki@example.gr"),
+            j("MANOLI", "Μαρία Μανώλη", "m.manoli@example.gr"),
+            j("STAMATAKIS", "Αντώνης Σταματάκης", "a.stamatakis@example.gr"),
+            Journalist { aliases: vec!["ΚΩΣΤΑ".into()], ..j("DIMITRIOU", "Kostas Dimitriou", "k.dimitriou@example.gr") },
+        ]
+    }
+
+    /// P15.8 (i): «ΘΕΜΑΤΑ ΜΑΚΕΤΑ ΓΙΑΝΝΗΣ ΚΟΥΝΑΛΑΚΗΣ» is about a Giannis whose
+    /// surname is not Drakakis: the first name does not take the mail from its sender.
+    #[test]
+    fn a_first_name_before_someone_elses_surname_is_not_that_person() {
+        let r = namesake_roster();
+        let link = "https://www.youtube.com/watch?v=abcdefghijk";
+        let m = mail("ΘΕΜΑΤΑ ΜΑΚΕΤΑ ΓΙΑΝΝΗΣ ΚΟΥΝΑΛΑΚΗΣ", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("LEFAKI".into(), Resolution::Sender));
+        // From the desk, nobody: the subject names no one on the roster.
+        let m = mail("ΘΕΜΑΤΑ ΜΑΚΕΤΑ ΓΙΑΝΝΗΣ ΚΟΥΝΑΛΑΚΗΣ", "master@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("MCR".into(), Resolution::Unresolved));
+
+        // His own surname after it, in either case: him.
+        for subject in ["ΓΙΑ ΓΙΑΝΝΗ ΔΡΑΚΑΚΗ", "ΘΕΜΑΤΑ ΓΙΑΝΝΗΣ ΔΡΑΚΑΚΗΣ"] {
+            let m = mail(subject, "a.lefaki@example.gr", link);
+            assert_eq!(resolved(&m, &r), ("DRAKAKIS".into(), Resolution::Subject), "{subject}");
+        }
+        // A first name alone, or before a word that is no surname: him, as before.
+        for subject in ["για Γιάννη", "ΓΙΑ ΓΙΑΝΝΗ ΠΛΑΝΑ", "ΓΙΑ ΓΙΑΝΝΗ ΤΟ ΒΙΝΤΕΟ", "ΓΙΑ ΓΙΑΝΝΗ 2"] {
+            let m = mail(subject, "a.lefaki@example.gr", link);
+            assert_eq!(resolved(&m, &r), ("DRAKAKIS".into(), Resolution::Subject), "{subject}");
+        }
+        // Her own surname with a doubled letter written single, his with a
+        // letter wrong (both still end like a surname): still them.
+        let m = mail("για ΦΩΤΕΙΝΗ ΚΟΚΙΝΑΚΗ", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("KOKKINAKI".into(), Resolution::Subject));
+        for subject in ["ΓΙΑ ΓΙΑΝΝΗ ΔΡΑΓΑΚΗ", "ΘΕΜΑΤΑ ΓΙΑΝΝΗΣ ΔΡΑΓΑΚΗΣ"] {
+            let m = mail(subject, "a.lefaki@example.gr", link);
+            assert_eq!(resolved(&m, &r), ("DRAKAKIS".into(), Resolution::Subject), "{subject}");
+        }
+        // A topic after the first name, or a word set apart by punctuation: her or him.
+        for (subject, who) in [
+            ("ΓΙΑ ΓΙΑΝΝΗ ΑΓΙΟΣ ΝΙΚΟΛΑΟΣ", "DRAKAKIS"),
+            ("ΓΙΑ ΜΑΡΙΑ - ΚΑΙΡΟΣ", "MANOLI"),
+            ("ΓΙΑ ΜΑΡΙΑ: ΜΕΤΑΝΑΣΤΕΣ", "MANOLI"),
+            ("ΓΙΑ ΓΙΑΝΝΗ ΣΕΙΣΜΟΣ", "DRAKAKIS"),
+        ] {
+            let m = mail(subject, "a.lefaki@example.gr", link);
+            assert_eq!(resolved(&m, &r), (who.into(), Resolution::Subject), "{subject}");
+        }
+        // An alias that is the first name in another case («ΚΩΣΤΑ» for Kostas)
+        // is a first name: before a guest's surname it is not him.
+        let m = mail("ΓΙΑ ΚΩΣΤΑ ΘΕΟΦΙΛΟΥ", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("LEFAKI".into(), Resolution::Sender));
+        let m = mail("ΓΙΑ ΚΩΣΤΑ", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("DIMITRIOU".into(), Resolution::Subject));
+        // Words without a surname's ending: «live», a town, a part, a disaster.
+        for subject in ["ΓΙΑ ΓΙΑΝΝΗ ΛΑΙΒ", "για Γιάννη λάιβ", "ΓΙΑ ΓΙΑΝΝΗ ΣΗΤΕΙΑ", "ΓΙΑ ΓΙΑΝΝΗ ΤΕΛΕΥΤΑΙΟ ΜΕΡΟΣ", "ΓΙΑ ΓΙΑΝΝΗ ΚΑΤΑΣΤΡΟΦΗ"] {
+            let m = mail(subject, "a.lefaki@example.gr", link);
+            assert_eq!(resolved(&m, &r), ("DRAKAKIS".into(), Resolution::Subject), "{subject}");
+        }
+        // A guest's surname (-ΑΚΗ, -ΟΥ, -ΩΦ, -ΗΣ): not him.
+        for subject in ["ΚΑΛΕΣΜΕΝΟ ΓΙΑ ΓΙΑΝΝΗ ΣΚΟΥΛΑΚΗ", "ΓΙΑ ΓΙΑΝΝΗ ΘΕΟΦΙΛΟΥ", "ΓΙΑ ΓΙΑΝΝΗ ΠΕΤΡΩΦ", "ΘΕΜΑΤΑ ΓΙΑΝΝΗΣ ΣΚΟΥΛΑΚΗΣ"] {
+            let m = mail(subject, "a.lefaki@example.gr", link);
+            assert_eq!(resolved(&m, &r), ("LEFAKI".into(), Resolution::Sender), "{subject}");
+        }
+        // The word after the first name is another roster surname: that person.
+        let m = mail("ΓΙΑ ΓΙΑΝΝΗ ΜΠΟΥΡΝΑΚΗ", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("MPOURNAKI".into(), Resolution::Subject));
+        // A surname still overrides a rostered sender («για Χ»).
+        let m = mail("ΓΙΑ ΔΡΑΚΑΚΗ", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("DRAKAKIS".into(), Resolution::Subject));
+    }
+
+    /// P15.8: the topic words rule 2 skips after a first name are still the
+    /// subject's keyword after «ΓΙΑ» alone.
+    #[test]
+    fn a_topic_after_gia_is_still_the_keyword() {
+        let r = roster();
+        for (subject, keyword) in [("ΠΛΑΝΑ ΓΙΑ ΤΡΟΧΑΙΟ", "TROCHAIO"), ("ΓΙΑ ΕΚΛΟΓΕΣ", "EKLOGES"), ("ΒΙΝΤΕΟ ΓΙΑ ΚΑΚΟΚΑΙΡΙΑ", "KAKOKAIRIA")] {
+            let p = parse(&mail(subject, "a.papadaki@example.gr", "https://www.youtube.com/watch?v=abcdefghijk"), &r, &ParserConfig::default());
+            let got = p.sections.first().and_then(|s| s.jobs.first()).map(|j| j.keyword.as_str());
+            assert_eq!(got, Some(keyword), "{subject}: {:?}", p.sections);
+        }
+    }
+
+    /// P15.8 (ii): «ΓΙΑ ΑΡΙΑ» from one of the two Arias is hers, even when the
+    /// forwarded headers name the other.
+    #[test]
+    fn the_sender_wins_a_first_name_she_shares() {
+        let r = namesake_roster();
+        let body = "Από: Άρια Μπουρνάκη <a.mpournaki@example.gr>\n\
+                    Προς: Master Desk <master@example.gr>\n\
+                    https://www.youtube.com/watch?v=abcdefghijk";
+        let m = mail("Πρ: ΓΙΑ ΑΡΙΑ", "a.lefaki@example.gr", body);
+        assert_eq!(resolved(&m, &r), ("LEFAKI".into(), Resolution::Subject));
+        // From the desk, the headers still settle it.
+        let m = mail("Πρ: ΓΙΑ ΑΡΙΑ", "master@example.gr", body);
+        assert_eq!(resolved(&m, &r), ("MPOURNAKI".into(), Resolution::Subject));
+        // From someone who is neither, the headers settle it too.
+        let m = mail("Πρ: ΓΙΑ ΑΡΙΑ", "g.drakakis@example.gr", body);
+        assert_eq!(resolved(&m, &r), ("MPOURNAKI".into(), Resolution::Subject));
+    }
+
+    /// P15.8: a transfer service's delivery is the named sender's, by surname
+    /// or full name, never by a first name alone.
+    #[test]
+    fn a_locker_delivery_is_the_named_senders() {
+        let r = namesake_roster();
+        let ix = Roster::new(&r);
+        assert_eq!(ix.by_full_or_surname("Nikos Vardakis"), Some("VARDAKIS".into()));
+        assert_eq!(ix.by_full_or_surname("ELENI VARDAKI"), Some("VARDAKI".into()));
+        assert_eq!(ix.by_full_or_surname("Ο Γιάννης Δρακάκης"), Some("DRAKAKIS".into()));
+        assert_eq!(ix.by_full_or_surname("Giannis"), None, "a first name alone");
+        assert_eq!(ix.by_full_or_surname("Άρια"), None, "a first name alone");
+        assert_eq!(ix.by_full_or_surname("Petros Paradeigma"), None);
+        // A first name is not a surname in another case: «Manolis» is not ΜΑΝΩΛΗ.
+        assert_eq!(ix.by_full_or_surname("Manolis Kalogerakis"), None);
+        // Someone else's first name on the roster: someone else of that surname.
+        assert_eq!(ix.by_full_or_surname("Giannis Vardakis"), None);
+        // Their own first name in another form: them.
+        assert_eq!(ix.by_full_or_surname("Antonios Stamatakis"), Some("STAMATAKIS".into()));
+        assert_eq!(ix.by_full_or_surname("ANTONIS STAMATAKIS"), Some("STAMATAKIS".into()));
+
+        let link = "Download your files: https://www.transfernow.net/dl/20261124AbCdEf48/XyZ48key";
+        let notice = |subject: &str| mail(subject, "noreply@transfernow.net", link);
+        assert_eq!(resolved(&notice("Γιάννης Δρακάκης has sent you \"x.mp4\" via TransferNow"), &r), ("DRAKAKIS".into(), Resolution::LockerSender));
+        assert_eq!(resolved(&notice("Ο Γιάννης Δρακάκης σας έστειλε αρχεία μέσω της TransferNow"), &r), ("DRAKAKIS".into(), Resolution::LockerSender));
+        assert_eq!(resolved(&notice("Giannis has sent you \"x.mp4\" via TransferNow"), &r), ("MCR".into(), Resolution::Unresolved));
+        assert_eq!(resolved(&notice("Manolis Other has sent you \"x.mp4\" via TransferNow"), &r), ("MCR".into(), Resolution::Unresolved));
+        assert_eq!(resolved(&notice("Giannis Vardakis has sent you \"x.mp4\" via TransferNow"), &r), ("MCR".into(), Resolution::Unresolved));
+        assert_eq!(resolved(&notice("Antonios Stamatakis has sent you \"x.mp4\" via TransferNow"), &r), ("STAMATAKIS".into(), Resolution::LockerSender));
+        // About a transfer we sent, naming a rostered address: no one's.
+        let m = mail("x.mp4 has been downloaded by n.vardakis@example.gr", "noreply@wetransfer.com", "x.mp4 has been downloaded.");
+        assert_eq!(resolved(&m, &r), ("MCR".into(), Resolution::Unresolved));
+        // An explicit subject name outranks it.
+        let m = mail("Γιάννης Δρακάκης has sent you ΓΙΑ ΛΕΦΑΚΗ via TransferNow", "noreply@transfernow.net", link);
+        assert_eq!(resolved(&m, &r), ("LEFAKI".into(), Resolution::Subject));
+        // A staff member forwarding such a notice is the sender, as before.
+        let m = mail("FW: Nikos Vardakis has sent you files", "a.lefaki@example.gr", link);
+        assert_eq!(resolved(&m, &r), ("LEFAKI".into(), Resolution::Sender));
+    }
+
+    /// P15.8: a delivery that names its sender by address is that address's
+    /// owner on the roster; the address outranks a display name.
+    #[test]
+    fn a_locker_delivery_naming_an_address_is_its_owners() {
+        let r = namesake_roster();
+        let swiss = |body: &str| mail("You have received 3 files via SwissTransfer", "noreply@swisstransfer.com", body);
+        let m = swiss("3 files, 1.2 GB\nFrom n.vardakis@example.gr\nDownload files");
+        assert_eq!(resolved(&m, &r), ("VARDAKIS".into(), Resolution::LockerSender));
+        let m = mail("☁ ΠΛΗΜΜΥΡΑ ΧΑΝΙΑ", "noreply@mail.myairbridge.com", "Sender: e.vardaki@example.gr\nDownload: https://mab.to/t/AbC123/eu1");
+        assert_eq!(resolved(&m, &r), ("VARDAKI".into(), Resolution::LockerSender));
+
+        // The name says one person, the address another: the address.
+        let m = mail("Nikos Vardakis <e.vardaki@example.gr> sent you 1 file", "noreply@wetransfer.com", "Download");
+        assert_eq!(resolved(&m, &r), ("VARDAKI".into(), Resolution::LockerSender));
+
+        // An address nobody on the roster has: MCR.
+        let m = swiss("From someone@studio.example\nDownload files");
+        assert_eq!(resolved(&m, &r), ("MCR".into(), Resolution::Unresolved));
+        // One of our own domain, not on the roster: still a delivery, still MCR.
+        let m = swiss("From x.unknown@example.gr\nDownload files");
+        let own = vec!["master@example.gr".to_string()];
+        assert_eq!(
+            crate::locker_notice::notice_kind(&m, &own),
+            crate::locker_notice::NoticeKind::Delivery { sender: Some("x.unknown@example.gr".into()) }
+        );
+        assert_eq!(resolved(&m, &r), ("MCR".into(), Resolution::Unresolved));
     }
 
     #[test]

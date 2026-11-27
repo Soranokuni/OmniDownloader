@@ -136,6 +136,26 @@ pub fn notice_kind(mail: &InboundMail, own: &[String]) -> NoticeKind {
     NoticeKind::ServiceMail
 }
 
+/// The words before «has sent you» / «σας έστειλε» (an address between them
+/// skipped), up to four, on one line, in the text's own script and case.
+static RE_SENT_YOU_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)((?:\p{L}[\p{L}.'’\-]*[ \t]+){0,3}\p{L}[\p{L}.'’\-]*)[ \t]+(?:[<(][^>)\s]+[>)][ \t]+)?(?:(?:has[ \t]+)?sent[ \t]+you\b|σας[ \t]+[εέ]στειλε)",
+    )
+    .unwrap()
+});
+
+/// The display name a delivery gives its sender («Nikos Example has sent
+/// you…», «Ο Νίκος Παράδειγμα σας έστειλε…»), from the subject, else the
+/// first body line that has one (P15.8). Only words: the roster decides
+/// whether they name anyone.
+pub fn sender_name(mail: &InboundMail) -> Option<String> {
+    let body = mail.readable_body();
+    std::iter::once(mail.subject.as_str())
+        .chain(body.lines())
+        .find_map(|line| RE_SENT_YOU_NAME.captures(line).map(|c| c[1].trim().to_string()))
+}
+
 /// Whether folded `text` says something about a transfer we sent.
 fn outbound_cue(text: &str) -> bool {
     OUTBOUND.iter().any(|p| text.contains(&fold(p)))

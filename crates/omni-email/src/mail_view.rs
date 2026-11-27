@@ -201,6 +201,7 @@ pub fn how_el(how: Resolution) -> &'static str {
         Resolution::BodyOverrideSender => "από το κείμενο («ΣΤΟ ΟΝΟΜΑ ΜΟΥ»)",
         Resolution::Subject => "από το θέμα του email",
         Resolution::Sender => "από τη διεύθυνση του αποστολέα",
+        Resolution::LockerSender => "από το όνομα του αποστολέα στην ειδοποίηση μεταφοράς",
         Resolution::Forwarded => "από το προωθημένο μήνυμα",
         Resolution::Unresolved => "δεν βρέθηκε· τα αρχεία πήραν το όνομα MCR",
         Resolution::LlmAssist => "πρόταση του LLM, επιβεβαιωμένη από τη λίστα",
