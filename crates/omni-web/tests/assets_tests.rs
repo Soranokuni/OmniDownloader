@@ -379,10 +379,10 @@ fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
         ("desk.js", 28),
-        ("inbox.js", 35),
+        ("inbox.js", 36),
         ("approval.js", 23),
         ("notify.js", 23),
-        ("mcr.js", 61),
+        ("mcr.js", 62),
         ("status.js", 11),
         ("status.css", 12),
         ("worklist.js", 11),
@@ -2086,4 +2086,24 @@ fn the_journalist_import_explains_json_and_aliases() {
     // A JSON list's problems are numbered as people («Άτομο n»), a text's as lines.
     assert!(wizard.contains("q.person ? 'wizard.people.person' : 'wizard.people.line'"), "JSON problems are shown as lines");
     assert!(dictionary(&assets, "static/admin-text.el.js")["wizard.people.person"].starts_with("Άτομο {line}"));
+}
+
+/// P15.12a: the Email tab's card of a photo link (P15.5) offers «Άλλος
+/// σύνδεσμος» and «Δοκιμή ξανά», as a review card does; a photo still never
+/// needs a person.
+#[test]
+fn a_photo_card_takes_another_link() {
+    let assets = all_assets();
+    let inbox = &assets["static/inbox.js"];
+    let more = function_body(inbox, "moreNode");
+    let photo = more.split("if (isPhoto(j)) {").nth(1).and_then(|s| s.split("} else if (needsAttention(j)) {").next()).expect("moreNode has a photo branch before the review branch");
+    assert!(photo.contains("otherLinkButton()") && photo.contains("otherLinkForm()"), "the photo card does not take another link");
+    assert!(photo.contains("retryJob(j, afterAction)"), "the photo card does not offer a retry");
+    assert!(more.contains("overrideJob(j, input.value, afterAction)"), "the field does not override");
+    let status = &assets["static/status.js"];
+    assert_eq!(
+        function_body(status, "needsAttention").trim(),
+        "job) {\n  return job.status === 'REQUIRES_REVIEW' || job.status === 'MANUAL_DOWNLOAD' || job.status === 'FAILED';",
+        "a photo must not need a person"
+    );
 }

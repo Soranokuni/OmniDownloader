@@ -26,7 +26,7 @@ import { deferAction, visible } from '/static/undo.js?v=12';
 import { infoDialog } from '/static/dialog.js?v=11';
 import { STATUS, statusBadge } from '/static/status.js?v=11';
 import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=11';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=35';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=36';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,

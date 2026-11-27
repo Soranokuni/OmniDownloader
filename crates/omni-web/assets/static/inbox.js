@@ -25,7 +25,7 @@ import {
 } from '/static/desk.js?v=28';
 import { visible } from '/static/undo.js?v=12';
 import {
-  STATUS, jobInfo, tone, needsAttention, statusBadge, statusTag, legendNode, markNode,
+  STATUS, jobInfo, tone, needsAttention, isPhoto, statusBadge, statusTag, legendNode, markNode,
 } from '/static/status.js?v=11';
 import { whyText } from '/static/worklist.js?v=11';
 import { t, tn } from '/static/text.js?v=10';
@@ -904,7 +904,38 @@ function moreNode(j, sel) {
   const box = el('div', { class: 'jc-more' });
   const href = safeHref(j.url);
   const openLink = href ? el('a', { class: 'btn', href, target: '_blank', rel: 'noopener noreferrer', title: j.url }, icon('external-link'), t('mail.open')) : null;
-  if (needsAttention(j)) {
+  // «Άλλος σύνδεσμος»: the button that opens the card's own field, and the field.
+  const otherLinkButton = () => el('button', {
+    class: 'btn btn-warn',
+    type: 'button',
+    'aria-expanded': String(overrideOpen.has(j.id)),
+    onClick: () => {
+      if (overrideOpen.has(j.id)) overrideOpen.delete(j.id); else overrideOpen.add(j.id);
+      repaintJob(j.id, true);
+      if (overrideOpen.has(j.id)) openRoot()?.querySelector(`.jcard[data-job="${j.id}"] input`)?.focus();
+    },
+  }, t('mail.other_link'));
+  const otherLinkForm = () => {
+    if (!overrideOpen.has(j.id)) return;
+    const input = el('input', { type: 'url', class: 'mono', placeholder: t('mail.other_link.placeholder'), 'aria-label': t('mail.other_link.label') });
+    const submit = async () => {
+      if (await overrideJob(j, input.value, afterAction)) overrideOpen.delete(j.id);
+    };
+    input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
+    box.append(el('div', { class: 'jc-override' }, el('div', { class: 'grow' }, input),
+      el('button', { class: 'btn btn-warn', type: 'button', onClick: submit }, t('mail.other_link.use'))));
+  };
+  if (isPhoto(j)) {
+    // P15.12a: a photo link (P15.5). Not something to look at (never in
+    // needsAttention), but the hint asks the journalist for the video's link,
+    // so the card takes it: «Άλλος σύνδεσμος», as on a review card.
+    box.append(el('div', { class: 'jc-actions' },
+      el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, t('action.retry')),
+      otherLinkButton(),
+      openLink,
+      el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, t('action.remove'))));
+    otherLinkForm();
+  } else if (needsAttention(j)) {
     const locker = j.status === 'MANUAL_DOWNLOAD';
     box.append(el('div', { class: `jc-hint ${j.status === 'FAILED' ? 'bad' : ''}`.trim() },
       // The same sentence as the review tab's card: by state as well as code (P12.2).
@@ -913,30 +944,13 @@ function moreNode(j, sel) {
     // Every action is on the card without selecting it first (P12.4).
     box.append(el('div', { class: 'jc-actions' },
       locker ? null : el('button', { class: 'btn btn-primary', type: 'button', onClick: () => retryJob(j, afterAction) }, t('action.retry')),
-      locker ? null : el('button', {
-        class: 'btn btn-warn',
-        type: 'button',
-        'aria-expanded': String(overrideOpen.has(j.id)),
-        onClick: () => {
-          if (overrideOpen.has(j.id)) overrideOpen.delete(j.id); else overrideOpen.add(j.id);
-          repaintJob(j.id, true);
-          if (overrideOpen.has(j.id)) openRoot()?.querySelector(`.jcard[data-job="${j.id}"] input`)?.focus();
-        },
-      }, t('mail.other_link')),
+      locker ? null : otherLinkButton(),
       el('button', { class: locker ? 'btn btn-primary' : 'btn', type: 'button', onClick: () => markDoneJob(j, afterAction) }, t('desk.markdone.button')),
       openLink,
       canRename(j) ? renameButton(j) : null,
       el('button', { class: 'btn btn-danger', type: 'button', onClick: () => discardJob(j, afterAction) }, t('action.remove'))));
     if (renameOpen.has(j.id)) box.append(renameForm(j, afterAction, () => repaintJob(j.id, true)));
-    if (overrideOpen.has(j.id)) {
-      const input = el('input', { type: 'url', class: 'mono', placeholder: t('mail.other_link.placeholder'), 'aria-label': t('mail.other_link.label') });
-      const submit = async () => {
-        if (await overrideJob(j, input.value, afterAction)) overrideOpen.delete(j.id);
-      };
-      input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
-      box.append(el('div', { class: 'jc-override' }, el('div', { class: 'grow' }, input),
-        el('button', { class: 'btn btn-warn', type: 'button', onClick: submit }, t('mail.other_link.use'))));
-    }
+    otherLinkForm();
   } else if (j.status !== 'AWAITING_APPROVAL') {
     // A held video's actions are on its approval card (the chip above leads there).
     const done = j.status === 'COMPLETED' || j.status === 'COMPLETED_MANUAL';
