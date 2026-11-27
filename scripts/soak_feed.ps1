@@ -4,8 +4,9 @@
     instance and checks the files it delivers (plan P14.1).
 
 .DESCRIPTION
-    Meant to run every 15 minutes from a Task Scheduler task, one pass per
-    invocation. It keeps no state except files under -Root, so a reboot or a
+    Meant to run from a Task Scheduler task, one pass per invocation: every
+    15 minutes for the link soak, every minute for a replay (-ReplayDir), so
+    replayed mail arrives close to its time on the replay clock. It keeps no state except files under -Root, so a reboot or a
     missed run only delays work. It never starts or stops the daemon.
 
     A pass does, in order:
@@ -44,6 +45,16 @@
     next due mail. -Days does not apply: once every manifest row is sent or
     given up, passes only do steps 4-5 and log "replay complete". Steps 4-5,
     the lock and the free-space rule are the same as in the link soak.
+
+    Each replayed mail is restamped: a copy is written to <Root>\replay_restamp
+    with its top-level Date: header (folded lines included) replaced by its
+    arrival on the replay clock, replay_start_utc + (manifest date - first
+    manifest date) / -Speed, in RFC 5322 form and UTC, followed by a header
+    X-Omni-Original-Date: holding the old value. The copy is what mail-ingest
+    reads, and it is deleted once mail-ingest has queued it. Without this the
+    Email tab, which shows the last 30 days, would hide mail with its original
+    dates, and retention would strip its text. A forwarded mail's Date: in the
+    body is left alone; a mail with no Date: header is sent as it is.
 
     The replay folder may hold REAL mail: it is refused inside any git
     repository, like the root, and nothing is ever written into it.
@@ -98,6 +109,11 @@
     Most mails sent in one pass (default 3, 1 to 500). Bounds the catch-up
     after missed passes.
 
+.PARAMETER SelfTest
+    Check the replay restamping on embedded sample mails (folded Date:, LF-only,
+    no Date:, a forwarded Date: in the body) and exit: 0 when all pass, 1 when
+    one fails. Needs no root and touches no file.
+
 .EXAMPLE
     .\soak_feed.ps1 -Root D:\OmniSoak -LinksPerDay 10
 
@@ -105,9 +121,9 @@
     .\soak_feed.ps1 -Root C:\OmniReplay -ReplayDir C:\OmniReplay\mail -Speed 7 -MaxPerPass 40
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Pass')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Pass')]
     [string]$Root,
     [string]$Binary = '',
     [ValidateRange(1, 365)]
@@ -119,7 +135,9 @@ param(
     [int]$LinksPerDay = 0,
     [string]$ReplayDir = '',
     [double]$Speed = 7.0,
-    [int]$MaxPerPass = 3
+    [int]$MaxPerPass = 3,
+    [Parameter(Mandatory = $true, ParameterSetName = 'SelfTest')]
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version Latest
@@ -594,6 +612,84 @@ function Read-ReplayManifest {
     return , @($rows.ToArray() | Sort-Object -Property Date, File)
 }
 
+function Format-MailDateUtc {
+    param([datetime]$Utc)
+    # RFC 5322, in UTC.
+    return $Utc.ToString('ddd, dd MMM yyyy HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) + ' +0000'
+}
+
+function Get-ReplayArrival {
+    param([datetime]$StartUtc, [datetime]$FirstUtc, [datetime]$OriginalUtc, [double]$Speed)
+    # When the mail "arrives" on the replay clock: its offset from the first
+    # manifest mail, sped up, after the replay's start.
+    return $StartUtc.AddSeconds(($OriginalUtc - $FirstUtc).TotalSeconds / $Speed)
+}
+
+function ConvertTo-RestampedMail {
+    param([string]$Raw, [datetime]$ArrivalUtc)
+    # The mail (read as Latin-1, so every byte survives) with its top-level
+    # Date: header, folded lines included, replaced by the arrival time and
+    # followed by X-Omni-Original-Date: with the old value. Only the header
+    # block is searched: a forwarded mail's Date: in the body stays. $null
+    # when the header block has no Date:.
+    $split = [regex]::Match($Raw, "\r?\n\r?\n")
+    $headEnd = $Raw.Length
+    if ($split.Success) { $headEnd = $split.Index }
+    $head = $Raw.Substring(0, $headEnd)
+    $m = [regex]::Match($head, '(?im)^Date:[ \t]*([^\r\n]*(?:\r?\n[ \t][^\r\n]*)*)')
+    if (-not $m.Success) { return $null }
+    $original = ([regex]::Replace($m.Groups[1].Value, '\r?\n(?=[ \t])', '')).Trim()
+    # The header's own line ending, so an LF-only mail stays LF-only.
+    $after = $m.Index + $m.Length
+    $nl = "`r`n"
+    if (($after -lt $Raw.Length) -and ($Raw[$after] -eq "`n")) { $nl = "`n" }
+    $new = 'Date: ' + (Format-MailDateUtc $ArrivalUtc) + $nl + 'X-Omni-Original-Date: ' + $original
+    return $Raw.Substring(0, $m.Index) + $new + $Raw.Substring($after)
+}
+
+function Invoke-SelfTest {
+    # Restamps embedded sample mails and checks the results. Exit 0: all pass.
+    $check = {
+        param([string]$Name, [bool]$Ok)
+        if ($Ok) { Write-Host "PASS $Name" } else { Write-Host "FAIL $Name"; $script:selfTestFailed = $true }
+    }
+    $script:selfTestFailed = $false
+    $arrival = [datetime]::new(2026, 11, 27, 13, 25, 42, [System.DateTimeKind]::Utc)
+    $stamp = 'Date: Fri, 27 Nov 2026 13:25:42 +0000'
+
+    $start = [datetime]::new(2026, 11, 27, 10, 0, 0, [System.DateTimeKind]::Utc)
+    $first = [datetime]::new(2025, 10, 13, 0, 0, 0, [System.DateTimeKind]::Utc)
+    $orig = [datetime]::new(2025, 10, 14, 0, 0, 0, [System.DateTimeKind]::Utc)
+    & $check 'arrival = start + (original - first) / speed' ((Format-MailDateUtc (Get-ReplayArrival $start $first $orig 7.0)) -eq 'Fri, 27 Nov 2026 13:25:42 +0000')
+
+    $folded = "From: a@example.invalid`r`nDate: Tue, 14 Oct`r`n 2025 09:30:00 +0300`r`nSubject: x`r`n`r`nbody`r`n"
+    $got = ConvertTo-RestampedMail $folded $arrival
+    & $check 'folded CRLF Date is replaced whole' ($got -eq "From: a@example.invalid`r`n$stamp`r`nX-Omni-Original-Date: Tue, 14 Oct 2025 09:30:00 +0300`r`nSubject: x`r`n`r`nbody`r`n")
+
+    $lf = "Date: Wed, 15 Oct 2025 10:00:00 +0300`nSubject: y`n`nbody`n"
+    $got = ConvertTo-RestampedMail $lf $arrival
+    & $check 'LF-only mail stays LF-only' ($got -eq "$stamp`nX-Omni-Original-Date: Wed, 15 Oct 2025 10:00:00 +0300`nSubject: y`n`nbody`n")
+
+    $none = "From: a@example.invalid`r`nSubject: no date`r`n`r`nDate: Mon, 13 Oct 2025 08:00:00 +0300`r`n"
+    & $check 'no Date header: left as it is' ($null -eq (ConvertTo-RestampedMail $none $arrival))
+
+    $fwd = "Subject: Fw: z`r`nDate: Thu, 16 Oct 2025 11:00:00 +0300`r`n`r`n---------- Forwarded message ---------`r`nDate: Mon, 13 Oct 2025 08:00:00 +0300`r`nSubject: z`r`n"
+    $got = ConvertTo-RestampedMail $fwd $arrival
+    & $check 'a forwarded Date in the body is not touched' ($got -eq "Subject: Fw: z`r`n$stamp`r`nX-Omni-Original-Date: Thu, 16 Oct 2025 11:00:00 +0300`r`n`r`n---------- Forwarded message ---------`r`nDate: Mon, 13 Oct 2025 08:00:00 +0300`r`nSubject: z`r`n")
+
+    $xdate = "X-Original-Date: Mon, 13 Oct 2025 08:00:00 +0300`r`nSubject: q`r`n`r`nbody`r`n"
+    & $check 'X-...-Date is not the Date header' ($null -eq (ConvertTo-RestampedMail $xdate $arrival))
+
+    $bytes = [byte[]](0x44, 0x61, 0x74, 0x65, 0x3A, 0x20, 0x31, 0x0A, 0x53, 0x3A, 0x20, 0xE9, 0xFF, 0x0A, 0x0A, 0xC3, 0xA9)
+    $back = $Latin1.GetBytes((ConvertTo-RestampedMail $Latin1.GetString($bytes) $arrival))
+    $tail = [byte[]]$back[($back.Length - 10)..($back.Length - 1)]
+    & $check 'other bytes survive unchanged' ([System.Linq.Enumerable]::SequenceEqual($tail, [byte[]]$bytes[7..16]))
+
+    if ($script:selfTestFailed) { Write-Host 'soak_feed self-test: FAILED'; return 1 }
+    Write-Host 'soak_feed self-test: all passed'
+    return 0
+}
+
 function Read-StateObject {
     param([string]$Path)
     # Used by the refusals only; a state file that does not parse is the pass's error, not a refusal.
@@ -712,6 +808,8 @@ function ConvertTo-CsvField {
     if ($Value -match '[",\r\n]') { return '"' + $Value.Replace('"', '""') + '"' }
     return $Value
 }
+
+if ($SelfTest) { exit (Invoke-SelfTest) }
 
 # =========================================================================== refusals
 
@@ -907,11 +1005,23 @@ try {
                 # mail-ingest's answers are kept in the root, never in the replay folder.
                 $outDir = Join-Path (Join-Path $RootFull 'soak_mail') 'replay'
                 [void](New-Item -ItemType Directory -Force -Path $outDir)
+                # Restamped copies: next to the replay state, never in the replay folder.
+                $restampDir = Join-Path $RootFull 'replay_restamp'
+                [void](New-Item -ItemType Directory -Force -Path $restampDir)
                 foreach ($row in $batch) {
-                    $args1 = '--root "{0}" --config "{1}" mail-ingest --eml "{2}"' -f $RootFull, $ConfigPath, $row.Path
+                    # The Email tab shows 30 days and retention strips old text: a replayed
+                    # mail carries its arrival on the replay clock as its Date.
+                    $emlPath = $row.Path
+                    $restamped = ConvertTo-RestampedMail $Latin1.GetString([System.IO.File]::ReadAllBytes($row.Path)) (Get-ReplayArrival $startUtc $firstUtc $row.Date $Speed)
+                    if ($null -ne $restamped) {
+                        $emlPath = Join-Path $restampDir $row.File
+                        [System.IO.File]::WriteAllBytes($emlPath, $Latin1.GetBytes($restamped))
+                    }
+                    $args1 = '--root "{0}" --config "{1}" mail-ingest --eml "{2}"' -f $RootFull, $ConfigPath, $emlPath
                     $r = Invoke-Tool -FilePath $BinaryFull -Arguments $args1 -TimeoutMs $IngestTimeoutMs
                     $v = Get-IngestVerdict $r
                     [System.IO.File]::WriteAllText((Join-Path $outDir ($row.File + '.out.txt')), ($r.Out + $r.Err), $Utf8NoBom)
+                    if ($v.Ok -and ($emlPath -ne $row.Path)) { Remove-Item -LiteralPath $emlPath -Force }
                     if (-not $v.Ok) {
                         $sendFailed++
                         $attempts = 1
