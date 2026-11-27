@@ -415,6 +415,18 @@ impl<'a> Roster<'a> {
         collect(&|k| inflected(&k.key, &tok))
     }
 
+    /// Whether `token` is a name of `surname`'s journalist of this kind:
+    /// the surname (`want_surname`), or another of their names.
+    fn names(&self, token: &str, surname: &str, want_surname: bool) -> bool {
+        let k = latin_key(token);
+        k.len() >= 3
+            && self
+                .keys
+                .iter()
+                .filter(|key| key.surname == surname && (key.kind == KeyKind::Surname) == want_surname)
+                .any(|key| key.key == k || inflected(&key.key, &k))
+    }
+
     fn lookup(&self, token: &str) -> Lookup {
         pick(self.candidates(token).into_iter().map(|(s, _)| s).collect())
     }
@@ -1514,17 +1526,23 @@ pub fn is_outsider(from: &str, roster: &[Journalist]) -> bool {
     if roster.iter().flat_map(|j| j.emails.iter()).any(|e| e.trim().eq_ignore_ascii_case(&addr)) {
         return false;
     }
-    let own: Vec<String> = roster
-        .iter()
-        .flat_map(|j| j.emails.iter())
-        .filter_map(|e| mail_domain(e))
-        .filter(|d| !is_public_mail_domain(d))
-        .collect();
+    let own = own_mail_domains(roster);
     if own.is_empty() {
         return false;
     }
     let Some(domain) = mail_domain(&addr) else { return true };
     !own.iter().any(|d| domain == *d || domain.ends_with(&format!(".{d}")))
+}
+
+/// The station's own mail domains: those of the roster's addresses, public
+/// mail providers left out. Nothing is configured.
+fn own_mail_domains(roster: &[Journalist]) -> Vec<String> {
+    roster
+        .iter()
+        .flat_map(|j| j.emails.iter())
+        .filter_map(|e| mail_domain(e))
+        .filter(|d| !is_public_mail_domain(d))
+        .collect()
 }
 
 /// Whether `url` is one of a transfer service's own pages rather than the
@@ -1677,10 +1695,117 @@ const STOPWORDS: &[&str] = &[
 
 const MAX_KEYWORD: usize = 20;
 
+/// File types: what a file is, never what it shows (P15.10).
+const FILE_TYPES: &[&str] = &[
+    "MP4", "MOV", "MXF", "AVI", "MKV", "WMV", "M4V", "MTS", "JPG", "JPEG", "PNG", "HEIC", "ZIP", "RAR", "PDF", "DOCX",
+    "WAV", "MP3",
+];
+
+/// The English words of a transfer service's notice («Nikos Example has
+/// sent you…») that no Greek word becomes in ELOT 743 (no Greek letter
+/// gives H, W or a C outside CH), the services' own names, and the fallback
+/// keyword itself (P15.10). The notice words a Greek word can become (VIA is
+/// ΒΙΑ, FILES ΦΙΛΕΣ, FILE ΦΙΛΕ, SAS ΣΑΣ) are only junk in a service's own
+/// mail: see [`NOTICE_VOCABULARY_EN`].
+const NOTICE_WORDS: &[&str] = &[
+    "HAS", "HAVE", "SENT", "YOU", "DOWNLOADED", "RECEIVED", "TRANSFERNOW", "WETRANSFER", "SWISSTRANSFER", "MYAIRBRIDGE",
+    "FILEMAIL", "DROPBOX", "ASSET",
+];
+
+/// English filler a notice or a newsletter is written in ("Here is the
+/// video you might like"), past the English [`STOPWORDS`] (P15.10). Not a
+/// word a news subject is about (NEWS, LIVE and MATCH stay).
+const FILLER_WORDS: &[&str] = &[
+    "YOUR", "THIS", "THAT", "BEEN", "MIGHT", "WILL", "ARE", "WAS", "WERE", "TOTAL", "ITEM", "ITEMS", "CLICK", "VIEW",
+    "OPEN", "PLEASE", "DEAR", "HELLO", "HI", "THANKS",
+];
+
+/// What a transfer service's own mail is written in (P15.10): never a
+/// keyword in mail from such a service, and still a topic in anyone else's
+/// («ΜΕΤΑΦΟΡΑ ΑΣΘΕΝΟΥΣ»). Greek as written, the months in the genitive.
+const NOTICE_VOCABULARY_EL: &[&str] = &[
+    "ΣΑΣ", "ΕΣΤΕΙΛΕ", "ΜΕΣΩ", "ΕΚΑΝΕ", "ΜΕΤΑΦΟΡΤΩΣΗ", "ΛΗΨΗ", "ΛΗΓΕΙ", "ΜΕΤΑΦΟΡΑ", "ΜΕΤΑΦΟΡΑΣ", "ΗΜΕΡΕΣ", "ΣΤΑΛΘΕΙ", "ΕΧΟΥΝ",
+    "ΕΝΤΟΠΙΣΕ", "ΕΓΚΥΡΗ", "ΑΡΧΕΙΟ", "ΑΡΧΕΙΑ", "ΚΩΔΙΚΟΣ", "ΕΠΙΒΕΒΑΙΩΣΗ", "ΙΑΝΟΥΑΡΙΟΥ", "ΦΕΒΡΟΥΑΡΙΟΥ", "ΜΑΡΤΙΟΥ",
+    "ΑΠΡΙΛΙΟΥ", "ΜΑΪΟΥ", "ΙΟΥΝΙΟΥ", "ΙΟΥΛΙΟΥ", "ΑΥΓΟΥΣΤΟΥ", "ΣΕΠΤΕΜΒΡΙΟΥ", "ΟΚΤΩΒΡΙΟΥ", "ΝΟΕΜΒΡΙΟΥ", "ΔΕΚΕΜΒΡΙΟΥ",
+];
+const NOTICE_VOCABULARY_EN: &[&str] = &[
+    "VIA", "FILES", "FILE", "EXPIRE", "EXPIRES", "EXPIRED", "SUCCESSFULLY", "CONFIRM", "CONFIRMATION", "CODE", "TRANSFER", "TRANSFERS", "SECURE",
+    "LARGE", "STORAGE", "ACCOUNT", "RECIPIENT", "RECIPIENTS", "SHARED", "DETECTED", "INVALID", "DOWNLOAD", "UPLOAD",
+    "STILL", "ABOUT", "NOT", "OUT", "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST",
+    "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+];
+
+/// [`NOTICE_VOCABULARY_EL`] and [`NOTICE_VOCABULARY_EN`] as keyword tokens.
+fn notice_vocabulary() -> Vec<String> {
+    NOTICE_VOCABULARY_EL.iter().map(|w| latin_key(w)).chain(NOTICE_VOCABULARY_EN.iter().map(|w| w.to_string())).collect()
+}
+
+/// A camera's or phone's file name: IMG4411, DSC01234, GOPR0042, FILE382,
+/// WA0001 (WhatsApp), CLIP7.
+static RE_CAMERA_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:IMG|DSC|DSCN|DSCF|MVI|VID|GOPR|GP|DJI|PXL|FILE|CLIP|ASSET|VIDEO|WA)\d+$").unwrap());
+
+/// A date or a time written out (27/10, 27-10-2026, 2026-10-27, 14:30):
+/// taken out of a text before its words are read (P15.10).
+static RE_DATE_TIME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.\-]\d{1,2}(?:[/.\-]\d{2,4})?|\d{1,2}:\d{2}(?::\d{2})?)\b").unwrap()
+});
+
+/// `text` without mail addresses, dates and times: none of them names a story.
+fn without_addresses_and_dates(text: &str) -> String {
+    RE_DATE_TIME.replace_all(&RE_ADDRESS.replace_all(text, " "), " ").into_owned()
+}
+
+/// Whether a keyword token (Latin capitals and digits) names nothing
+/// (P15.10): a file type, a camera's file name, a long bare number (a
+/// phone, a file number, a date run together), a word of a transfer notice, or one
+/// of `own`: the labels of the station's own mail domains (from the
+/// roster) and, in a transfer service's own mail, its vocabulary.
+fn is_junk_token(t: &str, own: &[String]) -> bool {
+    // A long bare number: a phone, a file number, a date run together
+    // (20261027). Short numbers and codes (112, 1866, F35, A320, 20I) stay.
+    let long_number = t.len() >= 5 && t.chars().all(|c| c.is_ascii_digit());
+    FILE_TYPES.contains(&t)
+        || NOTICE_WORDS.contains(&t)
+        || FILLER_WORDS.contains(&t)
+        || RE_CAMERA_NAME.is_match(t)
+        || long_number
+        || own.iter().any(|l| l == t)
+}
+
+/// Whether a keyword is junk through and through: one junk token, or two
+/// run together (`HASSENT`, `MP4FILE`). Used where a keyword arrives whole
+/// (the LLM's), with no word boundaries left.
+fn is_junk_keyword(k: &str) -> bool {
+    is_junk_token(k, &[]) || (1..k.len()).any(|i| k.is_char_boundary(i) && is_junk_token(&k[..i], &[]) && is_junk_token(&k[i..], &[]))
+}
+
+/// The labels of the station's own mail domains (`example.gr` → EXAMPLE,
+/// GR), from the roster's addresses as [`is_outsider`] finds them: never
+/// part of a keyword (P15.10).
+fn own_domain_labels(roster: &[Journalist]) -> Vec<String> {
+    let mut labels: Vec<String> = own_mail_domains(roster)
+        .iter()
+        .flat_map(|d| d.split('.').map(|l| l.to_ascii_uppercase()).collect::<Vec<_>>())
+        .map(|l| l.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+        .filter(|l| !l.is_empty())
+        .collect();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
 /// `[A-Z0-9]{2,20}` from free text: transliterate, drop stopwords and short
 /// words, keep the first two, join.
 pub fn keyword_from_text(text: &str) -> Option<String> {
-    keyword_from_tokens(tokens(&translit(text)).map(|t| t.to_string()).collect(), false)
+    keyword_from_text_with(text, &[])
+}
+
+/// [`keyword_from_text`], also leaving out the labels of the station's own
+/// mail domains (`own`).
+fn keyword_from_text_with(text: &str, own: &[String]) -> Option<String> {
+    let text = RE_DATE_TIME.replace_all(text, " ");
+    keyword_from_tokens(tokens(&translit(&text)).map(|t| t.to_string()).collect(), false, own)
 }
 
 /// "VINTEOOO" → "VINTEO": a letter typed three or more times in a row is
@@ -1742,18 +1867,45 @@ pub fn keyword_from_title(title: &str) -> Option<String> {
         .map(|t| t.to_string())
         .filter(|t| !GENERIC.contains(&fold_stretched(t).as_str()))
         .collect();
-    keyword_from_tokens(toks, false).filter(|k| !is_generic_keyword(k))
+    keyword_from_tokens(toks, false, &[]).filter(|k| !is_generic_keyword(k))
 }
 
-fn keyword_from_tokens(toks: Vec<String>, letters_only: bool) -> Option<String> {
-    let picked: Vec<String> = toks
+/// The first two words that name something, joined. Junk (P15.10) is
+/// never one of them; with none left, `None`, and the next source is tried.
+fn keyword_from_tokens(toks: Vec<String>, letters_only: bool, own: &[String]) -> Option<String> {
+    let folded: Vec<String> = toks
         .into_iter()
-        .map(|t| fold_stretched(&t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()))
+        .map(|t| fold_stretched(&t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_uppercase()))
+        .collect();
+    // "You Tube", "you-tube": one name written apart. Junk goes by whole
+    // words, so without this YOU would go and TUBE stay.
+    let mut joined_up: Vec<String> = Vec::with_capacity(folded.len());
+    for t in folded {
+        if t == "TUBE" && joined_up.last().is_some_and(|p| p == "YOU") {
+            joined_up.pop();
+            joined_up.push("YOUTUBE".into());
+        } else {
+            joined_up.push(t);
+        }
+    }
+    // A camera's file name written apart ("IMG_4411", "FILE 382"): the
+    // number after the word is the file's, not the story's.
+    let camera_number = |i: usize| {
+        i > 0 && joined_up[i].chars().all(|c| c.is_ascii_digit()) && RE_CAMERA_NAME.is_match(&format!("{}0", joined_up[i - 1]))
+    };
+    let kept: Vec<String> = (0..joined_up.len()).filter(|i| !camera_number(*i)).map(|i| joined_up[i].clone()).collect();
+    let picked: Vec<String> = kept
+        .into_iter()
         .filter(|t| t.len() >= 3)
         .filter(|t| !letters_only || t.chars().all(|c| c.is_ascii_alphabetic()))
         .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .filter(|t| !is_junk_token(t, own))
         .take(2)
         .collect();
+    // Numbers alone ("820 2026") name nothing; beside a word they may (ΜΗΝΥΜΑ 112).
+    if !picked.iter().any(|t| t.chars().any(|c| c.is_ascii_alphabetic())) {
+        return None;
+    }
     let joined: String = picked.concat().chars().take(MAX_KEYWORD).collect();
     (joined.len() >= 2).then_some(joined)
 }
@@ -1762,6 +1914,11 @@ fn keyword_from_tokens(toks: Vec<String>, letters_only: bool) -> Option<String> 
 /// Opaque ids (`watch?v=dQw4w9`, `/reel/C8xYz`) have no separators and are
 /// skipped, so they fall through to `ASSET` rather than become gibberish.
 pub fn keyword_from_url(url: &str) -> Option<String> {
+    keyword_from_url_with(url, &[])
+}
+
+/// [`keyword_from_url`], also leaving out the station's own domain labels.
+fn keyword_from_url_with(url: &str, own: &[String]) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
     let segments: Vec<String> = parsed
         .path_segments()?
@@ -1775,24 +1932,24 @@ pub fn keyword_from_url(url: &str) -> Option<String> {
             continue;
         }
         let toks = parts.iter().map(|p| translit(p)).collect();
-        if let Some(k) = keyword_from_tokens(toks, true) {
+        if let Some(k) = keyword_from_tokens(toks, true, own) {
             return Some(k);
         }
     }
     None
 }
 
-fn keyword_from_filename(name: &str) -> Option<String> {
+fn keyword_from_filename(name: &str, own: &[String]) -> Option<String> {
     let stem = name.rsplit_once('.').map(|(a, _)| a).unwrap_or(name);
     let toks = tokens(&translit(stem)).map(|t| t.to_string()).collect();
-    keyword_from_tokens(toks, true)
+    keyword_from_tokens(toks, true, own)
 }
 
 /// Each link's own line, as a keyword: the text before it on its line, or
 /// the line right above it when that line has no link of its own. Only a
 /// line with one link (two links on a line share whatever it says), and
 /// only a caption that names something (not "Καλημέρα", not "βίντεο").
-fn link_captions(lines: &[Line]) -> HashMap<String, String> {
+fn link_captions(lines: &[Line], own: &[String]) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for (i, line) in lines.iter().enumerate() {
         if line.urls.len() != 1 {
@@ -1805,7 +1962,7 @@ fn link_captions(lines: &[Line]) -> HashMap<String, String> {
         let keyword = [same_line, above]
             .into_iter()
             .flatten()
-            .filter_map(|t| keyword_from_text(&t))
+            .filter_map(|t| keyword_from_text_with(&t, own))
             .find(|k| !is_generic_keyword(k));
         if let Some(k) = keyword {
             out.insert(line.urls[0].clone(), k);
@@ -2094,8 +2251,8 @@ static RE_SUBJECT_PREFIX_ORIGINAL: LazyLock<Regex> =
 /// Title and keyword from the subject of an unnumbered email: the title is
 /// the subject as written (minus `RE:`/`FW:`), the keyword leaves out routing
 /// words and the journalist's own name. `None` if nothing usable remains.
-fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(String, String)> {
-    let latin = subject_without_prefixes(&translit(subject));
+fn subject_title(subject: &str, roster: &Roster, journalist: &str, own: &[String], sender_words: &[String]) -> Option<(String, String)> {
+    let latin = subject_without_prefixes(&translit(&without_addresses_and_dates(subject)));
     // "… ΓΙΑ ΕΥΗ", "ΓΙΑ ΜΟΝΤΑΖ ΓΙΩΡΓΟ": the word after ΓΙΑ (past ΜΟΝΤΑΖ) names
     // who the mail is for, not the story, whether or not the roster knows
     // them. After an article ("ΓΙΑ ΤΟ ΣΕΙΣΜΟ") it is the story (plan P4.26).
@@ -2120,6 +2277,8 @@ fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(St
         .filter(|(i, _)| !recipient_at.contains(i))
         .map(|(_, t)| *t)
         .filter(|t| !matches!(roster.lookup(t), Lookup::One(ref s) if s == journalist))
+        // A transfer notice's sender, known to the roster or not (P15.10).
+        .filter(|t| !sender_words.iter().any(|w| w == t || inflected(w, t)))
         .filter(|t| !["THEMATA", "EPIKAIROTITA", "EPIKAIROTHTA", "GIA", "MONTAZ", "EKTAKTO", "BREAKING", "URGENT"].contains(t))
         .collect();
     // "Για Διαμαντη" and nothing else: a name the roster does not know is
@@ -2133,9 +2292,9 @@ fn subject_title(subject: &str, roster: &Roster, journalist: &str) -> Option<(St
             .filter(|t| matches!(roster.lookup(t), Lookup::None))
             .filter(|t| !NOT_A_NAME.contains(t))
             .collect();
-        keyword_from_text(&words.join(" "))
+        keyword_from_text_with(&words.join(" "), own)
     };
-    let keyword = keyword_from_text(&kept.join(" ")).or_else(unlisted_recipient)?;
+    let keyword = keyword_from_text_with(&kept.join(" "), own).or_else(unlisted_recipient)?;
     let mut display = subject.trim().to_string();
     loop {
         let next = RE_SUBJECT_PREFIX_ORIGINAL.replace(&display, "").into_owned();
@@ -2256,8 +2415,48 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
     let lines: Vec<Line> = body.lines().map(Line::new).collect();
     let (preamble, mut raw) = split_sections(&lines, &mut warnings);
     // (title shown to people, keyword source) per section.
+    // The station's own domain names are never a keyword (P15.10).
+    let mut own_labels = own_domain_labels(roster);
+    // Nor, in a transfer service's own mail, the words it is written in.
+    if notice != crate::locker_notice::NoticeKind::NotANotice {
+        own_labels.extend(notice_vocabulary());
+    }
+    // Nor are the names of who sent it (P15.10): the resolved journalist's
+    // (surname, full name, aliases, in any case), and the sender a transfer
+    // service's delivery names, whether or not the roster knows them.
+    let sender_words: Vec<String> = locker_sender
+        .as_ref()
+        .and_then(|d| d.name.as_deref())
+        .map(|n| tokens(n).map(latin_key).filter(|k| k.len() >= 3).collect())
+        .unwrap_or_default();
+    // The journalist by surname, or by first name right before it; a first
+    // name or alias alone is left (ΝΙΚΗ, ΕΙΡΗΝΗ are words too).
+    let named = journalist.surname != "MCR";
+    let is_surname = |t: &str| named && roster_ix.names(t, &journalist.surname, true);
+    let is_other_name = |t: &str| named && roster_ix.names(t, &journalist.surname, false);
+    let is_sender = |t: &str| -> bool {
+        let k = latin_key(t);
+        sender_words.iter().any(|w| *w == k || inflected(w, &k))
+    };
+    // Mail addresses ("<nikos.home@mail.example>"), dates and times are no
+    // words of the story either.
+    let without_names = |text: &str| -> String {
+        let latin = translit(&without_addresses_and_dates(text));
+        let words: Vec<&str> = tokens(&latin).collect();
+        words
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| {
+                let full_name = is_other_name(t) && words.get(i + 1).is_some_and(|n| is_surname(n));
+                !(is_sender(t) || is_surname(t) || full_name)
+            })
+            .map(|(_, t)| *t)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let keyword_of = |t: &str| keyword_from_text_with(&without_names(t), &own_labels);
     let with_keyword = |t: Option<String>| {
-        let k = t.as_deref().and_then(keyword_from_text);
+        let k = t.as_deref().and_then(keyword_of);
         (t, k)
     };
     let mut titles: Vec<(Option<String>, Option<String>, KeywordSource)> = raw
@@ -2269,11 +2468,35 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
         .collect();
 
     if raw.is_empty() {
-        let title = match subject_title(&mail.subject, &roster_ix, &journalist.surname) {
+        let title = match subject_title(&mail.subject, &roster_ix, &journalist.surname, &own_labels, &sender_words) {
             Some((t, k)) => (Some(t), Some(k), KeywordSource::Subject),
             None => {
-                let (t, k) = with_keyword(preamble.iter().filter(|l| !l.is_marker()).find_map(|l| l.title_text()));
-                (t, k, KeywordSource::Preamble)
+                // The first line before the links that names something (a
+                // transfer notice's «X sent you 2 files» names nothing once
+                // the sender and the notice's words are left out; the file's
+                // name on the next line does).
+                // Only down to the first real link: what follows it (a
+                // footer, «Λήψη του Outlook για Android», a signature) is not
+                // its name. A transfer service's own pages and action links
+                // do not end the search (fixture 48 starts with one).
+                let first_link = preamble
+                    .iter()
+                    .position(|l| l.urls.iter().any(|u| !is_transfer_service_page(u) && !is_action_link(u)));
+                let upto = first_link.map_or(preamble.len(), |i| i + 1);
+                let titled = |lines: &[Line]| -> Vec<String> {
+                    lines.iter().filter(|l| !l.is_marker()).filter_map(|l| l.title_text()).collect()
+                };
+                let texts = titled(&preamble[..upto]);
+                match texts.iter().find_map(|t| keyword_of(t).map(|k| (t.clone(), k))) {
+                    Some((t, k)) => (Some(t), Some(k), KeywordSource::Preamble),
+                    // Nothing above the first link names it (a link pasted
+                    // first, a logo): the first line that reads as a title,
+                    // as before this limit, wherever it is (P15.10 round 4).
+                    None => {
+                        let (t, k) = with_keyword(titled(&preamble).into_iter().next());
+                        (t, k, KeywordSource::Preamble)
+                    }
+                }
             }
         };
         raw.push(RawSection {
@@ -2394,7 +2617,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
         // επείγον"). A generic title is the meter's to flag, not theirs.
         let section_names_them = kw_source == KeywordSource::Title && section_kw.is_some();
         let captions: HashMap<String, String> = if many && !section_names_them {
-            let found = link_captions(&s.lines);
+            let found = link_captions(&s.lines, &own_labels);
             let usable = selected.iter().filter(|(u, _, _)| found.contains_key(u)).count();
             if usable >= 2 { found } else { HashMap::new() }
         } else {
@@ -2411,7 +2634,7 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                     (k.clone(), KeywordSource::Caption)
                 } else if let Some(k) = section_kw.clone() {
                     (k, kw_source)
-                } else if let Some(k) = keyword_from_url(&url) {
+                } else if let Some(k) = keyword_from_url_with(&url, &own_labels) {
                     (k, KeywordSource::Url)
                 } else {
                     ("ASSET".into(), KeywordSource::Fallback)
@@ -2505,14 +2728,14 @@ pub fn parse(mail: &InboundMail, roster: &[Journalist], cfg: &ParserConfig) -> P
                 },
                 url: attachment_url(&mail.internet_message_id, &a.id),
                 tier: Tier::Attachment,
-                keyword_from: if keyword_from_filename(&a.name).is_some() {
+                keyword_from: if keyword_from_filename(&a.name, &own_labels).is_some() {
                     KeywordSource::FileName
                 } else if section_kw.is_some() {
                     inherited_from
                 } else {
                     KeywordSource::Fallback
                 },
-                keyword: keyword_from_filename(&a.name)
+                keyword: keyword_from_filename(&a.name, &own_labels)
                     .or_else(|| section_kw.clone())
                     .unwrap_or_else(|| "ASSET".into()),
                 confidence,
@@ -3368,6 +3591,181 @@ https://youtu.be/sent-on";
         assert_eq!(clean_url(safe).as_deref(), Some("https://youtu.be/abc"));
     }
 
+    /// P15.10: file types, camera file names, numbers and transfer-notice
+    /// words are never part of a keyword; with nothing else left, the next
+    /// source names the file.
+    #[test]
+    fn junk_never_makes_a_keyword() {
+        for junk in ["ΠΛΑΝΑ MP4", "FILE382", "6912345678", "IMG_4411.MOV", "20261027 14:30", "27/10/2026", "2026-10-27", "has sent you", "ASSET"] {
+            assert_eq!(keyword_from_text(junk), None, "{junk}");
+        }
+        assert_eq!(keyword_from_text("ΣΥΝΕΝΤΕΥΞΗ_ΔΗΜΑΡΧΟΥ.MP4").as_deref(), Some("SYNENTEFXIDIMARCHOU"));
+        assert_eq!(keyword_from_text("ΔΗΜΟΤΙΚΟ 20261027 ΣΥΜΒΟΥΛΙΟ").as_deref(), Some("DIMOTIKOSYMVOULIO"));
+        assert_eq!(keyword_from_text("ΣΥΜΒΟΥΛΙΟ 27/10 14:30").as_deref(), Some("SYMVOULIO"));
+        assert_eq!(keyword_from_text("COVID19 ΕΜΒΟΛΙΑ").as_deref(), Some("COVID19EMVOLIA"), "a few digits in a word stay");
+        // Short numbers and codes are topics (P15.10 round 3).
+        for (text, keyword) in [
+            ("ΜΗΝΥΜΑ 112", "MINYMA112"),
+            ("ΑΡΚΑΔΙ 1866", "ARKADI1866"),
+            ("ΔΕΛΤΙΟ 20Η", "DELTIO20I"),
+            ("F35 ΣΟΥΔΑ", "F35SOUDA"),
+            ("A320 ΗΡΑΚΛΕΙΟ", "A320IRAKLEIO"),
+        ] {
+            assert_eq!(keyword_from_text(text).as_deref(), Some(keyword), "{text}");
+        }
+        // ΒΙΑ is VIA, ΦΙΛΕΣ is FILES: a notice word only in a service's own mail.
+        assert_eq!(keyword_from_text("ΕΝΔΟΟΙΚΟΓΕΝΕΙΑΚΗ ΒΙΑ ΣΤΟ ΗΡΑΚΛΕΙΟ").as_deref(), Some("ENDOOIKOGENEIAKIVIA"));
+        assert_eq!(keyword_from_text("ΣΧΟΛΙΚΗ ΒΙΑ").as_deref(), Some("SCHOLIKIVIA"));
+        assert_eq!(valid_keyword("SCHOLIKIVIA").as_deref(), Some("SCHOLIKIVIA"));
+        assert_eq!(valid_keyword("VIA").as_deref(), Some("VIA"));
+        // The LLM's keywords too.
+        for junk in ["MP4", "HASSENT", "FILE382", "6912345678", "MP4MOV"] {
+            assert_eq!(valid_keyword(junk), None, "{junk}");
+        }
+        assert_eq!(valid_keyword("FESTIVAL").as_deref(), Some("FESTIVAL"));
+
+        let r = roster();
+        let keyword = |subject: &str, from: &str| {
+            let p = parse(&mail(subject, from, "https://www.youtube.com/watch?v=abcdefghijk"), &r, &ParserConfig::default());
+            p.sections.first().and_then(|s| s.jobs.first()).map(|j| j.keyword.clone()).unwrap()
+        };
+        // Nothing left in the subject: the fallback, as before.
+        assert_eq!(keyword("ΠΛΑΝΑ MP4", "a.papadaki@example.gr"), "ASSET");
+        assert_eq!(keyword("ΓΙΑ ΔΗΜΟ 20261027", "a.papadaki@example.gr"), "DIMO");
+        // A label of the station's own mail domain (example.gr, from the roster).
+        assert_eq!(keyword("ΘΕΜΑΤΑ EXAMPLE ΣΕΙΣΜΟΣ", "a.papadaki@example.gr"), "SEISMOS");
+
+        // A transfer notice: the file's words, not "HASSENT".
+        let r = namesake_roster();
+        let m = mail(
+            "Nikos Vardakis has sent you festival-crete.mp4 via TransferNow",
+            "noreply@transfernow.net",
+            "Download your files: https://www.transfernow.net/dl/20261127AbCd/XyZkey",
+        );
+        let p = parse(&m, &r, &ParserConfig::default());
+        assert_eq!(p.journalist.surname, "VARDAKIS");
+        assert_eq!(p.sections[0].jobs[0].keyword, "FESTIVALCRETE", "{:?}", p.sections);
+    }
+
+    /// P15.10 round 2: a transfer notice's sender is not the keyword, known
+    /// to the roster or not; the file's words are. English filler names nothing.
+    #[test]
+    fn a_notice_is_named_by_its_file_not_its_sender() {
+        let r = roster();
+        let link = "Download your files: https://www.transfernow.net/dl/20261127AbCd/XyZkey";
+        let notice = |subject: &str, body: &str| {
+            let p = parse(&mail(subject, "noreply@transfernow.net", body), &r, &ParserConfig::default());
+            (p.journalist.surname.clone(), p.sections[0].jobs[0].keyword.clone())
+        };
+        // Nobody on the roster: MCR, and the subject's file name.
+        assert_eq!(notice("Maria Testaki has sent you festival-crete.mp4 via TransferNow", link), ("MCR".into(), "FESTIVALCRETE".into()));
+        // Nothing but the notice in the subject: the body's file name, not the
+        // sender line above it (address and all).
+        let body = format!("Maria Testaki <m.testaki@studio.example> sent you 1 file\nplimmyra_limani.mp4 (1.1 GB)\n{link}");
+        assert_eq!(notice("Maria Testaki has sent you files via TransferNow", &body), ("MCR".into(), "PLIMMYRALIMANI".into()));
+
+        assert_eq!(keyword_from_text("Here is the video you might like").as_deref(), Some("LIKE"), "only a word that is not filler");
+        assert_eq!(keyword_from_text("Please click here to view your items"), None);
+    }
+
+    /// P15.10 round 3: a transfer service's own words never name a clip in
+    /// its mail, and stay a topic in anyone else's.
+    #[test]
+    fn a_transfer_services_words_name_nothing_in_its_own_mail() {
+        let r = roster();
+        let section_keyword = |subject: &str, from: &str, body: &str| {
+            parse(&mail(subject, from, body), &r, &ParserConfig::default()).sections.first().and_then(|s| s.keyword.clone())
+        };
+        let link = "https://we.tl/t-AbCdEf1234";
+        assert_eq!(section_keyword("p.example@studio.example έκανε μεταφόρτωση μέσω WeTransfer", "noreply@wetransfer.com", link), None);
+        // The sender's name is dropped too (round 2): nothing is left.
+        assert_eq!(section_keyword("Ο Πέτρος σας έστειλε αρχεία μέσω WeTransfer", "noreply@wetransfer.com", link), None);
+        assert_eq!(section_keyword("Your transfer expires on 3 November", "noreply@wetransfer.com", link), None);
+        assert_eq!(section_keyword("Η μεταφορά λήγει σε 2 ημέρες, 3 Νοεμβρίου", "noreply@transfernow.net", link), None);
+        // The file's name, when the notice gives one, still names it.
+        assert_eq!(
+            section_keyword("Your transfer expires on 3 November", "noreply@wetransfer.com", &format!("katastrofi-limani.mp4\n{link}")),
+            Some("KATASTROFILIMANI".into())
+        );
+        // "via" is a notice word in a service's own mail (in anyone else's it is ΒΙΑ).
+        assert_eq!(section_keyword("Festival Chania via WeTransfer", "noreply@wetransfer.com", link), Some("FESTIVALCHANIA".into()));
+        // In a colleague's mail the same words are the story.
+        assert_eq!(
+            section_keyword("ΜΕΤΑΦΟΡΑ ΑΣΘΕΝΟΥΣ ΜΕ ΕΚΑΒ", "a.papadaki@example.gr", "https://www.youtube.com/watch?v=abcdefghijk"),
+            Some("METAFORAASTHENOUS".into())
+        );
+    }
+
+    /// P15.10 round 3: the preamble names a link only from the lines down to
+    /// it; a footer under it (Outlook's «Λήψη του Outlook για Android») does
+    /// not, and the link's own slug does.
+    #[test]
+    fn a_footer_below_the_link_does_not_name_it() {
+        let body = "Δείτε εδώ:\nhttps://news.example/kriti/seismos-irakleio-video\n\nΛήψη του Outlook για Android<https://aka.ms/AAb9ysg>\nΚαλή συνέχεια";
+        let p = parse(&mail("Βίντεο", "a.papadaki@example.gr", body), &roster(), &ParserConfig::default());
+        let job = p.jobs().find(|j| j.url.contains("news.example")).expect("the news link is a job");
+        assert_eq!(job.keyword, "SEISMOSIRAKLEIO", "{:?}", p.sections);
+    }
+
+    /// P15.10 round 4: a section's own title line names it, as at HEAD,
+    /// whatever the links below it.
+    #[test]
+    fn a_title_line_above_its_links_still_names_them() {
+        let r = roster();
+        let kw = |subject: &str, body: &str| {
+            let p = parse(&mail(subject, "a.papadaki@example.gr", body), &r, &ParserConfig::default());
+            (p.sections.iter().map(|s| s.keyword.clone()).collect::<Vec<_>>(), p.jobs().map(|j| j.keyword.clone()).collect::<Vec<_>>())
+        };
+        let (sections, jobs) = kw("ΘΕΜΑΤΑ", "ΤΟ ΔΙΝΕΙ lIVE ΕΙΚΟΝΑ ΕΚΛΟΓΕΣ - ΝΑ ΤΟ ΔΩΣΟΥΜΕ\nhttps://www.youtube.com/watch?v=abcdefghij1");
+        assert_eq!(sections, [Some("DINEILIVE".to_string())], "{jobs:?}");
+        let (sections, jobs) = kw("ΘΕΜΑΤΑ", "AYTOΔΙΝΕΙ lIVE ΕΙΚΟΝΑ\nhttps://www.youtube.com/watch?v=abcdefghij1");
+        assert_eq!(sections, [Some("AYTODINEILIVE".to_string())], "{jobs:?}");
+        let body = "για την αρχή 30 δευτερόλεπτα\nhttps://www.youtube.com/watch?v=abcdefghij1\nhttps://www.youtube.com/watch?v=abcdefghij2\nhttps://www.youtube.com/watch?v=abcdefghij3";
+        let (sections, jobs) = kw("ΘΕΜΑΤΑ", body);
+        assert_eq!(sections, [Some("ARCHIDEFTEROLEPTA".to_string())], "{jobs:?}");
+        let (sections, _) = kw("ΘΕΜΑΤΑ", &format!("1. {}", body));
+        assert_eq!(sections, [Some("ARCHIDEFTEROLEPTA".to_string())]);
+        // A link above the title (a logo, a link pasted first): the title
+        // still names the section, as at HEAD.
+        let (sections, jobs) = kw("ΘΕΜΑΤΑ", &format!("https://news.example/logo\n{body}"));
+        assert_eq!(sections, [Some("ARCHIDEFTEROLEPTA".to_string())], "{jobs:?}");
+        let (sections, jobs) = kw("ΘΕΜΑΤΑ", "https://www.youtube.com/watch?v=abcdefghij0\nΤΟ ΔΙΝΕΙ lIVE ΕΙΚΟΝΑ ΕΚΛΟΓΕΣ - ΝΑ ΤΟ ΔΩΣΟΥΜΕ\nhttps://www.youtube.com/watch?v=abcdefghij1");
+        assert_eq!(sections, [Some("DINEILIVE".to_string())], "{jobs:?}");
+    }
+
+    /// P15.10 round 3: a section title loses the journalist's surname, and
+    /// a first name only right before it; a first name alone is a word.
+    #[test]
+    fn a_section_title_drops_the_journalists_surname_not_a_lone_first_name() {
+        let r = vec![
+            Journalist { id: 0, surname: "MCR".into(), full_name: "Master Control Room".into(), emails: vec!["master@example.gr".into()], default_priority: 0, aliases: vec![], groups: vec![], created_at: None },
+            Journalist { id: 0, surname: "TESTAKI".into(), full_name: "Νίκη Τεστάκη".into(), emails: vec!["n.testaki@example.gr".into()], default_priority: 0, aliases: vec![], groups: vec![], created_at: None },
+        ];
+        let body = "1. ΝΙΚΗ ΟΦΗ\nhttps://www.youtube.com/watch?v=abcdefghij1\n\n2. ΤΕΣΤΑΚΗ ΣΕΙΣΜΟΣ\nhttps://www.youtube.com/watch?v=abcdefghij2\n\n3. ΝΙΚΗ ΤΕΣΤΑΚΗ ΠΛΗΜΜΥΡΑ\nhttps://www.youtube.com/watch?v=abcdefghij3";
+        let p = parse(&mail("ΘΕΜΑΤΑ", "n.testaki@example.gr", body), &r, &ParserConfig::default());
+        assert_eq!(p.journalist.surname, "TESTAKI");
+        let keywords: Vec<Option<String>> = p.sections.iter().map(|s| s.keyword.clone()).collect();
+        assert_eq!(keywords, [Some("NIKIOFI".to_string()), Some("SEISMOS".to_string()), Some("PLIMMYRA".to_string())]);
+    }
+
+    /// P15.10 round 3: junk is removed as whole words only: YOUTUBE is not
+    /// YOU + TUBE.
+    #[test]
+    fn a_word_that_starts_with_a_junk_word_is_kept_whole() {
+        assert_eq!(keyword_from_text("YOUTUBE ΣΕΙΣΜΟΣ").as_deref(), Some("YOUTUBESEISMOS"));
+        assert_eq!(keyword_from_text("YouTube Shorts: σεισμός στην Κρήτη").as_deref(), Some("YOUTUBESEISMOS"));
+        assert_eq!(keyword_from_text("Hasta la vista").as_deref(), Some("HASTAVISTA"));
+        // Written apart ("You Tube", "you-tube" in a slug), it is still one name.
+        assert_eq!(keyword_from_text("You Tube σεισμός").as_deref(), Some("YOUTUBESEISMOS"));
+        assert_eq!(keyword_from_url("https://news.example/you-tube-seismos").as_deref(), Some("YOUTUBESEISMOS"));
+        let r = roster();
+        for subject in ["YOUTUBE ΣΕΙΣΜΟΣ", "YouTube Shorts σεισμός"] {
+            let p = parse(&mail(subject, "a.papadaki@example.gr", "https://www.youtube.com/watch?v=abcdefghijk"), &r, &ParserConfig::default());
+            let k = p.sections[0].jobs[0].keyword.clone();
+            assert!(!k.starts_with("TUBE"), "{subject}: {k}");
+        }
+    }
+
     #[test]
     fn keywords() {
         assert_eq!(keyword_from_text("ΠΑΡΕΛΑΣΗ ΣΤΟ ΗΡΑΚΛΕΙΟ").as_deref(), Some("PARELASIIRAKLEIO"));
@@ -3462,7 +3860,10 @@ pub fn valid_keyword(raw: &str) -> Option<String> {
     // A model that has no keyword sometimes answers the word for "nothing"
     // as a string; "NULL" would pass the pattern and name a file.
     const NOTHING: &[&str] = &["NULL", "NONE", "NIL", "NA", "N/A", "UNDEFINED", "UNKNOWN", "EMPTY", "KEYWORD", "ASSET"];
-    (RE_KEYWORD.is_match(&k) && !STOPWORDS.contains(&k.as_str()) && !NOTHING.contains(&k.as_str())).then_some(k)
+    // A keyword that is junk through and through (MP4, FILE382, a phone
+    // number, HASSENT) names no story, from the model either (P15.10).
+    (RE_KEYWORD.is_match(&k) && !STOPWORDS.contains(&k.as_str()) && !NOTHING.contains(&k.as_str()) && !is_junk_keyword(&k))
+        .then_some(k)
 }
 
 /// A video keyword as the LLM wrote it (P4.34), in Greek or Latin, one or
