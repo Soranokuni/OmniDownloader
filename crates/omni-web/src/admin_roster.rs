@@ -7,6 +7,10 @@
 //! Columns, in this order: surname, full name, then one or more email
 //! addresses (in further columns, or in one cell separated by `;`, `,` or
 //! spaces). A first line naming the columns is skipped.
+//!
+//! Or a JSON list in the seed file's shape (P15.17): `[{"surname": …,
+//! "full_name": …, "emails": [..] or "a; b", "aliases": [..] or "a; b"}]`;
+//! other fields (`default_priority`) are read past.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,6 +20,10 @@ use serde::Serialize;
 pub const MAX_ROWS: usize = 500;
 /// At most this many addresses per person, as on the desk.
 pub const MAX_EMAILS: usize = 20;
+/// At most this many parser aliases per person, of at most this many
+/// characters, as on the desk (`api_save_journalist`).
+pub const MAX_ALIASES: usize = 30;
+pub const MAX_ALIAS_CHARS: usize = 40;
 
 /// One person of the pasted list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -26,6 +34,11 @@ pub struct RosterRow {
     pub surname: String,
     pub full_name: String,
     pub emails: Vec<String>,
+    /// Parser aliases (P15.17): only a JSON list carries them.
+    pub aliases: Vec<String>,
+    /// From a JSON list: `line` is the person's place in it, not a line.
+    #[serde(skip)]
+    pub person: bool,
 }
 
 /// A line that is not imported, and why.
@@ -33,6 +46,16 @@ pub struct RosterRow {
 pub struct RosterProblem {
     pub line: usize,
     pub message: String,
+    /// `line` is a person's place in a JSON list (P15.17), shown as «Άτομο n».
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub person: bool,
+}
+
+impl RosterProblem {
+    /// A problem with the person `row`, numbered as the row is.
+    pub fn of(row: &RosterRow, message: String) -> Self {
+        Self { line: row.line, message, person: row.person }
+    }
 }
 
 /// What an import of the text would do.
@@ -100,44 +123,51 @@ fn is_header(first_cell: &str) -> bool {
     ["surname", "last name", "lastname", "επώνυμο", "επωνυμο"].iter().any(|h| c == *h)
 }
 
-/// The rows of `text` and the lines that cannot be read. `token` makes a
-/// surname what the slugs use (the desk's rule; `""` when nothing is left).
-pub fn parse(text: &str, token: &dyn Fn(&str) -> String) -> (Vec<RosterRow>, Vec<RosterProblem>) {
-    let sep = separator(text);
-    let mut rows = Vec::new();
-    let mut problems = Vec::new();
-    let mut seen_surname: HashMap<String, usize> = HashMap::new();
-    let mut seen_email: HashMap<String, usize> = HashMap::new();
-    let mut counted = 0usize;
-    for (i, raw) in text.lines().enumerate() {
-        let line = i + 1;
-        let raw = raw.trim_start_matches('\u{feff}');
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let c = cells(raw, sep);
-        if counted == 0 && rows.is_empty() && problems.is_empty() && is_header(&c[0]) {
-            continue;
-        }
-        counted += 1;
-        if counted > MAX_ROWS {
-            problems.push(RosterProblem { line, message: format!("At most {MAX_ROWS} people in one import; import the rest separately.") });
-            break;
-        }
-        let mut bad = |message: String| problems.push(RosterProblem { line, message });
-        let surname = token(&c[0]);
+/// One person as read, before the checks every format shares.
+struct RawRow<'a> {
+    line: usize,
+    surname: &'a str,
+    full_name: &'a str,
+    /// Cells or strings holding addresses, separated by `;`, `,` or spaces.
+    emails: Vec<&'a str>,
+    /// Parser aliases, or why they cannot be read.
+    aliases: Result<Vec<String>, String>,
+}
+
+/// The checks every format shares, and the duplicates within the list.
+#[derive(Default)]
+struct Collector {
+    rows: Vec<RosterRow>,
+    problems: Vec<RosterProblem>,
+    seen_surname: HashMap<String, usize>,
+    seen_email: HashMap<String, usize>,
+    /// A JSON list: people are numbered, and fields named, not columns.
+    json: bool,
+}
+
+impl Collector {
+    fn take(&mut self, r: RawRow, token: &dyn Fn(&str) -> String) {
+        let line = r.line;
+        let person = self.json;
+        let mut bad = |message: String| self.problems.push(RosterProblem { line, message, person });
+        let (no_surname, no_email, unit) = if person {
+            ("No surname (field \"surname\").", "no email address (field \"emails\").", "person")
+        } else {
+            ("No surname in the first column.", "no email address (third column).", "line")
+        };
+        let surname = token(r.surname);
         if surname.is_empty() {
-            bad("No surname in the first column.".into());
-            continue;
+            bad(no_surname.into());
+            return;
         }
         if surname == "MCR" {
             bad("MCR is the desk's own destination, not a journalist.".into());
-            continue;
+            return;
         }
-        let full_name = c.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| c[0].trim().to_string());
+        let full_name = Some(r.full_name.trim()).filter(|s| !s.is_empty()).unwrap_or_else(|| r.surname.trim()).to_string();
         let mut emails: Vec<String> = Vec::new();
         let mut wrong = None;
-        for cell in c.iter().skip(2) {
+        for cell in r.emails {
             for e in cell.split(|ch: char| ch == ';' || ch == ',' || ch.is_whitespace()).filter(|e| !e.is_empty()) {
                 let e = e.trim_matches(|ch| ch == '<' || ch == '>').to_lowercase();
                 if !plausible_email(&e) {
@@ -149,31 +179,153 @@ pub fn parse(text: &str, token: &dyn Fn(&str) -> String) -> (Vec<RosterRow>, Vec
         }
         if let Some(e) = wrong {
             bad(format!("\"{}\" is not an email address.", e.chars().take(80).collect::<String>()));
-            continue;
+            return;
         }
         if emails.is_empty() {
-            bad(format!("{surname}: no email address (third column)."));
-            continue;
+            bad(format!("{surname}: {no_email}"));
+            return;
         }
         if emails.len() > MAX_EMAILS {
             bad(format!("{surname}: at most {MAX_EMAILS} addresses per person."));
-            continue;
+            return;
         }
-        if let Some(first) = seen_surname.get(&surname) {
-            bad(format!("{surname} is already on line {first} of this list."));
-            continue;
+        let aliases = match r.aliases {
+            Ok(a) => a,
+            Err(why) => {
+                bad(format!("{surname}: {why}"));
+                return;
+            }
+        };
+        if let Some(first) = self.seen_surname.get(&surname) {
+            bad(format!("{surname} is already on {unit} {first} of this list."));
+            return;
         }
-        if let Some((e, first)) = emails.iter().find_map(|e| seen_email.get(e).map(|l| (e, *l))) {
-            bad(format!("{e} is already on line {first} of this list."));
-            continue;
+        if let Some((e, first)) = emails.iter().find_map(|e| self.seen_email.get(e).map(|l| (e, *l))) {
+            bad(format!("{e} is already on {unit} {first} of this list."));
+            return;
         }
-        seen_surname.insert(surname.clone(), line);
+        self.seen_surname.insert(surname.clone(), line);
         for e in &emails {
-            seen_email.insert(e.clone(), line);
+            self.seen_email.insert(e.clone(), line);
         }
-        rows.push(RosterRow { line, surname, full_name, emails });
+        self.rows.push(RosterRow { line, surname, full_name, emails, aliases, person });
     }
-    (rows, problems)
+}
+
+/// Parser aliases as the desk stores them (P15.17): trimmed, at most
+/// [`MAX_ALIASES`] of [`MAX_ALIAS_CHARS`] characters, never the desk's name.
+/// From a JSON array each entry must say something; from one string
+/// separated by `;` or `,`, empty pieces between separators are dropped.
+fn check_aliases(list: Vec<String>, from_array: bool) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for a in list {
+        let a = a.trim().to_string();
+        if a.is_empty() {
+            if from_array {
+                return Err("κενό ψευδώνυμο (aliases)· σβήστε το ή γράψτε το.".into());
+            }
+            continue;
+        }
+        if a.chars().count() > MAX_ALIAS_CHARS {
+            return Err(format!("το ψευδώνυμο «{}…» ξεπερνά τους {MAX_ALIAS_CHARS} χαρακτήρες.", a.chars().take(20).collect::<String>()));
+        }
+        if a.eq_ignore_ascii_case("MCR") {
+            return Err("το MCR είναι ο προορισμός του πάγκου, όχι ψευδώνυμο δημοσιογράφου.".into());
+        }
+        out.push(a);
+    }
+    if out.len() > MAX_ALIASES {
+        return Err(format!("έως {MAX_ALIASES} ψευδώνυμα ανά δημοσιογράφο."));
+    }
+    Ok(out)
+}
+
+/// A JSON list or string field: an array of strings, or one string.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ListOrText {
+    List(Vec<String>),
+    Text(String),
+}
+
+/// One person of a JSON import: the seed file's shape
+/// (`data/journalists.seed.json`).
+#[derive(serde::Deserialize)]
+struct JsonPerson {
+    #[serde(default)]
+    surname: String,
+    #[serde(default)]
+    full_name: String,
+    #[serde(default)]
+    emails: Option<ListOrText>,
+    #[serde(default)]
+    aliases: Option<ListOrText>,
+    // Other fields (the seed file's `default_priority`) are read past: the
+    // import does not set them.
+}
+
+/// The people of a JSON list (P15.17); their "lines" are their places in it.
+fn parse_json(text: &str, token: &dyn Fn(&str) -> String) -> (Vec<RosterRow>, Vec<RosterProblem>) {
+    let mut c = Collector { json: true, ..Collector::default() };
+    let people: Vec<JsonPerson> = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        Ok(p) => p,
+        Err(e) => {
+            // A real line of the text: shown as «Γραμμή n».
+            c.problems.push(RosterProblem { line: e.line(), message: format!("Το JSON δεν διαβάζεται: {e}"), person: false });
+            return (c.rows, c.problems);
+        }
+    };
+    for (i, p) in people.iter().enumerate() {
+        let line = i + 1;
+        if line > MAX_ROWS {
+            c.problems.push(RosterProblem { line, message: format!("At most {MAX_ROWS} people in one import; import the rest separately."), person: true });
+            break;
+        }
+        let emails = match &p.emails {
+            Some(ListOrText::List(v)) => v.iter().map(String::as_str).collect(),
+            Some(ListOrText::Text(s)) => vec![s.as_str()],
+            None => Vec::new(),
+        };
+        let aliases = match &p.aliases {
+            Some(ListOrText::List(v)) => check_aliases(v.clone(), true),
+            Some(ListOrText::Text(s)) => check_aliases(s.split([';', ',']).map(String::from).collect(), false),
+            None => Ok(Vec::new()),
+        };
+        c.take(RawRow { line, surname: &p.surname, full_name: &p.full_name, emails, aliases }, token);
+    }
+    (c.rows, c.problems)
+}
+
+/// The rows of `text` and the lines that cannot be read. `token` makes a
+/// surname what the slugs use (the desk's rule; `""` when nothing is left).
+/// A text that starts with `[` is a JSON list in the seed file's shape.
+pub fn parse(text: &str, token: &dyn Fn(&str) -> String) -> (Vec<RosterRow>, Vec<RosterProblem>) {
+    if text.trim_start_matches('\u{feff}').trim_start().starts_with('[') {
+        return parse_json(text, token);
+    }
+    let sep = separator(text);
+    let mut c = Collector::default();
+    let mut counted = 0usize;
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let raw = raw.trim_start_matches('\u{feff}');
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let cl = cells(raw, sep);
+        if counted == 0 && c.rows.is_empty() && c.problems.is_empty() && is_header(&cl[0]) {
+            continue;
+        }
+        counted += 1;
+        if counted > MAX_ROWS {
+            c.problems.push(RosterProblem { line, message: format!("At most {MAX_ROWS} people in one import; import the rest separately."), person: false });
+            break;
+        }
+        let full_name = cl.get(1).map(String::as_str).unwrap_or("");
+        let emails = cl.iter().skip(2).map(String::as_str).collect();
+        c.take(RawRow { line, surname: &cl[0], full_name, emails, aliases: Ok(Vec::new()) }, token);
+    }
+    (c.rows, c.problems)
 }
 
 /// What importing `rows` adds, given the people on the list now as
@@ -189,7 +341,7 @@ pub fn plan(rows: Vec<RosterRow>, mut problems: Vec<RosterProblem>, existing: &[
         if on_list.contains(&row.surname) {
             out.existing.push(row);
         } else if let Some((e, who)) = row.emails.iter().find_map(|e| owner.get(e).map(|w| (e, *w))) {
-            problems.push(RosterProblem { line: row.line, message: format!("{e} already belongs to {who} on the list.") });
+            problems.push(RosterProblem::of(&row, format!("{e} already belongs to {who} on the list.")));
         } else {
             out.add.push(row);
         }

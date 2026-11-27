@@ -140,7 +140,8 @@ pub struct RosterPayload {
     dry_run: bool,
 }
 
-/// Import journalists pasted from Excel or read from a CSV (P13.4). People
+/// Import journalists pasted from Excel or read from a CSV (P13.4), or a
+/// JSON list in the seed file's shape with parser aliases (P15.17). People
 /// already on the list are left as they are; every line that cannot be
 /// imported is named with its number and the reason. A copy of the list is
 /// kept before anything is added.
@@ -170,15 +171,14 @@ pub async fn api_admin_import_journalists(
         for row in std::mem::take(&mut plan.add) {
             match state
                 .repo
-                .add_new_journalist(&row.surname, &row.full_name, &row.emails)
+                .add_new_journalist_with_aliases(&row.surname, &row.full_name, &row.emails, &row.aliases)
                 .map_err(internal_error("Could not save a journalist; the copy of the list made before the import is in data/backups/taxonomy."))?
             {
                 NewJournalist::Added => added.push(row),
                 NewJournalist::AlreadyListed => plan.existing.push(row),
-                NewJournalist::AddressTaken { address, surname } => plan.problems.push(admin_roster::RosterProblem {
-                    line: row.line,
-                    message: format!("{address} already belongs to {surname} on the list."),
-                }),
+                NewJournalist::AddressTaken { address, surname } => plan
+                    .problems
+                    .push(admin_roster::RosterProblem::of(&row, format!("{address} already belongs to {surname} on the list."))),
             }
         }
         plan.problems.sort_by_key(|p| p.line);

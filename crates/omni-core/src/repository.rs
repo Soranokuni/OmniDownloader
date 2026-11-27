@@ -95,6 +95,11 @@ pub enum NewJournalist {
     AddressTaken { address: String, surname: String },
 }
 
+/// Parser aliases as stored: trimmed, blank entries dropped.
+fn clean_aliases(aliases: &[String]) -> Vec<String> {
+    aliases.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect()
+}
+
 /// The finished jobs retention may delete: terminal, past the cutoff (?1), not held (?2 = batch).
 pub const PURGE_JOB_IDS_SQL: &str = "SELECT id FROM queue
      WHERE status IN ('COMPLETED','COMPLETED_MANUAL','FAILED','REQUIRES_REVIEW','MANUAL_DOWNLOAD','CANCELLED')
@@ -5243,11 +5248,7 @@ impl Repository {
     /// Replace a journalist's parser aliases (plan P4.3). Blank entries are
     /// dropped; a missing journalist is an error, not a silent no-op.
     pub fn set_journalist_aliases(&self, surname: &str, aliases: &[String]) -> Result<()> {
-        let clean: Vec<String> = aliases
-            .iter()
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
-            .collect();
+        let clean = clean_aliases(aliases);
         let conn = self.pool.get()?;
         let n = conn.execute(
             "UPDATE journalists SET aliases = ? WHERE surname = ?",
@@ -5305,7 +5306,15 @@ impl Repository {
     /// someone else. The check and the insert are one transaction, so a save
     /// on the desk between an import's preview and the import is kept.
     pub fn add_new_journalist(&self, surname: &str, full_name: &str, emails: &[String]) -> Result<NewJournalist> {
+        self.add_new_journalist_with_aliases(surname, full_name, emails, &[])
+    }
+
+    /// [`Self::add_new_journalist`] with parser aliases, stored as
+    /// [`Self::set_journalist_aliases`] stores them, in the same transaction
+    /// as the insert (P15.17). Someone already listed keeps their aliases.
+    pub fn add_new_journalist_with_aliases(&self, surname: &str, full_name: &str, emails: &[String], aliases: &[String]) -> Result<NewJournalist> {
         let surname = surname.trim().to_uppercase();
+        let aliases = clean_aliases(aliases);
         let emails: Vec<String> = emails.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
         let mut conn = self.pool.get()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -5324,9 +5333,9 @@ impl Repository {
             }
         }
         let n = tx.execute(
-            "INSERT INTO journalists (surname, full_name, emails, default_priority) VALUES (?, ?, ?, 0)
+            "INSERT INTO journalists (surname, full_name, emails, default_priority, aliases) VALUES (?, ?, ?, 0, ?)
              ON CONFLICT(surname) DO NOTHING",
-            params![surname, full_name, serde_json::to_string(&emails)?],
+            params![surname, full_name, serde_json::to_string(&emails)?, serde_json::to_string(&aliases)?],
         )?;
         tx.commit()?;
         Ok(if n == 1 { NewJournalist::Added } else { NewJournalist::AlreadyListed })
@@ -9295,6 +9304,30 @@ mod tests {
         assert_eq!(find(&repo)?.len(), 2);
 
         assert!(repo.set_journalist_aliases("NOBODY", &["X".into()]).is_err());
+        Ok(())
+    }
+
+    /// P15.17: an import stores its aliases as the desk does; someone already
+    /// listed is skipped and keeps the aliases they had.
+    #[test]
+    fn an_imported_journalist_keeps_its_aliases_and_a_listed_one_is_untouched() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let aliases_of = |repo: &Repository, s: &str| -> Result<Vec<String>> {
+            Ok(repo.list_journalists()?.into_iter().find(|j| j.surname == s).unwrap().aliases)
+        };
+        let r = repo.add_new_journalist_with_aliases("neotaki", "Nefeli Neotaki", &["n.neotaki@example.gr".into()], &[" ΝΕΦΕΛΗ ".into(), "".into(), "ΝΕΟΤΑΚΗ".into()])?;
+        assert_eq!(r, NewJournalist::Added);
+        assert_eq!(aliases_of(&repo, "NEOTAKI")?, ["ΝΕΦΕΛΗ", "ΝΕΟΤΑΚΗ"]);
+
+        repo.save_journalist("PALIOU", "Petros Paliou", &["p.paliou@example.gr".into()], 0)?;
+        repo.set_journalist_aliases("PALIOU", &["ΠΑΛΙΟΥ".into()])?;
+        let r = repo.add_new_journalist_with_aliases("PALIOU", "Other", &["other@example.gr".into()], &["ΑΛΛΟ".into()])?;
+        assert_eq!(r, NewJournalist::AlreadyListed);
+        assert_eq!(aliases_of(&repo, "PALIOU")?, ["ΠΑΛΙΟΥ"]);
+        // Without aliases, as before: none stored.
+        repo.add_new_journalist("TRITAKIS", "Tritakis", &["t@example.gr".into()])?;
+        assert!(aliases_of(&repo, "TRITAKIS")?.is_empty());
         Ok(())
     }
 

@@ -4,9 +4,9 @@
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
-import { runWizard } from '/static/wizard.js?v=15';
+import { runWizard } from '/static/wizard.js?v=16';
 import { confirmDialog } from '/static/dialog.js?v=11';
-import { t } from '/static/admin-text.js?v=5';
+import { t } from '/static/admin-text.js?v=6';
 
 const setupState = await api('/api/admin/settings').catch(() => null);
 const MODES = ['beginner', 'intermediate', 'it'];

@@ -1661,11 +1661,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v21() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v45_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v46_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=45"), "admin.html does not import admin.js?v=45");
-    assert!(!admin.contains("/static/admin.js?v=44"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=46"), "admin.html does not import admin.js?v=46");
+    assert!(!admin.contains("/static/admin.js?v=45"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -1790,7 +1790,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["15".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["16".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");
@@ -2066,4 +2066,24 @@ fn the_admin_panel_and_the_wizard_are_greek_by_default_with_an_english_switch() 
             assert!(words["admin.sites.about"].contains(&words[button]), "the Sites note does not name «{}»", words[button]);
         }
     }
+}
+
+/// P15.17: the import step says a JSON list with aliases is accepted, in both
+/// languages, and its preview shows the aliases each new person brings.
+#[test]
+fn the_journalist_import_explains_json_and_aliases() {
+    let assets = all_assets();
+    for dict in ["static/admin-text.el.js", "static/admin-text.en.js"] {
+        let d = dictionary(&assets, dict);
+        let help = &d["wizard.people.paste_help"];
+        assert!(help.contains("JSON") && help.contains("\"aliases\"") && help.contains("journalists.seed.json"), "{dict}: {help}");
+        assert!(d["wizard.people.file_help"].contains("JSON"), "{dict}: the file help does not name JSON");
+        assert!(d.contains_key("wizard.people.aliases"), "{dict}: no aliases label");
+    }
+    let wizard = &assets["static/wizard.js"];
+    assert!(wizard.contains("t('wizard.people.aliases'"), "the preview does not show aliases");
+    assert!(wizard.contains(".json,"), "the file picker does not offer JSON files");
+    // A JSON list's problems are numbered as people («Άτομο n»), a text's as lines.
+    assert!(wizard.contains("q.person ? 'wizard.people.person' : 'wizard.people.line'"), "JSON problems are shown as lines");
+    assert!(dictionary(&assets, "static/admin-text.el.js")["wizard.people.person"].starts_with("Άτομο {line}"));
 }
