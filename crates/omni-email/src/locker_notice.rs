@@ -42,7 +42,7 @@ impl NoticeKind {
 /// Mail domains of the transfer services (subdomains included:
 /// `mail.myairbridge.com`, `em-s.dropbox.com`).
 const SERVICE_DOMAINS: &[&str] =
-    &["transfernow.net", "wetransfer.com", "swisstransfer.com", "myairbridge.com", "filemail.com", "dropbox.com"];
+    &["transfernow.net", "wetransfer.com", "swisstransfer.com", "myairbridge.com", "filemail.com", "dropbox.com", "fex.net"];
 
 /// Phrases of a service's mail about a transfer *we* sent (folded with [`fold`]).
 const OUTBOUND: &[&str] = &[
@@ -51,6 +51,7 @@ const OUTBOUND: &[&str] = &[
     "HAS BEEN DOWNLOADED",
     "DOWNLOADED BY",
     "HAS DOWNLOADED",
+    "WERE DOWNLOADED",
     "HAS BEEN PREVIEWED",
     "TRANSFER YOU SENT",
     "LINK HAS BEEN CREATED",
@@ -107,10 +108,18 @@ pub fn notice_kind(mail: &InboundMail, own: &[String]) -> NoticeKind {
     if !from_a_service(&mail.from_address) {
         return NoticeKind::NotANotice;
     }
-    let subject = fold(&mail.subject);
+    // MyAirBridge writes the sender's own title after «☁» (P15.11): its words
+    // («λήγει», "sent") are the sender's, not the service's; the body decides.
+    let titled_by_sender = domain_is(&mail.from_address, "myairbridge.com") && mail.subject.trim_start().starts_with('☁');
+    let subject = if titled_by_sender { String::new() } else { fold(&mail.subject) };
     let body = fold(&mail.readable_body());
     let is_own = |a: &String| own.iter().any(|o| o.trim().eq_ignore_ascii_case(a));
     let (subject_delivery, mut named) = delivery_cues(&subject);
+    // "Your files were downloaded — transfer from a@b": the address alone
+    // (RE_NAMED) does not make a subject a delivery when the subject also
+    // says the transfer was ours (P15.11).
+    let subject_delivery =
+        subject_delivery && !(outbound_cue(&subject) && !delivery_cues(&RE_NAMED.replace_all(&subject, " ")).0);
     let (body_delivery, body_named) = delivery_cues(&body);
     named.extend(body_named);
     let delivery = |named: Vec<String>| {
@@ -198,9 +207,14 @@ fn delivery_cues(text: &str) -> (bool, Vec<String>) {
 
 /// Whether `from` is an address of a transfer service's own domain.
 fn from_a_service(from: &str) -> bool {
+    SERVICE_DOMAINS.iter().any(|d| domain_is(from, d))
+}
+
+/// Whether the address `from` is at `domain` or one of its subdomains.
+fn domain_is(from: &str, domain: &str) -> bool {
     let from = from.trim().trim_end_matches('>').to_ascii_lowercase();
-    let Some((_, domain)) = from.rsplit_once('@') else { return false };
-    SERVICE_DOMAINS.iter().any(|d| domain == *d || domain.ends_with(&format!(".{d}")))
+    let Some((_, d)) = from.rsplit_once('@') else { return false };
+    d == domain || d.ends_with(&format!(".{domain}"))
 }
 
 /// Text in one comparable form: uppercase, Greek without accents, the Greek
@@ -300,6 +314,33 @@ mod tests {
         );
         // No cue in the subject: the body decides.
         assert_eq!(kind("noreply@transfernow.net", "TransferNow", "Your link expires tomorrow"), NoticeKind::OwnTransfer);
+    }
+
+    /// P15.11: a MyAirBridge «☁ title» is the sender's own words: an
+    /// outbound word in it does not make the mail our own transfer.
+    #[test]
+    fn a_myairbridge_title_is_the_senders_not_the_services() {
+        let body = "Sender: p.example@studio.example\nDownload: https://mab.to/t/AbC123/eu1";
+        assert_eq!(kind("noreply@mail.myairbridge.com", "☁ Η προθεσμία λήγει – πλάνα", body), delivery(Some("p.example@studio.example")));
+        assert_eq!(kind("noreply@mail.myairbridge.com", "☁ Clips sent from the scene", body), delivery(Some("p.example@studio.example")));
+        // The body still says when it is ours.
+        assert_eq!(kind("noreply@mail.myairbridge.com", "☁ ΠΛΑΝΑ", "Your transfer has been downloaded by a@studio.example"), NoticeKind::OwnTransfer);
+        // Without «☁» the subject is the service's, as before.
+        assert_eq!(kind("noreply@mail.myairbridge.com", "Your transfer expires tomorrow", body), NoticeKind::OwnTransfer);
+    }
+
+    /// P15.11: an outbound subject that names an address ("transfer from
+    /// a@b") is about our own transfer; a real delivery naming one stays one.
+    #[test]
+    fn an_outbound_subject_with_from_an_address_is_our_own_transfer() {
+        assert_eq!(
+            kind("noreply@wetransfer.com", "Your files were downloaded — transfer from p.example@studio.example", "Download link"),
+            NoticeKind::OwnTransfer
+        );
+        assert_eq!(
+            kind("noreply@wetransfer.com", "Petros Example sent you files (from p.example@studio.example)", "Download link"),
+            delivery(Some("p.example@studio.example"))
+        );
     }
 
     #[test]

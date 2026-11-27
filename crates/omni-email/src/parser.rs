@@ -893,7 +893,7 @@ static RE_BARE_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r#"(?i)\b(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be|youtube-nocookie\.com|instagram\.com|facebook\.com"#,
         r#"|fb\.watch|tiktok\.com|x\.com|twitter\.com|vimeo\.com|dailymotion\.com|dai\.ly"#,
-        r#"|wetransfer\.com|we\.tl|transfernow\.net|myairbridge\.com|filemail\.com|1drv\.ms"#,
+        r#"|wetransfer\.com|we\.tl|transfernow\.net|myairbridge\.com|filemail\.com|fex\.net|1drv\.ms"#,
         r#"|onedrive\.live\.com|drive\.google\.com|dropbox\.com)/[^\s<>"'«»\[\]{}|\\^`]+"#
     ))
     .unwrap()
@@ -1560,6 +1560,8 @@ const LOCKER_DOMAINS: &[&str] = &[
     "myairbridge.com",
     "mab.to",
     "filemail.com",
+    "fex.net",
+    "kdrive.infomaniak.com",
     "1drv.ms",
     "onedrive.live.com",
     "sharepoint.com",
@@ -3705,6 +3707,47 @@ https://youtu.be/sent-on";
         let p = parse(&mail("Βίντεο", "a.papadaki@example.gr", body), &roster(), &ParserConfig::default());
         let job = p.jobs().find(|j| j.url.contains("news.example")).expect("the news link is a job");
         assert_eq!(job.keyword, "SEISMOSIRAKLEIO", "{:?}", p.sections);
+    }
+
+    /// P15.11: a FEX share from outside the newsroom is a locker for MCR,
+    /// not a link to an unknown site held back.
+    #[test]
+    fn a_fex_share_from_an_outsider_is_a_locker() {
+        let p = parse(&mail("Πλάνα από τη φωτιά", "someone@studio.example", "https://fex.net/uk/s/abc1d2e"), &roster(), &ParserConfig::default());
+        let jobs: Vec<_> = p.jobs().collect();
+        assert_eq!(jobs.len(), 1, "{p:?}");
+        assert_eq!((jobs[0].tier, jobs[0].status), (Tier::Locker, JobStatus::ManualDownload), "{p:?}");
+        assert!(!p.warnings.iter().any(|w| w.code == warnings::OUTSIDER_UNKNOWN_SITES), "{:?}", p.warnings);
+        assert_eq!(classify("https://fex.net/s/abc1d2e", &ParserConfig::default()), Tier::Locker);
+    }
+
+    /// P15.11: a SwissTransfer delivery a colleague forwards carries
+    /// Infomaniak's ads and footer: those are the service's pages, never
+    /// jobs; the share is the one job, for MCR.
+    #[test]
+    fn a_forwarded_swisstransfer_delivery_queues_only_its_share() {
+        let body = "---------- Forwarded message ---------\nFrom: SwissTransfer <noreply@swisstransfer.com>\n\
+                    You have received 2 files\nhttps://www.swisstransfer.com/d/0a1b2c3d-1111-2222-3333-444455556666\n\
+                    Discover kDrive https://www.infomaniak.com/en/kdrive?utm_source=swisstransfer\n\
+                    https://news.infomaniak.com/l/promo-2026\nManage your account https://manager.infomaniak.com/v3/account";
+        let p = parse(&mail("FW: You have received 2 files", "a.papadaki@example.gr", body), &roster(), &ParserConfig::default());
+        let jobs: Vec<_> = p.jobs().collect();
+        assert_eq!(jobs.len(), 1, "{p:?}");
+        assert!(jobs[0].url.contains("swisstransfer.com/d/") && jobs[0].status == JobStatus::ManualDownload, "{p:?}");
+        assert!(p.ignored_urls.iter().filter(|u| u.contains("infomaniak.com")).count() == 3, "{:?}", p.ignored_urls);
+    }
+
+    /// P15.11: a notice that our own transfer was downloaded, naming an
+    /// address, queues nothing.
+    #[test]
+    fn an_outbound_notice_naming_an_address_queues_nothing() {
+        let m = mail(
+            "Your files were downloaded — transfer from p.example@studio.example",
+            "noreply@wetransfer.com",
+            "Your files were downloaded.\nhttps://wetransfer.com/downloads/a1b2c3d4e5/f6a7b8c9d0",
+        );
+        let p = parse(&m, &roster(), &ParserConfig::default());
+        assert_eq!(p.jobs().count(), 0, "{p:?}");
     }
 
     /// P15.10 round 4: a section's own title line names it, as at HEAD,
