@@ -1071,11 +1071,29 @@ fn continues_wrapped_url(prev: &str, next: &str) -> bool {
         && next.chars().all(is_url_char)
         && !next.to_ascii_lowercase().starts_with("http")
         && !next.to_ascii_lowercase().starts_with("www.")
+        && !starts_with_a_link(next)
         && !next.starts_with(|c: char| c.is_ascii_digit() && next.len() <= 4);
     let at_separator = prev_trim.ends_with(['&', '=', '?', '/', '-', '_', '%', '.'])
         || next.starts_with(['&', '=', '?', '/', '#', '%']);
     let wrap_long = prev.chars().count() >= WRAP_WIDTH;
     ends_in_url && continues && (at_separator || wrap_long)
+}
+
+/// A host name with a path at the start of a line: `clips.news.example/v/…`.
+/// A file name (`story.html/amp`) is not a host.
+static RE_HOST_WITH_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+([a-z]{2,24})/[^\s/]").unwrap()
+});
+const FILE_EXTENSIONS: &[&str] = &["html", "htm", "shtml", "php", "asp", "aspx", "jsp", "cfm", "cgi"];
+
+/// Whether `line` starts with a link of its own (P15.9): a bare link on a
+/// known host, or a host name with a path. Such a line is never the rest of
+/// the link above it.
+fn starts_with_a_link(line: &str) -> bool {
+    if RE_BARE_URL.find(line).is_some_and(|m| m.start() == 0) {
+        return true;
+    }
+    RE_HOST_WITH_PATH.captures(line).is_some_and(|c| !FILE_EXTENSIONS.contains(&c[1].to_ascii_lowercase().as_str()))
 }
 
 /// Two links written with no space between them (`…/a1,https://…/a2`,
@@ -1287,6 +1305,13 @@ fn link_bounds(raw: &str) -> std::ops::Range<usize> {
     if let Some(cut) = trailing_annotation(&with_scheme) {
         let cut = cut - (with_scheme.len() - u.len());
         u = u[..cut].trim_end_matches(TRAILING);
+    }
+    // P15.9: a dash that is a whole last path segment ("…/arthro/-") is the
+    // sender's, not the site's. A dash at the end of a slug ("…-me-barka-")
+    // stays: news sites that cut long titles keep it in the real address.
+    // Not in a query or a fragment either.
+    if u.ends_with("/-") && !u.contains(['?', '#']) {
+        u = &u[..u.len() - 1];
     }
     start..start + u.len()
 }
@@ -3292,6 +3317,43 @@ https://youtu.be/sent-on";
             clean_url("https://www.google.com/url?q=javascript:alert(1)").as_deref(),
             Some("https://www.google.com/url?q=javascript:alert(1)")
         );
+    }
+
+    /// P15.9: a wrap-width line ending in a link, followed by a line that is
+    /// itself a link, is two links; a real soft wrap still joins.
+    #[test]
+    fn a_link_on_the_next_line_is_its_own_link() {
+        let long = "https://news.example/video/2026/10/09/some-long-slug-words-here-and-more-sp";
+        assert!(long.len() >= 70);
+        let urls = |body: &str| find_urls(&rejoin_wrapped_urls(body)).into_iter().map(|(_, u)| u).collect::<Vec<_>>();
+
+        // A known host with a path, and any host-like name with a path.
+        assert_eq!(urls(&format!("{long}\nyoutube.com/watch?v=AbCdEfGhIjK")), [long, "https://youtube.com/watch?v=AbCdEfGhIjK"]);
+        assert_eq!(urls(&format!("{long}\nm.youtube.com/watch?v=AbCdEfGhIjK")), [long, "https://m.youtube.com/watch?v=AbCdEfGhIjK"]);
+        assert_eq!(rejoin_wrapped_urls(&format!("{long}\nclips.news-two.example/v/abc-def")), format!("{long}\nclips.news-two.example/v/abc-def"));
+
+        // A client's wrap of one long link: still one link.
+        assert_eq!(urls(&format!("{long}\nabc-def/ghi?x=1")), [format!("{long}abc-def/ghi?x=1")]);
+        assert_eq!(urls(&format!("{long}\nstory-title.html/amp")), [format!("{long}story-title.html/amp")], "a file name is not a host");
+
+        // A link, a space and a lone dash: the line does not end in a link.
+        assert_eq!(urls(&format!("{long} -\nabc-def/ghi")), [long]);
+        assert_eq!(urls(&format!("{long} –\nabc-def/ghi")), [long]);
+    }
+
+    /// P15.9: a dash that is a whole last path segment (`…/-`) is not the
+    /// link's; one at the end of a slug, in a query or in a fragment is.
+    #[test]
+    fn a_dash_as_the_last_path_segment_is_dropped() {
+        assert_eq!(clean_url("https://news.example/a-b-c/-").as_deref(), Some("https://news.example/a-b-c/"));
+        assert_eq!(clean_url("https://news.example/4812330/-").as_deref(), Some("https://news.example/4812330/"));
+        assert_eq!(clean_url("www.news.example/a-b-c/-").as_deref(), Some("https://www.news.example/a-b-c/"));
+        // A slug that ends in a dash keeps it: sites that cut long titles keep
+        // the dash in the real address, and the link without it is a 404.
+        assert_eq!(clean_url("https://news.example/a-b-c-").as_deref(), Some("https://news.example/a-b-c-"));
+        assert_eq!(clean_url("https://news.example/watch?v=ab-").as_deref(), Some("https://news.example/watch?v=ab-"));
+        assert_eq!(clean_url("https://news.example/a#part-").as_deref(), Some("https://news.example/a#part-"));
+        assert_eq!(clean_url("https://news.example/a/?q=-").as_deref(), Some("https://news.example/a/?q=-"));
     }
 
     #[test]
