@@ -57,6 +57,31 @@ const TEXT_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><tit
 const BLOCKED_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Just a moment</title></head><body>
 <p>Checking your browser.</p></body></html>"#;
 
+/// A valid 1×1 baseline JPEG (the same picture as omni-email's fixture 06).
+const TINY_JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AKp//2Q==";
+
+/// The eight bytes every PNG starts with: enough for an error image's body.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// [`TINY_JPEG_B64`] decoded (standard alphabet; no crate needed for one picture).
+fn tiny_jpeg() -> Vec<u8> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => panic!("not base64: {c}"),
+    };
+    let digits: Vec<u8> = TINY_JPEG_B64.bytes().filter(|&c| c != b'=').map(value).collect();
+    let mut out = Vec::new();
+    for chunk in digits.chunks(4) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &d)| n | (u32::from(d) << (18 - 6 * i)));
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    out
+}
+
 fn browser_installed() -> bool {
     [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -86,6 +111,13 @@ async fn serve() -> std::net::SocketAddr {
             get(|| async { (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, "/login")]) }),
         )
         .route("/login", get(|| async { Html(TEXT_PAGE) }))
+        // P15.5: a photo server's extension-less address, and a blocked video
+        // answering with an error image.
+        .route("/static-rsc-4/AbCdEf123", get(|| async { ([(CONTENT_TYPE, "image/jpeg")], tiny_jpeg()) }))
+        .route(
+            "/v/expired",
+            get(|| async { (axum::http::StatusCode::FORBIDDEN, [(CONTENT_TYPE, "image/png")], PNG_SIGNATURE.to_vec()) }),
+        )
         .route(
             "/blocked",
             get(|| async { (axum::http::StatusCode::FORBIDDEN, Html(BLOCKED_PAGE)) }),
@@ -298,4 +330,47 @@ async fn a_page_that_ends_up_on_a_login_is_incomplete_but_a_trailing_slash_is_no
     let (snap, diag) = StreamSniffer::diagnose(&format!("http://{addr}/slash"), 40).await;
     assert!(snap.final_url.as_deref().is_some_and(|u| u.ends_with("/slash/")), "{:?}", snap.final_url);
     assert!(diag.complete, "a redirect to the same page with a slash is the same page");
+}
+
+/// P15.5: a link that opens as a picture (a photo server's address with no
+/// extension, answered 200 with image/jpeg) ends as a photo in a real browser,
+/// not as a page without a video.
+#[tokio::test]
+async fn an_extensionless_image_link_ends_as_a_photo() {
+    if !browser_installed() {
+        eprintln!("WARNING: skipping evidence test -- no Chrome/Edge installed");
+        return;
+    }
+    let jpeg = tiny_jpeg();
+    assert!(jpeg.starts_with(&[0xFF, 0xD8]) && jpeg.ends_with(&[0xFF, 0xD9]), "the fixture is a JPEG");
+    let adblock = tempfile::tempdir().unwrap();
+    UnifiedAdBlocker::init(adblock.path().to_path_buf());
+    let addr = serve().await;
+
+    let url = format!("http://{addr}/static-rsc-4/AbCdEf123");
+    let run = StreamSniffer::extract_with_evidence(&url, 8);
+    let sniffed = tokio::time::timeout(std::time::Duration::from_secs(90), run).await.expect("the sniff stalled");
+    let err = sniffed.media.expect_err("a picture has no video");
+    assert!(matches!(err.downcast_ref::<BrowserError>(), Some(BrowserError::IsPhoto(_))), "{err:#}");
+}
+
+/// P15.5: an expired or hotlink-blocked video answering 403 with an error
+/// image is not a photo: the run ends NoStreamFound, as before.
+#[tokio::test]
+async fn a_blocked_address_answering_with_an_error_image_is_not_a_photo() {
+    if !browser_installed() {
+        eprintln!("WARNING: skipping evidence test -- no Chrome/Edge installed");
+        return;
+    }
+    let adblock = tempfile::tempdir().unwrap();
+    UnifiedAdBlocker::init(adblock.path().to_path_buf());
+    let addr = serve().await;
+
+    let url = format!("http://{addr}/v/expired");
+    let run = StreamSniffer::extract_with_evidence(&url, 8);
+    let sniffed = tokio::time::timeout(std::time::Duration::from_secs(90), run).await.expect("the sniff stalled");
+    let err = sniffed.media.expect_err("an error image has no video");
+    assert!(matches!(err.downcast_ref::<BrowserError>(), Some(BrowserError::NoStreamFound(_))), "{err:#}");
+    let doc = sniffed.snapshot.network.iter().find(|n| n.url.ends_with("/v/expired")).expect("the document was seen");
+    assert_eq!((doc.status, doc.mime.as_deref()), (Some(403), Some("image/png")), "the browser saw the error image");
 }

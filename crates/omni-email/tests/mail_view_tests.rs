@@ -350,6 +350,30 @@ fn an_outsiders_marker_narrows_as_before_and_non_stories_keep_their_reason() {
     assert!(!view.notes.iter().any(|n| n.text.contains("εκτός σύνταξης")), "{:?}", view.notes);
 }
 
+/// P15.5: photo links without an extension (fixture 47) make no job; the
+/// mail view says they are photos, and since only their server says so (a
+/// misread video would otherwise be lost), MCR can still queue them. A link
+/// with an image extension stays unqueueable.
+#[test]
+fn photo_links_without_an_extension_are_skipped_as_photos_but_can_be_queued() {
+    let raw = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("47_photo_links_without_extension.eml")).unwrap();
+    let (_d, repo) = repo();
+    let (row, jobs) = ingest(&repo, &InboundMail::from_rfc822("fixture", &raw).unwrap());
+    assert_eq!(jobs.iter().map(|j| j.url.as_str()).collect::<Vec<_>>(), ["https://www.youtube.com/watch?v=Ab3dEf6hIjK"]);
+    let view = build(&row, &jobs, &ParserConfig::default());
+    for part in ["images.openai.com", "encrypted-tbn0.gstatic.com"] {
+        let skip = view.links.iter().find(|l| l.url.contains(part)).unwrap().skip.clone().unwrap();
+        assert_eq!(skip.reason, "Φωτογραφία: κατεβαίνουν μόνο βίντεο.", "{part}");
+        assert!(skip.can_queue, "{part}: a server-matched photo can be queued by MCR");
+    }
+
+    let (row, jobs) = ingest(&repo, &mail("ΛΙΜΑΝΙ", "1. ΛΙΜΑΝΙ\nhttps://www.youtube.com/watch?v=video000047\nhttps://www.example.org/press/limani-01.jpg"));
+    let view = build(&row, &jobs, &ParserConfig::default());
+    let skip = view.links.iter().find(|l| l.url.ends_with(".jpg")).unwrap().skip.clone().unwrap();
+    assert_eq!(skip.reason, "Φωτογραφία: κατεβαίνουν μόνο βίντεο.");
+    assert!(!skip.can_queue, "a .jpg is a photo for certain");
+}
+
 /// P15.1: a service mail no template recognised, with a link to files: no
 /// job, but a warning for MCR, and the link can be queued by hand.
 #[test]

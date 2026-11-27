@@ -253,6 +253,25 @@ fn a_mail_is_settled_only_when_none_of_its_videos_waits_or_runs() {
     assert_eq!((mixed.delivered, mixed.total), (1, 2));
 }
 
+/// P15.5: a mail whose only link turned out to be a photo is done, not
+/// waiting for a person: the worker closed the job as CANCELLED / IS_PHOTO.
+#[test]
+fn a_mail_whose_only_link_was_a_photo_is_done_not_attention() {
+    let (_d, repo) = repo();
+    let ids = mail(&repo, "<ph@x>", "ΛΙΜΑΝΙ", 10, &[("https://images.example/static/a1", JobStatus::Pending)]);
+    assert_eq!(repo.lease_job("w1", 120).unwrap().map(|j| j.id), Some(ids[0]));
+    assert!(repo.finish(ids[0], "w1", JobStatus::Cancelled, Some("IS_PHOTO"), Some("IS_PHOTO: a photo"), None).unwrap());
+
+    let entries = list(&repo);
+    let entry = entries.iter().find(|e| e.key == "<ph@x>").unwrap();
+    assert_eq!(entry.state, EntryState::Done);
+    // The list carries the code, or the Email tab cannot colour it as a photo.
+    assert_eq!(entry.jobs[0].error_code.as_deref(), Some("IS_PHOTO"));
+    let s = inbox::settlements(&entries, Utc::now() - Duration::hours(48));
+    let ph = s.iter().find(|x| x.id == "mail:<ph@x>").unwrap();
+    assert!(ph.settled, "{ph:?}");
+}
+
 #[test]
 fn a_cancelled_video_is_an_operator_decision_not_a_failure() {
     // P7.20: MCR cancels one of two videos; the other is delivered. The mail

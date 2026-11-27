@@ -847,6 +847,8 @@ pub struct InboxJobRow {
     pub submitted_by_user_id: Option<i64>,
     pub group_code: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    /// Only the colour of a photo (CANCELLED with IS_PHOTO, P15.5) reads it.
+    pub error_code: Option<String>,
 }
 
 /// A job to be queued (plan P1.1).

@@ -15,25 +15,25 @@
 import {
   api, el, render, fmtTime, fmtDuration, logout, safeHref, icon,
 } from '/static/app.js?v=6';
-import { toast } from '/static/toast.js?v=10';
+import { toast } from '/static/toast.js?v=11';
 import {
   stageLine, waitLine, stepTimeNode, limitNote, fileName, deliveredName, pager,
   retryJob as deskRetry, overrideJob as deskOverride, discardJob as deskDiscard, cancelJob as deskCancel,
   redownloadJob as deskRedownload, applyJobEvent, markDoneJob as deskMarkDone, queueOffer as deskQueueOffer,
   canRename, renameForm, renameOpen, timelineNode, autoDeliveredNode, lateReason, arrivedAgo, slugPreview,
-} from '/static/desk.js?v=27';
-import { deferAction, visible } from '/static/undo.js?v=11';
-import { infoDialog } from '/static/dialog.js?v=10';
-import { STATUS, statusBadge } from '/static/status.js?v=10';
-import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=10';
-import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=34';
+} from '/static/desk.js?v=28';
+import { deferAction, visible } from '/static/undo.js?v=12';
+import { infoDialog } from '/static/dialog.js?v=11';
+import { STATUS, statusBadge } from '/static/status.js?v=11';
+import { inGroupOrder, groupOf, groupLabel, primaryOf, whyText } from '/static/worklist.js?v=11';
+import { initInbox, loadInbox, openMail } from '/static/inbox.js?v=35';
 import {
   initNotify, watchStatus, serviceDown, serviceBack, CHECK_INFO, healthSummary, healthProblems,
   checkTexts, siteSentence, WHO,
-} from '/static/notify.js?v=22';
-import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=22';
-import { t, tn, applyText } from '/static/text.js?v=9';
-import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=8';
+} from '/static/notify.js?v=23';
+import { syncApproval, approvalIds, focusApproval } from '/static/approval.js?v=23';
+import { t, tn, applyText } from '/static/text.js?v=10';
+import { initKeys, navCard, showShortcuts } from '/static/keys.js?v=9';
 
 // The page's fixed words (header, tabs, the broadcast specification) come
 // from the same dictionary as everything else (P12.7).

@@ -78,11 +78,14 @@ pub enum ErrorCode {
     /// The platform is refusing our requests for now: its bot check, HTTP 429,
     /// "try again later" (P11.4). Waiting, longer than for a network fault, helps.
     RateLimited,
+    /// The link opened as a photo, not a page with a video (P15.5): MCR does
+    /// not take photos, so the job ends quietly as CANCELLED.
+    IsPhoto,
 }
 
 impl ErrorCode {
     /// Every code. A new variant goes here too, or `from_code` cannot read it.
-    pub const ALL: [ErrorCode; 34] = [
+    pub const ALL: [ErrorCode; 35] = [
         Self::UnsupportedUrl,
         Self::Http403,
         Self::LoginRequired,
@@ -117,6 +120,7 @@ impl ErrorCode {
         Self::NonPublicAddress,
         Self::DeliveryUnconfirmed,
         Self::RateLimited,
+        Self::IsPhoto,
     ];
 
     /// The code stored on a job, back as a code.
@@ -160,6 +164,7 @@ impl ErrorCode {
             Self::NonPublicAddress => "NON_PUBLIC_ADDRESS",
             Self::DeliveryUnconfirmed => "DELIVERY_UNCONFIRMED",
             Self::RateLimited => "RATE_LIMITED",
+            Self::IsPhoto => "IS_PHOTO",
         }
     }
 
@@ -271,6 +276,7 @@ impl ErrorCode {
             Self::NonPublicAddress => "Ο σύνδεσμος δείχνει σε εσωτερική διεύθυνση· δεν κατεβαίνει αυτόματα.",
             Self::DeliveryUnconfirmed => "Η παράδοση διακόπηκε και δεν είναι βέβαιο αν το αρχείο έφτασε. Ελέγξτε πρώτα στο Dalet αν υπάρχει ήδη: αν υπάρχει, πατήστε «Το έβαλα στο Dalet»· αν όχι, πατήστε «Δοκιμή ξανά».",
             Self::RateLimited => "Ο ιστότοπος περιορίζει προσωρινά τις λήψεις. Γίνεται αυτόματη επανάληψη.",
+            Self::IsPhoto => "Φωτογραφία, όχι βίντεο: το MCR δεν περνάει φωτογραφίες. Αν ο δημοσιογράφος θέλει βίντεο, ζητήστε τον σύνδεσμο του βίντεο.",
         }
     }
 
@@ -416,7 +422,8 @@ pub fn stopped_hint_el(
 /// failures come last, so any more exact code a stage attached wins.
 /// RATE_LIMITED (P11.4) is appended after them: only a failed yt-dlp run
 /// attaches it, a job that has it is never sniffed and never reaches a stage,
-/// so no chain carries it with another code.
+/// so no chain carries it with another code. IS_PHOTO (P15.5) likewise: the
+/// worker replaces the whole failure with it when the browser opened a photo.
 pub const CLASSIFIED: &[ErrorCode] = &[
     ErrorCode::ManualDownload,
     ErrorCode::HeldFileChanged,
@@ -439,6 +446,7 @@ pub const CLASSIFIED: &[ErrorCode] = &[
     ErrorCode::TranscodeFailed,
     ErrorCode::RewrapFailed,
     ErrorCode::RateLimited,
+    ErrorCode::IsPhoto,
 ];
 
 /// Every other code, and why the text classifier does not look for it. A new
@@ -1139,6 +1147,7 @@ mod tests {
             ErrorCode::NonPublicAddress,
             ErrorCode::DeliveryUnconfirmed,
             ErrorCode::RateLimited,
+            ErrorCode::IsPhoto,
         ] {
             let hint = code.hint_el();
             assert!(hint.len() > 20, "{code} has no useful hint");
@@ -1168,9 +1177,9 @@ mod tests {
             assert!(!c.should_try_sniffer());
             assert_eq!(ErrorCode::ALL.iter().filter(|x| **x == c).count(), 1);
         }
-        assert_eq!(ErrorCode::ALL.len(), 34);
+        assert_eq!(ErrorCode::ALL.len(), 35);
         let unique: std::collections::HashSet<_> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
-        assert_eq!(unique.len(), 34);
+        assert_eq!(unique.len(), 35);
     }
 
     /// P11.2b: the code of a delivery whose result nobody knows. Appended last
@@ -1199,6 +1208,31 @@ mod tests {
         assert_eq!(code_in_text("x: DELIVERY_UNCONFIRMED: y"), None, "read out of text");
     }
 
+    /// P15.5: a link that opened as a photo. Appended last (the list is
+    /// append-only), stable, read back out of the worker's chain, never
+    /// retried, never sniffed (the browser is what found it), and its Greek
+    /// hint says it is a photo, not a video.
+    #[test]
+    fn is_photo_is_the_last_code_terminal_and_never_sniffed() {
+        let c = ErrorCode::IsPhoto;
+        assert_eq!(ErrorCode::ALL.last(), Some(&c));
+        assert_eq!(c.as_str(), "IS_PHOTO");
+        assert_eq!(ErrorCode::from_code("IS_PHOTO"), Some(c));
+        assert_eq!(serde_json::to_string(&c).unwrap(), "\"IS_PHOTO\"");
+        assert!(!c.is_retryable(), "a photo never becomes a video by waiting");
+        assert_eq!(c.retry_max_attempts(), None);
+        assert_eq!(retry_after(c, 1, Duration::zero(), Duration::minutes(120)), None);
+        assert!(!c.should_try_sniffer());
+        assert!(!c.uses_exhausted_hint());
+        assert!(CLASSIFIED.contains(&c));
+        assert_eq!(code_in_text("IS_PHOTO: IS_PHOTO: the link is a photo, not a video"), Some(c));
+        assert_eq!(
+            c.hint_el(),
+            "Φωτογραφία, όχι βίντεο: το MCR δεν περνάει φωτογραφίες. Αν ο δημοσιογράφος θέλει βίντεο, ζητήστε τον σύνδεσμο του βίντεο."
+        );
+        assert_ne!(c.hint_el(), ErrorCode::NoStreamFound.hint_el());
+    }
+
     /// P11.4: the code of a platform refusing us for now. Appended last, stable,
     /// read back out of a failure's chain, retried after 2, 5, 10 and 15 minutes
     /// within the age limit (then the exhausted hint), never sniffed, and
@@ -1206,7 +1240,8 @@ mod tests {
     #[test]
     fn rate_limited_is_the_last_code_retried_four_times_and_never_sniffed() {
         let c = ErrorCode::RateLimited;
-        assert_eq!(ErrorCode::ALL.last(), Some(&c));
+        // Appended last in P11.4; only IS_PHOTO (P15.5) came after it.
+        assert_eq!(ErrorCode::ALL[33], c);
         assert_eq!(c.as_str(), "RATE_LIMITED");
         assert_eq!(ErrorCode::from_code("RATE_LIMITED"), Some(c));
         assert_eq!(serde_json::to_string(&c).unwrap(), "\"RATE_LIMITED\"");

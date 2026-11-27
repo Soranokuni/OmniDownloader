@@ -357,7 +357,10 @@ where
 
     let (reached_tx, mut reached) = tokio::sync::mpsc::unbounded_channel::<String>();
     let page = browser.new_page("about:blank").await.map_err(|e| format!("no page: {e}"))?;
-    watch(&page, &options.allow, proxy.addr, &reached_tx).await;
+    let proxy_addr = proxy.addr;
+    let proxy_password = proxy.password.clone();
+    let proxy_refused = &mut proxy.refused;
+    watch(&page, &options.allow, proxy_addr, &reached_tx).await;
     let mut watched: HashSet<TargetId> = HashSet::from([page.target_id().clone()]);
     // Popups and tabs seen, not yet watched (their page is still starting).
     let mut unwatched: Vec<TargetId> = Vec::new();
@@ -372,7 +375,49 @@ where
         })
     });
 
-    let result = async {
+    // The gate: every held request, and the proxy's challenge, is answered
+    // here, beside the loop below and never behind it. A press that waits on
+    // its own request (a synchronous one, a tab the browser opens for it)
+    // would otherwise hold the request it waits on, and the refusal would go
+    // unseen until the run is dropped (PR #29's CI).
+    let gate = async {
+        loop {
+            tokio::select! {
+                Some(ev) = challenged.next() => {
+                    let challenge = &ev.auth_challenge;
+                    let ours = challenge.source == Some(AuthChallengeSource::Proxy)
+                        && challenge.origin.trim_end_matches('/').eq_ignore_ascii_case(&proxy_origin);
+                    let answer = if ours {
+                        AuthChallengeResponse {
+                            response: AuthChallengeResponseResponse::ProvideCredentials,
+                            username: Some(proxy::PROXY_USER.to_string()),
+                            password: Some(proxy_password.clone()),
+                        }
+                    } else {
+                        AuthChallengeResponse { response: AuthChallengeResponseResponse::CancelAuth, username: None, password: None }
+                    };
+                    let _ = browser.execute(ContinueWithAuthParams::new(ev.request_id.clone(), answer)).await;
+                }
+                Some(ev) = paused.next() => {
+                    let id = ev.request_id.clone();
+                    if allowed(&ev.request.url, &options.allow, resolve.clone(), &refused).await {
+                        let _ = browser.execute(ContinueRequestParams::new(id)).await;
+                    } else {
+                        if let Ok(mut s) = seen.lock() {
+                            s.refused_by_page.get_or_insert_with(|| site_for_log(&ev.request.url));
+                        }
+                        let _ = browser.execute(FailRequestParams::new(id, ErrorReason::BlockedByClient)).await;
+                    }
+                }
+                else => break,
+            }
+        }
+        // Both streams ended (the browser is gone): the gate waits for ever
+        // and the loop below ends the run.
+        std::future::pending::<Result<PathBuf, String>>().await
+    };
+
+    let events = async {
         let mut ours: Option<(String, String)> = None;
         let mut clicks = 0usize;
         // The first click waits for the page to load.
@@ -425,35 +470,9 @@ where
                     return Err(format!("the page reached an internal address ({site})"));
                 }
                 // A connection the proxy refused (a WebSocket, a preconnect, …).
-                Some(site) = proxy.refused.recv() => {
+                Some(site) = proxy_refused.recv() => {
                     if let Ok(mut s) = seen.lock() {
                         s.refused_by_proxy.get_or_insert(site);
-                    }
-                }
-                Some(ev) = challenged.next() => {
-                    let challenge = &ev.auth_challenge;
-                    let ours = challenge.source == Some(AuthChallengeSource::Proxy)
-                        && challenge.origin.trim_end_matches('/').eq_ignore_ascii_case(&proxy_origin);
-                    let answer = if ours {
-                        AuthChallengeResponse {
-                            response: AuthChallengeResponseResponse::ProvideCredentials,
-                            username: Some(proxy::PROXY_USER.to_string()),
-                            password: Some(proxy.password.clone()),
-                        }
-                    } else {
-                        AuthChallengeResponse { response: AuthChallengeResponseResponse::CancelAuth, username: None, password: None }
-                    };
-                    let _ = browser.execute(ContinueWithAuthParams::new(ev.request_id.clone(), answer)).await;
-                }
-                Some(ev) = paused.next() => {
-                    let id = ev.request_id.clone();
-                    if allowed(&ev.request.url, &options.allow, resolve.clone(), &refused).await {
-                        let _ = browser.execute(ContinueRequestParams::new(id)).await;
-                    } else {
-                        if let Ok(mut s) = seen.lock() {
-                            s.refused_by_page.get_or_insert_with(|| site_for_log(&ev.request.url));
-                        }
-                        let _ = browser.execute(FailRequestParams::new(id, ErrorReason::BlockedByClient)).await;
                     }
                 }
                 Some(ev) = created.next() => {
@@ -468,7 +487,7 @@ where
                     for id in std::mem::take(&mut unwatched) {
                         match browser.get_page(id.clone()).await {
                             Ok(p) => {
-                                watch(&p, &options.allow, proxy.addr, &reached_tx).await;
+                                watch(&p, &options.allow, proxy_addr, &reached_tx).await;
                                 watched.insert(id);
                             }
                             Err(_) => still.push(id),
@@ -486,8 +505,12 @@ where
                 }
             }
         }
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        result = events => result,
+        parked = gate => parked,
+    };
     drop(navigation);
     let _ = tokio::time::timeout(PAGE_CLOSE, page.close()).await;
     result

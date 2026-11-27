@@ -1412,7 +1412,8 @@ async fn run_job_steps(
     } else {
         sniff_end
     };
-    if falls_back_to_ytdlp(sniff_first, end) {
+    // A link the browser opened as a photo (P15.5) has no video for yt-dlp either.
+    if falls_back_to_ytdlp(sniff_first, end) && !is_photo_failure(&process_result) {
         repo.record_event(job_id, "INFO", Some(JobStage::Extract), "The browser found no video; trying yt-dlp's own pick")?;
         if !repo.set_stage(job_id, owner, JobStage::Download)? {
             warn!("Job #{job_id}: no longer ours; not trying yt-dlp's own pick");
@@ -1488,6 +1489,11 @@ async fn run_job_steps(
             // rotation and does not require finding the right file.
             let diagnostic: String = diagnostic_chain(&e).chars().take(8192).collect();
             let _ = repo.record_event(job_id, "DEBUG", None, &diagnostic);
+
+            // A photo ends here (P15.5): before the retry, the page's second look and the repair ladder.
+            if finish_photo(repo, job_id, owner, code, &message)? {
+                return Ok(());
+            }
 
             if !retry_by_policy(repo, engine, job_id, owner, code, &message)? {
                 // MANUAL_DOWNLOAD is not a failure, it is a different workflow.
@@ -2237,8 +2243,35 @@ fn after_failed_sniff(previous: anyhow::Error, sniff_err: anyhow::Error) -> anyh
             anyhow::anyhow!("{}: no video found in the page", ErrorCode::NoStreamFound.as_str())
                 .context(ErrorCode::NoStreamFound.as_str())
         }
+        // The link opened as an image (P15.5): a photo, not a page.
+        Some(omni_browser::BrowserError::IsPhoto(_)) => {
+            anyhow::anyhow!("{}: the link is a photo, not a video", ErrorCode::IsPhoto.as_str())
+                .context(ErrorCode::IsPhoto.as_str())
+        }
         _ => previous,
     }
+}
+
+/// Whether the run's failure is a photo (P15.5).
+fn is_photo_failure(result: &Result<omni_broadcast::pipeline::RunOutcome>) -> bool {
+    result.as_ref().err().is_some_and(|e| classify_pipeline_error(e) == ErrorCode::IsPhoto)
+}
+
+/// A link that turned out to be a photo ends quietly (P15.5): CANCELLED with
+/// IS_PHOTO, by the lease holder, with no retry, no second look at the page,
+/// no repair and no site-health record. MCR does not take photos, so nothing
+/// waits for a person. Returns whether `code` was a photo: the caller is done
+/// either way. A job no longer ours gets nothing written (`finish` refuses).
+fn finish_photo(repo: &Repository, job_id: i64, owner: &str, code: ErrorCode, message: &str) -> Result<bool> {
+    if code != ErrorCode::IsPhoto {
+        return Ok(false);
+    }
+    if repo.finish(job_id, owner, JobStatus::Cancelled, Some(code.as_str()), Some(message), None)? {
+        info!("Job #{job_id}: the link is a photo, not a video; closed without review");
+    } else {
+        warn!("Job #{job_id}: a photo, but the job is no longer ours; nothing written");
+    }
+    Ok(true)
 }
 
 /// Whether the engine stopped because this worker no longer holds the job
@@ -3157,6 +3190,63 @@ mod tests {
 
         let no_browser = anyhow::Error::from(omni_browser::BrowserError::LaunchFailed("no Chrome".into()));
         assert_eq!(classify_pipeline_error(&after_failed_sniff(yt_dlp(), no_browser)), ErrorCode::UnsupportedUrl);
+    }
+
+    /// P15.5: four of the first six review jobs of a mail replay were photo
+    /// links (images.openai.com, a gstatic thumbnail) the browser opened and
+    /// found no video in. A photo ends CANCELLED with IS_PHOTO by the lease
+    /// holder: not review, not retried, and yt-dlp is not asked after it.
+    #[test]
+    fn a_photo_link_ends_cancelled_with_is_photo_and_nothing_else() {
+        let yt_dlp = || anyhow::anyhow!("ERROR: Unsupported URL: https://images.example/a").context(ErrorCode::UnsupportedUrl.as_str());
+        let photo = || after_failed_sniff(yt_dlp(), anyhow::Error::from(omni_browser::BrowserError::IsPhoto("https://images.example/a".into())));
+        let page = || after_failed_sniff(yt_dlp(), anyhow::Error::from(omni_browser::BrowserError::NoStreamFound("https://news.example/a".into())));
+        assert_eq!(classify_pipeline_error(&photo()), ErrorCode::IsPhoto);
+        assert!(is_photo_failure(&Err(photo())), "yt-dlp's own pick is not tried after a photo");
+        assert!(!is_photo_failure(&Err(page())));
+        assert!(!is_photo_failure(&Ok(omni_broadcast::pipeline::RunOutcome::Delivered)));
+
+        let r = LeasedRun::new(HEARTBEAT_INTERVAL);
+        let id = r.queue_and_lease(1, "w1", LEASE_SECS);
+        let e = photo();
+        let message = readable_cause(&e);
+        assert!(finish_photo(r.repo(), id, "w1", classify_pipeline_error(&e), &message).unwrap(), "the caller stops here");
+        let job = r.job(id);
+        assert_eq!(job.status, JobStatus::Cancelled);
+        assert_eq!(job.error_code.as_deref(), Some("IS_PHOTO"));
+        assert_eq!(job.lease_owner, None);
+        assert_eq!(job.attempts, 1, "not run again");
+        assert_eq!(job.not_before, None, "no retry scheduled");
+        assert!(job.completed_at.is_some());
+        assert!(r.repo().lease_job("w2", LEASE_SECS).unwrap().is_none(), "nothing left to lease");
+
+        // A page without a video takes the normal path: nothing written here.
+        let id = r.queue_and_lease(2, "w1", LEASE_SECS);
+        let e = page();
+        assert!(!finish_photo(r.repo(), id, "w1", classify_pipeline_error(&e), &readable_cause(&e)).unwrap());
+        let job = r.job(id);
+        assert_eq!((job.status, job.lease_owner.as_deref(), job.error_code), (JobStatus::Running, Some("w1"), None));
+
+        // A worker that lost the lease writes nothing.
+        let e = photo();
+        assert!(finish_photo(r.repo(), id, "w-old", classify_pipeline_error(&e), &readable_cause(&e)).unwrap());
+        let job = r.job(id);
+        assert_eq!((job.status, job.lease_owner.as_deref(), job.error_code), (JobStatus::Running, Some("w1"), None));
+    }
+
+    /// P15.5: in the failure path a photo is finished before the retry, the
+    /// page's second look and the repair ladder, so none of them runs for it.
+    #[test]
+    fn a_photo_is_finished_before_retry_recheck_and_repair() {
+        let src = include_str!("worker.rs");
+        let src = &src[..src.find("#[cfg(test)]\nmod tests {").or_else(|| src.find("#[cfg(test)]\r\nmod tests {")).expect("test module")];
+        let body = &src[src.find("let mut code = classify_pipeline_error(&e);").expect("the failure path")..];
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("{s}"));
+        let photo = at("if finish_photo(repo, job_id, owner, code, &message)? {");
+        assert!(photo < at("retry_by_policy(repo, engine, job_id, owner, code, &message)"));
+        assert!(photo < at("assess_failed_page("));
+        assert!(photo < at("repair::after_failure_with("));
+        assert!(src.contains("if falls_back_to_ytdlp(sniff_first, end) && !is_photo_failure(&process_result) {"));
     }
 
     /// A mistyped YouTube id (2026-10-07): the card said «Απρόβλεπτο

@@ -75,6 +75,8 @@ pub struct EntryJob {
     pub stage: String,
     pub progress: f64,
     pub parent_job_id: Option<i64>,
+    /// Only for the colour of a photo (CANCELLED with IS_PHOTO, P15.5).
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -374,6 +376,7 @@ fn entry_job(j: &InboxJobRow) -> EntryJob {
         stage: j.stage.clone(),
         progress: j.progress,
         parent_job_id: j.parent_job_id,
+        error_code: j.error_code.clone(),
     }
 }
 

@@ -378,23 +378,23 @@ fn a_failed_sign_in_shows_the_servers_message_not_session_expired() {
 fn desk_modules_have_one_url_each_and_mcr_handles_job_events_in_place() {
     let assets = all_assets();
     for (module, version) in [
-        ("desk.js", 27),
-        ("inbox.js", 34),
-        ("approval.js", 22),
-        ("notify.js", 22),
-        ("mcr.js", 60),
-        ("status.js", 10),
-        ("status.css", 11),
-        ("worklist.js", 10),
-        ("undo.js", 11),
-        ("dialog.js", 10),
-        ("keys.js", 8),
-        ("sound.js", 7),
-        ("board.js", 3),
-        ("user.js", 20),
-        ("toast.js", 10),
-        ("text.js", 9),
-        ("text.el.js", 9),
+        ("desk.js", 28),
+        ("inbox.js", 35),
+        ("approval.js", 23),
+        ("notify.js", 23),
+        ("mcr.js", 61),
+        ("status.js", 11),
+        ("status.css", 12),
+        ("worklist.js", 11),
+        ("undo.js", 12),
+        ("dialog.js", 11),
+        ("keys.js", 9),
+        ("sound.js", 8),
+        ("board.js", 4),
+        ("user.js", 21),
+        ("toast.js", 11),
+        ("text.js", 10),
+        ("text.el.js", 10),
     ] {
         let needle = format!("/static/{module}?v=");
         let mut found = std::collections::BTreeSet::new();
@@ -623,6 +623,67 @@ fn every_status_has_one_word_one_colour_and_a_mark_in_status_js() {
         let status = html.find("/static/status.css?v=").unwrap_or_else(|| panic!("{page} does not link status.css"));
         assert!(app < status, "{page} links status.css before app.css, so app.css would win");
     }
+}
+
+/// P15.5: a photo link the worker closed (CANCELLED with IS_PHOTO) has its own calm tone, mark
+/// and words; every badge, tag and segment colour of a job goes through status.js's one override;
+/// and it never counts as needing a person.
+#[test]
+fn a_photo_job_has_its_own_calm_tone_and_never_needs_a_person() {
+    use omni_broadcast::errors::ErrorCode;
+    let assets = all_assets();
+    let js = assets.get("static/status.js").expect("status.js shipped");
+    let css = format!("{}\n{}", assets["static/app.css"], assets["static/status.css"]);
+    let words = desk_dictionary(&assets);
+
+    // The override, keyed on the code the worker writes.
+    assert_eq!(ErrorCode::IsPhoto.as_str(), "IS_PHOTO");
+    assert!(
+        function_body(js, "isPhoto").contains("job.status === 'CANCELLED' && job.error_code === 'IS_PHOTO'"),
+        "status.js does not recognise a photo by CANCELLED + IS_PHOTO"
+    );
+    assert!(function_body(js, "jobInfo").contains("isPhoto(job) ? PHOTO : statusInfo(job && job.status)"));
+    assert!(js.contains("const PHOTO = row('PHOTO', 'photo');"));
+    for f in ["tone", "statusBadge", "statusTag"] {
+        let body = function_body(js, f);
+        assert!(body.contains("jobInfo(job)"), "{f} does not go through jobInfo");
+        assert!(!body.contains("statusInfo("), "{f} reads the bare status and misses the photo");
+    }
+
+    // Its own mark, words and colour.
+    let tones = js.split("export const TONES = {").nth(1).and_then(|s| s.split("};").next()).unwrap();
+    assert!(tones.lines().any(|l| l.trim() == "photo: { mark: '▣' },"), "no photo mark");
+    assert_eq!(words["status.PHOTO.label"], "Φωτογραφία");
+    assert_eq!(words["status.PHOTO.phrase"], "φωτογραφία, όχι βίντεο");
+    for key in ["short", "user"] {
+        assert!(words.get(&format!("status.PHOTO.{key}")).is_some_and(|w| w.contains("ωτογραφία")), "{key}");
+    }
+    assert_eq!(words["tone.photo"], "φωτογραφία");
+    assert!(words.contains_key("mail.sum.photo.one") && words.contains_key("mail.sum.photo.other"));
+    for selector in [".badge.photo ", ".tag.photo ", ".seg.photo ", ".dot.photo ", ".legend i.photo "] {
+        assert!(css.contains(selector), "no `{selector}` colour rule");
+    }
+    let photo = css_var(&css, "photo");
+    for other in ["ok", "warn", "bad", "info", "busy", "text-dim"] {
+        assert_ne!(photo.to_ascii_lowercase(), css_var(&css, other).to_ascii_lowercase(), "photo looks like --{other}");
+    }
+    assert!(contrast(&photo, "#0a1a24") >= 4.5, "the photo tag's mark is not readable");
+    assert!(contrast(&photo, &css_var(&css, "bg")) >= 4.5, "the photo badge's word is not readable");
+
+    // Not a person's work: CANCELLED is outside every «needs you» set.
+    assert!(!function_body(js, "needsAttention").contains("CANCELLED"));
+    let worklist = &assets["static/worklist.js"];
+    let needs_you = worklist.split("const NEEDS_YOU = [").nth(1).and_then(|s| s.split("];").next()).unwrap();
+    assert!(!needs_you.contains("CANCELLED"), "{needs_you}");
+    assert!(!assets["static/desk.js"].contains("'MANUAL_DOWNLOAD', 'FAILED', 'CANCELLED'"));
+
+    // The Email tab's rail, summary and card line read the job's row, not the bare status.
+    let inbox = &assets["static/inbox.js"];
+    let code: String = inbox.lines().filter(|l| !is_comment(l)).collect::<Vec<_>>().join("\n");
+    assert!(!code.contains("statusInfo("), "inbox.js reads a bare status and misses the photo");
+    assert!(code.contains("return jobInfo(j).phrase;"));
+    assert!(code.contains("left = [jobInfo(j).label];"));
+    assert!(code.contains("off: 0, photo: 0 };") && code.contains("tn('mail.sum.photo', c.photo)"));
 }
 
 /// P12.2: the review tab is a work list grouped by what the operator has to do. «Για έγκριση»
@@ -1583,11 +1644,11 @@ fn the_desk_counts_itself_reminds_held_videos_and_names_the_login_sites() {
 }
 
 #[test]
-fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
+fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v21() {
     let assets = all_assets();
     let page = assets.get("user.html").expect("user.html shipped");
-    assert!(page.contains("/static/user.js?v=20"), "user.html does not import user.js?v=20");
-    assert!(!page.contains("/static/user.js?v=19"), "user.html still imports the old user.js");
+    assert!(page.contains("/static/user.js?v=21"), "user.html does not import user.js?v=21");
+    assert!(!page.contains("/static/user.js?v=20"), "user.html still imports the old user.js");
 
     let js = assets.get("static/user.js").expect("user.js shipped");
     let code: Vec<&str> = js.lines().filter(|l| !is_comment(l)).collect();
@@ -1600,11 +1661,11 @@ fn the_user_panel_posts_to_its_own_endpoint_and_is_imported_at_v20() {
 }
 
 #[test]
-fn the_first_run_password_card_ships_with_admin_v44_and_login_v7() {
+fn the_first_run_password_card_ships_with_admin_v45_and_login_v7() {
     let assets = all_assets();
     let admin = assets.get("admin.html").expect("admin.html shipped");
-    assert!(admin.contains("/static/admin.js?v=44"), "admin.html does not import admin.js?v=44");
-    assert!(!admin.contains("/static/admin.js?v=43"), "admin.html still imports the old admin.js");
+    assert!(admin.contains("/static/admin.js?v=45"), "admin.html does not import admin.js?v=45");
+    assert!(!admin.contains("/static/admin.js?v=44"), "admin.html still imports the old admin.js");
     let login = assets.get("login.html").expect("login.html shipped");
     assert!(login.contains("/static/login.js?v=7"), "login.html does not import login.js?v=7");
     assert!(!login.contains("/static/login.js?v=6"), "login.html still imports the old login.js");
@@ -1729,7 +1790,7 @@ fn the_setup_wizard_is_one_module_with_no_innerhtml_and_no_external_origin() {
             versions.insert(rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>());
         }
     }
-    assert_eq!(versions, ["14".to_string()].into(), "wizard.js is imported under different versions");
+    assert_eq!(versions, ["15".to_string()].into(), "wizard.js is imported under different versions");
     let admin = assets.get("static/admin.js").expect("admin.js shipped");
     assert!(admin.contains("runWizard"), "admin.js never starts the wizard");
     let page = assets.get("admin.html").expect("admin.html shipped");

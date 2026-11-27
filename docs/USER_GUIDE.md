@@ -509,6 +509,7 @@ The card always says why in Greek. The usual ones:
 |---|---|
 | Login required (e.g. X, Instagram, Facebook) | the site needs the station's cookies: tell the administrator (Admin → Cookies). Once they are added, a job younger than 2 hours that nobody has touched goes back to the queue by itself (§4.10); otherwise «Δοκιμή ξανά». |
 | No video found on the page | open the link yourself; if there is a video, paste its direct link with «Χρήση αυτού του συνδέσμου» or download it by hand and mark «Το έβαλα στο Dalet». |
+| «Φωτογραφία» (blue-grey ▣ badge) | the link was a photo, not a video. MCR does not take photos, so the job closes by itself and does not count in «Θέλουν προσοχή». Known image servers (Google thumbnails, OpenAI images, Pinterest, Twitter media) make no job at all; the Email tab shows them as «Φωτογραφία». If the journalist wanted a video, ask them for the video's link. |
 | Live stream | checked again by itself for 2 hours (§4.10). If it stays live, ask the journalist for the clip, or «Δοκιμή ξανά» once the recording is up. |
 | Video removed / private | ask the journalist for another source. |
 | Network or a time-out | retries by itself (§4.10). When the card says it stopped trying, «Δοκιμή ξανά» or paste another link. |

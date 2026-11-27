@@ -118,7 +118,7 @@ pub const INBOX_MAIL_SQL: &str =
      WHERE COALESCE(received_at, processed_at) >= ?";
 pub const INBOX_JOB_SQL: &str =
     "SELECT id, url, slug, journalist, index_str, status, stage, progress, email_message_id,
-            parent_job_id, submitted_by_user_id, group_code, created_at
+            parent_job_id, submitted_by_user_id, group_code, created_at, error_code
      FROM queue
      WHERE created_at >= ? OR id IN (SELECT value FROM json_each(?))";
 
@@ -1468,7 +1468,9 @@ impl Repository {
             if status.is_terminal() {
                 count_finished(status);
             }
-            let level = if matches!(status, JobStatus::Completed | JobStatus::AwaitingApproval) { "INFO" } else { "ERROR" };
+            // A photo link (P15.5) is closed quietly: nothing went wrong.
+            let photo = status == JobStatus::Cancelled && error_code == Some("IS_PHOTO");
+            let level = if photo || matches!(status, JobStatus::Completed | JobStatus::AwaitingApproval) { "INFO" } else { "ERROR" };
             self.record_event(
                 job_id,
                 level,
@@ -6042,6 +6044,7 @@ impl Repository {
                 submitted_by_user_id: r.get("submitted_by_user_id")?,
                 group_code: r.get("group_code")?,
                 created_at: timestamps::parse_opt(r.get("created_at").ok().flatten()),
+                error_code: r.get("error_code")?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -9549,6 +9552,33 @@ mod tests {
         repo.finish(id, owner, JobStatus::Completed, None, None, None)?;
         let v = next(&mut rx);
         assert_eq!((v["status"].as_str(), v["stage"].as_str(), v["progress"].as_f64()), (Some("COMPLETED"), Some("DONE"), Some(100.0)));
+        Ok(())
+    }
+
+    /// P15.5: a photo link closed by its worker leaves an INFO line in the
+    /// history; any other CANCELLED or failed ending keeps its ERROR line.
+    #[test]
+    fn a_photo_finish_is_logged_as_info_and_other_endings_keep_their_level() -> Result<()> {
+        let temp_db = NamedTempFile::new()?;
+        let repo = Repository::new(temp_db.path())?;
+        let finished = |n: u32, status: JobStatus, code: Option<&str>| -> Result<(String, String)> {
+            let job = crate::models::NewJob::new(&format!("https://example.gr/p155/{n}"), &format!("{n}_ARGYRI_P155"), "ARGYRI");
+            let id = repo.enqueue(&job, DEFAULT_DEDUP_WINDOW_HOURS)?.job_id();
+            assert_eq!(repo.lease_job("w1", 120)?.map(|j| j.id), Some(id));
+            assert!(repo.finish(id, "w1", status, code, Some("x"), None)?);
+            let events = repo.get_job_events(id, 50)?;
+            let e = events.into_iter().find(|e| e.message.starts_with("Finished as")).expect("the finish line");
+            Ok((e.level, e.message))
+        };
+        assert_eq!(
+            finished(1, JobStatus::Cancelled, Some("IS_PHOTO"))?,
+            ("INFO".to_string(), "Finished as CANCELLED (IS_PHOTO)".to_string())
+        );
+        assert_eq!(finished(2, JobStatus::Cancelled, Some("NO_STREAM_FOUND"))?.0, "ERROR");
+        assert_eq!(finished(3, JobStatus::Cancelled, None)?.0, "ERROR");
+        assert_eq!(finished(4, JobStatus::RequiresReview, Some("IS_PHOTO"))?.0, "ERROR");
+        assert_eq!(finished(5, JobStatus::RequiresReview, Some("NO_STREAM_FOUND"))?.0, "ERROR");
+        assert_eq!(finished(6, JobStatus::Completed, None)?.0, "INFO");
         Ok(())
     }
 

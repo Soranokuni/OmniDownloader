@@ -429,7 +429,8 @@ fn skip_for(url: &str, role: LineRole, removed: bool, notice: bool, outsider: bo
     }
     let tier = parser::classify(url, cfg);
     if tier == Tier::Image {
-        return skip("Φωτογραφία: κατεβαίνουν μόνο βίντεο.", false);
+        // A photo by its server only (P15.5) may be a misread video: MCR can still queue it.
+        return skip("Φωτογραφία: κατεβαίνουν μόνο βίντεο.", !parser::has_image_extension(url));
     }
     if parser::is_document_link(url) {
         return skip("Έγγραφο, όχι σελίδα με βίντεο.", false);

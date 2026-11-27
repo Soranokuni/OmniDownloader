@@ -1,0 +1,31 @@
+{
+  "ignored_urls": [
+    "https://images.openai.com/static-rsc-4/Qx7_aBcDeFgHiJkLmN0pQrStUvWxYz?purpose=fullsize",
+    "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTxYz012345abcdef&s=10"
+  ],
+  "journalist": {
+    "how": "sender",
+    "surname": "PAPADAKI"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 0.95,
+          "index_str": "1",
+          "keyword": "PLIMMYRESLIMANI",
+          "marker": false,
+          "status": "PENDING",
+          "tier": "tier1",
+          "url": "https://www.youtube.com/watch?v=Ab3dEf6hIjK"
+        }
+      ],
+      "keyword": "PLIMMYRESLIMANI",
+      "title": "Πλημμύρες στο λιμάνι"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

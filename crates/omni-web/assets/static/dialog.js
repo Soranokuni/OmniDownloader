@@ -24,7 +24,7 @@
  */
 
 import { el } from '/static/app.js?v=6';
-import { t } from '/static/text.js?v=9';
+import { t } from '/static/text.js?v=10';
 
 let openNow = false;
 let seq = 0;

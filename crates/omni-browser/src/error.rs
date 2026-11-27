@@ -17,6 +17,10 @@ pub enum BrowserError {
     #[error("No video stream found for URL: {0}")]
     NoStreamFound(String),
 
+    /// Nothing found, and the page itself answered as an image (P15.5).
+    #[error("The link is a photo, not a video: {0}")]
+    IsPhoto(String),
+
     #[error("Browser timeout: {0}")]
     Timeout(String),
 }
