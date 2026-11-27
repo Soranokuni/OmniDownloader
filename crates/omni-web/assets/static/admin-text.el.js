@@ -799,10 +799,11 @@ export default {
   'wizard.people.title': 'Δημοσιογράφοι',
   'wizard.people.intro': 'Ποιοι στέλνουν συνδέσμους, ώστε κάθε βίντεο να παίρνει το σωστό όνομα στο Dalet. Επικολλήστε τη λίστα από το Excel, διαλέξτε αρχείο CSV ή αφήστε τη λίστα να συμπληρώνεται καθώς έρχονται mail.',
   'wizard.people.paste': 'Επικόλληση από Excel (επώνυμο, ονοματεπώνυμο, email)',
-  'wizard.people.paste_help': 'Ένα άτομο ανά γραμμή. Περισσότερες διευθύνσεις μπαίνουν σε επόμενες στήλες ή σε ένα κελί χωρισμένες με «;». Τα ελληνικά επώνυμα γράφονται με λατινικά κεφαλαία, όπως στα ονόματα των αρχείων. Μια πρώτη γραμμή με τα ονόματα των στηλών παραλείπεται.',
+  'wizard.people.paste_help': 'Ένα άτομο ανά γραμμή. Περισσότερες διευθύνσεις μπαίνουν σε επόμενες στήλες ή σε ένα κελί χωρισμένες με «;». Τα ελληνικά επώνυμα γράφονται με λατινικά κεφαλαία, όπως στα ονόματα των αρχείων. Μια πρώτη γραμμή με τα ονόματα των στηλών παραλείπεται. Μπορείτε επίσης να επικολλήσετε λίστα JSON όπως το αρχείο journalists.seed.json: [{"surname": "PAPADAKI", "full_name": "Anna Papadaki", "emails": ["anna@newsroom.example"], "aliases": ["ANNA", "PAPADAKI"]}]. Τα ψευδώνυμα (aliases) είναι τα ονόματα που διαβάζει ο parser στα mail· γράφονται ως λίστα ή σε ένα κείμενο χωρισμένα με «;» ή «,», έως 30 των 40 χαρακτήρων το καθένα.',
+  'wizard.people.aliases': 'ψευδώνυμα: {names}',
   'wizard.people.placeholder': 'Επώνυμο\tΟνοματεπώνυμο\tEmail\nPAPADAKI\tΆννα Παπαδάκη\tanna@newsroom.example',
   'wizard.people.file': 'Ή διαλέξτε αρχείο CSV',
-  'wizard.people.file_help': 'Αποθηκευμένο από το Excel ως «CSV UTF-8» ή απλό «CSV»· με κόμμα ή ερωτηματικό.',
+  'wizard.people.file_help': 'Αποθηκευμένο από το Excel ως «CSV UTF-8» ή απλό «CSV»· με κόμμα ή ερωτηματικό. Ή αρχείο JSON με τη μορφή του journalists.seed.json.',
   'wizard.people.preview': 'Προεπισκόπηση',
   'wizard.people.import': 'Εισαγωγή',
   'wizard.people.learn': 'Εκμάθηση καθώς έρχονται mail',
@@ -813,6 +814,7 @@ export default {
   'wizard.people.to_add': 'Προς προσθήκη ({n})',
   'wizard.people.existing': 'Ήδη στη λίστα, μένουν όπως είναι: {names}.',
   'wizard.people.line': 'Γραμμή {line}: {message}',
+  'wizard.people.person': 'Άτομο {line}: {message}',
   'wizard.people.nobody': 'Κανένας νέος για προσθήκη.',
 
   // ---- Οδηγός: εργαλεία ----

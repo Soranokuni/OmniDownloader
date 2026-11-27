@@ -1,0 +1,32 @@
+{
+  "ignored_urls": [
+    "https://www.transfernow.net/en",
+    "https://www.transfernow.net/en/support",
+    "https://www.transfernow.net/api/mailer/subscriptions/recipient.html?email=master%40example.gr&token=f4k3t0k3n48"
+  ],
+  "journalist": {
+    "how": "locker_sender",
+    "surname": "PAPADAKIS"
+  },
+  "outcome": "JOBS",
+  "sections": [
+    {
+      "index_str": "1",
+      "jobs": [
+        {
+          "confidence": 1.0,
+          "index_str": "1",
+          "keyword": "SYNENTEUXILIMANI",
+          "marker": false,
+          "status": "MANUAL_DOWNLOAD",
+          "tier": "locker",
+          "url": "https://www.transfernow.net/dl/20261125GhIjKl48/AbC48key"
+        }
+      ],
+      "keyword": "SYNENTEUXILIMANI",
+      "title": "synenteuxi_limani.mp4 (2.1 GB)"
+    }
+  ],
+  "urgent": false,
+  "warnings": []
+}

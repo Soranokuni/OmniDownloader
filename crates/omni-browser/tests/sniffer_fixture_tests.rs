@@ -357,6 +357,46 @@ async fn a_sidebar_named_layout_wrapper_above_the_article_does_not_count() {
     within_budget(took);
 }
 
+/// P15.13 round 3: a sidebar-named layout wrapper that holds the story's body
+/// (`.entry-content`) is a layout, not a widget: the header video stays in and
+/// leads.
+#[tokio::test]
+async fn a_sidebar_named_layout_wrapper_holding_the_body_does_not_count() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_in_sidebar_layout_with_body.html")).await;
+    assert_eq!(media.meta[&yt("lAyOuTbOdY1")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.primary_stream, yt("lAyOuTbOdY1"), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// P15.13 round 3: the same wrapper with a lone promo `<article>` inside the
+/// story and no body container. The wrapper is named only for a sidebar and
+/// holds one top-level article (the story; the promo is nested in it), so it
+/// is a layout, not a widget: the story counts, is in no list, and its video
+/// stays in.
+#[tokio::test]
+async fn a_sidebar_named_layout_wrapper_with_a_promo_inside_the_story_does_not_count() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_in_sidebar_layout_with_promo.html")).await;
+    assert_eq!(media.meta[&yt("lAyOuTpRoM1")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.primary_stream, yt("lAyOuTpRoM1"), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// P15.13 round 4: a promo `<article>` with its own video in the site header,
+/// and the story under a sidebar-named wrapper with a body the selectors do
+/// not know (`.article__body`): the story's video is in and leads; the
+/// promo's is not the primary.
+#[tokio::test]
+async fn a_site_promo_does_not_take_the_story_from_a_sidebar_named_layout() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_in_sidebar_layout_with_site_promo.html")).await;
+    assert_eq!(media.meta[&yt("sItEsToRy01")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.primary_stream, yt("sItEsToRy01"), "all: {:?}", media.all_streams);
+    assert_ne!(media.meta.get(&yt("sItEpRoMo01")).and_then(|m| m.in_article), Some(true), "meta: {:?}", media.meta);
+    within_budget(took);
+}
+
 /// The same video in a sidebar strip (earlier in the page) and in the article
 /// body is the article's.
 #[tokio::test]
@@ -393,6 +433,124 @@ async fn a_card_article_inside_an_aside_is_outside_a_real_article_under_a_layout
     assert_eq!(media.meta[&yt("cArDvId0001")].in_article, Some(false), "meta: {:?}", media.meta);
     assert_eq!(media.meta[&yt("rEaLaRt0001")].in_article, Some(true), "meta: {:?}", media.meta);
     assert_eq!(media.primary_stream, yt("rEaLaRt0001"), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// P15.13 (a): a "related" rail of bare `<article>` cards after the story,
+/// in a plain `<div>`: the story's two videos are in the article, the cards'
+/// three are not, although the cards hold more text than the story.
+#[tokio::test]
+async fn cards_of_a_related_rail_after_the_story_are_not_the_article() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_then_related_cards.html")).await;
+    for id in ["mAiNvId0001", "mAiNvId0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(true), "{id}: {:?}", media.meta);
+    }
+    for id in ["cArDrEl0001", "cArDrEl0002", "cArDrEl0003"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(false), "{id}: {:?}", media.meta);
+    }
+    within_budget(took);
+}
+
+/// P15.13 (b): one `<article>` on the page: its videos are in it, as before.
+#[tokio::test]
+async fn a_single_article_keeps_its_videos() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/single_article_two_videos.html")).await;
+    for id in ["sOlOvId0001", "sOlOvId0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(true), "{id}: {:?}", media.meta);
+    }
+    within_budget(took);
+}
+
+/// P15.13 (c): the story in `itemprop=articleBody`, then a grid of wrapped
+/// `<article>` cards: the body's videos are in the article, the cards' not.
+#[tokio::test]
+async fn an_article_body_beside_a_wrapped_card_grid_keeps_only_its_own_videos() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_body_and_card_grid.html")).await;
+    for id in ["bOdYvId0001", "bOdYvId0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(true), "{id}: {:?}", media.meta);
+    }
+    for id in ["gRiDvId0001", "gRiDvId0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(false), "{id}: {:?}", media.meta);
+    }
+    within_budget(took);
+}
+
+/// P15.13 (d): a grid of cards and no story: the page does not say (`None`),
+/// so none of them earns the in-article cap.
+#[tokio::test]
+async fn a_card_grid_without_a_story_says_nothing() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/card_grid_only.html")).await;
+    for id in ["oNlYcRd0001", "oNlYcRd0002", "oNlYcRd0003"] {
+        assert_eq!(media.meta[&yt(id)].in_article, None, "{id}: {:?}", media.meta);
+    }
+    within_budget(took);
+}
+
+/// P15.13 round 2: a card in an `<aside>` with a long title and an inline
+/// script is not counted against the story: the story stays in, the card out.
+#[tokio::test]
+async fn a_wordy_card_in_an_aside_does_not_outweigh_the_story() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_card_in_aside_with_text.html")).await;
+    assert_eq!(media.meta[&yt("sToRyTx0001")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.meta[&yt("aSiDeTx0001")].in_article, Some(false), "meta: {:?}", media.meta);
+    assert_eq!(media.primary_stream, yt("sToRyTx0001"), "all: {:?}", media.all_streams);
+    within_budget(took);
+}
+
+/// P15.13 round 2: one long reader comment (an `<article>` under the
+/// comments) is not the story: the post's video stays in, the comment's out.
+#[tokio::test]
+async fn a_long_comment_is_not_the_story() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/article_with_one_long_comment.html")).await;
+    assert_eq!(media.meta[&yt("pOsTvId0001")].in_article, Some(true), "meta: {:?}", media.meta);
+    assert_eq!(media.meta[&yt("cOmMeNtL001")].in_article, Some(false), "meta: {:?}", media.meta);
+    within_budget(took);
+}
+
+/// P15.13 round 2: a live blog's updates are `<article>`s inside the story:
+/// all in; a "related" list inside the story stays out.
+#[tokio::test]
+async fn a_live_blogs_nested_updates_are_the_story() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/live_blog_nested_updates.html")).await;
+    for id in ["lIvEuPd0001", "lIvEuPd0002", "lIvEuPd0003"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(true), "{id}: {:?}", media.meta);
+    }
+    for id in ["rElInSd0001", "rElInSd0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(false), "{id}: {:?}", media.meta);
+    }
+    within_budget(took);
+}
+
+/// P15.13 round 2: the story is one of a feed of articles and counts only by
+/// the body container it holds; its video, in the header, is in.
+#[tokio::test]
+async fn a_story_in_a_feed_counts_by_its_body_container() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/story_in_feed_by_entry_content.html")).await;
+    assert_eq!(media.meta[&yt("hEaDsTr0001")].in_article, Some(true), "meta: {:?}", media.meta);
+    for id in ["fEeDcRd0001", "fEeDcRd0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(false), "{id}: {:?}", media.meta);
+    }
+    within_budget(took);
+}
+
+/// P15.13 round 2: the story is one of a feed of articles and counts only by
+/// having over twice the text of any card.
+#[tokio::test]
+async fn a_story_in_a_feed_counts_by_its_length() {
+    need_browser!();
+    let (_, media, took) = sniff(include_str!("fixtures/story_in_feed_by_length.html")).await;
+    assert_eq!(media.meta[&yt("lOnGsTr0001")].in_article, Some(true), "meta: {:?}", media.meta);
+    for id in ["sHoRtCd0001", "sHoRtCd0002"] {
+        assert_eq!(media.meta[&yt(id)].in_article, Some(false), "{id}: {:?}", media.meta);
+    }
     within_budget(took);
 }
 

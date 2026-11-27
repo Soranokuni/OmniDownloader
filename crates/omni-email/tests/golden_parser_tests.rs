@@ -38,6 +38,8 @@ fn roster() -> Vec<Journalist> {
         j("NIKOLAOU", "Giorgos Nikolaou", &["g.nikolaou@example.gr"], &["ΝΙΚΟΛΑΟΥ", "ΓΙΩΡΓΟΣ"]),
         j("GEORGIOU", "Eleni Georgiou", &["e.georgiou@example.gr"], &["ΓΕΩΡΓΙΟΥ", "ΕΛΕΝΗ"]),
         j("DIMITRIOU", "Kostas Dimitriou", &["k.dimitriou@example.gr"], &["ΔΗΜΗΤΡΙΟΥ", "ΚΩΣΤΑ"]),
+        // Sends files from a private address through a transfer service (fixture 48).
+        j("PAPADAKIS", "Nikos Papadakis", &["n.papadakis@example.gr"], &["ΠΑΠΑΔΑΚΗΣ"]),
     ]
 }
 

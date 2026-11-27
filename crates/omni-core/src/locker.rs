@@ -107,8 +107,15 @@ const MANUAL: &[(&str, &str)] = &[
     ("transfernow.net", "TransferNow"),
     ("swisstransfer.com", "SwissTransfer"),
     ("filemail.com", "Filemail"),
+    ("fex.net", "FEX"),
     ("mega.nz", "MEGA"),
     ("mega.io", "MEGA"),
+];
+
+/// Infomaniak's own pages in SwissTransfer mail (the apex, and these
+/// subdomains): never jobs. Its other hosts (the video players) stay links.
+const INFOMANIAK_SERVICE_HOSTS: &[&str] = &[
+    "infomaniak.com", "www", "news", "manager", "login", "shop", "support", "faq", "welcome", "kdrive", "swisstransfer",
 ];
 
 /// [`Locker`] of `url`, from its parsed host and path.
@@ -137,6 +144,10 @@ pub fn classify(url: &str) -> Locker {
             }
         }
         "sharepoint.com" => sharepoint(&parsed, &segs),
+        // Infomaniak (P15.11) runs SwissTransfer; of its sites only a kDrive
+        // share holds files.
+        "infomaniak.com" if host == "kdrive.infomaniak.com" => Locker::Manual { vendor: "kDrive" },
+        "infomaniak.com" => Locker::No,
         _ => match MANUAL.iter().find(|(d, _)| *d == site) {
             Some((_, vendor)) => Locker::Manual { vendor },
             None => Locker::No,
@@ -157,7 +168,11 @@ pub fn is_transfer_service(url: &str) -> bool {
     let Some((_, host)) = web(url) else { return false };
     match crate::psl::registrable(&host).as_str() {
         "wetransfer.com" | "wetransfer.net" | "we.tl" | "transfernow.net" | "swisstransfer.com" | "myairbridge.com" | "mab.to"
-        | "filemail.com" | "dropbox.com" | "sharepoint.com" | "1drv.ms" => true,
+        | "filemail.com" | "dropbox.com" | "sharepoint.com" | "1drv.ms" | "fex.net" => true,
+        // SwissTransfer's operator: its ads, footer and account pages ride
+        // along in a forwarded SwissTransfer mail (P15.11). Only those hosts:
+        // its video players (`player.vod2…`, `vod…`, `player…`) are media.
+        "infomaniak.com" => INFOMANIAK_SERVICE_HOSTS.iter().any(|h| host == *h || host.strip_suffix(".infomaniak.com") == Some(*h)),
         "google.com" => host == "drive.google.com",
         "live.com" => host == "onedrive.live.com",
         _ => false,
@@ -174,6 +189,8 @@ pub fn is_transfer_service(url: &str) -> bool {
 /// * MyAirBridge `mab.to/t/{id}…`, `myairbridge.com/transfer/{id}/…` and the
 ///   older `#!/folder/…` / `#!/link/…` pages;
 /// * Filemail `/d/{id}`;
+/// * FEX `fex.net/s/{id}`, also after a language segment (`/uk/s/{id}`);
+/// * Infomaniak's kDrive `kdrive.infomaniak.com/app/share/…`;
 /// * Dropbox (any subdomain, `dl.dropbox.com` too): a shared file or folder
 ///   as [`classify`] reads it, or a Dropbox Transfer `/t/{id}`;
 /// * Google Drive: a shared file or folder (`/file/d/{id}`, `open?id=`,
@@ -208,6 +225,8 @@ pub fn is_share_link(url: &str) -> bool {
             kind_then_id(&["transfer"]) || fragment.contains("/folder/") || fragment.contains("/link/")
         }
         "filemail.com" => seg(0) == Some("d") && seg(1).is_some(),
+        "fex.net" => kind_then_id(&["s"]),
+        "infomaniak.com" => host == "kdrive.infomaniak.com" && seg(0) == Some("app") && seg(1) == Some("share") && seg(2).is_some(),
         // Any subdomain (`dl.dropbox.com/s/…`): the path's shape decides.
         "dropbox.com" => shared() || (seg(0) == Some("t") && seg(1).is_some()),
         "google.com" if host == "drive.google.com" => {
@@ -638,6 +657,48 @@ mod tests {
         }
         assert!(is_locker("https://we.tl/t-abc") && !is_locker("https://news.example/story"));
         assert_eq!(direct_download("https://we.tl/t-abc"), None);
+    }
+
+    /// P15.11: FEX is a locker a person fetches; its share is `/s/{id}`
+    /// (after a language segment too), its other pages are its own.
+    #[test]
+    fn fex_is_a_manual_locker() {
+        for url in ["https://fex.net/s/abc1d2e", "https://fex.net/uk/s/abc1d2e", "https://fex.net/ru/s/abc1d2e?x=1"] {
+            assert_eq!(classify(url), Locker::Manual { vendor: "FEX" }, "{url}");
+            assert!(is_share_link(url) && is_transfer_service(url), "{url}");
+        }
+        for url in ["https://fex.net/", "https://fex.net/uk/", "https://fex.net/pricing", "https://fex.net/s"] {
+            assert!(!is_share_link(url) && is_transfer_service(url), "{url}");
+        }
+    }
+
+    /// P15.11: Infomaniak (SwissTransfer's operator) is a transfer service:
+    /// its pages are never jobs; only a kDrive share holds files.
+    #[test]
+    fn infomaniak_pages_are_the_services_and_a_kdrive_share_is_a_locker() {
+        let share = "https://kdrive.infomaniak.com/app/share/123456/ab12cd34-ef56";
+        assert_eq!(classify(share), Locker::Manual { vendor: "kDrive" });
+        assert!(is_share_link(share) && is_transfer_service(share));
+        for url in [
+            "https://www.infomaniak.com/en/hosting",
+            "https://manager.infomaniak.com/v3/account",
+            "https://news.infomaniak.com/promo?utm_source=swisstransfer",
+            "https://kdrive.infomaniak.com/app/drive/123",
+        ] {
+            assert!(is_transfer_service(url) && !is_share_link(url), "{url}");
+        }
+        assert!(is_transfer_service("https://infomaniak.com/en"));
+        // Its video players are media, not the service's pages (round 2).
+        for url in [
+            "https://player.vod2.infomaniak.com/embed/1abcd2efgh",
+            "https://vod.infomaniak.com/redirect/station_vod/clip-2026.mp4",
+            "https://player.infomaniak.com/?channel=12345",
+        ] {
+            assert!(!is_transfer_service(url), "{url}");
+            assert_eq!(classify(url), Locker::No, "{url}");
+        }
+        assert_eq!(classify("https://www.infomaniak.com/en/hosting"), Locker::No);
+        assert!(!is_transfer_service("https://infomaniak.com.evil.example/app/share/1/x"));
     }
 
     /// P15.1: SwissTransfer and MyAirBridge's short host are lockers a person fetches.

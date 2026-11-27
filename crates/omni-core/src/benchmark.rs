@@ -303,6 +303,13 @@ pub fn mean_extract_passes(ms: f64) -> bool {
     ms <= MEAN_EXTRACT_MAX_MS
 }
 
+// The limit is 0 today, which clippy sees as `fails == 0` spelt oddly; the
+// comparison stays so that the limit can be raised.
+#[allow(clippy::absurd_extreme_comparisons)]
+pub fn compliance_passes(fails: usize) -> bool {
+    fails <= MAX_COMPLIANCE_FAILS
+}
+
 /// One threshold and how the run stands against it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Check {
@@ -421,7 +428,7 @@ pub fn summarize(mode: Mode, rows: &[(TargetRow, ResultRow)]) -> Summary {
             op: "<=".into(),
             limit: MAX_COMPLIANCE_FAILS as f64,
             unit: "".into(),
-            pass: full.then_some(compliance_fails <= MAX_COMPLIANCE_FAILS),
+            pass: full.then_some(compliance_passes(compliance_fails)),
             note: None,
         },
         Check {

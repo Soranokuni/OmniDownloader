@@ -906,6 +906,65 @@ async fn pasted_journalists_are_previewed_then_added_and_people_on_the_list_are_
     Ok(())
 }
 
+/// P15.17: a JSON list in the seed file's shape imports with its aliases, as
+/// an array or as one string; a row with a bad alias is refused whole and
+/// named; someone already listed keeps the aliases they had.
+#[tokio::test]
+async fn a_seed_shaped_json_list_imports_its_aliases() -> Result<()> {
+    let app = app(false)?;
+    let tok = session_for(&app, "it@newsroom.local");
+    app.repo.save_journalist("PALIOU", "Petros Paliou", &["p.paliou@news.example".to_string()], 0)?;
+    app.repo.set_journalist_aliases("PALIOU", &["ΠΑΛΙΟΥ".to_string()])?;
+    let list = json!([
+        { "surname": "NEOTAKI", "full_name": "Nefeli Neotaki", "emails": ["n.neotaki@news.example"], "default_priority": 0, "aliases": ["ΝΕΦΕΛΗ", " ΝΕΟΤΑΚΗ "] },
+        { "surname": "DEFTERAKIS", "full_name": "Dimos Defterakis", "emails": "d.defterakis@news.example; dd@news.example", "aliases": "ΔΗΜΟΣ; ΔΕΥΤΕΡΑΚΗΣ," },
+        { "surname": " ", "full_name": "Anonymos", "emails": [] },
+        { "surname": "KAKOS", "full_name": "Kakos Kakidis", "emails": ["kakos@news.example"], "aliases": ["MCR"] },
+        { "surname": "MAKRYS", "full_name": "Makrys Makridis", "emails": ["makrys@news.example"], "aliases": ["Α".repeat(41)] },
+        { "surname": "KENOS", "full_name": "Kenos Kenidis", "emails": ["kenos@news.example"], "aliases": ["ΚΕΝΟΣ", "  "] },
+        { "surname": "PALIOU", "full_name": "Other", "emails": ["other@news.example"], "default_priority": 3, "aliases": ["ΑΛΛΟ"] }
+    ]);
+    let text = serde_json::to_string_pretty(&list)?;
+
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": text, "dry_run": true}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let v = r.json();
+    assert_eq!(v["add"].as_array().map(|a| a.len()), Some(2), "{v}");
+    assert_eq!(v["add"][0]["aliases"], json!(["ΝΕΦΕΛΗ", "ΝΕΟΤΑΚΗ"]), "{v}");
+    assert_eq!(v["existing"][0]["surname"], "PALIOU");
+    let lines: Vec<u64> = v["problems"].as_array().unwrap().iter().map(|p| p["line"].as_u64().unwrap()).collect();
+    assert_eq!(lines, [3, 4, 5, 6], "{v}");
+    let messages: Vec<&str> = v["problems"].as_array().unwrap().iter().map(|p| p["message"].as_str().unwrap()).collect();
+    // People of a JSON list are numbered as people, and fields are named, not columns.
+    assert_eq!(messages[0], "No surname (field \"surname\").", "{v}");
+    assert!(v["problems"].as_array().unwrap().iter().all(|p| p["person"] == true), "{v}");
+    assert!(messages[1].contains("MCR") && messages[2].contains("40 χαρακτήρες") && messages[3].contains("κενό ψευδώνυμο"), "{messages:?}");
+    // A JSON syntax error is a real line of the text.
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": "[\n{\"surname\": \"X\",,}\n]", "dry_run": true}))).await;
+    let v = r.json();
+    assert_eq!((v["problems"][0]["line"].as_u64(), v["problems"][0].get("person")), (Some(2), None), "{v}");
+    // A CSV keeps its lines and its column wording.
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": "A-ONE,One,one@news.example\n,Nobody,x@news.example\nB-TWO,Two\n", "dry_run": true}))).await;
+    let v = r.json();
+    assert_eq!(v["problems"][0], json!({"line": 2, "message": "No surname in the first column."}), "{v}");
+    assert_eq!(v["problems"][1], json!({"line": 3, "message": "B-TWO: no email address (third column)."}), "{v}");
+
+    let r = send(&app, "POST", "/api/admin/journalists/import", Some(&tok), Some(json!({"text": text}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let people = app.repo.list_journalists()?;
+    let find = |s: &str| people.iter().find(|j| j.surname == s);
+    assert_eq!(find("NEOTAKI").expect("added").aliases, ["ΝΕΦΕΛΗ", "ΝΕΟΤΑΚΗ"]);
+    let d = find("DEFTERAKIS").expect("added");
+    assert_eq!(d.aliases, ["ΔΗΜΟΣ", "ΔΕΥΤΕΡΑΚΗΣ"]);
+    assert_eq!(d.emails, ["d.defterakis@news.example", "dd@news.example"]);
+    for s in ["KAKOS", "MAKRYS", "KENOS"] {
+        assert!(find(s).is_none(), "{s}: a row with a bad alias is refused");
+    }
+    let paliou = find("PALIOU").unwrap();
+    assert_eq!((paliou.full_name.as_str(), paliou.aliases.clone()), ("Petros Paliou", vec!["ΠΑΛΙΟΥ".to_string()]), "left as it was");
+    Ok(())
+}
+
 #[tokio::test]
 async fn completing_setup_records_the_mode_and_the_answer_file_has_no_secret() -> Result<()> {
     let app = app(false)?;

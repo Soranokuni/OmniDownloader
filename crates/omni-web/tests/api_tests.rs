@@ -163,6 +163,28 @@ async fn health_is_public_and_says_nothing_about_the_station() -> Result<()> {
     Ok(())
 }
 
+/// P15.12a: a photo link the worker closed (CANCELLED + IS_PHOTO) takes
+/// «Άλλος σύνδεσμος»: the override requeues it with the new link.
+#[tokio::test]
+async fn a_photo_job_takes_another_link() -> Result<()> {
+    let app = App::new()?;
+    let (status, json) = app
+        .send("POST", "/api/jobs", &app.mcr_token, Some(json!({"url": "https://news.example/gallery/abc"})))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let id = json["job_id"].as_i64().unwrap();
+    assert_eq!(app.repo.lease_job("w1", 120)?.map(|j| j.id), Some(id));
+    assert!(app.repo.finish(id, "w1", JobStatus::Cancelled, Some("IS_PHOTO"), Some("a photo"), None)?);
+
+    let (status, _) = app
+        .send("POST", &format!("/api/jobs/{id}/override"), &app.mcr_token, Some(json!({"url": "https://www.youtube.com/watch?v=pHoToNeXt01"})))
+        .await?;
+    assert_eq!(status, StatusCode::OK);
+    let job = app.repo.get_job(id)?.unwrap();
+    assert_eq!((job.url.as_str(), job.status), ("https://www.youtube.com/watch?v=pHoToNeXt01", JobStatus::Pending));
+    Ok(())
+}
+
 #[tokio::test]
 async fn jobs_api_full_lifecycle() -> Result<()> {
     let app = App::new()?;

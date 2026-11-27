@@ -9,7 +9,7 @@
  */
 
 import { api, el, render, toast } from '/static/app.js?v=6';
-import { t, onLanguageChange } from '/static/admin-text.js?v=5';
+import { t, onLanguageChange } from '/static/admin-text.js?v=6';
 
 // Each mode's name and summary are `wizard.mode.<id>` and `wizard.mode.<id>.about`.
 const MODES = ['beginner', 'intermediate', 'it'];
@@ -329,19 +329,20 @@ export async function runWizard({ defaultAdmin = false, showPasswordCard = null 
       const text = el('textarea', { id: 'wz-people', rows: 7, class: 'mono',
         placeholder: t('wizard.people.placeholder') });
       if (P.previewText !== null) text.value = P.previewText;
-      const file = el('input', { type: 'file', id: 'wz-people-file', accept: '.csv,.txt,text/csv,text/plain' });
+      const file = el('input', { type: 'file', id: 'wz-people-file', accept: '.csv,.txt,.json,text/csv,text/plain,application/json' });
       const out = el('div', { class: 'stack' });
       const paint = () => {
         const p = P.preview;
         if (!p) { render(out); return; }
         const row = (r) => el('div', { class: 'spec-row' }, el('span', {}, r.surname), el('span', {}, r.full_name),
-          el('span', { class: 'note' }, r.emails.join(', ')));
+          el('span', { class: 'note' }, r.emails.join(', ')),
+          (r.aliases || []).length ? el('span', { class: 'note' }, t('wizard.people.aliases', { names: r.aliases.join(', ') })) : null);
         render(out,
           P.imported ? el('p', { class: 'note ok' }, `✓ ${t('wizard.people.added_n', { n: p.add.length })}`) : null,
           p.add.length ? el('strong', {}, P.imported ? t('wizard.people.added') : t('wizard.people.to_add', { n: p.add.length })) : null,
           ...p.add.map(row),
           p.existing.length ? el('p', { class: 'note' }, t('wizard.people.existing', { names: p.existing.map((r) => r.surname).join(', ') })) : null,
-          ...p.problems.map((q) => el('p', { class: 'note bad' }, t('wizard.people.line', { line: q.line, message: q.message }))),
+          ...p.problems.map((q) => el('p', { class: 'note bad' }, t(q.person ? 'wizard.people.person' : 'wizard.people.line', { line: q.line, message: q.message }))),
           !P.imported && p.add.length === 0 ? el('p', { class: 'note' }, t('wizard.people.nobody')) : null);
       };
       const send = async (dryRun) => {

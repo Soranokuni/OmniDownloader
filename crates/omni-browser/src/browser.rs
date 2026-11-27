@@ -64,6 +64,21 @@ impl Drop for BrowserSession {
     }
 }
 
+/// How long starting the browser may take, up to a connected DevTools
+/// socket (P15.14). A cold Edge start on a slow PC takes ~10 s. chromiumoxide
+/// bounds only reading the DevTools address (20 s), not the connect after it.
+pub const LAUNCH: Duration = Duration::from_secs(30);
+
+/// Await `launch` for at most `limit`. Past it the launch is dropped, and
+/// with it the browser it started: chromiumoxide spawns Chrome with
+/// `kill_on_drop`, so dropping its launch future kills the process.
+async fn within_launch<T>(limit: Duration, launch: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(limit, launch).await {
+        Ok(launched) => launched,
+        Err(_) => Err(anyhow::anyhow!("the browser did not start within {} s", limit.as_secs())),
+    }
+}
+
 /// Where this process's browser profiles live.
 fn profiles_root() -> PathBuf {
     std::env::temp_dir().join("omni-sniffer")
@@ -218,7 +233,8 @@ impl HeadlessBrowserManager {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building BrowserConfig: {}", e))?;
 
-        let (browser, mut handler) = match Browser::launch(config).await {
+        let launched = within_launch(LAUNCH, async { Browser::launch(config).await.map_err(anyhow::Error::from) }).await;
+        let (browser, mut handler) = match launched {
             Ok(launched) => launched,
             Err(e) => {
                 if !keep_profile {
@@ -281,6 +297,30 @@ mod tests {
                 "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0",
             ]
         );
+    }
+
+    /// P15.14: a browser that never finishes starting ends the launch at
+    /// [`LAUNCH`], not earlier and not never.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_that_never_finishes_ends_at_the_launch_bound() {
+        let start = tokio::time::Instant::now();
+        let hung = within_launch(LAUNCH, std::future::pending::<Result<()>>());
+        let got = tokio::time::timeout(Duration::from_secs(120), hung).await.expect("the launch must be bounded");
+        let err = got.expect_err("a hung launch is an error");
+        assert_eq!(err.to_string(), "the browser did not start within 30 s");
+        let took = start.elapsed();
+        assert!(took >= LAUNCH && took < LAUNCH + Duration::from_secs(1), "{took:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_within_the_bound_passes_its_result_through() {
+        let slow = async {
+            tokio::time::sleep(LAUNCH - Duration::from_millis(100)).await;
+            Ok(7)
+        };
+        assert_eq!(within_launch(LAUNCH, slow).await.unwrap(), 7);
+        let failed = within_launch(LAUNCH, async { Err::<(), _>(anyhow::anyhow!("no sandbox")) }).await;
+        assert_eq!(failed.unwrap_err().to_string(), "no sandbox");
     }
 
     #[test]

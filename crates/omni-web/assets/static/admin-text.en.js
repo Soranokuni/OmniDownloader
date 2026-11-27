@@ -802,10 +802,11 @@ export default {
   'wizard.people.title': 'Journalists',
   'wizard.people.intro': 'Who sends links, so each video gets the right name in Dalet. Paste the list from Excel, choose a CSV file, or let the list grow as mail arrives.',
   'wizard.people.paste': 'Paste from Excel (surname, full name, email)',
-  'wizard.people.paste_help': 'One person per line. Several addresses go in further columns or in one cell separated by “;”. Greek surnames are written in Latin capitals, as in the file names. A first line naming the columns is skipped.',
+  'wizard.people.paste_help': 'One person per line. Several addresses go in further columns or in one cell separated by “;”. Greek surnames are written in Latin capitals, as in the file names. A first line naming the columns is skipped. You can also paste a JSON list like the journalists.seed.json file: [{"surname": "PAPADAKI", "full_name": "Anna Papadaki", "emails": ["anna@newsroom.example"], "aliases": ["ANNA", "PAPADAKI"]}]. Aliases are the names the parser reads in mail; give them as a list or in one text separated by “;” or “,”, at most 30 of 40 characters each.',
+  'wizard.people.aliases': 'aliases: {names}',
   'wizard.people.placeholder': 'Surname\tFull name\tEmail\nPapadaki\tAnna Papadaki\tanna@newsroom.example',
   'wizard.people.file': 'Or choose a CSV file',
-  'wizard.people.file_help': 'Saved from Excel as “CSV UTF-8” or plain “CSV”; comma or semicolon.',
+  'wizard.people.file_help': 'Saved from Excel as “CSV UTF-8” or plain “CSV”; comma or semicolon. Or a JSON file shaped like journalists.seed.json.',
   'wizard.people.preview': 'Preview',
   'wizard.people.import': 'Import',
   'wizard.people.learn': 'Learn them as mail arrives',
@@ -816,6 +817,7 @@ export default {
   'wizard.people.to_add': 'To add ({n})',
   'wizard.people.existing': 'Already on the list, left as they are: {names}.',
   'wizard.people.line': 'Line {line}: {message}',
+  'wizard.people.person': 'Person {line}: {message}',
   'wizard.people.nobody': 'Nobody new to add.',
 
   // ---- Wizard: tools ----
