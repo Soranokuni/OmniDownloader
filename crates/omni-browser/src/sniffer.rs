@@ -835,6 +835,111 @@ impl StreamSniffer {
                     tokens.push(a.getAttribute('id') || '');
                     return tokens.some((t) => { t = t.toLowerCase(); return t && !NOT_A_MARKER.test(t) && MARKER_WORD.test(t); });
                 };
+                // A bare <article> is the page's story, not a card of a
+                // "related" rail or grid (P15.13), when it is not one of a
+                // list of sibling articles, or when it is the clearly
+                // largest article on the page (twice the text of the next),
+                // or when it holds the strong container. Cards may be
+                // wrapped: up to three levels up, a parent with two or more
+                // children that each hold exactly one article is a list.
+                // Only articles the walk would not already call outside are
+                // counted: not a comment, not under an aside, nav, footer,
+                // navigation/complementary role or a named widget.
+                const outsideRole = (b) => {
+                    const r = (b.getAttribute('role') || '').toLowerCase();
+                    return OUTSIDE_TAGS.has(b.tagName) || r === 'navigation' || r === 'complementary';
+                };
+                const above = (a, test) => {
+                    for (let b = a.parentElement; b && b !== document.body && b !== document.documentElement; b = b.parentElement) {
+                        if (test(b)) return true;
+                    }
+                    return false;
+                };
+                const inComment = (a) => a.matches(COMMENT_SEL) || above(a, (b) => b.matches(COMMENT_SEL));
+                // A named widget above the article ("related", "sidebar"), unless it
+                // is a layout wrapper holding the story's body or main part, or the
+                // article holds the body itself: markers above the container do
+                // not count then (P3.14). A wrapper named only for a sidebar
+                // (`content-with-sidebar`) is a layout around one story; it is a
+                // widget only when it holds two or more articles of its own.
+                const STORY_PART = STRONG_SEL + ', main, [role="main"]';
+                const markerWords = (b) => {
+                    const tokens = String(b.getAttribute('class') || '').split(/\s+/);
+                    tokens.push(b.getAttribute('id') || '');
+                    return tokens.map((t) => t.toLowerCase()).filter((t) => t && !NOT_A_MARKER.test(t)).map((t) => (t.match(MARKER_WORD) || [])[2]).filter(Boolean);
+                };
+                const topArticles = (b) => Array.from(b.querySelectorAll('article')).filter((x) => {
+                    const outer = x.parentElement && x.parentElement.closest('article');
+                    return !outer || !b.contains(outer);
+                }).length;
+                const widget = (b) => {
+                    if (!namedOutside(b) || b.querySelector(STORY_PART)) return false;
+                    return markerWords(b).some((w) => w !== 'sidebar') || topArticles(b) >= 2;
+                };
+                const namedAbove = (a) => !a.querySelector(STRONG_SEL) && above(a, widget);
+                const eligibility = new Map();
+                const eligible = (a) => {
+                    if (!eligibility.has(a)) eligibility.set(a, !inComment(a) && !above(a, outsideRole) && !namedAbove(a));
+                    return eligibility.get(a);
+                };
+                const counted = () => Array.from(document.querySelectorAll('article')).filter(eligible);
+                const countedIn = (c) => Array.from(c.querySelectorAll('article')).filter(eligible).length;
+                const holdsOne = (c) => c.tagName === 'ARTICLE' ? eligible(c) && countedIn(c) === 0 : countedIn(c) === 1;
+                // Per evaluation: a grid of N cards is read once, not N times.
+                const lists = new Map();
+                const listParents = new Map();
+                const inList = (a) => {
+                    if (lists.has(a)) return lists.get(a);
+                    let answer = false;
+                    let level = a;
+                    for (let i = 0; i < 3; i++) {
+                        const p = level.parentElement;
+                        if (!p || p === document.documentElement) break;
+                        if (!listParents.has(p)) listParents.set(p, Array.from(p.children).filter(holdsOne).length >= 2);
+                        if (listParents.get(p)) { answer = true; break; }
+                        if (p === document.body) break;
+                        level = p;
+                    }
+                    lists.set(a, answer);
+                    return answer;
+                };
+                // Visible words only: a script, style or template is not the story.
+                const textLen = (a) => {
+                    let n = 0;
+                    const walk = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
+                    for (let t = walk.nextNode(); t; t = walk.nextNode()) {
+                        if (t.parentElement && t.parentElement.closest('script, style, template, noscript')) continue;
+                        n += t.data.replace(/\s+/g, ' ').trim().length;
+                    }
+                    return n;
+                };
+                let dominant;
+                const dominantArticle = () => {
+                    if (dominant !== undefined) return dominant;
+                    const sizes = counted().map((a) => [a, textLen(a)]).sort((x, y) => y[1] - x[1]);
+                    dominant = sizes.length > 0 && (sizes.length === 1 || sizes[0][1] >= 2 * sizes[1][1]) ? sizes[0][0] : null;
+                    return dominant;
+                };
+                const isStory = (a) => !inList(a) || a === dominantArticle() || a.querySelector(STRONG_SEL) !== null;
+                // Whether the page has a story at all: else a card says nothing (null).
+                let storySeen;
+                const pageHasStory = () => {
+                    if (storySeen === undefined) {
+                        storySeen = document.querySelector(STRONG_SEL) !== null || counted().some(isStory);
+                    }
+                    return storySeen;
+                };
+                // An article nested in the story (a live blog's updates, list
+                // items in the body) is the story, unless a named widget or
+                // an outside tag stands between them.
+                const inStory = (a) => {
+                    const outer = a.parentElement && a.parentElement.closest(ARTICLE_SEL);
+                    if (!outer) return false;
+                    for (let b = a.parentElement; b && b !== outer; b = b.parentElement) {
+                        if (outsideRole(b) || namedOutside(b)) return false;
+                    }
+                    return outer.tagName !== 'ARTICLE' || outer.matches(STRONG_SEL) || isStory(outer);
+                };
                 const inArticle = (el) => {
                     try {
                         let marker = false;
@@ -850,6 +955,13 @@ impl StreamSniffer {
                                     const r = (b.getAttribute('role') || '').toLowerCase();
                                     if (OUTSIDE_TAGS.has(b.tagName) || r === 'navigation' || r === 'complementary') return false;
                                 }
+                                // A comment, even a bare <article> under the comments.
+                                if (inComment(a)) return false;
+                                if (inStory(a)) return true;
+                                // A card under a named widget ("related"): outside when the page has its story elsewhere.
+                                if (namedAbove(a) && pageHasStory()) return false;
+                                // A card of a rail or grid: likewise.
+                                if (!isStory(a)) return pageHasStory() ? false : null;
                                 return true;
                             }
                             const role = (a.getAttribute('role') || '').toLowerCase();
