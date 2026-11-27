@@ -1593,11 +1593,15 @@ const IMAGE_SERVERS: &[(&str, &str)] = &[
 const IMAGE_FORMATS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "avif"];
 
 /// A Google Photos video stream on an `lhN.googleusercontent.com` host: its
-/// address ends in `=dv` or `=m<digits>` (P15.5). Never a photo.
+/// address's options after the last `=` hold `dv` or `m<digits>` (P15.5),
+/// alone or among others separated by `-` (`=w1280-h720-dv`, `=m22-no`,
+/// P15.12b). Never a photo.
 fn is_google_photos_video(host: &str, path: &str) -> bool {
     host.ends_with(".googleusercontent.com")
         && path.rsplit_once('=').is_some_and(|(_, tail)| {
-            tail == "dv" || tail.strip_prefix('m').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            tail.split('-').any(|o| {
+                o == "dv" || o.strip_prefix('m').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
         })
 }
 
@@ -3316,6 +3320,13 @@ mod tests {
             ("https://lh5.googleusercontent.com/pw/AbCdEf123=m18", Tier::Other),
             ("https://lh6.googleusercontent.com/AbCdEf123=m37", Tier::Other),
             ("https://lh4.googleusercontent.com/pw/AbCdEf123=m22?format=jpg", Tier::Other),
+            // P15.12b: the same options combined with size options.
+            ("https://lh3.googleusercontent.com/pw/AbCdEf123=w1280-h720-dv", Tier::Other),
+            ("https://lh5.googleusercontent.com/pw/AbCdEf123=m22-no", Tier::Other),
+            ("https://lh6.googleusercontent.com/pw/AbCdEf123=s0-dv", Tier::Other),
+            // Size options alone are a photo's.
+            ("https://lh3.googleusercontent.com/pw/AbCdEf123=w1280-h720", Tier::Image),
+            ("https://lh3.googleusercontent.com/pw/AbCdEf123=w1280-mx-dvd", Tier::Image),
             ("https://notimages.openai.com.example/x", Tier::Other),
             ("https://encrypted-tbnx.gstatic.com/images?q=x", Tier::Other),
             ("https://www.gstatic.com/images/branding/logo", Tier::Other),
